@@ -1,0 +1,13 @@
+{
+  "tasks": [
+    {
+      "id": "greet",
+      "title": "实现 greet 函数",
+      "description": "在 hello.py 实现 greet(name)，返回 Hello, {name}!。",
+      "depends_on": [],
+      "allowed_paths": ["hello.py"],
+      "acceptance": ["greet('Ada') 等于 'Hello, Ada!'", "项目 unittest 通过"],
+      "skills": []
+    }
+  ]
+}

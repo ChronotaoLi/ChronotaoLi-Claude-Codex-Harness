@@ -1,0 +1,10 @@
+{
+  "pre_agent": [],
+  "post_agent": [],
+  "pre_verify": [],
+  "post_verify": [],
+  "pre_accept": [],
+  "post_accept": [],
+  "context_compacted": [],
+  "on_error": []
+}

@@ -35,3 +35,8 @@ coverage/
 
 # Claude Code local settings
 .claude/settings.local.json
+
+# Harness local state, generated adapters, and package metadata
+.harness/
+*.egg-info/
+.ruff_cache/

@@ -1,0 +1,13 @@
+{
+  "servers": {
+    "openwiki": {
+      "enabled": false,
+      "transport": "stdio",
+      "command": "openwiki",
+      "args": ["mcp", "--wiki", "/absolute/path/output/wiki", "--index", "/absolute/path/output/index", "--graph", "/absolute/path/output/graph"],
+      "env_vars": [],
+      "roles": ["commander", "worker", "reviewer"],
+      "read_only": true
+    }
+  }
+}

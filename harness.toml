@@ -1,0 +1,37 @@
+[roles.commander]
+cli = "codex"
+model = "gpt-6-astra"
+effort = "high"
+
+[roles.fable]
+cli = "claude"
+model = "claude-fable-5-1"
+effort = "high"
+
+[roles.worker]
+cli = "claude"
+model = "claude-opus-5-5"
+effort = "high"
+
+[roles.reviewer]
+cli = "codex"
+model = "gpt-6.1-sol"
+effort = "high"
+
+[runtime]
+agent_timeout_seconds = 1200
+verify_timeout_seconds = 300
+max_attempts = 3
+max_tasks = 20
+context_chars = 32000
+claude_max_turns = 50
+
+[shared]
+rules = "shared/RULES.md"
+skills = "shared/skills"
+mcp = "shared/mcp.json"
+hooks = "shared/hooks.json"
+
+[verification]
+# 配置目标项目的验证命令。这里的默认值用于本 Harness 项目。
+commands = [["python3", "-m", "unittest", "discover", "-s", "tests", "-v"]]
