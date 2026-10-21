@@ -5,6 +5,6 @@
   "post_verify": [],
   "pre_accept": [],
   "post_accept": [],
-  "context_compacted": [],
+  "context_prepared": [],
   "on_error": []
 }

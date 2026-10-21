@@ -20,7 +20,9 @@ flowchart TD
     R -->|通过| A[核对文件快照并提交到隔离分支]
     A --> M[记录来源、记忆与交接检查点]
     M --> C
-    A --> D[所有任务完成，交付分支]
+    A --> F[所有任务完成：重新验证并整体审阅原始目标]
+    F -->|通过| D[交付分支]
+    F -->|缺漏| C
 ```
 
 ## 先运行
@@ -43,7 +45,7 @@ python3 -m harness smoke
 python3 -m harness smoke --commander fable
 ```
 
-`smoke` 在临时 Git 仓库完成一个小函数，使用预写任务计划，依次调用真实指挥、执行者、审阅者，并运行真实测试。它不改动本仓库代码。
+`smoke` 在临时 Git 仓库完成一个小函数，由真实指挥生成计划，再调用执行者、任务审阅者和整体审阅者，并运行真实测试。它不改动本仓库代码。
 
 ## 对自己的项目执行任务
 
@@ -58,7 +60,18 @@ python3 -m harness --repo /absolute/path/to/project run "实现导出功能" --c
 
 配置路径可以显式指定：`--config /absolute/path/harness.toml`。共享资源路径相对于该配置文件所在目录。自定义配置请使用正确的相对或绝对资源路径。
 
-可用 `--plan /path/to/plan.json` 提供已有计划，格式见 [examples/plan.json](examples/plan.json)。指挥仍负责选择可执行任务与给出返工指令。计划会检查任务 ID、依赖环、验收条件与文件范围。
+可用 `--plan /path/to/plan.json` 提供已有计划，格式见 [examples/plan.json](examples/plan.json)。计划会检查任务 ID、依赖环、非空验收条件与文件范围。唯一就绪任务在首次尝试且没有反馈时直接使用完整任务简报派发；存在选择或返工反馈时才调用指挥。
+
+默认连续执行。需要先检查计划或分步执行时，可显式选择：
+
+```bash
+python3 -m harness --repo /path/to/project run "实现导出功能" --pause-after-plan
+python3 -m harness --repo /path/to/project status run_实际ID
+python3 -m harness --repo /path/to/project resume run_实际ID --approve-plan --step
+python3 -m harness --repo /path/to/project resume run_实际ID --step
+```
+
+`--pause-after-plan` 将计划保存到运行目录并等待 `--approve-plan`；普通 `resume` 不会替你批准。`--step` 最多接受一个任务后暂停；最后一个任务完成后仍执行整体验收。
 
 所有更改在 `<目标项目>/.harness/worktrees/<run_id>` 的 `harness/<run_id>` 分支完成。每个通过检查和审阅的任务生成本地提交。成功输出分支和路径，便于查看 diff、merge 或 cherry-pick。最终集成由你操作。
 
@@ -68,7 +81,11 @@ python3 -m harness --repo /path/to/project status run_实际ID
 python3 -m harness --repo /path/to/project resume run_实际ID
 ```
 
-`resume` 使用已有台账、代码现场和新的 agent 继续，不恢复供应商会话。总尝试次数不会因恢复而清零。旧进程组仍存活、配置变化或 Git HEAD 与检查点不一致时停止恢复，保留现场供核对。账号授权/模型权限失败直接报错，不自动换成其他模型。
+`resume` 使用已有台账、代码现场和新的 agent 继续，不恢复供应商会话。任务次数、总 worker 尝试次数和再规划次数均不会因恢复而清零。可以调大 `context_chars`、两种超时、`claude_max_turns`、`max_attempts` 和 `max_total_attempts` 后恢复，变更会写入事件；其余配置和共享资源必须一致。旧进程组仍存活或 Git HEAD 与检查点不一致时停止恢复。账号授权/模型权限失败直接报错，不自动换成其他模型。
+
+当前运行台账为版本 2，旧版台账可通过 `status` 查看，不能直接恢复执行；请用旧版本完成旧 run，或从核对后的代码开始新 run。
+
+任务因缺少前置工作而返回 `blocker_kind=task` 时，指挥可进行有限再规划；权限、工具、账号或服务问题使用 `environment` 并停止。再规划保留所有现有任务 ID、验收条件和文件范围，已接受任务完全不变，可增加现有范围内的前置任务或修复任务。重新分配前，运行时归档未接受的修改并恢复到最后接受的提交。`max_attempts` 是每任务累计上限，`max_total_attempts` 是整个 run 的 worker 上限，`max_replans` 是再规划上限；达到上限不会通过改名刷新预算。
 
 ## “一个 agent 只做一件事”如何落实
 
@@ -76,9 +93,11 @@ python3 -m harness --repo /path/to/project resume run_实际ID
 - Claude 使用 `--no-session-persistence`，Codex 使用 `--ephemeral`，没有 resume/continue。
 - 禁用原生子 agent；指挥通过结构化计划交给调度器启动执行者。
 - 返工使用新进程，得到同一任务、验收条件和必要的失败反馈。
-- 审阅者收到任务、实际 diff 和验证日志，不注入执行者的解释或私有推理。
+- 审阅者收到任务、实际 diff、验证日志和历轮审阅问题的证据引用，不注入执行者的私有推理。记忆提案作为待独立核实的数据传入。
 - 一条 run 按 DAG 串行执行，复用该 run 的工作树和已经通过审阅的代码；不复用执行者的模型会话。
-- 完成由“检查通过 + 审阅通过 + 文件快照未变”决定。记忆写入只发生在接受之后。
+- 任务接受由“检查通过 + 审阅通过 + 文件快照未变”决定。结构化 findings 区分阻断问题与建议；建议可以保留，`request_changes` 或任何阻断问题都不通过。
+- 全部任务接受后重新运行验证，由新的审阅实例对照原始目标、原始任务约束和整条分支 diff 验收。整体拒绝后须经新修复任务通过门禁，不能靠反复恢复抽取新的审阅结论。
+- 记忆写入只发生在任务接受之后；项目知识还需审阅者单独批准具体提案。
 
 这是任务和会话层面的隔离。Git worktree 不是操作系统安全沙箱；文件范围检查是接受前的检查，不能保证恶意进程无法触碰同一用户可访问的其他文件。忽略文件、外部服务副作用不在 Git 快照覆盖范围内。
 
@@ -109,7 +128,7 @@ python3 -m harness sync --role worker
 
 这会生成 `.harness/generated/worker/claude.mcp.json` 和 `codex.mcp.toml`，供检查或手动使用；每次正式 dispatch 也会生成并传入自己的 MCP 配置。不会覆盖 `~/.claude` 或 `~/.codex` 的配置。Codex 调用使用 `--ignore-user-config` 保留登录凭据并减少个人配置干扰；如果你的登录依赖自定义 provider/base URL，当前适配器需要先显式扩展后才能复用该配置。
 
-统一 hooks 目前是**编排生命周期 hooks**，覆盖 `pre_agent`、`post_agent`、`pre_verify`、`post_verify`、`pre_accept`、`post_accept`、`context_compacted`、`on_error`。例如：
+统一 hooks 是**编排生命周期 hooks**，覆盖 `pre_agent`、`post_agent`、`pre_verify`、`post_verify`、`pre_accept`、`post_accept`、`context_prepared`、`on_error`。例如：
 
 ```json
 {
@@ -119,9 +138,18 @@ python3 -m harness sync --role worker
 }
 ```
 
-脚本工作目录是配置所在目录，从 stdin 读取 JSON 事件，非零退出码阻止继续。通过事件中的路径定位目标项目。它们与厂商原生的 `PreToolUse`、`PostToolUse` 不是同一层；首版没有宣称能够截获所有原生工具调用。生成的调用会关闭个人原生 hooks/自动记忆，避免重复采集；企业管理配置可能仍有更高优先级。
+脚本工作目录是配置所在目录，从 stdin 读取 JSON 事件，非零退出码阻止继续。通过事件中的路径定位目标项目。默认空数组表示没有额外策略。`context_prepared` 表示已组装有界输入；旧名 `context_compacted` 仍可单独配置作为别名，不能与新名同时配置非空脚本。它们与厂商原生的 `PreToolUse`、`PostToolUse` 不是同一层；运行时不截获所有原生工具调用。生成的调用会关闭个人原生 hooks/自动记忆，避免重复采集；企业管理配置可能仍有更高优先级。
 
-Claude worker 自动允许读写工具、部分只读 shell 命令，以及你配置的验证命令。不使用跳过所有权限检查的参数；超出允许范围的命令会导致 agent 报告 blocker。目标项目的原生规则与 CLI 自动加载内容仍可能影响模型，32,000 字符预算仅覆盖编排器生成的输入包。
+`post_accept` 失败时保留已接受提交及待完成的 hook；恢复会先重试该 hook，成功前不能执行下一个任务或完成 run。hook 在成功后、检查点写入前中断时可能再次执行，需要将外部副作用写成可重复执行的操作。
+
+Claude worker 显式允许读写工具、部分读取命令和配置的验证命令。Claude 指挥与审阅角色也可使用受限的 Git 查询命令；输入包列出可用命令示例。额外的 worker 命令通过配置声明为完整 argv：
+
+```toml
+[permissions]
+worker_commands = [["python3", "-m", "unittest", "tests.test_export", "-v"]]
+```
+
+额外命令不接受 `*` 或换行。验证 argv 中的字面 `*` 仍可由确定性验证器执行，但不转成 Bash 授权，以免被 CLI 解释为权限通配符。不使用跳过所有权限检查的参数；CLI 自身仍可能允许内建只读命令，这些授权不是操作系统沙箱。必要命令被拒绝时，worker 应报告环境 blocker。当前 Codex 适配器只提供只读模式，因此配置 Codex worker 会提前报错。目标项目的原生规则与 CLI 自动加载内容仍可能影响模型，32,000 字符预算仅覆盖编排器生成的输入包。
 
 ## 记忆与压缩
 
@@ -134,6 +162,10 @@ Claude worker 自动允许读写工具、部分只读 shell 命令，以及你�
 | 原始证据 | diff、测试输出、结构化结果、进程日志、提交 | 文件落盘，摘要保留引用，可按需读取 |
 
 SQLite 存在目标项目 `.harness/memory.sqlite3`，项目之间独立。每条记忆保存来源、时间、类型和版本。相同 `key` 的新记录替代旧记录的默认检索资格，旧记录仍可按 ID 查询。支持 TTL。系统不会自动猜测两条不同 key 的事实是否矛盾。
+
+任务历史仍使用 `task:<run_id>:<task_id>`，保留每次已接受结果。worker 可另行返回 `proposed_memories`，每条包含稳定 key、摘要、事实内容和仓库来源文件；审阅者通过 `approved_memory_keys` 单独批准。运行时将通过检查的提案写入 `knowledge:` 命名空间，并保护操作者维护的记录。代码通过不代表所有记忆提案通过，agent 没有直接写记忆的 MCP 工具。
+
+自动任务记忆与项目知识默认 TTL 均为 180 天，可用 `[memory]` 的 `task_ttl_days`、`knowledge_ttl_days` 配置，设为 0 表示不过期。操作者手写事实默认不过期。项目知识保存提交和来源文件哈希；检索时来源变化会标记 `possibly_stale` 并降权，保留原记录供查证。类型权重帮助项目知识和手写事实优先于同等相关的任务流水，但不能替代对当前代码的核对。
 
 ```bash
 python3 -m harness --repo /path/to/project memory add \

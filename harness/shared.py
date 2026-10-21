@@ -79,15 +79,20 @@ def mcp_configs(config, state: Path, role: str, run_path: Path | None = None):
 
 
 class Hooks:
-    EVENTS = {"pre_agent", "post_agent", "pre_verify", "post_verify", "pre_accept", "post_accept", "on_error", "context_compacted"}
+    EVENTS = {"pre_agent", "post_agent", "pre_verify", "post_verify", "pre_accept", "post_accept", "on_error",
+              "context_prepared", "context_compacted"}
 
     def __init__(self, config):
         self.config = config
         self.spec = read_json(config.asset("hooks"))
         if set(self.spec) - self.EVENTS:
             raise HarnessError("hooks.json 含未知事件")
+        if self.spec.get("context_prepared") and self.spec.get("context_compacted"):
+            raise HarnessError("context_prepared 与旧名 context_compacted 只能配置一个，避免重复执行")
 
     def emit(self, event, payload, logs: Path):
+        if event == "context_prepared" and not self.spec.get(event) and self.spec.get("context_compacted"):
+            event = "context_compacted"
         for i, hook in enumerate(self.spec.get(event, [])):
             argv = hook["argv"]
             if not isinstance(argv, list) or not argv or not all(isinstance(x, str) for x in argv):

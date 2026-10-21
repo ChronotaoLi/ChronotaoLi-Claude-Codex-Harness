@@ -47,13 +47,10 @@ def demo(config, live=False, commander="astra"):
     config.data["runtime"]["agent_timeout_seconds"] = 180 if live else 1200
     config.data["runtime"]["max_attempts"] = 1 if live else 3
     print(f"[harness] {'LIVE SMOKE' if live else 'OFFLINE DEMO'} repo={root}", flush=True)
-    plan = read_json(ROOT_PLAN) if live else None
-    result = Engine(config, root, backend=None if live else DemoBackend(), commander=commander).start("Implement greet(name)", plan)
+    result = Engine(config, root, backend=None if live else DemoBackend(), commander=commander).start(
+        "Implement greet(name) in hello.py, returning 'Hello, {name}!'. Keep the existing test unchanged.")
     print(dump({"simulation": not live, "models_called": live, "verification": "real unittest + git", "repo": str(root),
                 "run": result["id"], "branch": result["branch"], "status": result["status"]}))
-
-
-ROOT_PLAN = Path(__file__).resolve().parent.parent / "examples" / "plan.json"
 
 
 def main(argv=None):
@@ -73,8 +70,12 @@ def main(argv=None):
     run.add_argument("goal")
     run.add_argument("--commander", choices=["astra", "fable"], default="astra")
     run.add_argument("--plan", type=Path, help="使用已编写的 JSON 任务计划")
+    run.add_argument("--pause-after-plan", action="store_true", help="保存计划并等待显式批准，再开始执行")
+    run.add_argument("--step", action="store_true", help="最多接受一个任务后暂停；最后一个任务仍需整体验收")
     resume = sub.add_parser("resume")
     resume.add_argument("run_id")
+    resume.add_argument("--approve-plan", action="store_true", help="批准等待确认的计划并继续")
+    resume.add_argument("--step", action="store_true", help="最多接受一个任务后暂停")
     status = sub.add_parser("status")
     status.add_argument("run_id", nargs="?")
     sync = sub.add_parser("sync", help="生成共用 MCP 的两种客户端配置，不覆盖个人配置")
@@ -105,10 +106,11 @@ def main(argv=None):
         state = repo / ".harness"
         if args.command == "run":
             engine = Engine(config, repo, commander=args.commander)
-            result = engine.start(args.goal, read_json(args.plan) if args.plan else None)
+            result = engine.start(args.goal, read_json(args.plan) if args.plan else None,
+                                  pause_after_plan=args.pause_after_plan, step=args.step)
             print(dump({k: result[k] for k in ("id", "status", "branch", "worktree", "accepted")}))
         elif args.command == "resume":
-            result = Engine(config, repo).resume(args.run_id)
+            result = Engine(config, repo).resume(args.run_id, approve_plan=args.approve_plan, step=args.step)
             print(dump({k: result[k] for k in ("id", "status", "branch", "worktree")}))
         elif args.command == "status":
             if args.run_id:
@@ -127,7 +129,7 @@ def main(argv=None):
             print(str(folder))
         elif args.command == "memory":
             git.ignore_state(repo)
-            memory = Memory(state / "memory.sqlite3")
+            memory = Memory(state / "memory.sqlite3", repo=repo)
             if args.memory_command == "add":
                 print(memory.remember(key=args.key, abstract=args.title, overview=args.text, detail=args.text,
                                       source=args.source, ttl_days=args.ttl_days))

@@ -73,7 +73,8 @@ class ContractTests(unittest.TestCase):
 
     def test_stale_dispatch_cannot_complete_new_attempt(self):
         schema = envelope(WORK, "task1", "new")
-        value = {"task_id": "task1", "dispatch_id": "old", "status": "completed", "summary": "done", "evidence": [], "blockers": []}
+        value = {"task_id": "task1", "dispatch_id": "old", "status": "completed", "summary": "done", "evidence": [],
+                 "blockers": [], "blocker_kind": "none", "proposed_memories": []}
         with self.assertRaises(HarnessError):
             validate(value, schema)
 
@@ -163,16 +164,19 @@ class RuntimeTests(RepoCase):
             count = 0
             def invoke(self, **kwargs):
                 value = super().invoke(**kwargs)
-                if kwargs["role"] == "reviewer":
+                if kwargs["role"] == "reviewer" and kwargs["kind"] == "review":
                     self.count += 1
                     if self.count == 1:
-                        value.update(verdict="request_changes", findings=["Please inspect edge case"])
+                        value.update(verdict="request_changes", findings=[{
+                            "id": "edge-case", "severity": "blocking", "category": "evidence",
+                            "location": "hello.py", "message": "Please inspect edge case",
+                            "evidence": ["The first review requests an additional check."]}])
                 return value
         engine = self.engine(RejectOnce())
         result = engine.start("Implement greet")
         self.assertEqual(result["attempts"]["greet"], 2)
         for role in ("worker", "reviewer"):
-            ids = [d["id"] for d in result["dispatches"] if d["role"] == role]
+            ids = [d["id"] for d in result["dispatches"] if d["role"] == role and d["task_id"] == "greet"]
             self.assertEqual(len(ids), 2)
             self.assertNotEqual(ids[0], ids[1])
         self.assertEqual(len(engine.memory.export()), 1)
@@ -265,7 +269,8 @@ class RuntimeTests(RepoCase):
                     packet = json.loads(kwargs["prompt"].split("\n\nREFERENCE MEMORY")[0])["packet"]
                     assert "greet" in packet["dependencies"]
                     (kwargs["cwd"] / "usage.txt").write_text("Use greet(name)")
-                    return {**ids, "status": "completed", "summary": "Documented greet", "evidence": ["usage.txt"], "blockers": []}
+                    return {**ids, "status": "completed", "summary": "Documented greet", "evidence": ["usage.txt"],
+                            "blockers": [], "blocker_kind": "none", "proposed_memories": []}
                 return super().invoke(**kwargs)
         plan = read_json(ROOT / "examples/plan.json")
         plan["tasks"].append({"id": "document", "title": "Document greet", "description": "Document greet in usage.txt",
@@ -293,7 +298,7 @@ class RuntimeTests(RepoCase):
     def test_resume_rejects_changed_configuration(self):
         engine = self.engine()
         engine.start("Implement greet")
-        self.config.data["runtime"]["context_chars"] += 1
+        self.config.data["roles"]["reviewer"]["model"] = "changed-model"
         with self.assertRaisesRegex(HarnessError, "配置已改变"):
             self.engine().resume(engine.run["id"])
 

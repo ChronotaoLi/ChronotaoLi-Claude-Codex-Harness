@@ -22,9 +22,21 @@ effort = "high"
 agent_timeout_seconds = 1200
 verify_timeout_seconds = 300
 max_attempts = 3
+max_total_attempts = 60
+max_replans = 2
 max_tasks = 20
 context_chars = 32000
 claude_max_turns = 50
+
+[permissions]
+# 额外授权给 Claude worker 的精确 argv，不接受 * 通配符或换行。
+# 例如 [["npm", "run", "build"]]；这是 CLI 权限规则，不是操作系统沙箱。
+worker_commands = []
+
+[memory]
+# 0 表示不设到期时间；过期记录仍保留历史，默认检索不返回。
+task_ttl_days = 180
+knowledge_ttl_days = 180
 
 [shared]
 rules = "shared/RULES.md"

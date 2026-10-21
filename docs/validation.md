@@ -1,8 +1,8 @@
-# 首版验证记录
+# 验证记录
 
 验证日期：2026-10-21。本记录描述已执行的检查，不保证将来账号权限或 CLI 行为不变。
 
-## 离线行为测试
+## 首版离线基线
 
 `python3 -W error::ResourceWarning -m unittest discover -s tests -v`：27 项通过。
 
@@ -10,7 +10,7 @@
 
 三个共用 SKILL.md 均通过 skill-creator 的 `quick_validate.py`。Python 模块语法检查通过。
 
-## 真实模型联调
+## 首版真实模型联调（历史记录）
 
 本机环境：Codex CLI 0.163.0、Claude Code 2.1.306；复用本机已有登录。
 
@@ -23,7 +23,7 @@
 
 这验证了实际 CLI 调用、结构化派发、工具写入、测试与审阅闭环。真实联调使用预写计划，未覆盖复杂需求的自动拆解质量；自动计划的 schema 和 DAG 调度有离线行为测试。OpenWiki 外部服务未部署，Orca 桌面编排未接管。
 
-可复现命令：
+当时使用的命令（当前版本已改为自动生成计划并追加整体验收）：
 
 ```bash
 python3 -m harness smoke
@@ -31,3 +31,22 @@ python3 -m harness smoke --commander fable
 ```
 
 离线模拟入口 `python3 -m harness demo` 不调用模型，不能代替以上两次真实联调。
+
+## 设计修订后的验证
+
+本次修订增加结构化审阅、整体目标验收、有界再规划、恢复参数白名单、可选计划批准与单步执行，以及经单独审阅的项目知识提案。首版的真实联调记录不作为这些新增流程的验证结论。
+
+新增离线检查覆盖：整体审阅拒绝与修复、历史 findings、建议与阻断的区别、再规划保留原始义务、累计预算、任务与环境受阻分类、配置恢复、显式计划批准、知识提案来源与操作者保护、批量写入回滚、来源过时排序和旧数据库读取。
+
+`python3 -m unittest discover -s tests -v`：105 项通过（Python 3.15.0，20.470 秒）。还覆盖了再规划中断恢复、计划生成中断后的批准边界、post_accept 失败恢复、暂存区隐藏变更、任务名与整体验收证据隔离，以及供应商 schema 投影与本地严格校验。`python3 -m compileall -q harness tests` 与 `git diff --check` 通过。
+
+同日对修订后的代码执行了两条真实模型 smoke：
+
+| 指挥 | 运行 ID | 结果 |
+| --- | --- | --- |
+| `gpt-6-astra` | `run_dcc89b3ed5284c64` | completed |
+| `claude-fable-5-1` | `run_1fb92660a4d94e18` | completed |
+
+两次均由真实指挥自动生成单任务计划，使用 `claude-opus-5-5` 实现，再由两个不同 dispatch 的 `gpt-6.1-sol` 分别执行任务审阅与整体目标审阅。各执行两轮真实 unittest，最终均 approve，原工作区保持干净。每条链路包含四次模型派发；唯一就绪任务跳过了额外的调度指挥调用。
+
+这验证了当前 CLI 参数、供应商 schema 投影、自动规划和正常验收路径。复杂规划质量、真实模型再规划及故障恢复仍不由这个小函数 smoke 证明；对应的确定性边界通过上述离线行为测试验证。

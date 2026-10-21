@@ -48,7 +48,7 @@ def handle(request, memory, skills, run):
             value = read_skill(skills, args["name"])
         elif name == "run_status":
             state = read_json(run) if run else {}
-            value = {k: state.get(k) for k in ("id", "goal", "status", "accepted")}
+            value = {k: state.get(k) for k in ("id", "goal", "status", "accepted", "total_attempts", "replan_attempts")}
         else:
             raise HarnessError("Unknown tool")
         return {"content": [{"type": "text", "text": json.dumps(value, ensure_ascii=False)}], "isError": False}
@@ -62,7 +62,10 @@ def main():
     parser.add_argument("--skills", type=Path, required=True)
     parser.add_argument("--run", type=Path)
     args = parser.parse_args()
-    memory = Memory(args.state / "memory.sqlite3")
+    run_state = read_json(args.run) if args.run else {}
+    repo = Path(run_state["worktree"]) if run_state.get("worktree") else (
+        args.state.parent if args.state.name == ".harness" else None)
+    memory = Memory(args.state / "memory.sqlite3", repo=repo)
     for line in sys.stdin:
         request = {}
         try:

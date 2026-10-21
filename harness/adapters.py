@@ -3,9 +3,21 @@ from __future__ import annotations
 import json
 import os
 import shlex
+from copy import deepcopy
 
 from .shared import mcp_configs, toml_value
 from .util import HarnessError, read_json, run_process, tail, write_json
+
+
+def provider_schema(schema):
+    """Project our richer local contract onto both CLIs' common schema core."""
+    core = {"type", "properties", "required", "additionalProperties", "items", "enum"}
+    result = {key: deepcopy(value) for key, value in schema.items() if key in core}
+    if "properties" in result:
+        result["properties"] = {name: provider_schema(value) for name, value in result["properties"].items()}
+    if "items" in result:
+        result["items"] = provider_schema(result["items"])
+    return result
 
 
 class CLIBackend:
@@ -13,8 +25,12 @@ class CLIBackend:
         self.config, self.state = config, state
 
     def command(self, role, model, cwd, job, schema, run_path):
+        if role == "worker" and model["cli"] == "codex":
+            raise HarnessError("当前 Codex 适配器仅支持只读角色，不能配置为 worker")
         claude, codex = mcp_configs(self.config, self.state, role, run_path)
         write_json(job / "mcp.json", claude)
+        wire_schema = provider_schema(schema)
+        write_json(job / "provider-schema.json", wire_schema)
         if model["cli"] == "codex":
             return ["codex", "exec", "--model", model["model"], "--ephemeral", "--ignore-user-config",
                     "--sandbox", "read-only", "--cd", str(cwd), "--json", "--color", "never",
@@ -22,28 +38,32 @@ class CLIBackend:
                     "-c", "features.multi_agent=false", "-c", "features.memories=false",
                     "-c", "features.hooks=false", "-c", "features.plugins=false",
                     "-c", "mcp_servers=" + toml_value(codex),
-                    "--output-schema", str(job / "schema.json"),
+                    "--output-schema", str(job / "provider-schema.json"),
                     "--output-last-message", str(job / "response.json"), "-"]
-        settings = {"autoMemoryEnabled": False, "disableAllHooks": True}
-        argv = ["claude", "--print", "--model", model["model"], "--effort", model["effort"],
+        allow = ["Read", "Glob", "Grep"]
+        allow += ["Bash(" + shlex.join(cmd) + " *)" for cmd in self.config.readonly_commands()]
+        tools = "Read,Glob,Grep,Bash"
+        if role == "worker":
+            allow += ["Edit", "Write"]
+            tools = "Read,Edit,Write,Glob,Grep,Bash"
+            commands = self.config.data["verification"]["commands"] + self.config.data["permissions"]["worker_commands"]
+            # A literal * in an argv becomes a permission wildcard even when
+            # shell-quoted. Such verification commands remain runnable by the
+            # deterministic verifier, but never become broad Bash grants.
+            allow += ["Bash(" + shlex.join(cmd) + ")" for cmd in commands
+                      if not any("*" in arg or "\n" in arg or "\r" in arg for arg in cmd)]
+        # Only configured MCP servers are exposed. Their permissions are a trusted operator choice.
+        allow += ["mcp__" + name for name in claude["mcpServers"]]
+        # JSON preserves commas and parentheses inside exact command arguments.
+        settings = {"autoMemoryEnabled": False, "disableAllHooks": True, "permissions": {"allow": allow}}
+        return ["claude", "--print", "--model", model["model"], "--effort", model["effort"],
                 "--no-session-persistence", "--session-id", job.name,
                 "--setting-sources", "", "--settings", json.dumps(settings),
                 "--strict-mcp-config", "--mcp-config", str(job / "mcp.json"),
-                "--output-format", "json", "--json-schema", json.dumps(schema),
+                "--output-format", "json", "--json-schema", json.dumps(wire_schema),
                 "--max-turns", str(self.config.data["runtime"]["claude_max_turns"]),
-                "--permission-mode", "dontAsk", "--disallowedTools", "Agent,Task"]
-        if role == "worker":
-            allow = ["Read", "Edit", "Write", "Glob", "Grep", "Bash(git status *)", "Bash(git diff *)",
-                     "Bash(git log *)", "Bash(rg *)", "Bash(ls *)"]
-            allow += ["Bash(" + shlex.join(cmd) + ")" for cmd in self.config.data["verification"]["commands"]]
-            argv += ["--tools", "Read,Edit,Write,Glob,Grep,Bash"]
-        else:
-            allow = ["Read", "Glob", "Grep"]
-            argv += ["--tools", "Read,Glob,Grep"]
-        # Only configured MCP servers are exposed. Their permissions are a trusted operator choice.
-        allow += ["mcp__" + name for name in claude["mcpServers"]]
-        argv += ["--allowedTools", ",".join(allow)]
-        return argv
+                "--permission-mode", "dontAsk", "--disallowedTools", "Agent,Task",
+                "--tools", tools]
 
     def invoke(self, *, role, model, cwd, job, schema, prompt, run_path, on_start, task=None, kind=None):
         write_json(job / "schema.json", schema)
@@ -80,12 +100,16 @@ class DemoBackend:
         ids = {k: schema["properties"][k]["enum"][0] for k in ("task_id", "dispatch_id")}
         if role == "worker":
             (cwd / "hello.py").write_text('def greet(name):\n    return f"Hello, {name}!"\n')
-            result = {"status": "completed", "summary": "Implemented greet", "evidence": ["hello.py"], "blockers": []}
+            result = {"status": "completed", "summary": "Implemented greet", "evidence": ["hello.py"],
+                      "blockers": [], "blocker_kind": "none", "proposed_memories": []}
         elif role == "reviewer":
-            result = {"verdict": "approve", "summary": "Demo simulated review", "findings": []}
+            result = {"verdict": "approve", "summary": "Demo simulated review", "findings": [],
+                      "approved_memory_keys": []}
         elif kind == "plan":
             result = {"tasks": [{"id": "greet", "title": "Implement greet", "description": "Implement greet(name) returning Hello, name!",
                                   "depends_on": [], "allowed_paths": ["hello.py"], "acceptance": ["test_greet passes"], "skills": []}]}
+        elif kind == "replan":
+            result = {"action": "stop", "reason": "Demo cannot replan a failed task automatically", "tasks": []}
         else:
             result = {"selected_task": task["id"], "instruction": "Complete this one task and satisfy its acceptance criteria."}
         value = {**ids, **result}
