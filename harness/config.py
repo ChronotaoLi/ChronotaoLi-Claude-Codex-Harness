@@ -73,12 +73,19 @@ class Config:
     @classmethod
     def load(cls, path):
         path = Path(path).resolve()
-        data = normalized(tomllib.loads(path.read_text()))
+        data = normalized(tomllib.loads(path.read_text(encoding="utf-8")))
         cls.validate(data)
         return cls(path, data)
 
     @staticmethod
     def validate(data):
+        shared = data.get("shared")
+        if not isinstance(shared, dict):
+            raise HarnessError("shared 必须为配置表，包含 rules、skills、mcp、hooks")
+        for key in ("rules", "skills", "mcp", "hooks"):
+            value = shared.get(key)
+            if not isinstance(value, str) or not value.strip() or "\0" in value:
+                raise HarnessError(f"shared.{key} 必须为非空路径字符串")
         if not isinstance(data.get("roles"), dict):
             raise HarnessError("roles 必须为配置表")
         for name in ("commander", "worker", "reviewer", "fable"):

@@ -40,7 +40,7 @@ def skills_catalog(root: Path):
     for path in sorted(root.glob("*/SKILL.md")):
         if path.is_symlink() or path.parent.is_symlink():
             raise HarnessError("shared skills 不能使用符号链接")
-        match = re.search(r"^description:\s*(.+)$", path.read_text(), re.M)
+        match = re.search(r"^description:\s*(.+)$", path.read_text(encoding="utf-8"), re.M)
         result.append({"name": path.parent.name, "description": match.group(1) if match else path.parent.name})
     return result
 
@@ -51,7 +51,7 @@ def read_skill(root: Path, name: str):
     path = root / name / "SKILL.md"
     if path.is_symlink() or path.parent.is_symlink() or not path.is_file():
         raise HarnessError(f"skill 不存在或为链接：{name}")
-    return path.read_text()
+    return path.read_text(encoding="utf-8")
 
 
 def mcp_configs(config, state: Path, role: str, run_path: Path | None = None):

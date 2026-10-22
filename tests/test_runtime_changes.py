@@ -97,6 +97,7 @@ class RuntimeChangesTests(RepoCase):
         self.assertNotEqual(result["final_history"][0]["head"], result["final_history"][1]["head"])
 
     def test_noop_corrective_task_does_not_get_fresh_final_verdict(self):
+        self.config.data["runtime"]["max_replans"] = 1
         def no_change(backend, kwargs, packet, result):
             if kwargs["kind"] == "final_review":
                 result.update(verdict="request_changes", findings=[finding()])
@@ -109,6 +110,7 @@ class RuntimeChangesTests(RepoCase):
             engine.start("Implement greet", self.plan())
         self.assertEqual(engine.run["final_attempts"], 1)
         self.assertEqual(len(engine.run["accepted"]), 2)
+        self.assertEqual(engine.run["pending_replan"]["trigger"]["unchanged_corrections"], ["correct"])
 
     def test_final_readonly_mutation_never_completes(self):
         def mutate(backend, kwargs, packet, result):

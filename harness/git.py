@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import os
 import shutil
+import stat
 import subprocess
 from fnmatch import fnmatchcase
 from pathlib import Path
@@ -43,13 +44,95 @@ def ignore_state(repo: Path):
         common = repo / common
     path = common / "info" / "exclude"
     path.parent.mkdir(parents=True, exist_ok=True)
-    previous = path.read_text() if path.exists() else ""
+    previous = path.read_text(encoding="utf-8") if path.exists() else ""
     if "/.harness/" not in previous.splitlines():
-        path.write_text(previous.rstrip() + "\n/.harness/\n")
+        path.write_text(previous.rstrip() + "\n/.harness/\n", encoding="utf-8")
 
 
 def clean(repo: Path):
     return not git(repo, "status", "--porcelain").strip()
+
+
+def reject_submodules(repo: Path):
+    """Reject indexed gitlinks, including uninitialized or missing submodules."""
+    for entry in git_bytes(repo, "ls-files", "--stage", "-z").split(b"\0"):
+        if entry.startswith(b"160000 "):
+            name = os.fsdecode(entry.partition(b"\t")[2])
+            raise HarnessError(f"v0.1 暂不支持 submodule：{name}")
+
+
+def check_worktree_state(repo: Path):
+    """A run worktree must never contain the main repository's private state.
+
+    The shared Git exclude hides this root from normal change enumeration.
+    Only call this on run worktrees; the main repository owns .harness itself.
+    """
+    private = repo / ".harness"
+    if private.exists() or private.is_symlink():
+        raise HarnessError("任务修改了受保护路径：.harness")
+
+
+def assert_removable_worktree(repo: Path):
+    """Refuse removal unless all tracked bytes match HEAD and no data is hidden.
+
+    Git status may trust cached stat fields or index flags. Hash the actual
+    bytes with Git's blob framing, without clean filters or external programs.
+    This intentionally refuses transformed checkouts (for example autocrlf)
+    when their bytes differ from the saved blobs.
+    """
+    for entry in git_bytes(repo, "ls-files", "-v", "-z").split(b"\0"):
+        if entry[:1].islower() or entry.startswith(b"S "):
+            raise HarnessError("worktree 索引含 assume-unchanged/skip-worktree 标记；"
+                               f"请先核对并清除，不能移除：{os.fsdecode(entry[2:])}")
+    untracked = git_bytes(repo, "ls-files", "--others", "-z").split(b"\0")
+    if any(untracked):
+        raise HarnessError("worktree 有未保存文件（包括忽略文件）；请先归档或清理，不能移除")
+    tree = {}
+    for entry in git_bytes(repo, "ls-tree", "-r", "-z", "HEAD").split(b"\0"):
+        if not entry:
+            continue
+        metadata, name = entry.split(b"\t", 1)
+        mode, kind, object_id = metadata.split()
+        if kind != b"blob" or mode not in (b"100644", b"100755", b"120000"):
+            raise HarnessError(f"worktree 含 submodule 或不支持的文件类型，不能移除：{os.fsdecode(name)}")
+        tree[name] = (mode, object_id)
+    index = {}
+    for entry in git_bytes(repo, "ls-files", "--stage", "-z").split(b"\0"):
+        if not entry:
+            continue
+        metadata, name = entry.split(b"\t", 1)
+        mode, object_id, stage = metadata.split()
+        if stage != b"0":
+            raise HarnessError("worktree 索引含未解决的冲突，不能移除")
+        index[name] = (mode, object_id)
+    if index != tree:
+        raise HarnessError("worktree 索引与 HEAD 不同；请先保存或归档，不能移除")
+    object_format = git(repo, "rev-parse", "--show-object-format").strip()
+    if object_format not in ("sha1", "sha256"):
+        raise HarnessError(f"不支持的 Git 对象格式，不能移除：{object_format}")
+    for name, (mode, object_id) in tree.items():
+        path = repo / os.fsdecode(name)
+        for parent in path.parents:
+            if parent == repo:
+                break
+            if parent.is_symlink():
+                raise HarnessError(f"worktree 路径有符号链接祖先，不能移除：{os.fsdecode(name)}")
+        try:
+            metadata = path.lstat()
+            if mode == b"120000":
+                if not stat.S_ISLNK(metadata.st_mode):
+                    raise HarnessError(f"worktree 文件类型与 HEAD 不同，不能移除：{os.fsdecode(name)}")
+                data = os.fsencode(os.readlink(path))
+            else:
+                if (not stat.S_ISREG(metadata.st_mode)
+                        or bool(metadata.st_mode & 0o111) != (mode == b"100755")):
+                    raise HarnessError(f"worktree 文件类型或执行位与 HEAD 不同，不能移除：{os.fsdecode(name)}")
+                data = path.read_bytes()
+        except OSError as error:
+            raise HarnessError(f"worktree 已跟踪文件无法读取，不能移除：{os.fsdecode(name)}：{error}") from error
+        digest = hashlib.new(object_format, b"blob " + str(len(data)).encode("ascii") + b"\0" + data).hexdigest()
+        if digest.encode("ascii") != object_id:
+            raise HarnessError(f"worktree 文件内容与 HEAD 不同；请先保存或归档，不能移除：{os.fsdecode(name)}")
 
 
 def snapshot(repo: Path):
@@ -123,6 +206,7 @@ def path_matches(name: str, pattern: str) -> bool:
 def check_scope(repo: Path, allowed: list[str]):
     for pattern in allowed:
         validate_scope_pattern(pattern)
+    check_worktree_state(repo)
     paths = changed(repo)
     for path in paths:
         if path.split("/", 1)[0] in PROTECTED_ROOTS:

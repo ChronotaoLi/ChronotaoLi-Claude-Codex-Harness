@@ -21,7 +21,7 @@ from .util import HarnessError, dump, read_json, write_json
 
 def doctor(config):
     result = {"python": sys.version.split()[0], "models": config.data["roles"], "checks": {}}
-    for cli in ("codex", "claude"):
+    for cli in sorted({config.data["roles"][name]["cli"] for name in ("commander", "worker", "reviewer", "fable")}):
         if not shutil.which(cli):
             result["checks"][cli] = {"installed": False}
             continue
@@ -38,8 +38,8 @@ def doctor(config):
 
 def demo(config, live=False, commander="astra"):
     root = Path(tempfile.mkdtemp(prefix="personal-harness-smoke-" if live else "personal-harness-demo-"))
-    (root / ".gitignore").write_text(".harness/\n__pycache__/\n")
-    (root / "test_hello.py").write_text('import unittest\nfrom hello import greet\n\nclass TestGreet(unittest.TestCase):\n    def test_greet(self):\n        self.assertEqual(greet("Ada"), "Hello, Ada!")\n')
+    (root / ".gitignore").write_text(".harness/\n__pycache__/\n", encoding="utf-8")
+    (root / "test_hello.py").write_text('import unittest\nfrom hello import greet\n\nclass TestGreet(unittest.TestCase):\n    def test_greet(self):\n        self.assertEqual(greet("Ada"), "Hello, Ada!")\n', encoding="utf-8")
     git.git(root, "init", "-b", "main")
     git.git(root, "add", ".")
     git.git(root, "-c", "user.name=Harness Demo", "-c", "user.email=demo@localhost", "-c", "commit.gpgsign=false", "commit", "-m", "Demo fixture")
@@ -77,6 +77,20 @@ def read_ledger(path):
     return value
 
 
+def status_summary(run):
+    if not isinstance(run.get("accepted", {}), dict) or not isinstance(run.get("replan_stopped", {}), dict):
+        raise HarnessError("运行台账 accepted 或 replan_stopped 字段无效；使用 status --full 查看原始内容")
+    result = {key: run.get(key) for key in ("id", "status", "goal", "branch", "worktree", "current_task")}
+    result["accepted_tasks"] = list(run.get("accepted", {}))
+    result["budgets"] = {key: run.get(key) for key in
+                         ("attempts", "total_attempts", "agent_dispatches", "replan_attempts", "final_attempts")}
+    if run.get("error"):
+        result["error"] = str(run["error"]).splitlines()[0]
+    if run.get("replan_stopped"):
+        result["replan_stopped"] = {key: run["replan_stopped"].get(key) for key in ("target", "reason", "artifact")}
+    return result
+
+
 def _main(argv=None):
     parser = argparse.ArgumentParser(description="Personal Harness — fresh task agents, independent review")
     parser.add_argument("--config", default=str(Path(__file__).resolve().parent.parent / "harness.toml"))
@@ -97,8 +111,13 @@ def _main(argv=None):
     resume.add_argument("--approve-plan", action="store_true", help="批准等待确认的计划并继续")
     resume.add_argument("--step", action="store_true", help="最多接受一个任务后暂停")
     resume.add_argument("--reverify", action="store_true", help="在最终验收预算内重新执行失败的整体验证；不重抽审阅结论")
+    resume.add_argument("--retry-stopped", metavar="TASK_ID|final", help="显式重试已被指挥停止的规划请求，仍受累计预算约束")
     status = sub.add_parser("status")
     status.add_argument("run_id", nargs="?")
+    status.add_argument("--full", action="store_true", help="输出完整运行台账")
+    abandon = sub.add_parser("abandon", help="放弃运行并保留分支与证据")
+    abandon.add_argument("run_id")
+    abandon.add_argument("--remove-worktree", action="store_true", help="同时移除无未保存文件的隔离工作树；保留分支与运行证据")
     sync = sub.add_parser("sync", help="生成共用 MCP 的两种客户端配置，不覆盖个人配置")
     sync.add_argument("--role", choices=["commander", "worker", "reviewer"], default="worker")
     mem = sub.add_parser("memory")
@@ -116,6 +135,8 @@ def _main(argv=None):
     read.add_argument("id")
     msub.add_parser("export")
     args = parser.parse_args(argv)
+    if args.command == "status" and args.full and not args.run_id:
+        parser.error("status --full 需要 run_id")
     try:
         config = Config.load(args.config)
         if args.command == "doctor":
@@ -133,14 +154,19 @@ def _main(argv=None):
                                   pause_after_plan=args.pause_after_plan, step=args.step)
             print(dump({k: result[k] for k in ("id", "status", "branch", "worktree", "accepted")}))
         elif args.command == "resume":
+            options = {"retry_stopped": args.retry_stopped} if args.retry_stopped is not None else {}
             result = Engine(config, repo).resume(args.run_id, approve_plan=args.approve_plan, step=args.step,
-                                                reverify=args.reverify)
+                                                reverify=args.reverify, **options)
             print(dump({k: result[k] for k in ("id", "status", "branch", "worktree")}))
+        elif args.command == "abandon":
+            result = Engine(config, repo).abandon(args.run_id, remove_worktree=args.remove_worktree)
+            print(dump(status_summary(result)))
         elif args.command == "status":
             if args.run_id:
                 if not args.run_id.startswith("run_") or not args.run_id[4:].isalnum():
                     raise HarnessError("无效 run ID")
-                print(dump(read_ledger(state / "runs" / args.run_id / "state.json")))
+                ledger = read_ledger(state / "runs" / args.run_id / "state.json")
+                print(dump(ledger if args.full else status_summary(ledger)))
             else:
                 runs = []
                 for directory in sorted((state / "runs").glob("*/")):
@@ -163,7 +189,7 @@ def _main(argv=None):
             claude, codex = mcp_configs(config, state, args.role)
             folder = state / "generated" / args.role
             write_json(folder / "claude.mcp.json", claude)
-            (folder / "codex.mcp.toml").write_text("mcp_servers = " + toml_value(codex) + "\n")
+            (folder / "codex.mcp.toml").write_text("mcp_servers = " + toml_value(codex) + "\n", encoding="utf-8")
             print(str(folder))
         elif args.command == "memory":
             git.ignore_state(repo)
@@ -178,7 +204,7 @@ def _main(argv=None):
             else:
                 print(dump(memory.export()))
         return 0
-    except (HarnessError, OSError, ValueError, KeyError, subprocess.TimeoutExpired) as e:
+    except (HarnessError, OSError, ValueError, subprocess.TimeoutExpired) as e:
         print(f"harness: {e}", file=sys.stderr)
         return 1
     except sqlite3.Error as e:

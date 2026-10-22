@@ -84,6 +84,8 @@ class Memory:
             if "provenance" not in columns:
                 db.execute("ALTER TABLE memories ADD COLUMN provenance TEXT NOT NULL DEFAULT '{}'")
             db.execute("CREATE UNIQUE INDEX IF NOT EXISTS current_key ON memories(key) WHERE active=1")
+            db.execute("""CREATE TABLE IF NOT EXISTS memory_operations (
+                id TEXT PRIMARY KEY, request_digest TEXT NOT NULL, result TEXT NOT NULL)""")
 
     @contextmanager
     def connect(self):
@@ -119,13 +121,44 @@ class Memory:
                     json.dumps(provenance or {}, ensure_ascii=False)))
         return ident
 
+    @staticmethod
+    def _operation_digest(operation_id, request):
+        if not isinstance(operation_id, str) or not operation_id or len(operation_id) > 256:
+            raise HarnessError("记忆写入操作 ID 无效")
+        data = json.dumps(request, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
+        return hashlib.sha256(data.encode("utf-8")).hexdigest()
+
+    def _operation_result(self, db, operation_id, request):
+        if operation_id is None:
+            return None
+        digest = self._operation_digest(operation_id, request)
+        row = db.execute("SELECT request_digest,result FROM memory_operations WHERE id=?",
+                         (operation_id,)).fetchone()
+        if row:
+            if row["request_digest"] != digest:
+                raise HarnessError("记忆写入操作 ID 已绑定其他内容")
+            return json.loads(row["result"])
+        return None
+
+    def _complete_operation(self, db, operation_id, request, result):
+        if operation_id is not None:
+            db.execute("INSERT INTO memory_operations (id,request_digest,result) VALUES (?,?,?)",
+                       (operation_id, self._operation_digest(operation_id, request), json.dumps(result)))
+
     def remember(self, *, key, abstract, overview, detail, source, kind="operator", ttl_days=None,
-                 provenance=None):
+                 provenance=None, operation_id=None):
         self._validate_record(key, abstract, overview, detail, source, ttl_days)
+        record = dict(key=key, abstract=abstract, overview=overview, detail=detail,
+                      source=source, kind=kind, ttl_days=ttl_days, provenance=provenance)
+        request = {"method": "remember", **record}
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            return self._insert(db, key=key, abstract=abstract, overview=overview, detail=detail,
-                                source=source, kind=kind, ttl_days=ttl_days, provenance=provenance)
+            previous = self._operation_result(db, operation_id, request)
+            if previous is not None:
+                return previous
+            ident = self._insert(db, **record)
+            self._complete_operation(db, operation_id, request, ident)
+            return ident
 
     def _check_proposals(self, db, proposals, approved_keys, commit):
         if not isinstance(proposals, list):
@@ -173,13 +206,19 @@ class Memory:
         with self.connect() as db:
             return self._check_proposals(db, proposals, approved_keys, commit)
 
-    def remember_proposals(self, proposals, approved_keys, commit, run_id, task_id, ttl_days=180):
+    def remember_proposals(self, proposals, approved_keys, commit, run_id, task_id, ttl_days=180,
+                           *, operation_id=None):
         """Atomically promote only independently approved keys; preserve operator ownership."""
         self._validate_record("knowledge", "knowledge", "", "", "review", ttl_days)
         if commit is None:
             raise HarnessError("提升项目知识必须提供接受的提交")
+        request = {"method": "remember_proposals", "proposals": proposals, "approved_keys": approved_keys,
+                   "commit": commit, "run_id": run_id, "task_id": task_id, "ttl_days": ttl_days}
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            previous = self._operation_result(db, operation_id, request)
+            if previous is not None:
+                return previous
             approved = self._check_proposals(db, proposals, approved_keys, commit)
             identifiers = []
             for proposal in approved:
@@ -189,6 +228,7 @@ class Memory:
                     abstract=proposal["abstract"], overview=proposal["content"], detail=proposal["content"],
                     source=f"git:{commit};run:{run_id};task:{task_id}", kind="project_knowledge",
                     ttl_days=ttl_days, provenance=provenance))
+            self._complete_operation(db, operation_id, request, identifiers)
             return identifiers
 
     @staticmethod

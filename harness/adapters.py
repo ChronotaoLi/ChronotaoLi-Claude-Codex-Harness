@@ -67,7 +67,7 @@ class CLIBackend:
 
     def invoke(self, *, role, model, cwd, job, schema, prompt, run_path, on_start, task=None, kind=None):
         write_json(job / "schema.json", schema)
-        (job / "prompt.txt").write_text(prompt)
+        (job / "prompt.txt").write_text(prompt, encoding="utf-8")
         argv = self.command(role, model, cwd, job, schema, run_path)
         write_json(job / "command.json", argv)
         env = os.environ.copy()
@@ -111,7 +111,7 @@ class DemoBackend:
     def invoke(self, *, role, model, cwd, job, schema, prompt, run_path, on_start, task=None, kind=None):
         ids = {k: schema["properties"][k]["enum"][0] for k in ("task_id", "dispatch_id")}
         if role == "worker":
-            (cwd / "hello.py").write_text('def greet(name):\n    return f"Hello, {name}!"\n')
+            (cwd / "hello.py").write_text('def greet(name):\n    return f"Hello, {name}!"\n', encoding="utf-8")
             result = {"status": "completed", "summary": "Implemented greet", "evidence": ["hello.py"],
                       "blockers": [], "blocker_kind": "none", "proposed_memories": []}
         elif role == "reviewer":
@@ -126,5 +126,5 @@ class DemoBackend:
             result = {"selected_task": task["id"], "instruction": "Complete this one task and satisfy its acceptance criteria."}
         value = {**ids, **result}
         write_json(job / "response.json", value)
-        (job / "prompt.txt").write_text(prompt)
+        (job / "prompt.txt").write_text(prompt, encoding="utf-8")
         return value

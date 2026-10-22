@@ -22,6 +22,10 @@ for tool in TOOLS:
     tool["annotations"] = {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False}
 
 
+class MethodNotFound(HarnessError):
+    pass
+
+
 def handle(request, memory, skills, run):
     method, params = request.get("method"), request.get("params", {})
     if method == "initialize":
@@ -35,7 +39,7 @@ def handle(request, memory, skills, run):
     if method == "tools/list":
         return {"tools": TOOLS}
     if method != "tools/call":
-        raise HarnessError("Unknown method")
+        raise MethodNotFound(f"Unknown method: {method}")
     try:
         name, args = params["name"], params.get("arguments", {})
         if name == "memory_search":
@@ -78,5 +82,6 @@ def main():
             response = {"jsonrpc": "2.0", "id": request["id"], "result": result}
         except Exception as e:
             response = {"jsonrpc": "2.0", "id": request.get("id") if isinstance(request, dict) else None,
-                        "error": {"code": -32603, "message": str(e)}}
+                        "error": {"code": -32601 if isinstance(e, MethodNotFound) else -32603,
+                                  "message": str(e)}}
         print(json.dumps(response, ensure_ascii=False), flush=True)

@@ -46,12 +46,16 @@ class Engine:
     def worktree(self):
         return Path(self.run["worktree"])
 
+    def snapshot(self):
+        git.check_worktree_state(self.worktree)
+        return git.snapshot(self.worktree)
+
     def save(self):
         write_json(self.directory / "state.json", self.run)
 
     def event(self, event, **fields):
         record = {"time": time.time(), "event": event, "run_id": self.run["id"], **fields}
-        with (self.directory / "events.jsonl").open("a") as f:
+        with (self.directory / "events.jsonl").open("a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=True) + "\n")
         print(f"[harness] {event} {fields.get('task_id', '')}", flush=True)
 
@@ -65,7 +69,7 @@ class Engine:
                    "final_history": self.run["final_history"], "plan_revision": len(self.run["plan_history"]),
                    "next": "Resume the harness run; every dispatch creates a fresh agent process."}
         write_json(self.directory / "handoff.json", handoff)
-        (self.directory / "handoff.md").write_text("# Run handoff\n\n```json\n" + dump(handoff) + "\n```\n")
+        (self.directory / "handoff.md").write_text("# Run handoff\n\n```json\n" + dump(handoff) + "\n```\n", encoding="utf-8")
 
     def accepted_context(self):
         # Keep summaries bounded; accepted commits and artifact paths are never removed.
@@ -93,7 +97,7 @@ class Engine:
                   for command in self.config.data["verification"]["commands"]]
         required = {
             "role": "reviewer", "kind": "final_review", "task_id": "final", "dispatch_id": dispatch_id,
-            "rules": self.config.asset("rules").read_text(),
+            "rules": self.config.asset("rules").read_text(encoding="utf-8"),
             "role_skill": read_skill(self.config.asset("skills"), "harness-reviewer"),
             "output_constraints": output_constraints(envelope(REVIEW, "final", dispatch_id)),
             "packet": {"goal": self.run["goal"], **compact_plan(original_tasks, tasks),
@@ -167,26 +171,79 @@ class Engine:
 
     def finish_post_accept(self):
         pending = self.run.get("pending_post_accept")
-        if pending:
-            # A crash after hook success but before saving can retry the hook.
-            # Keep the accepted commit, and require this gate before any dispatch.
-            self.hooks.emit("post_accept", pending["payload"], Path(pending["logs"]))
-            self.run.pop("pending_post_accept")
+        if not pending:
+            return False
+        completion = pending["completion"]
+        payload = pending["payload"]
+        tid, commit = payload["task_id"], payload["commit"]
+        # These IDs are committed in the same SQLite transaction as the records.
+        # A crash after a successful write but before save must not create a version.
+        if not completion.get("task_memory_id"):
+            completion["task_memory_id"] = self.memory.remember(
+                **completion["task_memory"], operation_id=completion["id"] + ":task")
             self.save()
+        if completion["knowledge"]["status"] == "pending":
+            try:
+                identifiers = self.memory.remember_proposals(
+                    completion["proposals"], completion["approved_keys"], commit, self.run["id"], tid,
+                    completion["knowledge_ttl_days"], operation_id=completion["id"] + ":knowledge")
+            except HarnessError as error:
+                completion["knowledge"] = {"status": "discarded", "reason": str(error)}
+            else:
+                completion["knowledge"] = {"status": "promoted", "memory_ids": identifiers}
+            self.save()
+        if completion["knowledge"]["status"] == "discarded":
+            self.acceptance_event_once("memory_proposals_discarded", completion["id"] + ":discarded",
+                                       task_id=tid, reason=completion["knowledge"]["reason"])
+        self.acceptance_event_once("task_accepted", completion["id"], task_id=tid, commit=commit)
+        # A crash after hook success but before saving can retry the hook.
+        # Memory completion and this gate both precede any subsequent dispatch.
+        self.hooks.emit("post_accept", payload, Path(pending["logs"]))
+        self.run.pop("pending_post_accept")
+        self.save()
+        return True
+
+    def acceptance_event_once(self, event, event_id, **fields):
+        """Recover the event-append/state-save boundary using the stable acceptance ID."""
+        path = self.directory / "events.jsonl"
+        content = path.read_text(encoding="utf-8") if path.exists() else ""
+        for line in content.splitlines():
+            try:
+                record = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(record, dict) and record.get("event_id") == event_id:
+                return
+        if content and not content.endswith("\n"):
+            # Preserve a partial final append as evidence without joining the retry to it.
+            with path.open("a", encoding="utf-8") as stream:
+                stream.write("\n")
+        self.event(event, event_id=event_id, **fields)
 
     def dispatch(self, role, kind, task_id, schema, packet, task=None):
         # A format correction is a new process, never a provider-session resume.
         key = f"{role}:{kind}:{task_id}"
         previous_review = None
+        pending = self.run.setdefault("pending_format_corrections", {})
         guards = self.run.setdefault("review_corrections", {})
         guard = guards.get(key) if role == "reviewer" else None
+        candidate_digest = (snapshot_digest(self.snapshot())
+                            if guard or key in pending else None)
+        if key in pending:
+            if candidate_digest == pending[key]["snapshot_digest"]:
+                packet = {**packet, "format_correction": pending[key]["correction"]}
+            else:
+                pending.pop(key)
+                self.save()
         if guard:
-            if snapshot_digest(git.snapshot(self.worktree)) != guard["snapshot_digest"]:
+            if candidate_digest != guard["snapshot_digest"]:
                 guards.pop(key)
+                pending.pop(key, None)
+                self.save()
             else:
                 if guard.get("failed"):
                     raise HarnessError("审阅格式修复违反原审阅结论；同一快照禁止重复抽取结论")
-                previous_review = read_json(Path(guard["artifact"]))
+                previous_review = self.read_review_correction(guard)
                 previous_review = {k: v for k, v in previous_review.items() if k not in ("task_id", "dispatch_id")}
                 packet = {**packet, "format_correction": self.review_correction(guard, previous_review)}
         while True:
@@ -203,6 +260,8 @@ class Engine:
                 else:
                     result = self.dispatch_once(role, kind, task_id, schema, packet, task, previous_review)
                 self.ensure_exited()
+                if pending.pop(key, None) is not None:
+                    self.save()
                 return result
             except RepairableFormatError as error:
                 self.ensure_exited()
@@ -219,7 +278,9 @@ class Engine:
                     raise HarnessError("指挥已停止再规划；保留格式错误证据，不自动重派") from error
                 if role == "reviewer" and previous_review is None:
                     previous_review = {k: v for k, v in returned.items() if k not in ("task_id", "dispatch_id")}
-                    guard = {"artifact": str(self.directory / "dispatches" / previous["id"] / "returned-result.json"),
+                    artifact = self.directory / "dispatches" / previous["id"] / "returned-result.json"
+                    guard = {"artifact": str(artifact),
+                             "artifact_digest": receipt["artifact_digest"],
                              "snapshot_digest": previous["snapshot_digest"], "error": str(error)}
                     guards[key] = guard
                     self.save()
@@ -237,18 +298,27 @@ class Engine:
                         raise HarnessError(f"{task_id} 已达尝试次数上限；格式修复也计入预算") from error
                     if self.run["total_attempts"] >= self.config.data["runtime"]["max_total_attempts"]:
                         raise HarnessError("已达 run 总尝试次数上限；格式修复也计入预算") from error
-                    self.run["attempts"][task_id] += 1
-                    self.run["total_attempts"] += 1
-                repairs[key] = 1
                 correction = {"error": str(error), "previous_dispatch": previous["id"],
                               "artifact": str(self.directory / "dispatches" / previous["id"]),
                               "instruction": "Correct the reported output format using the current task and files. Recheck the evidence. Return only this dispatch's IDs; do not relax acceptance or discard blocking findings."}
                 if role == "reviewer":
                     correction = self.review_correction(guard, previous_review)
                 packet = {**packet, "format_correction": correction}
-                self.run["feedback"] = {**(self.run.get("feedback") or {}), "format_correction": correction}
+                pending[key] = {"correction": correction,
+                                "snapshot_digest": snapshot_digest(self.snapshot())}
                 self.save()
                 self.event("output_format_repair", task_id=task_id, role=role, previous_dispatch=previous["id"])
+
+    @staticmethod
+    def read_review_correction(guard):
+        artifact = Path(guard["artifact"])
+        try:
+            raw = artifact.read_bytes()
+        except OSError as error:
+            raise HarnessError("审阅修正的原始结果缺失或无法读取；保留证据，禁止重新抽取结论") from error
+        if hashlib.sha256(raw).hexdigest() != guard.get("artifact_digest"):
+            raise HarnessError("审阅修正的原始结果已改变；保留证据，禁止重新抽取结论")
+        return json.loads(raw)
 
     @staticmethod
     def review_correction(guard, previous_review):
@@ -268,7 +338,7 @@ class Engine:
         if digest != receipt["artifact_digest"]:
             raise HarnessError("审阅原始结果已改变；保留证据，禁止重新抽取结论")
         if (git.head(self.worktree) != self.run["expected_head"]
-                or snapshot_digest(git.snapshot(self.worktree)) != receipt["snapshot_digest"]):
+                or snapshot_digest(self.snapshot()) != receipt["snapshot_digest"]):
             raise HarnessError("审阅或 hook 修改了代码/HEAD；原审阅结果不能用于当前快照")
         result = read_json(artifact)
         contract = envelope(schema, entry["task_id"], entry["id"])
@@ -288,7 +358,7 @@ class Engine:
             logs = artifact.parent / f"post-agent-{receipt['hook_attempts']}"
             self.hooks.emit("post_agent", {**entry, "status": "completed", "result": result}, logs)
             if (git.head(self.worktree) != self.run["expected_head"]
-                    or snapshot_digest(git.snapshot(self.worktree)) != receipt["snapshot_digest"]):
+                    or snapshot_digest(self.snapshot()) != receipt["snapshot_digest"]):
                 raise HarnessError("reviewer hook 修改了代码；已停止，保留现场")
             receipt["hook_completed"] = True
         entry["status"] = "completed"
@@ -302,7 +372,7 @@ class Engine:
         job.mkdir(parents=True)
         contract = envelope(schema, task_id, dispatch_id)
         required = {"role": role, "kind": kind, "task_id": task_id, "dispatch_id": dispatch_id,
-                    "rules": self.config.asset("rules").read_text(),
+                    "rules": self.config.asset("rules").read_text(encoding="utf-8"),
                     "role_skill": read_skill(self.config.asset("skills"), "harness-" + role),
                     "packet": packet, "output_constraints": output_constraints(contract)}
         if role != "reviewer":
@@ -318,18 +388,29 @@ class Engine:
         entry = self.run["dispatches"][-1]
         self.save()
         self.event("dispatch_started", task_id=task_id, dispatch_id=dispatch_id, role=role)
-        self.hooks.emit("pre_agent", entry, job)
-        before = git.snapshot(self.worktree)
-        entry["snapshot_digest"] = snapshot_digest(before)
-
         def on_start(pgid):
             entry["pgid"] = pgid
             self.save()
 
         try:
+            self.hooks.emit("pre_agent", entry, job)
+            before = self.snapshot()
+            entry["snapshot_digest"] = snapshot_digest(before)
             if self.run["agent_dispatches"] >= self.config.data["runtime"]["max_agent_dispatches"]:
                 raise HarnessError("已达 run 模型派发次数上限；可显式增大 max_agent_dispatches 后恢复")
+            # Persist all invocation budgets together after local preparation.
+            # Provider failures still count, while context/hook/snapshot failures do not.
+            if role == "worker":
+                attempts = self.run["attempts"].get(task_id, 0)
+                if attempts >= self.config.data["runtime"]["max_attempts"]:
+                    raise HarnessError(f"{task_id} 已达尝试次数上限；格式修复也计入预算")
+                if self.run["total_attempts"] >= self.config.data["runtime"]["max_total_attempts"]:
+                    raise HarnessError("已达 run 总尝试次数上限；格式修复也计入预算")
+                self.run["attempts"][task_id] = attempts + 1
+                self.run["total_attempts"] += 1
             self.run["agent_dispatches"] += 1
+            if "format_correction" in packet:
+                self.run.setdefault("format_repairs", {})[f"{role}:{kind}:{task_id}"] = 1
             if role == "reviewer":
                 # Persist the identity and expected path before calling the model:
                 # a crash immediately after the atomic result write must not reroll.
@@ -351,7 +432,7 @@ class Engine:
                 return self.finish_review_receipt(key, schema, packet, previous_review)
             if git.head(self.worktree) != self.run["expected_head"]:
                 raise HarnessError("agent 修改了 Git HEAD；已停止，保留现场")
-            if role != "worker" and git.snapshot(self.worktree) != before:
+            if role != "worker" and self.snapshot() != before:
                 raise HarnessError(f"{role} 修改了代码；已停止，保留现场")
             if role == "worker":
                 git.check_scope(self.worktree, task["allowed_paths"])
@@ -375,7 +456,7 @@ class Engine:
             self.hooks.emit("post_agent", {**entry, "result": result}, job)
             if git.head(self.worktree) != self.run["expected_head"]:
                 raise HarnessError("agent hook 修改了 Git HEAD；已停止，保留现场")
-            if role != "worker" and git.snapshot(self.worktree) != before:
+            if role != "worker" and self.snapshot() != before:
                 raise HarnessError(f"{role} hook 修改了代码；已停止，保留现场")
             return {k: v for k, v in result.items() if k not in ("task_id", "dispatch_id")}
         except BaseException as error:
@@ -396,16 +477,17 @@ class Engine:
             raise HarnessError("目标仓库有未提交变更；请先保存提交，再创建隔离 worktree")
         if not self.config.data["verification"]["commands"]:
             raise HarnessError("请先配置目标项目的 verification.commands")
+        git.reject_submodules(self.repo)
         ident = uid("run")
         worktree = self.state / "worktrees" / ident
-        self.run = {"schema_version": 4, "id": ident, "repo": str(self.repo), "goal": goal, "status": "planning", "commander": self.commander,
+        self.run = {"schema_version": 5, "id": ident, "repo": str(self.repo), "goal": goal, "status": "planning", "commander": self.commander,
                     "branch": "harness/" + ident, "worktree": str(worktree), "tasks": [], "accepted": {}, "attempts": {},
                     "dispatches": [], "expected_head": git.head(self.repo), "feedback": None,
                     "config_path": str(self.config.path), "config_snapshot": deepcopy(self.config.data),
                     "asset_digest": asset_digest(self.config), "base_commit": git.head(self.repo), "original_tasks": [],
                     "total_attempts": 0, "replan_attempts": 0, "final_attempts": 0,
                     "review_history": {}, "final_history": [], "plan_history": [], "format_repairs": {},
-                    "review_corrections": {}, "review_receipts": {}, "agent_dispatches": 0,
+                    "review_corrections": {}, "review_receipts": {}, "pending_format_corrections": {}, "agent_dispatches": 0,
                     "plan_approval_required": pause_after_plan, "plan_approved": not pause_after_plan}
         self.directory.mkdir(parents=True)
         self.save()
@@ -418,19 +500,20 @@ class Engine:
             self.memory.repo = self.worktree
             return self.execute(plan, step=step)
 
-    def resume(self, ident, *, step=False, approve_plan=False, reverify=False):
+    def load_run(self, ident):
         if not ident.startswith("run_") or not ident[4:].isalnum():
             raise HarnessError("无效 run ID")
         self.run = read_json(self.state / "runs" / ident / "state.json")
         if not isinstance(self.run, dict):
             raise HarnessError("运行台账必须为对象")
-        if self.run.get("schema_version") != 4:
+        if self.run.get("schema_version") != 5:
             raise HarnessError("旧 run 状态格式无法安全恢复；请保留证据并使用原版本完成，或开始新 run")
         required = {"id": str, "repo": str, "worktree": str, "status": str, "commander": str,
                     "goal": str, "branch": str, "expected_head": str, "base_commit": str,
                     "config_snapshot": dict, "tasks": list, "original_tasks": list,
                     "accepted": dict, "attempts": dict, "dispatches": list,
                     "review_history": dict, "review_corrections": dict, "review_receipts": dict,
+                    "pending_format_corrections": dict,
                     "final_history": list, "plan_history": list, "format_repairs": dict,
                     "total_attempts": int, "agent_dispatches": int, "final_attempts": int,
                     "replan_attempts": int, "plan_approval_required": bool, "plan_approved": bool}
@@ -439,17 +522,75 @@ class Engine:
             raise HarnessError("运行台账字段缺失或类型无效；保留原文件并核对证据")
         if self.run["repo"] != str(self.repo):
             raise HarnessError("Run 属于另一个项目")
-        self.commander = self.run["commander"]
-        self.reverify_requested = reverify
-        changes = self.config.resume_changes(self.run["config_snapshot"])
-        if self.run.get("asset_digest") != asset_digest(self.config):
-            raise HarnessError("共享规则、skills、MCP 或 hooks 已改变；请恢复原版本后继续")
+
+    def abandon(self, ident, *, remove_worktree=False):
+        self.load_run(ident)
         with lock(self.directory / "run.lock"):
+            # Reload under the lock so a concurrent completion cannot be lost.
+            self.load_run(ident)
+            self.ensure_exited()
+            if self.run["status"] == "completed":
+                raise HarnessError("已完成的 run 不能标记为放弃")
+            removal_finished = False
+            if remove_worktree and not self.run.get("worktree_removed"):
+                expected = (self.state / "worktrees" / ident).resolve()
+                if self.worktree.resolve() != expected or self.worktree.is_symlink():
+                    raise HarnessError("只能移除该 run 所有的隔离 worktree")
+                if not self.worktree.exists() and self.run.get("pending_worktree_removal"):
+                    registered = {field.removeprefix("worktree ") for field in
+                                  git.git(self.repo, "worktree", "list", "--porcelain", "-z").split("\0")
+                                  if field.startswith("worktree ")}
+                    if str(self.worktree) in registered:
+                        raise HarnessError("工作树路径缺失但 Git 注册仍存在；请核对后再清理")
+                    removal_finished = True
+                else:
+                    if not (self.worktree / ".git").is_file():
+                        raise HarnessError("只能移除该 run 所有的隔离 worktree")
+                    if git.head(self.worktree) != self.run["expected_head"]:
+                        raise HarnessError("worktree HEAD 与检查点不同；保留工作树供核对")
+                    git.assert_removable_worktree(self.worktree)
+            if self.run["status"] != "abandoned":
+                self.run["status"] = "abandoned"
+                self.save()
+                self.checkpoint()
+                self.event("run_abandoned")
+            if remove_worktree and not self.run.get("worktree_removed"):
+                if not removal_finished:
+                    self.run["pending_worktree_removal"] = True
+                    self.save()
+                    git.git(self.repo, "worktree", "remove", str(self.worktree))
+                self.run["worktree_removed"] = True
+                self.run.pop("pending_worktree_removal", None)
+                self.save()
+                self.event("worktree_removed")
+            return self.run
+
+    def resume(self, ident, *, step=False, approve_plan=False, reverify=False, retry_stopped=None):
+        self.load_run(ident)
+        with lock(self.directory / "run.lock"):
+            self.load_run(ident)
+            if self.run["status"] == "abandoned":
+                raise HarnessError("该 run 已放弃；保留分支、工作树与证据，不能继续派发")
+            self.commander = self.run["commander"]
+            self.reverify_requested = reverify
+            changes = self.config.resume_changes(self.run["config_snapshot"])
+            if self.run.get("asset_digest") != asset_digest(self.config):
+                raise HarnessError("共享规则、skills、MCP 或 hooks 已改变；请恢复原版本后继续")
             if self.run["status"] == "completed":
                 return self.run
             self.ensure_exited()
             if git.head(self.worktree) != self.run["expected_head"]:
                 raise HarnessError("worktree HEAD 与检查点不同；请先核对提交，不自动重放")
+            if retry_stopped is not None:
+                stopped = self.run.get("replan_stopped")
+                if not stopped or stopped["target"] != retry_stopped:
+                    raise HarnessError("--retry-stopped 必须匹配已停止的任务 ID，或 final")
+                # Reopen the saved planning request, not another attempt by the
+                # already blocked worker. Preserve the original stop as evidence.
+                self.run["pending_replan"] = {"stage": "request", "trigger": deepcopy(stopped["trigger"])}
+                self.run.pop("replan_stopped")
+                self.save()
+                self.event("stopped_replan_retry_requested", target=retry_stopped, artifact=stopped["artifact"])
             self.memory.repo = self.worktree
             if changes:
                 self.run["config_snapshot"] = deepcopy(self.config.data)
@@ -470,7 +611,7 @@ class Engine:
     def verify(self, task_id, attempt, *, whole_run=False, artifact_dir=None):
         folder = Path(artifact_dir) if artifact_dir is not None else self.verification_directory(task_id, attempt, whole_run=whole_run)
         folder.mkdir(parents=True, exist_ok=True)
-        before = git.snapshot(self.worktree)
+        before = self.snapshot()
         self.hooks.emit("pre_verify", {"task_id": task_id, "worktree": str(self.worktree),
                                       "scope": "run" if whole_run else "task"}, folder)
         results = []
@@ -505,7 +646,7 @@ class Engine:
             write_json(folder / "results.json", results)
             self.ensure_exited()
         self.hooks.emit("post_verify", {"task_id": task_id, "results": results}, folder)
-        after = git.snapshot(self.worktree)
+        after = self.snapshot()
         if after != before:
             changes = git.snapshot_changes(before, after)
             write_json(folder / "file-changes.json", changes)
@@ -513,7 +654,9 @@ class Engine:
                 "verification_changes": {**changes, "artifact": str(folder / "file-changes.json")}}
             raise HarnessError("验证命令修改了待审阅文件；验证必须为只读检查。"
                                f"新增未跟踪文件：{changes['added']}；修改：{changes['modified']}；删除：{changes['deleted']}。"
-                               "请配置构建/测试输出位置或显式忽略生成产物；不自动豁免文件。")
+                               "请配置构建/测试输出位置或显式忽略生成产物；不自动豁免文件。"
+                               "运行中可在公共 Git 目录的 info/exclude 精确忽略新生成文件；"
+                               "这会改变后续快照可见范围，不豁免已跟踪文件，请先核对文件内容。")
         write_json(folder / "results.json", results)
         return results
 
@@ -538,7 +681,7 @@ class Engine:
         if final:
             if not git.clean(self.worktree):
                 raise HarnessError("整体审阅要求干净的已接受提交；请核对并清理未接受修改")
-            if snapshot_digest(git.snapshot(self.worktree)) != final["snapshot_digest"]:
+            if snapshot_digest(self.snapshot()) != final["snapshot_digest"]:
                 raise HarnessError("待再规划的整体审阅快照已变化；请核对检查点")
         if self.run["total_attempts"] >= self.config.data["runtime"]["max_total_attempts"]:
             raise HarnessError("已达 run 总尝试次数上限；不通过新增任务绕过预算")
@@ -572,6 +715,9 @@ class Engine:
         self.validate_tasks({"tasks": tasks})
         self.run["replan_attempts"] = attempt
         if result["action"] == "stop":
+            self.run["replan_stopped"] = {"target": trigger.get("task_id") or "final",
+                "trigger": deepcopy(trigger), "attempt": attempt, "artifact": str(artifact),
+                "reason": result["reason"]}
             self.run.pop("pending_replan", None)
             self.save()
             raise HarnessError(f"指挥停止重新规划：{result['reason']}")
@@ -594,6 +740,7 @@ class Engine:
                                             folder, self.state / "worktrees")
             self.event("replan_edits_archived", task_id=pending["trigger"].get("task_id"), artifact=archive)
         self.run["feedback"] = {"replan": pending["artifact"], "trigger": compact_feedback(pending["trigger"])}
+        self.run["pending_format_corrections"].clear()
         self.record_plan(pending["tasks"], pending["reason"], pending["trigger"], finish_replan=True)
         self.checkpoint()
         self.event("plan_revised", revision=len(self.run["plan_history"]) - 1)
@@ -636,8 +783,6 @@ class Engine:
         attempt = self.run["attempts"].get(tid, 0) + 1
         if attempt > self.config.data["runtime"]["max_attempts"]:
             raise HarnessError(f"{tid} 已达尝试次数上限")
-        self.run["attempts"][tid] = attempt
-        self.run["total_attempts"] += 1
         self.run["current_task"] = tid
         self.save()
         self.checkpoint()
@@ -659,7 +804,7 @@ class Engine:
             self.replan(deepcopy(self.run["feedback"]))
             return False
         self.run["pending_task"] = {"task_id": tid, "attempt": attempt, "stage": "verifying",
-            "snapshot_digest": snapshot_digest(git.snapshot(self.worktree)),
+            "snapshot_digest": snapshot_digest(self.snapshot()),
             "worker_result": result, "prior_reviews": prior_reviews, "verification_rounds": 0}
         self.save()
         return self.continue_task()
@@ -680,10 +825,12 @@ class Engine:
             raise HarnessError("任务恢复前 HEAD 与检查点不同；保留现场")
         paths = self.check_task_scope(task)
         key = f"reviewer:review:{tid}"
-        if snapshot_digest(git.snapshot(self.worktree)) != pending["snapshot_digest"]:
+        if snapshot_digest(self.snapshot()) != pending["snapshot_digest"]:
             self.run.pop("pending_task")
             self.run["review_receipts"].pop(key, None)
             self.run["review_corrections"].pop(key, None)
+            self.run["pending_format_corrections"].pop(key, None)
+            self.run["pending_format_corrections"].pop(f"worker:implement:{tid}", None)
             self.run["feedback"] = {"task_id": tid, "recovery": {
                 "error": "任务候选已变化；旧验证及审阅失效，重新执行任务",
                 "verification": pending.get("verification")}}
@@ -708,7 +855,7 @@ class Engine:
             evidence = folder / "change.diff"
             evidence.write_bytes(git.diff_bytes(self.worktree))
             snapshot_artifact = folder / "snapshot.json"
-            write_json(snapshot_artifact, git.snapshot(self.worktree))
+            write_json(snapshot_artifact, self.snapshot())
             try:
                 proposals = validate_proposals(pending["worker_result"]["proposed_memories"], self.worktree)
             except HarnessError as error:
@@ -764,7 +911,7 @@ class Engine:
         tid, attempt = pending["task_id"], pending["attempt"]
         task = next(task for task in self.run["tasks"] if task["id"] == tid)
         self.ensure_exited()
-        if snapshot_digest(git.snapshot(self.worktree)) != pending["snapshot_digest"]:
+        if snapshot_digest(self.snapshot()) != pending["snapshot_digest"]:
             self.run.pop("pending_acceptance")
             self.run["feedback"] = {"task_id": tid, "acceptance": {
                 "error": "待接受文件已变化，旧审阅失效；需要重新验证和独立审阅",
@@ -784,7 +931,7 @@ class Engine:
             self.run["feedback"] = {"task_id": tid, "pre_accept": detail}
             self.save()
             raise
-        if snapshot_digest(git.snapshot(self.worktree)) != pending["snapshot_digest"]:
+        if snapshot_digest(self.snapshot()) != pending["snapshot_digest"]:
             raise HarnessError("审阅后文件发生变化；禁止接受旧审阅结果")
         paths = git.check_scope(self.worktree, task["allowed_paths"])
         commit = git.accept(self.worktree, paths, self.run["id"], tid)
@@ -796,34 +943,55 @@ class Engine:
         self.run["feedback"] = None
         self.run["current_task"] = None
         self.run.pop("pending_acceptance")
-        self.run["pending_post_accept"] = {"payload": {"task_id": tid, **accepted},
-                                            "logs": str(self.directory / "hooks" / f"{tid}-{attempt}")}
+        detail = {"commit": commit, "summary": accepted["summary"], "summary_source": "reviewer",
+                  "changed_file_count": len(paths), "finding_count": len(pending["review"]["findings"]),
+                  "verification": accepted["verification"], "review_artifact": accepted["review_artifact"],
+                  "snapshot_artifact": pending["snapshot_artifact"]}
+        completion = {
+            "id": f"acceptance:{self.run['id']}:{tid}",
+            "task_memory": {"key": f"task:{self.run['id']}:{tid}", "abstract": task["title"][:500],
+                            "overview": accepted["summary"], "detail": dump(detail),
+                            "source": f"git:{commit};run:{self.run['id']}", "kind": "accepted_task",
+                            "ttl_days": self.config.data["memory"]["task_ttl_days"] or None},
+            "proposals": pending["proposals"], "approved_keys": pending["approved_keys"],
+            "knowledge_ttl_days": self.config.data["memory"]["knowledge_ttl_days"] or None,
+            "knowledge": {"status": "pending"},
+        }
+        self.run["pending_post_accept"] = {
+            "payload": {"task_id": tid, **accepted},
+            "logs": str(self.directory / "hooks" / f"{tid}-{attempt}"), "completion": completion}
         self.save()
-        self.memory.remember(key=f"task:{self.run['id']}:{tid}", abstract=task["title"][:500],
-                             overview=accepted["summary"], detail=dump(accepted),
-                             source=f"git:{commit};run:{self.run['id']}", kind="accepted_task",
-                             ttl_days=self.config.data["memory"]["task_ttl_days"] or None)
-        try:
-            self.memory.remember_proposals(pending["proposals"], pending["approved_keys"], commit, self.run["id"], tid,
-                                           self.config.data["memory"]["knowledge_ttl_days"] or None)
-        except HarnessError as error:
-            self.event("memory_proposals_discarded", task_id=tid, reason=str(error))
-        self.event("task_accepted", task_id=tid, commit=commit)
         self.finish_post_accept()
         self.checkpoint()
         return True
 
     def final_review(self, *, reverify=False):
+        git.check_worktree_state(self.worktree)
         if not git.clean(self.worktree):
             raise HarnessError("整体审阅要求干净的已接受提交；未接受的修改不能用于完成 run")
-        snapshot = git.snapshot(self.worktree)
+        snapshot = self.snapshot()
         if snapshot["head"] != self.run["expected_head"]:
             raise HarnessError("整体审阅前 HEAD 与检查点不同；保留现场")
         digest = snapshot_digest(snapshot)
         history = self.run["final_history"]
         same_snapshot = [item for item in history
                          if item["snapshot_digest"] == digest and item["head"] == snapshot["head"]]
-        if any(item["status"] == "rejected" for item in same_snapshot):
+        rejected = next((item for item in reversed(same_snapshot) if item["status"] == "rejected"), None)
+        if rejected:
+            # A corrective task can validly accept an empty diff. Its acceptance
+            # does not erase the earlier rejection; ask for another bounded plan
+            # once per newly accepted correction, without calling the reviewer.
+            handled = set(rejected.get("noop_corrections_handled", []))
+            corrections = set(self.run["accepted"]) - set(rejected["accepted_tasks"]) - handled
+            if corrections:
+                rejected["noop_corrections_handled"] = sorted(handled | corrections)
+                trigger = {"final_review": deepcopy(rejected), "unchanged_corrections": sorted(corrections),
+                           "reason": "已接受的修正任务未改变被拒绝的代码快照，需要新的修正计划"}
+                self.run["feedback"] = deepcopy(trigger)
+                self.run["pending_replan"] = {"stage": "pending", "trigger": trigger}
+                self.save()
+                self.replan(trigger)
+                return False
             raise HarnessError("整体审阅已拒绝同一代码快照；必须先通过修正任务，不能恢复后重复抽取审阅")
         if any(item["status"] == "approved" for item in same_snapshot):
             # Approval is persisted only after all validation and snapshot gates.
@@ -842,6 +1010,7 @@ class Engine:
             folder = self.verification_directory("final", attempt, whole_run=True)
             snapshot_artifact = folder / "snapshot.json"
             record = {"attempt": attempt, "head": self.run["expected_head"], "snapshot_digest": digest,
+                      "accepted_tasks": sorted(self.run["accepted"]),
                       "snapshot_artifact": str(snapshot_artifact), "phase": "verifying",
                       "verification_rounds": [], "status": "running", "artifact": str(folder / "final.json")}
             history.append(record)
@@ -868,7 +1037,7 @@ class Engine:
             rounds.append(round_record)
             self.save()
             checks = self.verify("final", attempt, whole_run=True, artifact_dir=verification_folder)
-            if git.snapshot(self.worktree) != snapshot:
+            if self.snapshot() != snapshot:
                 raise HarnessError("整体验证后文件发生变化；禁止使用旧验证结果")
             evidence = folder / "change.diff"
             evidence.write_bytes(git.range_diff_bytes(self.worktree, self.run["base_commit"]))
@@ -898,7 +1067,7 @@ class Engine:
                                                         if item["status"] != "running"]),
                       "instruction": FINAL_REVIEW_INSTRUCTION})
             validate_review(review)
-            if git.snapshot(self.worktree) != snapshot:
+            if self.snapshot() != snapshot:
                 raise HarnessError("整体审阅后文件发生变化；禁止完成 run")
             record.update(review=review, phase="finished", status="approved" if review_approved(review) else "rejected")
             self.run["review_corrections"].pop("reviewer:final_review:final", None)
@@ -910,7 +1079,7 @@ class Engine:
                 self.run["pending_replan"] = {"stage": "pending", "trigger": deepcopy(self.run["feedback"])}
         write_json(folder / "final.json", record)
         self.save()
-        if git.snapshot(self.worktree) != snapshot:
+        if self.snapshot() != snapshot:
             raise HarnessError("整体审阅后文件发生变化；禁止完成 run")
         if record["status"] == "approved":
             return True
@@ -928,6 +1097,10 @@ class Engine:
 
     def execute(self, supplied_plan=None, *, step=False):
         try:
+            stopped = self.run.get("replan_stopped")
+            if stopped:
+                raise HarnessError(f"指挥停止重新规划：{stopped['reason']}；"
+                                   f"显式使用 resume --retry-stopped {stopped['target']} 可重试保存的规划请求")
             if not self.run["tasks"]:
                 plan = supplied_plan or self.dispatch("commander", "plan", "planning", PLAN,
                          {"goal": self.run["goal"], "instruction": "Inspect the repository, then decompose the goal into bounded tasks. Each worker does one task. Use real dependencies and observable acceptance. Never change files.",
@@ -949,8 +1122,7 @@ class Engine:
             self.run.pop("error", None)
             self.run.pop("error_type", None)
             self.save()
-            accepted_this_call = 0
-            self.finish_post_accept()
+            accepted_this_call = int(self.finish_post_accept())
             if self.run.get("pending_acceptance"):
                 if self.accept_pending():
                     accepted_this_call += 1
@@ -959,7 +1131,7 @@ class Engine:
                 final = pending.get("trigger", {}).get("final_review", {})
                 if (getattr(self, "reverify_requested", False) and pending["stage"] in ("pending", "request")
                         and final.get("status") == "verification_failed"
-                        and snapshot_digest(git.snapshot(self.worktree)) == final.get("snapshot_digest")):
+                        and snapshot_digest(self.snapshot()) == final.get("snapshot_digest")):
                     self.run.pop("pending_replan")
                     self.event("unvalidated_replan_cancelled_for_reverification", trigger=deepcopy(pending))
                     self.save()

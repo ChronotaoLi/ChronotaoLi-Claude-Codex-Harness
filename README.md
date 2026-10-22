@@ -35,7 +35,7 @@ python3 -m harness demo
 python3 -m unittest discover -s tests -v
 ```
 
-`doctor` 只检查安装和登录，不请求模型；`demo` 用模拟 agent 跑真实 Git、测试、提交、记忆和交接流程，在临时目录留下可检查的结果。它不证明真实模型调用成功。
+`doctor` 只检查配置中使用的 CLI 安装和登录，不请求模型；`demo` 用模拟 agent 跑真实 Git、测试、提交、记忆和交接流程，在临时目录留下可检查的结果。它不证明真实模型调用成功。
 
 真实模型的最小联调会消耗你现有账号的额度：
 
@@ -50,7 +50,7 @@ python3 -m harness smoke --commander fable
 ## 对自己的项目执行任务
 
 1. 为目标项目准备配置文件，设置真正需要的 `verification.commands`，并在运行时显式传入 `--config`。每条命令是 argv 数组，不经 shell 解释。例如 Python 项目可以使用 `["uv", "run", "pytest"]`，Node 项目可以使用 `["npm", "test", "--", "--run"]`。依赖需要在 worktree 中可用；覆盖率、构建等生成产物应配置到已忽略或工作树之外的位置，验证期间出现未忽略的新文件也会触发快照门禁。
-2. 目标项目必须有 Git 提交，且工作区干净。编排器不会替你 stash 尚未提交的工作。
+2. 目标项目必须有 Git 提交，且工作区干净。编排器不会替你 stash 尚未提交的工作。当前不支持 submodule；索引中存在 gitlink 时会在创建 worktree 和派发模型之前报错。
 3. 在本 Harness 仓库目录运行：
 
 ```bash
@@ -78,8 +78,13 @@ python3 -m harness --config /path/to/harness.toml --repo /path/to/project resume
 ```bash
 python3 -m harness --repo /path/to/project status
 python3 -m harness --repo /path/to/project status run_实际ID
+python3 -m harness --repo /path/to/project status run_实际ID --full
 python3 -m harness --config /path/to/harness.toml --repo /path/to/project resume run_实际ID
 ```
+
+`status <run_id>` 默认显示状态、任务、预算和最后错误首行；`--full` 输出完整台账。需要结束未完成运行时使用 `abandon <run_id>`，保留分支、工作树和证据，并禁止继续恢复。可追加 `--remove-worktree` 移除该 run 的干净工作树；进程仍存活、HEAD 不符或有任何未保存文件（包括忽略文件）时拒绝移除，不使用强制删除。
+
+移除前还独立核对已跟踪文件的字节与 HEAD，并拒绝 `assume-unchanged`、`skip-worktree` 标记。换行转换或 clean/smudge 过滤导致工作树字节不同，也会保守拒绝；此时可只放弃运行并保留工作树。
 
 `resume` 使用已有台账、代码现场和新的 agent 继续，不恢复供应商会话。任务、总 worker、模型派发、有效再规划和最终验收次数均不会因恢复而清零。可以调大 `context_chars`、两种超时、`claude_max_turns`、`max_attempts`、`max_total_attempts`、`max_agent_dispatches`、`max_replans` 和 `max_final_attempts` 后恢复；也可以在 `permissions.worker_commands` 中追加精确 argv，但不能删除或修改已有授权。变更写入事件，其余配置和共享资源必须一致。旧进程组仍存活、无法确认其退出，或 Git HEAD 与检查点不一致时停止恢复。账号授权、模型权限和其他 CLI 故障直接报错，不自动换模型或进行通用瞬时故障重试。
 
@@ -87,16 +92,20 @@ worker 完成后保存验证阶段；验证通过后保存待审阅阶段及快�
 
 整体验收也保存验证和审阅阶段；中断继续同一次最终尝试。最终验证全部失败项都是超时时，修复环境或增加超时后普通 `resume` 可重验；普通非零退出进入修正规划，操作者确认需要重验同一快照时使用 `resume <run_id> --reverify`。重验消耗新的最终尝试，并保留失败证据；该选项只能取消尚未校验的验证失败修正规划，不能跳过已校验修订或重抽模型拒绝结论。预算耗尽时保留待再规划意图，增加预算后继续修正规划。
 
-当前运行台账为版本 4，旧版台账可通过 `status` 查看，不能直接恢复执行；请用旧版本完成旧 run，或从核对后的代码开始新 run。列出状态时，损坏或缺失的台账会产生诊断，不会阻止查看其他运行。
+当前运行台账为版本 5，旧版台账可通过 `status` 查看，不能直接恢复执行；请用旧版本完成旧 run，或从核对后的代码开始新 run。列出状态时，损坏或缺失的台账会产生诊断，不会阻止查看其他运行。
 
 任务因缺少前置工作而返回 `blocker_kind=task` 时，指挥可进行有限再规划；权限、工具、账号或服务问题使用 `environment` 并停止。指挥仅返回 `new_tasks` 和 `updates` 增量操作，运行时保留已有任务的 ID、验收条件、文件范围及依赖；更新只能改进未接受任务的描述并增加依赖，已接受任务完全不变。新任务必须复用既有范围模式。已校验的修订先保存，再归档未接受修改并恢复到最后接受的提交；归档中断后的恢复继续应用该修订，不再请求模型或增加再规划次数。
 
+指挥明确 `stop` 后保存停止原因和原规划请求，普通 `resume` 不派发模型。操作者决定重试时使用 `resume <run_id> --retry-stopped <task_id>`，整体验收的停止使用 `--retry-stopped final`。该选项重新请求规划，保留原停止证据，仍消耗累计再规划与派发预算。整体拒绝后，若修正任务接受了空 diff，运行时保留原拒绝并再次请求受预算约束的修正规划，不对同一快照重抽审阅。
+
 `max_attempts` 是每任务累计上限，`max_total_attempts` 是整个 run 的 worker 上限。`max_replans` 计入通过完整校验的指挥再规划结果（包括明确停止），请求故障不扣除它；独立的 `max_agent_dispatches` 默认 200，限制所有角色的模型调用，包括失败和格式修正调用。`max_final_attempts` 默认 3，限制整体验证与审阅尝试；未完成阶段恢复复用当前尝试，重新验证已失败的最终检查则消耗新尝试。达到上限不会通过改名刷新预算。
+
+worker 尝试与模型派发在上下文、派发前 hook、快照及预算检查成功后，调用后端前一起持久化。本地准备失败不消耗这些额度；后端调用失败仍计数。格式修正走同一个计数入口。
 
 ## “一个 agent 只做一件事”如何落实
 
 - 每次调用生成唯一 `dispatch_id`，返回结果必须同时匹配它和 `task_id`。
-- 输入包的 `output_constraints` 从本地契约生成，列出长度、数量、非空、唯一性及标识符格式限制。仅这些格式限制失败时，每个角色／调用类型／任务组合最多自动修复一次，使用新进程和新 dispatch；worker 修复计入任务及总尝试预算。已报告 blocker 的 worker 不自动重派；reviewer 修复不能改变原结论、findings 或证据。身份、结构、语义、越界和 CLI 错误直接停止。
+- 输入包的 `output_constraints` 从本地契约生成，列出长度、数量、非空、唯一性及标识符格式限制。仅这些格式限制失败时，每个角色／调用类型／任务组合在整个 run 内最多自动修复一次，不因新尝试或新快照恢复额度；使用新进程和新 dispatch，worker 修复计入任务及总尝试预算。格式修正状态独立保存，不混入其他角色的任务反馈。计划的现有格式边界由规划校验作为硬错误拒绝。已报告 blocker 的 worker 不自动重派；reviewer 修复不能改变原结论、findings 或证据，原始修正依据绑定内容摘要。身份、结构、语义、越界和 CLI 错误直接停止。
 - Claude 使用 `--no-session-persistence`，Codex 使用 `--ephemeral`，没有 resume/continue。
 - 禁用原生子 agent；指挥通过结构化计划交给调度器启动执行者。
 - 返工使用新进程，得到同一任务、验收条件和必要的失败反馈。
@@ -152,6 +161,8 @@ python3 -m harness sync --role worker
 
 `post_accept` 失败时保留已接受提交及待完成的 hook；恢复会先重试该 hook，成功前不能执行下一个任务或完成 run。hook 在成功后、检查点写入前中断时可能再次执行，需要将外部副作用写成可重复执行的操作。
 
+任务记忆、获批知识提案及接受事件也有持久待办，在 `post_accept` 之前完成。SQLite 故障后恢复补写；稳定操作 ID 与内容摘要防止写入成功后中断造成重复版本，接受事件使用稳定 ID 去重。任务记忆只保存有界摘要和完整审阅产物引用。恢复补完一项待接受后续工作也计入 `--step` 的一个任务边界。
+
 共享资产摘要按规则、skill 名称、MCP 和 hooks 的逻辑身份及内容计算，字节一致的 Harness 安装可以搬迁；目标项目与运行状态路径仍须保持一致。摘要不会递归追踪任意 hook 命令引用的脚本或依赖。操作者仍需保证这些外部内容在恢复时保持一致。
 
 Claude worker 显式允许读写工具、部分读取命令和配置的验证命令。Claude 指挥与审阅角色也可使用受限的 Git 查询命令；输入包列出可用命令示例。额外的 worker 命令通过配置声明为完整 argv：
@@ -162,6 +173,8 @@ worker_commands = [["python3", "-m", "unittest", "tests.test_export", "-v"]]
 ```
 
 额外命令不接受 `*` 或换行。需要删除或移动文件时，可显式配置包含具体路径的 `rm` / `mv` argv；默认不授予这些命令。验证 argv 中的字面 `*` 仍可由确定性验证器执行，但不转成 Bash 授权，以免被 CLI 解释为权限通配符。不使用跳过所有权限检查的参数；CLI 自身仍可能允许内建只读命令，这些授权不是操作系统沙箱。必要命令被拒绝时，worker 应报告环境 blocker。当前 Codex 适配器只提供只读模式，因此配置 Codex worker 会提前报错。目标项目的原生规则与 CLI 自动加载内容仍可能影响模型，32,000 字符预算仅覆盖编排器生成的输入包。
+
+两种只读角色的调用方式不同：Claude 通过工具许可限制可用写入工具和命令，Codex 调用显式传入 `--sandbox read-only`。这些配置不承诺工作树之外的读取隔离；需要更强隔离时使用专用 OS 用户或容器。
 
 ## 记忆与压缩
 
@@ -218,6 +231,12 @@ python3 -m harness --repo /path/to/project memory export > memory-backup.json
 ```
 
 运行时只把 `/.harness/` 加入目标项目的本地 `.git/info/exclude`，不更改其已跟踪 `.gitignore`。日志可能包含代码和业务内容，按你的项目数据要求保管。
+
+隔离工作树内部不允许创建 `.harness` 文件、目录或符号链接，即使 Git 忽略该路径，任务范围和运行时快照检查仍会拒绝它。目标项目根目录的真实 `.harness/` 状态目录不受此限制。
+
+若验证中途产生未忽略的新文件，可在核对内容后，通过 `git rev-parse --git-common-dir` 定位公共 Git 目录，在其 `info/exclude` 中加入精确生成产物模式，再恢复。linked worktree 共用该文件；这会改变后续快照可见范围，不豁免已跟踪文件，不能用宽泛模式掩盖待交付代码。
+
+结构非法的审阅仍保留原始产物并停止，不提供通用丢弃审阅选项：多出一个字段的结果也可能包含明确拒绝和阻断证据。普通恢复、重验或重试停止规划均不能跳过此检查；需要结束运行时保留证据并使用 `abandon`。
 
 超时会停止该次调用的进程组；验证超时还会保存 `timed_out`、退出码 124 和日志。缺少 CLI、无效供应商输出和其他运行错误进入 blocked，Ctrl+C、SIGTERM 和终端 SIGHUP 进入 interrupted，清理子进程组并保留检查点。角色调用故障单独记入 `last_runtime_error`，不作为无关 worker 的返工反馈。若进程在 Git commit 与检查点写入之间被强制杀死，恢复会因 HEAD 不一致而拒绝自动重放；先核对包含 `Harness-Run` / `Harness-Task` 的提交。首版不提供自动“修复”状态文件的危险捷径。
 
