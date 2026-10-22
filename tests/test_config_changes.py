@@ -97,13 +97,11 @@ class ConfigChangesTests(unittest.TestCase):
             with self.subTest(key=key), self.assertRaisesRegex(HarnessError, "只能保持或增大"):
                 config.resume_changes(snapshot)
 
-    def test_resume_rejects_model_permissions_acceptance_and_other_config_changes(self):
+    def test_resume_rejects_model_acceptance_and_other_fixed_config_changes(self):
         mutations = [
             ("roles", "reviewer", "model", "configured-other-model"),
             ("roles", "reviewer", "effort", "low"),
             ("runtime", "max_tasks", 21),
-            ("runtime", "max_replans", 3),
-            ("permissions", "worker_commands", [["npm", "run", "build"]]),
             ("verification", "commands", [["true"]]),
             ("shared", "rules", "different-rules.md"),
             ("memory", "task_ttl_days", 365),

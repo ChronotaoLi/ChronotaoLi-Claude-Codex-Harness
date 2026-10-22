@@ -12,12 +12,16 @@ from .util import HarnessError, ProcessTimeout, read_json, run_process
 
 
 def asset_digest(config):
-    digest = hashlib.sha256()
-    files = [config.asset(key) for key in ("rules", "mcp", "hooks")]
-    files += sorted(config.asset("skills").glob("*/SKILL.md"))
-    for path in files:
-        digest.update(str(path).encode())
-        digest.update(path.read_bytes())
+    # Logical identities keep a byte-identical installation portable; framing
+    # binds each identity to its bytes without ambiguous concatenation.
+    digest = hashlib.sha256(b"personal-harness/shared-assets/v2\0")
+    files = [(key, config.asset(key)) for key in ("rules", "mcp", "hooks")]
+    files += [(f"skills/{path.parent.name}/SKILL.md", path)
+              for path in sorted(config.asset("skills").glob("*/SKILL.md"))]
+    for identity, path in files:
+        for value in (identity.encode("utf-8"), path.read_bytes()):
+            digest.update(len(value).to_bytes(8, "big"))
+            digest.update(value)
     return digest.hexdigest()
 
 

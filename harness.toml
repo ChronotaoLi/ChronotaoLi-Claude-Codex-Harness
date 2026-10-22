@@ -24,6 +24,7 @@ verify_timeout_seconds = 300
 max_attempts = 3
 max_final_attempts = 3
 max_total_attempts = 60
+max_agent_dispatches = 200
 max_replans = 2
 max_tasks = 20
 context_chars = 32000

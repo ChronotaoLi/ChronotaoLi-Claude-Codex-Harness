@@ -1,5 +1,6 @@
 import copy
 import tomllib
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -10,6 +11,7 @@ DEFAULTS = {
     "runtime": {
         "agent_timeout_seconds": 1200, "verify_timeout_seconds": 300,
         "max_attempts": 3, "max_final_attempts": 3, "max_total_attempts": 60, "max_replans": 2,
+        "max_agent_dispatches": 200,
         "max_tasks": 20, "context_chars": 32000, "claude_max_turns": 50,
     },
     "permissions": {"worker_commands": []},
@@ -19,6 +21,7 @@ DEFAULTS = {
 RESUME_INCREASES = (
     "agent_timeout_seconds", "verify_timeout_seconds", "context_chars",
     "claude_max_turns", "max_attempts", "max_final_attempts", "max_total_attempts",
+    "max_replans", "max_agent_dispatches",
 )
 
 # Arguments may be appended only after --, where they cannot enable Git's
@@ -102,7 +105,7 @@ class Config:
         validate_commands(data["permissions"]["worker_commands"], "permissions.worker_commands", exact_permissions=True)
 
     def resume_changes(self, snapshot):
-        """Return permitted budget increases without mutating either snapshot."""
+        """Return budget increases and exact command grants without mutating inputs."""
         previous, current = normalized(snapshot), normalized(self.data)
         self.validate(previous)
         self.validate(current)
@@ -113,8 +116,22 @@ class Config:
                 raise HarnessError(f"配置已改变：恢复时 runtime.{key} 只能保持或增大（{old} → {new}）")
             if new != old:
                 changes[key] = {"old": old, "new": new}
+        old_commands = previous["permissions"].pop("worker_commands")
+        new_commands = current["permissions"].pop("worker_commands")
+        remaining = Counter(tuple(command) for command in old_commands)
+        added = []
+        for command in new_commands:
+            exact = tuple(command)
+            if remaining[exact]:
+                remaining[exact] -= 1
+            else:
+                added.append(command)
+        if any(remaining.values()):
+            raise HarnessError("配置已改变：恢复时 permissions.worker_commands 只允许增加精确 argv，不能删除或修改已有命令")
+        if added:
+            changes["worker_commands"] = {"old": old_commands, "new": new_commands, "added": added}
         if previous != current:
-            raise HarnessError("配置已改变：恢复只允许增大超时、上下文、轮数和尝试预算；其他配置必须保持一致")
+            raise HarnessError("配置已改变：恢复只允许增大超时、上下文、轮数和尝试预算或追加精确 worker 命令；其他配置必须保持一致")
         return changes
 
     @staticmethod

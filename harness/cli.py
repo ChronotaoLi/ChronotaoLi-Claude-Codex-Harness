@@ -4,6 +4,7 @@ import argparse
 import copy
 import shutil
 import signal
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -58,7 +59,25 @@ def main(argv=None):
     def interrupted(signum, frame):
         raise KeyboardInterrupt()
 
-    signal.signal(signal.SIGTERM, interrupted)
+    previous = {}
+    try:
+        for name in ("SIGTERM", "SIGHUP"):
+            if signum := getattr(signal, name, None):
+                previous[signum] = signal.signal(signum, interrupted)
+        return _main(argv)
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
+
+
+def read_ledger(path):
+    value = read_json(path)
+    if not isinstance(value, dict):
+        raise HarnessError(f"运行台账必须为对象：{path}")
+    return value
+
+
+def _main(argv=None):
     parser = argparse.ArgumentParser(description="Personal Harness — fresh task agents, independent review")
     parser.add_argument("--config", default=str(Path(__file__).resolve().parent.parent / "harness.toml"))
     parser.add_argument("--repo", type=Path, default=Path.cwd())
@@ -77,6 +96,7 @@ def main(argv=None):
     resume.add_argument("run_id")
     resume.add_argument("--approve-plan", action="store_true", help="批准等待确认的计划并继续")
     resume.add_argument("--step", action="store_true", help="最多接受一个任务后暂停")
+    resume.add_argument("--reverify", action="store_true", help="在最终验收预算内重新执行失败的整体验证；不重抽审阅结论")
     status = sub.add_parser("status")
     status.add_argument("run_id", nargs="?")
     sync = sub.add_parser("sync", help="生成共用 MCP 的两种客户端配置，不覆盖个人配置")
@@ -113,22 +133,21 @@ def main(argv=None):
                                   pause_after_plan=args.pause_after_plan, step=args.step)
             print(dump({k: result[k] for k in ("id", "status", "branch", "worktree", "accepted")}))
         elif args.command == "resume":
-            result = Engine(config, repo).resume(args.run_id, approve_plan=args.approve_plan, step=args.step)
+            result = Engine(config, repo).resume(args.run_id, approve_plan=args.approve_plan, step=args.step,
+                                                reverify=args.reverify)
             print(dump({k: result[k] for k in ("id", "status", "branch", "worktree")}))
         elif args.command == "status":
             if args.run_id:
                 if not args.run_id.startswith("run_") or not args.run_id[4:].isalnum():
                     raise HarnessError("无效 run ID")
-                print(dump(read_json(state / "runs" / args.run_id / "state.json")))
+                print(dump(read_ledger(state / "runs" / args.run_id / "state.json")))
             else:
                 runs = []
                 for directory in sorted((state / "runs").glob("*/")):
                     path = directory / "state.json"
                     try:
-                        run = read_json(path)
-                        if not isinstance(run, dict):
-                            raise ValueError("运行台账必须为对象")
-                    except (OSError, ValueError) as e:
+                        run = read_ledger(path)
+                    except (HarnessError, OSError, ValueError) as e:
                         print(f"harness: 跳过无法读取的运行台账 {path}：{e}", file=sys.stderr)
                         continue
                     fields = ("id", "status", "goal", "branch")
@@ -161,6 +180,11 @@ def main(argv=None):
         return 0
     except (HarnessError, OSError, ValueError, KeyError, subprocess.TimeoutExpired) as e:
         print(f"harness: {e}", file=sys.stderr)
+        return 1
+    except sqlite3.Error as e:
+        if isinstance(e, (sqlite3.ProgrammingError, sqlite3.InterfaceError)):
+            raise
+        print(f"harness: SQLite 记忆数据库错误：{e}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
         print("harness: 已中断；运行状态和 worktree 已保留", file=sys.stderr)

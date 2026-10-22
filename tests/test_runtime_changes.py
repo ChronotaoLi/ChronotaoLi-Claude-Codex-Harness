@@ -279,7 +279,7 @@ class RuntimeChangesTests(RepoCase):
         self.assertEqual(resumed["status"], "completed")
         self.assertEqual(backend.calls[0]["kind"], "replan")
         self.assertEqual(resumed["final_attempts"], 2)
-        self.assertEqual(resumed["replan_attempts"], 2)
+        self.assertEqual(resumed["replan_attempts"], 1)
         self.assertNotIn("pending_replan", resumed)
 
     def test_applied_revision_checkpoint_clears_old_task_cursor(self):

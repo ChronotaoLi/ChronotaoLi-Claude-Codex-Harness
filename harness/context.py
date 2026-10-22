@@ -3,6 +3,62 @@ from copy import deepcopy
 from .util import HarnessError, dump
 
 
+FINAL_REVIEW_INSTRUCTION = (
+    "Independently review the complete base-to-HEAD result against the immutable original user goal "
+    "and original acceptance requirements. Check cross-task integration, omissions and regressions. "
+    "Task approvals are evidence, not proof of whole-run completion. Separate blocking defects "
+    "from advisory preferences; approved_memory_keys must be empty. Do not edit files."
+)
+
+
+def compact_plan(original_tasks, tasks):
+    """Represent the current plan as a lossless delta from original obligations."""
+    result = {"original_tasks": deepcopy(original_tasks)}
+    if tasks == original_tasks:
+        return {**result, "tasks_ref": "original_tasks"}
+    original = {task["id"]: task for task in original_tasks}
+    # Runtime revisions append tasks and only refine descriptions/add dependencies.
+    # Fail closed if the persisted plan cannot be represented by that contract.
+    if [task["id"] for task in tasks[:len(original_tasks)]] != list(original):
+        raise HarnessError("当前计划无法无损表示：原始任务被移除或重排")
+    updates = []
+    for task in tasks[:len(original_tasks)]:
+        before = original[task["id"]]
+        immutable = set(before) - {"description", "depends_on"}
+        if (set(task) != set(before) or any(task[key] != before[key] for key in immutable)
+                or task["depends_on"][:len(before["depends_on"])] != before["depends_on"]):
+            raise HarnessError("当前计划无法无损表示：原始任务约束已改变")
+        update = {"id": task["id"]}
+        if task["description"] != before["description"]:
+            update["description"] = task["description"]
+        added = task["depends_on"][len(before["depends_on"]):]
+        if added:
+            update["add_depends_on"] = deepcopy(added)
+        if len(update) > 1:
+            updates.append(update)
+    result.update(
+        tasks_base_ref="original_tasks",
+        tasks_delta={"updates": updates, "new_tasks": deepcopy(tasks[len(original_tasks):])},
+        tasks_reconstruction=(
+            "The current tasks are original_tasks plus tasks_delta. Copy the original list; "
+            "apply updates by id, replacing description only when supplied and appending "
+            "add_depends_on; then append new_tasks in order. Omitted fields retain their "
+            "original values. All original acceptance, scope, skills and dependencies remain binding."
+        ),
+    )
+    return result
+
+
+def capacity_report(required, projected, budget):
+    """Distinguish an impossible required core from an advisory size projection."""
+    required_chars, projected_chars = len(dump(required)), len(dump(projected))
+    status = ("required_overflow" if required_chars > budget else
+              "projected_overflow" if projected_chars > budget else "fits")
+    return {"budget_chars": budget, "required_chars": required_chars,
+            "projected_chars": projected_chars, "status": status,
+            "method": "required core lower bound + projected final review; not tokenizer count"}
+
+
 def compact_checks(checks):
     """Keep command outcomes and log references with at most 500 output chars."""
     result = []
