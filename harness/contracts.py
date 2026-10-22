@@ -74,6 +74,33 @@ def output_constraints(schema, path="response"):
     return result
 
 
+def review_output_constraints(schema, proposed_keys=()):
+    """Expose review semantics alongside the schema's ordinary format bounds.
+
+    ``uniqueBy`` names the field that must be unique across array items;
+    ``subsetOf`` lists all permitted array values. The conditional rule applies
+    independently to every finding, using JSON Schema's if/then structure.
+    These input constraints do not extend either provider's wire schema.
+    """
+    result = output_constraints(schema)
+    by_path = {constraint["path"]: constraint for constraint in result}
+    by_path["response.findings"]["uniqueBy"] = "id"
+    approved = by_path["response.approved_memory_keys"]
+    approved["subsetOf"] = list(dict.fromkeys(proposed_keys))
+    if not approved["subsetOf"]:
+        approved["maxItems"] = 0
+    categories = schema["properties"]["findings"]["items"]["properties"]["category"]["enum"]
+    result.append({
+        "path": "response.findings[]",
+        "if": {"properties": {"severity": {"enum": ["blocking"]}}},
+        "then": {"properties": {
+            "evidence": {"minItems": 1},
+            "category": {"enum": [category for category in categories if category != "preference"]},
+        }},
+    })
+    return result
+
+
 def validate_structure(value, schema, path="response"):
     """Check all hard schema boundaries before considering a format repair."""
     expected = {"object": dict, "array": list, "string": str}[schema["type"]]

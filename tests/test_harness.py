@@ -297,7 +297,8 @@ class RuntimeTests(RepoCase):
 
     def test_resume_rejects_changed_configuration(self):
         engine = self.engine()
-        engine.start("Implement greet")
+        engine.start("Implement greet", pause_after_plan=True)
+        self.assertEqual(engine.run["status"], "awaiting_approval")
         self.config.data["roles"]["reviewer"]["model"] = "changed-model"
         with self.assertRaisesRegex(HarnessError, "配置已改变"):
             self.engine().resume(engine.run["id"])

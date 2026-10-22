@@ -150,8 +150,9 @@ class ConfigChangesTests(unittest.TestCase):
         argv, allow = self.command(config, "worker", config.role("worker"))
         self.assertIn("Bash(" + shlex.join(extra) + ")", allow)
         self.assertNotIn("Bash(python3 *)", allow)
-        self.assertIn("Edit", allow)
-        self.assertIn("Write", allow)
+        self.assertIn("Edit(/" + self.root.resolve().as_posix() + "/**)", allow)
+        self.assertNotIn("Edit", allow)
+        self.assertNotIn("Write", allow)
         self.assertEqual(argv[argv.index("--disallowedTools") + 1], "Agent,Task")
 
     def test_verification_literal_star_never_becomes_wildcard_permission(self):

@@ -68,6 +68,7 @@ class OperationalControlsTests(RepoCase):
         self.assertTrue(all(call.args[0][0] == "claude" for call in process.call_args_list))
 
     def test_cli_does_not_hide_programming_key_errors(self):
+        self.engine()  # Existing database; absent read-only queries need no Memory instance.
         with self.assertRaises(KeyError):
             self.invoke(["memory", "export"], Memory=Mock(side_effect=KeyError("programming defect")))
 

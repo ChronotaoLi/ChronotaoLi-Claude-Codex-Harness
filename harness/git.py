@@ -290,8 +290,14 @@ def accept(repo: Path, paths: list[str], run_id: str, task_id: str):
     # The worker does not own the acceptance index. Rebuild it from the reviewed
     # worktree so hidden staged content can never enter the runtime's commit.
     git(repo, "reset", "--mixed", "HEAD")
-    if paths:
-        git(repo, "--literal-pathspecs", "add", "--", *paths)
+    tracked = set(git(repo, "ls-files", "-z").split("\0"))
+    # A worker may stage a new file and then delete it. Reset already removes
+    # that index-only addition; git add cannot match it afterward. Keep real
+    # tracked deletions and dangling symlinks in the reviewed acceptance set.
+    stage = [name for name in paths
+             if name in tracked or (repo / name).exists() or (repo / name).is_symlink()]
+    if stage:
+        git(repo, "--literal-pathspecs", "add", "--", *stage)
     if git(repo, "diff", "--cached", "--name-only", "HEAD").strip():
         git(repo, "-c", "user.name=Personal Harness", "-c", "user.email=harness@localhost",
             "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false", "commit", "-m",

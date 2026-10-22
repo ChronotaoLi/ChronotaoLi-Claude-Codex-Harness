@@ -117,9 +117,17 @@ def show_status(args, state):
 
 
 def manage_memory(args, repo, state):
-    git.ignore_state(repo)
-    memory = Memory(state / "memory.sqlite3", repo=repo)
-    if args.memory_command == "add":
+    path = state / "memory.sqlite3"
+    adding = args.memory_command == "add"
+    if adding:
+        git.ignore_state(repo)
+    elif not path.exists():
+        if args.memory_command == "read":
+            raise HarnessError(f"没有此记忆：{args.id}")
+        print(dump([]))
+        return
+    memory = Memory(path, repo=repo, read_only=not adding)
+    if adding:
         print(memory.remember(key=args.key, abstract=args.title, overview=args.text, detail=args.text,
                               source=args.source, ttl_days=args.ttl_days))
     elif args.memory_command == "search":

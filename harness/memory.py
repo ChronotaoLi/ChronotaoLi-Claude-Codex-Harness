@@ -1,6 +1,7 @@
 """Project-scoped, versioned memory. Retrieval is lexical, not semantic."""
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import math
@@ -68,10 +69,25 @@ def validate_proposals(proposals, worktree):
 
 
 class Memory:
-    def __init__(self, path: Path, repo=None):
+    def __init__(self, path: Path, repo=None, *, read_only=False):
         self.path = Path(path)
         self.repo = Path(repo).resolve() if repo is not None else None
+        self.read_only = read_only
+        if read_only:
+            return
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        # WAL setup and read-then-ALTER migrations need a single initializer.
+        # Wait only for this database's short initialization, not another run.
+        # Resolve aliases so callers opening the same database share its lock.
+        database = self.path.resolve()
+        with database.with_name(database.name + ".init.lock").open("a+") as initialization:
+            fcntl.flock(initialization, fcntl.LOCK_EX)
+            try:
+                self._initialize()
+            finally:
+                fcntl.flock(initialization, fcntl.LOCK_UN)
+
+    def _initialize(self):
         with self.connect() as db:
             db.execute("PRAGMA journal_mode=WAL")
             db.execute("""CREATE TABLE IF NOT EXISTS memories (
@@ -89,7 +105,10 @@ class Memory:
 
     @contextmanager
     def connect(self):
-        db = sqlite3.connect(self.path, timeout=10)
+        if self.read_only:
+            db = sqlite3.connect(self.path.resolve().as_uri() + "?mode=ro", uri=True, timeout=10)
+        else:
+            db = sqlite3.connect(self.path, timeout=10)
         db.row_factory = sqlite3.Row
         try:
             with db:

@@ -120,6 +120,39 @@ class GitBoundaryRepairsTests(unittest.TestCase):
         self.assertEqual(git.git(self.repo, "show", f"{commit}:literal*.txt"), "reviewed\n")
         self.assertEqual(git.changed(self.repo), ["literal-secret.txt"])
 
+    def test_accept_discards_staged_new_file_deleted_before_review_without_commit(self):
+        before = git.head(self.repo)
+        path = self.repo / "src/discarded.py"
+        path.write_text("staged but absent at review\n")
+        git.git(self.repo, "add", "src/discarded.py")
+        path.unlink()
+        paths = git.check_scope(self.repo, ["src/*"])
+        self.assertEqual(paths, ["src/discarded.py"])
+        self.assertEqual(git.accept(self.repo, paths, "run_deleted", "deleted"), before)
+        self.assertTrue(git.clean(self.repo))
+
+    def test_accept_mixed_index_and_worktree_changes_commits_only_reviewed_contents(self):
+        root = self.repo / "src/root.py"
+        root.write_text("hidden staged contents\n")
+        discarded = self.repo / "src/discarded.py"
+        discarded.write_text("staged but absent at review\n")
+        git.git(self.repo, "add", "src/root.py", "src/discarded.py")
+        root.write_text("original\n")
+        discarded.unlink()
+        (self.repo / "src/nested/leaf.py").unlink()
+        (self.repo / "src/reviewed.py").write_text("reviewed new contents\n")
+        (self.repo / "src/link").symlink_to("missing-target")
+        paths = git.check_scope(self.repo, ["src/**"])
+        commit = git.accept(self.repo, paths, "run_mixed", "mixed")
+        self.assertEqual(git.git(self.repo, "show", f"{commit}:src/root.py"), "original\n")
+        self.assertEqual(git.git(self.repo, "show", f"{commit}:src/reviewed.py"), "reviewed new contents\n")
+        self.assertEqual(git.git(self.repo, "show", f"{commit}:src/link"), "missing-target")
+        self.assertEqual(set(git.git(self.repo, "diff", "--name-only", "HEAD^", "HEAD").splitlines()),
+                         {"src/nested/leaf.py", "src/reviewed.py", "src/link"})
+        self.assertFalse(discarded.exists())
+        self.assertFalse((self.repo / "src/nested/leaf.py").exists())
+        self.assertTrue(git.clean(self.repo))
+
     def test_non_utf8_paths_and_link_targets_survive_snapshot_and_acceptance(self):
         names = [os.fsdecode(b"src/name_\xff.py"), os.fsdecode(b"src/name_\xfe.py")]
         for index, name in enumerate(names):

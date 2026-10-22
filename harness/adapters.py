@@ -20,6 +20,17 @@ def provider_schema(schema):
     return result
 
 
+def claude_worktree_edit_rule(cwd):
+    """Grant built-in file writes only below this literal, resolved worktree."""
+    path = cwd.resolve().as_posix().rstrip("/")
+    if "\n" in path or "\r" in path:
+        raise HarnessError("Claude 工作树路径不能包含换行符，无法生成精确文件权限")
+    # Claude uses gitignore patterns: // anchors at the filesystem root and
+    # Edit(path) also governs Write. Escape the directory, not the final /**.
+    escaped = "".join("\\" + char if char in "\\*?[]" else char for char in path)
+    return "Edit(/" + escaped + "/**)"
+
+
 class CLIBackend:
     def __init__(self, config, state):
         self.config, self.state = config, state
@@ -44,7 +55,7 @@ class CLIBackend:
         allow += ["Bash(" + shlex.join(cmd) + " *)" for cmd in self.config.readonly_commands()]
         tools = "Read,Glob,Grep,Bash"
         if role == "worker":
-            allow += ["Edit", "Write"]
+            allow.append(claude_worktree_edit_rule(cwd))
             tools = "Read,Edit,Write,Glob,Grep,Bash"
             commands = self.config.data["verification"]["commands"] + self.config.data["permissions"]["worker_commands"]
             # A literal * in an argv becomes a permission wildcard even when
