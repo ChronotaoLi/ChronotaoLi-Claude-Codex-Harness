@@ -89,3 +89,13 @@ python3 -m harness smoke --commander fable
 还覆盖工作树隐藏 `.harness` 的 worker／整体审阅／hook 门禁、submodule 提前拒绝、恢复 mtime 与隐藏索引标记下的内容快照、验证生成文件的本地排除恢复、配置和 MCP 诊断、状态摘要与完整台账、放弃运行与清理。清理检查独立核对实际文件内容、拒绝隐藏索引标记和忽略文件；测试验证删除后的记账中断可恢复，以及 resume 不会覆盖并发放弃操作。
 
 本次未运行真实模型 smoke。测试使用模拟模型响应、真实 Git 和本地子进程，不能证明当前真实模型调用、复杂规划或供应商故障恢复可用。完整测试日志保存在 `.harness/validation/review-fixes-2026-10-22-final-unittest.log`，不提交运行日志。设计与使用说明已同步，原临时审阅文档已删除。
+
+## 后续设计评审修复（2026-10-22，台账 v5）
+
+执行 `python3 -m unittest discover -s tests -v`：312 项，311 项通过、1 项跳过（Python 3.15.0，103.958 秒）。跳过项仍为本机文件系统无法创建非 UTF-8 文件名。`python3 -m compileall -q harness tests`、运行时代码的 Python 3.11 语法解析与 `git diff --check` 通过；Python 3.11 语法解析不等于在该版本执行完整测试。
+
+新增行为覆盖：接近契约上限且含转义字符的大型审阅经过有界摘录后，在默认上下文预算内完成任务返工、最终修正规划和格式修正；摘录之外的证据改变仍被完整结果门禁拒绝。还覆盖三种任务再规划预算耗尽后的直接恢复、格式错误 stop 的持久停止、不可修复及修正额度耗尽后的零重派，以及终止守卫写入中断后保留原审阅 receipt。
+
+同任务 worker 故障来源与跨任务隔离、post_accept/on_error 独立日志、整体验证失败后空 diff 修正的再规划、未知配置键、无配置的状态和记忆操作均有回归测试。显式退出确认覆盖精确 dispatch、未知 ID 整批拒绝、审计事件、PGID 复用后的恢复和放弃、保留 HEAD 与忽略文件的删除门禁。单任务一次通过流程最多 15 次全量快照，验证 hook 修改仍阻止进入审阅；空白调度指令必须经新 dispatch 修正才能传给 worker。
+
+`python3 -m harness demo` 完成，stdout 可直接解析为单个 JSON；模型调用标记为 false。本次未运行真实模型 smoke，以上离线结果不证明真实账号或供应商调用可用。日志位于 `.harness/review-fixes-final-tests.log`，demo 结果及日志位于 `.harness/review-demo.json` 与 `.harness/review-demo.log`，均不提交。使用说明与设计约束已同步，临时评审文件已删除。

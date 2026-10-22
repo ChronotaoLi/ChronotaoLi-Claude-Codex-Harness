@@ -48,7 +48,7 @@ def demo(config, live=False, commander="astra"):
     config.data["runtime"]["agent_timeout_seconds"] = 180 if live else 1200
     config.data["runtime"]["max_attempts"] = 1 if live else 3
     config.data["runtime"]["max_final_attempts"] = 1 if live else 3
-    print(f"[harness] {'LIVE SMOKE' if live else 'OFFLINE DEMO'} repo={root}", flush=True)
+    print(f"[harness] {'LIVE SMOKE' if live else 'OFFLINE DEMO'} repo={root}", file=sys.stderr, flush=True)
     result = Engine(config, root, backend=None if live else DemoBackend(), commander=commander).start(
         "Implement greet(name) in hello.py, returning 'Hello, {name}!'. Keep the existing test unchanged.")
     print(dump({"simulation": not live, "models_called": live, "verification": "real unittest + git", "repo": str(root),
@@ -91,6 +91,45 @@ def status_summary(run):
     return result
 
 
+def show_status(args, state):
+    if args.run_id:
+        if not args.run_id.startswith("run_") or not args.run_id[4:].isalnum():
+            raise HarnessError("无效 run ID")
+        ledger = read_ledger(state / "runs" / args.run_id / "state.json")
+        print(dump(ledger if args.full else status_summary(ledger)))
+        return
+    runs = []
+    for directory in sorted((state / "runs").glob("*/")):
+        path = directory / "state.json"
+        try:
+            run = read_ledger(path)
+        except (HarnessError, OSError, ValueError) as e:
+            print(f"harness: 跳过无法读取的运行台账 {path}：{e}", file=sys.stderr)
+            continue
+        fields = ("id", "status", "goal", "branch")
+        if any(key not in run for key in fields):
+            print(f"harness: 运行台账字段不完整 {path}", file=sys.stderr)
+        item = {key: run.get(key) for key in fields}
+        item["id"] = run.get("id", path.parent.name)
+        item["status"] = run.get("status", "unknown")
+        runs.append(item)
+    print(dump(runs))
+
+
+def manage_memory(args, repo, state):
+    git.ignore_state(repo)
+    memory = Memory(state / "memory.sqlite3", repo=repo)
+    if args.memory_command == "add":
+        print(memory.remember(key=args.key, abstract=args.title, overview=args.text, detail=args.text,
+                              source=args.source, ttl_days=args.ttl_days))
+    elif args.memory_command == "search":
+        print(dump(memory.search(args.query, level=args.level)))
+    elif args.memory_command == "read":
+        print(dump(memory.read(args.id)))
+    else:
+        print(dump(memory.export()))
+
+
 def _main(argv=None):
     parser = argparse.ArgumentParser(description="Personal Harness — fresh task agents, independent review")
     parser.add_argument("--config", default=str(Path(__file__).resolve().parent.parent / "harness.toml"))
@@ -112,12 +151,16 @@ def _main(argv=None):
     resume.add_argument("--step", action="store_true", help="最多接受一个任务后暂停")
     resume.add_argument("--reverify", action="store_true", help="在最终验收预算内重新执行失败的整体验证；不重抽审阅结论")
     resume.add_argument("--retry-stopped", metavar="TASK_ID|final", help="显式重试已被指挥停止的规划请求，仍受累计预算约束")
+    resume.add_argument("--confirm-exited", action="append", metavar="DISPATCH_ID",
+                        help="确认指定旧 dispatch 已退出并记录证据；可重复指定")
     status = sub.add_parser("status")
     status.add_argument("run_id", nargs="?")
     status.add_argument("--full", action="store_true", help="输出完整运行台账")
     abandon = sub.add_parser("abandon", help="放弃运行并保留分支与证据")
     abandon.add_argument("run_id")
     abandon.add_argument("--remove-worktree", action="store_true", help="同时移除无未保存文件的隔离工作树；保留分支与运行证据")
+    abandon.add_argument("--confirm-exited", action="append", metavar="DISPATCH_ID",
+                         help="确认指定旧 dispatch 已退出并记录证据；可重复指定")
     sync = sub.add_parser("sync", help="生成共用 MCP 的两种客户端配置，不覆盖个人配置")
     sync.add_argument("--role", choices=["commander", "worker", "reviewer"], default="worker")
     mem = sub.add_parser("memory")
@@ -138,7 +181,19 @@ def _main(argv=None):
     if args.command == "status" and args.full and not args.run_id:
         parser.error("status --full 需要 run_id")
     try:
-        config = Config.load(args.config)
+        if args.command in ("status", "memory"):
+            repo = git.repository(args.repo)
+            state = repo / ".harness"
+            if args.command == "status":
+                show_status(args, state)
+            else:
+                manage_memory(args, repo, state)
+            return 0
+        try:
+            config = Config.load(args.config)
+        except FileNotFoundError as e:
+            raise HarnessError(f"找不到配置文件 {Path(args.config).resolve()}；请通过 --config 指定配置文件，"
+                               "默认 harness.toml 和 shared 资源仅随源码仓库提供") from e
         if args.command == "doctor":
             return doctor(config)
         if args.command in ("demo", "smoke"):
@@ -155,35 +210,15 @@ def _main(argv=None):
             print(dump({k: result[k] for k in ("id", "status", "branch", "worktree", "accepted")}))
         elif args.command == "resume":
             options = {"retry_stopped": args.retry_stopped} if args.retry_stopped is not None else {}
+            if args.confirm_exited:
+                options["confirm_exited"] = args.confirm_exited
             result = Engine(config, repo).resume(args.run_id, approve_plan=args.approve_plan, step=args.step,
                                                 reverify=args.reverify, **options)
             print(dump({k: result[k] for k in ("id", "status", "branch", "worktree")}))
         elif args.command == "abandon":
-            result = Engine(config, repo).abandon(args.run_id, remove_worktree=args.remove_worktree)
+            options = {"confirm_exited": args.confirm_exited} if args.confirm_exited else {}
+            result = Engine(config, repo).abandon(args.run_id, remove_worktree=args.remove_worktree, **options)
             print(dump(status_summary(result)))
-        elif args.command == "status":
-            if args.run_id:
-                if not args.run_id.startswith("run_") or not args.run_id[4:].isalnum():
-                    raise HarnessError("无效 run ID")
-                ledger = read_ledger(state / "runs" / args.run_id / "state.json")
-                print(dump(ledger if args.full else status_summary(ledger)))
-            else:
-                runs = []
-                for directory in sorted((state / "runs").glob("*/")):
-                    path = directory / "state.json"
-                    try:
-                        run = read_ledger(path)
-                    except (HarnessError, OSError, ValueError) as e:
-                        print(f"harness: 跳过无法读取的运行台账 {path}：{e}", file=sys.stderr)
-                        continue
-                    fields = ("id", "status", "goal", "branch")
-                    if any(key not in run for key in fields):
-                        print(f"harness: 运行台账字段不完整 {path}", file=sys.stderr)
-                    item = {key: run.get(key) for key in fields}
-                    item["id"] = run.get("id", path.parent.name)
-                    item["status"] = run.get("status", "unknown")
-                    runs.append(item)
-                print(dump(runs))
         elif args.command == "sync":
             git.ignore_state(repo)
             claude, codex = mcp_configs(config, state, args.role)
@@ -191,18 +226,6 @@ def _main(argv=None):
             write_json(folder / "claude.mcp.json", claude)
             (folder / "codex.mcp.toml").write_text("mcp_servers = " + toml_value(codex) + "\n", encoding="utf-8")
             print(str(folder))
-        elif args.command == "memory":
-            git.ignore_state(repo)
-            memory = Memory(state / "memory.sqlite3", repo=repo)
-            if args.memory_command == "add":
-                print(memory.remember(key=args.key, abstract=args.title, overview=args.text, detail=args.text,
-                                      source=args.source, ttl_days=args.ttl_days))
-            elif args.memory_command == "search":
-                print(dump(memory.search(args.query, level=args.level)))
-            elif args.memory_command == "read":
-                print(dump(memory.read(args.id)))
-            else:
-                print(dump(memory.export()))
         return 0
     except (HarnessError, OSError, ValueError, subprocess.TimeoutExpired) as e:
         print(f"harness: {e}", file=sys.stderr)

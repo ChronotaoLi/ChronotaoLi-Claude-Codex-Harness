@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from harness.util import HarnessError, read_json
 from test_harness import RepoCase, ROOT
 from test_runtime_changes import ScriptedBackend, finding
@@ -91,7 +93,10 @@ class ReviewCorrectionRecoveryTests(RepoCase):
             resumed.resume(engine.run["id"])
         self.assertEqual(resumed.run["status"], "blocked")
         self.assertEqual(resumed.run["expected_head"], head)
-        self.assertEqual(sum(call["kind"] == "final_review" for call in backend.calls), 4)
+        self.assertEqual(sum(call["kind"] == "final_review" for call in backend.calls), 3)
+        guard = resumed.run["review_corrections"]["reviewer:final_review:final"]
+        self.assertTrue(guard["exhausted"])
+        self.assertEqual(read_json(Path(guard["artifact"]))["verdict"], "request_changes")
 
 
 if __name__ == "__main__":

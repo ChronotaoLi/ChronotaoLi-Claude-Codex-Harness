@@ -79,6 +79,24 @@ class Config:
 
     @staticmethod
     def validate(data):
+        unknown = []
+
+        def check_keys(values, allowed, prefix=""):
+            if isinstance(values, dict):
+                unknown.extend(prefix + key for key in values if key not in allowed)
+
+        check_keys(data, {*DEFAULTS, "shared", "roles"})
+        for section, defaults in DEFAULTS.items():
+            check_keys(data.get(section), defaults, section + ".")
+        check_keys(data.get("shared"), ("rules", "skills", "mcp", "hooks"), "shared.")
+        roles = data.get("roles")
+        role_names = ("commander", "worker", "reviewer", "fable")
+        check_keys(roles, role_names, "roles.")
+        if isinstance(roles, dict):
+            for name in role_names:
+                check_keys(roles.get(name), ("cli", "model", "effort"), f"roles.{name}.")
+        if unknown:
+            raise HarnessError("未知配置键：" + "、".join(sorted(unknown)))
         shared = data.get("shared")
         if not isinstance(shared, dict):
             raise HarnessError("shared 必须为配置表，包含 rules、skills、mcp、hooks")
@@ -88,7 +106,7 @@ class Config:
                 raise HarnessError(f"shared.{key} 必须为非空路径字符串")
         if not isinstance(data.get("roles"), dict):
             raise HarnessError("roles 必须为配置表")
-        for name in ("commander", "worker", "reviewer", "fable"):
+        for name in role_names:
             role = data.get("roles", {}).get(name, {})
             if (not isinstance(role, dict) or role.get("cli") not in ("codex", "claude")
                     or not isinstance(role.get("model"), str) or not role["model"].strip()

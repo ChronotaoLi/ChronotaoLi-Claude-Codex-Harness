@@ -1,4 +1,5 @@
 from copy import deepcopy
+import hashlib
 
 from .util import HarnessError, dump
 
@@ -78,16 +79,76 @@ def compact_checks(checks):
     return result
 
 
+REVIEW_CONTEXT_CHARS = 9000
+
+
+def review_digest(review):
+    """Hash review content, excluding identity envelopes; not artifact bytes."""
+    content = {key: value for key, value in review.items() if key not in ("task_id", "dispatch_id")}
+    return hashlib.sha256(dump(content).encode("utf-8")).hexdigest()
+
+
+def compact_review(review, artifact, budget=REVIEW_CONTEXT_CHARS, *, digest=None):
+    """Bound review prose only when the complete evidence remains retrievable.
+
+    Finding identities and classifications are mandatory, even if they alone
+    exceed the requested share. compose() then fails closed instead of hiding
+    findings. This representation is input context, never an acceptance result.
+    """
+    if not artifact or len(dump(review)) <= budget:
+        return deepcopy(review)
+    digest = digest or review_digest(review)
+
+    def excerpt(size):
+        result = {key: deepcopy(value) for key, value in review.items()
+                  if key not in ("summary", "findings")}
+        result.update(
+            details_truncated=True, full_review_artifact=artifact,
+            review_content_sha256=digest,
+            read_instruction=(
+                "Read full_review_artifact before acting on findings or deciding they are resolved. "
+                "Summary, locations, messages and evidence below are excerpts; missing text or "
+                "a later review omitting a finding does not establish resolution. "
+                "The content digest uses dump(review) without task_id/dispatch_id."
+            ),
+        )
+        if size:
+            result["summary"] = review.get("summary", "")[:min(600, size)]
+        result["findings"] = []
+        for finding in review.get("findings", []):
+            item = {key: finding[key] for key in ("id", "severity", "category")}
+            if size:
+                item.update(location=finding["location"][:size // 5],
+                            message=finding["message"][:size * 2 // 5],
+                            evidence=[value[:size // 5] for value in finding["evidence"][:2]])
+            result["findings"].append(item)
+        return result
+
+    # Account for JSON escaping, field overhead and long finding IDs. A single
+    # character bound cannot bound serialized context for every valid review.
+    low, high = 0, 600
+    result = excerpt(0)
+    while low <= high:
+        size = (low + high) // 2
+        candidate = excerpt(size)
+        if len(dump(candidate)) <= budget:
+            result, low = candidate, size + 1
+        else:
+            high = size - 1
+    return result
+
+
 def compact_reviews(history):
-    """Retain latest review, unique prior findings, and every evidence pointer.
+    """Retain review decisions, unique prior findings, and every evidence pointer.
 
     Finding disappearance never proves resolution. Only identical findings are
-    deduplicated; a changed severity, message or evidence remains visible.
-    Earlier prose summaries remain in their cited artifacts.
+    deduplicated; changed severity, message or evidence keeps a distinct entry.
+    Prose shares a bounded budget, with complete text in the cited artifacts.
     """
     history = [item for index, item in enumerate(history) if item not in history[index + 1:]]
     result = []
     seen_findings = []
+    review_budget = REVIEW_CONTEXT_CHARS // max(1, sum(bool(item.get("review")) for item in history))
     for index in range(len(history) - 1, -1, -1):
         item = deepcopy(history[index])
         item.pop("snapshot", None)
@@ -97,6 +158,7 @@ def compact_reviews(history):
             item["verification"] = compact_checks(item["verification"])
         review = item.get("review")
         if review:
+            digest = review_digest(review)
             unique = []
             repeated = []
             for finding in review.get("findings", []):
@@ -112,6 +174,7 @@ def compact_reviews(history):
                     review.pop("approved_memory_keys", None)
                 if repeated:
                     item["repeated_finding_ids"] = repeated
+            item["review"] = compact_review(review, item.get("artifact"), review_budget, digest=digest)
         # A repeated record without additional metadata contributes nothing.
         if item not in result:
             result.append(item)
@@ -119,8 +182,9 @@ def compact_reviews(history):
 
 
 def compact_feedback(feedback, prior_reviews=()):
-    """Bound log excerpts recursively and avoid repeating supplied reviews."""
+    """Bound log/review excerpts recursively and avoid repeating supplied reviews."""
     known_reviews = [item.get("review") for item in prior_reviews if item.get("review")]
+    known_digests = {review.get("review_content_sha256") or review_digest(review) for review in known_reviews}
 
     def compact(value):
         if isinstance(value, list):
@@ -133,8 +197,11 @@ def compact_feedback(feedback, prior_reviews=()):
                 continue
             if key in ("verification", "verification_failures") and isinstance(child, list):
                 item[key] = compact_checks(child)
-            elif key == "review" and child in known_reviews:
-                item["review_in_prior_reviews"] = True
+            elif key == "review" and isinstance(child, dict):
+                if review_digest(child) in known_digests:
+                    item["review_in_prior_reviews"] = True
+                else:
+                    item[key] = compact_review(child, value.get("artifact"))
             else:
                 item[key] = compact(child)
         return item

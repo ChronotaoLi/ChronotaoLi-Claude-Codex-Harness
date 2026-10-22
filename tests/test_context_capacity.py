@@ -127,7 +127,7 @@ class FinalContextCapacityTests(RepoCase):
         backend = ScriptedBackend()
         engine = self.engine(backend)
         output = io.StringIO()
-        with contextlib.redirect_stdout(output):
+        with contextlib.redirect_stderr(output):
             result = engine.start("Implement greeting throughout the project", {"tasks": tasks}, step=True)
         self.assertEqual(result["status"], "paused")
         self.assertEqual(result["total_attempts"], 1)
