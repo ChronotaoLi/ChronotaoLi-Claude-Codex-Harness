@@ -175,7 +175,7 @@ def run_process(argv: list[str], cwd: Path, log: Path, *, stdin: str = "",
                 if remaining <= 0:
                     raise ProcessTimeout(timeout, log)
                 try:
-                    p.communicate(input=data, timeout=min(15, remaining))
+                    p.communicate(input=data, timeout=min(60, remaining))
                     return p.returncode
                 except subprocess.TimeoutExpired:
                     data = None

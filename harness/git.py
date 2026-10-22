@@ -165,6 +165,23 @@ def clean(repo: Path, *, binding=None):
     return not git(repo, "status", "--porcelain", binding=binding).strip()
 
 
+def check_starting_checkout(repo: Path):
+    """Require committed tracked files; untracked main-checkout files stay local."""
+    if git(repo, "status", "--porcelain", "--untracked-files=no").strip():
+        raise HarnessError("目标仓库有已跟踪或暂存的未提交变更；请先保存提交，再创建隔离 worktree")
+    return [os.fsdecode(name) for name in
+            git_bytes(repo, "ls-files", "--others", "--exclude-standard", "--directory", "-z").split(b"\0")
+            if name]
+
+
+def describe_paths(names):
+    """Keep filesystem diagnostics bounded and escape control/non-UTF-8 bytes."""
+    shown = [repr(name) for name in names[:10]]
+    paths = ", ".join(name if len(name) <= 240 else name[:240] + "…" for name in shown)
+    remaining = f"；另有 {len(names) - 10} 项未列出" if len(names) > 10 else ""
+    return paths + remaining
+
+
 def reject_submodules(repo: Path, *, binding=None):
     """Reject indexed gitlinks, including uninitialized or missing submodules."""
     _reject_indexed_submodules(git_bytes(repo, "ls-files", "--stage", "-z", binding=binding))
@@ -205,11 +222,8 @@ def assert_removable_worktree(repo: Path, *, binding=None):
     untracked = [os.fsdecode(name) for name in
                  git_bytes(repo, "ls-files", "--others", "-z", binding=binding).split(b"\0") if name]
     if untracked:
-        shown = [repr(name) for name in untracked[:10]]
-        paths = ", ".join(name if len(name) <= 240 else name[:240] + "…" for name in shown)
-        remaining = f"；另有 {len(untracked) - 10} 项未列出" if len(untracked) > 10 else ""
         raise HarnessError("worktree 有未保存文件（包括忽略文件）；请先归档或清理，不能移除："
-                           f"{paths}{remaining}")
+                           + describe_paths(untracked))
     tree = {}
     for entry in git_bytes(repo, "ls-tree", "-r", "-z", "HEAD", binding=binding).split(b"\0"):
         if not entry:

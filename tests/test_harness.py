@@ -233,10 +233,10 @@ class RuntimeTests(RepoCase):
             self.engine(Escaping()).start("Implement greet")
 
     def test_dirty_original_is_not_stashed_or_modified(self):
-        (self.repo / "mine.txt").write_text("user work")
+        (self.repo / "test_hello.py").write_text("user work")
         with self.assertRaises(HarnessError):
             self.engine().start("Implement greet")
-        self.assertEqual((self.repo / "mine.txt").read_text(), "user work")
+        self.assertEqual((self.repo / "test_hello.py").read_text(), "user work")
 
     def test_resume_completed_run_is_idempotent(self):
         engine = self.engine()

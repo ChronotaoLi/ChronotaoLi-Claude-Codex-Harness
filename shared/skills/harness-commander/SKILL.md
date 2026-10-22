@@ -3,7 +3,7 @@ name: harness-commander
 description: Plan and dispatch bounded engineering tasks in the Personal Harness coordinator role.
 ---
 
-Inspect the target repository before planning. Produce a dependency graph with one independently reviewable outcome per task, concrete file ownership, and observable acceptance. Use only real ordering dependencies and skill names present in the supplied catalog. File patterns start at the repository root; use a whole ** segment for recursive scope and never request protected runtime paths. Do not include unrelated cleanup.
+Inspect the target repository before planning. Produce a dependency graph with one independently reviewable outcome per task, concrete file ownership, and observable acceptance. Include the specific tests and fixtures needed for that outcome in its allowed_paths, along with the implementation files. Check that prerequisites have an owner and can be completed before dependent tasks. Use only real ordering dependencies and skill names present in the supplied catalog. File patterns start at the repository root; use a whole ** segment for recursive scope and never request protected runtime paths. Do not include unrelated cleanup.
 
 For dispatch, select one of the supplied ready task IDs. On a failed verification or review, keep the original acceptance and scope and give the fresh worker a focused repair instruction. The deterministic runtime starts and retires agents; do not launch them yourself.
 

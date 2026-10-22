@@ -159,3 +159,29 @@ python3 -m harness smoke --commander fable
 另使用仓库私有 Python 3.11.17 执行 `test_process_exit_recovery.py`：4 项全部通过，耗时 4.580 秒；日志位于 `.harness/validation/review-v8-process-python311.log`。本轮未在 Python 3.11 重跑完整测试集。运行时代码的 Python 3.11 语法解析、`python3 -m compileall -q harness tests` 和 `git diff --check` 通过。
 
 本次未调用真实模型或执行 smoke，离线模型响应与本地进程测试不证明真实账号或供应商调用可用。临时审阅文档 `docs/review-2026-10-22-v8.md` 已按要求删除。
+
+## v9 审阅后的使用与观测修订（2026-10-22，台账仍为 v8）
+
+本轮提前校验启用的 MCP 配置，在 run 创建前及派发计数前报告服务和字段错误；允许主检出保留未跟踪文件并提示其不进入工作树；记录供应商用量并将进程心跳间隔调为 60 秒。规划说明补充所需测试、夹具与前置工作的归属，详细恢复语义移到 [恢复协议](recovery.md)。任务预算、现有恢复出口和默认 32,000 字符预算保持原有语义，没有新增台账状态或版本。
+
+完整执行 `python3 -m unittest discover -s tests -v`：**499 项，498 通过、1 跳过，452.501 秒**（Python 3.15.0）。跳过项仍为本机文件系统拒绝实际创建非 UTF-8 文件名。新增的 MCP、启动隔离及用量观测三组测试另在 Python 3.11.17 执行，**18 项全部通过，12.862 秒**；本轮未在 Python 3.11 重跑完整测试集。`python3 -m compileall -q harness tests` 与 `git diff --check` 通过。离线日志分别为 `.harness/validation/review-v9-implementation-unittest.log` 与 `.harness/validation/review-v9-python311.log`。
+
+新增行为覆盖：缺失连接字段及非法配置类型在创建 run/分支前被拒绝；pre_agent 后的 MCP 配置错误不消耗任务或派发次数，恢复原配置后可继续；主检出同名未跟踪文件与笔记在完整任务运行后保留，暂存和已跟踪修改仍阻止启动；诊断路径转义并限制显示长度。用量测试以真实本地子进程模拟 CLI 输出，覆盖成功、CLI/协议失败、缺失及非法指标、模型自报费用不作计量、receipt 恢复不重复记录，以及观测故障不改变接受结果。它们不证明真实模型调用可用。
+
+另使用真实 CLI 完成一次多任务联调：Claude Code 2.1.308、codex-cli 0.163.0，run 为 `run_8e93e74bc5b045e4`，最终 `completed`。保留精确模型 ID：
+
+| 模型与角色 | 实际派发数 |
+| --- | --- |
+| `claude-fable-5-1` 指挥 | 4 |
+| `claude-opus-5-5` worker | 5 |
+| `gpt-6.1-sol` 独立审阅 | 5 |
+
+临时仓库实现标签规范化、整数金额合计和发票文本组合。通过 `--plan` 提供三个任务，初始有两个同时就绪的任务以触发指挥选择；计划刻意遗漏共享金额校验模块的前置任务，该文件范围已包含在原集成任务的授权中。固定验收测试对尚未实现的模块暂时跳过，整体验收要求全部模块存在且不再跳过。
+
+真实执行先通过 `--step` 接受 labels 后暂停，再由独立 CLI 命令 resume。totals worker 确认前置模块缺失并返回 task blocker，指挥添加 amount_rules 任务和依赖；该前置任务通过验证及独立审阅后，新的 totals worker 继续，随后完成 invoice 集成。原三个任务的 ID、标题、范围、验收和 skills 不变。共 5 次 worker 尝试、1 次有效再规划、1 次最终尝试；报告 blocker 的尝试仍计入预算。四个接受任务和整体目标分别通过五次独立审阅，最终 unittest **25 项全部通过，无跳过**。
+
+核对原主分支 HEAD、固定验收测试字节和未跟踪 `operator-notes.txt` 均未改变；笔记没有进入任务工作树。14 次模型调用的 dispatch ID 与实际进程组 ID 均不同且确认退出，调用命令使用上述模型，不含会话 resume。14 个 dispatch 均有供应商用量记录，与完成事件对应；9 次 Claude 调用累计报告约 **2.557116 美元**，Codex 仅记录 token，不据此推算费用，这不是完整账号账单。实际派发包最大为 **26,836 字符**，未调整默认上下文预算；此样本不证明更大计划也能容纳。
+
+本次覆盖真实任务选择、step/resume、任务 blocker、受限再规划、新增前置任务、跨任务集成、任务与整体审阅，以及供应商用量提取。没有触发任务/整体审阅拒绝、格式修正、invalid_rejected、`--repair-invalid` 或供应商故障恢复；没有以本次 Fable 联调替代 Astra 链路验证。遗漏前置任务是明确设计的联调条件，不用于估计真实任务的失败频率。
+
+夹具、配置、启动/恢复输出、完整核验脚本和汇总报告保存在 `.harness/validation/v9-live/`；原始 dispatch、验证、提交和记忆证据保留在该目录 `fixture.json` 指向的临时项目 `.harness/`。这些私有产物不提交。临时审阅文档 `docs/review-2026-10-22-v9.md` 已按要求删除。

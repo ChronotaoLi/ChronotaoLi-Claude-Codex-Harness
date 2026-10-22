@@ -1,12 +1,72 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import shlex
 from copy import deepcopy
 
 from .shared import mcp_configs, toml_value
 from .util import HarnessError, read_json, run_process, tail, write_json
+
+
+_USAGE_MAX_BYTES = 16 * 1024 * 1024
+_USAGE_MAX_COUNT = 2**63 - 1
+
+
+def _usage_counts(value, fields):
+    if not isinstance(value, dict):
+        return {}
+    return {key: value[key] for key in fields
+            if type(value.get(key)) is int and 0 <= value[key] <= _USAGE_MAX_COUNT}
+
+
+def provider_usage(job, provider):
+    """Read bounded diagnostics from the CLI, never from the model's response.
+
+    Missing/invalid metrics stay unknown. The CLI's cost is its reported estimate,
+    not an account bill; none of these observations affect execution budgets.
+    """
+    try:
+        with (job / "process.stdout").open("rb") as stream:
+            raw = stream.read(_USAGE_MAX_BYTES + 1)
+        if len(raw) > _USAGE_MAX_BYTES:
+            return None
+        if provider == "claude":
+            result = json.loads(raw)
+            if not isinstance(result, dict) or result.get("type") != "result":
+                return None
+            metrics = _usage_counts(result, ("num_turns",))
+            cost = result.get("total_cost_usd")
+            if type(cost) in (int, float) and 0 <= cost <= 1_000_000_000 and math.isfinite(cost):
+                metrics["reported_cost_usd"] = cost
+            tokens = _usage_counts(result.get("usage"), (
+                "input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"))
+        elif provider == "codex":
+            turns, tokens = 0, None
+            for line in raw.splitlines():
+                try:
+                    event = json.loads(line)
+                except (ValueError, UnicodeError, RecursionError):
+                    continue
+                if not isinstance(event, dict) or event.get("type") != "turn.completed":
+                    continue
+                turns += 1
+                reported = _usage_counts(event.get("usage"), (
+                    "input_tokens", "cached_input_tokens", "output_tokens"))
+                # Sum only fields reported for every completed turn. A missing
+                # field cannot turn into a misleading partial dispatch total.
+                tokens = reported if tokens is None else {
+                    key: value + reported[key] for key, value in tokens.items()
+                    if key in reported and value + reported[key] <= _USAGE_MAX_COUNT}
+            metrics = {"completed_turns": turns} if turns else {}
+        else:
+            return None
+        if tokens:
+            metrics["tokens"] = tokens
+        return {"provider": provider, "source": "process.stdout", **metrics} if metrics else None
+    except (OSError, ValueError, UnicodeError, RecursionError):
+        return None
 
 
 def provider_schema(schema):

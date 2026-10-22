@@ -58,7 +58,7 @@ python3 -m harness.permission_smoke --config /path/to/harness.toml --repo /path/
 ## 对自己的项目执行任务
 
 1. 为目标项目准备配置文件，设置真正需要的 `verification.commands`，并在运行时显式传入 `--config`。每条命令是 argv 数组，不经 shell 解释。例如 Python 项目可以使用 `["uv", "run", "pytest"]`，Node 项目可以使用 `["npm", "test", "--", "--run"]`。依赖需要在 worktree 中可用；覆盖率、构建等生成产物应配置到已忽略或工作树之外的位置，验证期间出现未忽略的新文件也会触发快照门禁。
-2. 目标项目必须有 Git 提交，且工作区干净。编排器不会替你 stash 尚未提交的工作。当前不支持 submodule；索引中存在 gitlink 时会在创建 worktree 和派发模型之前报错。
+2. 目标项目必须有 Git 提交，且已跟踪文件与暂存区没有未提交修改。主检出的未跟踪文件只产生警告，保留原位，不复制到从 HEAD 创建的任务工作树；忽略文件也不会自动复制。编排器不会替你 stash 尚未提交的工作。当前不支持 submodule；索引中存在 gitlink 时会在创建 worktree 和派发模型之前报错。
 3. 在本 Harness 仓库目录运行：
 
 ```bash
@@ -72,7 +72,7 @@ python3 -m harness --config /absolute/path/harness.toml --repo /absolute/path/to
 
 可用 `--plan /path/to/plan.json` 提供已有计划，格式见 [examples/plan.json](examples/plan.json)。计划会检查任务 ID、依赖环、非空验收条件、文件范围及引用的 skill 是否存在。`allowed_paths` 从仓库根目录匹配：`src/*` 只匹配直接子项，`src/**` 匹配所有层级，`**/*.py` 也可匹配根目录 Python 文件；只有独立的 `**` 路径段跨越 `/`。显式指向 `.git`、`.harness`、`.codex`、`.claude` 的范围在规划时拒绝，实际变更仍会独立检查这些受保护路径。唯一就绪任务在首次尝试且没有反馈时直接使用完整任务简报派发；存在选择或返工反馈时才调用指挥。
 
-用户提供的计划在创建 run 目录、分支和 worktree 前完成校验，输入错误可直接修正后重试。`**`、`**/*` 等常见全仓库模式仍允许使用，但登记计划时会向 stderr 提示并记录 `broad_scope_warning`；这类范围不限制普通项目文件，受保护路径门禁仍生效。
+用户提供的计划在创建 run 目录、分支和 worktree 前完成校验，输入错误可直接修正后重试。任务范围应覆盖实现所需的具体测试与夹具，前置工作应有明确归属与依赖顺序。`**`、`**/*` 等常见全仓库模式仍允许使用，但登记计划时会向 stderr 提示并记录 `broad_scope_warning`；这类范围不限制普通项目文件，受保护路径门禁仍生效。
 
 默认连续执行。需要先检查计划或分步执行时，可显式选择：
 
@@ -210,6 +210,8 @@ worker 尝试与模型派发在上下文、派发前 hook、快照及预算检�
 
 `shared/mcp.json` 支持 stdio 与 HTTP。外部服务可按 `roles` 限定可见性；指挥和审阅服务必须声明 `read_only = true`，该声明由配置维护者负责核实。外部服务需要的凭据只填写环境变量名称。完整示例见 [examples/mcp.json](examples/mcp.json)，其中 OpenWiki 默认关闭，需要填入真实路径，并确保它没有开启 agent 写入能力。
 
+创建 run 前校验所有角色可见且已启用的 MCP 服务配置，缺少 `transport`、stdio 的 `command` 或 HTTP 的 `url` 等错误会指出具体服务与字段。派发前再次校验当前角色的配置，本地配置错误不消耗 worker 或模型派发次数；关闭的示例服务可以保留未填写的连接字段。此预检不连接服务，也不证明凭据或服务可用。
+
 ```bash
 python3 -m harness sync --role worker
 ```
@@ -315,6 +317,8 @@ python3 -m harness --repo /path/to/project memory export > memory-backup.json
 
 运行时只把 `/.harness/` 加入目标项目的本地 `.git/info/exclude`，不更改其已跟踪 `.gitignore`。日志可能包含代码和业务内容，按你的项目数据要求保管。
 
+模型调用结束时，`dispatch_finished` 事件和台账对应 dispatch 的 `provider_usage` 记录 CLI 实际返回的用量，可通过 `status RUN --full` 查看。Claude 包括其报告的美元成本、轮数及 token 字段；Codex 包括完成轮数及报告的 token 字段，不推算美元成本。来源是供应商输出，模型自行声明的费用不作计量；缺失、损坏、过大的输出或中断可能没有记录，不将未知用量当作零。报告成本不等于账号实际账单，观测不改变预算或接受条件，恢复已有审阅结果不重复累计。长时间进程每 60 秒输出一次仍在运行提示，配置的实际超时仍单独生效。
+
 隔离工作树内部不允许创建 `.harness` 文件、目录或符号链接，即使 Git 忽略该路径，任务范围和运行时快照检查仍会拒绝它。目标项目根目录的真实 `.harness/` 状态目录不受此限制。
 
 若验证中途产生未忽略的新文件，可在核对内容后，通过 `git rev-parse --git-common-dir` 定位公共 Git 目录，在其 `info/exclude` 中加入精确生成产物模式，再恢复。linked worktree 共用该文件；这会改变后续快照可见范围，不豁免已跟踪文件，不能用宽泛模式掩盖待交付代码。
@@ -325,7 +329,7 @@ worker 的格式修正一旦返回结果，就结束该待修正状态，即使�
 
 任务候选文件变化时，旧审阅接收记录及格式修正原始结果会先保留到审阅历史，再重新执行任务。历史标注快照失效、协议错误和产物摘要，后续 worker/reviewer 可读取原始证据；旧批准不能用于新候选。已绑定的产物缺失或被改动仍停止，不能通过改文件隐藏它。
 
-finding 数量、位置、说明或证据等不可变字段违反格式限制时，直接保存不可修复状态；已返回的格式修正仍不合法时保存额度耗尽状态。普通恢复不再调用 reviewer；只有符合上述条件的格式耗尽批准可显式使用 `--repair-invalid`。修正进程未返回结果的 CLI 故障允许人工恢复后重派，仍保留原结论和累计预算。完整的阻塞状态与操作出口见 [设计文档](docs/design.md#阻塞状态与操作者出口)。
+finding 数量、位置、说明或证据等不可变字段违反格式限制时，直接保存不可修复状态；已返回的格式修正仍不合法时保存额度耗尽状态。普通恢复不再调用 reviewer；只有符合上述条件的格式耗尽批准可显式使用 `--repair-invalid`。修正进程未返回结果的 CLI 故障允许人工恢复后重派，仍保留原结论和累计预算。完整的阻塞状态与操作出口见 [恢复协议](docs/recovery.md#阻塞状态与操作者出口)。
 
 超时会停止该次调用的进程组；验证超时还会保存 `timed_out`、退出码 124 和日志。缺少 CLI、无效供应商输出和其他运行错误进入 blocked，Ctrl+C、SIGTERM 和终端 SIGHUP 进入 interrupted，清理子进程组并保留检查点。角色调用故障单独记入 `last_runtime_error`，不作为无关 worker 的返工反馈。若进程在 Git commit 与检查点写入之间被强制杀死，恢复会因 HEAD 不一致而拒绝自动重放；先核对包含 `Harness-Run` / `Harness-Task` 的提交。首版不提供自动“修复”状态文件的危险捷径。任务级非法审阅并不锁死整个 run：范围内候选真实改变时，运行时归档原始结果及身份／结构诊断，再执行新的任务尝试；同一候选不能靠普通 resume 重抽。整体审阅仍遵守其独立的拒绝与恢复门禁。
 

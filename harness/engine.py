@@ -10,7 +10,7 @@ from copy import deepcopy
 from pathlib import Path
 
 from . import git
-from .adapters import CLIBackend
+from .adapters import CLIBackend, provider_usage
 from .context import (FINAL_REVIEW_INSTRUCTION, capacity_report, compact_checks,
                       compact_feedback, compact_plan, compact_review, compact_reviews, compose,
                       instruction_file_changes)
@@ -21,7 +21,7 @@ from .contracts import (DETAIL, PLAN, REPLAN, REVIEW, WORK, RepairableFormatErro
                         validate_commander_format_correction)
 from .memory import Memory, validate_proposals
 from .recovery import InvalidOutputRecovery, read_bound_result, snapshot_digest
-from .shared import HookError, Hooks, asset_digest, read_skill, skills_catalog
+from .shared import HookError, Hooks, asset_digest, read_skill, skills_catalog, validate_mcp
 from .util import (HarnessError, ProcessTimeout, append_event, confirm_dispatches_exited,
                    dump, ensure_dispatches_exited, group_alive, lock,
                    read_json, run_process, tail, uid, write_json)
@@ -648,6 +648,7 @@ class Engine(InvalidOutputRecovery):
         startup_interrupted = False
         try:
             self.emit_hook("pre_agent", entry, job)
+            validate_mcp(self.config, roles=(role,))
             before = self.snapshot()
             entry["snapshot_digest"] = snapshot_digest(before)
             self.validate_invalid_repair_source(f"{role}:{kind}:{task_id}", before)
@@ -656,7 +657,7 @@ class Engine(InvalidOutputRecovery):
             if self.run["agent_dispatches"] >= self.config.data["runtime"]["max_agent_dispatches"]:
                 raise HarnessError("已达 run 模型派发次数上限；可显式增大 max_agent_dispatches 后恢复")
             # Persist all invocation budgets together after local preparation.
-            # Provider failures still count, while context/hook/snapshot failures do not.
+            # Provider failures still count; local context/hook/MCP/snapshot failures do not.
             if role == "worker":
                 attempts = self.run["attempts"].get(task_id, 0)
                 if attempts >= self.config.data["runtime"]["max_attempts"]:
@@ -769,18 +770,35 @@ class Engine(InvalidOutputRecovery):
                                        and (not entry["pgid"] or not group_alive(entry["pgid"])))
             if entry["exit_confirmed"]:
                 entry["process_state"] = "exited"
+            if invoked:
+                # Observe the provider envelope even on CLI/protocol failures.
+                # Telemetry is best effort and cannot change acceptance/recovery.
+                try:
+                    usage = provider_usage(job, self.config.role(role, self.commander)["cli"])
+                    if usage is not None:
+                        entry["provider_usage"] = usage
+                except Exception:
+                    pass
             self.save()
+            try:
+                self.event("dispatch_finished", task_id=task_id, dispatch_id=dispatch_id, role=role,
+                           status=entry["status"], provider_usage=entry.get("provider_usage"))
+            except Exception:
+                pass
 
     def start(self, goal, plan=None, *, pause_after_plan=False, step=False):
         if not goal.strip():
             raise HarnessError("目标不能为空")
-        if not git.clean(self.repo):
-            raise HarnessError("目标仓库有未提交变更；请先保存提交，再创建隔离 worktree")
+        untracked = git.check_starting_checkout(self.repo)
         if not self.config.data["verification"]["commands"]:
             raise HarnessError("请先配置目标项目的 verification.commands")
         git.reject_submodules(self.repo)
         if plan is not None:
             self.validate_tasks(plan)
+        validate_mcp(self.config)
+        if untracked:
+            print("[harness] 主检出存在未跟踪文件；保留原处，不进入隔离 worktree："
+                  + git.describe_paths(untracked), file=sys.stderr, flush=True)
         ident = uid("run")
         worktree = self.state / "worktrees" / ident
         self.run = {"schema_version": 8, "id": ident, "repo": str(self.repo), "goal": goal, "status": "planning", "commander": self.commander,
