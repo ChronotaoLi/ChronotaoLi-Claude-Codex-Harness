@@ -220,8 +220,9 @@ class ConfigChangesTests(unittest.TestCase):
                           "approved_memory_keys": ["same", "same"]}
         with self.assertRaisesRegex(HarnessError, "duplicate entries"):
             validate(duplicate_keys, schema)
+        proposal = {"key": "storage", "abstract": "Storage", "content": "SQLite", "source_paths": ["store.py"]}
         oversized = {"status": "completed", "summary": "Implemented", "evidence": [], "blockers": [],
-                     "blocker_kind": "none", "proposed_memories": [{}] * 9}
+                     "blocker_kind": "none", "proposed_memories": [proposal] * 9}
         with self.assertRaisesRegex(HarnessError, "array length"):
             validate(oversized, WORK)
 

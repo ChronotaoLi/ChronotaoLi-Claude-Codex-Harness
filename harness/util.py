@@ -16,12 +16,22 @@ class HarnessError(Exception):
     pass
 
 
+class ProcessTimeout(HarnessError):
+    def __init__(self, timeout: int | float, log: Path):
+        self.timeout = timeout
+        self.log = log
+        super().__init__(f"进程超过 {timeout}s；日志：{log}")
+
+
 def uid(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:16]}"
 
 
 def dump(value) -> str:
-    return json.dumps(value, ensure_ascii=False, indent=2)
+    text = json.dumps(value, ensure_ascii=False, indent=2)
+    # Git paths may contain surrogateescaped filesystem bytes. Preserve their
+    # exact identity in JSON while keeping ordinary Unicode readable.
+    return text.encode("utf-8", errors="backslashreplace").decode("utf-8")
 
 
 def write_json(path: Path, value):
@@ -58,15 +68,24 @@ def group_alive(pgid: int) -> bool:
         return True
     except ProcessLookupError:
         return False
+    except PermissionError:
+        # Lack of permission is not evidence that an old group has exited.
+        return True
 
 
 def run_process(argv: list[str], cwd: Path, log: Path, *, stdin: str = "",
-                timeout: int = 900, env=None, on_start=None) -> int:
+                timeout: int | float = 900, env=None, on_start=None) -> int:
     """No shell interpolation; terminate the owned process group on all exits."""
     log.parent.mkdir(parents=True, exist_ok=True)
-    with log.with_suffix(".stdout").open("w") as out, log.with_suffix(".stderr").open("w") as err:
-        p = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.PIPE, stdout=out,
-                             stderr=err, text=True, env=env, start_new_session=True)
+    with log.with_suffix(".stdout").open("w", encoding="utf-8") as out, \
+            log.with_suffix(".stderr").open("w", encoding="utf-8", errors="backslashreplace") as err:
+        try:
+            p = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.PIPE, stdout=out,
+                                 stderr=err, text=True, env=env, start_new_session=True)
+        except (OSError, ValueError) as e:
+            message = f"无法启动进程 {argv[0] if argv else '<empty argv>'}：{e}；日志：{log}"
+            err.write(message + "\n")
+            raise HarnessError(message) from e
         started = time.monotonic()
         try:
             if on_start:
@@ -75,7 +94,7 @@ def run_process(argv: list[str], cwd: Path, log: Path, *, stdin: str = "",
             while True:
                 remaining = timeout - (time.monotonic() - started)
                 if remaining <= 0:
-                    raise HarnessError(f"进程超过 {timeout}s；日志：{log}")
+                    raise ProcessTimeout(timeout, log)
                 try:
                     p.communicate(input=data, timeout=min(15, remaining))
                     return p.returncode

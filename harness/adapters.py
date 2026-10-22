@@ -79,8 +79,8 @@ class CLIBackend:
         if model["cli"] == "codex":
             if not (job / "response.json").exists():
                 raise HarnessError(f"Codex 未输出结构化结果：{job}")
-            return read_json(job / "response.json")
-        result = read_json(job / "process.stdout")
+            return self.read_result(job / "response.json", "Codex")
+        result = self.read_result(job / "process.stdout", "Claude")
         write_json(job / "provider-result.json", result)
         if result.get("is_error") or result.get("subtype", "success") != "success":
             raise HarnessError(f"Claude 未成功完成：{result.get('subtype')}；日志：{job}")
@@ -91,6 +91,18 @@ class CLIBackend:
             except (ValueError, TypeError) as e:
                 raise HarnessError(f"Claude 未返回 JSON；日志：{job}") from e
         write_json(job / "response.json", value)
+        if not isinstance(value, dict):
+            raise HarnessError(f"Claude 结构化结果必须为 JSON 对象；日志：{job}")
+        return value
+
+    @staticmethod
+    def read_result(path, provider):
+        try:
+            value = read_json(path)
+        except (OSError, ValueError) as e:
+            raise HarnessError(f"{provider} 未返回有效 JSON；日志：{path}") from e
+        if not isinstance(value, dict):
+            raise HarnessError(f"{provider} 结果必须为 JSON 对象；日志：{path}")
         return value
 
 
@@ -109,7 +121,7 @@ class DemoBackend:
             result = {"tasks": [{"id": "greet", "title": "Implement greet", "description": "Implement greet(name) returning Hello, name!",
                                   "depends_on": [], "allowed_paths": ["hello.py"], "acceptance": ["test_greet passes"], "skills": []}]}
         elif kind == "replan":
-            result = {"action": "stop", "reason": "Demo cannot replan a failed task automatically", "tasks": []}
+            result = {"action": "stop", "reason": "Demo cannot replan a failed task automatically", "new_tasks": [], "updates": []}
         else:
             result = {"selected_task": task["id"], "instruction": "Complete this one task and satisfy its acceptance criteria."}
         value = {**ids, **result}

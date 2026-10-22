@@ -9,7 +9,7 @@ from .util import HarnessError
 DEFAULTS = {
     "runtime": {
         "agent_timeout_seconds": 1200, "verify_timeout_seconds": 300,
-        "max_attempts": 3, "max_total_attempts": 60, "max_replans": 2,
+        "max_attempts": 3, "max_final_attempts": 3, "max_total_attempts": 60, "max_replans": 2,
         "max_tasks": 20, "context_chars": 32000, "claude_max_turns": 50,
     },
     "permissions": {"worker_commands": []},
@@ -18,7 +18,7 @@ DEFAULTS = {
 }
 RESUME_INCREASES = (
     "agent_timeout_seconds", "verify_timeout_seconds", "context_chars",
-    "claude_max_turns", "max_attempts", "max_total_attempts",
+    "claude_max_turns", "max_attempts", "max_final_attempts", "max_total_attempts",
 )
 
 # Arguments may be appended only after --, where they cannot enable Git's

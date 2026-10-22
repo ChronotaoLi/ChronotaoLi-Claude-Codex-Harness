@@ -46,6 +46,7 @@ def demo(config, live=False, commander="astra"):
     config.data["verification"]["commands"] = [[sys.executable, "-m", "unittest", "-v"]]
     config.data["runtime"]["agent_timeout_seconds"] = 180 if live else 1200
     config.data["runtime"]["max_attempts"] = 1 if live else 3
+    config.data["runtime"]["max_final_attempts"] = 1 if live else 3
     print(f"[harness] {'LIVE SMOKE' if live else 'OFFLINE DEMO'} repo={root}", flush=True)
     result = Engine(config, root, backend=None if live else DemoBackend(), commander=commander).start(
         "Implement greet(name) in hello.py, returning 'Hello, {name}!'. Keep the existing test unchanged.")
@@ -105,6 +106,8 @@ def main(argv=None):
         repo = git.repository(args.repo)
         state = repo / ".harness"
         if args.command == "run":
+            print(f"[harness] config={config.path}", file=sys.stderr)
+            print(f"[harness] verification={dump(config.data['verification']['commands'])}", file=sys.stderr)
             engine = Engine(config, repo, commander=args.commander)
             result = engine.start(args.goal, read_json(args.plan) if args.plan else None,
                                   pause_after_plan=args.pause_after_plan, step=args.step)
@@ -118,8 +121,24 @@ def main(argv=None):
                     raise HarnessError("无效 run ID")
                 print(dump(read_json(state / "runs" / args.run_id / "state.json")))
             else:
-                runs = [read_json(p) for p in sorted((state / "runs").glob("*/state.json"))]
-                print(dump([{k: r[k] for k in ("id", "status", "goal", "branch")} for r in runs]))
+                runs = []
+                for directory in sorted((state / "runs").glob("*/")):
+                    path = directory / "state.json"
+                    try:
+                        run = read_json(path)
+                        if not isinstance(run, dict):
+                            raise ValueError("运行台账必须为对象")
+                    except (OSError, ValueError) as e:
+                        print(f"harness: 跳过无法读取的运行台账 {path}：{e}", file=sys.stderr)
+                        continue
+                    fields = ("id", "status", "goal", "branch")
+                    if any(key not in run for key in fields):
+                        print(f"harness: 运行台账字段不完整 {path}", file=sys.stderr)
+                    item = {key: run.get(key) for key in fields}
+                    item["id"] = run.get("id", path.parent.name)
+                    item["status"] = run.get("status", "unknown")
+                    runs.append(item)
+                print(dump(runs))
         elif args.command == "sync":
             git.ignore_state(repo)
             claude, codex = mcp_configs(config, state, args.role)

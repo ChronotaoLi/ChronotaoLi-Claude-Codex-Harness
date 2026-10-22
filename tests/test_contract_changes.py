@@ -85,9 +85,9 @@ class RevisionContractTests(unittest.TestCase):
             validate_revision(original, original + [task("three")], {"missing"})
 
     def test_stop_contract_retains_explicit_reason(self):
-        validate({"action": "stop", "reason": "External credentials are unavailable", "tasks": []}, REPLAN)
+        validate({"action": "stop", "reason": "External credentials are unavailable", "new_tasks": [], "updates": []}, REPLAN)
         with self.assertRaises(HarnessError):
-            validate({"action": "stop", "reason": "", "tasks": []}, REPLAN)
+            validate({"action": "stop", "reason": "", "new_tasks": [], "updates": []}, REPLAN)
 
     def test_blank_acceptance_and_scope_do_not_create_obligations(self):
         for field in ("acceptance", "allowed_paths"):

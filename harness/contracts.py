@@ -1,7 +1,9 @@
 """Small, closed JSON-schema subset; every returned field is validated locally."""
 import re
+from copy import deepcopy
 from pathlib import PurePosixPath
 
+from . import git
 from .util import HarnessError
 
 
@@ -10,7 +12,11 @@ def obj(**fields):
 
 
 TEXT = {"type": "string"}
-STRINGS = {"type": "array", "items": TEXT}
+NONBLANK = {"type": "string", "minLength": 1}
+TASK_ID = {"type": "string", "pattern": r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$"}
+SKILL_NAME = {"type": "string", "pattern": r"^[a-z0-9-]+$"}
+DEPENDENCIES = {"type": "array", "items": TASK_ID}
+OBLIGATIONS = {"type": "array", "items": NONBLANK, "minItems": 1}
 SAFE_ID = {"type": "string", "pattern": r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,95}$"}
 DETAIL = {"type": "string", "minLength": 1, "maxLength": 4000}
 EVIDENCE = {"type": "array", "items": DETAIL, "maxItems": 20}
@@ -20,11 +26,14 @@ PROPOSAL = obj(key=SAFE_ID,
                source_paths={"type": "array", "items": {"type": "string", "minLength": 1, "maxLength": 500},
                              "minItems": 1, "maxItems": 10, "uniqueItems": True})
 PROPOSALS = {"type": "array", "items": PROPOSAL, "maxItems": 8}
-TASK = obj(id=TEXT, title=TEXT, description=TEXT, depends_on=STRINGS,
-           allowed_paths=STRINGS, acceptance=STRINGS, skills=STRINGS)
-PLAN = obj(tasks={"type": "array", "items": TASK})
+TASK = obj(id=TASK_ID, title=NONBLANK, description=NONBLANK, depends_on=DEPENDENCIES,
+           allowed_paths=OBLIGATIONS, acceptance=OBLIGATIONS,
+           skills={"type": "array", "items": SKILL_NAME})
+PLAN = obj(tasks={"type": "array", "items": TASK, "minItems": 1})
+TASK_UPDATE = obj(id=TASK_ID, description=NONBLANK, add_depends_on=DEPENDENCIES)
 REPLAN = obj(action={"type": "string", "enum": ["revise", "stop"]},
-             reason=DETAIL, tasks={"type": "array", "items": TASK})
+             reason=DETAIL, new_tasks={"type": "array", "items": TASK},
+             updates={"type": "array", "items": TASK_UPDATE})
 WORK = obj(status={"type": "string", "enum": ["completed", "blocked"]},
            summary=DETAIL, evidence=EVIDENCE, blockers=EVIDENCE,
            blocker_kind={"type": "string", "enum": ["none", "task", "environment"]},
@@ -43,46 +52,89 @@ def envelope(schema, task_id, dispatch_id):
                dispatch_id={"type": "string", "enum": [dispatch_id]}, **schema["properties"])
 
 
-def validate(value, schema, path="response"):
+class RepairableFormatError(HarnessError):
+    """A bounded output formatting defect, never an identity or approval error."""
+
+    def __init__(self, path, message):
+        self.path = path
+        super().__init__(f"{path}: {message}")
+
+
+def output_constraints(schema, path="response"):
+    """Derive the local constraints omitted from the providers' schema subset."""
+    fields = ("minLength", "maxLength", "pattern", "minItems", "maxItems", "uniqueItems")
+    bounds = {key: deepcopy(schema[key]) for key in fields if key in schema}
+    if schema.get("minLength", 0):
+        bounds["non_blank"] = True
+    result = [{"path": path, **bounds}] if bounds else []
+    for key, field in schema.get("properties", {}).items():
+        result.extend(output_constraints(field, f"{path}.{key}"))
+    if "items" in schema:
+        result.extend(output_constraints(schema["items"], f"{path}[]"))
+    return result
+
+
+def validate_structure(value, schema, path="response"):
+    """Check all hard schema boundaries before considering a format repair."""
     expected = {"object": dict, "array": list, "string": str}[schema["type"]]
     if not isinstance(value, expected):
         raise HarnessError(f"{path}: expected {schema['type']}")
     if "enum" in schema and value not in schema["enum"]:
         raise HarnessError(f"{path}: value not in permitted set")
-    if expected is str:
-        if len(value) < schema.get("minLength", 0) or len(value) > schema.get("maxLength", float("inf")):
-            raise HarnessError(f"{path}: string length exceeds permitted bounds")
-        if schema.get("minLength", 0) and not value.strip():
-            raise HarnessError(f"{path}: string must not be blank")
-        if "pattern" in schema and not re.fullmatch(schema["pattern"], value):
-            raise HarnessError(f"{path}: invalid identifier")
     if expected is dict:
         if set(value) != set(schema["required"]):
             raise HarnessError(f"{path}: missing or unexpected fields")
         for key, field in schema["properties"].items():
-            validate(value[key], field, f"{path}.{key}")
+            validate_structure(value[key], field, f"{path}.{key}")
     if expected is list:
-        if len(value) < schema.get("minItems", 0) or len(value) > schema.get("maxItems", float("inf")):
-            raise HarnessError(f"{path}: array length exceeds permitted bounds")
-        if schema.get("uniqueItems") and any(item in value[:i] for i, item in enumerate(value)):
-            raise HarnessError(f"{path}: duplicate entries")
         for i, item in enumerate(value):
-            validate(item, schema["items"], f"{path}[{i}]")
+            validate_structure(item, schema["items"], f"{path}[{i}]")
 
 
-def validate_work(result):
-    validate(result, WORK)
+def _validate_format(value, schema, path):
+    if schema["type"] == "string":
+        if len(value) < schema.get("minLength", 0) or len(value) > schema.get("maxLength", float("inf")):
+            raise RepairableFormatError(path, "string length exceeds permitted bounds")
+        if schema.get("minLength", 0) and not value.strip():
+            raise RepairableFormatError(path, "string must not be blank")
+        if "pattern" in schema and not re.fullmatch(schema["pattern"], value):
+            raise RepairableFormatError(path, "invalid identifier")
+    if schema["type"] == "object":
+        for key, field in schema["properties"].items():
+            _validate_format(value[key], field, f"{path}.{key}")
+    if schema["type"] == "array":
+        if len(value) < schema.get("minItems", 0) or len(value) > schema.get("maxItems", float("inf")):
+            raise RepairableFormatError(path, "array length exceeds permitted bounds")
+        if schema.get("uniqueItems") and any(item in value[:i] for i, item in enumerate(value)):
+            raise RepairableFormatError(path, "duplicate entries")
+        for i, item in enumerate(value):
+            _validate_format(item, schema["items"], f"{path}[{i}]")
+
+
+def validate(value, schema, path="response"):
+    validate_structure(value, schema, path)
+    _validate_format(value, schema, path)
+
+
+def validate_work_semantics(result):
+    """Check worker completion and proposal identity after structural validation."""
     completed = result["status"] == "completed"
     if completed != (result["blocker_kind"] == "none") or completed != (not result["blockers"]):
         raise HarnessError("worker 状态、blocker_kind 与 blockers 不一致")
     keys = [proposal["key"] for proposal in result["proposed_memories"]]
     if len(keys) != len(set(keys)):
         raise HarnessError("记忆提案 key 必须唯一")
+
+
+def validate_work(result):
+    validate_structure(result, WORK)
+    validate_work_semantics(result)
+    _validate_format(result, WORK, "response")
     return result
 
 
-def validate_review(result, proposed_keys=()):
-    validate(result, REVIEW)
+def validate_review_semantics(result, proposed_keys=()):
+    """Keep finding identity and memory approvals outside format correction."""
     ids = [finding["id"] for finding in result["findings"]]
     if len(ids) != len(set(ids)):
         raise HarnessError("审阅 finding ID 必须唯一")
@@ -92,7 +144,33 @@ def validate_review(result, proposed_keys=()):
                 raise HarnessError("阻断 finding 必须有证据，且不能仅为偏好")
     if not set(result["approved_memory_keys"]) <= set(proposed_keys):
         raise HarnessError("审阅批准了不存在的记忆提案")
+
+
+def validate_review(result, proposed_keys=()):
+    validate_structure(result, REVIEW)
+    validate_review_semantics(result, proposed_keys)
+    _validate_format(result, REVIEW, "response")
     return result
+
+
+def validate_review_correction(previous, current):
+    """A fully validated correction must preserve the first review's decision.
+
+    Only its summary and malformed finding IDs may change. In particular, an
+    invalidly long finding cannot be shortened by losing its evidence, and an
+    overfull findings array cannot be repaired by dropping a reported defect.
+    """
+    if (current["verdict"] != previous["verdict"]
+            or set(current["approved_memory_keys"]) != set(previous["approved_memory_keys"])
+            or len(current["findings"]) != len(previous["findings"])):
+        raise HarnessError("审阅格式修复不得改变结论、记忆批准或 findings 数量")
+    fields = ("severity", "category", "location", "message", "evidence")
+    for old, new in zip(previous["findings"], current["findings"]):
+        if any(new[field] != old[field] for field in fields):
+            raise HarnessError("审阅格式修复不得改变 finding 内容、严重级别或顺序")
+        if re.fullmatch(SAFE_ID["pattern"], old["id"]) and new["id"] != old["id"]:
+            raise HarnessError("审阅格式修复不得改变已有合法 finding ID")
+    return current
 
 
 def review_approved(result):
@@ -101,13 +179,13 @@ def review_approved(result):
 
 
 def validate_plan(plan, max_tasks=20):
-    validate(plan, PLAN)
+    validate_structure(plan, PLAN)
     tasks = plan["tasks"]
     ids = [t["id"] for t in tasks]
     if not tasks or len(tasks) > max_tasks or len(set(ids)) != len(ids):
         raise HarnessError("计划必须有 1..max_tasks 个任务，且 ID 唯一")
     for task in tasks:
-        if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}", task["id"]):
+        if not re.fullmatch(TASK_ID["pattern"], task["id"]):
             raise HarnessError("任务 ID 只能含字母、数字、下划线和连字符")
         if not task["description"].strip() or not task["title"].strip():
             raise HarnessError("任务标题和描述不能为空")
@@ -118,9 +196,10 @@ def validate_plan(plan, max_tasks=20):
         for path in task["allowed_paths"]:
             if not path.strip() or PurePosixPath(path).is_absolute() or ".." in PurePosixPath(path).parts:
                 raise HarnessError(f"无效文件范围：{path}")
+            git.validate_scope_pattern(path)
         if any(d not in ids or d == task["id"] for d in task["depends_on"]):
             raise HarnessError("任务依赖不存在或依赖自身")
-        if any(not re.fullmatch(r"[a-z0-9-]+", s) for s in task["skills"]):
+        if any(not re.fullmatch(SKILL_NAME["pattern"], s) for s in task["skills"]):
             raise HarnessError("无效 skill 名称")
     done = set()
     while len(done) < len(tasks):
@@ -128,6 +207,38 @@ def validate_plan(plan, max_tasks=20):
         if not ready:
             raise HarnessError("任务依赖包含环")
         done |= ready
+    _validate_format(plan, PLAN, "response")
+    return tasks
+
+
+def apply_revision(current_tasks, result, accepted_ids, max_tasks=20):
+    """Apply only explicit additions and brief updates to runtime-owned tasks."""
+    validate_structure(result, REPLAN)
+    validate_plan({"tasks": current_tasks}, max_tasks)
+    accepted = set(accepted_ids)
+    current = {task["id"]: task for task in current_tasks}
+    if not accepted <= current.keys():
+        raise HarnessError("再规划引用未知已接受任务")
+    if result["action"] == "stop":
+        if result["new_tasks"] or result["updates"]:
+            raise HarnessError("停止再规划时不得包含新增任务或更新")
+        _validate_format(result, REPLAN, "response")
+        return deepcopy(current_tasks)
+    proposed = deepcopy(current_tasks)
+    by_id = {task["id"]: task for task in proposed}
+    updated = set()
+    for update in result["updates"]:
+        ident = update["id"]
+        if ident not in current or ident in accepted or ident in updated:
+            raise HarnessError("再规划只能更新未接受的既有任务，且每个任务仅更新一次")
+        updated.add(ident)
+        by_id[ident]["description"] = update["description"]
+        for dependency in update["add_depends_on"]:
+            if dependency not in by_id[ident]["depends_on"]:
+                by_id[ident]["depends_on"].append(dependency)
+    proposed.extend(deepcopy(result["new_tasks"]))
+    tasks = validate_revision(current_tasks, proposed, accepted, max_tasks)
+    _validate_format(result, REPLAN, "response")
     return tasks
 
 

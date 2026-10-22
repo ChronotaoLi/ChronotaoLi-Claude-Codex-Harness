@@ -76,11 +76,10 @@ class RuntimeChangesTests(RepoCase):
             if kwargs["kind"] == "final_review" and sum(c["kind"] == "final_review" for c in backend.calls) == 1:
                 result.update(verdict="request_changes", findings=[finding()])
             if kwargs["kind"] == "replan":
-                tasks = copy.deepcopy(packet["tasks"])
+                tasks = copy.deepcopy(packet.get("tasks", packet["original_tasks"]))
                 task = copy.deepcopy(tasks[0])
                 task.update(id="correct", title="Correct edge case", description="Correct the final finding", depends_on=["greet"])
-                tasks.append(task)
-                result.update(action="revise", reason="Address final review finding", tasks=tasks)
+                result.update(action="revise", reason="Address final review finding", new_tasks=[task], updates=[])
             if kwargs["role"] == "worker" and kwargs["task"]["id"] == "correct":
                 with (kwargs["cwd"] / "hello.py").open("a") as file:
                     file.write("# correction independently reviewed\n")
@@ -102,9 +101,9 @@ class RuntimeChangesTests(RepoCase):
             if kwargs["kind"] == "final_review":
                 result.update(verdict="request_changes", findings=[finding()])
             elif kwargs["kind"] == "replan":
-                task = copy.deepcopy(packet["tasks"][0])
+                task = copy.deepcopy(packet.get("tasks", packet["original_tasks"])[0])
                 task.update(id="correct", depends_on=["greet"])
-                result.update(action="revise", reason="Fix finding", tasks=packet["tasks"] + [task])
+                result.update(action="revise", reason="Fix finding", new_tasks=[task], updates=[])
         engine = self.engine(ScriptedBackend(no_change))
         with self.assertRaisesRegex(HarnessError, "同一代码快照"):
             engine.start("Implement greet", self.plan())
@@ -159,11 +158,11 @@ class RuntimeChangesTests(RepoCase):
                 (kwargs["cwd"] / "hello.py").write_text("partial blocked implementation\n")
                 result.update(status="blocked", blocker_kind="task", blockers=["Need prerequisite"], summary="Missing prerequisite")
             elif kwargs["kind"] == "replan":
-                original = copy.deepcopy(packet["tasks"][0])
+                original = copy.deepcopy(packet.get("tasks", packet["original_tasks"])[0])
                 prerequisite_task = copy.deepcopy(original)
                 prerequisite_task.update(id="prepare", title="Prepare prerequisite")
-                original["depends_on"] = ["prepare"]
-                result.update(action="revise", reason="Prepare prerequisite before original task", tasks=[prerequisite_task, original])
+                result.update(action="revise", reason="Prepare prerequisite before original task", new_tasks=[prerequisite_task],
+                              updates=[{"id": original["id"], "description": original["description"], "add_depends_on": ["prepare"]}])
             elif kwargs["role"] == "worker" and kwargs["task"]["id"] == "prepare":
                 # DemoBackend already generated a valid file; inspect the archived original separately.
                 with (kwargs["cwd"] / "hello.py").open("a") as file:
@@ -269,9 +268,9 @@ class RuntimeChangesTests(RepoCase):
         self.assertIn("pending_replan", engine.run)
         def continue_replan(backend, kwargs, packet, result):
             if kwargs["kind"] == "replan":
-                task = copy.deepcopy(packet["tasks"][0])
+                task = copy.deepcopy(packet.get("tasks", packet["original_tasks"])[0])
                 task.update(id="correct", depends_on=["greet"])
-                result.update(action="revise", reason="Fix the recorded final finding", tasks=packet["tasks"] + [task])
+                result.update(action="revise", reason="Fix the recorded final finding", new_tasks=[task], updates=[])
             elif kwargs["role"] == "worker":
                 with (kwargs["cwd"] / "hello.py").open("a") as file:
                     file.write("# reviewed correction\n")
@@ -288,11 +287,11 @@ class RuntimeChangesTests(RepoCase):
             if kwargs["role"] == "worker":
                 result.update(status="blocked", blocker_kind="task", blockers=["Need preparation"], summary="Need preparation")
             elif kwargs["kind"] == "replan":
-                task = copy.deepcopy(packet["tasks"][0])
+                task = copy.deepcopy(packet.get("tasks", packet["original_tasks"])[0])
                 prerequisite = copy.deepcopy(task)
                 prerequisite["id"] = "prepare"
-                task["depends_on"] = ["prepare"]
-                result.update(action="revise", reason="Add preparation", tasks=[prerequisite, task])
+                result.update(action="revise", reason="Add preparation", new_tasks=[prerequisite],
+                              updates=[{"id": task["id"], "description": task["description"], "add_depends_on": ["prepare"]}])
         engine = self.engine(ScriptedBackend(revise))
         save = engine.save
         def interrupt_after_application():
