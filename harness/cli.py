@@ -177,6 +177,8 @@ def _main(argv=None):
     cleanup = sub.add_parser("cleanup-verification", help="检查保留的全新验证检出；不加载运行配置")
     cleanup.add_argument("run_id")
     cleanup.add_argument("--remove", action="store_true", help="移除已退出且干净的验证检出；保留运行与验证证据")
+    cleanup.add_argument("--confirm-exited", action="append", metavar="DISPATCH_ID",
+                         help="确认指定旧 dispatch 已退出并记录证据；支持已完成或已放弃的 run，可重复指定")
     sync = sub.add_parser("sync", help="生成共用 MCP 的两种客户端配置，不覆盖个人配置")
     sync.add_argument("--role", choices=["commander", "worker", "reviewer"], default="worker")
     mem = sub.add_parser("memory")
@@ -203,7 +205,8 @@ def _main(argv=None):
             if args.command == "status":
                 show_status(args, state)
             elif args.command == "cleanup-verification":
-                result = cleanup_verification(repo, args.run_id, remove=args.remove)
+                result = cleanup_verification(repo, args.run_id, remove=args.remove,
+                                              confirm_exited=args.confirm_exited or ())
                 print(dump(result))
                 return 1 if any(item["status"] == "blocked" for item in result["checkouts"]) else 0
             else:

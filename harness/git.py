@@ -202,9 +202,14 @@ def assert_removable_worktree(repo: Path, *, binding=None):
         if entry[:1].islower() or entry.startswith(b"S "):
             raise HarnessError("worktree 索引含 assume-unchanged/skip-worktree 标记；"
                                f"请先核对并清除，不能移除：{os.fsdecode(entry[2:])}")
-    untracked = git_bytes(repo, "ls-files", "--others", "-z", binding=binding).split(b"\0")
-    if any(untracked):
-        raise HarnessError("worktree 有未保存文件（包括忽略文件）；请先归档或清理，不能移除")
+    untracked = [os.fsdecode(name) for name in
+                 git_bytes(repo, "ls-files", "--others", "-z", binding=binding).split(b"\0") if name]
+    if untracked:
+        shown = [repr(name) for name in untracked[:10]]
+        paths = ", ".join(name if len(name) <= 240 else name[:240] + "…" for name in shown)
+        remaining = f"；另有 {len(untracked) - 10} 项未列出" if len(untracked) > 10 else ""
+        raise HarnessError("worktree 有未保存文件（包括忽略文件）；请先归档或清理，不能移除："
+                           f"{paths}{remaining}")
     tree = {}
     for entry in git_bytes(repo, "ls-tree", "-r", "-z", "HEAD", binding=binding).split(b"\0"):
         if not entry:
@@ -305,6 +310,12 @@ def validate_scope_pattern(pattern: str):
         raise HarnessError(f"无效文件范围：{pattern}")
     if parts[0] in PROTECTED_ROOTS:
         raise HarnessError(f"文件范围包含受保护路径：{pattern}")
+
+
+def repository_wide_scope(pattern: str) -> bool:
+    """Recognize common whole-repository globs without inferring glob containment."""
+    parts = pattern.split("/")
+    return "**" in parts and all(part in ("*", "**") for part in parts) and parts.count("*") <= 1
 
 
 def path_matches(name: str, pattern: str) -> bool:

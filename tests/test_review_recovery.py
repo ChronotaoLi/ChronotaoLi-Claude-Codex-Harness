@@ -1,7 +1,7 @@
 from pathlib import Path
 
 from harness.util import HarnessError, read_json
-from test_harness import RepoCase, ROOT
+from test_harness import RepoCase, ROOT, interrupt_started_agent
 from test_runtime_changes import ScriptedBackend, finding
 
 
@@ -14,7 +14,7 @@ class ReviewCorrectionRecoveryTests(RepoCase):
             if number == 1:
                 result.update(verdict="request_changes", findings=[finding()], summary="x" * 4001)
             elif number == 2:
-                raise KeyboardInterrupt()
+                interrupt_started_agent(kwargs)
             elif preserve_rejection:
                 result.update(verdict="request_changes", findings=[finding()], summary="The recorded defect remains")
         return ScriptedBackend(change)

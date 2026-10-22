@@ -6,7 +6,7 @@ from pathlib import Path
 from harness import git
 from harness.adapters import DemoBackend
 from harness.util import HarnessError, read_json
-from test_harness import RepoCase, ROOT
+from test_harness import RepoCase, ROOT, interrupt_started_agent
 
 
 def finding(severity="blocking", category="defect"):
@@ -213,7 +213,7 @@ class RuntimeChangesTests(RepoCase):
     def test_resume_budget_increase_preserves_attempts_and_logs_change(self):
         def interrupt(backend, kwargs, packet, result):
             if kwargs["role"] == "worker":
-                raise KeyboardInterrupt()
+                interrupt_started_agent(kwargs)
         engine = self.engine(ScriptedBackend(interrupt))
         with self.assertRaises(KeyboardInterrupt):
             engine.start("Implement greet", self.plan())
@@ -263,7 +263,7 @@ class RuntimeChangesTests(RepoCase):
             if kwargs["kind"] == "final_review":
                 result.update(verdict="request_changes", findings=[finding()])
             elif kwargs["kind"] == "replan":
-                raise KeyboardInterrupt()
+                interrupt_started_agent(kwargs)
         engine = self.engine(ScriptedBackend(interrupt_replan))
         with self.assertRaises(KeyboardInterrupt):
             engine.start("Implement greet", self.plan())
@@ -326,7 +326,7 @@ class RuntimeChangesTests(RepoCase):
     def test_approval_cannot_preapprove_plan_generated_after_interruption(self):
         def interrupt(backend, kwargs, packet, result):
             if kwargs["kind"] == "plan":
-                raise KeyboardInterrupt()
+                interrupt_started_agent(kwargs)
         engine = self.engine(ScriptedBackend(interrupt))
         with self.assertRaises(KeyboardInterrupt):
             engine.start("Implement greet", pause_after_plan=True)

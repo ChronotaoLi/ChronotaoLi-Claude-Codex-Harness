@@ -9,7 +9,8 @@ import time
 from pathlib import Path
 
 from . import git
-from .util import HarnessError, group_alive, lock, read_json, write_json
+from .util import (HarnessError, append_event, confirm_dispatches_exited,
+                   ensure_dispatches_exited, group_alive, lock, read_json, write_json)
 
 
 def _canonical(path):
@@ -24,18 +25,7 @@ def _regular_bytes(path):
 
 
 def _ensure_exited(run):
-    for entry in run["dispatches"]:
-        if not isinstance(entry, dict):
-            raise HarnessError("运行台账 dispatch 无效")
-        if entry.get("exit_confirmed") is True:
-            continue
-        pgid = entry.get("pgid")
-        if pgid is not None and (type(pgid) is not int or pgid <= 0):
-            raise HarnessError("运行台账进程组 ID 无效")
-        if pgid and group_alive(pgid):
-            raise HarnessError(f"旧 dispatch {entry.get('id')} 的进程组仍存在；不能清理验证工作树")
-        if pgid is None and entry.get("status") == "running":
-            raise HarnessError(f"无法确认旧 dispatch {entry.get('id')} 已退出；不能清理验证工作树")
+    ensure_dispatches_exited(run["dispatches"], observe=group_alive)
 
 
 def _checkout_identity(repo, run, environment, expected_head, common):
@@ -148,7 +138,7 @@ def _remove_checkout(repo, run, artifact, expected_head, common, remove):
     return {**result, "status": "removed"}
 
 
-def cleanup_verification(repo: Path, ident: str, *, remove=False):
+def cleanup_verification(repo: Path, ident: str, *, remove=False, confirm_exited=()):
     """Preview all saved checkouts, or remove eligible ones and report refusals."""
     repo = git.repository(repo)
     if not ident.startswith("run_") or not ident[4:].isalnum():
@@ -170,6 +160,14 @@ def cleanup_verification(repo: Path, ident: str, *, remove=False):
         common = Path(git.git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir").removesuffix("\n")).resolve()
         if run["worktree_binding"].get("common_dir") != str(common):
             raise HarnessError("运行台账的 Git 公共目录绑定已改变")
+        if confirm_exited:
+            events = directory / "events.jsonl"
+            _canonical(events)
+            if events.exists():
+                _regular_bytes(events)
+            confirm_dispatches_exited(run["dispatches"], confirm_exited,
+                audit=lambda event, **fields: append_event(events, ident, event, **fields),
+                save=lambda: write_json(directory / "state.json", run), observe=group_alive)
         _ensure_exited(run)
         artifacts = []
         for final in run["final_history"]:

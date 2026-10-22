@@ -145,3 +145,17 @@ python3 -m harness smoke --commander fable
 真实权限报告和原始证据保留在 `.harness/permission-smoke/7e3e021b1d7d4efda4bc79ecef33fce9/`，不提交。该探针使用专用精确命令并关闭外部 MCP，验证本次 CLI 对这组允许／拒绝操作的处理，不证明任意项目授权或 OS 隔离。本轮未重新执行完整 Astra／Fable 指挥、worker、独立 reviewer 的真实工作流；新增受控恢复和故障分支仍由离线行为测试验证。
 
 台账升级为版本 8，旧执行器不能忽略新增修正守卫；版本 7 及更早运行须由对应旧版本继续，独立清理命令支持版本 7、8。使用说明与设计文档已同步，临时审阅文档 `docs/review-2026-10-22-v7.md` 已删除。
+
+## v8 审阅后的恢复与诊断修订（2026-10-22）
+
+最终执行 `python3 -m unittest discover -s tests -v`：481 项，480 项通过、1 项跳过，耗时 449.788 秒（Python 3.15.0）。跳过原因仍为本机文件系统拒绝实际创建非 UTF-8 文件名。完整日志保存在 `.harness/validation/review-v8-implementation-verified.log`，不提交。
+
+新增检查覆盖自动格式修正耗尽后的显式一次修正、最初与失败修正结果的双重摘要绑定、原审阅结论和指挥决定固定、累计预算、返回结果落盘中断及候选失效归档。旧 v8 指挥修正缺少原始摘要时，普通恢复、显式修正和候选变化均不能重新派发或接受无法核验的决定；已有摘要的 reviewer 守卫可继续按受控条件恢复。
+
+生命周期测试使用真实本地子进程，覆盖 Popen 成功但 pgid 尚未保存时 controller 强制退出，以及 Popen 返回前的 KeyboardInterrupt；未知启动同时阻止恢复与清理。已退出进程的中断恢复夹具也先记录实际 pgid，再中断并清理，检查新 dispatch、阶段复用与预算累计。清理确认覆盖 v7/v8、completed/abandoned、整批 ID 校验、运行锁、先审计后记账、故障保留及文件门禁。
+
+还覆盖全部 hook 的运行定位字段、全新验证目录与源工作树区分、错误与恢复事件、非法显式计划不创建运行现场、全仓库范围提示中断后保留原验收，以及未跟踪／忽略文件诊断不删除任何内容。README 与设计文档同步更新，并增加阻塞状态与操作者出口表。
+
+另使用仓库私有 Python 3.11.17 执行 `test_process_exit_recovery.py`：4 项全部通过，耗时 4.580 秒；日志位于 `.harness/validation/review-v8-process-python311.log`。本轮未在 Python 3.11 重跑完整测试集。运行时代码的 Python 3.11 语法解析、`python3 -m compileall -q harness tests` 和 `git diff --check` 通过。
+
+本次未调用真实模型或执行 smoke，离线模型响应与本地进程测试不证明真实账号或供应商调用可用。临时审阅文档 `docs/review-2026-10-22-v8.md` 已按要求删除。

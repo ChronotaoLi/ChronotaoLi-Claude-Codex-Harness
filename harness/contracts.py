@@ -220,6 +220,13 @@ def validate_approval_repair(previous, current, proposed_keys):
             raise HarnessError("显式审阅修正不得改变已有合法且唯一的 finding ID")
 
 
+def validate_commander_format_correction(kind, previous, current):
+    """Text formatting cannot replace an already selected task or revision."""
+    fields = ("selected_task",) if kind == "dispatch" else ("action", "new_tasks", "updates")
+    if kind not in ("dispatch", "replan") or any(previous[field] != current[field] for field in fields):
+        raise HarnessError("指挥格式修正不得改变原任务选择或修订操作")
+
+
 def validate_plan(plan, max_tasks=20):
     validate_structure(plan, PLAN)
     tasks = plan["tasks"]

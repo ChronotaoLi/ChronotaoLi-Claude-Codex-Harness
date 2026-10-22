@@ -5,7 +5,7 @@ from unittest.mock import patch
 from harness import git
 from harness.util import HarnessError, ProcessTimeout, read_json, run_process
 from test_engine_repairs import RecordingBackend
-from test_harness import RepoCase, ROOT
+from test_harness import RepoCase, ROOT, interrupt_started_agent
 from test_runtime_changes import finding
 
 
@@ -52,7 +52,7 @@ class TaskStageRecoveryTests(RepoCase):
         self.assert_review_failure_recovery(lambda kwargs: HarnessError("Reviewer service unavailable"))
 
     def test_reviewer_keyboard_interrupt_resumes_review_at_worker_budget_limit(self):
-        self.assert_review_failure_recovery(lambda kwargs: KeyboardInterrupt())
+        self.assert_review_failure_recovery(interrupt_started_agent)
 
     def test_reviewer_timeout_resumes_review_at_worker_budget_limit(self):
         self.assert_review_failure_recovery(lambda kwargs: ProcessTimeout(1, kwargs["job"] / "cli"))

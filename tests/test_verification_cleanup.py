@@ -196,3 +196,94 @@ class VerificationCleanupTests(RepoCase):
         self.assertEqual(json.loads(stdout.getvalue())["checkouts"][0]["status"], "blocked")
         self.assertEqual(stderr.getvalue(), "")
         self.assertTrue(self.checkout.exists())
+
+    def add_unknown_dispatch(self, ident="unknown"):
+        entry = {"id": ident, "role": "verification", "status": "running",
+                 "pgid": None, "exit_confirmed": False}
+        self.run["dispatches"].append(entry)
+        write_json(self.directory / "state.json", self.run)
+        return entry
+
+    def confirmation_events(self):
+        return [entry for line in (self.directory / "events.jsonl").read_text().splitlines()
+                if (entry := json.loads(line))["event"] == "dispatch_exit_confirmed_by_operator"]
+
+    def test_terminal_confirmation_supports_both_ledger_versions_and_preserves_status(self):
+        evidence = self.artifact.read_bytes()
+        for version in (7, 8):
+            for status in ("completed", "abandoned"):
+                with self.subTest(version=version, status=status):
+                    self.run.update(schema_version=version, status=status)
+                    ident = f"unknown-{version}-{status}"
+                    self.add_unknown_dispatch(ident)
+                    with self.assertRaisesRegex(HarnessError, "无法确认"):
+                        self.cleanup()
+                    result = cleanup_verification(self.repo, self.run["id"], confirm_exited=[ident, ident])
+                    self.assertEqual(result["checkouts"][0]["status"], "eligible")
+                    self.run = read_json(self.directory / "state.json")
+                    self.assertEqual(self.run["status"], status)
+                    self.assertEqual(self.run["schema_version"], version)
+                    self.assertTrue(self.run["dispatches"][-1]["exit_confirmed"])
+                    self.assertIsNone(self.confirmation_events()[-1]["observed"]["group_alive"])
+        self.assertEqual(len(self.confirmation_events()), 4)
+        self.assertTrue(self.checkout.exists())
+        self.assertEqual(self.artifact.read_bytes(), evidence)
+
+    def test_confirmation_checks_lock_and_entire_id_batch_before_audit_or_mutation(self):
+        entry = self.add_unknown_dispatch()
+        state = (self.directory / "state.json").read_bytes()
+        events = (self.directory / "events.jsonl").read_bytes()
+        with lock(self.directory / "run.lock"), self.assertRaisesRegex(HarnessError, "运行锁"):
+            cleanup_verification(self.repo, self.run["id"], confirm_exited=[entry["id"]])
+        with patch("harness.cleanup.group_alive") as observe, self.assertRaisesRegex(HarnessError, "unknown-id"):
+            cleanup_verification(self.repo, self.run["id"], confirm_exited=[entry["id"], "unknown-id"])
+        observe.assert_not_called()
+        self.assertEqual((self.directory / "state.json").read_bytes(), state)
+        self.assertEqual((self.directory / "events.jsonl").read_bytes(), events)
+
+    def test_confirmation_never_implicitly_confirms_other_dispatches_or_sends_signals(self):
+        selected = self.add_unknown_dispatch("selected")
+        selected["pgid"] = 2_000_000_000
+        other = self.add_unknown_dispatch("other")
+        with patch("harness.cleanup.group_alive", return_value=True), \
+                patch("harness.util.os.killpg", side_effect=AssertionError("must not signal")), \
+                self.assertRaisesRegex(HarnessError, "other"):
+            cleanup_verification(self.repo, self.run["id"], remove=True, confirm_exited=[selected["id"]])
+        saved = read_json(self.directory / "state.json")
+        self.assertTrue(saved["dispatches"][-2]["exit_confirmed"])
+        self.assertEqual(saved["dispatches"][-1], other)
+        self.assertTrue(self.confirmation_events()[-1]["observed"]["group_alive"])
+        self.assertTrue(self.checkout.exists())
+        self.assertFalse(self.artifact.with_name("cleanup.json").exists())
+
+    def test_confirmation_audit_is_persisted_before_state_and_failure_cannot_grant_exit(self):
+        selected = self.add_unknown_dispatch()
+        before = (self.directory / "state.json").read_bytes()
+        with patch("harness.cleanup.append_event", side_effect=OSError("audit unavailable")), \
+                self.assertRaisesRegex(OSError, "audit unavailable"):
+            cleanup_verification(self.repo, self.run["id"], confirm_exited=[selected["id"]])
+        self.assertEqual((self.directory / "state.json").read_bytes(), before)
+        self.assertEqual(self.confirmation_events(), [])
+        with patch("harness.cleanup.write_json", side_effect=OSError("state unavailable")), \
+                self.assertRaisesRegex(OSError, "state unavailable"):
+            cleanup_verification(self.repo, self.run["id"], confirm_exited=[selected["id"]])
+        self.assertEqual((self.directory / "state.json").read_bytes(), before)
+        self.assertEqual(self.confirmation_events()[0]["dispatch_id"], selected["id"])
+        self.assertTrue(self.checkout.exists())
+
+    def test_cli_terminal_confirmation_needs_no_configuration_and_keeps_file_gates(self):
+        selected = self.add_unknown_dispatch()
+        unsaved = self.checkout / "__pycache__" / "operator-data"
+        unsaved.parent.mkdir()
+        unsaved.write_text("keep")
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = main(["--repo", str(self.repo), "--config", str(self.repo / "absent.toml"),
+                         "cleanup-verification", self.run["id"], "--remove",
+                         "--confirm-exited", selected["id"]])
+        self.assertEqual(code, 1)
+        self.assertEqual(json.loads(stdout.getvalue())["checkouts"][0]["status"], "blocked")
+        self.assertEqual(unsaved.read_text(), "keep")
+        saved = read_json(self.directory / "state.json")
+        self.assertTrue(saved["dispatches"][-1]["exit_confirmed"])
+        self.assertEqual(saved["status"], "completed")

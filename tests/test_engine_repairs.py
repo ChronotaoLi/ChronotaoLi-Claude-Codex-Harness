@@ -368,8 +368,9 @@ class EngineRepairsTests(RepoCase):
         with self.assertRaises(HarnessError):
             engine.start("Implement greet", plan)
         self.assertEqual(backend.calls, [])
-        self.assertEqual(engine.run["total_attempts"], 0)
-        self.assertEqual(engine.run["status"], "blocked")
+        self.assertIsNone(engine.run)
+        self.assertFalse((engine.state / "runs").exists())
+        self.assertFalse((engine.state / "worktrees").exists())
 
     def test_final_history_stores_digest_and_external_snapshot(self):
         engine = self.engine(RecordingBackend())

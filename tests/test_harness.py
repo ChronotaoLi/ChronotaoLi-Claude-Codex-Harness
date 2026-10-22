@@ -23,6 +23,20 @@ from harness.util import HarnessError, read_json, run_process
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def interrupt_started_agent(kwargs):
+    """Interrupt a real owned child after its pgid is durably recorded.
+
+    Recovery fixtures need evidence of an exited process; a backend raising
+    before on_start instead represents an unknown startup that must stay blocked.
+    """
+    def interrupt(pgid):
+        kwargs["on_start"](pgid)
+        raise KeyboardInterrupt()
+
+    run_process([sys.executable, "-c", "import time; time.sleep(30)"], kwargs["cwd"],
+                kwargs["job"] / "interrupted-process", on_start=interrupt)
+
+
 class RepoCase(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -235,7 +249,7 @@ class RuntimeTests(RepoCase):
         class InterruptOnce(DemoBackend):
             def invoke(self, **kwargs):
                 if kwargs["role"] == "worker":
-                    raise KeyboardInterrupt()
+                    interrupt_started_agent(kwargs)
                 return super().invoke(**kwargs)
         engine = self.engine(InterruptOnce())
         with self.assertRaises(KeyboardInterrupt):

@@ -72,6 +72,8 @@ python3 -m harness --config /absolute/path/harness.toml --repo /absolute/path/to
 
 可用 `--plan /path/to/plan.json` 提供已有计划，格式见 [examples/plan.json](examples/plan.json)。计划会检查任务 ID、依赖环、非空验收条件、文件范围及引用的 skill 是否存在。`allowed_paths` 从仓库根目录匹配：`src/*` 只匹配直接子项，`src/**` 匹配所有层级，`**/*.py` 也可匹配根目录 Python 文件；只有独立的 `**` 路径段跨越 `/`。显式指向 `.git`、`.harness`、`.codex`、`.claude` 的范围在规划时拒绝，实际变更仍会独立检查这些受保护路径。唯一就绪任务在首次尝试且没有反馈时直接使用完整任务简报派发；存在选择或返工反馈时才调用指挥。
 
+用户提供的计划在创建 run 目录、分支和 worktree 前完成校验，输入错误可直接修正后重试。`**`、`**/*` 等常见全仓库模式仍允许使用，但登记计划时会向 stderr 提示并记录 `broad_scope_warning`；这类范围不限制普通项目文件，受保护路径门禁仍生效。
+
 默认连续执行。需要先检查计划或分步执行时，可显式选择：
 
 ```bash
@@ -109,6 +111,8 @@ python3 -m harness --repo /path/to/project cleanup-verification run_实际ID --r
 
 默认只返回各检出的可清理状态；`--remove` 在运行锁内确认旧进程退出、路径归属、Git 绑定及原验证提交后逐项移除，保留运行台账、diff、日志和 `checkout.json`，另写清理记录。已跟踪修改、未跟踪或忽略文件均阻止清理，需要先人工核对。目录已缺失时，仅在原绑定仍可核验的情况下注销该精确路径，不执行全仓库 prune。该命令兼容版本 7、8 的台账，不加载配置或调用模型。
 
+旧 dispatch 没有可确认的退出记录时，清理与恢复均停止；缺少 pgid 不能证明进程未启动。核实退出后可执行 `cleanup-verification RUN --confirm-exited DISPATCH_ID`，可重复指定 ID，也可与 `--remove` 合用。此确认入口支持已完成或已放弃的 run，先保存审计事件，再更新指定 dispatch 的确认，不改变 run 状态或放松文件清理门禁。未指定确认时，预览不改运行台账。
+
 运行开始、worker 返回及验证结束还保存被忽略路径的清单和相对初始状态的增减，变化写入事件；审阅输入带清单产物引用。目录折叠显示，此诊断不哈希忽略文件内容，也不能发现既有依赖目录内部的修改，不能替代全新检出验证。
 
 ```bash
@@ -121,6 +125,8 @@ python3 -m harness --config /path/to/harness.toml --repo /path/to/project resume
 `status <run_id>` 默认显示状态、任务、预算和最后错误首行；`--full` 输出完整台账。需要结束未完成运行时使用 `abandon <run_id>`，保留分支、工作树和证据，并禁止继续恢复。可追加 `--remove-worktree` 移除该 run 的干净工作树；进程仍存活、HEAD 不符或有任何未保存文件（包括忽略文件）时拒绝移除，不使用强制删除。
 
 移除前还独立核对已跟踪文件的字节与 HEAD，并拒绝 `assume-unchanged`、`skip-worktree` 标记。换行转换或 clean/smudge 过滤导致工作树字节不同，也会保守拒绝；此时可只放弃运行并保留工作树。
+
+未跟踪文件（包括忽略文件）导致清理失败时，错误列出前 10 个阻塞路径及剩余数量，长路径作有界显示；这些文件仍需人工核对，不自动删除。
 
 `resume` 使用已有台账、代码现场和新的 agent 继续，不恢复供应商会话。任务、总 worker、模型派发、有效再规划和最终验收次数均不会因恢复而清零。可以调大 `context_chars`、两种超时、`claude_max_turns`、`max_attempts`、`max_total_attempts`、`max_agent_dispatches`、`max_replans` 和 `max_final_attempts` 后恢复；也可以在 `permissions.worker_commands` 中追加精确 argv，但不能删除或修改已有授权。变更写入事件，其余配置和共享资源必须一致。旧进程组仍存活、无法确认其退出，或 Git HEAD 与检查点不一致时停止恢复。账号授权、模型权限和其他 CLI 故障直接报错，不自动换模型或进行通用瞬时故障重试。
 
@@ -152,9 +158,11 @@ python3 -m harness --config /path/to/harness.toml --repo /path/to/project resume
 python3 -m harness --config /path/to/harness.toml --repo /path/to/project resume run_实际ID --repair-invalid DISPATCH_ID
 ```
 
-适用对象是语义非法的指挥计划／`revise`，以及没有 blocking finding、但存在重复 finding ID 或越界记忆批准的 `approve`。每个角色／调用类型／任务在整个 run 内最多授权一次，原结果文件与派发输入保留，`invalid_repairs` 保存原 receipt、内容摘要和快照依据；修正使用新进程、新 dispatch，继续消耗累计派发预算。审阅修正必须保留 verdict、全部 finding 内容与顺序，以及原先已批准的合法记忆 key；只可修正重复或非法 ID、摘要、去重 key 并删除不属于提案的 key。
+适用对象是语义非法的指挥计划／`revise`，以及没有 blocking finding、但存在重复 finding ID 或越界记忆批准的 `approve`。自动格式修正额度耗尽后，指挥任务选择的指令、`revise` 的原因文本，以及无 blocking finding 的 `approve` 的可变格式字段，也可请求这一次显式修正。每个角色／调用类型／任务在整个 run 内最多授权一次，语义和格式修正共用此额度。原结果文件与派发输入保留，`invalid_repairs` 保存原 receipt、内容摘要和快照依据；修正使用新进程、新 dispatch，继续消耗累计派发预算。
 
-该选项不能处理身份／结构错误、stop、拒绝或 blocking 审阅、已有格式修正、不可改写的超大 finding，也不能绕过合法结果的 hook 失败。修正结果已返回后不会再次重抽；尚未返回结果的 CLI 故障可普通 `resume` 继续，仍受预算限制，完成或待处理的修正守卫都会保留。`--repair-invalid` 不能与 `--reverify`、`--retry-stopped` 或 `--allow-scope` 同时使用。
+审阅修正必须保留最初 verdict、全部 finding 内容与顺序，以及原先已批准的合法记忆 key；只可修正重复或非法 ID、摘要、去重 key，并在语义修正中删除不属于提案的 key。格式耗尽后的修正同时绑定最初结果和失败修正结果；指挥格式修正固定最初选择的任务或修订操作，只能修正对应的指令或原因文本。旧 v8 指挥格式修正若缺少最初结果的已绑定摘要，不补造依据；普通恢复和显式修正均停止，可保留证据后 `abandon`。已有摘要的旧 reviewer 守卫仍可按上述条件恢复。
+
+该选项不能处理身份／结构错误、stop、拒绝或 blocking 审阅、改变原结论的失败修正、不可改写的超大 finding，也不能绕过合法结果的 hook 失败。修正结果已返回后不会再次重抽，也不另获自动格式修正额度；尚未返回结果的 CLI 故障可普通 `resume` 继续，仍受预算限制，完成或待处理的修正守卫都会保留。`--repair-invalid` 不能与 `--reverify`、`--retry-stopped` 或 `--allow-scope` 同时使用。
 
 指挥明确 `stop` 后保存停止原因和原规划请求，普通 `resume` 不派发模型。操作者决定重试时使用 `resume <run_id> --retry-stopped <task_id>`，整体验收的停止使用 `--retry-stopped final`。该选项重新请求规划，保留原停止证据，仍消耗累计再规划与派发预算。整体拒绝后，若修正任务接受了空 diff，运行时保留原拒绝并再次请求受预算约束的修正规划，不对同一快照重抽审阅。
 
@@ -219,6 +227,8 @@ python3 -m harness sync --role worker
 ```
 
 脚本工作目录是配置所在目录，从 stdin 读取 JSON 事件，非零退出码或超时阻止继续。全部事件、argv 和正有限超时值在执行任何脚本前校验。通过事件中的路径定位目标项目。默认空数组表示没有额外策略。`context_prepared` 表示已组装有界输入；旧名 `context_compacted` 仍可单独配置作为别名，不能与新名同时配置非空脚本。它们与厂商原生的 `PreToolUse`、`PostToolUse` 不是同一层；运行时不截获所有原生工具调用。生成的调用会关闭个人原生 hooks/自动记忆，避免重复采集；企业管理配置可能仍有更高优先级。
+
+所有 hook 事件都有 `run_id`、`repo`（目标仓库）、`worktree`（该事件的工作树）和 `run_dir`（运行证据目录），路径为绝对路径。全新检出的 `pre_verify`／`post_verify` 使用实际验证目录作为 `worktree`，另以 `source_worktree` 指向原 run 工作树；其他事件默认使用 run 工作树。
 
 `post_agent` 接收已通过结果校验的调用，以及明确保留为 `invalid_rejected` 的审阅。其他非法结果在调用该 hook 前停止。“至少一次”指已进入 hook 门禁后的重试语义，不要求每个非法模型输出也触发 `post_agent`。
 
@@ -315,7 +325,7 @@ worker 的格式修正一旦返回结果，就结束该待修正状态，即使�
 
 任务候选文件变化时，旧审阅接收记录及格式修正原始结果会先保留到审阅历史，再重新执行任务。历史标注快照失效、协议错误和产物摘要，后续 worker/reviewer 可读取原始证据；旧批准不能用于新候选。已绑定的产物缺失或被改动仍停止，不能通过改文件隐藏它。
 
-finding 数量、位置、说明或证据等不可变字段违反格式限制时，直接保存不可修复状态；已返回的格式修正仍不合法时保存额度耗尽状态。普通恢复不再调用 reviewer。只有修正进程未返回结果的 CLI 故障才允许人工恢复后重派，仍保留原结论和累计预算。
+finding 数量、位置、说明或证据等不可变字段违反格式限制时，直接保存不可修复状态；已返回的格式修正仍不合法时保存额度耗尽状态。普通恢复不再调用 reviewer；只有符合上述条件的格式耗尽批准可显式使用 `--repair-invalid`。修正进程未返回结果的 CLI 故障允许人工恢复后重派，仍保留原结论和累计预算。完整的阻塞状态与操作出口见 [设计文档](docs/design.md#阻塞状态与操作者出口)。
 
 超时会停止该次调用的进程组；验证超时还会保存 `timed_out`、退出码 124 和日志。缺少 CLI、无效供应商输出和其他运行错误进入 blocked，Ctrl+C、SIGTERM 和终端 SIGHUP 进入 interrupted，清理子进程组并保留检查点。角色调用故障单独记入 `last_runtime_error`，不作为无关 worker 的返工反馈。若进程在 Git commit 与检查点写入之间被强制杀死，恢复会因 HEAD 不一致而拒绝自动重放；先核对包含 `Harness-Run` / `Harness-Task` 的提交。首版不提供自动“修复”状态文件的危险捷径。任务级非法审阅并不锁死整个 run：范围内候选真实改变时，运行时归档原始结果及身份／结构诊断，再执行新的任务尝试；同一候选不能靠普通 resume 重抽。整体审阅仍遵守其独立的拒绝与恢复门禁。
 

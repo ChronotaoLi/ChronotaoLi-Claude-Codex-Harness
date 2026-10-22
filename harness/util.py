@@ -73,21 +73,100 @@ def group_alive(pgid: int) -> bool:
         return True
 
 
+def _dispatch_pgid(entry):
+    if not isinstance(entry, dict):
+        raise HarnessError("运行台账 dispatch 无效")
+    pgid = entry.get("pgid")
+    if pgid is not None and (type(pgid) is not int or pgid <= 0):
+        raise HarnessError("运行台账进程组 ID 无效")
+    return pgid
+
+
+def ensure_dispatches_exited(dispatches, *, observe=group_alive):
+    """Use the same conservative exit gate for execution and cleanup.
+
+    Only a saved preparation state proves that startup has not been attempted.
+    An absent pgid after startup may mean the controller died between Popen and
+    its callback, including for older ledgers without process_state.
+    """
+    exited = []
+    for entry in dispatches:
+        pgid = _dispatch_pgid(entry)
+        if entry.get("exit_confirmed") is True:
+            continue
+        hint = ("核实旧进程已退出后，可用 --confirm-exited <dispatch_id> 留痕确认；"
+                "已完成或已放弃的 run 使用 cleanup-verification 的同名选项")
+        if pgid is not None:
+            if observe(pgid):
+                raise HarnessError(f"旧 dispatch {entry.get('id', '<unknown>')} 的进程组仍存在；{hint}")
+            exited.append(entry)
+        elif entry.get("process_state") != "prepared":
+            raise HarnessError(f"无法确认旧 dispatch {entry.get('id', '<unknown>')} 已退出；{hint}")
+    return exited
+
+
+def confirm_dispatches_exited(dispatches, identifiers, *, audit, save, observe=group_alive):
+    """Audit explicit assertions before saving them; never send process signals."""
+    identifiers = list(dict.fromkeys(identifiers))
+    if not identifiers:
+        return
+    entries = {}
+    for entry in dispatches:
+        if not isinstance(entry, dict) or not isinstance(entry.get("id"), str):
+            raise HarnessError("运行台账 dispatch 身份无效")
+        if entry["id"] in entries:
+            raise HarnessError("运行台账 dispatch ID 重复；不能确认退出")
+        entries[entry["id"]] = entry
+    unknown = set(identifiers) - entries.keys()
+    if unknown:
+        raise HarnessError(f"未知 dispatch ID：{sorted(unknown)}")
+    # Validate the whole selected batch before observation, audit or mutation.
+    for ident in identifiers:
+        _dispatch_pgid(entries[ident])
+    for ident in identifiers:
+        entry = entries[ident]
+        if entry.get("exit_confirmed") is True:
+            continue
+        pgid = entry.get("pgid")
+        observed = {"pgid": pgid, "group_alive": observe(pgid) if pgid is not None else None}
+        if pgid is not None:
+            try:
+                process = subprocess.run(
+                    ["ps", "-p", str(pgid), "-o", "pid=,ppid=,pgid=,lstart=,comm="],
+                    capture_output=True, text=True, errors="replace", timeout=5, check=False)
+                observed.update(leader=process.stdout.strip(), query_exit_code=process.returncode)
+            except (OSError, subprocess.TimeoutExpired) as error:
+                observed["query_error"] = str(error)
+        confirmation = {"time": time.time(), "observed": observed}
+        audit("dispatch_exit_confirmed_by_operator", dispatch_id=ident, **confirmation)
+        entry.update(exit_confirmed=True, operator_exit_confirmation=confirmation)
+        save()
+
+
+def append_event(path, run_id, event, **fields):
+    record = {"time": time.time(), "event": event, "run_id": run_id, **fields}
+    with path.open("a", encoding="utf-8") as output:
+        output.write(json.dumps(record, ensure_ascii=True) + "\n")
+        output.flush()
+        os.fsync(output.fileno())
+
+
 def run_process(argv: list[str], cwd: Path, log: Path, *, stdin: str = "",
                 timeout: int | float = 900, env=None, on_start=None) -> int:
     """No shell interpolation; terminate the owned process group on all exits."""
     log.parent.mkdir(parents=True, exist_ok=True)
     with log.with_suffix(".stdout").open("w", encoding="utf-8") as out, \
             log.with_suffix(".stderr").open("w", encoding="utf-8", errors="backslashreplace") as err:
+        p = None
         try:
-            p = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.PIPE, stdout=out,
-                                 stderr=err, text=True, env=env, start_new_session=True)
-        except (OSError, ValueError) as e:
-            message = f"无法启动进程 {argv[0] if argv else '<empty argv>'}：{e}；日志：{log}"
-            err.write(message + "\n")
-            raise HarnessError(message) from e
-        started = time.monotonic()
-        try:
+            try:
+                p = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.PIPE, stdout=out,
+                                     stderr=err, text=True, env=env, start_new_session=True)
+            except (OSError, ValueError) as e:
+                message = f"无法启动进程 {argv[0] if argv else '<empty argv>'}：{e}；日志：{log}"
+                err.write(message + "\n")
+                raise HarnessError(message) from e
+            started = time.monotonic()
             if on_start:
                 on_start(p.pid)
             data = stdin
@@ -102,17 +181,18 @@ def run_process(argv: list[str], cwd: Path, log: Path, *, stdin: str = "",
                     data = None
                     print(f"[harness] {argv[0]} 仍在运行；日志 {log}", file=sys.stderr)
         finally:
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(p.pid, signal.SIGTERM)
-            try:
-                p.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                pass
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(p.pid, signal.SIGKILL)
-            p.wait()
-            if p.stdin:
-                p.stdin.close()
+            if p is not None:
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(p.pid, signal.SIGTERM)
+                try:
+                    p.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    pass
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(p.pid, signal.SIGKILL)
+                p.wait()
+                if p.stdin:
+                    p.stdin.close()
 
 
 def tail(path: Path, size=4000) -> str:

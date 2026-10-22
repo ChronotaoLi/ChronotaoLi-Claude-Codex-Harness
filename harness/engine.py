@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import subprocess
 import sys
 import tempfile
 import time
@@ -18,11 +17,13 @@ from .context import (FINAL_REVIEW_INSTRUCTION, capacity_report, compact_checks,
 from .contracts import (DETAIL, PLAN, REPLAN, REVIEW, WORK, RepairableFormatError, apply_revision,
                         envelope, obj, output_constraints, review_output_constraints, review_approved, validate,
                         validate_plan, validate_review, validate_review_correction, validate_review_semantics,
-                        validate_structure, validate_work, validate_work_semantics, validate_approval_repair)
+                        validate_structure, validate_work, validate_work_semantics, validate_approval_repair,
+                        validate_commander_format_correction)
 from .memory import Memory, validate_proposals
 from .recovery import InvalidOutputRecovery, read_bound_result, snapshot_digest
 from .shared import HookError, Hooks, asset_digest, read_skill, skills_catalog
-from .util import (HarnessError, ProcessTimeout, dump, group_alive, lock,
+from .util import (HarnessError, ProcessTimeout, append_event, confirm_dispatches_exited,
+                   dump, ensure_dispatches_exited, group_alive, lock,
                    read_json, run_process, tail, uid, write_json)
 
 
@@ -57,6 +58,14 @@ class Engine(InvalidOutputRecovery):
     @property
     def worktree(self):
         return Path(self.run["worktree"])
+
+    def emit_hook(self, event, payload, logs):
+        # Bind every lifecycle event to its run, including resumed receipts and
+        # error paths. Verification may explicitly target a fresh checkout.
+        context = {**payload, "run_id": self.run["id"], "repo": str(self.repo),
+                   "worktree": payload.get("worktree", str(self.worktree)),
+                   "run_dir": str(self.directory)}
+        return self.hooks.emit(event, context, logs)
 
     def snapshot(self):
         git.check_worktree_state(self.worktree)
@@ -95,9 +104,7 @@ class Engine(InvalidOutputRecovery):
         write_json(self.directory / "state.json", self.run)
 
     def event(self, event, **fields):
-        record = {"time": time.time(), "event": event, "run_id": self.run["id"], **fields}
-        with (self.directory / "events.jsonl").open("a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=True) + "\n")
+        append_event(self.directory / "events.jsonl", self.run["id"], event, **fields)
         print(f"[harness] {event} {fields.get('task_id', '')}", file=sys.stderr, flush=True)
 
     def checkpoint(self):
@@ -213,39 +220,13 @@ class Engine(InvalidOutputRecovery):
         self.save()
 
     def ensure_exited(self):
-        for entry in self.run["dispatches"]:
-            if not entry.get("exit_confirmed") and entry.get("pgid"):
-                if group_alive(entry["pgid"]):
-                    raise HarnessError(f"旧 dispatch {entry.get('id', '<unknown>')} 的进程组仍存在；"
-                                       "核实旧进程已退出后，可用 --confirm-exited <dispatch_id> 留痕确认")
-                entry["exit_confirmed"] = True
+        for entry in ensure_dispatches_exited(self.run["dispatches"], observe=group_alive):
+            entry["exit_confirmed"] = True
 
     def confirm_exited(self, identifiers):
         """Record an operator's explicit assertion; never signal an unowned group."""
-        entries = {entry.get("id"): entry for entry in self.run["dispatches"]}
-        unknown = set(identifiers) - entries.keys()
-        if unknown:
-            raise HarnessError(f"未知 dispatch ID：{sorted(unknown)}")
-        for ident in dict.fromkeys(identifiers):
-            entry = entries[ident]
-            if entry.get("exit_confirmed"):
-                continue
-            pgid = entry.get("pgid")
-            observed = {"pgid": pgid, "group_alive": bool(pgid and group_alive(pgid))}
-            if pgid:
-                try:
-                    process = subprocess.run(
-                        ["ps", "-p", str(pgid), "-o", "pid=,ppid=,pgid=,lstart=,comm="],
-                        capture_output=True, text=True, errors="replace", timeout=5, check=False)
-                    observed.update(leader=process.stdout.strip(), query_exit_code=process.returncode)
-                except (OSError, subprocess.TimeoutExpired) as error:
-                    observed["query_error"] = str(error)
-            confirmation = {"time": time.time(), "observed": observed}
-            # Append the audit record before persisting the override, so a crash
-            # cannot make a process appear exited without a recorded assertion.
-            self.event("dispatch_exit_confirmed_by_operator", dispatch_id=ident, **confirmation)
-            entry.update(exit_confirmed=True, operator_exit_confirmation=confirmation)
-            self.save()
+        confirm_dispatches_exited(self.run["dispatches"], identifiers,
+                                  audit=self.event, save=self.save, observe=group_alive)
 
     def stop(self, error):
         self.run["status"] = "interrupted" if isinstance(error, (KeyboardInterrupt, SystemExit)) else "blocked"
@@ -256,7 +237,7 @@ class Engine(InvalidOutputRecovery):
         self.checkpoint()
         self.event("run_stopped", error=str(error), error_type=type(error).__name__)
         try:
-            self.hooks.emit("on_error", {"error": str(error), "run_id": self.run["id"]},
+            self.emit_hook("on_error", {"error": str(error)},
                             self.directory / "hooks" / f"error-{self.run['error_hook_attempts']}")
         except Exception as hook_error:
             self.event("error_hook_failed", error=str(hook_error))
@@ -297,7 +278,7 @@ class Engine(InvalidOutputRecovery):
         # Memory completion and this gate both precede any subsequent dispatch.
         pending["hook_attempts"] = pending.get("hook_attempts", 0) + 1
         self.save()
-        self.hooks.emit("post_accept", payload, Path(pending["logs"]) / f"post_accept-{pending['hook_attempts']}")
+        self.emit_hook("post_accept", payload, Path(pending["logs"]) / f"post_accept-{pending['hook_attempts']}")
         self.run.pop("pending_post_accept")
         self.save()
         return True
@@ -330,6 +311,9 @@ class Engine(InvalidOutputRecovery):
         candidate_digest = (snapshot_digest(self.snapshot())
                             if guard or key in pending else None)
         if key in pending:
+            if role == "commander" and not pending[key]["correction"].get("source"):
+                # Legacy evidence must not disappear through candidate invalidation.
+                self.commander_format_source(key, {"format_correction": pending[key]["correction"]})
             correction_id = pending[key].get("dispatch_id")
             returned = (correction_id and
                         (self.directory / "dispatches" / correction_id / "returned-result.json").exists())
@@ -349,12 +333,20 @@ class Engine(InvalidOutputRecovery):
                 self.save()
             else:
                 if guard.get("failed"):
-                    raise HarnessError("审阅格式修复违反原审阅结论；同一快照禁止重复抽取结论")
-                if guard.get("unrepairable") or guard.get("exhausted"):
-                    raise HarnessError(f"审阅格式无法在保留证据和修复额度内修正；禁止重复派发：{guard['error']}")
+                    raise HarnessError("审阅格式修复违反原审阅结论；同一快照禁止重复抽取结论；请保留证据并 abandon")
+                repair = self.active_invalid_repair(key)
+                explicit_format = repair and repair.get("mode") == "format"
+                if guard.get("unrepairable"):
+                    raise HarnessError(f"审阅不可变字段格式无法修复；请保留证据并 abandon：{guard['error']}")
+                if guard.get("exhausted") and not explicit_format:
+                    original = self.read_review_correction(guard)
+                    raise HarnessError(f"审阅自动格式修正额度已用：{guard['error']}" +
+                                       self.format_repair_guidance(key, original))
                 previous_review = self.read_review_correction(guard)
                 previous_review = {k: v for k, v in previous_review.items() if k not in ("task_id", "dispatch_id")}
                 packet = {**packet, "format_correction": self.review_correction(guard, previous_review)}
+        if role == "commander":
+            self.commander_format_source(key, packet)
         while True:
             self.ensure_exited()
             receipts = self.run["commander_receipts"] if role == "commander" else self.run["review_receipts"]
@@ -435,7 +427,7 @@ class Engine(InvalidOutputRecovery):
                     self.save()
                     if role == "worker":
                         raise HarnessError(f"{error}；格式修复额度已用，resume 将执行新的普通 worker 尝试并消耗任务、总尝试及派发预算") from error
-                    raise
+                    raise HarnessError(str(error) + self.format_repair_guidance(key, previous_review or returned)) from error
                 # Keep a returned invalid correction attached until the terminal
                 # guard is durable; an interruption must not turn it into a retry.
                 if role == "worker":
@@ -449,6 +441,13 @@ class Engine(InvalidOutputRecovery):
                               "instruction": "Correct the reported output format using the current task and files. Recheck the evidence. Return only this dispatch's IDs; do not relax acceptance or discard blocking findings."}
                 if role == "reviewer":
                     correction = self.review_correction(guard, previous_review)
+                elif role == "commander":
+                    correction["source"] = {field: receipt[field] for field in
+                                            ("artifact", "artifact_digest", "dispatch_id", "snapshot_digest")}
+                    correction["instruction"] = (
+                        "Correct only the reported text format using this dispatch's IDs. Read source.artifact. "
+                        "Preserve the original selected_task, or action, new_tasks and updates exactly. "
+                        "Do not change scope, acceptance or the selected revision operations.")
                 packet = {**packet, "format_correction": correction}
                 pending[key] = {"correction": correction,
                                 "snapshot_digest": snapshot_digest(self.snapshot())}
@@ -502,6 +501,12 @@ class Engine(InvalidOutputRecovery):
             raise HarnessError("指挥原始结果不是有效 JSON；保留证据，禁止重新抽取结论") from error
         contract = envelope(receipt["request"]["schema"], entry["task_id"], entry["id"])
         validate_structure(result, contract)
+        previous = self.commander_format_source(key, receipt["request"]["packet"])
+        repair = self.active_invalid_repair(key)
+        if repair and repair.get("mode") == "format":
+            previous = self.validate_invalid_repair_source(key)
+        if previous is not None:
+            validate_commander_format_correction(entry["kind"], previous, result)
         payload = {k: v for k, v in result.items() if k not in ("task_id", "dispatch_id")}
         if entry["kind"] == "plan":
             self.validate_tasks(payload)
@@ -514,13 +519,14 @@ class Engine(InvalidOutputRecovery):
         if not receipt.get("hook_completed"):
             receipt["hook_attempts"] = receipt.get("hook_attempts", 0) + 1
             self.save()
-            self.hooks.emit("post_agent", {**entry, "status": "completed", "result": result},
+            self.emit_hook("post_agent", {**entry, "status": "completed", "result": result},
                             artifact.parent / f"post-agent-{receipt['hook_attempts']}")
             if (git.head(self.worktree, binding=self.run["worktree_binding"]) != self.run["expected_head"]
                     or snapshot_digest(self.snapshot()) != receipt["snapshot_digest"]):
                 raise HarnessError("commander hook 修改了代码/HEAD；已停止，保留现场")
             receipt["hook_completed"] = True
         self.validate_invalid_repair_source(key)
+        self.commander_format_source(key, receipt["request"]["packet"])
         entry["status"] = "completed"
         entry.pop("error", None)
         self.save()
@@ -586,7 +592,7 @@ class Engine(InvalidOutputRecovery):
             receipt["hook_attempts"] = receipt.get("hook_attempts", 0) + 1
             self.save()
             logs = artifact.parent / f"post-agent-{receipt['hook_attempts']}"
-            self.hooks.emit("post_agent", {**entry, "status": "invalid_rejected" if rejection else "completed",
+            self.emit_hook("post_agent", {**entry, "status": "invalid_rejected" if rejection else "completed",
                                            "result": result,
                                            **({"validation_error": str(rejection)} if rejection else {})}, logs)
             if (git.head(self.worktree, binding=self.run["worktree_binding"]) != self.run["expected_head"]
@@ -627,21 +633,26 @@ class Engine(InvalidOutputRecovery):
         memories = self.memory.search(query, level=1)
         prompt, report = compose(required, memories, self.config.data["runtime"]["context_chars"])
         write_json(job / "context-report.json", report)
-        self.hooks.emit("context_prepared", {"report": report, "run_id": self.run["id"]}, job)
-        self.run["dispatches"].append({"id": dispatch_id, "role": role, "kind": kind, "task_id": task_id, "status": "running", "pgid": None})
+        self.emit_hook("context_prepared", {"report": report}, job)
+        self.run["dispatches"].append({"id": dispatch_id, "role": role, "kind": kind, "task_id": task_id,
+                                       "status": "running", "pgid": None, "process_state": "prepared"})
         entry = self.run["dispatches"][-1]
         self.save()
         self.event("dispatch_started", task_id=task_id, dispatch_id=dispatch_id, role=role)
         def on_start(pgid):
             entry["pgid"] = pgid
+            entry["process_state"] = "running"
             self.save()
 
         invoked = False
+        startup_interrupted = False
         try:
-            self.hooks.emit("pre_agent", entry, job)
+            self.emit_hook("pre_agent", entry, job)
             before = self.snapshot()
             entry["snapshot_digest"] = snapshot_digest(before)
             self.validate_invalid_repair_source(f"{role}:{kind}:{task_id}", before)
+            if role == "commander":
+                self.commander_format_source(f"{role}:{kind}:{task_id}", packet, before)
             if self.run["agent_dispatches"] >= self.config.data["runtime"]["max_agent_dispatches"]:
                 raise HarnessError("已达 run 模型派发次数上限；可显式增大 max_agent_dispatches 后恢复")
             # Persist all invocation budgets together after local preparation.
@@ -680,11 +691,16 @@ class Engine(InvalidOutputRecovery):
                     "request": request, "request_digest": snapshot_digest(request),
                     "request_id": (self.run["pending_replan"]["request_id"] if kind == "replan"
                                    else dispatch_id)}
+            entry["process_state"] = "starting"
             self.save()
             invoked = True
             result = self.backend.invoke(role=role, model=self.config.role(role, self.commander), cwd=self.worktree,
                                          job=job, schema=contract, prompt=prompt, run_path=self.directory / "state.json",
                                          on_start=on_start, task=task, kind=kind)
+            # The synchronous backend has returned through run_process cleanup.
+            # Receipt validation may itself check that all processes exited.
+            entry["exit_confirmed"] = not entry["pgid"] or not group_alive(entry["pgid"])
+            entry["process_state"] = "exited" if entry["exit_confirmed"] else "running"
             write_json(job / "returned-result.json", result)
             if role == "worker" and "format_correction" in packet:
                 self.run["pending_format_corrections"].pop(f"{role}:{kind}:{task_id}", None)
@@ -723,7 +739,7 @@ class Engine(InvalidOutputRecovery):
                 validate_review_correction(previous_review, result)
             validate(result, contract)
             entry["status"] = "completed"
-            self.hooks.emit("post_agent", {**entry, "result": result}, job)
+            self.emit_hook("post_agent", {**entry, "result": result}, job)
             if git.head(self.worktree, binding=self.run["worktree_binding"]) != self.run["expected_head"]:
                 raise HarnessError("agent hook 修改了 Git HEAD；已停止，保留现场")
             if role != "worker" and self.snapshot() != before:
@@ -732,6 +748,8 @@ class Engine(InvalidOutputRecovery):
         except InvalidReviewRejection:
             raise
         except BaseException as error:
+            startup_interrupted = (isinstance(error, (KeyboardInterrupt, SystemExit))
+                                   and entry["process_state"] == "starting" and entry["pgid"] is None)
             entry["status"] = "failed"
             entry["error"] = str(error)
             if not isinstance(error, (KeyboardInterrupt, SystemExit)):
@@ -747,7 +765,10 @@ class Engine(InvalidOutputRecovery):
                 self.run.setdefault("worker_recovery", {})[task_id] = recovery
             raise
         finally:
-            entry["exit_confirmed"] = not entry["pgid"] or not group_alive(entry["pgid"])
+            entry["exit_confirmed"] = (not startup_interrupted
+                                       and (not entry["pgid"] or not group_alive(entry["pgid"])))
+            if entry["exit_confirmed"]:
+                entry["process_state"] = "exited"
             self.save()
 
     def start(self, goal, plan=None, *, pause_after_plan=False, step=False):
@@ -758,6 +779,8 @@ class Engine(InvalidOutputRecovery):
         if not self.config.data["verification"]["commands"]:
             raise HarnessError("请先配置目标项目的 verification.commands")
         git.reject_submodules(self.repo)
+        if plan is not None:
+            self.validate_tasks(plan)
         ident = uid("run")
         worktree = self.state / "worktrees" / ident
         self.run = {"schema_version": 8, "id": ident, "repo": str(self.repo), "goal": goal, "status": "planning", "commander": self.commander,
@@ -921,7 +944,8 @@ class Engine(InvalidOutputRecovery):
             self.ensure_exited()
             git.check_worktree_binding(cwd, binding)
             log = folder / f"check-{i}"
-            entry = {"id": str(uuid.uuid4()), "role": "verification", "task_id": task_id, "status": "running", "pgid": None}
+            entry = {"id": str(uuid.uuid4()), "role": "verification", "task_id": task_id,
+                     "status": "running", "pgid": None, "process_state": "starting"}
             entry["worktree"] = str(cwd)
             if phase:
                 entry["phase"] = phase
@@ -930,9 +954,11 @@ class Engine(InvalidOutputRecovery):
 
             def on_start(pgid):
                 entry["pgid"] = pgid
+                entry["process_state"] = "running"
                 self.save()
 
             timed_out = False
+            startup_interrupted = False
             try:
                 code = run_process(command, cwd, log, timeout=self.config.data["runtime"]["verify_timeout_seconds"], on_start=on_start)
                 entry["status"] = "completed" if code == 0 else "failed"
@@ -940,12 +966,17 @@ class Engine(InvalidOutputRecovery):
                 code, timed_out = 124, True
                 entry["status"] = "timed_out"
             except BaseException as error:
+                startup_interrupted = (isinstance(error, (KeyboardInterrupt, SystemExit))
+                                       and entry["pgid"] is None)
                 entry["status"] = "interrupted" if isinstance(error, (KeyboardInterrupt, SystemExit)) else "failed"
                 self.run["feedback"] = {"task_id": task_id,
                     "verification_error": {"argv": command, "error": str(error), "log": str(log)}}
                 raise
             finally:
-                entry["exit_confirmed"] = not entry["pgid"] or not group_alive(entry["pgid"])
+                entry["exit_confirmed"] = (not startup_interrupted
+                                           and (not entry["pgid"] or not group_alive(entry["pgid"])))
+                if entry["exit_confirmed"]:
+                    entry["process_state"] = "exited"
                 self.save()
             results.append({"argv": command, "exit_code": code, "stdout": tail(log.with_suffix(".stdout")),
                             "stderr": tail(log.with_suffix(".stderr")), "log": str(log), "timed_out": timed_out})
@@ -965,11 +996,11 @@ class Engine(InvalidOutputRecovery):
         before = self.snapshot() if before is None else before
         if whole_run and self.config.data["verification"]["fresh_checkout"]:
             return self.verify_fresh_checkout(task_id, folder, before)
-        self.hooks.emit("pre_verify", {"task_id": task_id, "worktree": str(self.worktree),
+        self.emit_hook("pre_verify", {"task_id": task_id, "worktree": str(self.worktree),
                                       "scope": "run" if whole_run else "task"}, folder)
         results = self.run_verification_commands(task_id, self.config.data["verification"]["commands"],
                                                   self.worktree, folder, self.run["worktree_binding"])
-        self.hooks.emit("post_verify", {"task_id": task_id, "results": results}, folder)
+        self.emit_hook("post_verify", {"task_id": task_id, "results": results}, folder)
         after = self.snapshot()
         if after != before:
             changes = git.snapshot_changes(before, after)
@@ -1005,7 +1036,7 @@ class Engine(InvalidOutputRecovery):
         environment["binding"] = binding
         write_json(artifact, environment)
         baseline = git.snapshot(checkout, binding=binding)
-        self.hooks.emit("pre_verify", {"task_id": task_id, "worktree": str(checkout),
+        self.emit_hook("pre_verify", {"task_id": task_id, "worktree": str(checkout),
                                       "source_worktree": str(self.worktree), "scope": "run",
                                       "mode": "fresh_checkout"}, folder)
         setup = self.run_verification_commands(task_id, environment["setup_commands"], checkout,
@@ -1020,7 +1051,7 @@ class Engine(InvalidOutputRecovery):
                                                  checkout, folder, binding)
         for result in results:
             result.update(worktree=str(checkout), checkout_artifact=str(artifact))
-        self.hooks.emit("post_verify", {"task_id": task_id, "results": results,
+        self.emit_hook("post_verify", {"task_id": task_id, "results": results,
                                        "worktree": str(checkout), "source_worktree": str(self.worktree)}, folder)
         after = git.snapshot(checkout, binding=binding)
         if after != baseline:
@@ -1038,6 +1069,11 @@ class Engine(InvalidOutputRecovery):
 
     def record_plan(self, tasks, reason, trigger=None, *, finish_replan=False):
         revision = len(self.run["plan_history"])
+        previous = {(task["id"], pattern) for record in self.run["plan_history"]
+                    for task in record["tasks"] for pattern in task["allowed_paths"]}
+        broad = [{"task_id": task["id"], "pattern": pattern} for task in tasks
+                 for pattern in dict.fromkeys(task["allowed_paths"])
+                 if (task["id"], pattern) not in previous and git.repository_wide_scope(pattern)]
         artifact = self.directory / "plans" / f"revision-{revision}.json"
         record = {"revision": revision, "reason": reason, "trigger": trigger,
                   "tasks": deepcopy(tasks), "artifact": str(artifact)}
@@ -1050,6 +1086,10 @@ class Engine(InvalidOutputRecovery):
             self.run["current_task"] = None
             self.run.pop("pending_replan", None)
         self.save()
+        if broad:
+            self.event("broad_scope_warning", revision=revision, scopes=broad)
+            print("[harness] 警告：任务范围覆盖全仓库，受保护路径仍禁止修改："
+                  + json.dumps(broad, ensure_ascii=True), file=sys.stderr, flush=True)
 
     def replan(self, trigger):
         pending = self.run.get("pending_replan")
@@ -1406,7 +1446,7 @@ class Engine(InvalidOutputRecovery):
         logs = self.directory / "hooks" / f"{tid}-{attempt}" / f"pre_accept-{pending['hook_attempts']}"
         self.save()
         try:
-            self.hooks.emit("pre_accept", {"task_id": tid, "review": pending["review"]}, logs)
+            self.emit_hook("pre_accept", {"task_id": tid, "review": pending["review"]}, logs)
         except Exception as error:
             detail = {"error": str(error), "logs": str(logs), "review_artifact": pending["review_artifact"]}
             if isinstance(error, HookError):
@@ -1596,7 +1636,7 @@ class Engine(InvalidOutputRecovery):
                 raise HarnessError(f"指挥停止重新规划：{stopped['reason']}；"
                                    f"显式使用 resume --retry-stopped {stopped['target']} 可重试保存的规划请求")
             if not self.run["tasks"]:
-                plan = supplied_plan or self.dispatch("commander", "plan", "planning", PLAN,
+                plan = supplied_plan if supplied_plan is not None else self.dispatch("commander", "plan", "planning", PLAN,
                          {"goal": self.run["goal"], "instruction": "Inspect the repository, then decompose the goal into bounded tasks. Each worker does one task. Use real dependencies and observable acceptance. Never change files.",
                           "max_tasks": self.config.data["runtime"]["max_tasks"],
                           "tool_constraints": self.tool_constraints(),
