@@ -16,7 +16,7 @@ DEFAULTS = {
     },
     "permissions": {"worker_commands": []},
     "memory": {"task_ttl_days": 180, "knowledge_ttl_days": 180},
-    "verification": {"commands": []},
+    "verification": {"commands": [], "fresh_checkout": False, "setup_commands": []},
 }
 RESUME_INCREASES = (
     "agent_timeout_seconds", "verify_timeout_seconds", "context_chars",
@@ -127,6 +127,11 @@ class Config:
         if not isinstance(verification, dict):
             raise HarnessError("verification 必须为配置表")
         validate_commands(verification.get("commands", []), "verification.commands")
+        if type(verification.get("fresh_checkout", False)) is not bool:
+            raise HarnessError("verification.fresh_checkout 必须为布尔值")
+        validate_commands(verification.get("setup_commands", []), "verification.setup_commands")
+        if verification.get("setup_commands") and not verification.get("fresh_checkout"):
+            raise HarnessError("verification.setup_commands 需要开启 fresh_checkout")
         validate_commands(data["permissions"]["worker_commands"], "permissions.worker_commands", exact_permissions=True)
 
     def resume_changes(self, snapshot):

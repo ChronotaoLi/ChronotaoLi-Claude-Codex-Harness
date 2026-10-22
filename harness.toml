@@ -49,3 +49,7 @@ hooks = "shared/hooks.json"
 [verification]
 # 配置目标项目的验证命令。这里的默认值用于本 Harness 项目。
 commands = [["python3", "-m", "unittest", "discover", "-s", "tests", "-v"]]
+# 显式开启后，整体验证在仓库之外的全新 detached worktree 中执行。
+# setup_commands 只供确定性验证器准备依赖，不授予 worker Bash 权限。
+fresh_checkout = false
+setup_commands = []

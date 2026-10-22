@@ -43,8 +43,10 @@ def handle(request, memory, skills, run):
     try:
         name, args = params["name"], params.get("arguments", {})
         if name == "memory_search":
-            value = memory.search(args["query"], level=args.get("level", 1))
+            value = memory.search(args["query"], level=args.get("level", 1)) if memory.path.exists() else []
         elif name == "memory_read":
+            if not memory.path.exists():
+                raise HarnessError(f"没有此记忆：{args['id']}")
             value = memory.read(args["id"])
         elif name == "skill_list":
             value = skills_catalog(skills)
@@ -69,7 +71,8 @@ def main():
     run_state = read_json(args.run) if args.run else {}
     repo = Path(run_state["worktree"]) if run_state.get("worktree") else (
         args.state.parent if args.state.name == ".harness" else None)
-    memory = Memory(args.state / "memory.sqlite3", repo=repo)
+    memory = Memory(args.state / "memory.sqlite3", repo=repo, read_only=True,
+                    binding=run_state.get("worktree_binding"))
     for line in sys.stdin:
         request = {}
         try:

@@ -212,23 +212,24 @@ class TaskStageRecoveryTests(RepoCase):
         with self.assertRaisesRegex(HarnessError, error):
             resumed.resume(engine.run["id"])
         self.assertEqual(resumed.run["replan_attempts"], 0)
-        self.assertEqual(resumed.run["agent_dispatches"], 3)
+        expected_dispatches = 3 if mode == "cli" else 2
+        self.assertEqual(resumed.run["agent_dispatches"], expected_dispatches)
         self.assertEqual(resumed.run["tasks"], self.plan()["tasks"])
         self.assertEqual(len(resumed.run["plan_history"]), 1)
         calls = list(backend.calls)
         again = self.engine(backend)
-        with self.assertRaisesRegex(HarnessError, "模型派发次数上限"):
+        with self.assertRaisesRegex(HarnessError, "模型派发次数上限" if mode == "cli" else error):
             again.resume(engine.run["id"])
-        self.assertEqual(again.run["agent_dispatches"], 3)
+        self.assertEqual(again.run["agent_dispatches"], expected_dispatches)
         self.assertEqual(again.run["replan_attempts"], 0)
         self.assertEqual(again.run["attempts"], {"greet": 1})
         self.assertEqual(backend.calls, calls)
-        self.assertEqual(len({request["dispatch_id"] for request in backend.requests}), 3)
+        self.assertEqual(len({request["dispatch_id"] for request in backend.requests}), expected_dispatches)
 
     def test_replan_cli_failures_preserve_revision_budget_but_consume_dispatch_budget(self):
         self.assert_replan_failure_budget("cli")
 
-    def test_replan_unknown_skill_preserves_revision_budget_but_consumes_dispatch_budget(self):
+    def test_replan_unknown_skill_preserves_result_and_budgets_on_resume(self):
         self.assert_replan_failure_budget("skill")
 
     def test_increasing_replan_budget_resumes_corrective_planning_without_rerolling_rejection(self):

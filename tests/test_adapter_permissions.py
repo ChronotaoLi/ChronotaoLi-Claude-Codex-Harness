@@ -77,6 +77,27 @@ class AdapterPermissionTests(unittest.TestCase):
             with self.subTest(name=name), self.assertRaisesRegex(HarnessError, "路径不能包含换行符"):
                 self.command(self.root / name)
 
+    def test_worker_denies_git_metadata_with_the_same_literal_path_escaping(self):
+        matcher = self.root / "deny-matcher"
+        matcher.mkdir()
+        subprocess.run(["git", "init", "-q", str(matcher)], check=True, capture_output=True)
+        for name in ("work[ab]", "work*", "work?", "work\\tree", "work (a,b)"):
+            worktree = self.root / name
+            worktree.mkdir()
+            argv, _ = self.command(worktree)
+            settings = json.loads(argv[argv.index("--settings") + 1])
+            rules = settings["permissions"]["deny"]
+            self.assertEqual(len(rules), 2)
+            (matcher / ".gitignore").write_text("\n".join(rule[len("Edit(/"):-1] for rule in rules) + "\n")
+            candidates = [(worktree / ".git", True), (worktree / ".git" / "config", True),
+                          (worktree / "a.py", False), (worktree / ".gitignore", False),
+                          (self.root / "worka" / ".git", False)]
+            for candidate, denied in candidates:
+                with self.subTest(name=name, candidate=candidate):
+                    result = subprocess.run(["git", "-C", str(matcher), "check-ignore", "--no-index",
+                                             "-q", "--", candidate.as_posix().lstrip("/")], capture_output=True)
+                    self.assertEqual(result.returncode, 0 if denied else 1, result.stderr)
+
     def test_readonly_roles_never_receive_scoped_or_bare_write_grants(self):
         for role in ("commander", "reviewer"):
             with self.subTest(role=role):

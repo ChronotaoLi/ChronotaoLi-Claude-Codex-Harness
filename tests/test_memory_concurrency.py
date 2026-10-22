@@ -1,3 +1,4 @@
+import contextlib
 import multiprocessing
 import sqlite3
 import tempfile
@@ -71,7 +72,7 @@ class MemoryInitializationTests(unittest.TestCase):
         self.assertEqual(len(memory.export()), 8)
 
     def test_processes_migrate_a_legacy_database_without_losing_history(self):
-        with sqlite3.connect(self.path) as db:
+        with contextlib.closing(sqlite3.connect(self.path)) as db, db:
             db.execute("""CREATE TABLE memories (
                 id TEXT PRIMARY KEY, key TEXT NOT NULL, abstract TEXT NOT NULL,
                 overview TEXT NOT NULL, detail TEXT NOT NULL, source TEXT NOT NULL,

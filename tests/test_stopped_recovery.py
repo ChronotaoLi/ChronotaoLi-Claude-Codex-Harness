@@ -204,8 +204,8 @@ class StoppedRecoveryTests(RepoCase):
         engine.start("Implement greet", self.plan(), pause_after_plan=True)
         real_git = git.git
 
-        def remove_then_interrupt(repo, *args):
-            result = real_git(repo, *args)
+        def remove_then_interrupt(repo, *args, **kwargs):
+            result = real_git(repo, *args, **kwargs)
             if args[:2] == ("worktree", "remove"):
                 raise KeyboardInterrupt()
             return result

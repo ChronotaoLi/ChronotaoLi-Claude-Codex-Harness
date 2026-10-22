@@ -20,15 +20,24 @@ def provider_schema(schema):
     return result
 
 
-def claude_worktree_edit_rule(cwd):
-    """Grant built-in file writes only below this literal, resolved worktree."""
+def claude_literal_worktree(cwd):
     path = cwd.resolve().as_posix().rstrip("/")
     if "\n" in path or "\r" in path:
         raise HarnessError("Claude 工作树路径不能包含换行符，无法生成精确文件权限")
+    return "".join("\\" + char if char in "\\*?[]" else char for char in path)
+
+
+def claude_worktree_edit_rule(cwd):
+    """Grant built-in file writes only below this literal, resolved worktree."""
     # Claude uses gitignore patterns: // anchors at the filesystem root and
     # Edit(path) also governs Write. Escape the directory, not the final /**.
-    escaped = "".join("\\" + char if char in "\\*?[]" else char for char in path)
-    return "Edit(/" + escaped + "/**)"
+    return "Edit(/" + claude_literal_worktree(cwd) + "/**)"
+
+
+def claude_worktree_git_deny_rules(cwd):
+    """Protect Git discovery metadata as well as any replacement directory."""
+    path = claude_literal_worktree(cwd)
+    return ["Edit(/" + path + suffix + ")" for suffix in ("/.git", "/.git/**")]
 
 
 class CLIBackend:
@@ -66,7 +75,10 @@ class CLIBackend:
         # Only configured MCP servers are exposed. Their permissions are a trusted operator choice.
         allow += ["mcp__" + name for name in claude["mcpServers"]]
         # JSON preserves commas and parentheses inside exact command arguments.
-        settings = {"autoMemoryEnabled": False, "disableAllHooks": True, "permissions": {"allow": allow}}
+        permissions = {"allow": allow}
+        if role == "worker":
+            permissions["deny"] = claude_worktree_git_deny_rules(cwd)
+        settings = {"autoMemoryEnabled": False, "disableAllHooks": True, "permissions": permissions}
         return ["claude", "--print", "--model", model["model"], "--effort", model["effort"],
                 "--no-session-persistence", "--session-id", job.name,
                 "--setting-sources", "", "--settings", json.dumps(settings),

@@ -318,10 +318,10 @@ class EngineRepairsTests(RepoCase):
     def test_worktree_creation_failure_persists_blocked_checkpoint(self):
         engine = self.engine(RecordingBackend())
         original = git.git
-        def fail_creation(repo, *args):
+        def fail_creation(repo, *args, **kwargs):
             if args[:2] == ("worktree", "add"):
                 raise OSError("worktree directory unavailable")
-            return original(repo, *args)
+            return original(repo, *args, **kwargs)
         with patch("harness.engine.git.git", side_effect=fail_creation), self.assertRaises(OSError):
             engine.start("Implement greet", self.plan())
         state = read_json(engine.directory / "state.json")
@@ -340,7 +340,7 @@ class EngineRepairsTests(RepoCase):
                     "id": "greet", "description": "Check prerequisites and implement the greeting", "add_depends_on": []}])
         backend = RecordingBackend(replan)
         engine = self.engine(backend)
-        def fail_archive(repo, expected_head, archive, owned_root):
+        def fail_archive(repo, expected_head, archive, owned_root, **kwargs):
             archive.mkdir(parents=True)
             (archive / "partial-evidence").write_text("preserve this failed attempt")
             raise HarnessError("archive unavailable")

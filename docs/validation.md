@@ -109,3 +109,16 @@ python3 -m harness smoke --commander fable
 还覆盖审阅语义约束与本地校验的一致性、工作树写权限的真实路径及模式字符转义、8 个独立进程同时初始化新数据库和迁移旧数据库、只读记忆查询不建库或修改 Git 排除项、已删除暂存新文件与真实删除的接受、全部就绪任务的记忆检索，以及已完成 run 返回原台账而不比较执行配置。
 
 本次未运行真实模型 smoke。权限测试检查生成参数并使用 Git 验证文档规定的路径模式，不证明真实 Claude CLI 已拒绝越界写入；恢复测试使用模拟模型响应和真实 Git、子进程。模型 ID、新进程与 dispatch、原有接受门禁和人工集成边界保持不变。
+
+
+## Git 绑定、指挥恢复与可选新检出验证（2026-10-22，台账 v7）
+
+最终执行 `python3 -m unittest discover -s tests -v`：402 项，401 项通过、1 项跳过，耗时 304.243 秒（Python 3.15.0）。跳过项仍为本机文件系统无法创建非 UTF-8 文件名。完整日志位于 `.harness/validation/design-implementation-2026-10-22-final.log`，不提交。`python3 -m compileall -q harness tests`、运行时代码的 Python 3.11 语法解析与 `git diff --check` 通过；语法解析不等于在 Python 3.11 运行测试。
+
+新增行为覆盖：工作树 `.git` 改向、符号链接、实际管理目录重名、反向链接和公共目录变化、嵌套符号分支、环境 Git 参数重定向，以及 detached 提交绑定；接受、恢复、移除和记忆来源核验拒绝错误绑定，主分支和主索引保持不变。文件与目录互换可快照、接受和归档恢复，新增暂存的 gitlink 仍被拒绝。
+
+指挥 plan、replan 和任务选择的结果落盘中断、hook 失败、结果篡改、格式修正、停止与显式重试均有覆盖；普通恢复复用原结果，返回 stop 后的 --reverify 不能丢弃该结论，登记 stop 中断不重复计数。格式超限的 task blocker 恢复进入再规划，审阅 receipt 校验故障更新 dispatch 状态。大型 worker 反馈通过有界摘录进入再规划与返工，全文及记忆提案不裁剪，引用缺失或篡改停止。MCP 查询不创建或迁移数据库，测试 SQLite 连接显式关闭。
+
+可选 fresh_checkout 覆盖忽略文件使任务通过但新检出整体验证失败、显式依赖准备成功、准备修改受检文件被拒绝、准备首步失败不执行后续步骤、恢复使用新检出且不重复 worker、审阅恢复复用已有验证、验证 Git 绑定变化及源候选被修改。忽略路径诊断传入审阅；初始化中断或基线产物写入失败后，恢复仍使用台账中的原始基线。
+
+`python3 -m harness demo` 完成，stdout 为单个 JSON，明确记录 `simulation: true`、`models_called: false`。结果和日志位于 `.harness/validation/design-implementation-demo.json` 与 `.harness/validation/design-implementation-demo.log`。本次没有真实模型调用；以上测试使用模拟模型响应、真实 Git 和本地子进程，不证明当前账号、Claude 原生权限判定或真实供应商故障恢复可用。使用说明和设计约束已同步，临时审阅文档 `docs/review-2026-10-22.md` 已删除。

@@ -1,5 +1,6 @@
 from copy import deepcopy
 import hashlib
+from pathlib import Path
 
 from .util import HarnessError, dump
 
@@ -80,6 +81,66 @@ def compact_checks(checks):
 
 
 REVIEW_CONTEXT_CHARS = 9000
+WORKER_CONTEXT_CHARS = 9000
+
+
+def compact_worker(worker, artifact, budget=WORKER_CONTEXT_CHARS, *, digest=None):
+    """Bound worker feedback, retaining retrieval and the actual blocker decision.
+
+    Memory proposals are independently reviewed from the full task result, so
+    feedback carries only their keys. Without a bound source, keep all evidence
+    and let compose() reject an oversized context rather than silently lose it.
+    """
+    artifact = artifact or worker.get("full_worker_artifact")
+    digest = digest or worker.get("worker_artifact_sha256")
+    if not artifact or not digest:
+        return deepcopy(worker)
+    try:
+        raw = Path(artifact).read_bytes()
+    except OSError as error:
+        raise HarnessError("worker 完整反馈产物缺失或无法读取；不能仅凭摘录继续") from error
+    if hashlib.sha256(raw).hexdigest() != digest:
+        raise HarnessError("worker 完整反馈产物已改变；不能仅凭摘录继续")
+    if "full_worker_artifact" in worker and len(dump(worker)) <= budget:
+        return deepcopy(worker)
+    evidence = worker.get("evidence", [])
+    blockers = worker.get("blockers", [])
+    proposal_keys = worker.get("proposed_memory_keys", [p["key"] for p in worker.get("proposed_memories", [])])
+
+    def excerpt(size):
+        result = {key: deepcopy(worker[key]) for key in ("task_id", "dispatch_id", "status", "blocker_kind")
+                  if key in worker}
+        result.update(
+            full_worker_artifact=str(artifact), worker_artifact_sha256=digest,
+            evidence_count=worker.get("evidence_count", len(evidence)),
+            blocker_count=worker.get("blocker_count", len(blockers)),
+            proposed_memory_count=worker.get("proposed_memory_count", len(proposal_keys)),
+            proposed_memory_keys=deepcopy(proposal_keys),
+            read_instruction=(
+                "Read full_worker_artifact before acting on blockers or evidence. "
+                "Its SHA-256 digest covers the complete artifact bytes. Excerpts do not resolve "
+                "omitted blockers; memory proposals remain unapproved until independent task review."
+            ),
+            summary=worker.get("summary", "")[:size],
+            blockers=[value[:size] for value in blockers],
+            evidence=[value[:size] for value in evidence],
+        )
+        if (worker.get("details_truncated") or result["summary"] != worker.get("summary", "")
+                or result["blockers"] != blockers or result["evidence"] != evidence
+                or worker.get("proposed_memories")):
+            result["details_truncated"] = True
+        return result
+
+    low, high = 0, max([len(worker.get("summary", "")), *(len(value) for value in evidence + blockers)])
+    result = excerpt(0)
+    while low <= high:
+        size = (low + high) // 2
+        candidate = excerpt(size)
+        if len(dump(candidate)) <= budget:
+            result, low = candidate, size + 1
+        else:
+            high = size - 1
+    return result
 
 
 def review_digest(review):
@@ -182,9 +243,19 @@ def compact_reviews(history):
 
 
 def compact_feedback(feedback, prior_reviews=()):
-    """Bound log/review excerpts recursively and avoid repeating supplied reviews."""
+    """Bound evidence recursively and avoid repeating supplied reviews."""
     known_reviews = [item.get("review") for item in prior_reviews if item.get("review")]
     known_digests = {review.get("review_content_sha256") or review_digest(review) for review in known_reviews}
+
+    def worker_count(value):
+        if isinstance(value, list):
+            return sum(worker_count(child) for child in value)
+        if isinstance(value, dict):
+            return sum(1 if key == "worker" and isinstance(child, dict) else worker_count(child)
+                       for key, child in value.items())
+        return 0
+
+    worker_budget = WORKER_CONTEXT_CHARS // max(1, worker_count(feedback))
 
     def compact(value):
         if isinstance(value, list):
@@ -202,6 +273,9 @@ def compact_feedback(feedback, prior_reviews=()):
                     item["review_in_prior_reviews"] = True
                 else:
                     item[key] = compact_review(child, value.get("artifact"))
+            elif key == "worker" and isinstance(child, dict):
+                item[key] = compact_worker(child, value.get("worker_artifact"), worker_budget,
+                                           digest=value.get("worker_artifact_digest"))
             else:
                 item[key] = compact(child)
         return item

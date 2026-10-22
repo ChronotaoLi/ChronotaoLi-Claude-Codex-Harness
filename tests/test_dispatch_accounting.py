@@ -67,11 +67,11 @@ class DispatchAccountingTests(RepoCase):
         engine = self.engine(backend)
         original_snapshot = git.snapshot
 
-        def unreadable_candidate(path):
+        def unreadable_candidate(path, **kwargs):
             entries = engine.run["dispatches"] if engine.run else []
             if entries and entries[-1]["role"] == "worker" and entries[-1]["status"] == "running":
                 raise HarnessError("candidate snapshot unavailable")
-            return original_snapshot(path)
+            return original_snapshot(path, **kwargs)
 
         with patch("harness.engine.git.snapshot", side_effect=unreadable_candidate):
             with self.assertRaisesRegex(HarnessError, "snapshot unavailable"):

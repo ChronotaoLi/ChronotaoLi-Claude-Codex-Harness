@@ -12,6 +12,7 @@ import time
 from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
 
+from . import git
 from .contracts import PROPOSALS, REVIEW, validate
 from .util import HarnessError, uid
 
@@ -69,9 +70,10 @@ def validate_proposals(proposals, worktree):
 
 
 class Memory:
-    def __init__(self, path: Path, repo=None, *, read_only=False):
+    def __init__(self, path: Path, repo=None, *, read_only=False, binding=None):
         self.path = Path(path)
         self.repo = Path(repo).resolve() if repo is not None else None
+        self.binding = binding
         self.read_only = read_only
         if read_only:
             return
@@ -212,8 +214,8 @@ class Memory:
                     raise HarnessError(f"记忆来源在审阅后改变：{name}")
                 if commit is not None:
                     try:
-                        blob = subprocess.run(["git", "-C", str(root), "show", f"{commit}:{name}"],
-                                              capture_output=True, timeout=10)
+                        blob = git.git_process(root, "show", f"{commit}:{name}",
+                                               binding=self.binding, timeout=10)
                     except (OSError, subprocess.TimeoutExpired) as error:
                         raise HarnessError(f"无法核对记忆来源提交：{name}") from error
                     if blob.returncode or hashlib.sha256(blob.stdout).hexdigest() != expected:
@@ -300,8 +302,8 @@ class Memory:
             # checks would incorrectly invalidate their provenance in the main checkout.
             if commit not in commit_cache:
                 try:
-                    result = subprocess.run(["git", "-C", str(root), "cat-file", "-e", f"{commit}^{{commit}}"],
-                                            capture_output=True, timeout=10)
+                    result = git.git_process(root, "cat-file", "-e", f"{commit}^{{commit}}",
+                                             binding=self.binding, timeout=10)
                     commit_cache[commit] = "commit_unavailable" if result.returncode else None
                 except (OSError, subprocess.TimeoutExpired):
                     commit_cache[commit] = "commit_not_checked"

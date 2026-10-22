@@ -113,6 +113,43 @@ class GitBoundaryRepairsTests(unittest.TestCase):
         accepted = git.snapshot(self.repo)
         self.assertTrue(git.snapshot_changes(staged, accepted)["head_changed"])
 
+    def test_tracked_file_replaced_by_directory_can_be_reviewed_and_accepted(self):
+        before = git.snapshot(self.repo)
+        path = self.repo / "src/root.py"
+        path.unlink()
+        path.mkdir()
+        (path / "main.py").write_text("replacement module\n")
+        after = git.snapshot(self.repo)
+        self.assertEqual(git.snapshot_changes(before, after), {
+            "added": ["src/root.py/main.py"], "modified": [], "deleted": ["src/root.py"],
+            "index_changed": False, "head_changed": False,
+        })
+        paths = git.check_scope(self.repo, ["src/**"])
+        git.accept(self.repo, paths, "run_directory", "directory")
+        self.assertTrue(git.clean(self.repo))
+        self.assertEqual(git.git(self.repo, "show", "HEAD:src/root.py/main.py"), "replacement module\n")
+
+    def test_snapshot_rejects_newly_staged_gitlink_even_without_directory(self):
+        git.git(self.repo, "update-index", "--add", "--cacheinfo", "160000", git.head(self.repo), "submodule")
+        with self.assertRaisesRegex(HarnessError, "不支持 submodule：submodule"):
+            git.snapshot(self.repo)
+
+    def test_tracked_directory_replaced_by_file_records_deleted_descendants(self):
+        before = git.snapshot(self.repo)
+        path = self.repo / "src/nested"
+        (path / "leaf.py").unlink()
+        path.rmdir()
+        path.write_text("replacement file\n")
+        after = git.snapshot(self.repo)
+        self.assertEqual(git.snapshot_changes(before, after), {
+            "added": ["src/nested"], "modified": [], "deleted": ["src/nested/leaf.py"],
+            "index_changed": False, "head_changed": False,
+        })
+        paths = git.check_scope(self.repo, ["src/**"])
+        git.accept(self.repo, paths, "run_file", "file")
+        self.assertTrue(git.clean(self.repo))
+        self.assertEqual(git.git(self.repo, "show", "HEAD:src/nested"), "replacement file\n")
+
     def test_accept_uses_literal_filenames_instead_of_git_pathspec_wildcards(self):
         (self.repo / "literal*.txt").write_text("reviewed\n")
         (self.repo / "literal-secret.txt").write_text("not reviewed\n")
@@ -235,6 +272,30 @@ class GitBoundaryRepairsTests(unittest.TestCase):
         self.assertEqual(git.head(worktree), expected)
         self.assertTrue(git.clean(worktree))
         self.assertFalse((worktree / name).exists())
+
+    def test_archive_restores_file_and_directory_replacements_without_losing_evidence(self):
+        worktree = self.root / "worktrees" / "worker"
+        git.git(self.repo, "worktree", "add", "-b", "worker", str(worktree))
+        binding = git.capture_worktree_binding(worktree, "worker")
+        expected = git.head(worktree, binding=binding)
+        directory = worktree / "src/nested"
+        (directory / "leaf.py").unlink()
+        directory.rmdir()
+        directory.write_text("replacement file\n")
+        file = worktree / "src/root.py"
+        file.unlink()
+        file.mkdir()
+        (file / "main.py").write_text("replacement module\n")
+        before = git.snapshot(worktree, binding=binding)
+        archive = self.root / "replacements"
+        git.archive_and_reset(worktree, expected, archive, worktree.parent, binding=binding)
+        self.assertEqual(read_json(archive / "snapshot.json"), before)
+        self.assertEqual((archive / "files/src/nested").read_text(), "replacement file\n")
+        self.assertEqual((archive / "files/src/root.py/main.py").read_text(), "replacement module\n")
+        self.assertEqual((worktree / "src/nested/leaf.py").read_text(), "original\n")
+        self.assertEqual((worktree / "src/root.py").read_text(), "original\n")
+        self.assertTrue(git.clean(worktree, binding=binding))
+        self.assertEqual(git.head(worktree, binding=binding), expected)
 
 
 if __name__ == "__main__":
