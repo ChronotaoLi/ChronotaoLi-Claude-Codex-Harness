@@ -122,3 +122,26 @@ python3 -m harness smoke --commander fable
 可选 fresh_checkout 覆盖忽略文件使任务通过但新检出整体验证失败、显式依赖准备成功、准备修改受检文件被拒绝、准备首步失败不执行后续步骤、恢复使用新检出且不重复 worker、审阅恢复复用已有验证、验证 Git 绑定变化及源候选被修改。忽略路径诊断传入审阅；初始化中断或基线产物写入失败后，恢复仍使用台账中的原始基线。
 
 `python3 -m harness demo` 完成，stdout 为单个 JSON，明确记录 `simulation: true`、`models_called: false`。结果和日志位于 `.harness/validation/design-implementation-demo.json` 与 `.harness/validation/design-implementation-demo.log`。本次没有真实模型调用；以上测试使用模拟模型响应、真实 Git 和本地子进程，不证明当前账号、Claude 原生权限判定或真实供应商故障恢复可用。使用说明和设计约束已同步，临时审阅文档 `docs/review-2026-10-22.md` 已删除。
+
+## 受控恢复与维护修订（2026-10-22，台账 v8）
+
+完整执行 `python3 -m unittest discover -s tests -v`，分别使用以下两个解释器：
+
+| Python | 测试结果 | 耗时 | 私有日志 |
+| --- | --- | --- | --- |
+| 3.15.0 | 447 项，446 通过、1 跳过 | 435.810 秒 | `.harness/validation/design-v8-python-current.log` |
+| 3.11.17 | 447 项，446 通过、1 跳过 | 440.123 秒 | `.harness/validation/design-v8-python311.log` |
+
+两次跳过均为本机文件系统拒绝实际创建非 UTF-8 文件名。Python 3.11.17 安装在本仓库 `.harness/python/`，本次已实际运行完整测试，不再仅以语法解析作为该版本的验证。新增 GitHub Actions 配置在 Python 3.11 和 3.x 执行同一离线测试命令；本记录不声称远程 CI 已运行。`python3 -m compileall -q harness tests` 与 `git diff --check` 通过。
+
+新增离线行为覆盖：显式修正非法计划／修订及无拒绝的非法批准元数据，保留原始 receipt、摘要、findings、有效记忆批准和累计预算；合法结果的 hook 故障、停止、拒绝、身份／结构错误均不能通过修正选项丢弃。派发前 hook 改变候选、模型或 hook 改写原始依据、结果落盘后中断、畸形 JSON 的先绑定后解析、修正服务故障及预算耗尽都有恢复检查。已返回的非法修正不增加自动重派，`--reverify` 不能取消已授权且保留原结果的再规划修正。
+
+范围授权测试验证整批校验、审计、原任务范围和验收不变，以及已返回的越界修订获授权后继续校验同一结果。清理测试覆盖预览、运行锁、进程退出、路径与 Git 绑定、修改及忽略文件拒绝、精确注销缺失检出、部分清理、中断恢复和 Git 管理目录名称复用；原运行和验证证据保留。还覆盖缺失审阅产物更新 dispatch 诊断、旧审阅原始摘要的检索去重，以及指令文件新增／修改／删除／重命名进入任务和整体审阅输入。
+
+`python3 -m harness demo` 完成，stdout 可解析为单个 JSON，记录 `simulation: true`、`models_called: false`；结果和日志位于 `.harness/validation/design-v8-demo.json` 与 `.harness/validation/design-v8-demo.log`。
+
+本次另执行一次真实 `python3 -m harness.permission_smoke`，使用 Claude Code 2.1.308 和精确 worker 模型 `claude-opus-5-5`，dispatch 为 `e388fab9-e345-44f9-9678-088bdc6c5e4a`。11 次实际工具调用中，工作树内 Read/Edit/Write、`.git` 读取、精确 Bash 命令及工作树外 Read 共 6 项允许控制成功；追加未授权参数、未列命令、工作树外 Edit/Write 和 `.git` Edit 共 5 项均被拒绝。每项拒绝都有匹配工具 ID 与输入的供应商 `permission_denials` 及错误工具结果，同时核对边界文件字节，未使用模型文字作为通过依据。供应商结果记录 12 轮、成本字段 0.1453248 美元。
+
+真实权限报告和原始证据保留在 `.harness/permission-smoke/7e3e021b1d7d4efda4bc79ecef33fce9/`，不提交。该探针使用专用精确命令并关闭外部 MCP，验证本次 CLI 对这组允许／拒绝操作的处理，不证明任意项目授权或 OS 隔离。本轮未重新执行完整 Astra／Fable 指挥、worker、独立 reviewer 的真实工作流；新增受控恢复和故障分支仍由离线行为测试验证。
+
+台账升级为版本 8，旧执行器不能忽略新增修正守卫；版本 7 及更早运行须由对应旧版本继续，独立清理命令支持版本 7、8。使用说明与设计文档已同步，临时审阅文档 `docs/review-2026-10-22-v7.md` 已删除。

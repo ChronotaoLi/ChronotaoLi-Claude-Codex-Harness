@@ -12,6 +12,7 @@ from pathlib import Path
 
 from . import git
 from .adapters import DemoBackend
+from .cleanup import cleanup_verification
 from .config import Config
 from .engine import Engine
 from .memory import Memory
@@ -161,6 +162,10 @@ def _main(argv=None):
     resume.add_argument("--retry-stopped", metavar="TASK_ID|final", help="显式重试已被指挥停止的规划请求，仍受累计预算约束")
     resume.add_argument("--confirm-exited", action="append", metavar="DISPATCH_ID",
                         help="确认指定旧 dispatch 已退出并记录证据；可重复指定")
+    resume.add_argument("--repair-invalid", metavar="DISPATCH_ID",
+                        help="显式修正当前非法计划或无拒绝的非法批准元数据；保留证据和累计预算")
+    resume.add_argument("--allow-scope", action="append", metavar="PATTERN",
+                        help="为待再规划显式授权新增文件范围模式；可重复指定，不改变原任务范围")
     status = sub.add_parser("status")
     status.add_argument("run_id", nargs="?")
     status.add_argument("--full", action="store_true", help="输出完整运行台账")
@@ -169,6 +174,9 @@ def _main(argv=None):
     abandon.add_argument("--remove-worktree", action="store_true", help="同时移除无未保存文件的隔离工作树；保留分支与运行证据")
     abandon.add_argument("--confirm-exited", action="append", metavar="DISPATCH_ID",
                          help="确认指定旧 dispatch 已退出并记录证据；可重复指定")
+    cleanup = sub.add_parser("cleanup-verification", help="检查保留的全新验证检出；不加载运行配置")
+    cleanup.add_argument("run_id")
+    cleanup.add_argument("--remove", action="store_true", help="移除已退出且干净的验证检出；保留运行与验证证据")
     sync = sub.add_parser("sync", help="生成共用 MCP 的两种客户端配置，不覆盖个人配置")
     sync.add_argument("--role", choices=["commander", "worker", "reviewer"], default="worker")
     mem = sub.add_parser("memory")
@@ -189,11 +197,15 @@ def _main(argv=None):
     if args.command == "status" and args.full and not args.run_id:
         parser.error("status --full 需要 run_id")
     try:
-        if args.command in ("status", "memory"):
+        if args.command in ("status", "memory", "cleanup-verification"):
             repo = git.repository(args.repo)
             state = repo / ".harness"
             if args.command == "status":
                 show_status(args, state)
+            elif args.command == "cleanup-verification":
+                result = cleanup_verification(repo, args.run_id, remove=args.remove)
+                print(dump(result))
+                return 1 if any(item["status"] == "blocked" for item in result["checkouts"]) else 0
             else:
                 manage_memory(args, repo, state)
             return 0
@@ -220,6 +232,10 @@ def _main(argv=None):
             options = {"retry_stopped": args.retry_stopped} if args.retry_stopped is not None else {}
             if args.confirm_exited:
                 options["confirm_exited"] = args.confirm_exited
+            if args.repair_invalid is not None:
+                options["repair_invalid"] = args.repair_invalid
+            if args.allow_scope:
+                options["allow_scope"] = args.allow_scope
             result = Engine(config, repo).resume(args.run_id, approve_plan=args.approve_plan, step=args.step,
                                                 reverify=args.reverify, **options)
             print(dump({k: result[k] for k in ("id", "status", "branch", "worktree")}))

@@ -205,6 +205,21 @@ def review_approved(result):
         finding["severity"] == "blocking" for finding in result["findings"])
 
 
+def validate_approval_repair(previous, current, proposed_keys):
+    """Repair approval metadata without replacing the underlying review."""
+    permitted = set(previous["approved_memory_keys"]) & set(proposed_keys)
+    if (not review_approved(previous) or not review_approved(current)
+            or set(current["approved_memory_keys"]) != permitted
+            or len(previous["findings"]) != len(current["findings"])):
+        raise HarnessError("显式审阅修正必须保留批准结论、有效记忆批准和全部 findings")
+    ids = [finding["id"] for finding in previous["findings"]]
+    for old, new in zip(previous["findings"], current["findings"]):
+        if any(old[field] != new[field] for field in ("severity", "category", "location", "message", "evidence")):
+            raise HarnessError("显式审阅修正不得改变 finding 内容、严重级别或顺序")
+        if ids.count(old["id"]) == 1 and re.fullmatch(SAFE_ID["pattern"], old["id"]) and new["id"] != old["id"]:
+            raise HarnessError("显式审阅修正不得改变已有合法且唯一的 finding ID")
+
+
 def validate_plan(plan, max_tasks=20):
     validate_structure(plan, PLAN)
     tasks = plan["tasks"]
@@ -238,7 +253,7 @@ def validate_plan(plan, max_tasks=20):
     return tasks
 
 
-def apply_revision(current_tasks, result, accepted_ids, max_tasks=20):
+def apply_revision(current_tasks, result, accepted_ids, max_tasks=20, *, additional_allowed_paths=()):
     """Apply only explicit additions and brief updates to runtime-owned tasks."""
     validate_structure(result, REPLAN)
     validate_plan({"tasks": current_tasks}, max_tasks)
@@ -264,12 +279,13 @@ def apply_revision(current_tasks, result, accepted_ids, max_tasks=20):
             if dependency not in by_id[ident]["depends_on"]:
                 by_id[ident]["depends_on"].append(dependency)
     proposed.extend(deepcopy(result["new_tasks"]))
-    tasks = validate_revision(current_tasks, proposed, accepted, max_tasks)
+    tasks = validate_revision(current_tasks, proposed, accepted, max_tasks,
+                              additional_allowed_paths=additional_allowed_paths)
     _validate_format(result, REPLAN, "response")
     return tasks
 
 
-def validate_revision(current_tasks, proposed_tasks, accepted_ids, max_tasks=20):
+def validate_revision(current_tasks, proposed_tasks, accepted_ids, max_tasks=20, *, additional_allowed_paths=()):
     """Allow bounded refinement while retaining every original obligation."""
     validate_plan({"tasks": current_tasks}, max_tasks)
     tasks = validate_plan({"tasks": proposed_tasks}, max_tasks)
@@ -279,6 +295,11 @@ def validate_revision(current_tasks, proposed_tasks, accepted_ids, max_tasks=20)
     if not accepted <= current.keys() or not current.keys() <= proposed.keys():
         raise HarnessError("再规划不得移除既有任务或引用未知已接受任务")
     scope = {path for task in current_tasks for path in task["allowed_paths"]}
+    for path in additional_allowed_paths:
+        if not isinstance(path, str):
+            raise HarnessError("额外批准的文件范围必须是字符串")
+        git.validate_scope_pattern(path)
+        scope.add(path)
     for ident, old in current.items():
         new = proposed[ident]
         if ident in accepted and new != old:
@@ -289,7 +310,7 @@ def validate_revision(current_tasks, proposed_tasks, accepted_ids, max_tasks=20)
             raise HarnessError("再规划不得移除既有依赖")
     for ident in proposed.keys() - current.keys():
         if not set(proposed[ident]["allowed_paths"]) <= scope:
-            raise HarnessError("新增任务必须复用既有文件范围，不得扩大范围")
+            raise HarnessError("新增任务必须复用既有文件范围或操作者显式批准的范围，不得自行扩大范围")
     if proposed == current:
         raise HarnessError("再规划没有产生有效变更")
     return tasks
