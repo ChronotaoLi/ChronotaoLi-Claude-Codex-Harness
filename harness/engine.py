@@ -1359,8 +1359,10 @@ class Engine(EnvironmentRecovery, InvalidOutputRecovery):
             raise HarnessError(f"{current} 已达尝试次数上限")
         if self.run["total_attempts"] >= self.config.data["runtime"]["max_total_attempts"]:
             raise HarnessError("已达 run 总尝试次数上限")
-        for candidate in ready:
-            self.check_environment(candidate["id"])
+        # A task's prerequisites must not prevent selecting other ready work.
+        # The selected worker is checked again before its invocation is counted.
+        if current:
+            self.check_environment(current)
         saved_directive = self.run.get("pending_directive")
         pristine = len(ready) == 1 and not self.run.get("feedback") and not self.run["attempts"].get(ready[0]["id"])
         if saved_directive:

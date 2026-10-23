@@ -242,3 +242,15 @@ Codex 0.163.0 的本地 `debug prompt-input` 检查确认：未提交的 AGENTS.
 使用 Python 3.11.17 执行 `PYTHONPATH=tests python3.11 -m unittest test_environment_updates test_environment_cli -v`：全部 30 项新增测试通过，33.100 秒；日志为 `.harness/validation/environment-update-python311.log`。本轮未在 Python 3.11 重跑完整套件。全部 Python 文件的 3.11 语法解析及 `git diff --check` 通过。
 
 测试使用模拟模型响应及真实本地 Git、验证子进程；前置检查自身不启动子进程。这些测试不证明真实 CLI 会正确理解环境更新，本轮未运行 Harness 的真实模型 `smoke`。README、设计与恢复协议已同步，私有证据不纳入 Git。
+
+## 第十四轮审阅修订验证（2026-10-23，台账 v9）
+
+执行 `python3 -m unittest discover -s tests -v`：562 项，561 项通过、1 项跳过（Python 3.15.0，591.827 秒）。跳过原因仍为本机文件系统拒绝非 UTF-8 文件名。完整日志保存在 `.harness/validation/review-v14-offline.log`，不提交。`git diff --check` 通过。
+
+新增 6 项行为测试覆盖：再规划后多个 ready 任务中，无关任务的失败环境检查不阻止被选任务接受，也不追加无关检查记录；指挥选中受阻任务后仅扣指挥派发预算，保存指令，反复恢复不重派指挥，修复条件后使用原指令；后续模型调用前中断遗留 interrupted 或 running 时仍可登记环境更新；已有指挥 receipt 的中断状态和已放弃运行继续拒绝更新。大型合法更新在上下文超限后保留原产物与预算，增加上下文预算并满足声明检查后可完成运行，原更新字节和台账引用不变。
+
+执行 `python3 -m unittest discover -s tests -p 'test_environment*.py' -v`：36 项全部通过，41.504 秒。使用 Python 3.11.17 单独执行全部 6 项新增测试，均通过，11.583 秒；本轮未在 Python 3.11 重跑完整套件。日志分别保存在 `.harness/validation/review-v14-environment.log` 和 `.harness/validation/review-v14-python311.log`，不提交。
+
+仅在内存中恢复基线 b56c948 的 `task_attempt` 或 `prepare_environment_update` 后，两个任务选择用例和中断更新资格用例均检出原问题；后者分别覆盖 interrupted 与遗留 running。负向验证日志保存在 `.harness/validation/review-v14-regression-baseline.log`，工作区源文件未因此替换。
+
+台账保持版本 9，没有新增 CLI 参数或恢复子状态，保留历史环境更新的输入契约。`gpt-6.1-sol` 独立审阅未发现运行时缺陷；发现的恢复文档预算表述遗漏已修正。上述测试使用模拟模型响应及真实本地 Git、验证子进程，不证明真实模型调用行为；本轮未运行 Harness 的真实模型 `smoke`。README、设计与恢复协议已同步。

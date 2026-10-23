@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 from unittest.mock import patch
 
+from harness.cli import status_summary
 from harness.util import HarnessError, read_json, write_json
 from test_harness import ROOT, RepoCase
 from test_runtime_changes import ScriptedBackend
@@ -41,6 +42,166 @@ class EnvironmentUpdateTests(RepoCase):
 
     def saved(self, engine):
         return read_json(engine.directory / 'state.json')
+
+    def replanned_environment_task(self, selected_task):
+        engine, backend, path, value = self.blocked()
+        marker = self.repo / 'ready-for-greet'
+        marker.touch()
+        value['checks'] = [{'kind': 'path', 'path': str(marker), 'path_type': 'file'}]
+        write_json(path, value)
+
+        def add_ready_work(backend, kwargs, packet, result):
+            if kwargs['role'] == 'worker' and sum(c['role'] == 'worker' for c in backend.calls) == 2:
+                result.update(status='blocked', blocker_kind='task', blockers=['Additional work is required'])
+            elif kwargs['kind'] == 'replan':
+                task = copy.deepcopy(packet['original_tasks'][0])
+                task.update(id='other', title='Additional independent work')
+                result.update(action='revise', reason='Add independent work', new_tasks=[task], updates=[])
+            elif kwargs['kind'] == 'dispatch' and len(packet['ready']) > 1:
+                result.update(selected_task=selected_task, instruction='Use this saved selection after recovery')
+
+        backend.change = add_ready_work
+        resumed = self.engine(backend)
+        task_attempt = resumed.task_attempt
+
+        def interrupt_after_replan(ready):
+            if len(ready) > 1:
+                raise KeyboardInterrupt()
+            return task_attempt(ready)
+
+        with patch.object(resumed, 'task_attempt', side_effect=interrupt_after_replan):
+            with self.assertRaises(KeyboardInterrupt):
+                resumed.resume(engine.run['id'], environment_update=path)
+        saved = self.saved(engine)
+        self.assertIsNone(saved['current_task'])
+        self.assertEqual([task['id'] for task in saved['tasks']], ['greet', 'other'])
+        self.assertTrue(all(not task['depends_on'] for task in saved['tasks']))
+        marker.unlink()
+        return engine, backend, marker
+
+    def test_ready_task_check_does_not_block_selection_of_other_work(self):
+        engine, backend, _ = self.replanned_environment_task('other')
+        before = self.saved(engine)
+        calls = len(backend.calls)
+        result = self.engine(backend).resume(engine.run['id'], step=True)
+        self.assertEqual(result['status'], 'paused')
+        self.assertEqual(set(result['accepted']), {'other'})
+        self.assertEqual(result['attempts'], {'greet': 2, 'other': 1})
+        self.assertEqual(result['environment_checks'], before['environment_checks'])
+        self.assertEqual([call['task_id'] for call in backend.calls[calls:] if call['role'] == 'worker'], ['other'])
+
+    def test_selected_task_check_preserves_directive_without_worker_budget(self):
+        engine, backend, marker = self.replanned_environment_task('greet')
+        before = self.saved(engine)
+        calls = len(backend.calls)
+        with self.assertRaises(HarnessError):
+            self.engine(backend).resume(engine.run['id'], step=True)
+        saved = self.saved(engine)
+        self.assertEqual([(call['role'], call['kind']) for call in backend.calls[calls:]], [('commander', 'dispatch')])
+        for key in ('attempts', 'total_attempts'):
+            self.assertEqual(saved[key], before[key])
+        self.assertEqual(saved['agent_dispatches'], before['agent_dispatches'] + 1)
+        self.assertFalse(saved['environment_checks'][-1]['passed'])
+        directive = saved['pending_directive']
+        self.assertEqual(directive['directive']['selected_task'], 'greet')
+        calls = len(backend.calls)
+        with self.assertRaises(HarnessError):
+            self.engine(backend).resume(engine.run['id'], step=True)
+        self.assertEqual(len(backend.calls), calls)
+        retried = self.saved(engine)
+        self.assertEqual(retried['pending_directive'], directive)
+        for key in ('attempts', 'total_attempts', 'agent_dispatches'):
+            self.assertEqual(retried[key], saved[key])
+        marker.touch()
+        result = self.engine(backend).resume(engine.run['id'], step=True)
+        self.assertEqual(set(result['accepted']), {'greet'})
+        self.assertEqual(result['attempts'], {'greet': 3})
+        self.assertNotIn('pending_directive', result)
+        later = backend.calls[calls:]
+        self.assertFalse(any(call['role'] == 'commander' for call in later))
+        worker = next(call for call in later if call['role'] == 'worker')
+        self.assertEqual(worker['packet']['instruction'], directive['directive']['instruction'])
+
+    def test_pre_invocation_interruption_preserves_environment_update_eligibility(self):
+        for abrupt in (False, True):
+            with self.subTest(abrupt=abrupt):
+                engine, backend, path, value = self.blocked()
+                before = self.saved(engine)
+                resumed = self.engine(backend)
+                # This boundary follows the durable running status but precedes
+                # any subsequent model call. Suppress stop to model a hard crash.
+                stop = (lambda error: None) if abrupt else resumed.stop
+                with patch.object(resumed, 'finish_post_accept', side_effect=KeyboardInterrupt()), \
+                        patch.object(resumed, 'stop', side_effect=stop):
+                    with self.assertRaises(KeyboardInterrupt):
+                        resumed.resume(engine.run['id'])
+                saved = self.saved(engine)
+                self.assertEqual(saved['status'], 'running' if abrupt else 'interrupted')
+                for key in ('dispatches', 'attempts', 'total_attempts', 'agent_dispatches', 'feedback'):
+                    self.assertEqual(saved[key], before[key])
+                self.assertFalse(status_summary(saved)['last_environment_blocker']['stale'])
+                result = self.engine(backend).resume(engine.run['id'], environment_update=path)
+                self.assertEqual(result['status'], 'completed')
+                self.assertEqual(result['attempts'], {'greet': 2})
+                self.assertEqual(len(result['environment_updates']), 1)
+                self.assertEqual(result['environment_updates'][0]['blocker_dispatch_id'], value['blocker_dispatch_id'])
+                for call in backend.calls[1:]:
+                    self.assertEqual(call['packet']['environment_updates'][0]['summary'], value['summary'])
+
+    def test_interrupted_commander_receipt_still_rejects_environment_update(self):
+        engine, backend, path, _ = self.blocked()
+        resumed = self.engine(backend)
+        with patch.object(resumed, 'finish_commander_receipt', side_effect=KeyboardInterrupt()):
+            with self.assertRaises(KeyboardInterrupt):
+                resumed.resume(engine.run['id'])
+        before = self.saved(engine)
+        self.assertEqual(before['status'], 'interrupted')
+        self.assertTrue(before['commander_receipts'])
+        self.assertTrue(status_summary(before)['last_environment_blocker']['stale'])
+        calls = len(backend.calls)
+        with self.assertRaises(HarnessError):
+            self.engine(backend).resume(engine.run['id'], environment_update=path)
+        self.assertEqual(len(backend.calls), calls)
+        self.assertEqual(self.saved(engine), before)
+
+    def test_abandoned_run_rejects_environment_update(self):
+        engine, backend, path, _ = self.blocked()
+        self.engine(backend).abandon(engine.run['id'])
+        before = self.saved(engine)
+        with self.assertRaises(HarnessError):
+            self.engine(backend).resume(engine.run['id'], environment_update=path)
+        self.assertEqual(len(backend.calls), 1)
+        self.assertEqual(self.saved(engine), before)
+
+    def test_large_saved_update_can_resume_after_context_budget_increase(self):
+        engine, backend, path, value = self.blocked()
+        # The declaration is intentionally large and repeated, but within the
+        # update contract. Checking it never executes this command.
+        argv = [sys.executable, '-c', '#' + ' ' * 3900]
+        value['checks'] = [{'kind': 'worker_command', 'argv': argv}] * 12
+        write_json(path, value)
+        self.assertLessEqual(path.stat().st_size, 65536)
+        before = self.saved(engine)
+        with self.assertRaises(HarnessError):
+            self.engine(backend).resume(engine.run['id'], environment_update=path)
+        saved = self.saved(engine)
+        self.assertEqual(saved['context_capacity']['status'], 'required_overflow')
+        self.assertEqual(len(saved['environment_updates']), 1)
+        artifact = Path(saved['environment_updates'][0]['artifact'])
+        original = artifact.read_bytes()
+        path.unlink()
+        with self.assertRaises(HarnessError):
+            self.engine(backend).resume(engine.run['id'])
+        for key in ('attempts', 'total_attempts', 'agent_dispatches'):
+            self.assertEqual(self.saved(engine)[key], before[key])
+        self.assertEqual(len(backend.calls), 1)
+        self.config.data['runtime']['context_chars'] = 200000
+        self.config.data['permissions']['worker_commands'].append(argv)
+        result = self.engine(backend).resume(engine.run['id'])
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(result['attempts'], {'greet': 2})
+        self.assertEqual(result['environment_updates'], saved['environment_updates'])
+        self.assertEqual(artifact.read_bytes(), original)
 
     def test_update_reaches_every_later_role_and_preserves_task_contract(self):
         engine, backend, path, value = self.blocked()

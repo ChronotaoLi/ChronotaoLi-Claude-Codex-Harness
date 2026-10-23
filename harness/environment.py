@@ -182,7 +182,10 @@ class EnvironmentRecovery:
         feedback = self.run.get("feedback")
         if not isinstance(feedback, dict) or not isinstance(feedback.get("worker"), dict):
             raise HarnessError("环境更新缺少当前 worker 环境阻断反馈")
-        if (self.run["status"] != "blocked" or self.run.get("current_task") != task_id
+        # A pre-invocation interruption can leave interrupted/running status
+        # without invalidating the saved blocker. Resume guards terminal runs;
+        # the evidence and pending-state checks below guard this update boundary.
+        if (self.run.get("current_task") != task_id
                 or task_id in self.run["accepted"] or feedback.get("task_id") != task_id):
             raise HarnessError("--environment-update 仅用于当前未接受任务的环境阻断")
         busy = ("pending_task", "pending_acceptance", "pending_post_accept", "pending_replan", "pending_directive",
@@ -273,4 +276,5 @@ class EnvironmentRecovery:
         self.save()
         self.event("environment_checked", task_id=task_id, passed=report["passed"], artifact=str(artifact))
         if not report["passed"]:
-            raise HarnessError(f"环境前置检查未通过；未派发模型、未消耗尝试。检查日志：{artifact}")
+            raise HarnessError(f"环境前置检查未通过；未派发本次 worker、未消耗本次 worker 尝试；"
+                               f"已发生的指挥调用仍计入派发预算。检查日志：{artifact}")

@@ -30,13 +30,15 @@ worker 尝试与派发计数在本地上下文、hooks、MCP 配置、快照和�
 
 `resume RUN --environment-update FILE` 接受最多 64 KiB 的严格 JSON，每个 run 最多 32 条更新：必填 `schema_version: 1`、`task_id`、`blocker_dispatch_id` 和非空、至多 4,000 字符的 `summary`；可选 `checks` 默认 `[]`，最多 16 项。未知字段拒绝。检查只允许 `{kind: "path", path: 绝对路径, path_type: "file"|"directory"|"any"}`、`{kind: "executable", name: 可执行文件名或绝对路径}`、`{kind: "worker_command", argv: 精确命令数组}`。命令检查以是否已在当前 worker_commands 或 verification.commands 中声明判定通过；未声明时仍保留更新及失败检查报告，追加精确配置授权后普通 resume 可重检。检查不执行命令、不启动子进程、不新增授权，也不保证真实 CLI、账号或服务成功。只需表达操作者事实时可省略 checks。
 
-接受更新前在 run 锁内核对进程退出、Git 绑定、HEAD、当前任务与范围，以及保存的环境 blocker 来源身份和原结果摘要。只接受当前未接受任务的 worker 环境阻断边界；后续模型调用使旧来源失效。存在待处理任务／最终验证或审阅、接受及接受后待办、再规划／指挥 stop、pending_directive、commander/reviewer receipt、待格式修正或活动非法结果修正时拒绝。完成或放弃状态拒绝更新；与 reverify、retry-stopped、allow-scope、repair-invalid 互斥，step 可合用。不得通过更新清除任何 receipt、修正守卫、已保存拒绝或批准快照。
+接受更新前在 run 锁内核对进程退出、Git 绑定、HEAD、当前任务与范围，以及保存的环境 blocker 来源身份和原结果摘要。只接受当前未接受任务的 worker 环境阻断边界；首次后续模型调用前中断，即使状态为 interrupted 或遗留 running，仍按这些证据判断资格。后续模型调用使旧来源失效，包括已开始但失败的指挥调用；需在新的 worker 环境阻断后再提交更新。存在待处理任务／最终验证或审阅、接受及接受后待办、再规划／指挥 stop、pending_directive、commander/reviewer receipt、待格式修正或活动非法结果修正时拒绝。完成或放弃状态拒绝更新；与 reverify、retry-stopped、allow-scope、repair-invalid 互斥，step 可合用。不得通过更新清除任何 receipt、修正守卫、已保存拒绝或批准快照。
 
 更新输入被复制到私有产物并绑定摘要，台账按顺序引用，原输入文件不再是恢复依赖。保存的更新缺失或被篡改时停止；相同来源尚无后续模型调用时重复提交相同更新幂等。产物、审计事件和台账之间中断时，审计事件可能以同一稳定更新 ID 重复，台账仅保留一条授权引用。后续指挥、worker、任务审阅及整体审阅的必要上下文包含有序 environment_updates，最近检查报告经摘要核验后作为 environment_observations 一并发送，整体上下文预估使用同一内容；不能作为可丢弃记忆处理，也不授予记忆覆盖权。操作者断言替代匹配任务的过时环境假设，但原目标、任务范围、验收及所有累计预算保持不变，后续调用仍使用新进程和新 dispatch。
 
-同一任务最新更新的 checks 替代先前检查列表，所有历史声明仍按序发送。可选检查在匹配任务后续每次 worker 尝试（含格式修正）前执行，所有报告保留。失败不派发模型、不消耗尝试或派发预算，修复后普通 resume 可重检。worker 已返回并进入验证／审阅后不重跑这些前置检查；正常验证、独立审阅、快照和接受门禁仍全部执行，检查成功或操作者声明本身不是完成证据。
+更新登记后不可撤回，其序列化内容计入此后各角色的必要上下文。64 KiB 输入上限及字段限制不保证能装入默认 32,000 字符预算；单条或累计更新造成超限时，需增大 context_chars 后恢复，追加更短的更新不会移除旧内容。历史更新仍按原输入契约读取，不追溯施加更小的长度限制。
 
-状态摘要的 worker_outcomes 仅分类 worker 自报完成、任务／环境阻断、运行故障与未知结果，不替代 accepted 或 completed 门禁。last_environment_blocker 是最近环境阻断的历史诊断；后续模型调用开始后标为 stale，不能将其存在视为当前仍具备环境更新资格。
+同一任务最新更新的 checks 替代先前检查列表，所有历史声明仍按序发送。选择前只预检已有的 current_task，不检查全部 ready 任务；选中任务在后续每次 worker 尝试（含格式修正）前仍重检，所有报告保留。已有当前任务的一次普通尝试可能在选择前与派发前分别记录报告，输入使用最近一份。检查失败不启动本次 worker，不消耗其尝试或派发预算。current_task 为空时，指挥选择可能已消耗派发预算；其选定指令保存到 pending_directive，后续恢复复用，修复条件后启动 worker 才消费该指令。worker 已返回并进入验证／审阅后不重跑这些前置检查；正常验证、独立审阅、快照和接受门禁仍全部执行，检查成功或操作者声明本身不是完成证据。
+
+状态摘要的 worker_outcomes 仅分类 worker 自报完成、任务／环境阻断、运行故障与未知结果，不替代 accepted 或 completed 门禁。last_environment_blocker 是最近环境阻断的历史诊断；后续模型调用开始后标为 stale。stale=false 也不代表具备环境更新资格：更新仍需通过进程退出、来源摘要、任务范围和待处理阶段等检查。
 
 对长时间中断后 pgid 被复用的情况，采用显式确认而非根据组长身份自动推断整个进程组已退出。`resume` 与 `abandon` 的 `--confirm-exited <dispatch_id>` 在运行锁内校验全部 ID，先追加操作事件，再只更新指定记录的退出确认。事件记录当时的组存活探测及组长 PID、PPID、PGID、启动时间和命令名（或探测错误）；组长缺失不构成自动退出证明，不发送终止信号。确认不放宽其他恢复或工作树移除检查。
 
@@ -117,7 +119,7 @@ worker 调用失败或中断时，另按 task ID 保存 `worker_recovery`，记�
 | 次数、上下文或超时预算不足 | 按允许范围增加配置后 `resume` | 累计计数不清零，已有结果不重抽 |
 | 旧进程存活或退出未知 | 核实后 `resume --confirm-exited ID`；终态使用 `cleanup-verification RUN --confirm-exited ID` | 确认精确 dispatch，先审计后写入，不终止无关进程 |
 | worker 或未返回结果的模型调用故障 | 修复环境后 `resume` | 新进程、新 dispatch，保留故障来源并消耗对应预算 |
-| worker 已报告环境阻断，需要更新环境事实 | `resume --environment-update FILE`；已保存检查仍失败时修复条件后普通 `resume` | 来源有效且无待处理阶段；检查不执行命令，更新不扩大权限或降低验收，失败检查不消耗模型预算 |
+| worker 已报告环境阻断，需要更新环境事实 | `resume --environment-update FILE`；已保存检查仍失败时修复条件后普通 `resume` | 来源有效且无待处理阶段；检查不执行命令，更新不扩大权限或降低验收，失败检查不消耗本次 worker 尝试或派发预算 |
 | 验证、审阅或接受 hook 中断 | 修复原因后 `resume` | 同一快照复用已有阶段；hook 不被绕过 |
 | 自动格式修正耗尽，且满足显式修正条件 | `resume --repair-invalid ID` | 最初结论、已绑定原文、失败修正证据与快照不变；整个角色／类型／任务仅一次，指挥任务选择和再规划各按固定身份在整个 run 共用 |
 | 首次拒绝仅可变字段格式非法，且自动额度已用 | 保存为 `invalid_rejected` 后进入任务返工或整体修正规划；中断后普通 `resume` | 原文、摘要、快照及 hook 仍须核验；不追加格式修正派发，不适用于修正结果或旧拒绝型 exhausted 守卫 |
