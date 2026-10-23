@@ -196,3 +196,13 @@ python3 -m harness smoke --commander fable
 Python 3.11.17 上另行通过新增 stdin 测试 3 项、拒绝恢复测试 4 项、状态校验及任务容量恢复测试 7 项，以及既有超时／启动／进程退出测试 7 项。stdin 测试使用超过 256 KiB 的多字节输入、延迟读取和多个短心跳窗口，核对实际字节数与 SHA-256，并检查空输入 EOF、退出码和中断清理；同一延迟读取场景在旧 run_process 的 Python 3.11 实现上复现超时。
 
 Codex 0.163.0 的本地 `debug prompt-input` 检查确认：未提交的 AGENTS.md 标记默认出现在输入中，设置 `project_doc_max_bytes=0` 后消失。该检查只渲染输入，不证明真实 exec 模型调用成功；Claude 的空 setting-sources 参数保持原行为，本轮没有新增真实模型或权限联调。没有运行 `python3 -m harness smoke`。
+
+## 第十一轮审阅修订验证（台账 v8）
+
+2026-10-22 执行 `python3 -m unittest discover -s tests -v`：520 项，519 项通过、1 项跳过（Python 3.15.0，531.499 秒）。跳过原因仍为本机文件系统拒绝实际创建非 UTF-8 文件名。完整日志保存在本仓库私有 `.harness/validation/review-v11-offline.log`，不提交。
+
+本轮新增 6 项行为测试，并调整已有整体审阅用例。自动格式额度已用后，新候选首次拒绝若仅摘要或 finding ID 格式非法，保存为 `invalid_rejected` 并进入任务返工或整体修正规划；测试核对原始产物、内容摘要、派发次数和累计额度，以及 post_agent 失败后复用同一结果、独立重试 hook 的恢复行为。已保存的拒绝型 exhausted 守卫仍阻断同一快照，批准及修正结果继续遵守原有门禁。
+
+恢复加载另检查任务条目、待验证／审阅和待接受任务引用、接受后待办的嵌套 payload，以及非空闲的 current_task。未知任务、缺失字段、错误类型或重复任务 ID 在执行前以 HarnessError 停止；测试确认台账字节、事件、记忆、Git HEAD 和模型派发均不改变。指挥任务选择与再规划的固定身份及额度保持原实现，仅在文档明确各调用类型在整个 run 共用一次自动和一次显式修正额度。
+
+上述审阅恢复测试使用模拟模型响应及真实本地 Git、验证子进程，不证明真实模型调用行为。本轮未运行 `python3 -m harness smoke` 或新增真实模型联调。README、设计与恢复协议已同步，临时审阅文档 `docs/review-2026-10-22-v11.md` 已按要求删除。

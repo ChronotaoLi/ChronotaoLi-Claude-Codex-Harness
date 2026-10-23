@@ -1,5 +1,6 @@
 import copy
 from pathlib import Path
+from unittest.mock import patch
 
 from harness import git
 from harness.util import HarnessError, read_json, write_json
@@ -29,11 +30,65 @@ class RecoveryStateValidationTests(RepoCase):
         original = path.read_bytes()
         calls = copy.deepcopy(self.backend.calls)
         head = git.head(self.engine_before.worktree)
+        events = self.engine_before.directory / "events.jsonl"
+        original_events = events.read_bytes()
+        memories = self.engine_before.memory.export()
         with self.assertRaisesRegex(HarnessError, "运行台账恢复状态无效"):
             self.engine(self.backend).resume(state["id"])
         self.assertEqual(self.backend.calls, calls)
         self.assertEqual(path.read_bytes(), original)
         self.assertEqual(git.head(self.engine_before.worktree), head)
+        self.assertEqual(events.read_bytes(), original_events)
+        self.assertEqual(self.engine_before.memory.export(), memories)
+
+    def test_task_references_stop_before_resume_side_effects(self):
+        self.blocked_review()
+        for field in ("pending_task", "pending_acceptance", "current_task"):
+            for ident in ("ghost", "", [], {}, 1, None):
+                if field == "current_task" and ident is None:
+                    continue  # An idle run legitimately has no current task.
+                with self.subTest(field=field, ident=ident):
+                    state = copy.deepcopy(self.saved)
+                    if field == "current_task":
+                        state[field] = ident
+                    else:
+                        state.setdefault(field, {})["task_id"] = ident
+                    self.assert_stops_before_resume(state)
+        for field in ("pending_task", "pending_acceptance"):
+            with self.subTest(field=field, missing_id=True):
+                state = copy.deepcopy(self.saved)
+                state.setdefault(field, {}).pop("task_id", None)
+                self.assert_stops_before_resume(state)
+
+    def test_invalid_post_accept_task_cannot_complete_memory_or_events(self):
+        self.backend = RecordingBackend()
+        self.engine_before = self.engine(self.backend)
+        with patch.object(self.engine_before.memory, "remember", side_effect=HarnessError("storage unavailable")):
+            with self.assertRaisesRegex(HarnessError, "storage unavailable"):
+                self.engine_before.start("Implement greet", read_json(ROOT / "examples/plan.json"))
+        self.saved = copy.deepcopy(self.engine_before.run)
+        self.assertEqual(set(self.saved["accepted"]), {"greet"})
+        self.assertEqual(self.engine_before.memory.export(), [])
+        original_payload = self.saved["pending_post_accept"]["payload"]
+        payloads = [None, [], "invalid", {}] + [
+            {**original_payload, "task_id": ident} for ident in ("ghost", [], {}, None, 1, "")]
+        for payload in payloads:
+            with self.subTest(payload=payload):
+                state = copy.deepcopy(self.saved)
+                state["pending_post_accept"]["payload"] = payload
+                self.assert_stops_before_resume(state)
+        state = copy.deepcopy(self.saved)
+        state["pending_post_accept"].pop("payload")
+        self.assert_stops_before_resume(state)
+
+    def test_invalid_task_catalog_cannot_break_reference_validation(self):
+        self.blocked_review()
+        for tasks in ([None], ["invalid"], [{}], [{"id": []}], [{"id": {}}],
+                      [{"id": ""}], self.saved["tasks"] * 2):
+            with self.subTest(tasks=tasks):
+                state = copy.deepcopy(self.saved)
+                state["tasks"] = tasks
+                self.assert_stops_before_resume(state)
 
     def test_optional_state_types_stop_before_dispatch_or_ledger_write(self):
         self.blocked_review()

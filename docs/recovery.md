@@ -40,7 +40,7 @@ worker 完成且结果通过检查后，持久化 `pending_task` 的 verifying �
 
 审阅派发在调用模型之前保存 `review_receipts` 接收意图，绑定原 dispatch ID、候选快照和结果文件位置。返回结果原子落盘后即使还没完成检查就中断，恢复也读取该结果，完成原契约身份、结构、语义、格式、文件一致性和 post_agent hook 检查。结果绑定哈希后，文件缺失或改变必须停止；hook 重试使用独立日志并具有至少一次执行语义。没有返回结果的调用可在人工 resume 后重新派发，仍消耗派发预算。协议错误不能通过重抽结果消失。
 
-首次审阅的身份、结构和快照正确，但 finding ID 重复、blocking 缺少证据／属于偏好或记忆批准越界时，若 verdict 为 request_changes 或包含任意 blocking finding，则保留为 `invalid_rejected`。首次拒绝若语义合法、但 finding 数量、位置、说明或证据等不可变字段违反格式限制，也使用该路径；仅可变字段格式错误仍走现有一次自动格式修正。该状态保存完整原文、产物摘要和校验诊断，不修造一份合法结果，也不批准记忆；post_agent hook 仍须通过。任务级保存历史后返工，整体级保存完成的失败记录与 pending_replan，再按原预算请求修正。相同整体快照包括空 diff 修正均不可重抽审阅；不含拒绝的非法批准默认停止，仅下述显式元数据修正可继续。身份／结构错误及格式修正中的非法结果继续停止。无效语义结果可能同时超过格式大小限制；历史通过原始产物引用和有界摘录传递，必要元数据仍超预算时明确停止。
+首次审阅的身份、结构和快照正确，但 finding ID 重复、blocking 缺少证据／属于偏好或记忆批准越界时，若 verdict 为 request_changes 或包含任意 blocking finding，则保留为 `invalid_rejected`。首次拒绝若语义合法、但 finding 数量、位置、说明或证据等不可变字段违反格式限制，也使用该路径。仅可变字段格式错误时，该角色／调用类型／任务的自动额度未用则走现有一次自动格式修正；额度已用的首次拒绝直接保存为 `invalid_rejected`，不追加格式修正派发。该状态保存完整原文、产物摘要和校验诊断，不修造一份合法结果，也不批准记忆；post_agent hook 仍须通过，hook 中断后恢复继续核验同一原始结果。任务级保存历史后返工，整体级保存完成的失败记录与 pending_replan，再按原预算请求修正。相同整体快照包括空 diff 修正均不可重抽审阅；不含拒绝的非法批准默认停止，仅下述显式元数据修正可继续。身份／结构错误及自动或显式修正中的非法结果继续停止。无效语义结果可能同时超过格式大小限制；历史通过原始产物引用和有界摘录传递，必要元数据仍超预算时明确停止。
 
 整体验收在 `final_history` 中持久化 verifying/reviewing 阶段及证据。中断且快照相同则复用同一次最终尝试；未完成记录不作为先前审阅结论注入。验证失败使用独立的 verification_failed 状态：所有失败项均超时时停止，人工修复环境或增加超时后 resume 可在同一快照上重验；普通非零退出进入修正规划，同一快照重验须显式 `--reverify`。重验消耗新的最终尝试且保留原失败记录。该选项只可取消尚未返回指挥结果的验证失败再规划请求；已返回结果必须完成原校验，已校验修订必须继续应用，模型拒绝仍要求正常修正任务。最终拒绝结果与待再规划意图一起保存，避免中断丢失修正路径。
 
@@ -56,9 +56,11 @@ worker 调用失败或中断时，另按 task ID 保存 `worker_recovery`，记�
 
 `resume --repair-invalid DISPATCH_ID` 提供独立、显式且有界的输出修正入口。仅匹配当前未消费的 receipt，先验证原字节摘要、派发身份、结构、当前快照，以及指挥请求摘要和 replan 请求归属。语义修正适用对象为非法 plan/revise，或 verdict 为 approve、没有 blocking finding，但重复 finding ID／批准未知记忆 key 的审阅。自动格式修正额度耗尽后，仅可变字段格式非法的指挥任务选择、revise 和无阻断 approve 也可使用同一显式额度；不得在自动修正尚未耗尽时取得额外派发。
 
-格式耗尽的显式修正保留最初结果和最新失败修正结果的路径、派发、快照与内容摘要。review 以最初 review_corrections 守卫为约束，不能用后一次返回的内容替代最初结论；指挥的自动和显式格式修正固定最初 selected_task 或 action/new_tasks/updates，仅修正 instruction 或 reason。旧 v8 指挥格式修正没有最初结果的已绑定摘要时，普通恢复与显式修正均停止：既不派发未返回的修正，也不接受已有修正结果，不从现有文件补造可信依据；操作者可保留证据后 abandon。旧 reviewer 守卫已有原始摘要，可按同一条件恢复。合法结果及其 hook 失败、stop、拒绝或 blocking 审阅、身份／结构错误、改变原结论的 failed 守卫均不适用；非阻断批准的 finding 数量、位置、内容或证据等不可变字段超限仍属于 unrepairable，不派发无解修正。首次拒绝按前述 invalid_rejected 路径处理；旧运行中已保存的 unrepairable 守卫不自动转换，同一快照仍停止。任务候选真实变化时仅按证据归档与完整重做路径恢复。
+格式耗尽的显式修正保留最初结果和最新失败修正结果的路径、派发、快照与内容摘要。review 以最初 review_corrections 守卫为约束，不能用后一次返回的内容替代最初结论；指挥的自动和显式格式修正固定最初 selected_task 或 action/new_tasks/updates，仅修正 instruction 或 reason。旧 v8 指挥格式修正没有最初结果的已绑定摘要时，普通恢复与显式修正均停止：既不派发未返回的修正，也不接受已有修正结果，不从现有文件补造可信依据；操作者可保留证据后 abandon。旧 reviewer 守卫已有原始摘要，可按同一条件恢复。合法结果及其 hook 失败、stop、拒绝或 blocking 审阅、身份／结构错误、改变原结论的 failed 守卫均不适用；非阻断批准的 finding 数量、位置、内容或证据等不可变字段超限仍属于 unrepairable，不派发无解修正。符合前述条件的首次拒绝按 invalid_rejected 路径处理；旧运行中已保存的拒绝型 exhausted 或 unrepairable 守卫不自动转换，同一快照仍停止。任务候选真实变化时仅按证据归档与完整重做路径恢复。
 
 授权与原 receipt 一起持久保存在 `invalid_repairs`，保留原结果文件、内容摘要、快照、诊断和指挥请求。每个角色／调用类型／任务整个 run 只可授权一次；新派发使用新进程、新 dispatch，并消耗累计派发预算。指挥修正仍受原目标、范围、DAG、验收与预算约束。审阅修正必须保留原 verdict、全部 finding 的数量、顺序、严重程度、类别、位置、说明和证据，以及原先获批且确属提案的 key；只允许修改摘要、重复或非法 ID，并去重批准 key、删除不存在的 key。原本合法且唯一的 finding ID 不变，不允许新增批准。
+
+指挥任务选择的固定任务身份为 `dispatching`，再规划为 `replanning`，对应 `commander:dispatch:dispatching` 和 `commander:replan:replanning`。两种调用类型各自在整个 run 内共享一次自动格式修正额度和一次显式修正额度；选择不同工程任务、增加 worker 尝试、进入新一轮再规划或 resume 均不重置。已保存的 receipt 和修正依据仍按原身份恢复。
 
 语义修正与格式耗尽修正共用这一次显式额度；格式修正不允许改变已批准 key 集合。显式修正再次格式非法也不取得自动修正额度，普通恢复继续校验同一个已返回结果。
 
@@ -68,7 +70,7 @@ worker 调用失败或中断时，另按 task ID 保存 `worker_recovery`，记�
 
 ### 恢复子状态的维护约束
 
-加载台账时先检查下列可选对象的类型、任务阶段与再规划互斥，以及 receipt、修正守卫和 worker 故障来源引用的 dispatch 是否存在并匹配角色／调用类型／任务；重复 dispatch ID 同样停止。检查失败不重写台账、不派发，也不先归档候选。此检查不替代消费证据时的内容摘要、候选快照、身份和 hook 门禁，不自动修复损坏状态，台账版本保持 8。
+加载台账时先检查下列可选对象的类型、任务阶段与再规划互斥，以及 receipt、修正守卫和 worker 故障来源引用的 dispatch 是否存在并匹配角色／调用类型／任务；重复 dispatch ID 同样停止。`pending_task.task_id`、`pending_acceptance.task_id`、`pending_post_accept.payload.task_id` 和非 `None` 的 `current_task` 必须是指向现有任务的字符串；检查引用前先核对任务条目、嵌套 payload 和 ID 的类型。检查失败给出 `HarnessError`，不重写台账、不派发、不写入记忆，也不先归档候选。此检查不替代消费证据时的内容摘要、候选快照、身份和 hook 门禁，不自动修复损坏状态，台账版本保持 8。
 
 | 子状态 | 设置点 | 清除点与共存约束 |
 | --- | --- | --- |
@@ -99,9 +101,10 @@ worker 调用失败或中断时，另按 task ID 保存 `worker_recovery`，记�
 | 旧进程存活或退出未知 | 核实后 `resume --confirm-exited ID`；终态使用 `cleanup-verification RUN --confirm-exited ID` | 确认精确 dispatch，先审计后写入，不终止无关进程 |
 | worker 或未返回结果的模型调用故障 | 修复环境后 `resume` | 新进程、新 dispatch，保留故障来源并消耗对应预算 |
 | 验证、审阅或接受 hook 中断 | 修复原因后 `resume` | 同一快照复用已有阶段；hook 不被绕过 |
-| 自动格式修正耗尽，且满足显式修正条件 | `resume --repair-invalid ID` | 最初结论、已绑定原文、失败修正证据与快照不变；整个角色／类型／任务仅一次 |
+| 自动格式修正耗尽，且满足显式修正条件 | `resume --repair-invalid ID` | 最初结论、已绑定原文、失败修正证据与快照不变；整个角色／类型／任务仅一次，指挥任务选择和再规划各按固定身份在整个 run 共用 |
+| 首次拒绝仅可变字段格式非法，且自动额度已用 | 保存为 `invalid_rejected` 后进入任务返工或整体修正规划；中断后普通 `resume` | 原文、摘要、快照及 hook 仍须核验；不追加格式修正派发，不适用于修正结果或旧拒绝型 exhausted 守卫 |
 | 支持的语义非法 plan/revise 或批准元数据 | `resume --repair-invalid ID` | 原有语义修正约束及同一显式额度 |
-| 修正改变原结论、批准的不可变字段超限或已有 unrepairable 守卫、显式修正再次非法，或缺可信原始依据 | 保留证据后 `abandon` | 不重新抽取同一候选的结论；任务候选确有变化时仅适用既有归档与完整重做路径 |
+| 修正改变原结论、批准的不可变字段超限、已有 unrepairable 或拒绝型 exhausted 守卫、显式修正再次非法，或缺可信原始依据 | 保留证据后 `abandon` | 不重新抽取同一候选的结论；任务候选确有变化时仅适用既有归档与完整重做路径 |
 | 指挥明确 stop | `resume --retry-stopped TASK_ID` 或 `final` | 保留原 stop，仍受累计再规划和派发预算约束 |
 | 新任务需要额外文件范围 | 待再规划时 `resume --allow-scope PATTERN` | 只增加新任务可选模式；已停止时另需 `--retry-stopped` |
 | 最终验证超时／非零退出 | 超时修复后 `resume`；非零退出走修正规划，确认环境修复后可显式 `--reverify` | 已返回的指挥结果和模型拒绝不可由重验丢弃 |

@@ -587,7 +587,7 @@ class Engine(InvalidOutputRecovery):
         if rejection is None:
             try:
                 validate(result, contract)
-            except RepairableFormatError:
+            except RepairableFormatError as format_error:
                 if previous_review is not None or repair or review_approved(result):
                     raise
                 # An original rejection with immutable overflow still requires
@@ -598,7 +598,11 @@ class Engine(InvalidOutputRecovery):
                 except RepairableFormatError as error:
                     rejection = InvalidReviewRejection(result, receipt, error)
                 else:
-                    raise
+                    if not self.run["format_repairs"].get(key):
+                        raise
+                    # A prior candidate may have spent the correction budget.
+                    # Keep this candidate's original rejection and rework it.
+                    rejection = InvalidReviewRejection(result, receipt, format_error)
         if not receipt.get("hook_completed"):
             receipt["hook_attempts"] = receipt.get("hook_attempts", 0) + 1
             self.save()
@@ -886,6 +890,28 @@ class Engine(InvalidOutputRecovery):
                 mapping(self.run[field], field)
         if "pending_task" in self.run and "pending_replan" in self.run:
             fail("pending_task 与 pending_replan 不能同时存在")
+
+        task_ids = set()
+        for index, task in enumerate(self.run["tasks"]):
+            field = f"tasks[{index}]"
+            ident = mapping(task, field).get("id")
+            if not isinstance(ident, str) or not ident or ident in task_ids:
+                fail(field + ".id 缺失、类型无效或重复")
+            task_ids.add(ident)
+
+        def task_reference(ident, field):
+            if not isinstance(ident, str) or ident not in task_ids:
+                fail(field + " 必须引用现有任务的字符串 ID")
+
+        for field in ("pending_task", "pending_acceptance"):
+            if field in self.run:
+                task_reference(self.run[field].get("task_id"), field + ".task_id")
+        if "pending_post_accept" in self.run:
+            field = "pending_post_accept.payload"
+            payload = mapping(self.run["pending_post_accept"].get("payload"), field)
+            task_reference(payload.get("task_id"), field + ".task_id")
+        if self.run.get("current_task") is not None:
+            task_reference(self.run["current_task"], "current_task")
 
         dispatches = {}
         for entry in self.run["dispatches"]:
