@@ -230,3 +230,15 @@ Codex 0.163.0 的本地 `debug prompt-input` 检查确认：未提交的 AGENTS.
 另使用 Python 3.11.17 执行全部 2 项新增测试，均通过，耗时 5.668 秒，日志为 `.harness/validation/review-v13-python311.log`；本轮未在 Python 3.11 重跑完整套件。`python3 -m compileall -q harness tests` 与 `git diff --check` 通过。
 
 已完成 run 的恢复参数行为及损坏恢复链接阻止 `abandon` 的限制仅补充文档，未放宽台账、进程或清理门禁。台账保持版本 8，没有新增恢复子状态或 CLI 参数，模型 ID 与派发生命周期保持不变。上述测试使用模拟模型响应及真实本地 Git、验证子进程，不证明真实模型调用行为；本轮未运行 `python3 -m harness smoke` 或调用真实模型。README、设计与恢复协议已同步，临时审阅文档 `docs/review-2026-10-23-v13.md` 已按要求删除。
+
+## 环境更新与前置检查验证（2026-10-23，台账 v9）
+
+执行 `python3 -m unittest discover -s tests -v`：556 项，555 项通过、1 项跳过（Python 3.15.0，528.168 秒）。跳过原因仍为本机文件系统拒绝非 UTF-8 文件名。完整日志保存在 `.harness/validation/environment-update-offline.log`，不提交。
+
+新增 30 项行为测试覆盖操作者环境更新进入后续指挥、worker、任务及整体审阅，原任务义务和累计预算保留；失败前置检查不派发模型，补齐条件后普通恢复；输入副本与来源摘要校验、重复提交、审计及台账保存中断、历史检查替换、上下文溢出、预算耗尽、旧来源过期，以及已有指挥 receipt／待派发指令不能被环境更新替换。越界写入仍由原文件范围门禁拒绝；worker 格式修正前重新检查前置条件，worker 已完成后续接审阅则不重跑前置检查。命令声明检查通过不执行对应命令。CLI 测试覆盖参数传递、错误出口、worker 结果分类和过期阻断诊断。
+
+版本 8 的普通恢复与首次接收更新升级到版本 9 均通过；独立清理的终态确认覆盖版本 7、8、9，保留原状态与验证证据。检查原始环境更新和检查报告不改变模型 ID、命令授权、接受条件或派发预算。
+
+使用 Python 3.11.17 执行 `PYTHONPATH=tests python3.11 -m unittest test_environment_updates test_environment_cli -v`：全部 30 项新增测试通过，33.100 秒；日志为 `.harness/validation/environment-update-python311.log`。本轮未在 Python 3.11 重跑完整套件。全部 Python 文件的 3.11 语法解析及 `git diff --check` 通过。
+
+测试使用模拟模型响应及真实本地 Git、验证子进程；前置检查自身不启动子进程。这些测试不证明真实 CLI 会正确理解环境更新，本轮未运行 Harness 的真实模型 `smoke`。README、设计与恢复协议已同步，私有证据不纳入 Git。

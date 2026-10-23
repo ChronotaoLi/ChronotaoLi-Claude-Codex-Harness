@@ -85,6 +85,51 @@ def status_summary(run):
     result["accepted_tasks"] = list(run.get("accepted", {}))
     result["budgets"] = {key: run.get(key) for key in
                          ("attempts", "total_attempts", "agent_dispatches", "replan_attempts", "final_attempts")}
+    dispatches = run.get("dispatches", [])
+    dispatches = [entry for entry in dispatches if isinstance(entry, dict)] if isinstance(dispatches, list) else []
+    outcomes = dict.fromkeys(("completed", "task_blocked", "environment_blocked", "runtime_failed", "unknown"), 0)
+    for entry in dispatches:
+        if entry.get("role") == "worker":
+            outcome = entry.get("worker_outcome")
+            key = outcome if isinstance(outcome, str) and outcome in outcomes else (
+                "runtime_failed" if entry.get("status") == "failed" else "unknown")
+            outcomes[key] += 1
+    result["worker_outcomes"] = outcomes
+    feedback = run.get("feedback")
+    if isinstance(feedback, dict):
+        worker = feedback.get("worker")
+        if isinstance(worker, dict) and worker.get("status") == "blocked" and worker.get("blocker_kind") == "environment":
+            artifact = feedback.get("worker_artifact")
+            artifact = artifact if isinstance(artifact, str) else None
+            source_id = Path(artifact).parent.name if artifact else None
+            task_id = feedback.get("task_id")
+            source_index = next((i for i, entry in enumerate(dispatches)
+                                 if source_id is not None and entry.get("id") == source_id
+                                 and entry.get("role") == "worker"
+                                 and entry.get("task_id", task_id) == task_id), None)
+            stale = (not isinstance(task_id, str) or task_id != run.get("current_task")
+                     or task_id in run.get("accepted", {}) or source_index is None
+                     or any(entry.get("role") in ("commander", "worker", "reviewer") and entry.get("invoked") is not False
+                            for entry in dispatches[source_index + 1:]))
+            blockers = worker.get("blockers")
+            summary = {"task_id": task_id if isinstance(task_id, str) else None,
+                       "dispatch_id": source_id, "source_artifact": artifact,
+                       "source_digest": feedback.get("worker_artifact_digest") if isinstance(feedback.get("worker_artifact_digest"), str) else None,
+                       "blockers": [value for value in blockers if isinstance(value, str)] if isinstance(blockers, list) else [],
+                       "stale": stale}
+            attempt = feedback.get("attempt")
+            if type(attempt) is int and attempt > 0:
+                summary["attempt"] = attempt
+            updates = run.get("environment_updates", [])
+            updates = [entry for entry in updates if isinstance(entry, dict) and entry.get("task_id") == task_id
+                       and entry.get("blocker_dispatch_id") == source_id] if isinstance(updates, list) else []
+            if updates:
+                latest = updates[-1]
+                if isinstance(latest.get("id"), str):
+                    summary["latest_update_id"] = latest["id"]
+                if isinstance(latest.get("sequence"), int) and not isinstance(latest["sequence"], bool):
+                    summary["latest_update_version"] = latest["sequence"]
+            result["last_environment_blocker"] = summary
     if run.get("error"):
         result["error"] = str(run["error"]).splitlines()[0]
     if run.get("replan_stopped"):
@@ -164,6 +209,8 @@ def _main(argv=None):
                         help="确认指定旧 dispatch 已退出并记录证据；可重复指定")
     resume.add_argument("--repair-invalid", metavar="DISPATCH_ID",
                         help="显式修正当前非法计划或无拒绝的非法批准元数据；保留证据和累计预算")
+    resume.add_argument("--environment-update", type=Path, metavar="FILE",
+                        help="提供操作者环境澄清 JSON 文件；不扩展权限、文件范围或命令授权")
     resume.add_argument("--allow-scope", action="append", metavar="PATTERN",
                         help="为待再规划显式授权新增文件范围模式；可重复指定，不改变原任务范围")
     status = sub.add_parser("status")
@@ -237,6 +284,8 @@ def _main(argv=None):
                 options["confirm_exited"] = args.confirm_exited
             if args.repair_invalid is not None:
                 options["repair_invalid"] = args.repair_invalid
+            if args.environment_update is not None:
+                options["environment_update"] = args.environment_update
             if args.allow_scope:
                 options["allow_scope"] = args.allow_scope
             result = Engine(config, repo).resume(args.run_id, approve_plan=args.approve_plan, step=args.step,

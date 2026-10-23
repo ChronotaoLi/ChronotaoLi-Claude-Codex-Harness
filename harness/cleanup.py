@@ -151,7 +151,7 @@ def cleanup_verification(repo: Path, ident: str, *, remove=False, confirm_exited
     with lock(directory / "run.lock"):
         _regular_bytes(directory / "state.json")
         run = read_json(directory / "state.json")
-        if (not isinstance(run, dict) or run.get("schema_version") not in (7, 8) or run.get("id") != ident
+        if (not isinstance(run, dict) or run.get("schema_version") not in (7, 8, 9) or run.get("id") != ident
                 or run.get("repo") != str(repo) or not isinstance(run.get("dispatches"), list)
                 or not isinstance(run.get("final_history"), list)
                 or not isinstance(run.get("worktree_binding"), dict)

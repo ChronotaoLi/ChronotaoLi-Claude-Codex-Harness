@@ -109,7 +109,7 @@ python3 -m harness --repo /path/to/project cleanup-verification run_实际ID
 python3 -m harness --repo /path/to/project cleanup-verification run_实际ID --remove
 ```
 
-默认只返回各检出的可清理状态；`--remove` 在运行锁内确认旧进程退出、路径归属、Git 绑定及原验证提交后逐项移除，保留运行台账、diff、日志和 `checkout.json`，另写清理记录。已跟踪修改、未跟踪或忽略文件均阻止清理，需要先人工核对。目录已缺失时，仅在原绑定仍可核验的情况下注销该精确路径，不执行全仓库 prune。该命令兼容版本 7、8 的台账，不加载配置或调用模型。
+默认只返回各检出的可清理状态；`--remove` 在运行锁内确认旧进程退出、路径归属、Git 绑定及原验证提交后逐项移除，保留运行台账、diff、日志和 `checkout.json`，另写清理记录。已跟踪修改、未跟踪或忽略文件均阻止清理，需要先人工核对。目录已缺失时，仅在原绑定仍可核验的情况下注销该精确路径，不执行全仓库 prune。该命令兼容版本 7、8、9 的台账，不加载配置或调用模型。
 
 旧 dispatch 没有可确认的退出记录时，清理与恢复均停止；缺少 pgid 不能证明进程未启动。核实退出后可执行 `cleanup-verification RUN --confirm-exited DISPATCH_ID`，可重复指定 ID，也可与 `--remove` 合用。此确认入口支持已完成或已放弃的 run，先保存审计事件，再更新指定 dispatch 的确认，不改变 run 状态或放松文件清理门禁。未指定确认时，预览不改运行台账。
 
@@ -138,9 +138,36 @@ worker 完成后保存验证阶段；验证通过后保存待审阅阶段及快�
 
 整体验收也保存验证和审阅阶段；中断继续同一次最终尝试。最终验证全部失败项都是超时时，修复环境或增加超时后普通 `resume` 可重验；普通非零退出进入修正规划，操作者确认需要重验同一快照时使用 `resume <run_id> --reverify`。该授权仅对本次恢复的首次整体验收生效；即使首次处理的是新快照、未完成阶段或超时后的重验，也不会延续到本次恢复中后续产生的失败。重验消耗新的最终尝试，并保留失败证据；该选项仅在整体验收预算允许重验时取消尚未返回指挥结果的验证失败修正规划，不能丢弃已返回的指挥结果、跳过已校验修订或重抽模型拒绝结论。预算耗尽时，被拒绝的 `--reverify` 保留待再规划意图，增加预算后普通 `resume` 可继续修正规划，也可显式 `--reverify` 重验。
 
-当前运行台账为版本 8，新增显式非法结果修正记录与操作者批准的范围。版本 7 及更早台账可通过 `status` 查看，不能直接恢复执行；请用对应旧版本完成旧 run，或从核对后的代码开始新 run。列出状态时，损坏或缺失的台账会产生诊断，不会阻止查看其他运行。当前版本已完成的 run 在普通 `resume` 时直接返回保存结果，不再比较执行配置和共享资产与运行时保存值，也不派发或记账；CLI 初始化仍需能加载当前配置与 hooks。已完成 run 的 `resume` 拒绝 `--confirm-exited`、`--repair-invalid` 和 `--allow-scope`；`--reverify`、`--retry-stopped`、`--approve-plan` 和 `--step` 不生效，仍返回保存结果，不表示执行了所请求的恢复操作。
+新运行台账为版本 9，保存操作者环境更新及检查证据。版本 8 仍可普通恢复；首次接受环境更新时升级为 9，原预算与历史保留。版本 7 及更早台账可通过 `status` 查看，不能直接恢复执行；请用对应旧版本完成旧 run，或从核对后的代码开始新 run。列出状态时，损坏或缺失的台账会产生诊断，不会阻止查看其他运行。当前版本已完成的 run 在普通 `resume` 时直接返回保存结果，不再比较执行配置和共享资产与运行时保存值，也不派发或记账；CLI 初始化仍需能加载当前配置与 hooks。已完成 run 的 `resume` 拒绝 `--confirm-exited`、`--repair-invalid`、`--allow-scope` 和 `--environment-update`；`--reverify`、`--retry-stopped`、`--approve-plan` 和 `--step` 不生效，仍返回保存结果，不表示执行了所请求的恢复操作。
+
+`status` 的 `worker_outcomes` 区分 worker 自报完成、任务阻断、环境阻断、运行故障及未知结果，不代表任务已接受。`last_environment_blocker` 保留最近环境阻断来源与更新诊断；后续调用开始后标记 stale，属于历史证据，不表示当前仍停在同一环境阻断或仍可提交更新。
 
 任务因缺少前置工作而返回 `blocker_kind=task` 时，指挥可进行有限再规划；权限、工具、账号或服务问题使用 `environment` 并停止。指挥仅返回 `new_tasks` 和 `updates` 增量操作，运行时保留已有任务的 ID、验收条件、文件范围及依赖；更新只能改进未接受任务的描述并增加依赖，已接受任务完全不变。新任务必须复用既有范围模式或操作者显式批准的额外模式。已校验的修订先保存，再归档未接受修改并恢复到最后接受的提交；归档中断后的恢复继续应用该修订，不再请求模型或增加再规划次数。
+
+worker 因环境受阻后，可用结构化更新说明已修复的环境事实：
+
+```bash
+python3 -m harness --config /path/to/harness.toml --repo /path/to/project resume run_实际ID --environment-update /absolute/path/update.json --step
+```
+
+```json
+{
+  "schema_version": 1,
+  "task_id": "task_id_from_status",
+  "blocker_dispatch_id": "worker_dispatch_id_from_status",
+  "summary": "依赖已在当前运行工作树中准备好；请重新检查后继续原任务。",
+  "checks": [
+    {"kind": "path", "path": "/absolute/path/to/dependencies", "path_type": "directory"},
+    {"kind": "executable", "name": "python3"}
+  ]
+}
+```
+
+输入文件最多 64 KiB，每个 run 最多保存 32 条更新；严格拒绝未知字段。`summary` 必须非空且不超过 4,000 字符；`checks` 可省略，默认为空数组，最多 16 项。检查只允许三种形式：`path` 的绝对路径及 `path_type=file|directory|any`；`executable` 的可执行文件名或绝对路径；`worker_command` 的精确 `argv` 数组。最后一种只检查命令已在当前 `permissions.worker_commands` 或 `verification.commands` 中声明，不执行命令，也不新增授权。未声明的命令作为失败前置条件保留更新与报告；操作者在配置中追加精确授权后，可普通 resume 重检。全部检查只读，不启动子进程，不保证真实 CLI 或服务调用成功；仅需说明操作者事实时可省略检查。
+
+更新仅在当前 worker 的环境 blocker 已保存、来源仍有效且没有待处理派发指令、receipt、验证／审阅／接受／再规划阶段或活动修正时接受。任务 ID 与 blocker dispatch ID 必须匹配当前来源，旧反馈不能覆盖后续调用。已完成或已放弃的 run 拒绝更新；该选项与 `--reverify`、`--retry-stopped`、`--allow-scope`、`--repair-invalid` 互斥，可与 `--step` 合用。
+
+输入复制到 `.harness/` 私有产物并绑定摘要；原输入文件随后可移走。同一 blocker 来源、尚无后续模型调用时，重复提交相同更新不会重复登记。保存中断可能使审计事件以同一稳定更新 ID 重复出现，台账仍只登记一条引用。更新按顺序进入后续指挥、worker 和 reviewer 的必要上下文，包括整体审阅容量估计；各任务最新更新的最近检查报告经摘要核验后作为 `environment_observations` 一并提供。它是操作者对匹配任务环境事实的更新，可替代过时环境假设，不改变目标、文件范围、验收、工具权限或记忆所有权，也不是完成证据。同一任务最新更新的 checks 替代旧检查列表，所有历史声明仍按序保留。各次检查报告保留；匹配任务之后每次 worker 尝试（含格式修正）前重检，失败不派发或消耗调用预算。worker 返回后的验证和审阅不重跑这些前置检查，仍按原门禁独立验收。所有新调用使用新进程、新 dispatch，累计预算不清零；既有 receipt 与批准不能借更新重抽或复用到新候选。
 
 确需新增前置文件时，可在待再规划阶段显式扩展新任务可用的范围：
 
@@ -316,6 +343,7 @@ python3 -m harness --repo /path/to/project memory export > memory-backup.json
     hooks/             # 接受门禁日志
     plans/             # 计划版本与增量修订证据
     recovery/          # 再规划前归档的未接受修改
+    environment/       # 操作者环境更新、来源摘要与各次只读前置检查
   worktrees/<run_id>/   # 独立分支中的代码
 ```
 

@@ -20,6 +20,7 @@ from .contracts import (DETAIL, PLAN, REPLAN, REVIEW, WORK, RepairableFormatErro
                         validate_structure, validate_work, validate_work_semantics, validate_approval_repair,
                         validate_commander_format_correction, validate_immutable_findings)
 from .memory import Memory, validate_proposals
+from .environment import EnvironmentRecovery
 from .recovery import InvalidOutputRecovery, read_bound_result, snapshot_digest
 from .shared import HookError, Hooks, asset_digest, read_skill, skills_catalog, validate_mcp
 from .util import (HarnessError, ProcessTimeout, append_event, confirm_dispatches_exited,
@@ -39,7 +40,7 @@ class InvalidReviewRejection(HarnessError):
                             "dispatch_id": receipt["dispatch_id"]}
 
 
-class Engine(InvalidOutputRecovery):
+class Engine(EnvironmentRecovery, InvalidOutputRecovery):
     def __init__(self, config, repo, state=None, backend=None, commander="astra"):
         self.config = config
         self.repo = git.repository(Path(repo))
@@ -115,6 +116,8 @@ class Engine(InvalidOutputRecovery):
                    "original_tasks": self.run["original_tasks"], "base_commit": self.run["base_commit"],
                    "total_attempts": self.run["total_attempts"], "replan_attempts": self.run["replan_attempts"],
                    "final_history": self.run["final_history"], "plan_revision": len(self.run["plan_history"]),
+                   "environment_updates": deepcopy(self.run.get("environment_updates", [])),
+                   "environment_checks": deepcopy(self.run.get("environment_checks", [])),
                    "next": "Resume the harness run; every dispatch creates a fresh agent process."}
         write_json(self.directory / "handoff.json", handoff)
         (self.directory / "handoff.md").write_text("# Run handoff\n\n```json\n" + dump(handoff) + "\n```\n", encoding="utf-8")
@@ -158,6 +161,7 @@ class Engine(InvalidOutputRecovery):
                                                           if item["status"] != "running"]),
                        "instruction": FINAL_REVIEW_INSTRUCTION},
         }
+        required["packet"] = self.environment_packet(required["packet"])
         projected = deepcopy(required)
         packet = projected["packet"]
         runtime = self.config.data["runtime"]
@@ -245,7 +249,8 @@ class Engine(InvalidOutputRecovery):
     def tool_constraints(self):
         return {"readonly_commands": self.config.readonly_commands(),
                 "worker_commands": self.config.data["permissions"]["worker_commands"],
-                "verification_commands": self.config.data["verification"]["commands"]}
+                "verification_commands": self.config.data["verification"]["commands"],
+                "permission_guidance": "Use readonly command argv as shown, appending paths after --. A denied Bash form does not prove a path is unreadable or writable; use available Read/Glob/Grep. Distinguish command denial, missing path, tool failure and missing operation authority. Command declarations do not grant external write scope."}
 
     def finish_post_accept(self):
         pending = self.run.get("pending_post_accept")
@@ -303,6 +308,7 @@ class Engine(InvalidOutputRecovery):
     def dispatch(self, role, kind, task_id, schema, packet, task=None):
         # A format correction is a new process, never a provider-session resume.
         key = f"{role}:{kind}:{task_id}"
+        packet = self.environment_packet(packet)
         packet = self.invalid_repair_packet(key, packet)
         previous_review = None
         pending = self.run.setdefault("pending_format_corrections", {})
@@ -627,6 +633,11 @@ class Engine(InvalidOutputRecovery):
         return {k: v for k, v in result.items() if k not in ("task_id", "dispatch_id")}
 
     def dispatch_once(self, role, kind, task_id, schema, packet, task=None, previous_review=None):
+        if role == "worker":
+            # Includes automatic format corrections and retries after local
+            # preparation failure, before either invocation budget is consumed.
+            self.check_environment(task_id)
+            packet = self.environment_packet(packet)
         dispatch_id = str(uuid.uuid4())
         job = self.directory / "dispatches" / dispatch_id
         job.mkdir(parents=True)
@@ -650,7 +661,7 @@ class Engine(InvalidOutputRecovery):
         write_json(job / "context-report.json", report)
         self.emit_hook("context_prepared", {"report": report}, job)
         self.run["dispatches"].append({"id": dispatch_id, "role": role, "kind": kind, "task_id": task_id,
-                                       "status": "running", "pgid": None, "process_state": "prepared"})
+                                       "status": "running", "pgid": None, "process_state": "prepared", "invoked": False})
         entry = self.run["dispatches"][-1]
         self.save()
         self.event("dispatch_started", task_id=task_id, dispatch_id=dispatch_id, role=role)
@@ -708,6 +719,7 @@ class Engine(InvalidOutputRecovery):
                     "request_id": (self.run["pending_replan"]["request_id"] if kind == "replan"
                                    else dispatch_id)}
             entry["process_state"] = "starting"
+            entry["invoked"] = True
             self.save()
             invoked = True
             result = self.backend.invoke(role=role, model=self.config.role(role, self.commander), cwd=self.worktree,
@@ -740,6 +752,8 @@ class Engine(InvalidOutputRecovery):
             validate_structure(result, contract)
             if role == "worker":
                 validate_work_semantics(result)
+                entry["worker_outcome"] = ("completed" if result["status"] == "completed"
+                                           else result["blocker_kind"] + "_blocked")
             elif role == "reviewer":
                 validate_review_semantics(result, [p["key"] for p in packet.get("proposed_memories", [])])
             elif kind in ("plan", "replan"):
@@ -816,7 +830,7 @@ class Engine(InvalidOutputRecovery):
                   + git.describe_paths(untracked), file=sys.stderr, flush=True)
         ident = uid("run")
         worktree = self.state / "worktrees" / ident
-        self.run = {"schema_version": 8, "id": ident, "repo": str(self.repo), "goal": goal, "status": "planning", "commander": self.commander,
+        self.run = {"schema_version": 9, "id": ident, "repo": str(self.repo), "goal": goal, "status": "planning", "commander": self.commander,
                     "branch": "harness/" + ident, "worktree": str(worktree), "tasks": [], "accepted": {}, "attempts": {},
                     "dispatches": [], "expected_head": git.head(self.repo), "feedback": None,
                     "config_path": str(self.config.path), "config_snapshot": deepcopy(self.config.data),
@@ -825,6 +839,7 @@ class Engine(InvalidOutputRecovery):
                     "review_history": {}, "final_history": [], "plan_history": [], "format_repairs": {},
                     "review_corrections": {}, "review_receipts": {}, "commander_receipts": {},
                     "invalid_repairs": {}, "approved_scope": [],
+                    "environment_updates": [], "environment_checks": [],
                     "worktree_binding": {}, "ignored_baseline": [],
                     "pending_format_corrections": {}, "agent_dispatches": 0,
                     "plan_approval_required": pause_after_plan, "plan_approved": not pause_after_plan}
@@ -850,7 +865,7 @@ class Engine(InvalidOutputRecovery):
         self.run = read_json(self.state / "runs" / ident / "state.json")
         if not isinstance(self.run, dict):
             raise HarnessError("运行台账必须为对象")
-        if self.run.get("schema_version") != 8:
+        if self.run.get("schema_version") not in (8, 9):
             raise HarnessError("旧 run 状态格式无法安全恢复；请保留证据并使用原版本完成，或开始新 run")
         required = {"id": str, "repo": str, "worktree": str, "status": str, "commander": str,
                     "goal": str, "branch": str, "expected_head": str, "base_commit": str,
@@ -863,12 +878,15 @@ class Engine(InvalidOutputRecovery):
                     "final_history": list, "plan_history": list, "format_repairs": dict,
                     "total_attempts": int, "agent_dispatches": int, "final_attempts": int,
                     "replan_attempts": int, "plan_approval_required": bool, "plan_approved": bool}
+        if self.run["schema_version"] == 9:
+            required.update(environment_updates=list, environment_checks=list)
         if (self.run.get("id") != ident or any(type(self.run.get(k)) is not t for k, t in required.items())
                 or any(not isinstance(d, dict) for d in self.run["dispatches"])):
             raise HarnessError("运行台账字段缺失或类型无效；保留原文件并核对证据")
         if self.run["repo"] != str(self.repo):
             raise HarnessError("Run 属于另一个项目")
         self.validate_recovery_links()
+        self.validate_environment_links()
 
     def validate_recovery_links(self):
         """Reject inconsistent recovery links before any resumed side effects.
@@ -915,6 +933,8 @@ class Engine(InvalidOutputRecovery):
 
         dispatches = {}
         for entry in self.run["dispatches"]:
+            if "invoked" in entry and type(entry["invoked"]) is not bool:
+                fail("dispatches.invoked 必须是布尔值")
             ident = entry.get("id")
             if isinstance(ident, str):
                 if ident in dispatches:
@@ -1010,7 +1030,7 @@ class Engine(InvalidOutputRecovery):
             return self.run
 
     def resume(self, ident, *, step=False, approve_plan=False, reverify=False, retry_stopped=None, confirm_exited=(),
-               repair_invalid=None, allow_scope=()):
+               repair_invalid=None, allow_scope=(), environment_update=None):
         self.load_run(ident)
         with lock(self.directory / "run.lock"):
             self.load_run(ident)
@@ -1018,9 +1038,11 @@ class Engine(InvalidOutputRecovery):
                 raise HarnessError("该 run 已放弃；保留分支、工作树与证据，不能继续派发")
             self.commander = self.run["commander"]
             if self.run["status"] == "completed":
-                if confirm_exited or repair_invalid is not None or allow_scope:
-                    raise HarnessError("--confirm-exited、--repair-invalid 与 --allow-scope 仅用于未完成的 run")
+                if confirm_exited or repair_invalid is not None or allow_scope or environment_update is not None:
+                    raise HarnessError("--confirm-exited、--repair-invalid、--allow-scope 与 --environment-update 仅用于未完成的 run")
                 return self.run
+            if environment_update is not None and (reverify or retry_stopped is not None or repair_invalid is not None or allow_scope):
+                raise HarnessError("--environment-update 不能与 --reverify、--retry-stopped、--repair-invalid 或 --allow-scope 合用")
             if repair_invalid is not None and (reverify or retry_stopped is not None or allow_scope):
                 raise HarnessError("--repair-invalid 不能与 --reverify、--retry-stopped 或 --allow-scope 合用")
             if reverify and retry_stopped is not None:
@@ -1029,10 +1051,12 @@ class Engine(InvalidOutputRecovery):
             changes = self.config.resume_changes(self.run["config_snapshot"])
             if self.run.get("asset_digest") != asset_digest(self.config):
                 raise HarnessError("共享规则、skills、MCP 或 hooks 已改变；请恢复原版本后继续")
+            self.environment_context()
             self.confirm_exited(confirm_exited)
             self.ensure_exited()
             if git.head(self.worktree, binding=self.run["worktree_binding"]) != self.run["expected_head"]:
                 raise HarnessError("worktree HEAD 与检查点不同；请先核对提交，不自动重放")
+            update = self.prepare_environment_update(environment_update) if environment_update is not None else None
             if retry_stopped is not None:
                 stopped = self.run.get("replan_stopped")
                 if not stopped or stopped["target"] != retry_stopped:
@@ -1055,6 +1079,7 @@ class Engine(InvalidOutputRecovery):
                 self.run["config_snapshot"] = deepcopy(self.config.data)
                 self.event("resume_config_relaxed", changes=changes)
                 self.save()
+            self.record_environment_update(update)
             if self.run["tasks"] and self.run["plan_approval_required"] and not self.run["plan_approved"]:
                 if not approve_plan:
                     raise HarnessError("计划等待明确批准；使用 resume --approve-plan 继续")
@@ -1334,6 +1359,8 @@ class Engine(InvalidOutputRecovery):
             raise HarnessError(f"{current} 已达尝试次数上限")
         if self.run["total_attempts"] >= self.config.data["runtime"]["max_total_attempts"]:
             raise HarnessError("已达 run 总尝试次数上限")
+        for candidate in ready:
+            self.check_environment(candidate["id"])
         saved_directive = self.run.get("pending_directive")
         pristine = len(ready) == 1 and not self.run.get("feedback") and not self.run["attempts"].get(ready[0]["id"])
         if saved_directive:
@@ -1393,6 +1420,7 @@ class Engine(InvalidOutputRecovery):
             if result["blocker_kind"] != "task":
                 raise HarnessError(f"worker 环境受阻：{result['blockers']} {result['summary']}。"
                                    "若必要命令被拒绝，可在 permissions.worker_commands 追加精确 argv 后 resume；"
+                                   "环境事实有变化可使用 --environment-update FILE 记录补充说明与本地检查；"
                                    "原尝试和派发预算仍保留。")
             self.replan(deepcopy(self.run["feedback"]))
             return False
@@ -1778,7 +1806,7 @@ class Engine(InvalidOutputRecovery):
                 tasks = self.validate_tasks(plan)
                 self.run["original_tasks"] = deepcopy(tasks)
                 self.record_plan(tasks, "Initial plan")
-            if not self.run["attempts"]:
+            if not self.run["attempts"] or self.run.get("environment_updates"):
                 self.preflight_final_context()
             if self.run["plan_approval_required"] and not self.run["plan_approved"]:
                 self.run["status"] = "awaiting_approval"

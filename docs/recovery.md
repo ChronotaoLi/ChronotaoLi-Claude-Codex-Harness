@@ -26,11 +26,21 @@ worker 尝试与派发计数在本地上下文、hooks、MCP 配置、快照和�
 
 整体验证以非零退出失败后的空 diff 修正采用相同处理：保留失败记录，直接请求新的修正规划，不额外消耗最终尝试来重跑相同代码。显式 `--reverify` 仍可用于操作者确认环境已修复的情况。
 
-恢复配置允许增加上下文预算、agent/验证超时、Claude 轮数、上述次数上限及任务容量 `max_tasks`，不可减少。提高任务容量后，已返回的超限修订重新校验同一 receipt，不重抽指挥结果；已保存的 stop 仍须显式 `--retry-stopped`。操作者也可以追加精确 `worker_commands` argv，已有授权不可删除或修改；事件记录旧值、新值和新增命令。模型 ID、供应商、effort、验证命令和共享资产不允许在同一 run 中改变。进程存活和 Git HEAD 检查仍在恢复前执行；无法探测进程组权限时按仍存活处理。台账版本 8 增加 `invalid_repairs` 和 `approved_scope`；版本 7 及更早运行不能直接恢复，不自动迁移，也不补造旧运行的修正额度或授权。版本 7 已有的 Git 绑定和验证证据仍可用于独立清理命令。当前版本已完成的 run 在普通 resume 时直接返回保存结果，不再核对用于继续执行的配置和共享资源。
+恢复配置允许增加上下文预算、agent/验证超时、Claude 轮数、上述次数上限及任务容量 `max_tasks`，不可减少。提高任务容量后，已返回的超限修订重新校验同一 receipt，不重抽指挥结果；已保存的 stop 仍须显式 `--retry-stopped`。操作者也可以追加精确 `worker_commands` argv，已有授权不可删除或修改；事件记录旧值、新值和新增命令。模型 ID、供应商、effort、验证命令和共享资产不允许在同一 run 中改变。进程存活和 Git HEAD 检查仍在恢复前执行；无法探测进程组权限时按仍存活处理。台账版本 8 增加 `invalid_repairs` 和 `approved_scope`；新运行使用版本 9，增加环境更新及检查证据，版本 8 普通恢复保持兼容，首次接受环境更新时升级为 9；版本 7 及更早运行不能直接恢复，不自动迁移，也不补造旧运行的修正额度或授权。版本 7 已有的 Git 绑定和验证证据仍可用于独立清理命令。当前版本已完成的 run 在普通 resume 时直接返回保存结果，不再核对用于继续执行的配置和共享资源。
+
+`resume RUN --environment-update FILE` 接受最多 64 KiB 的严格 JSON，每个 run 最多 32 条更新：必填 `schema_version: 1`、`task_id`、`blocker_dispatch_id` 和非空、至多 4,000 字符的 `summary`；可选 `checks` 默认 `[]`，最多 16 项。未知字段拒绝。检查只允许 `{kind: "path", path: 绝对路径, path_type: "file"|"directory"|"any"}`、`{kind: "executable", name: 可执行文件名或绝对路径}`、`{kind: "worker_command", argv: 精确命令数组}`。命令检查以是否已在当前 worker_commands 或 verification.commands 中声明判定通过；未声明时仍保留更新及失败检查报告，追加精确配置授权后普通 resume 可重检。检查不执行命令、不启动子进程、不新增授权，也不保证真实 CLI、账号或服务成功。只需表达操作者事实时可省略 checks。
+
+接受更新前在 run 锁内核对进程退出、Git 绑定、HEAD、当前任务与范围，以及保存的环境 blocker 来源身份和原结果摘要。只接受当前未接受任务的 worker 环境阻断边界；后续模型调用使旧来源失效。存在待处理任务／最终验证或审阅、接受及接受后待办、再规划／指挥 stop、pending_directive、commander/reviewer receipt、待格式修正或活动非法结果修正时拒绝。完成或放弃状态拒绝更新；与 reverify、retry-stopped、allow-scope、repair-invalid 互斥，step 可合用。不得通过更新清除任何 receipt、修正守卫、已保存拒绝或批准快照。
+
+更新输入被复制到私有产物并绑定摘要，台账按顺序引用，原输入文件不再是恢复依赖。保存的更新缺失或被篡改时停止；相同来源尚无后续模型调用时重复提交相同更新幂等。产物、审计事件和台账之间中断时，审计事件可能以同一稳定更新 ID 重复，台账仅保留一条授权引用。后续指挥、worker、任务审阅及整体审阅的必要上下文包含有序 environment_updates，最近检查报告经摘要核验后作为 environment_observations 一并发送，整体上下文预估使用同一内容；不能作为可丢弃记忆处理，也不授予记忆覆盖权。操作者断言替代匹配任务的过时环境假设，但原目标、任务范围、验收及所有累计预算保持不变，后续调用仍使用新进程和新 dispatch。
+
+同一任务最新更新的 checks 替代先前检查列表，所有历史声明仍按序发送。可选检查在匹配任务后续每次 worker 尝试（含格式修正）前执行，所有报告保留。失败不派发模型、不消耗尝试或派发预算，修复后普通 resume 可重检。worker 已返回并进入验证／审阅后不重跑这些前置检查；正常验证、独立审阅、快照和接受门禁仍全部执行，检查成功或操作者声明本身不是完成证据。
+
+状态摘要的 worker_outcomes 仅分类 worker 自报完成、任务／环境阻断、运行故障与未知结果，不替代 accepted 或 completed 门禁。last_environment_blocker 是最近环境阻断的历史诊断；后续模型调用开始后标为 stale，不能将其存在视为当前仍具备环境更新资格。
 
 对长时间中断后 pgid 被复用的情况，采用显式确认而非根据组长身份自动推断整个进程组已退出。`resume` 与 `abandon` 的 `--confirm-exited <dispatch_id>` 在运行锁内校验全部 ID，先追加操作事件，再只更新指定记录的退出确认。事件记录当时的组存活探测及组长 PID、PPID、PGID、启动时间和命令名（或探测错误）；组长缺失不构成自动退出证明，不发送终止信号。确认不放宽其他恢复或工作树移除检查。
 
-运行与验证清理共用进程退出判定。派发在准备阶段保存 `process_state=prepared`，真正调用后端前与预算一起保存 `starting`，启动回调记录 pgid 后转为 `running`；受控结束记录退出。只有明确的准备状态可以证明尚未尝试启动，`starting` 或旧台账中无 pgid 且未确认退出的条目均停止恢复与清理，覆盖子进程已启动但 pgid 尚未落盘的中断窗口。`cleanup-verification --confirm-exited ID` 提供无需运行配置的同一审计确认入口，兼容 v7/v8，也支持 completed/abandoned，不恢复执行或改写终态。
+运行与验证清理共用进程退出判定。派发在准备阶段保存 `process_state=prepared`，真正调用后端前与预算一起保存 `starting`，启动回调记录 pgid 后转为 `running`；受控结束记录退出。只有明确的准备状态可以证明尚未尝试启动，`starting` 或旧台账中无 pgid 且未确认退出的条目均停止恢复与清理，覆盖子进程已启动但 pgid 尚未落盘的中断窗口。`cleanup-verification --confirm-exited ID` 提供无需运行配置的同一审计确认入口，兼容 v7/v8/v9，也支持 completed/abandoned，不恢复执行或改写终态。
 
 worker 完成且结果通过检查后，持久化 `pending_task` 的 verifying 阶段及完整快照摘要；验证成功后持久化 reviewing 阶段、diff、验证产物路径、记忆提案和历轮审阅。恢复时先检查范围、HEAD 和快照；一致则继续未完成阶段，不再派发 worker 或消耗 worker 额度。验证重跑使用新的日志目录。候选变化使后续证据失效，回到新的工作尝试；越界残留先停止并提示人工核对清理，不自动删文件，不派发模型或消耗 worker 额度。
 
@@ -72,7 +82,7 @@ worker 调用失败或中断时，另按 task ID 保存 `worker_recovery`，记�
 
 ### 恢复子状态的维护约束
 
-加载台账时先检查下列可选对象的类型、任务阶段与再规划互斥，以及 receipt、修正守卫和 worker 故障来源引用的 dispatch 是否存在并匹配角色／调用类型／任务；重复 dispatch ID 同样停止。`pending_task.task_id`、`pending_acceptance.task_id`、`pending_post_accept.payload.task_id` 和非 `None` 的 `current_task` 必须是指向现有任务的字符串；检查引用前先核对任务条目、嵌套 payload 和 ID 的类型。检查失败给出 `HarnessError`，不重写台账、不派发、不写入记忆，也不先归档候选。此检查不替代消费证据时的内容摘要、候选快照、身份和 hook 门禁，不自动修复损坏状态，台账版本保持 8。
+加载台账时先检查下列可选对象的类型、任务阶段与再规划互斥，以及 receipt、修正守卫和 worker 故障来源引用的 dispatch 是否存在并匹配角色／调用类型／任务；重复 dispatch ID 同样停止。`pending_task.task_id`、`pending_acceptance.task_id`、`pending_post_accept.payload.task_id` 和非 `None` 的 `current_task` 必须是指向现有任务的字符串；检查引用前先核对任务条目、嵌套 payload 和 ID 的类型。检查失败给出 `HarnessError`，不重写台账、不派发、不写入记忆，也不先归档候选。此检查不替代消费证据时的内容摘要、候选快照、身份和 hook 门禁，不自动修复损坏状态；版本 8、9 均执行这些检查，版本 9 另校验环境更新及检查的归属引用。
 
 恢复链接校验失败同样阻止 `abandon`，应保留台账与证据供核对。`status` 和 `cleanup-verification` 不经过此链接检查；后者仍须通过独立的台账、进程退出和 Git 绑定检查，不保证损坏台账可以清理。
 
@@ -90,6 +100,9 @@ worker 调用失败或中断时，另按 task ID 保存 `worker_recovery`，记�
 | `format_repairs` | 修正调用前 | 累计额度不因新候选或 resume 清零 |
 | `worker_recovery` | worker 调用内失败或中断 | 任务接受或应用再规划后清除；可与待验证、待审阅阶段共存 |
 | `replan_stopped` | 校验并保存指挥 stop | 显式 retry-stopped 转回 pending_replan 时清除 |
+| `environment_updates` | 操作者环境更新审计并登记 | 版本 9 的有序持久记录；不清除旧声明，最新同任务 checks 替代旧检查列表 |
+| `environment_checks` | 每次前置检查保存报告后 | 追加保存全部报告引用；必要上下文携带各任务最新更新的最近检查报告 |
+| `dispatches[].invoked` | 本地准备时为 false，后端调用前同预算保存为 true | 后续真实调用使旧环境 blocker 来源过期；旧记录缺该字段时保守按已调用处理，不替代进程退出检查 |
 
 新增子状态或改变保存顺序时，应同步更新此表并验证中断后的合法组合；不能将上述状态一概视为互斥。
 
@@ -104,6 +117,7 @@ worker 调用失败或中断时，另按 task ID 保存 `worker_recovery`，记�
 | 次数、上下文或超时预算不足 | 按允许范围增加配置后 `resume` | 累计计数不清零，已有结果不重抽 |
 | 旧进程存活或退出未知 | 核实后 `resume --confirm-exited ID`；终态使用 `cleanup-verification RUN --confirm-exited ID` | 确认精确 dispatch，先审计后写入，不终止无关进程 |
 | worker 或未返回结果的模型调用故障 | 修复环境后 `resume` | 新进程、新 dispatch，保留故障来源并消耗对应预算 |
+| worker 已报告环境阻断，需要更新环境事实 | `resume --environment-update FILE`；已保存检查仍失败时修复条件后普通 `resume` | 来源有效且无待处理阶段；检查不执行命令，更新不扩大权限或降低验收，失败检查不消耗模型预算 |
 | 验证、审阅或接受 hook 中断 | 修复原因后 `resume` | 同一快照复用已有阶段；hook 不被绕过 |
 | 自动格式修正耗尽，且满足显式修正条件 | `resume --repair-invalid ID` | 最初结论、已绑定原文、失败修正证据与快照不变；整个角色／类型／任务仅一次，指挥任务选择和再规划各按固定身份在整个 run 共用 |
 | 首次拒绝仅可变字段格式非法，且自动额度已用 | 保存为 `invalid_rejected` 后进入任务返工或整体修正规划；中断后普通 `resume` | 原文、摘要、快照及 hook 仍须核验；不追加格式修正派发，不适用于修正结果或旧拒绝型 exhausted 守卫 |

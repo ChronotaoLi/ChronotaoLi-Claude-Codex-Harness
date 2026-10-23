@@ -208,9 +208,9 @@ class VerificationCleanupTests(RepoCase):
         return [entry for line in (self.directory / "events.jsonl").read_text().splitlines()
                 if (entry := json.loads(line))["event"] == "dispatch_exit_confirmed_by_operator"]
 
-    def test_terminal_confirmation_supports_both_ledger_versions_and_preserves_status(self):
+    def test_terminal_confirmation_supports_all_ledger_versions_and_preserves_status(self):
         evidence = self.artifact.read_bytes()
-        for version in (7, 8):
+        for version in (7, 8, 9):
             for status in ("completed", "abandoned"):
                 with self.subTest(version=version, status=status):
                     self.run.update(schema_version=version, status=status)
@@ -225,7 +225,7 @@ class VerificationCleanupTests(RepoCase):
                     self.assertEqual(self.run["schema_version"], version)
                     self.assertTrue(self.run["dispatches"][-1]["exit_confirmed"])
                     self.assertIsNone(self.confirmation_events()[-1]["observed"]["group_alive"])
-        self.assertEqual(len(self.confirmation_events()), 4)
+        self.assertEqual(len(self.confirmation_events()), 6)
         self.assertTrue(self.checkout.exists())
         self.assertEqual(self.artifact.read_bytes(), evidence)
 
