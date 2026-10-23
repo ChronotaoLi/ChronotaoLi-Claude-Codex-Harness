@@ -206,3 +206,15 @@ Codex 0.163.0 的本地 `debug prompt-input` 检查确认：未提交的 AGENTS.
 恢复加载另检查任务条目、待验证／审阅和待接受任务引用、接受后待办的嵌套 payload，以及非空闲的 current_task。未知任务、缺失字段、错误类型或重复任务 ID 在执行前以 HarnessError 停止；测试确认台账字节、事件、记忆、Git HEAD 和模型派发均不改变。指挥任务选择与再规划的固定身份及额度保持原实现，仅在文档明确各调用类型在整个 run 共用一次自动和一次显式修正额度。
 
 上述审阅恢复测试使用模拟模型响应及真实本地 Git、验证子进程，不证明真实模型调用行为。本轮未运行 `python3 -m harness smoke` 或新增真实模型联调。README、设计与恢复协议已同步，临时审阅文档 `docs/review-2026-10-22-v11.md` 已按要求删除。
+
+## 第十二轮审阅修订验证（2026-10-23，台账 v8）
+
+执行 `python3 -m unittest discover -s tests -v`：524 项，523 项通过、1 项跳过（Python 3.15.0，511.501 秒）。跳过原因仍为本机文件系统拒绝实际创建非 UTF-8 文件名。完整日志保存在本仓库私有 `.harness/validation/review-v12-offline.log`，不提交。
+
+本轮新增 4 项行为测试。`--reverify` 的授权在本次恢复首次进入整体验收时消费：已返回修订产生新快照、续跑未完成验证及超时恢复三种路径中，后续非零失败和空 diff 修正均保留失败证据并请求再规划，不额外消耗最终尝试，也不误记显式重验事件。测试核对最终尝试数、验证派发数、接受提交及 `unchanged_corrections` 触发内容。
+
+恢复未完成的 run 时，`--reverify` 与 `--retry-stopped` 对 final 和任务目标均互斥。测试核对拒绝组合后台账及事件字节不变、原 stop 保留、没有新派发，即使同时提供有效的 `--confirm-exited` 也不会先写入退出确认；随后单独重试停止规划仍能确认退出并重新调用指挥。仅在内存中恢复基线提交的原始 `resume` 与 `final_review` 方法时，四项新增测试均检出旧行为；负向验证日志为 `.harness/validation/review-v12-regression-baseline.log`。
+
+另使用 Python 3.11.17 执行全部 4 项新增测试，均通过，耗时 12.173 秒，日志为 `.harness/validation/review-v12-python311.log`；本轮未在 Python 3.11 重跑完整套件。`python3 -m compileall -q harness tests`、CLI 恢复帮助输出与 `git diff --check` 检查通过。
+
+台账保持版本 8，没有新增恢复子状态。上述测试使用模拟模型响应及真实本地 Git、验证子进程，不证明真实模型调用行为；本轮未运行 `python3 -m harness smoke`。README、设计、恢复协议及 CLI 帮助已同步，临时审阅文档 `docs/review-2026-10-22-v12.md` 已按要求删除。

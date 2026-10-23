@@ -1023,6 +1023,8 @@ class Engine(InvalidOutputRecovery):
                 return self.run
             if repair_invalid is not None and (reverify or retry_stopped is not None or allow_scope):
                 raise HarnessError("--repair-invalid 不能与 --reverify、--retry-stopped 或 --allow-scope 合用")
+            if reverify and retry_stopped is not None:
+                raise HarnessError("--reverify 不能与 --retry-stopped 合用")
             self.reverify_requested = reverify
             changes = self.config.resume_changes(self.run["config_snapshot"])
             if self.run.get("asset_digest") != asset_digest(self.config):
@@ -1619,6 +1621,9 @@ class Engine(InvalidOutputRecovery):
         return True
 
     def final_review(self, *, reverify=False):
+        # Consume the resume flag on first entry, including new snapshots and
+        # unfinished attempts that do not need an explicit retry.
+        self.reverify_requested = False
         git.check_worktree_state(self.worktree)
         if not git.clean(self.worktree, binding=self.run["worktree_binding"]):
             raise HarnessError("整体审阅要求干净的已接受提交；未接受的修改不能用于完成 run")
@@ -1648,7 +1653,6 @@ class Engine(InvalidOutputRecovery):
                     if self.replan_unchanged_corrections(record):
                         return False
                     raise HarnessError("同一代码快照的整体验证曾失败；修复环境后使用 resume --reverify 显式重验")
-                self.reverify_requested = False
                 self.event("final_reverification_requested", previous_attempt=record["attempt"])
             if self.run["final_attempts"] >= self.config.data["runtime"]["max_final_attempts"]:
                 raise HarnessError("整体审阅已达尝试次数上限")

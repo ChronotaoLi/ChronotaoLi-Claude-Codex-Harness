@@ -1,9 +1,10 @@
 import copy
 import sys
+from pathlib import Path
 from unittest.mock import patch
 
 from harness import git
-from harness.util import HarnessError, read_json
+from harness.util import HarnessError, read_json, run_process
 from test_harness import ROOT, RepoCase
 from test_runtime_changes import ScriptedBackend, finding
 
@@ -60,6 +61,53 @@ class StoppedRecoveryTests(RepoCase):
         self.config.data["runtime"]["max_replans"] = 2
         result = self.engine(backend).resume(engine.run["id"])
         self.assertEqual(result["status"], "completed")
+
+    def test_reverify_and_retry_stopped_are_rejected_without_changing_saved_stop(self):
+        for target in ("final", "greet"):
+            with self.subTest(target=target):
+                def block_task(backend, kwargs, packet, result):
+                    if target == "greet" and kwargs["role"] == "worker":
+                        result.update(status="blocked", blockers=["Task needs a revised approach"], blocker_kind="task")
+
+                def fail_final(argv, cwd, log, **kwargs):
+                    if "final" in Path(log).parts:
+                        return 1
+                    return run_process(argv, cwd, log, **kwargs)
+
+                backend = ScriptedBackend(block_task)
+                engine = self.engine(backend)
+                with patch("harness.engine.run_process", side_effect=fail_final), self.assertRaisesRegex(HarnessError, "停止重新规划"):
+                    engine.start("Implement greet", self.plan())
+                self.assertEqual(engine.run["replan_stopped"]["target"], target)
+                # Even an explicit exit confirmation must wait until the option
+                # combination has been validated, before auditing or saving it.
+                dispatch = engine.run["dispatches"][0]
+                dispatch["exit_confirmed"] = False
+                engine.save()
+                state_path = engine.directory / "state.json"
+                events_path = engine.directory / "events.jsonl"
+                state_before = state_path.read_bytes()
+                events_before = events_path.read_bytes()
+                stop_before = copy.deepcopy(engine.run["replan_stopped"])
+                calls_before = copy.deepcopy(backend.calls)
+
+                with self.assertRaisesRegex(HarnessError, "--reverify.*--retry-stopped"):
+                    self.engine(backend).resume(engine.run["id"], retry_stopped=target, reverify=True,
+                                                confirm_exited=[dispatch["id"]])
+                self.assertEqual(state_path.read_bytes(), state_before)
+                self.assertEqual(events_path.read_bytes(), events_before)
+                self.assertEqual(read_json(state_path)["replan_stopped"], stop_before)
+                self.assertEqual(backend.calls, calls_before)
+
+                resumed = self.engine(backend)
+                with self.assertRaisesRegex(HarnessError, "停止重新规划"):
+                    resumed.resume(engine.run["id"], retry_stopped=target, confirm_exited=[dispatch["id"]])
+                self.assertEqual(len(backend.calls), len(calls_before) + 1)
+                self.assertEqual(backend.calls[-1]["kind"], "replan")
+                self.assertEqual(read_json(engine.directory / "plans" / "replan-2.json")["trigger"], stop_before["trigger"])
+                self.assertEqual(resumed.run["replan_attempts"], 2)
+                self.assertEqual(resumed.run["final_attempts"], engine.run["final_attempts"])
+                self.assertIn("operator_exit_confirmation", resumed.run["dispatches"][0])
 
     def corrective_backend(self):
         def change(backend, kwargs, packet, result):

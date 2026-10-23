@@ -158,7 +158,7 @@ def _main(argv=None):
     resume.add_argument("run_id")
     resume.add_argument("--approve-plan", action="store_true", help="批准等待确认的计划并继续")
     resume.add_argument("--step", action="store_true", help="最多接受一个任务后暂停")
-    resume.add_argument("--reverify", action="store_true", help="在最终验收预算内重新执行失败的整体验证；不重抽审阅结论")
+    resume.add_argument("--reverify", action="store_true", help="仅在本次恢复首次整体验收时重验失败快照；不重抽审阅结论，与 --retry-stopped 互斥")
     resume.add_argument("--retry-stopped", metavar="TASK_ID|final", help="显式重试已被指挥停止的规划请求，仍受累计预算约束")
     resume.add_argument("--confirm-exited", action="append", metavar="DISPATCH_ID",
                         help="确认指定旧 dispatch 已退出并记录证据；可重复指定")

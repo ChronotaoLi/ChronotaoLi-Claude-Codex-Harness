@@ -1,3 +1,4 @@
+import json
 from copy import deepcopy
 from pathlib import Path
 from unittest.mock import patch
@@ -285,6 +286,97 @@ class FinalStageRecoveryTests(RepoCase):
         self.assertEqual(sum(call["kind"] == "replan" for call in backend.calls), 1)
         self.assertNotIn("pending_replan", result)
         self.assertEqual(result["final_history"][0]["status"], "verification_failed")
+
+    def test_reverify_does_not_carry_over_to_failure_after_a_returned_revision(self):
+        self.config.data["runtime"].update(max_replans=3, max_final_attempts=5)
+
+        def corrective(backend, kwargs, packet, result):
+            if kwargs["kind"] == "replan":
+                number = sum(call["kind"] == "replan" for call in backend.calls)
+                if number <= 2:
+                    task = deepcopy(packet["original_tasks"][0])
+                    task.update(id=f"c{number}", depends_on=["greet" if number == 1 else "c1"])
+                    result.update(action="revise", reason="Fix the final check", new_tasks=[task], updates=[])
+            elif kwargs["role"] == "worker" and kwargs["task"]["id"] in ("c1", "c2"):
+                # DemoBackend writes the same implementation before each callback.
+                # c1 changes the accepted snapshot; c2 then leaves it unchanged.
+                with (kwargs["cwd"] / "hello.py").open("a") as output:
+                    output.write("# independently reviewed correction\n")
+
+        backend = ScriptedBackend(corrective)
+        engine = self.engine(backend)
+        emit = engine.hooks.emit
+
+        def interrupt_returned_revision(name, payload, folder):
+            if name == "post_agent" and payload.get("kind") == "replan":
+                raise KeyboardInterrupt()
+            return emit(name, payload, folder)
+
+        with patch("harness.engine.run_process", side_effect=self.fail_final_check(timed_out=False)):
+            with patch.object(engine.hooks, "emit", side_effect=interrupt_returned_revision), self.assertRaises(KeyboardInterrupt):
+                engine.start("Implement greet", self.plan())
+            self.assertEqual(engine.run["pending_replan"]["stage"], "request")
+            receipt = engine.run["commander_receipts"]["commander:replan:replanning"]
+            self.assertTrue(Path(receipt["artifact"]).is_file())
+            self.assertEqual(engine.run["final_attempts"], 1)
+            resumed = self.engine(backend)
+            with self.assertRaisesRegex(HarnessError, "停止重新规划"):
+                resumed.resume(engine.run["id"], reverify=True)
+
+        run = resumed.run
+        self.assertEqual(run["final_attempts"], 2)
+        self.assertEqual(len(self.final_checks(run)), 2)
+        self.assertEqual([record["status"] for record in run["final_history"]], ["verification_failed"] * 2)
+        self.assertNotEqual(run["final_history"][0]["snapshot_digest"], run["final_history"][1]["snapshot_digest"])
+        self.assertEqual(run["accepted"]["c1"]["commit"], run["accepted"]["c2"]["commit"])
+        self.assertEqual(run["replan_attempts"], 3)
+        self.assertEqual(sum(call["kind"] == "replan" for call in backend.calls), 3)
+        trigger = read_json(engine.directory / "plans" / "replan-3.json")["trigger"]
+        self.assertEqual(trigger["unchanged_corrections"], ["c2"])
+        self.assertEqual(trigger["final_review"]["attempt"], 2)
+        events = [json.loads(line) for line in (engine.directory / "events.jsonl").read_text().splitlines()]
+        self.assertFalse(any(event["event"] == "final_reverification_requested" for event in events))
+
+    def assert_reverify_consumed_by_verification_recovery(self, *, timed_out):
+        self.config.data["runtime"].update(max_replans=3, max_final_attempts=5)
+
+        def noop_correction(backend, kwargs, packet, result):
+            if kwargs["kind"] == "replan" and sum(call["kind"] == "replan" for call in backend.calls) == 1:
+                task = deepcopy(packet["original_tasks"][0])
+                task.update(id="correct", depends_on=["greet"])
+                result.update(action="revise", reason="Fix the final check", new_tasks=[task], updates=[])
+
+        backend = ScriptedBackend(noop_correction)
+        engine = self.engine(backend)
+        if timed_out:
+            with patch("harness.engine.run_process", side_effect=self.fail_final_check(timed_out=True)), self.assertRaisesRegex(HarnessError, "整体验证超时"):
+                engine.start("Implement greet", self.plan())
+        else:
+            self.stop_snapshot_write(engine, KeyboardInterrupt())
+            self.assertEqual(engine.run["final_history"][0]["status"], "running")
+        resumed = self.engine(backend)
+        with patch("harness.engine.run_process", side_effect=self.fail_final_check(timed_out=False)), self.assertRaisesRegex(HarnessError, "停止重新规划"):
+            resumed.resume(engine.run["id"], reverify=True)
+
+        run = resumed.run
+        expected_attempts = 2 if timed_out else 1
+        self.assertEqual(run["final_attempts"], expected_attempts)
+        self.assertEqual(len(self.final_checks(run)), expected_attempts)
+        self.assertEqual([record["status"] for record in run["final_history"]], ["verification_failed"] * expected_attempts)
+        self.assertEqual(run["final_history"][-1]["failure_kind"], "exit_code")
+        self.assertEqual(run["accepted"]["greet"]["commit"], run["accepted"]["correct"]["commit"])
+        self.assertEqual(sum(call["kind"] == "replan" for call in backend.calls), 2)
+        trigger = read_json(engine.directory / "plans" / "replan-2.json")["trigger"]
+        self.assertEqual(trigger["unchanged_corrections"], ["correct"])
+        self.assertEqual(trigger["final_review"]["attempt"], expected_attempts)
+        events = [json.loads(line) for line in (engine.directory / "events.jsonl").read_text().splitlines()]
+        self.assertFalse(any(event["event"] == "final_reverification_requested" for event in events))
+
+    def test_reverify_does_not_carry_over_after_resuming_running_verification(self):
+        self.assert_reverify_consumed_by_verification_recovery(timed_out=False)
+
+    def test_reverify_does_not_carry_over_after_timeout_recovery(self):
+        self.assert_reverify_consumed_by_verification_recovery(timed_out=True)
 
     def test_reverify_cannot_cancel_pending_replan_for_review_rejection(self):
         def rejected_and_unavailable(backend, kwargs, packet, result):
