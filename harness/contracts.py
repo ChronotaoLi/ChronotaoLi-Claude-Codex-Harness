@@ -180,6 +180,13 @@ def validate_review(result, proposed_keys=()):
     return result
 
 
+def validate_immutable_findings(findings):
+    """Check finding bounds that neither automatic nor explicit repair may change."""
+    immutable = deepcopy(REVIEW["properties"]["findings"])
+    immutable["items"]["properties"]["id"] = TEXT
+    validate(findings, immutable, "response.findings")
+
+
 def validate_review_correction(previous, current):
     """A fully validated correction must preserve the first review's decision.
 

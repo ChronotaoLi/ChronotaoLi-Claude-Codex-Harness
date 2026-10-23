@@ -101,7 +101,6 @@ class ConfigChangesTests(unittest.TestCase):
         mutations = [
             ("roles", "reviewer", "model", "configured-other-model"),
             ("roles", "reviewer", "effort", "low"),
-            ("runtime", "max_tasks", 21),
             ("verification", "commands", [["true"]]),
             ("shared", "rules", "different-rules.md"),
             ("memory", "task_ttl_days", 365),
@@ -181,6 +180,23 @@ class ConfigChangesTests(unittest.TestCase):
         with self.assertRaisesRegex(HarnessError, "不能配置为 worker"):
             CLIBackend(config, self.root / ".harness").command("worker", config.role("worker"), self.root, job, {}, None)
         self.assertFalse(job.exists())
+
+    def test_readonly_adapters_disable_automatic_project_instruction_loading(self):
+        config = self.load()
+        for cli in ("codex", "claude"):
+            for role in ("commander", "reviewer"):
+                job = self.root / f"{cli}-{role}"
+                job.mkdir()
+                model = {"cli": cli, "model": "exact-configured-model-v7", "effort": "high"}
+                argv = CLIBackend(config, self.root / ".harness").command(
+                    role, model, self.root, job, {}, None)
+                with self.subTest(cli=cli, role=role):
+                    if cli == "codex":
+                        overrides = [argv[index + 1] for index, arg in enumerate(argv) if arg == "-c"]
+                        self.assertIn("project_doc_max_bytes=0", overrides)
+                        self.assertEqual(argv[argv.index("--sandbox") + 1], "read-only")
+                    else:
+                        self.assertEqual(argv[argv.index("--setting-sources") + 1], "")
 
     def test_provider_projection_preserves_identity_and_structure_with_local_bounds(self):
         config = self.load()

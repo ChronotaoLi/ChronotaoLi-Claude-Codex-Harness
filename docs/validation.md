@@ -185,3 +185,14 @@ python3 -m harness smoke --commander fable
 本次覆盖真实任务选择、step/resume、任务 blocker、受限再规划、新增前置任务、跨任务集成、任务与整体审阅，以及供应商用量提取。没有触发任务/整体审阅拒绝、格式修正、invalid_rejected、`--repair-invalid` 或供应商故障恢复；没有以本次 Fable 联调替代 Astra 链路验证。遗漏前置任务是明确设计的联调条件，不用于估计真实任务的失败频率。
 
 夹具、配置、启动/恢复输出、完整核验脚本和汇总报告保存在 `.harness/validation/v9-live/`；原始 dispatch、验证、提交和记忆证据保留在该目录 `fixture.json` 指向的临时项目 `.harness/`。这些私有产物不提交。临时审阅文档 `docs/review-2026-10-22-v9.md` 已按要求删除。
+
+
+## 第十轮审阅修订验证（台账 v8）
+
+2026-10-22 执行 `python3 -m unittest discover -s tests -v`：514 项，513 项通过、1 项跳过（Python 3.15.0，482.060 秒）。跳过原因仍为本机文件系统拒绝实际创建非 UTF-8 文件名。日志保存在本仓库私有 `.harness/validation/review-v10-offline.log`，不提交。
+
+本轮修订覆盖：文件 stdin 在延迟读取大输入时完整传递 UTF-8 字节；首次拒绝的不可变 finding 格式错误保留为 invalid_rejected，维持原始产物摘要和 post_agent 门禁；Codex 只读调用关闭项目指令自动注入；恢复时拒绝类型、互斥或派发引用不一致的台账；显式增加 max_tasks 后复用已返回的超限修订，并保留 stop 的显式重试要求。worker 返回到阶段持久化之间的重复派发窗口仅补充文档，未新增旧结果消费协议。
+
+Python 3.11.17 上另行通过新增 stdin 测试 3 项、拒绝恢复测试 4 项、状态校验及任务容量恢复测试 7 项，以及既有超时／启动／进程退出测试 7 项。stdin 测试使用超过 256 KiB 的多字节输入、延迟读取和多个短心跳窗口，核对实际字节数与 SHA-256，并检查空输入 EOF、退出码和中断清理；同一延迟读取场景在旧 run_process 的 Python 3.11 实现上复现超时。
+
+Codex 0.163.0 的本地 `debug prompt-input` 检查确认：未提交的 AGENTS.md 标记默认出现在输入中，设置 `project_doc_max_bytes=0` 后消失。该检查只渲染输入，不证明真实 exec 模型调用成功；Claude 的空 setting-sources 参数保持原行为，本轮没有新增真实模型或权限联调。没有运行 `python3 -m harness smoke`。

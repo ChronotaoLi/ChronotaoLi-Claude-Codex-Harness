@@ -21,7 +21,7 @@ DEFAULTS = {
 RESUME_INCREASES = (
     "agent_timeout_seconds", "verify_timeout_seconds", "context_chars",
     "claude_max_turns", "max_attempts", "max_final_attempts", "max_total_attempts",
-    "max_replans", "max_agent_dispatches",
+    "max_replans", "max_agent_dispatches", "max_tasks",
 )
 
 # Arguments may be appended only after --, where they cannot enable Git's
@@ -161,7 +161,7 @@ class Config:
         if added:
             changes["worker_commands"] = {"old": old_commands, "new": new_commands, "added": added}
         if previous != current:
-            raise HarnessError("配置已改变：恢复只允许增大超时、上下文、轮数和尝试预算或追加精确 worker 命令；其他配置必须保持一致")
+            raise HarnessError("配置已改变：恢复只允许增大超时、上下文、轮数、任务数和尝试预算或追加精确 worker 命令；其他配置必须保持一致")
         return changes
 
     @staticmethod

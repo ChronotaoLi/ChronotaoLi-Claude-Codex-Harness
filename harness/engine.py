@@ -18,7 +18,7 @@ from .contracts import (DETAIL, PLAN, REPLAN, REVIEW, WORK, RepairableFormatErro
                         envelope, obj, output_constraints, review_output_constraints, review_approved, validate,
                         validate_plan, validate_review, validate_review_correction, validate_review_semantics,
                         validate_structure, validate_work, validate_work_semantics, validate_approval_repair,
-                        validate_commander_format_correction)
+                        validate_commander_format_correction, validate_immutable_findings)
 from .memory import Memory, validate_proposals
 from .recovery import InvalidOutputRecovery, read_bound_result, snapshot_digest
 from .shared import HookError, Hooks, asset_digest, read_skill, skills_catalog, validate_mcp
@@ -409,10 +409,8 @@ class Engine(InvalidOutputRecovery):
                 if role == "reviewer":
                     # Validate all immutable fields, even when the first reported
                     # error was in the mutable summary or finding ID.
-                    immutable = deepcopy(REVIEW["properties"]["findings"])
-                    immutable["items"]["properties"]["id"] = {"type": "string"}
                     try:
-                        validate(previous_review["findings"], immutable, "response.findings")
+                        validate_immutable_findings(previous_review["findings"])
                     except RepairableFormatError as immutable_error:
                         guard.update(unrepairable=True, error=str(immutable_error))
                         self.save()
@@ -587,7 +585,20 @@ class Engine(InvalidOutputRecovery):
                 self.save()
                 raise
         if rejection is None:
-            validate(result, contract)
+            try:
+                validate(result, contract)
+            except RepairableFormatError:
+                if previous_review is not None or repair or review_approved(result):
+                    raise
+                # An original rejection with immutable overflow still requires
+                # rework. Preserve its evidence instead of asking for an
+                # impossible format correction or weakening approval gates.
+                try:
+                    validate_immutable_findings(result["findings"])
+                except RepairableFormatError as error:
+                    rejection = InvalidReviewRejection(result, receipt, error)
+                else:
+                    raise
         if not receipt.get("hook_completed"):
             receipt["hook_attempts"] = receipt.get("hook_attempts", 0) + 1
             self.save()
@@ -853,6 +864,80 @@ class Engine(InvalidOutputRecovery):
             raise HarnessError("运行台账字段缺失或类型无效；保留原文件并核对证据")
         if self.run["repo"] != str(self.repo):
             raise HarnessError("Run 属于另一个项目")
+        self.validate_recovery_links()
+
+    def validate_recovery_links(self):
+        """Reject inconsistent recovery links before any resumed side effects.
+
+        This checks ledger structure, not artifact integrity or candidate validity;
+        the existing phase-specific gates still validate those when consumed.
+        """
+        def fail(field):
+            raise HarnessError(f"运行台账恢复状态无效：{field}；保留原文件并核对证据")
+
+        def mapping(value, field):
+            if not isinstance(value, dict):
+                fail(field)
+            return value
+
+        for field in ("pending_task", "pending_acceptance", "pending_post_accept", "pending_replan",
+                      "pending_directive", "worker_recovery", "replan_stopped"):
+            if field in self.run:
+                mapping(self.run[field], field)
+        if "pending_task" in self.run and "pending_replan" in self.run:
+            fail("pending_task 与 pending_replan 不能同时存在")
+
+        dispatches = {}
+        for entry in self.run["dispatches"]:
+            ident = entry.get("id")
+            if isinstance(ident, str):
+                if ident in dispatches:
+                    fail("dispatches 的 ID 重复")
+                dispatches[ident] = entry
+
+        def reference(ident, key, field):
+            if not isinstance(ident, str) or ident not in dispatches:
+                fail(field + " 引用了不存在的 dispatch")
+            entry = dispatches[ident]
+            if key != f"{entry.get('role')}:{entry.get('kind')}:{entry.get('task_id')}":
+                fail(field + " 与 dispatch 的角色、类型或任务不符")
+
+        def source(value, key, field):
+            value = mapping(value, field)
+            reference(value.get("dispatch_id"), key, field)
+
+        for field, role in (("review_receipts", "reviewer"), ("commander_receipts", "commander")):
+            for key, receipt in self.run[field].items():
+                if not key.startswith(role + ":"):
+                    fail(field + "." + key)
+                source(receipt, key, field + "." + key)
+        for key, guard in self.run["review_corrections"].items():
+            field = "review_corrections." + key
+            artifact = mapping(guard, field).get("artifact")
+            if not key.startswith("reviewer:") or not isinstance(artifact, str):
+                fail(field)
+            # Existing v8 guards identify the original dispatch by its artifact path.
+            reference(Path(artifact).parent.name, key, field)
+        for key, pending in self.run["pending_format_corrections"].items():
+            field = "pending_format_corrections." + key
+            pending = mapping(pending, field)
+            if "dispatch_id" in pending:
+                reference(pending["dispatch_id"], key, field)
+            correction = mapping(pending.get("correction"), field + ".correction")
+            if "previous_dispatch" in correction:
+                reference(correction["previous_dispatch"], key, field + ".correction")
+            if "source" in correction:
+                source(correction["source"], key, field + ".correction.source")
+        for key, repair in self.run["invalid_repairs"].items():
+            field = "invalid_repairs." + key
+            repair = mapping(repair, field)
+            source(repair.get("source"), key, field + ".source")
+            if "original" in repair:
+                source(repair["original"], key, field + ".original")
+            if "corrected_dispatch_id" in repair:
+                reference(repair["corrected_dispatch_id"], key, field)
+        for tid, recovery in self.run.get("worker_recovery", {}).items():
+            source(recovery, f"worker:implement:{tid}", "worker_recovery." + tid)
 
     def abandon(self, ident, *, remove_worktree=False, confirm_exited=()):
         self.load_run(ident)

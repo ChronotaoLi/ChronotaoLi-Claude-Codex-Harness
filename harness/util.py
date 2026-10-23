@@ -7,9 +7,13 @@ import os
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from pathlib import Path
+
+
+PROCESS_HEARTBEAT_SECONDS = 60
 
 
 class HarnessError(Exception):
@@ -156,11 +160,17 @@ def run_process(argv: list[str], cwd: Path, log: Path, *, stdin: str = "",
     """No shell interpolation; terminate the owned process group on all exits."""
     log.parent.mkdir(parents=True, exist_ok=True)
     with log.with_suffix(".stdout").open("w", encoding="utf-8") as out, \
-            log.with_suffix(".stderr").open("w", encoding="utf-8", errors="backslashreplace") as err:
+            log.with_suffix(".stderr").open("w", encoding="utf-8", errors="backslashreplace") as err, \
+            tempfile.TemporaryFile(dir=log.parent) as source:
+        # A regular file delivers the whole input even if startup spans several
+        # heartbeat windows. Retrying communicate(input=None) can strand a
+        # partially written pipe on Python 3.11.
+        source.write(stdin.encode("utf-8"))
+        source.seek(0)
         p = None
         try:
             try:
-                p = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.PIPE, stdout=out,
+                p = subprocess.Popen(argv, cwd=cwd, stdin=source, stdout=out,
                                      stderr=err, text=True, env=env, start_new_session=True)
             except (OSError, ValueError) as e:
                 message = f"无法启动进程 {argv[0] if argv else '<empty argv>'}：{e}；日志：{log}"
@@ -169,16 +179,14 @@ def run_process(argv: list[str], cwd: Path, log: Path, *, stdin: str = "",
             started = time.monotonic()
             if on_start:
                 on_start(p.pid)
-            data = stdin
             while True:
                 remaining = timeout - (time.monotonic() - started)
                 if remaining <= 0:
                     raise ProcessTimeout(timeout, log)
                 try:
-                    p.communicate(input=data, timeout=min(60, remaining))
+                    p.wait(timeout=min(PROCESS_HEARTBEAT_SECONDS, remaining))
                     return p.returncode
                 except subprocess.TimeoutExpired:
-                    data = None
                     print(f"[harness] {argv[0]} 仍在运行；日志 {log}", file=sys.stderr)
         finally:
             if p is not None:
@@ -191,8 +199,6 @@ def run_process(argv: list[str], cwd: Path, log: Path, *, stdin: str = "",
                 with contextlib.suppress(ProcessLookupError):
                     os.killpg(p.pid, signal.SIGKILL)
                 p.wait()
-                if p.stdin:
-                    p.stdin.close()
 
 
 def tail(path: Path, size=4000) -> str:

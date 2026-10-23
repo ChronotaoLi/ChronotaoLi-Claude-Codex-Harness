@@ -6,7 +6,8 @@ from pathlib import Path
 
 from .contracts import (REVIEW, RepairableFormatError, apply_revision, envelope,
                         review_approved, validate, validate_commander_format_correction,
-                        validate_review_correction, validate_review_semantics, validate_structure)
+                        validate_immutable_findings, validate_review_correction,
+                        validate_review_semantics, validate_structure)
 from .util import HarnessError
 
 
@@ -188,9 +189,7 @@ class InvalidOutputRecovery:
                 proposed_keys = [p["key"] for p in pending["proposals"]]
             elif entry["kind"] != "final_review":
                 raise HarnessError("不支持此类审阅修正")
-            immutable = deepcopy(REVIEW["properties"]["findings"])
-            immutable["items"]["properties"]["id"] = {"type": "string"}
-            validate(result["findings"], immutable, "response.findings")
+            validate_immutable_findings(result["findings"])
             guard = self.run["review_corrections"].get(key)
             if guard:
                 if guard.get("failed") or guard.get("unrepairable"):
@@ -200,7 +199,7 @@ class InvalidOutputRecovery:
                 validate_structure(previous, envelope(REVIEW, entry["task_id"], original["dispatch_id"]))
                 if not review_approved(previous):
                     raise HarnessError("原审阅拒绝或包含 blocking finding；不能追加修正")
-                validate(previous["findings"], immutable, "response.findings")
+                validate_immutable_findings(previous["findings"])
                 validate_review_semantics(previous, proposed_keys)
                 validate_review_semantics(result, proposed_keys)
                 # Recheck even when a crash prevented failed/exhausted from being saved.

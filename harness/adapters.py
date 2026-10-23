@@ -117,6 +117,7 @@ class CLIBackend:
                     "-c", 'approval_policy="never"', "-c", f'model_reasoning_effort={json.dumps(model["effort"])}',
                     "-c", "features.multi_agent=false", "-c", "features.memories=false",
                     "-c", "features.hooks=false", "-c", "features.plugins=false",
+                    "-c", "project_doc_max_bytes=0",
                     "-c", "mcp_servers=" + toml_value(codex),
                     "--output-schema", str(job / "provider-schema.json"),
                     "--output-last-message", str(job / "response.json"), "-"]

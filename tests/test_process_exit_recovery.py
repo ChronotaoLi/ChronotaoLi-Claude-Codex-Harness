@@ -152,4 +152,5 @@ engine.start("Implement greet", read_json(root / "examples/plan.json"))
                         with contextlib.suppress(ProcessLookupError):
                             os.killpg(process.pid, signal.SIGKILL)
                         process.wait()
-                        process.stdin.close()
+                        if process.stdin:
+                            process.stdin.close()
