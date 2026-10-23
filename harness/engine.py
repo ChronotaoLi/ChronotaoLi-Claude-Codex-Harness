@@ -1653,9 +1653,10 @@ class Engine(InvalidOutputRecovery):
                     if self.replan_unchanged_corrections(record):
                         return False
                     raise HarnessError("同一代码快照的整体验证曾失败；修复环境后使用 resume --reverify 显式重验")
-                self.event("final_reverification_requested", previous_attempt=record["attempt"])
             if self.run["final_attempts"] >= self.config.data["runtime"]["max_final_attempts"]:
                 raise HarnessError("整体审阅已达尝试次数上限")
+            if record and record["status"] == "verification_failed" and record["failure_kind"] != "timeout":
+                self.event("final_reverification_requested", previous_attempt=record["attempt"])
             self.run["final_attempts"] += 1
             attempt = self.run["final_attempts"]
             folder = self.verification_directory("final", attempt, whole_run=True)
@@ -1801,6 +1802,7 @@ class Engine(InvalidOutputRecovery):
                 returned = (receipt and ("artifact_digest" in receipt or Path(receipt["artifact"]).exists()))
                 if (getattr(self, "reverify_requested", False) and pending["stage"] in ("pending", "request")
                         and final.get("status") == "verification_failed"
+                        and self.run["final_attempts"] < self.config.data["runtime"]["max_final_attempts"]
                         and not returned and receipt_key not in self.run["pending_format_corrections"]
                         and not self.active_invalid_repair(receipt_key)
                         and snapshot_digest(self.snapshot()) == final.get("snapshot_digest")):

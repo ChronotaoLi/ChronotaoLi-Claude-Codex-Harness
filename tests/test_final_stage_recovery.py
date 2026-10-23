@@ -287,6 +287,97 @@ class FinalStageRecoveryTests(RepoCase):
         self.assertNotIn("pending_replan", result)
         self.assertEqual(result["final_history"][0]["status"], "verification_failed")
 
+    def test_reverify_budget_refusal_preserves_replan_and_both_resume_routes(self):
+        for reverify in (False, True):
+            with self.subTest(reverify_after_budget_increase=reverify):
+                self.config.data["runtime"]["max_final_attempts"] = 1
+                backend = ScriptedBackend()
+                engine = self.engine(backend)
+                with patch("harness.engine.run_process", side_effect=self.fail_final_check(timed_out=False)), \
+                        self.assertRaisesRegex(HarnessError, "整体审阅已达尝试次数"):
+                    engine.start("Implement greet", self.plan())
+                before = read_json(engine.directory / "state.json")
+                self.assertEqual(before["pending_replan"]["stage"], "pending")
+                failed_artifact = Path(before["final_history"][0]["artifact"])
+                failed_bytes = failed_artifact.read_bytes()
+                calls = deepcopy(backend.calls)
+                events_path = engine.directory / "events.jsonl"
+                event_count = len(events_path.read_text().splitlines())
+
+                with self.assertRaisesRegex(HarnessError, "整体审阅已达尝试次数"):
+                    self.engine(backend).resume(before["id"], reverify=True)
+                after = read_json(engine.directory / "state.json")
+                self.assertIn("pending_replan", after)
+                for field in ("pending_replan", "commander_receipts", "final_history", "dispatches",
+                              "final_attempts", "agent_dispatches", "total_attempts", "replan_attempts"):
+                    self.assertEqual(after[field], before[field], field)
+                self.assertEqual(after["final_attempts"], 1)
+                self.assertEqual(backend.calls, calls)
+                self.assertEqual(failed_artifact.read_bytes(), failed_bytes)
+                events = [json.loads(line)["event"] for line in events_path.read_text().splitlines()[event_count:]]
+                self.assertNotIn("unvalidated_replan_cancelled_for_reverification", events)
+                self.assertNotIn("final_reverification_requested", events)
+
+                self.config.data["runtime"]["max_final_attempts"] = 2
+                resumed = self.engine(backend)
+                if reverify:
+                    result = resumed.resume(before["id"], reverify=True)
+                    self.assertEqual(result["status"], "completed")
+                    self.assertEqual(result["final_attempts"], 2)
+                    self.assertEqual([record["status"] for record in result["final_history"]],
+                                     ["verification_failed", "approved"])
+                    self.assertEqual(sum(call["kind"] == "replan" for call in backend.calls), 0)
+                    events = [json.loads(line)["event"] for line in events_path.read_text().splitlines()[event_count:]]
+                    self.assertEqual(events.count("unvalidated_replan_cancelled_for_reverification"), 1)
+                    self.assertEqual(events.count("final_reverification_requested"), 1)
+                else:
+                    with self.assertRaisesRegex(HarnessError, "指挥停止重新规划"):
+                        resumed.resume(before["id"])
+                    self.assertEqual(sum(call["kind"] == "replan" for call in backend.calls), 1)
+                    self.assertEqual(resumed.run["final_attempts"], 1)
+                    self.assertEqual(self.final_checks(resumed.run), self.final_checks(before))
+                self.assertEqual(resumed.run["final_history"][0], before["final_history"][0])
+                self.assertEqual(failed_artifact.read_bytes(), failed_bytes)
+
+    def test_reverify_budget_refusal_without_pending_replan_does_not_record_request(self):
+        self.config.data["runtime"]["max_final_attempts"] = 1
+        backend = ScriptedBackend()
+        engine = self.engine(backend)
+        with patch("harness.engine.run_process", side_effect=self.fail_final_check(timed_out=False)), \
+                self.assertRaisesRegex(HarnessError, "整体审阅已达尝试次数"):
+            engine.start("Implement greet", self.plan())
+        state_path = engine.directory / "state.json"
+        before = read_json(state_path)
+        # Older v8 code could cancel this request before refusing the reverify budget.
+        before.pop("pending_replan")
+        write_json(state_path, before)
+        failed_artifact = Path(before["final_history"][0]["artifact"])
+        failed_bytes = failed_artifact.read_bytes()
+        calls = deepcopy(backend.calls)
+        events_path = engine.directory / "events.jsonl"
+        event_count = len(events_path.read_text().splitlines())
+
+        with self.assertRaisesRegex(HarnessError, "整体审阅已达尝试次数"):
+            self.engine(backend).resume(before["id"], reverify=True)
+        after = read_json(state_path)
+        for field in ("final_history", "dispatches", "final_attempts", "agent_dispatches", "total_attempts"):
+            self.assertEqual(after[field], before[field], field)
+        self.assertEqual(backend.calls, calls)
+        self.assertEqual(failed_artifact.read_bytes(), failed_bytes)
+        events = [json.loads(line)["event"] for line in events_path.read_text().splitlines()[event_count:]]
+        self.assertNotIn("final_reverification_requested", events)
+        self.assertNotIn("unvalidated_replan_cancelled_for_reverification", events)
+
+        self.config.data["runtime"]["max_final_attempts"] = 2
+        result = self.engine(backend).resume(before["id"], reverify=True)
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["final_attempts"], 2)
+        self.assertEqual(result["final_history"][0], before["final_history"][0])
+        self.assertEqual(failed_artifact.read_bytes(), failed_bytes)
+        self.assertEqual(sum(call["kind"] == "replan" for call in backend.calls), 0)
+        events = [json.loads(line)["event"] for line in events_path.read_text().splitlines()[event_count:]]
+        self.assertEqual(events.count("final_reverification_requested"), 1)
+
     def test_reverify_does_not_carry_over_to_failure_after_a_returned_revision(self):
         self.config.data["runtime"].update(max_replans=3, max_final_attempts=5)
 

@@ -218,3 +218,15 @@ Codex 0.163.0 的本地 `debug prompt-input` 检查确认：未提交的 AGENTS.
 另使用 Python 3.11.17 执行全部 4 项新增测试，均通过，耗时 12.173 秒，日志为 `.harness/validation/review-v12-python311.log`；本轮未在 Python 3.11 重跑完整套件。`python3 -m compileall -q harness tests`、CLI 恢复帮助输出与 `git diff --check` 检查通过。
 
 台账保持版本 8，没有新增恢复子状态。上述测试使用模拟模型响应及真实本地 Git、验证子进程，不证明真实模型调用行为；本轮未运行 `python3 -m harness smoke`。README、设计、恢复协议及 CLI 帮助已同步，临时审阅文档 `docs/review-2026-10-22-v12.md` 已按要求删除。
+
+## 第十三轮审阅修订验证（2026-10-23，台账 v8）
+
+执行 `python3 -m unittest discover -s tests -v`：526 项，525 项通过、1 项跳过（Python 3.15.0，519.838 秒）。跳过原因仍为本机文件系统拒绝实际创建非 UTF-8 文件名。完整日志保存在本仓库私有 `.harness/validation/review-v13-offline.log`，不提交。
+
+本轮新增 2 项行为测试。整体验收预算耗尽时，`--reverify` 不再取消待再规划意图；测试核对原请求、指挥 receipt、最终失败历史、原始失败产物、派发及累计计数保持不变，也不写取消或显式重验事件。增加预算后分别验证普通 `resume` 继续再规划，以及显式 `--reverify` 完成新的最终尝试。旧 v8 已经丢失待再规划意图的现场也有独立覆盖：预算不足时不记录显式重验事件，增加预算后仍可显式重验并保留原失败证据，不自动重建旧请求。
+
+全部整体验收恢复测试 18 项另行通过，耗时 35.698 秒，日志为 `.harness/validation/review-v13-final-stage.log`。仅在内存中分别恢复基线 `a3b651e` 的 `execute` 和 `final_review` 方法时，对应新增测试分别检出再规划意图丢失和过早记录重验事件；负向验证日志为 `.harness/validation/review-v13-regression-baseline.log`。
+
+另使用 Python 3.11.17 执行全部 2 项新增测试，均通过，耗时 5.668 秒，日志为 `.harness/validation/review-v13-python311.log`；本轮未在 Python 3.11 重跑完整套件。`python3 -m compileall -q harness tests` 与 `git diff --check` 通过。
+
+已完成 run 的恢复参数行为及损坏恢复链接阻止 `abandon` 的限制仅补充文档，未放宽台账、进程或清理门禁。台账保持版本 8，没有新增恢复子状态或 CLI 参数，模型 ID 与派发生命周期保持不变。上述测试使用模拟模型响应及真实本地 Git、验证子进程，不证明真实模型调用行为；本轮未运行 `python3 -m harness smoke` 或调用真实模型。README、设计与恢复协议已同步，临时审阅文档 `docs/review-2026-10-23-v13.md` 已按要求删除。
