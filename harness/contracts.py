@@ -36,8 +36,20 @@ REPLAN = obj(action={"type": "string", "enum": ["revise", "stop"]},
              updates={"type": "array", "items": TASK_UPDATE})
 WORK = obj(status={"type": "string", "enum": ["completed", "blocked"]},
            summary=DETAIL, evidence=EVIDENCE, blockers=EVIDENCE,
-           blocker_kind={"type": "string", "enum": ["none", "task", "environment"]},
+           blocker_kind={"type": "string", "enum": ["none", "task", "environment", "operator"]},
            proposed_memories=PROPOSALS)
+FILE_EVIDENCE = obj(path={"type": "string", "minLength": 1, "maxLength": 4096},
+                    sha256={"type": "string", "pattern": r"^[0-9a-f]{64}$"})
+CHECKPOINT = obj(id=SAFE_ID, summary=DETAIL,
+                 inputs={"type": "array", "items": FILE_EVIDENCE, "maxItems": 8},
+                 evidence={"type": "array", "items": FILE_EVIDENCE, "minItems": 1, "maxItems": 8},
+                 freshness={"type": "string", "enum": ["content", "volatile"]},
+                 max_age_seconds={"type": "integer", "minimum": 0, "maximum": 86400})
+# Optional extensions preserve old returned artifacts and simple worker clients.
+# A handoff question gates another task; it is not a blocker of this deliverable.
+WORK["properties"].update(
+    checkpoints={"type": "array", "items": CHECKPOINT, "maxItems": 16},
+    decision_requests={"type": "array", "items": obj(id=SAFE_ID, task_id=TASK_ID, question=DETAIL), "maxItems": 16})
 FINDING = obj(id=SAFE_ID,
               severity={"type": "string", "enum": ["blocking", "advisory"]},
               category={"type": "string", "enum": ["defect", "evidence", "scope", "preference"]},
@@ -48,8 +60,10 @@ REVIEW = obj(verdict={"type": "string", "enum": ["approve", "request_changes"]},
 
 
 def envelope(schema, task_id, dispatch_id):
-    return obj(task_id={"type": "string", "enum": [task_id]},
-               dispatch_id={"type": "string", "enum": [dispatch_id]}, **schema["properties"])
+    result = obj(task_id={"type": "string", "enum": [task_id]},
+                 dispatch_id={"type": "string", "enum": [dispatch_id]}, **schema["properties"])
+    result["required"] = ["task_id", "dispatch_id", *schema["required"]]
+    return result
 
 
 class RepairableFormatError(HarnessError):
@@ -62,7 +76,7 @@ class RepairableFormatError(HarnessError):
 
 def output_constraints(schema, path="response"):
     """Derive the local constraints omitted from the providers' schema subset."""
-    fields = ("minLength", "maxLength", "pattern", "minItems", "maxItems", "uniqueItems")
+    fields = ("minLength", "maxLength", "pattern", "minItems", "maxItems", "uniqueItems", "minimum", "maximum")
     bounds = {key: deepcopy(schema[key]) for key in fields if key in schema}
     if schema.get("minLength", 0):
         bounds["non_blank"] = True
@@ -103,16 +117,17 @@ def review_output_constraints(schema, proposed_keys=()):
 
 def validate_structure(value, schema, path="response"):
     """Check all hard schema boundaries before considering a format repair."""
-    expected = {"object": dict, "array": list, "string": str}[schema["type"]]
-    if not isinstance(value, expected):
+    expected = {"object": dict, "array": list, "string": str, "integer": int}[schema["type"]]
+    if not isinstance(value, expected) or (expected is int and type(value) is not int):
         raise HarnessError(f"{path}: expected {schema['type']}")
     if "enum" in schema and value not in schema["enum"]:
         raise HarnessError(f"{path}: value not in permitted set")
     if expected is dict:
-        if set(value) != set(schema["required"]):
+        if not set(schema["required"]) <= set(value) or set(value) - set(schema["properties"]):
             raise HarnessError(f"{path}: missing or unexpected fields")
         for key, field in schema["properties"].items():
-            validate_structure(value[key], field, f"{path}.{key}")
+            if key in value:
+                validate_structure(value[key], field, f"{path}.{key}")
     if expected is list:
         for i, item in enumerate(value):
             validate_structure(item, schema["items"], f"{path}[{i}]")
@@ -128,7 +143,11 @@ def _validate_format(value, schema, path):
             raise RepairableFormatError(path, "invalid identifier")
     if schema["type"] == "object":
         for key, field in schema["properties"].items():
-            _validate_format(value[key], field, f"{path}.{key}")
+            if key in value:
+                _validate_format(value[key], field, f"{path}.{key}")
+    if schema["type"] == "integer":
+        if not schema.get("minimum", value) <= value <= schema.get("maximum", value):
+            raise RepairableFormatError(path, "integer exceeds permitted bounds")
     if schema["type"] == "array":
         if len(value) < schema.get("minItems", 0) or len(value) > schema.get("maxItems", float("inf")):
             raise RepairableFormatError(path, "array length exceeds permitted bounds")
@@ -151,6 +170,15 @@ def validate_work_semantics(result):
     keys = [proposal["key"] for proposal in result["proposed_memories"]]
     if len(keys) != len(set(keys)):
         raise HarnessError("记忆提案 key 必须唯一")
+    for field in ("checkpoints", "decision_requests"):
+        ids = [item["id"] for item in result.get(field, [])]
+        if len(ids) != len(set(ids)):
+            raise HarnessError(f"worker {field} 的 id 必须唯一")
+    if result.get("decision_requests") and not completed:
+        raise HarnessError("后续任务的决策请求只允许随已完成的任务结果提交")
+    for checkpoint in result.get("checkpoints", []):
+        if checkpoint["freshness"] == "content" and (not checkpoint["inputs"] or checkpoint["max_age_seconds"] != 0):
+            raise HarnessError("内容检查点需要绑定输入文件且 max_age_seconds 为 0")
 
 
 def validate_work(result):

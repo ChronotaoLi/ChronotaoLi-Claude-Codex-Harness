@@ -10,7 +10,7 @@ from pathlib import Path
 
 from . import git
 from .util import (HarnessError, append_event, confirm_dispatches_exited,
-                   ensure_dispatches_exited, group_alive, lock, read_json, write_json)
+                   ensure_dispatches_exited, group_alive, lock, read_json, validate_command_directories, write_json)
 
 
 def _canonical(path):
@@ -151,12 +151,13 @@ def cleanup_verification(repo: Path, ident: str, *, remove=False, confirm_exited
     with lock(directory / "run.lock"):
         _regular_bytes(directory / "state.json")
         run = read_json(directory / "state.json")
-        if (not isinstance(run, dict) or run.get("schema_version") not in (7, 8, 9) or run.get("id") != ident
+        if (not isinstance(run, dict) or run.get("schema_version") not in (7, 8, 9, 10, 11) or run.get("id") != ident
                 or run.get("repo") != str(repo) or not isinstance(run.get("dispatches"), list)
                 or not isinstance(run.get("final_history"), list)
                 or not isinstance(run.get("worktree_binding"), dict)
                 or run.get("worktree") != str(repo / ".harness" / "worktrees" / ident)):
             raise HarnessError("运行台账或工作树归属无效；保留现场")
+        validate_command_directories(run["dispatches"], directory)
         common = Path(git.git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir").removesuffix("\n")).resolve()
         if run["worktree_binding"].get("common_dir") != str(common):
             raise HarnessError("运行台账的 Git 公共目录绑定已改变")

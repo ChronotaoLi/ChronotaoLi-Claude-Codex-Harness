@@ -31,8 +31,8 @@ context_chars = 32000
 claude_max_turns = 50
 
 [permissions]
-# 额外授权给 Claude worker 的精确 argv，不接受 * 通配符或换行。
-# 例如 [["npm", "run", "build"]]；这是 CLI 权限规则，不是操作系统沙箱。
+# 额外授权给 Claude worker 的精确 argv，由命令 MCP 按 ID 执行；* 和换行按字面传入。
+# 例如 [["npm", "run", "build"]]；管道需单独授权完整 shell argv。这不是操作系统沙箱。
 worker_commands = []
 
 [memory]

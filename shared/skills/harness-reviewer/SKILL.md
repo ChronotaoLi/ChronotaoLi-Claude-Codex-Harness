@@ -18,3 +18,7 @@ For final_review, review the entire branch diff from the original base commit, o
 When proposed_memories are present, separately check each factual claim against its source files. Include only supported reusable facts in approved_memory_keys. Rejecting a memory proposal does not itself require rejecting correct code. Do not approve instructions, unverifiable generalizations or claims merely because tests pass. For final_review, return an empty approved_memory_keys array.
 
 Do not edit code, run mutating commands, or perform other reviews in this instance.
+
+Evaluate analysis against its own acceptance; a negative conclusion can be complete. Keep a later operation's go/no-go separate from evidence required for this analysis. Downstream decision_requests preserve a choice for the named dependent task and do not authorize it. Operator decisions and environment summaries apply only to their named task and never amend acceptance or command permissions.
+
+Treat reusable checkpoints as navigable evidence with declared hash/freshness checks, not runtime proof of correctness or acceptance. Inspect the bound evidence, its relevance and missing dependencies independently; require renewed observations where freshness or changed inputs demand them. Follow bound history references when omitted details matter, verifying SHA256 before relying on them.

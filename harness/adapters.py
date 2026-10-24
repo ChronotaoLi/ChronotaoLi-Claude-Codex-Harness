@@ -4,8 +4,11 @@ import json
 import math
 import os
 import shlex
+import sys
 from copy import deepcopy
+from pathlib import Path
 
+from .command_server import create_manifest
 from .shared import mcp_configs, toml_value
 from .util import HarnessError, read_json, run_process, tail, write_json
 
@@ -108,6 +111,13 @@ class CLIBackend:
         if role == "worker" and model["cli"] == "codex":
             raise HarnessError("当前 Codex 适配器仅支持只读角色，不能配置为 worker")
         claude, codex = mcp_configs(self.config, self.state, role, run_path)
+        if role == "worker":
+            manifest = create_manifest(self.config, cwd, job.resolve(), run_path)
+            claude["mcpServers"]["harness_commands"] = {
+                "type": "stdio", "command": sys.executable,
+                "timeout": int(self.config.data["runtime"]["verify_timeout_seconds"] * 1000) + 10000,
+                "args": [str(Path(__file__).with_name("command_entry.py").resolve()),
+                         "--manifest", manifest["artifact"], "--sha256", manifest["artifact_digest"]]}
         write_json(job / "mcp.json", claude)
         wire_schema = provider_schema(schema)
         write_json(job / "provider-schema.json", wire_schema)
@@ -129,8 +139,8 @@ class CLIBackend:
             tools = "Read,Edit,Write,Glob,Grep,Bash"
             commands = self.config.data["verification"]["commands"] + self.config.data["permissions"]["worker_commands"]
             # A literal * in an argv becomes a permission wildcard even when
-            # shell-quoted. Such verification commands remain runnable by the
-            # deterministic verifier, but never become broad Bash grants.
+            # shell-quoted. The broker can execute these literal argv safely;
+            # they must never become broad Bash grants.
             allow += ["Bash(" + shlex.join(cmd) + ")" for cmd in commands
                       if not any("*" in arg or "\n" in arg or "\r" in arg for arg in cmd)]
         # Only configured MCP servers are exposed. Their permissions are a trusted operator choice.

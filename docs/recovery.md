@@ -6,7 +6,7 @@
 
 指挥选择就绪任务时，以目标和所有就绪任务的标题检索记忆，避免只使用列表首项的任务信息。
 
-再规划只处理任务拆分、缺少前置工作和整体验收发现的工程缺口。worker 通过 `blocker_kind` 区分 task 与 environment；CLI 错误、权限、范围违例和现场不一致不会被包装成自动再规划。非法结果默认停止；明确归属且保留拒绝证据的 invalid_rejected 整体审阅可自动进入修正规划，操作者请求的有界非法结果修正另述。指挥返回 `{action, reason, new_tasks, updates}`：每个 update 仅包含 `id`、`description`、`add_depends_on`，stop 必须提供空操作数组。运行时在原计划上应用增量并重新检查 DAG，要求：
+再规划只处理任务拆分、缺少前置工作和整体验收发现的工程缺口。worker 通过 `blocker_kind` 区分 task、environment 与 operator；operator 等待明确回答，不先再规划；CLI 错误、权限、范围违例和现场不一致不会被包装成自动再规划。非法结果默认停止；明确归属且保留拒绝证据的 invalid_rejected 整体审阅可自动进入修正规划，操作者请求的有界非法结果修正另述。指挥返回 `{action, reason, new_tasks, updates}`：每个 update 仅包含 `id`、`description`、`add_depends_on`，stop 必须提供空操作数组。运行时在原计划上应用增量并重新检查 DAG，要求：
 
 - 保留每个既有任务 ID，已接受任务完全不变。
 - 未接受任务只可更新描述并添加依赖；标题、skills、验收和 allowed_paths 均从台账保留，已有依赖不得删除。
@@ -26,23 +26,23 @@ worker 尝试与派发计数在本地上下文、hooks、MCP 配置、快照和�
 
 整体验证以非零退出失败后的空 diff 修正采用相同处理：保留失败记录，直接请求新的修正规划，不额外消耗最终尝试来重跑相同代码。显式 `--reverify` 仍可用于操作者确认环境已修复的情况。
 
-恢复配置允许增加上下文预算、agent/验证超时、Claude 轮数、上述次数上限及任务容量 `max_tasks`，不可减少。提高任务容量后，已返回的超限修订重新校验同一 receipt，不重抽指挥结果；已保存的 stop 仍须显式 `--retry-stopped`。操作者也可以追加精确 `worker_commands` argv，已有授权不可删除或修改；事件记录旧值、新值和新增命令。模型 ID、供应商、effort、验证命令和共享资产不允许在同一 run 中改变。进程存活和 Git HEAD 检查仍在恢复前执行；无法探测进程组权限时按仍存活处理。台账版本 8 增加 `invalid_repairs` 和 `approved_scope`；新运行使用版本 9，增加环境更新及检查证据，版本 8 普通恢复保持兼容，首次接受环境更新时升级为 9；版本 7 及更早运行不能直接恢复，不自动迁移，也不补造旧运行的修正额度或授权。版本 7 已有的 Git 绑定和验证证据仍可用于独立清理命令。当前版本已完成的 run 在普通 resume 时直接返回保存结果，不再核对用于继续执行的配置和共享资源。
+恢复配置允许增加上下文预算、agent/验证超时、Claude 轮数、次数上限及任务容量 `max_tasks`，不可减少。超限修订提高容量后重验同一 receipt，不重抽结果；已保存 stop 仍须显式 `--retry-stopped` 或匹配的操作者决定。可以追加精确 `worker_commands` argv，已有授权不可删除或修改；记录配置放宽事件。模型 ID、供应商、effort、验证命令和共享资产不允许在同一 run 改变。进程退出及 Git 绑定、HEAD 检查仍先执行。新运行版本为 11；未完成版本 8、9、10 通过恢复预检后升级，历史及预算保留，共享资产摘要仍必须匹配。版本 7 及更早不能直接恢复执行。已完成 run 普通恢复直接返回原结果，不升级、不比较执行配置及共享资产。
 
 `resume RUN --environment-update FILE` 接受最多 64 KiB 的严格 JSON，每个 run 最多 32 条更新：必填 `schema_version: 1`、`task_id`、`blocker_dispatch_id` 和非空、至多 4,000 字符的 `summary`；可选 `checks` 默认 `[]`，最多 16 项。未知字段拒绝。检查只允许 `{kind: "path", path: 绝对路径, path_type: "file"|"directory"|"any"}`、`{kind: "executable", name: 可执行文件名或绝对路径}`、`{kind: "worker_command", argv: 精确命令数组}`。命令检查以是否已在当前 worker_commands 或 verification.commands 中声明判定通过；未声明时仍保留更新及失败检查报告，追加精确配置授权后普通 resume 可重检。检查不执行命令、不启动子进程、不新增授权，也不保证真实 CLI、账号或服务成功。只需表达操作者事实时可省略 checks。
 
 接受更新前在 run 锁内核对进程退出、Git 绑定、HEAD、当前任务与范围，以及保存的环境 blocker 来源身份和原结果摘要。只接受当前未接受任务的 worker 环境阻断边界；首次后续模型调用前中断，即使状态为 interrupted 或遗留 running，仍按这些证据判断资格。后续模型调用使旧来源失效，包括已开始但失败的指挥调用；需在新的 worker 环境阻断后再提交更新。存在待处理任务／最终验证或审阅、接受及接受后待办、再规划／指挥 stop、pending_directive、commander/reviewer receipt、待格式修正或活动非法结果修正时拒绝。完成或放弃状态拒绝更新；与 reverify、retry-stopped、allow-scope、repair-invalid 互斥，step 可合用。不得通过更新清除任何 receipt、修正守卫、已保存拒绝或批准快照。
 
-更新输入被复制到私有产物并绑定摘要，台账按顺序引用，原输入文件不再是恢复依赖。保存的更新缺失或被篡改时停止；相同来源尚无后续模型调用时重复提交相同更新幂等。产物、审计事件和台账之间中断时，审计事件可能以同一稳定更新 ID 重复，台账仅保留一条授权引用。后续指挥、worker、任务审阅及整体审阅的必要上下文包含有序 environment_updates，最近检查报告经摘要核验后作为 environment_observations 一并发送，整体上下文预估使用同一内容；不能作为可丢弃记忆处理，也不授予记忆覆盖权。操作者断言替代匹配任务的过时环境假设，但原目标、任务范围、验收及所有累计预算保持不变，后续调用仍使用新进程和新 dispatch。
+更新输入复制到私有产物并绑定摘要，原输入文件不再是恢复依赖。所有历史更新、来源及检查报告在投影前核验；缺失或篡改时停止。有效来源的重复相同更新幂等，审计事件可因中断重复但台账只有一条引用。上下文只包含相关任务的最新摘要及紧凑检查结果：worker／任务 reviewer 看当前任务，dispatch 看 ready 任务，replan 看触发任务，final reviewer 看各任务。完整历史、checks、argv 和报告保留路径与 SHA256 引用；依赖省略的细节前须读取并核验产物，失败检查先查看详情。原目标、验收、范围、实际权限及未解决 blocker 始终保留，任务环境断言不得推广到其他任务。整体容量预估采用相同投影。
 
-更新登记后不可撤回，其序列化内容计入此后各角色的必要上下文。64 KiB 输入上限及字段限制不保证能装入默认 32,000 字符预算；单条或累计更新造成超限时，需增大 context_chars 后恢复，追加更短的更新不会移除旧内容。历史更新仍按原输入契约读取，不追溯施加更小的长度限制。
+更新登记后历史不可撤回；最新同任务摘要及 checks 可替代旧环境假设及检查列表，不覆盖验收或权限。旧声明及报告以可检索引用保留，不重复内联全部文字或命令。历史输入契约不收紧；合法输入的紧凑投影仍可能超出上下文预算，届时增加 `context_chars` 后恢复。
 
 同一任务最新更新的 checks 替代先前检查列表，所有历史声明仍按序发送。选择前只预检已有的 current_task，不检查全部 ready 任务；选中任务在后续每次 worker 尝试（含格式修正）前仍重检，所有报告保留。已有当前任务的一次普通尝试可能在选择前与派发前分别记录报告，输入使用最近一份。检查失败不启动本次 worker，不消耗其尝试或派发预算。current_task 为空时，指挥选择可能已消耗派发预算；其选定指令保存到 pending_directive，后续恢复复用，修复条件后启动 worker 才消费该指令。worker 已返回并进入验证／审阅后不重跑这些前置检查；正常验证、独立审阅、快照和接受门禁仍全部执行，检查成功或操作者声明本身不是完成证据。
 
-状态摘要的 worker_outcomes 仅分类 worker 自报完成、任务／环境阻断、运行故障与未知结果，不替代 accepted 或 completed 门禁。last_environment_blocker 是最近环境阻断的历史诊断；后续模型调用开始后标为 stale。stale=false 也不代表具备环境更新资格：更新仍需通过进程退出、来源摘要、任务范围和待处理阶段等检查。
+状态摘要的 worker_outcomes 仅分类 worker 自报完成、任务／环境／操作者阻断、运行故障与未知结果，不替代 accepted 或 completed 门禁。last_environment_blocker 是最近环境阻断的历史诊断；后续模型调用开始后标为 stale。stale=false 也不代表具备环境更新资格：更新仍需通过进程退出、来源摘要、任务范围和待处理阶段等检查。
 
 对长时间中断后 pgid 被复用的情况，采用显式确认而非根据组长身份自动推断整个进程组已退出。`resume` 与 `abandon` 的 `--confirm-exited <dispatch_id>` 在运行锁内校验全部 ID，先追加操作事件，再只更新指定记录的退出确认。事件记录当时的组存活探测及组长 PID、PPID、PGID、启动时间和命令名（或探测错误）；组长缺失不构成自动退出证明，不发送终止信号。确认不放宽其他恢复或工作树移除检查。
 
-运行与验证清理共用进程退出判定。派发在准备阶段保存 `process_state=prepared`，真正调用后端前与预算一起保存 `starting`，启动回调记录 pgid 后转为 `running`；受控结束记录退出。只有明确的准备状态可以证明尚未尝试启动，`starting` 或旧台账中无 pgid 且未确认退出的条目均停止恢复与清理，覆盖子进程已启动但 pgid 尚未落盘的中断窗口。`cleanup-verification --confirm-exited ID` 提供无需运行配置的同一审计确认入口，兼容 v7/v8/v9，也支持 completed/abandoned，不恢复执行或改写终态。
+运行与验证清理共用进程退出判定。派发在准备阶段保存 `process_state=prepared`，真正调用后端前与预算一起保存 `starting`，启动回调记录 pgid 后转为 `running`；受控结束记录退出。只有明确的准备状态可以证明尚未尝试启动，`starting` 或旧台账中无 pgid 且未确认退出的条目均停止恢复与清理，覆盖子进程已启动但 pgid 尚未落盘的中断窗口。`cleanup-verification --confirm-exited ID` 提供无需运行配置的同一审计确认入口，兼容 v7/v8/v9/v10/v11，也支持 completed/abandoned，不恢复执行或改写终态。
 
 worker 完成且结果通过检查后，持久化 `pending_task` 的 verifying 阶段及完整快照摘要；验证成功后持久化 reviewing 阶段、diff、验证产物路径、记忆提案和历轮审阅。恢复时先检查范围、HEAD 和快照；一致则继续未完成阶段，不再派发 worker 或消耗 worker 额度。验证重跑使用新的日志目录。候选变化使后续证据失效，回到新的工作尝试；越界残留先停止并提示人工核对清理，不自动删文件，不派发模型或消耗 worker 额度。
 
@@ -84,7 +84,7 @@ worker 调用失败或中断时，另按 task ID 保存 `worker_recovery`，记�
 
 ### 恢复子状态的维护约束
 
-加载台账时先检查下列可选对象的类型、任务阶段与再规划互斥，以及 receipt、修正守卫和 worker 故障来源引用的 dispatch 是否存在并匹配角色／调用类型／任务；重复 dispatch ID 同样停止。`pending_task.task_id`、`pending_acceptance.task_id`、`pending_post_accept.payload.task_id` 和非 `None` 的 `current_task` 必须是指向现有任务的字符串；检查引用前先核对任务条目、嵌套 payload 和 ID 的类型。检查失败给出 `HarnessError`，不重写台账、不派发、不写入记忆，也不先归档候选。此检查不替代消费证据时的内容摘要、候选快照、身份和 hook 门禁，不自动修复损坏状态；版本 8、9 均执行这些检查，版本 9 另校验环境更新及检查的归属引用。
+加载台账时先检查下列可选对象的类型、任务阶段与再规划互斥，以及 receipt、修正守卫和 worker 故障来源引用的 dispatch 是否存在并匹配角色／调用类型／任务；重复 dispatch ID 同样停止。`pending_task.task_id`、`pending_acceptance.task_id`、`pending_post_accept.payload.task_id` 和非 `None` 的 `current_task` 必须是指向现有任务的字符串；检查引用前先核对任务条目、嵌套 payload 和 ID 的类型。检查失败给出 `HarnessError`，不重写台账、不派发、不写入记忆，也不先归档候选。此检查不替代消费证据时的内容摘要、候选快照、身份和 hook 门禁，不自动修复损坏状态；版本 8、9、10、11 均执行这些检查；环境更新、检查点及决定另校验各自归属和证据引用。
 
 恢复链接校验失败同样阻止 `abandon`，应保留台账与证据供核对。`status` 和 `cleanup-verification` 不经过此链接检查；后者仍须通过独立的台账、进程退出和 Git 绑定检查，不保证损坏台账可以清理。
 
@@ -101,9 +101,13 @@ worker 调用失败或中断时，另按 task ID 保存 `worker_recovery`，记�
 | `invalid_repairs` | 操作者授权显式修正 | 完成、失败或失效后仍保留来源与额度记录 |
 | `format_repairs` | 修正调用前 | 累计额度不因新候选或 resume 清零 |
 | `worker_recovery` | worker 调用内失败或中断 | 任务接受或应用再规划后清除；可与待验证、待审阅阶段共存 |
-| `replan_stopped` | 校验并保存指挥 stop | 显式 retry-stopped 转回 pending_replan 时清除 |
-| `environment_updates` | 操作者环境更新审计并登记 | 版本 9 的有序持久记录；不清除旧声明，最新同任务 checks 替代旧检查列表 |
-| `environment_checks` | 每次前置检查保存报告后 | 追加保存全部报告引用；必要上下文携带各任务最新更新的最近检查报告 |
+| `replan_stopped` | 校验并保存指挥 stop | 显式 retry-stopped 或匹配该来源的 operator-decision continue 转回 pending_replan 时清除 |
+| `environment_updates` | 操作者环境更新审计并登记 | 版本 9 起的有序持久记录；不清除旧声明，最新同任务 checks 替代旧检查列表 |
+| `environment_checks` | 每次前置检查保存报告后 | 追加保存全部报告引用；上下文携带相关任务最新更新的最近检查结果及完整报告引用 |
+| `task_checkpoints` | 合法 worker 结果返回后，证据复制与摘要绑定完成 | 保留历次引用；同任务同检查 ID 采用最新记录，输入变化或过期标为 stale，不改变任务接受状态 |
+| `decision_requests` | 当前 operator 阻断、指挥 stop，或来源任务接受且 post_accept 完成 | 请求与原始结果绑定并保留；后续任务请求可从 accepted 中恢复登记，未答复或 stop 时禁止目标任务派发 |
+| `operator_decisions` | 严格校验显式答复后，审计先于台账 | 仅解除匹配请求的等待；后续调用开始后拒绝重交旧答复，不清除已有结果或累计预算 |
+| `accepted[].worker_source / decision_requests` | 任务接受台账保存时 | 保存接受的精确 worker 来源及后续决策请求，不能用其他尝试的结果替代 |
 | `dispatches[].invoked` | 本地准备时为 false，后端调用前同预算保存为 true | 后续真实调用使旧环境 blocker 来源过期；旧记录缺该字段时保守按已调用处理，不替代进程退出检查 |
 
 新增子状态或改变保存顺序时，应同步更新此表并验证中断后的合法组合；不能将上述状态一概视为互斥。
@@ -130,3 +134,30 @@ worker 调用失败或中断时，另按 task ID 保存 `worker_recovery`，记�
 | 最终验证超时／非零退出 | 超时修复后 `resume`；非零退出走修正规划，确认环境修复后可显式 `--reverify` | 已返回的指挥结果和模型拒绝不可由重验丢弃；预算耗尽时 `--reverify` 不取消待再规划意图 |
 | HEAD、Git 绑定、原始证据或候选不一致 | 核对并恢复可信现场，或 `abandon` 保留证据 | 不手工伪造接受依据；任务候选变化须重新执行验证与审阅 |
 | 移除工作树被未保存文件阻止 | 核对诊断路径、归档或清理后重试移除 | 忽略文件也不得未经核对删除 |
+
+## 可复用检查点与操作者决定（版本 10）
+
+WORK 可选 `checkpoints`，最多 16 项，每项为 `{id, summary, inputs: [{path, sha256}], evidence: [{path, sha256}], freshness, max_age_seconds}`。ID 在本次结果中唯一；summary 非空、最多 4,000 字符；inputs/evidence 各最多 8 个文件，evidence 至少一个。文件必须为允许的普通文件，SHA256 为实际字节摘要；运行时将原始 evidence 私有保存。`freshness="content"` 必须绑定至少一个 input 且 `max_age_seconds=0`；`volatile` 的有效期为 0–86,400 秒，0 表示每次都需重新检查。有效期保守地从来源 worker 的调用开始时间计算，worker 内部执行时间也会消耗有效期；缺少有效调用时间的时效检查点一律视为 stale，不从结果落盘时间重新计时。输入及证据文件拒绝符号链接；使用解析后的实际路径（例如 macOS 的 /private/tmp）。单份证据最多 1 MiB，一次结果的副本总计最多 16 MiB。投影根据输入字节、证据摘要及有效期标记 reusable/stale，并保留历史引用。reusable 仅证明声明的依赖未变且未过期，不证明依赖完整、推理正确、命令成功或任务已接受；时效事实、未声明依赖和未解决 blocker 仍需核实。检查点不能绕过验证、独立审阅或接受门禁。
+
+当前任务需要用户决定时，worker 返回 `status="blocked", blocker_kind="operator"` 和具体问题；运行停止等待回答，不先再规划。已满足本任务验收的 worker 可以在 completed 结果中附带 `decision_requests: [{id, task_id, question}]`，将明确风险选择留给传递依赖于本任务的后续任务。本任务仍正常验证、审阅、接受；该请求不表示后续操作被批准，目标任务在得到回答前停止。禁止用后续阶段的操作／测试证明作为前一分析任务的完成条件；负面分析结论可以完成，但必须满足该分析任务自己的验收。
+
+从 `status RUN` 取得运行时 request ID 后提交：
+
+```bash
+python3 -m harness --config /path/to/harness.toml --repo /path/to/project resume RUN --operator-decision /absolute/path/decision.json --step
+```
+
+```json
+{"schema_version": 1, "request_id": "request_id_from_status", "task_id": "target_task", "decision": "continue", "summary": "操作者对该问题的明确选择及理由"}
+```
+
+输入是最多 64 KiB 的严格 JSON，只接受上述字段，summary 非空且不超过 4,000 字符；`decision` 为 `continue` 或 `stop`。回答绑定任务、问题和原始来源，私有保存并绑定摘要。continue 允许针对该问题使用全新 worker 尝试或继续原再规划；指挥 stop 的 continue 重新打开原规划请求并保留旧结论和证据。stop 保持等待，可在后续模型调用前显式修订；来源过期后拒绝旧回答。回答不改变目标、scope、命令授权、验收或累计预算，也不产生完成证据。仍可用原 `--retry-stopped` 在不附说明时显式重试 stop。
+
+`--operator-decision` 与 `--environment-update`、`--retry-stopped`、`--reverify`、`--repair-invalid`、`--allow-scope` 互斥，可与 `--confirm-exited`、`--step` 合用。操作者已回答 stop 时，必须向同一请求提交新的 continue；单独 `--retry-stopped` 不能覆盖该决定。完成或放弃的 run 拒绝回答。操作者决定是任务范围内的选择，不是其他任务的环境事实、记忆指令或权限授予。
+
+
+## 命令子进程证据（版本 11）
+
+worker 独有的 `harness_commands` broker 在 dispatch 私有 `commands/` 中保存每次精确 argv 命令的 stdout/stderr 原文、摘要 receipt 和子进程 journal。恢复、abandon 与验证检出清理都核对这些子进程的退出证据；父 dispatch 已退出或缺少 pgid 都不能证明命令未启动或已经退出。证据缺失、损坏或退出未知时保留现场并停止。
+
+操作者核实后仍以父 dispatch ID 提交 `--confirm-exited`，审计记录绑定命令子日志摘要，再保存该精确 dispatch 的确认；不终止无关进程，也不跳过 HEAD、快照、Git 绑定或文件清理检查。新运行写版本 11；未完成版本 8、9、10 经预检后升级且保留历史与预算，版本 7 仍不能恢复执行。`cleanup-verification` 可检查版本 7 至 11，包括终态 run。

@@ -12,3 +12,7 @@ For replan, return action, reason, new_tasks and updates. Each update contains o
 When final review finds a gap, add a focused corrective task addressing the evidence; do not claim the already accepted tasks prove the complete goal. The runtime owns plan versions, attempt limits and any archived worktree restoration.
 
 The checkpoint is your durable state. Use accepted commits, pending tasks and unresolved findings to continue; do not depend on private conversation history. Never accept your own implementation or bypass the reviewer.
+
+Separate an analysis deliverable's acceptance from a later operation's go/no-go. Do not require a future operation or its tests to succeed before accepting completed analysis. A negative analytical conclusion may complete only when its own acceptance is met. Put known residual risk choices at a downstream operator decision gate. Keep mutable environmental assumptions in environment information, not immutable acceptance; the current permission packet defines allowed commands.
+
+Use environment summaries and operator decisions only for their named tasks and requests. An operator blocker waits for an explicit response before replanning; a continue response permits addressing that request without weakening the original goal, acceptance or scope. Saved checkpoint evidence can guide a fresh worker but never substitutes for review or accepted commits.

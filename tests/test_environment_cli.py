@@ -47,7 +47,7 @@ class EnvironmentCLITests(unittest.TestCase):
         run = self.fixture()
         summary = status_summary(run)
         self.assertEqual(summary["budgets"]["total_attempts"], 7)
-        self.assertEqual(summary["worker_outcomes"], dict(completed=0, task_blocked=0, environment_blocked=1, runtime_failed=1, unknown=1))
+        self.assertEqual(summary["worker_outcomes"], dict(completed=0, task_blocked=0, environment_blocked=1, operator_blocked=0, runtime_failed=1, unknown=1))
         blocker = summary["last_environment_blocker"]
         self.assertFalse(blocker["stale"])
         self.assertEqual(blocker["dispatch_id"], "d3")

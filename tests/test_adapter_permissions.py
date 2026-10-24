@@ -2,6 +2,7 @@ import json
 import subprocess
 import tempfile
 import unittest
+import uuid
 from pathlib import Path
 
 from harness.adapters import CLIBackend
@@ -20,7 +21,7 @@ class AdapterPermissionTests(unittest.TestCase):
         self.config = Config.load(ROOT / "harness.toml")
 
     def command(self, cwd, role="worker"):
-        job = self.root / "dispatch"
+        job = self.root / str(uuid.uuid4())
         job.mkdir(exist_ok=True)
         argv = CLIBackend(self.config, self.root / ".harness").command(
             role, self.config.role("commander", "fable"), cwd, job, {}, None)

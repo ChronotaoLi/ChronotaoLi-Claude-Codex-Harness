@@ -321,10 +321,10 @@ class RuntimeTests(RepoCase):
 class IntegrationTests(RepoCase):
     def test_adapter_commands_never_resume_or_bypass_permissions(self):
         backend = CLIBackend(self.config, self.repo / ".harness")
-        job = self.repo / "job"
-        job.mkdir()
         for role in ("commander", "worker", "reviewer"):
             for commander in ("astra", "fable"):
+                job = self.repo / (role + "-" + commander)
+                job.mkdir()
                 argv = backend.command(role, self.config.role(role, commander), self.repo, job, WORK, None)
                 self.assertFalse(any(x in ("resume", "--resume", "--continue", "--dangerously-skip-permissions", "--dangerously-bypass-approvals-and-sandbox") for x in argv))
                 if argv[0] == "codex":

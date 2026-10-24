@@ -11,6 +11,7 @@ from pathlib import Path
 
 from . import git
 from .adapters import CLIBackend, provider_usage
+from .command_server import command_id
 from .context import (FINAL_REVIEW_INSTRUCTION, capacity_report, compact_checks,
                       compact_feedback, compact_plan, compact_review, compact_reviews, compose,
                       instruction_file_changes)
@@ -21,11 +22,13 @@ from .contracts import (DETAIL, PLAN, REPLAN, REVIEW, WORK, RepairableFormatErro
                         validate_commander_format_correction, validate_immutable_findings)
 from .memory import Memory, validate_proposals
 from .environment import EnvironmentRecovery
+from .decisions import DecisionRecovery, read_decision
+from .progress import ProgressRecovery
 from .recovery import InvalidOutputRecovery, read_bound_result, snapshot_digest
 from .shared import HookError, Hooks, asset_digest, read_skill, skills_catalog, validate_mcp
 from .util import (HarnessError, ProcessTimeout, append_event, confirm_dispatches_exited,
                    dump, ensure_dispatches_exited, group_alive, lock,
-                   read_json, run_process, tail, uid, write_json)
+                   read_json, run_process, tail, uid, validate_command_directories, write_json)
 
 
 class InvalidReviewRejection(HarnessError):
@@ -40,7 +43,7 @@ class InvalidReviewRejection(HarnessError):
                             "dispatch_id": receipt["dispatch_id"]}
 
 
-class Engine(EnvironmentRecovery, InvalidOutputRecovery):
+class Engine(EnvironmentRecovery, DecisionRecovery, ProgressRecovery, InvalidOutputRecovery):
     def __init__(self, config, repo, state=None, backend=None, commander="astra"):
         self.config = config
         self.repo = git.repository(Path(repo))
@@ -118,6 +121,9 @@ class Engine(EnvironmentRecovery, InvalidOutputRecovery):
                    "final_history": self.run["final_history"], "plan_revision": len(self.run["plan_history"]),
                    "environment_updates": deepcopy(self.run.get("environment_updates", [])),
                    "environment_checks": deepcopy(self.run.get("environment_checks", [])),
+                   "decision_requests": deepcopy(self.run.get("decision_requests", [])),
+                   "operator_decisions": deepcopy(self.run.get("operator_decisions", [])),
+                   "task_checkpoints": deepcopy(self.run.get("task_checkpoints", [])),
                    "next": "Resume the harness run; every dispatch creates a fresh agent process."}
         write_json(self.directory / "handoff.json", handoff)
         (self.directory / "handoff.md").write_text("# Run handoff\n\n```json\n" + dump(handoff) + "\n```\n", encoding="utf-8")
@@ -161,7 +167,7 @@ class Engine(EnvironmentRecovery, InvalidOutputRecovery):
                                                           if item["status"] != "running"]),
                        "instruction": FINAL_REVIEW_INSTRUCTION},
         }
-        required["packet"] = self.environment_packet(required["packet"])
+        required["packet"] = self.runtime_packet(required["packet"], role="reviewer", kind="final_review", task_id="final")
         projected = deepcopy(required)
         packet = projected["packet"]
         runtime = self.config.data["runtime"]
@@ -224,11 +230,13 @@ class Engine(EnvironmentRecovery, InvalidOutputRecovery):
         self.save()
 
     def ensure_exited(self):
+        validate_command_directories(self.run["dispatches"], self.directory)
         for entry in ensure_dispatches_exited(self.run["dispatches"], observe=group_alive):
             entry["exit_confirmed"] = True
 
     def confirm_exited(self, identifiers):
         """Record an operator's explicit assertion; never signal an unowned group."""
+        validate_command_directories(self.run["dispatches"], self.directory)
         confirm_dispatches_exited(self.run["dispatches"], identifiers,
                                   audit=self.event, save=self.save, observe=group_alive)
 
@@ -250,7 +258,70 @@ class Engine(EnvironmentRecovery, InvalidOutputRecovery):
         return {"readonly_commands": self.config.readonly_commands(),
                 "worker_commands": self.config.data["permissions"]["worker_commands"],
                 "verification_commands": self.config.data["verification"]["commands"],
-                "permission_guidance": "Use readonly command argv as shown, appending paths after --. A denied Bash form does not prove a path is unreadable or writable; use available Read/Glob/Grep. Distinguish command denial, missing path, tool failure and missing operation authority. Command declarations do not grant external write scope."}
+                "command_execution": {"worker_only": True, "tool": "mcp__harness_commands__run_command",
+                                      "list_tool": "mcp__harness_commands__list_commands",
+                                      "worker_command_ids": [command_id(c) for c in self.config.data["permissions"]["worker_commands"]],
+                                      "verification_command_ids": [command_id(c) for c in self.config.data["verification"]["commands"]]},
+                "file_tools": ["mcp__harness__json_check", "mcp__harness__file_sha256", "mcp__harness__file_diff"],
+                "permission_guidance": "Workers: use aligned command IDs, with no argument overrides. Each call executes anew and saves stdout/stderr. Shell syntax requires its own authorized argv. Use file tools for JSON, hashes and differences. Append readonly Bash paths after --. A denied command does not prove a path unreadable; use Read/Glob/Grep. Command grants do not expand task scope."}
+
+    def runtime_packet(self, packet, *, role, kind, task_id):
+        if role != "worker" and "tool_constraints" in packet:
+            constraints = {k: v for k, v in packet["tool_constraints"].items() if k != "command_execution"}
+            constraints["permission_guidance"] = ("Command broker is worker-only. Use file tools for JSON, hashes and differences; "
+                "append readonly Bash paths after --. A denied command does not prove a path unreadable; use Read/Glob/Grep. "
+                "Command grants do not expand task scope.")
+            packet = {**packet, "tool_constraints": constraints}
+        packet = self.environment_packet(packet, role=role, kind=kind, task_id=task_id)
+        packet = self.decision_packet(packet, role=role, kind=kind, task_id=task_id)
+        return self.progress_packet(packet, role=role, kind=kind, task_id=task_id)
+
+    def validate_handoff_requests(self, task_id, result):
+        tasks = {t["id"]: t for t in self.run["tasks"]}
+        for request in result.get("decision_requests", []):
+            target = request["task_id"]
+            if target not in tasks or target in self.run["accepted"] or target == task_id:
+                raise HarnessError("后续决策必须指向尚未接受且依赖当前任务的任务")
+            seen, pending = set(), list(tasks[target]["depends_on"])
+            while pending:
+                ident = pending.pop()
+                if ident not in seen:
+                    seen.add(ident)
+                    pending.extend(tasks[ident]["depends_on"])
+            if task_id not in seen:
+                raise HarnessError("后续决策目标必须依赖当前任务；不能阻断无关任务")
+
+    def synchronize_decision_requests(self):
+        """Reconstruct request registration across result/acceptance save windows."""
+        feedback = self.run.get("feedback") or {}
+        worker = feedback.get("worker", {})
+        if worker.get("status") == "blocked" and worker.get("blocker_kind") == "operator":
+            source = {"artifact": feedback["worker_artifact"], "artifact_digest": feedback["worker_artifact_digest"],
+                      "dispatch_id": Path(feedback["worker_artifact"]).parent.name}
+            self.register_decision_request(feedback["task_id"], feedback["task_id"], "worker", source,
+                                           "\n".join(worker["blockers"]))
+        stopped = self.run.get("replan_stopped")
+        if stopped and stopped.get("dispatch_id") and stopped["reason"].strip() and len(stopped["reason"]) <= 4000:
+            artifact = self.directory / "dispatches" / stopped["dispatch_id"] / "returned-result.json"
+            source = {"artifact": str(artifact), "artifact_digest": stopped["source_digest"],
+                      "dispatch_id": stopped["dispatch_id"]}
+            self.register_decision_request(stopped["target"], "replanning", "replan_stop", source, stopped["reason"])
+        if not self.run.get("pending_post_accept"):
+            for tid, accepted in self.run["accepted"].items():
+                for request in accepted.get("decision_requests", []):
+                    if request["task_id"] not in self.run["accepted"]:
+                        self.register_decision_request(request["task_id"], tid, "handoff", accepted["worker_source"],
+                                                       request["question"], request["id"])
+
+    def task_decision_gate(self, task_id):
+        return next((r for r in self.decision_context() if r["task_id"] == task_id
+                     and r["kind"] in ("worker", "handoff")
+                     and (r["response"] is None or r["response"]["decision"] == "stop")), None)
+
+    @staticmethod
+    def decision_required(request):
+        return HarnessError(f"等待操作者决定：task_id={request['task_id']} request_id={request['id']}；"
+                            "使用 resume --operator-decision FILE 提供决定，不改变验收或工具权限")
 
     def finish_post_accept(self):
         pending = self.run.get("pending_post_accept")
@@ -286,6 +357,7 @@ class Engine(EnvironmentRecovery, InvalidOutputRecovery):
         self.emit_hook("post_accept", payload, Path(pending["logs"]) / f"post_accept-{pending['hook_attempts']}")
         self.run.pop("pending_post_accept")
         self.save()
+        self.synchronize_decision_requests()
         return True
 
     def acceptance_event_once(self, event, event_id, **fields):
@@ -308,7 +380,7 @@ class Engine(EnvironmentRecovery, InvalidOutputRecovery):
     def dispatch(self, role, kind, task_id, schema, packet, task=None):
         # A format correction is a new process, never a provider-session resume.
         key = f"{role}:{kind}:{task_id}"
-        packet = self.environment_packet(packet)
+        packet = self.runtime_packet(packet, role=role, kind=kind, task_id=task_id)
         packet = self.invalid_repair_packet(key, packet)
         previous_review = None
         pending = self.run.setdefault("pending_format_corrections", {})
@@ -397,6 +469,8 @@ class Engine(EnvironmentRecovery, InvalidOutputRecovery):
                         self.run["pending_replan"] = {"stage": "pending",
                             "trigger": deepcopy(self.run["feedback"])}
                     self.save()
+                    if returned["blocker_kind"] == "operator":
+                        self.synchronize_decision_requests()
                     raise HarnessError(f"worker 已报告 {returned['blocker_kind']} blocker；保留格式错误证据，不自动重派") from error
                 if role == "commander" and kind == "replan" and returned["action"] == "stop":
                     request = self.run["pending_replan"]
@@ -637,7 +711,7 @@ class Engine(EnvironmentRecovery, InvalidOutputRecovery):
             # Includes automatic format corrections and retries after local
             # preparation failure, before either invocation budget is consumed.
             self.check_environment(task_id)
-            packet = self.environment_packet(packet)
+            packet = self.runtime_packet(packet, role=role, kind=kind, task_id=task_id)
         dispatch_id = str(uuid.uuid4())
         job = self.directory / "dispatches" / dispatch_id
         job.mkdir(parents=True)
@@ -663,6 +737,9 @@ class Engine(EnvironmentRecovery, InvalidOutputRecovery):
         self.run["dispatches"].append({"id": dispatch_id, "role": role, "kind": kind, "task_id": task_id,
                                        "status": "running", "pgid": None, "process_state": "prepared", "invoked": False})
         entry = self.run["dispatches"][-1]
+        if role == "worker":
+            (job / "commands").mkdir()
+            entry["command_directory"] = str(job / "commands")
         self.save()
         self.event("dispatch_started", task_id=task_id, dispatch_id=dispatch_id, role=role)
         def on_start(pgid):
@@ -720,6 +797,7 @@ class Engine(EnvironmentRecovery, InvalidOutputRecovery):
                                    else dispatch_id)}
             entry["process_state"] = "starting"
             entry["invoked"] = True
+            entry["invoked_at"] = time.time()
             self.save()
             invoked = True
             result = self.backend.invoke(role=role, model=self.config.role(role, self.commander), cwd=self.worktree,
@@ -830,7 +908,7 @@ class Engine(EnvironmentRecovery, InvalidOutputRecovery):
                   + git.describe_paths(untracked), file=sys.stderr, flush=True)
         ident = uid("run")
         worktree = self.state / "worktrees" / ident
-        self.run = {"schema_version": 9, "id": ident, "repo": str(self.repo), "goal": goal, "status": "planning", "commander": self.commander,
+        self.run = {"schema_version": 11, "id": ident, "repo": str(self.repo), "goal": goal, "status": "planning", "commander": self.commander,
                     "branch": "harness/" + ident, "worktree": str(worktree), "tasks": [], "accepted": {}, "attempts": {},
                     "dispatches": [], "expected_head": git.head(self.repo), "feedback": None,
                     "config_path": str(self.config.path), "config_snapshot": deepcopy(self.config.data),
@@ -840,6 +918,7 @@ class Engine(EnvironmentRecovery, InvalidOutputRecovery):
                     "review_corrections": {}, "review_receipts": {}, "commander_receipts": {},
                     "invalid_repairs": {}, "approved_scope": [],
                     "environment_updates": [], "environment_checks": [],
+                    "decision_requests": [], "operator_decisions": [], "task_checkpoints": [],
                     "worktree_binding": {}, "ignored_baseline": [],
                     "pending_format_corrections": {}, "agent_dispatches": 0,
                     "plan_approval_required": pause_after_plan, "plan_approved": not pause_after_plan}
@@ -865,7 +944,7 @@ class Engine(EnvironmentRecovery, InvalidOutputRecovery):
         self.run = read_json(self.state / "runs" / ident / "state.json")
         if not isinstance(self.run, dict):
             raise HarnessError("运行台账必须为对象")
-        if self.run.get("schema_version") not in (8, 9):
+        if self.run.get("schema_version") not in (8, 9, 10, 11):
             raise HarnessError("旧 run 状态格式无法安全恢复；请保留证据并使用原版本完成，或开始新 run")
         required = {"id": str, "repo": str, "worktree": str, "status": str, "commander": str,
                     "goal": str, "branch": str, "expected_head": str, "base_commit": str,
@@ -878,15 +957,20 @@ class Engine(EnvironmentRecovery, InvalidOutputRecovery):
                     "final_history": list, "plan_history": list, "format_repairs": dict,
                     "total_attempts": int, "agent_dispatches": int, "final_attempts": int,
                     "replan_attempts": int, "plan_approval_required": bool, "plan_approved": bool}
-        if self.run["schema_version"] == 9:
+        if self.run["schema_version"] >= 9:
             required.update(environment_updates=list, environment_checks=list)
+        if self.run["schema_version"] >= 10:
+            required.update(decision_requests=list, operator_decisions=list, task_checkpoints=list)
         if (self.run.get("id") != ident or any(type(self.run.get(k)) is not t for k, t in required.items())
                 or any(not isinstance(d, dict) for d in self.run["dispatches"])):
             raise HarnessError("运行台账字段缺失或类型无效；保留原文件并核对证据")
         if self.run["repo"] != str(self.repo):
             raise HarnessError("Run 属于另一个项目")
+        validate_command_directories(self.run["dispatches"], self.directory)
         self.validate_recovery_links()
         self.validate_environment_links()
+        self.validate_decision_links()
+        self.validate_checkpoint_links()
 
     def validate_recovery_links(self):
         """Reject inconsistent recovery links before any resumed side effects.
@@ -1030,7 +1114,7 @@ class Engine(EnvironmentRecovery, InvalidOutputRecovery):
             return self.run
 
     def resume(self, ident, *, step=False, approve_plan=False, reverify=False, retry_stopped=None, confirm_exited=(),
-               repair_invalid=None, allow_scope=(), environment_update=None):
+               repair_invalid=None, allow_scope=(), environment_update=None, operator_decision=None):
         self.load_run(ident)
         with lock(self.directory / "run.lock"):
             self.load_run(ident)
@@ -1038,9 +1122,12 @@ class Engine(EnvironmentRecovery, InvalidOutputRecovery):
                 raise HarnessError("该 run 已放弃；保留分支、工作树与证据，不能继续派发")
             self.commander = self.run["commander"]
             if self.run["status"] == "completed":
-                if confirm_exited or repair_invalid is not None or allow_scope or environment_update is not None:
-                    raise HarnessError("--confirm-exited、--repair-invalid、--allow-scope 与 --environment-update 仅用于未完成的 run")
+                if confirm_exited or repair_invalid is not None or allow_scope or environment_update is not None or operator_decision is not None:
+                    raise HarnessError("--confirm-exited、--repair-invalid、--allow-scope、--environment-update 与 --operator-decision 仅用于未完成的 run")
                 return self.run
+            if operator_decision is not None and (environment_update is not None or reverify or retry_stopped is not None
+                                                   or repair_invalid is not None or allow_scope):
+                raise HarnessError("--operator-decision 不能与环境更新、重验、重试停止、修正或扩展范围合用")
             if environment_update is not None and (reverify or retry_stopped is not None or repair_invalid is not None or allow_scope):
                 raise HarnessError("--environment-update 不能与 --reverify、--retry-stopped、--repair-invalid 或 --allow-scope 合用")
             if repair_invalid is not None and (reverify or retry_stopped is not None or allow_scope):
@@ -1057,14 +1144,41 @@ class Engine(EnvironmentRecovery, InvalidOutputRecovery):
             if git.head(self.worktree, binding=self.run["worktree_binding"]) != self.run["expected_head"]:
                 raise HarnessError("worktree HEAD 与检查点不同；请先核对提交，不自动重放")
             update = self.prepare_environment_update(environment_update) if environment_update is not None else None
+            decision_value = read_decision(operator_decision) if operator_decision is not None else None
+            decision = self._prepare_decision(decision_value) if decision_value is not None else None
             if retry_stopped is not None:
                 stopped = self.run.get("replan_stopped")
                 if not stopped or stopped["target"] != retry_stopped:
                     raise HarnessError("--retry-stopped 必须匹配已停止的任务 ID，或 final")
+                if any(r["kind"] == "replan_stop" and r["source"]["dispatch_id"] == stopped.get("dispatch_id")
+                       and r["response"] and r["response"]["decision"] == "stop" for r in self.decision_context()):
+                    raise HarnessError("操作者已决定停止；请使用 --operator-decision 显式更新该决定")
             if allow_scope:
                 self.approve_scope_extensions(allow_scope)
             if repair_invalid is not None:
                 self.prepare_invalid_repair(repair_invalid)
+            if self.run["schema_version"] < 11:
+                previous_version = self.run["schema_version"]
+                for field in ("decision_requests", "operator_decisions", "task_checkpoints", "environment_updates", "environment_checks"):
+                    self.run.setdefault(field, [])
+                self.run["schema_version"] = 11
+                self.event("run_schema_upgraded", previous_version=previous_version, schema_version=11)
+                self.save()
+            self.record_operator_decision(decision)
+            if operator_decision is not None:
+                value = decision_value
+                if value["decision"] == "stop":
+                    error = HarnessError("操作者决定停止；决定与原证据已保存，未派发模型")
+                    self.stop(error)
+                    raise error
+                request = next(r for r in self.decision_context() if r["id"] == value["request_id"])
+                if request["kind"] == "replan_stop" and self.run.get("replan_stopped"):
+                    if self.run["replan_stopped"].get("dispatch_id") != request["source"]["dispatch_id"]:
+                        raise HarnessError("操作者决定不能重开另一次指挥停止；请回答当前请求")
+                    stopped = self.run.pop("replan_stopped")
+                    self.run["pending_replan"] = {"stage": "request", "trigger": deepcopy(stopped["trigger"])}
+                    self.save()
+                    self.event("stopped_replan_decision_applied", request_id=request["id"], artifact=stopped["artifact"])
             if retry_stopped is not None:
                 stopped = self.run.get("replan_stopped")
                 # Reopen the saved planning request, not another attempt by the
@@ -1312,10 +1426,15 @@ class Engine(EnvironmentRecovery, InvalidOutputRecovery):
         self.run["replan_stopped"] = {"target": trigger.get("task_id") or "final",
             "trigger": deepcopy(trigger), "attempt": attempt, "artifact": str(artifact),
             "reason": result["reason"], **diagnostics}
+        receipt = self.run["commander_receipts"].get("commander:replan:replanning")
+        if receipt:
+            self.run["replan_stopped"].update(dispatch_id=receipt["dispatch_id"],
+                                              source_digest=hashlib.sha256(Path(receipt["artifact"]).read_bytes()).hexdigest())
         self.run.pop("pending_replan", None)
         self.run["commander_receipts"].pop("commander:replan:replanning", None)
         self.run["pending_format_corrections"].pop("commander:replan:replanning", None)
         self.save()
+        self.synchronize_decision_requests()
 
     def apply_pending_revision(self):
         pending = self.run["pending_replan"]
@@ -1415,10 +1534,16 @@ class Engine(EnvironmentRecovery, InvalidOutputRecovery):
             raise HarnessError("worker 返回产物与当前任务结果不一致；保留现场")
         worker_source = {"worker_artifact": str(worker_artifact),
                          "worker_artifact_digest": hashlib.sha256(raw_worker).hexdigest()}
+        self.validate_handoff_requests(tid, result)
+        self.record_checkpoints(tid, worker_dispatch["id"], result,
+                                {"artifact": str(worker_artifact), "artifact_digest": worker_source["worker_artifact_digest"]})
         self.record_ignored_paths("worker", worker_artifact.parent)
         if result["status"] == "blocked":
             self.run["feedback"] = {"task_id": tid, "worker": result, "attempt": attempt, **worker_source}
             self.save()
+            if result["blocker_kind"] == "operator":
+                self.synchronize_decision_requests()
+                raise self.decision_required(self.task_decision_gate(tid))
             if result["blocker_kind"] != "task":
                 raise HarnessError(f"worker 环境受阻：{result['blockers']} {result['summary']}。"
                                    "若必要命令被拒绝，可在 permissions.worker_commands 追加精确 argv 后 resume；"
@@ -1560,6 +1685,7 @@ class Engine(EnvironmentRecovery, InvalidOutputRecovery):
                   "prior_reviews": prior_reviews,
                   "recovery": deepcopy(self.run.get("worker_recovery", {}).get(tid)),
                   "proposed_memories": proposals,
+                  "decision_requests": deepcopy(pending["worker_result"].get("decision_requests", [])),
                   "tool_constraints": self.tool_constraints(),
                   "instruction": "Independently inspect the actual diff, relevant code and acceptance. Prior findings are evidence to recheck, not a complete checklist. Separate blocking defects from advisory preferences. Approve only with no unresolved blocking findings; approve memory keys only when their claims and cited sources are independently supported. Your summary becomes the accepted task record: describe only independently verified outcomes and limits. An empty diff can pass only when current evidence already satisfies the task. Do not edit files."}, task=task)
         review_artifact = evidence.parent / "review.json"
@@ -1587,6 +1713,11 @@ class Engine(EnvironmentRecovery, InvalidOutputRecovery):
             "review": review, "review_artifact": str(review_artifact), "snapshot_digest": reviewed_digest,
             "snapshot_artifact": str(snapshot_artifact), "verification": str(evidence.parent / "results.json"),
             "proposals": proposals, "approved_keys": approved_keys}
+        if pending.get("worker_artifact"):
+            self.run["pending_acceptance"].update(
+                worker_source={"artifact": pending["worker_artifact"], "artifact_digest": pending["worker_artifact_digest"],
+                               "dispatch_id": Path(pending["worker_artifact"]).parent.name},
+                decision_requests=deepcopy(pending["worker_result"].get("decision_requests", [])))
         self.save()
         return self.accept_pending()
 
@@ -1622,6 +1753,9 @@ class Engine(EnvironmentRecovery, InvalidOutputRecovery):
         accepted = {"commit": commit, "summary": pending["review"]["summary"], "summary_source": "reviewer",
                     "files": paths, "verification": pending["verification"], "review": pending["review"],
                     "review_artifact": pending["review_artifact"]}
+        if pending.get("worker_source"):
+            accepted.update(worker_source=deepcopy(pending["worker_source"]),
+                            decision_requests=deepcopy(pending.get("decision_requests", [])))
         self.run["expected_head"] = commit
         self.run["accepted"][tid] = accepted
         self.run["feedback"] = None
@@ -1795,6 +1929,7 @@ class Engine(EnvironmentRecovery, InvalidOutputRecovery):
 
     def execute(self, supplied_plan=None, *, step=False):
         try:
+            self.synchronize_decision_requests()
             stopped = self.run.get("replan_stopped")
             if stopped:
                 raise HarnessError(f"指挥停止重新规划：{stopped['reason']}；"
@@ -1859,6 +1994,10 @@ class Engine(EnvironmentRecovery, InvalidOutputRecovery):
                         ready = [t for t in ready if t["id"] == self.run["current_task"]]
                     if not ready:
                         raise HarnessError("没有可执行任务")
+                    runnable = [t for t in ready if self.task_decision_gate(t["id"]) is None]
+                    if not runnable:
+                        raise self.decision_required(self.task_decision_gate(ready[0]["id"]))
+                    ready = runnable
                     if self.task_attempt(ready):
                         accepted_this_call += 1
                 elif self.final_review(reverify=getattr(self, "reverify_requested", False)):

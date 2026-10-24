@@ -72,7 +72,7 @@ def validate_mcp(config, roles=("commander", "worker", "reviewer")):
 
     selected = {}
     for name, spec in servers.items():
-        if not re.fullmatch(r"[a-zA-Z0-9_-]+", name) or name == "harness":
+        if not re.fullmatch(r"[a-zA-Z0-9_-]+", name) or name in ("harness", "harness_commands"):
             raise HarnessError(f"无效或保留 MCP 名称：{name}")
         field = f"MCP servers.{name}"
         if not isinstance(spec, dict):

@@ -68,13 +68,17 @@ class ConfigChangesTests(unittest.TestCase):
                 self.load()
 
     def test_worker_permissions_require_exact_command_arrays(self):
-        for commands in ("npm test", ["npm test"], [[]], [[""]], [["npm", 7]],
-                         [["npm", "*"]], [["echo", "a\nb"]], [["echo", "a\rb"]]):
+        for commands in ("npm test", ["npm test"], [[]], [[""]], [["npm", 7]], [["echo", "bad\0arg"]]):
             self.data["permissions"]["worker_commands"] = commands
             with self.subTest(commands=commands), self.assertRaises(HarnessError):
                 self.load()
         self.data["permissions"]["worker_commands"] = [["npm", "run", "build"]]
         self.assertEqual(self.load().data["permissions"]["worker_commands"], [["npm", "run", "build"]])
+
+    def test_worker_commands_preserve_literal_star_and_line_breaks(self):
+        commands = [["echo", "*", "a\nb", "a\rb"]]
+        self.data["permissions"]["worker_commands"] = commands
+        self.assertEqual(self.load().data["permissions"]["worker_commands"], commands)
 
     def test_resume_returns_only_increases_and_preserves_saved_configuration(self):
         config = self.load()

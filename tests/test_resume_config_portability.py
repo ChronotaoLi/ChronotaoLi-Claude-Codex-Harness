@@ -57,15 +57,21 @@ class ResumeConfigurationTests(unittest.TestCase):
         self.config.data["permissions"]["worker_commands"] = [first, second]
         self.assertEqual(self.config.resume_changes(current), {})
 
-    def test_command_removals_argument_changes_and_wildcards_remain_rejected(self):
+    def test_command_removals_and_argument_changes_remain_rejected(self):
         original = ["rm", "--", "generated.txt"]
         self.config.data["permissions"]["worker_commands"] = [original]
         saved = copy.deepcopy(self.config.data)
-        for commands in ([], [["rm", "--", "different.txt"]], [["rm", "generated.txt"]],
-                         [original, ["rm", "*"]], [original, ["echo", "line\nbreak"]]):
+        for commands in ([], [["rm", "--", "different.txt"]], [["rm", "generated.txt"]]):
             self.config.data["permissions"]["worker_commands"] = commands
             with self.subTest(commands=commands), self.assertRaises(HarnessError):
                 self.config.resume_changes(saved)
+
+    def test_resume_allows_appending_literal_star_and_newline_commands(self):
+        saved = copy.deepcopy(self.config.data)
+        commands = [["echo", "*"], ["echo", "line\nbreak"]]
+        self.config.data["permissions"]["worker_commands"] = commands
+        changes = self.config.resume_changes(saved)
+        self.assertEqual(changes["worker_commands"]["added"], commands)
 
 
 class AssetPortabilityTests(unittest.TestCase):

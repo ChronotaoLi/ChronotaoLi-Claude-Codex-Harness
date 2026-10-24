@@ -4,6 +4,7 @@ import json
 import sys
 from pathlib import Path
 
+from .file_tools import file_diff, file_sha256, json_check
 from .memory import Memory
 from .shared import read_skill, skills_catalog
 from .util import HarnessError, read_json
@@ -18,6 +19,14 @@ TOOLS = [
      "inputSchema": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}},
     {"name": "run_status", "description": "Read the current run goal, task status and accepted commits.", "inputSchema": {"type": "object", "properties": {}}},
 ]
+TOOLS.extend([
+    {"name": "file_sha256", "description": "Read a regular file and return its SHA256 and byte count (maximum 1 GiB). Relative paths use the run worktree; absolute paths, including external files, and resolved symlinks are allowed. No commands or writes.",
+     "inputSchema": {"type": "object", "properties": {"path": {"type": "string", "minLength": 1, "maxLength": 4096}}, "required": ["path"], "additionalProperties": False}},
+    {"name": "json_check", "description": "Check a UTF-8 JSON regular file up to 8 MiB, including untracked or external files. Reject duplicate keys and non-finite numbers. Returns valid, root_type, value_count, source SHA256 and bytes; invalid JSON returns valid=false with an error and available line/column/offset (null if unavailable). Does not modify files or run commands. Relative paths use the run worktree.",
+     "inputSchema": {"type": "object", "properties": {"path": {"type": "string", "minLength": 1, "maxLength": 4096}}, "required": ["path"], "additionalProperties": False}},
+    {"name": "file_diff", "description": "Compare two regular files up to 8 MiB each using Python, without Git, filters, subprocesses or writes. Relative paths use the run worktree; absolute external paths are allowed. Returns byte difference, both SHA256 digests, binary flag, and UTF-8 unified diff limited to 24000 characters with truncated flag. Binary files return digests and difference without text diff.",
+     "inputSchema": {"type": "object", "properties": {"left": {"type": "string", "minLength": 1, "maxLength": 4096}, "right": {"type": "string", "minLength": 1, "maxLength": 4096}}, "required": ["left", "right"], "additionalProperties": False}},
+])
 for tool in TOOLS:
     tool["annotations"] = {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False}
 
@@ -42,7 +51,15 @@ def handle(request, memory, skills, run):
         raise MethodNotFound(f"Unknown method: {method}")
     try:
         name, args = params["name"], params.get("arguments", {})
-        if name == "memory_search":
+        if name in ("file_sha256", "json_check", "file_diff"):
+            required = {"left", "right"} if name == "file_diff" else {"path"}
+            if not isinstance(args, dict) or set(args) != required:
+                raise HarnessError(f"{name} requires exactly: {', '.join(sorted(required))}")
+            state = read_json(run) if run else {}
+            base = Path(state["worktree"]) if state.get("worktree") else Path.cwd()
+            value = {"file_sha256": file_sha256, "json_check": json_check,
+                     "file_diff": file_diff}[name](**args, base=base)
+        elif name == "memory_search":
             value = memory.search(args["query"], level=args.get("level", 1)) if memory.path.exists() else []
         elif name == "memory_read":
             if not memory.path.exists():

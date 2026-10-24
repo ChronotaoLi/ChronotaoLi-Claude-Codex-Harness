@@ -45,6 +45,32 @@ class MCPReadOnlyTests(unittest.TestCase):
         self.assertFalse(responses[3]["result"]["isError"])
         self.assertFalse(self.state.exists())
 
+    def test_file_tools_protocol_preserves_files_and_missing_state(self):
+        source = Path(self.temp.name) / "untracked.json"
+        source.write_bytes(b'{"value": 1, "value": 2}')
+        before = source.read_bytes()
+        responses = self.call([
+            {"jsonrpc": "2.0", "id": 0, "method": "tools/list"},
+            self.request(1, "file_sha256", {"path": str(source)}),
+            self.request(2, "json_check", {"path": str(source)}),
+            self.request(3, "file_diff", {"left": str(source), "right": str(source)}),
+            self.request(4, "json_check", {"path": str(source), "write": True}),
+            self.request(5, "file_sha256", {"path": str(source.parent / "missing")}),
+        ])
+        tools = {tool["name"]: tool for tool in responses[0]["result"]["tools"]}
+        for name in ("file_sha256", "json_check", "file_diff"):
+            self.assertTrue(tools[name]["annotations"]["readOnlyHint"])
+            self.assertFalse(tools[name]["inputSchema"]["additionalProperties"])
+        self.assertFalse(responses[1]["result"]["isError"])
+        invalid = responses[2]["result"]
+        self.assertFalse(invalid["isError"])
+        self.assertFalse(json.loads(invalid["content"][0]["text"])["valid"])
+        self.assertFalse(json.loads(responses[3]["result"]["content"][0]["text"])["different"])
+        self.assertTrue(responses[4]["result"]["isError"])
+        self.assertTrue(responses[5]["result"]["isError"])
+        self.assertEqual(source.read_bytes(), before)
+        self.assertFalse(self.state.exists())
+
     def test_legacy_database_protocol_reads_do_not_migrate_or_create_init_lock(self):
         self.state.mkdir()
         with contextlib.closing(sqlite3.connect(self.database)) as db, db:

@@ -55,6 +55,14 @@ python3 -m harness.permission_smoke --config /path/to/harness.toml --repo /path/
 
 它在 `.harness/permission-smoke/` 创建专用测试仓库与工作树，保留报告和供应商原始输出；`--repo` 仅指定私有现场的存放位置。检查包含工作树内读写、精确命令、额外参数、工作树外读写及 `.git` 修改。通过标准要求实际工具调用、工具结果、对应的 `permission_denials` 和文件内容一致，模型自称“已拒绝”不算证据。工作树外读取按当前适配器授权应当成功。检查使用专用命令并关闭外部 MCP，不运行项目验证命令；默认超时 180 秒、最多 16 轮、预算参数为 1 美元，可用 `--timeout`、`--max-turns`、`--max-budget-usd` 调整。结果只覆盖这组测试与实际 CLI 版本，不证明完整的命令白名单或操作系统隔离。
 
+还可单独检查真实 worker 的只读文件工具与精确命令 broker：
+
+```bash
+python3 -m harness.tool_smoke --config /path/to/harness.toml --repo /path/to/project
+```
+
+此检查调用配置中的真实 Claude worker 模型并消耗账号额度，保留工具调用及命令证据供核对。离线模拟或协议测试不能证明真实模型工具调用通过；此处不声明该联调已经执行或通过。
+
 ## 对自己的项目执行任务
 
 1. 为目标项目准备配置文件，设置真正需要的 `verification.commands`，并在运行时显式传入 `--config`。每条命令是 argv 数组，不经 shell 解释。例如 Python 项目可以使用 `["uv", "run", "pytest"]`，Node 项目可以使用 `["npm", "test", "--", "--run"]`。依赖需要在 worktree 中可用；覆盖率、构建等生成产物应配置到已忽略或工作树之外的位置，验证期间出现未忽略的新文件也会触发快照门禁。
@@ -109,9 +117,9 @@ python3 -m harness --repo /path/to/project cleanup-verification run_实际ID
 python3 -m harness --repo /path/to/project cleanup-verification run_实际ID --remove
 ```
 
-默认只返回各检出的可清理状态；`--remove` 在运行锁内确认旧进程退出、路径归属、Git 绑定及原验证提交后逐项移除，保留运行台账、diff、日志和 `checkout.json`，另写清理记录。已跟踪修改、未跟踪或忽略文件均阻止清理，需要先人工核对。目录已缺失时，仅在原绑定仍可核验的情况下注销该精确路径，不执行全仓库 prune。该命令兼容版本 7、8、9 的台账，不加载配置或调用模型。
+默认只返回各检出的可清理状态；`--remove` 在运行锁内确认旧进程退出、路径归属、Git 绑定及原验证提交后逐项移除，保留运行台账、diff、日志和 `checkout.json`，另写清理记录。已跟踪修改、未跟踪或忽略文件均阻止清理，需要先人工核对。目录已缺失时，仅在原绑定仍可核验的情况下注销该精确路径，不执行全仓库 prune。该命令兼容版本 7、8、9、10、11 的台账，不加载配置或调用模型。
 
-旧 dispatch 没有可确认的退出记录时，清理与恢复均停止；缺少 pgid 不能证明进程未启动。核实退出后可执行 `cleanup-verification RUN --confirm-exited DISPATCH_ID`，可重复指定 ID，也可与 `--remove` 合用。此确认入口支持已完成或已放弃的 run，先保存审计事件，再更新指定 dispatch 的确认，不改变 run 状态或放松文件清理门禁。未指定确认时，预览不改运行台账。
+所有恢复和清理入口都核对父 dispatch 及 broker 命令子进程；父进程退出不能证明子进程已退出。旧 dispatch 没有可确认的退出记录时，清理与恢复均停止；缺少 pgid 不能证明进程未启动。核实退出后可执行 `cleanup-verification RUN --confirm-exited DISPATCH_ID`，可重复指定 ID，也可与 `--remove` 合用。此确认入口支持已完成或已放弃的 run，先保存审计事件，再更新指定 dispatch 的确认，不改变 run 状态或放松文件清理门禁。未指定确认时，预览不改运行台账。
 
 运行开始、worker 返回及验证结束还保存被忽略路径的清单和相对初始状态的增减，变化写入事件；审阅输入带清单产物引用。目录折叠显示，此诊断不哈希忽略文件内容，也不能发现既有依赖目录内部的修改，不能替代全新检出验证。
 
@@ -130,7 +138,7 @@ python3 -m harness --config /path/to/harness.toml --repo /path/to/project resume
 
 `resume` 使用已有台账、代码现场和新的 agent 继续，不恢复供应商会话。任务、总 worker、模型派发、有效再规划和最终验收次数均不会因恢复而清零。可以调大 `context_chars`、两种超时、`claude_max_turns`、`max_attempts`、`max_total_attempts`、`max_agent_dispatches`、`max_replans`、`max_final_attempts` 和 `max_tasks` 后恢复；也可以在 `permissions.worker_commands` 中追加精确 argv，但不能删除或修改已有授权。变更写入事件，其余配置和共享资源必须一致。旧进程组仍存活、无法确认其退出，或 Git HEAD 与检查点不一致时停止恢复。账号授权、模型权限和其他 CLI 故障直接报错，不自动换模型或进行通用瞬时故障重试。
 
-如果已人工核实旧 dispatch 退出，但记录的进程组 ID 被无关进程复用，可使用 `resume <run_id> --confirm-exited <dispatch_id>`；`abandon` 支持相同选项，多个 ID 可重复指定。该确认只影响精确指定的 dispatch，记录当时的进程组存活探测和组长进程信息，不终止无关进程，也不跳过 HEAD、文件或接受门禁。未知 ID 在任何确认写入前拒绝。
+如果已人工核实旧 dispatch 退出，但记录的进程组 ID 被无关进程复用，可使用 `resume <run_id> --confirm-exited <dispatch_id>`；`abandon` 支持相同选项，多个 ID 可重复指定。该确认使用父 dispatch ID，审计其命令子进程 journal 摘要，并只影响精确指定的 dispatch；记录当时的进程组存活探测和组长进程信息，不终止无关进程，也不跳过 HEAD、文件或接受门禁。未知 ID 在任何确认写入前拒绝。
 
 worker 完成后保存验证阶段；验证通过后保存待审阅阶段及快照、diff、验证证据。恢复时快照一致，验证中断只重跑验证，审阅调用故障只新派发 reviewer，均不重复消耗 worker 额度。文件变化使旧阶段失效，必须重新执行任务。重跑验证保留独立日志。越界文件留在工作树时，恢复先停止并提示清理，不再派发 worker 或扣除尝试。
 
@@ -138,9 +146,9 @@ worker 完成后保存验证阶段；验证通过后保存待审阅阶段及快�
 
 整体验收也保存验证和审阅阶段；中断继续同一次最终尝试。最终验证全部失败项都是超时时，修复环境或增加超时后普通 `resume` 可重验；普通非零退出进入修正规划，操作者确认需要重验同一快照时使用 `resume <run_id> --reverify`。该授权仅对本次恢复的首次整体验收生效；即使首次处理的是新快照、未完成阶段或超时后的重验，也不会延续到本次恢复中后续产生的失败。重验消耗新的最终尝试，并保留失败证据；该选项仅在整体验收预算允许重验时取消尚未返回指挥结果的验证失败修正规划，不能丢弃已返回的指挥结果、跳过已校验修订或重抽模型拒绝结论。预算耗尽时，被拒绝的 `--reverify` 保留待再规划意图，增加预算后普通 `resume` 可继续修正规划，也可显式 `--reverify` 重验。
 
-新运行台账为版本 9，保存操作者环境更新及检查证据。版本 8 仍可普通恢复；首次接受环境更新时升级为 9，原预算与历史保留。版本 7 及更早台账可通过 `status` 查看，不能直接恢复执行；请用对应旧版本完成旧 run，或从核对后的代码开始新 run。列出状态时，损坏或缺失的台账会产生诊断，不会阻止查看其他运行。当前版本已完成的 run 在普通 `resume` 时直接返回保存结果，不再比较执行配置和共享资产与运行时保存值，也不派发或记账；CLI 初始化仍需能加载当前配置与 hooks。已完成 run 的 `resume` 拒绝 `--confirm-exited`、`--repair-invalid`、`--allow-scope` 和 `--environment-update`；`--reverify`、`--retry-stopped`、`--approve-plan` 和 `--step` 不生效，仍返回保存结果，不表示执行了所请求的恢复操作。
+新运行台账为版本 11，保存环境更新、可复用检查点、操作者决定和命令子进程证据。未完成的版本 8、9、10 在恢复预检通过后升级，原预算、证据和历史保留；共享资产摘要仍须匹配，更新本仓库规则不构成继续旧 run 的授权。版本 7 及更早台账可通过 `status` 查看，不能直接恢复执行。列出状态时，损坏或缺失的台账会产生诊断，不阻止查看其他运行。已完成 run 的普通 `resume` 直接返回保存结果，不比较执行配置或共享资产，不升级台账、不派发或记账；CLI 仍需能加载当前配置与 hooks。已完成 run 拒绝 `--confirm-exited`、`--repair-invalid`、`--allow-scope`、`--environment-update` 和 `--operator-decision`；`--reverify`、`--retry-stopped`、`--approve-plan`、`--step` 不生效。
 
-`status` 的 `worker_outcomes` 区分 worker 自报完成、任务阻断、环境阻断、运行故障及未知结果，不代表任务已接受。`last_environment_blocker` 保留最近环境阻断来源与更新诊断；后续调用开始后标记 stale，属于历史证据，不表示当前仍停在同一环境阻断或仍可提交更新。
+`status` 的 `worker_outcomes` 区分 worker 自报完成、任务阻断、环境阻断、操作者阻断、运行故障及未知结果，不代表任务已接受。`last_environment_blocker` 保留最近环境阻断来源与更新诊断；后续调用开始后标记 stale，属于历史证据，不表示当前仍停在同一环境阻断或仍可提交更新。
 
 任务因缺少前置工作而返回 `blocker_kind=task` 时，指挥可进行有限再规划；权限、工具、账号或服务问题使用 `environment` 并停止。指挥仅返回 `new_tasks` 和 `updates` 增量操作，运行时保留已有任务的 ID、验收条件、文件范围及依赖；更新只能改进未接受任务的描述并增加依赖，已接受任务完全不变。新任务必须复用既有范围模式或操作者显式批准的额外模式。已校验的修订先保存，再归档未接受修改并恢复到最后接受的提交；归档中断后的恢复继续应用该修订，不再请求模型或增加再规划次数。
 
@@ -167,9 +175,13 @@ python3 -m harness --config /path/to/harness.toml --repo /path/to/project resume
 
 更新仅在当前 worker 的环境 blocker 已保存、来源仍有效且没有待处理派发指令、receipt、验证／审阅／接受／再规划阶段或活动修正时接受。任务 ID 与 blocker dispatch ID 必须匹配当前来源。首次后续模型调用前中断，即使状态为 interrupted 或遗留 running，满足这些条件仍可提交更新；已开始的指挥调用即使失败，也使旧来源过期。已完成或已放弃的 run 拒绝更新；该选项与 `--reverify`、`--retry-stopped`、`--allow-scope`、`--repair-invalid` 互斥，可与 `--step` 合用。
 
-输入复制到 `.harness/` 私有产物并绑定摘要；原输入文件随后可移走。同一 blocker 来源、尚无后续模型调用时，重复提交相同更新不会重复登记。保存中断可能使审计事件以同一稳定更新 ID 重复出现，台账仍只登记一条引用。更新按顺序进入后续指挥、worker 和 reviewer 的必要上下文，包括整体审阅容量估计；各任务最新更新的最近检查报告经摘要核验后作为 `environment_observations` 一并提供。它是操作者对匹配任务环境事实的更新，可替代过时环境假设，不改变目标、文件范围、验收、工具权限或记忆所有权，也不是完成证据。更新登记后不可撤回，其序列化内容持续计入必要上下文；合法输入也可能超过默认预算，此时需增大 `context_chars` 后恢复。
+输入复制到 `.harness/` 私有产物并绑定 SHA256；原输入文件随后可移走。相同有效来源重复提交相同更新幂等。全部历史更新、来源和检查报告保持可检索，并在使用前核验摘要；缺失或篡改时停止。工作和任务审阅上下文只携带当前任务的最新摘要，指挥派发携带 ready 任务，再规划携带触发任务，整体审阅携带各任务最新摘要。历史声明、完整 checks 和重复 argv 改为路径与摘要引用；需要依赖被省略细节时先读取并核验引用产物。最新同任务更新可替代旧环境假设及检查列表，但不改变目标、文件范围、验收或工具权限；检查数量、结果及失败索引保留，未解决 blocker 和实际权限仍有效。整体容量预估使用相同投影，必要上下文仍超限时需增加 `context_chars`。
 
 同一任务最新更新的 checks 替代旧检查列表，所有历史声明仍按序保留。选择前只预检已有的当前任务，不检查全部 ready 任务；选中的任务在每次 worker 尝试（含格式修正）前重检，所有报告保留。因此当前任务的一次普通尝试可能记录选择前和派发前两份报告。检查失败不启动本次 worker，也不消耗其尝试或派发预算；当前任务为空时，指挥选择可能已消耗派发预算，选定指令会保存供恢复复用。worker 返回后的验证和审阅不重跑这些前置检查，仍按原门禁独立验收。所有新调用使用新进程、新 dispatch，累计预算不清零；既有 receipt 与批准不能借更新重抽或复用到新候选。
+
+worker 可提交带输入／证据 SHA256 和有效期的 `checkpoints`，供后续全新进程检索已完成的检查。运行时私有保存原始证据，依据声明输入及有效期给出 reusable/stale；它不保证推理正确，也不代替验证与独立审阅。当前任务需用户决定时用 `blocker_kind=operator` 停止；分析任务可在 completed 结果中为依赖它的后续任务提出 `decision_requests`，本任务仍经过正常接受门禁。分析结论与后续操作的 go/no-go 应分开验收。
+
+操作者从 `status RUN` 取得 request ID，使用 `resume RUN --operator-decision FILE` 回答。严格 JSON 格式为 `{"schema_version":1,"request_id":"request_id_from_status","task_id":"target_task","decision":"continue","summary":"对该问题的明确选择"}`；decision 也可为 stop。continue 只允许对应任务继续新尝试或原再规划，stop 保持等待；均不新增命令权限、扩大范围、降低验收或补造证据。该选项与 environment-update、retry-stopped、reverify、repair-invalid、allow-scope 互斥，可与 step、confirm-exited 合用。格式、来源有效期及完整恢复边界见 [恢复协议](docs/recovery.md#可复用检查点与操作者决定版本-10)。
 
 确需新增前置文件时，可在待再规划阶段显式扩展新任务可用的范围：
 
@@ -235,11 +247,18 @@ worker 尝试与模型派发在上下文、派发前 hook、快照及预算检�
 
 当前角色 skill 直接注入；其他技能先加载目录，再通过内置 MCP `skill_read` 按需读取。任务计划中的 `skills` 可显式选择需要注入的技能。这里没有自动安装整个 ECC 技能目录。
 
-内置 stdio MCP 在两种 CLI 中提供相同工具：
+内置只读 `harness` stdio MCP 在两种 CLI 中提供相同工具：
 
 - `memory_search` / `memory_read`：项目记忆与来源。
 - `skill_list` / `skill_read`：共用技能。
 - `run_status`：当前目标与已接受任务。
+- `file_sha256({path})`：流式 SHA256 与字节数，最多 1 GiB。
+- `json_check({path})`：检查最多 8 MiB 的 UTF-8 JSON，拒绝重复 key、NaN、Infinity 和溢出的非有限数；返回 `valid`、根类型、值数量和源摘要。非法 JSON 返回 `valid=false` 与可用的错误位置，不算通过。
+- `file_diff({left,right})`：纯 Python 比较，每个源最多 8 MiB，返回差异／二进制标志、两边摘要，以及最多 24,000 字符的文本 diff 和截断标志；不调用 Git、过滤器或子进程。
+
+文件工具只读普通文件，解析符号链接并检查读取期间的文件身份与变化；拒绝设备、FIFO 和目录。相对路径以 run 工作树为基准，绝对路径可读取工作树外证据，与现有 Read 的外部读取能力一致；缺失、权限不足和大小超限均返回具体错误。它们不创建文件，也不提供记忆写入工具。
+
+worker 另获得独有的 `harness_commands` MCP：`list_commands` 列出已配置命令，`run_command({command_id})` 执行对应的精确 argv。工具约束 `command_execution` 中的 `worker_command_ids` 与 `permissions.worker_commands`、`verification_command_ids` 与 `verification.commands` 分别逐项对应；优先使用此 broker。它不接受额外参数、cwd 或 env 覆盖，不进行 shell 插值，也不自动组合命令。stdout/stderr 原文、带摘要的 receipt 和子进程 journal 保存在该 dispatch 私有 `commands/` 目录；返回的摘录不能替代完整证据。
 
 `shared/mcp.json` 支持 stdio 与 HTTP。外部服务可按 `roles` 限定可见性；指挥和审阅服务必须声明 `read_only = true`，该声明由配置维护者负责核实。外部服务需要的凭据只填写环境变量名称。完整示例见 [examples/mcp.json](examples/mcp.json)，其中 OpenWiki 默认关闭，需要填入真实路径，并确保它没有开启 agent 写入能力。
 
@@ -284,7 +303,7 @@ Claude worker 通过锚定在工作树真实路径的 `Edit(//.../**)` 规则允
 worker_commands = [["python3", "-m", "unittest", "tests.test_export", "-v"]]
 ```
 
-额外命令不接受 `*` 或换行。需要删除或移动文件时，可显式配置包含具体路径的 `rm` / `mv` argv；默认不授予这些命令。验证 argv 中的字面 `*` 仍可由确定性验证器执行，但不转成 Bash 授权，以免被 CLI 解释为权限通配符。不使用跳过所有权限检查的参数；CLI 自身仍可能允许内建只读命令，这些授权不是操作系统沙箱。必要命令被拒绝时，worker 应报告环境 blocker。当前 Codex 适配器只提供只读模式，因此配置 Codex worker 会提前报错。Codex 只读角色设置 `project_doc_max_bytes=0`，关闭项目指令文件的自动注入；Claude 使用 `--setting-sources ""`，当前适配版本关闭项目／本地来源的指令加载。已提交的项目指令也需由角色按需读取。其他 CLI 内建上下文及工具读取内容仍可能影响模型，32,000 字符预算仅覆盖编排器生成的输入包。
+精确 argv 可包含字面的 `*` 或换行，由命令 broker 原样传递；旧 Bash 授权仍过滤这些 argv，以免 CLI 将其解释为权限模式。需要管道或重定向时，必须显式授权完整的 `["/bin/sh", "-c", "固定脚本"]`，broker 不自行添加 shell。不会自动组合命令或授予 `gh`、`ssh`、`curl` 等命令前缀。需要删除或移动文件时，可显式配置包含具体路径的 `rm` / `mv` argv；默认不授予这些命令。不得使用后台运行或权限绕过来替代 broker。不使用跳过所有权限检查的参数；CLI 自身仍可能允许内建只读命令，这些授权不是操作系统沙箱。必要命令被拒绝时，worker 应报告环境 blocker。当前 Codex 适配器只提供只读模式，因此配置 Codex worker 会提前报错。Codex 只读角色设置 `project_doc_max_bytes=0`，关闭项目指令文件的自动注入；Claude 使用 `--setting-sources ""`，当前适配版本关闭项目／本地来源的指令加载。已提交的项目指令也需由角色按需读取。其他 CLI 内建上下文及工具读取内容仍可能影响模型，32,000 字符预算仅覆盖编排器生成的输入包。
 
 两种只读角色的调用方式不同：Claude 通过工具许可限制可用写入工具和命令，Codex 调用显式传入 `--sandbox read-only`。这些配置不承诺工作树之外的读取隔离；需要更强隔离时使用专用 OS 用户或容器。
 
@@ -346,6 +365,8 @@ python3 -m harness --repo /path/to/project memory export > memory-backup.json
     plans/             # 计划版本与增量修订证据
     recovery/          # 再规划前归档的未接受修改
     environment/       # 操作者环境更新、来源摘要与各次只读前置检查
+    decisions/         # 绑定任务和来源的决策请求、操作者答复
+    checkpoints/       # worker 检查点及运行时保存的原始证据副本
   worktrees/<run_id>/   # 独立分支中的代码
 ```
 
@@ -381,3 +402,5 @@ worker 故障或中断留下的范围内修改保留在工作树。同任务后�
 - OpenWiki：参考记忆、来源、版本替换与交接；当前没有部署它的图数据库或 LLM 检索管线，可经外部 MCP 接入。
 
 后续可在现有测试约束下扩展：每任务独立 worktree 的并行调度、Orca 可视化适配、embedding 混合检索、记忆整理与冲突候选审查。首版先保证完整串行闭环和新会话边界。
+
+JSON 检查对浮点数要求 Python 可表示的有限数值范围；超出该范围返回 `valid=false`。整数字面量不受 Python 默认 4,300 位转换限制。嵌套深度等解析能力或资源限制返回工具错误，不将有效但无法解析的内容宣称为非法 JSON。

@@ -173,35 +173,21 @@ class EnvironmentUpdateTests(RepoCase):
         self.assertEqual(len(backend.calls), 1)
         self.assertEqual(self.saved(engine), before)
 
-    def test_large_saved_update_can_resume_after_context_budget_increase(self):
+    def test_large_saved_update_uses_compact_command_references(self):
         engine, backend, path, value = self.blocked()
-        # The declaration is intentionally large and repeated, but within the
-        # update contract. Checking it never executes this command.
         argv = [sys.executable, '-c', '#' + ' ' * 3900]
         value['checks'] = [{'kind': 'worker_command', 'argv': argv}] * 12
         write_json(path, value)
-        self.assertLessEqual(path.stat().st_size, 65536)
-        before = self.saved(engine)
-        with self.assertRaises(HarnessError):
-            self.engine(backend).resume(engine.run['id'], environment_update=path)
-        saved = self.saved(engine)
-        self.assertEqual(saved['context_capacity']['status'], 'required_overflow')
-        self.assertEqual(len(saved['environment_updates']), 1)
-        artifact = Path(saved['environment_updates'][0]['artifact'])
-        original = artifact.read_bytes()
-        path.unlink()
-        with self.assertRaises(HarnessError):
-            self.engine(backend).resume(engine.run['id'])
-        for key in ('attempts', 'total_attempts', 'agent_dispatches'):
-            self.assertEqual(self.saved(engine)[key], before[key])
-        self.assertEqual(len(backend.calls), 1)
-        self.config.data['runtime']['context_chars'] = 200000
         self.config.data['permissions']['worker_commands'].append(argv)
-        result = self.engine(backend).resume(engine.run['id'])
+        result = self.engine(backend).resume(engine.run['id'], environment_update=path)
         self.assertEqual(result['status'], 'completed')
-        self.assertEqual(result['attempts'], {'greet': 2})
-        self.assertEqual(result['environment_updates'], saved['environment_updates'])
-        self.assertEqual(artifact.read_bytes(), original)
+        artifact = Path(result['environment_updates'][0]['artifact'])
+        self.assertEqual(read_json(artifact)['checks'], value['checks'])
+        for call in backend.calls[1:]:
+            update = call['packet']['environment_updates'][0]
+            self.assertEqual(update['check_count'], 12)
+            self.assertNotIn('checks', update)
+            self.assertEqual(update['artifact'], str(artifact))
 
     def test_update_reaches_every_later_role_and_preserves_task_contract(self):
         engine, backend, path, value = self.blocked()
@@ -209,7 +195,7 @@ class EnvironmentUpdateTests(RepoCase):
         calls = len(backend.calls)
         result = self.engine(backend).resume(engine.run['id'], environment_update=path)
         self.assertEqual(result['status'], 'completed')
-        self.assertEqual(result['schema_version'], 9)
+        self.assertEqual(result['schema_version'], 11)
         self.assertEqual(result['tasks'], before['tasks'])
         self.assertEqual(result['config_snapshot']['roles'], before['config_snapshot']['roles'])
         self.assertEqual(result['original_tasks'], before['original_tasks'])
@@ -334,7 +320,7 @@ class EnvironmentUpdateTests(RepoCase):
         state.pop('environment_checks', None)
         write_json(engine.directory / 'state.json', state)
         result = self.engine(backend).resume(engine.run['id'], environment_update=path)
-        self.assertEqual(result['schema_version'], 9)
+        self.assertEqual(result['schema_version'], 11)
         self.assertEqual(result['status'], 'completed')
 
     def test_check_does_not_reblock_completed_worker_pending_review(self):
@@ -448,7 +434,8 @@ class EnvironmentUpdateTests(RepoCase):
         self.assertEqual([r['sequence'] for r in result['environment_updates']], [1, 2])
         for call in backend.calls[calls:]:
             records = call['packet']['environment_updates']
-            self.assertEqual(len(records), 2)
+            self.assertEqual(len(records), 1)
+            self.assertEqual(len(call['packet']['environment_history']), 2)
             self.assertEqual(records[-1]['summary'], value['summary'])
             self.assertEqual(records[-1]['checks'], [])
 

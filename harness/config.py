@@ -53,7 +53,7 @@ def normalized(data):
     return data
 
 
-def validate_commands(commands, field, *, exact_permissions=False):
+def validate_commands(commands, field):
     if not isinstance(commands, list):
         raise HarnessError(f"{field} 必须使用 argv 数组列表")
     for command in commands:
@@ -61,8 +61,6 @@ def validate_commands(commands, field, *, exact_permissions=False):
                 or not all(isinstance(s, str) and "\0" not in s for s in command)
                 or not command[0].strip()):
             raise HarnessError(f"{field} 必须使用非空 argv 数组")
-        if exact_permissions and any("*" in s or "\n" in s or "\r" in s for s in command):
-            raise HarnessError(f"{field} 只接受精确命令，不能包含 * 或换行")
 
 
 @dataclass
@@ -132,7 +130,7 @@ class Config:
         validate_commands(verification.get("setup_commands", []), "verification.setup_commands")
         if verification.get("setup_commands") and not verification.get("fresh_checkout"):
             raise HarnessError("verification.setup_commands 需要开启 fresh_checkout")
-        validate_commands(data["permissions"]["worker_commands"], "permissions.worker_commands", exact_permissions=True)
+        validate_commands(data["permissions"]["worker_commands"], "permissions.worker_commands")
 
     def resume_changes(self, snapshot):
         """Return budget increases and exact command grants without mutating inputs."""

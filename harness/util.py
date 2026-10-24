@@ -20,6 +20,10 @@ class HarnessError(Exception):
     pass
 
 
+class ProcessStartError(HarnessError):
+    """Popen rejected startup synchronously; no child process was created."""
+
+
 class ProcessTimeout(HarnessError):
     def __init__(self, timeout: int | float, log: Path):
         self.timeout = timeout
@@ -86,6 +90,41 @@ def _dispatch_pgid(entry):
     return pgid
 
 
+def validate_command_directories(dispatches, run_dir):
+    """Reject ledger paths that could redirect child-process supervision."""
+    root = Path(run_dir)
+    if not root.is_absolute() or root.resolve() != root:
+        raise HarnessError("运行目录不是规范绝对路径")
+    for entry in dispatches:
+        if not isinstance(entry, dict):
+            raise HarnessError("运行台账 dispatch 无效")
+        directory = entry.get("command_directory")
+        if directory is None:
+            if "command_directory" in entry:
+                raise HarnessError("命令目录无效")
+            continue
+        ident = entry.get("id")
+        if (not isinstance(ident, str) or not ident or ident in (".", "..")
+                or "/" in ident or "\\" in ident
+                or not isinstance(directory, str)):
+            raise HarnessError("命令派发身份或目录无效")
+        expected = root / "dispatches" / ident / "commands"
+        path = Path(directory)
+        if (directory != str(expected) or path.resolve() != path
+                or not path.is_dir()
+                or any(part.is_symlink() for part in (path, *path.parents))):
+            raise HarnessError("命令目录不属于该 dispatch")
+        confirmations = entry.get("command_exit_confirmations", {})
+        if not isinstance(confirmations, dict):
+            raise HarnessError("命令退出确认无效")
+        for key, value in confirmations.items():
+            if (not isinstance(key, str) or not key.startswith(ident + ":command:")
+                    or not isinstance(value, dict) or not isinstance(value.get("journal_digest"), str)
+                    or len(value["journal_digest"]) != 64
+                    or any(c not in "0123456789abcdef" for c in value["journal_digest"])):
+                raise HarnessError("命令退出确认身份或摘要无效")
+
+
 def ensure_dispatches_exited(dispatches, *, observe=group_alive):
     """Use the same conservative exit gate for execution and cleanup.
 
@@ -96,6 +135,9 @@ def ensure_dispatches_exited(dispatches, *, observe=group_alive):
     exited = []
     for entry in dispatches:
         pgid = _dispatch_pgid(entry)
+        if entry.get("command_directory") is not None:
+            from .command_server import ensure_command_processes_exited
+            ensure_command_processes_exited(entry["command_directory"], entry, observe=observe)
         if entry.get("exit_confirmed") is True:
             continue
         hint = ("核实旧进程已退出后，可用 --confirm-exited <dispatch_id> 留痕确认；"
@@ -124,14 +166,19 @@ def confirm_dispatches_exited(dispatches, identifiers, *, audit, save, observe=g
     unknown = set(identifiers) - entries.keys()
     if unknown:
         raise HarnessError(f"未知 dispatch ID：{sorted(unknown)}")
-    # Validate the whole selected batch before observation, audit or mutation.
-    for ident in identifiers:
-        _dispatch_pgid(entries[ident])
+    # Read and validate every selected journal before audit or mutation.
+    from .command_server import command_processes
+    children = {}
     for ident in identifiers:
         entry = entries[ident]
-        if entry.get("exit_confirmed") is True:
-            continue
-        pgid = entry.get("pgid")
+        _dispatch_pgid(entry)
+        children[ident] = command_processes(entry["command_directory"]) if entry.get("command_directory") else []
+        confirmations = entry.get("command_exit_confirmations", {})
+        if (not isinstance(confirmations, dict)
+                or any(not isinstance(value, dict) for value in confirmations.values())):
+            raise HarnessError("命令退出确认无效")
+
+    def observation(pgid):
         observed = {"pgid": pgid, "group_alive": observe(pgid) if pgid is not None else None}
         if pgid is not None:
             try:
@@ -141,7 +188,23 @@ def confirm_dispatches_exited(dispatches, identifiers, *, audit, save, observe=g
                 observed.update(leader=process.stdout.strip(), query_exit_code=process.returncode)
             except (OSError, subprocess.TimeoutExpired) as error:
                 observed["query_error"] = str(error)
-        confirmation = {"time": time.time(), "observed": observed}
+        return observed
+
+    for ident in identifiers:
+        entry = entries[ident]
+        for child in children[ident]:
+            previous = entry.get("command_exit_confirmations", {}).get(child["id"], {})
+            if child["exit_confirmed"] or previous.get("journal_digest") == child["journal_digest"]:
+                continue
+            confirmation = {"time": time.time(), "journal_digest": child["journal_digest"],
+                            "observed": observation(child["pgid"])}
+            audit("command_exit_confirmed_by_operator", dispatch_id=ident,
+                  command_id=child["id"], **confirmation)
+            entry.setdefault("command_exit_confirmations", {})[child["id"]] = confirmation
+            save()
+        if entry.get("exit_confirmed") is True:
+            continue
+        confirmation = {"time": time.time(), "observed": observation(entry.get("pgid"))}
         audit("dispatch_exit_confirmed_by_operator", dispatch_id=ident, **confirmation)
         entry.update(exit_confirmed=True, operator_exit_confirmation=confirmation)
         save()
@@ -175,7 +238,7 @@ def run_process(argv: list[str], cwd: Path, log: Path, *, stdin: str = "",
             except (OSError, ValueError) as e:
                 message = f"无法启动进程 {argv[0] if argv else '<empty argv>'}：{e}；日志：{log}"
                 err.write(message + "\n")
-                raise HarnessError(message) from e
+                raise ProcessStartError(message) from e
             started = time.monotonic()
             if on_start:
                 on_start(p.pid)

@@ -87,7 +87,7 @@ def status_summary(run):
                          ("attempts", "total_attempts", "agent_dispatches", "replan_attempts", "final_attempts")}
     dispatches = run.get("dispatches", [])
     dispatches = [entry for entry in dispatches if isinstance(entry, dict)] if isinstance(dispatches, list) else []
-    outcomes = dict.fromkeys(("completed", "task_blocked", "environment_blocked", "runtime_failed", "unknown"), 0)
+    outcomes = dict.fromkeys(("completed", "task_blocked", "environment_blocked", "operator_blocked", "runtime_failed", "unknown"), 0)
     for entry in dispatches:
         if entry.get("role") == "worker":
             outcome = entry.get("worker_outcome")
@@ -134,6 +134,23 @@ def status_summary(run):
         result["error"] = str(run["error"]).splitlines()[0]
     if run.get("replan_stopped"):
         result["replan_stopped"] = {key: run["replan_stopped"].get(key) for key in ("target", "reason", "artifact")}
+    responses = run.get("operator_decisions", [])
+    requests = run.get("decision_requests", [])
+    if not isinstance(responses, list) or not isinstance(requests, list):
+        raise HarnessError("操作者决策台账格式无效")
+    latest = {r.get("request_id"): r for r in responses if isinstance(r, dict)}
+    pending = []
+    for request in requests:
+        if not isinstance(request, dict):
+            raise HarnessError("操作者决策请求格式无效")
+        response = latest.get(request.get("id"))
+        if request.get("task_id") in run.get("accepted", {}) or (response and response.get("decision") == "continue"):
+            continue
+        if request.get("kind") == "replan_stop" and request.get("source", {}).get("dispatch_id") != run.get("replan_stopped", {}).get("dispatch_id"):
+            continue
+        pending.append({key: request.get(key) for key in ("id", "task_id", "kind", "question", "artifact", "artifact_digest")})
+    if pending:
+        result["pending_decisions"] = pending
     return result
 
 
@@ -211,6 +228,8 @@ def _main(argv=None):
                         help="显式修正当前非法计划或无拒绝的非法批准元数据；保留证据和累计预算")
     resume.add_argument("--environment-update", type=Path, metavar="FILE",
                         help="提供操作者环境澄清 JSON 文件；不扩展权限、文件范围或命令授权")
+    resume.add_argument("--operator-decision", type=Path, metavar="FILE",
+                        help="回答 status 中的操作者决策请求；绑定任务和原始证据，不跳过验收或授予命令权限")
     resume.add_argument("--allow-scope", action="append", metavar="PATTERN",
                         help="为待再规划显式授权新增文件范围模式；可重复指定，不改变原任务范围")
     status = sub.add_parser("status")
@@ -286,6 +305,8 @@ def _main(argv=None):
                 options["repair_invalid"] = args.repair_invalid
             if args.environment_update is not None:
                 options["environment_update"] = args.environment_update
+            if args.operator_decision is not None:
+                options["operator_decision"] = args.operator_decision
             if args.allow_scope:
                 options["allow_scope"] = args.allow_scope
             result = Engine(config, repo).resume(args.run_id, approve_plan=args.approve_plan, step=args.step,
