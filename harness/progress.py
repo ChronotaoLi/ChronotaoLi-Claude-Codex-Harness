@@ -29,6 +29,10 @@ _SAFE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,119}\Z")
 _RESERVED = {".git", ".harness", ".codex", ".claude"}
 
 
+class CheckpointDeclarationError(HarnessError):
+    """An optional current declaration is unusable; bound state remains authoritative."""
+
+
 def validate_checkpoints(items):
     if not isinstance(items, list) or len(items) > 16:
         raise HarnessError("checkpoints must be an array of at most 16 entries")
@@ -109,7 +113,7 @@ class ProgressRecovery:
             raise HarnessError("checkpoint source uses reserved or unsafe path")
         return source if source.is_absolute() else Path(self.worktree) / source
 
-    def _checkpoint_source(self, task_id, dispatch_id, source):
+    def _checkpoint_source(self, task_id, dispatch_id, source, *, validate_declarations=True):
         expected = self.directory / "dispatches" / dispatch_id / "returned-result.json"
         if (not isinstance(source, dict) or source.get("artifact") != str(expected)
                 or not isinstance(source.get("artifact_digest"), str) or not _SHA.fullmatch(source["artifact_digest"])):
@@ -125,19 +129,34 @@ class ProgressRecovery:
             raise HarnessError("checkpoint source identity mismatch")
         if not any(d["id"] == dispatch_id and d["role"] == "worker" and d["task_id"] == task_id for d in self.run["dispatches"]):
             raise HarnessError("checkpoint source is not a known worker dispatch")
-        validate_structure(result, envelope(WORK, task_id, dispatch_id))
-        validate_work_semantics(result)
-        validate_checkpoints(result.get("checkpoints", []))
+        checked = result if validate_declarations else {k: v for k, v in result.items() if k != "checkpoints"}
+        validate_structure(checked, envelope(WORK, task_id, dispatch_id))
+        validate_work_semantics(checked)
+        if validate_declarations:
+            validate_checkpoints(result.get("checkpoints", []))
         return result
 
+    def _declared_checkpoint_file(self, path, *, digest=False):
+        # Only reads of worker-declared sources are discardable. Private artifacts
+        # and all writes deliberately remain outside this classification.
+        try:
+            source = self._checkpoint_path(path)
+            return _file_digest(source) if digest else _read(source, 1024 * 1024)
+        except (HarnessError, OSError) as error:
+            raise CheckpointDeclarationError(str(error)) from error
+
     def record_checkpoints(self, task_id, dispatch_id, result, source):
-        items = validate_checkpoints(result.get("checkpoints", []))
-        if not items:
-            return
-        original = self._checkpoint_source(task_id, dispatch_id, source)
+        # Check authoritative state before interpreting optional new declarations.
+        self.validate_checkpoint_links()
+        original = self._checkpoint_source(task_id, dispatch_id, source, validate_declarations=False)
         if {k: v for k, v in original.items() if k not in ("task_id", "dispatch_id")} != result:
             raise HarnessError("checkpoint result differs from bound original")
-        self.validate_checkpoint_links()
+        try:
+            items = validate_checkpoints(result.get("checkpoints", []))
+        except HarnessError as error:
+            raise CheckpointDeclarationError(str(error)) from error
+        if not items:
+            return
         existing = [r for r in self.run.get("task_checkpoints", []) if r["dispatch_id"] == dispatch_id]
         if existing:
             if len(existing) != len(items):
@@ -161,16 +180,16 @@ class ProgressRecovery:
                     raise HarnessError("checkpoint batch exceeds 16 MiB")
             else:
                 for ref in item["inputs"]:
-                    if _file_digest(self._checkpoint_path(ref["path"])) != ref["sha256"]:
-                        raise HarnessError("checkpoint declared input SHA256 mismatch")
+                    if self._declared_checkpoint_file(ref["path"], digest=True) != ref["sha256"]:
+                        raise CheckpointDeclarationError("checkpoint declared input SHA256 mismatch")
                 evidence = []
                 for index, ref in enumerate(item["evidence"]):
-                    raw = _read(self._checkpoint_path(ref["path"]), 1024 * 1024)
+                    raw = self._declared_checkpoint_file(ref["path"])
                     total += len(raw)
                     if total > 16 * 1024 * 1024:
-                        raise HarnessError("checkpoint batch exceeds 16 MiB")
+                        raise CheckpointDeclarationError("checkpoint batch exceeds 16 MiB")
                     if _digest(raw) != ref["sha256"]:
-                        raise HarnessError("checkpoint declared evidence SHA256 mismatch")
+                        raise CheckpointDeclarationError("checkpoint declared evidence SHA256 mismatch")
                     target = folder / f"{item['id']}-{index}.bin"
                     target.parent.mkdir(parents=True, exist_ok=True)
                     if target.exists():

@@ -181,6 +181,8 @@ python3 -m harness --config /path/to/harness.toml --repo /path/to/project resume
 
 worker 可提交带输入／证据 SHA256 和有效期的 `checkpoints`，供后续全新进程检索已完成的检查。运行时私有保存原始证据，依据声明输入及有效期给出 reusable/stale；它不保证推理正确，也不代替验证与独立审阅。当前任务需用户决定时用 `blocker_kind=operator` 停止；分析任务可在 completed 结果中为依赖它的后续任务提出 `decision_requests`，本任务仍经过正常接受门禁。分析结论与后续操作的 go/no-go 应分开验收。
 
+通过 worker 身份、结构和语义门禁后，本次检查点声明或文件核对失败只丢弃检查点并记录原因；原始结果、台账或私有副本的完整性错误仍停止。新返回的非法 handoff 请求在接受前拒绝，后续尝试收到恢复原因。operator 问题文本不合法时仍保留决策门禁，以绑定原始证据的有界说明登记；读取原文后显式回答，普通 resume 不代替决定。旧 run 已保存的候选或接受记录按相同方式恢复问题登记，既有验证、审阅和接受门禁保持有效。
+
 操作者从 `status RUN` 取得 request ID，使用 `resume RUN --operator-decision FILE` 回答。严格 JSON 格式为 `{"schema_version":1,"request_id":"request_id_from_status","task_id":"target_task","decision":"continue","summary":"对该问题的明确选择"}`；decision 也可为 stop。continue 只允许对应任务继续新尝试或原再规划，stop 保持等待；均不新增命令权限、扩大范围、降低验收或补造证据。该选项与 environment-update、retry-stopped、reverify、repair-invalid、allow-scope 互斥，可与 step、confirm-exited 合用。格式、来源有效期及完整恢复边界见 [恢复协议](docs/recovery.md#可复用检查点与操作者决定版本-10)。
 
 确需新增前置文件时，可在待再规划阶段显式扩展新任务可用的范围：

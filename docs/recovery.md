@@ -141,6 +141,10 @@ WORK 可选 `checkpoints`，最多 16 项，每项为 `{id, summary, inputs: [{p
 
 当前任务需要用户决定时，worker 返回 `status="blocked", blocker_kind="operator"` 和具体问题；运行停止等待回答，不先再规划。已满足本任务验收的 worker 可以在 completed 结果中附带 `decision_requests: [{id, task_id, question}]`，将明确风险选择留给传递依赖于本任务的后续任务。本任务仍正常验证、审阅、接受；该请求不表示后续操作被批准，目标任务在得到回答前停止。禁止用后续阶段的操作／测试证明作为前一分析任务的完成条件；负面分析结论可以完成，但必须满足该分析任务自己的验收。
 
+worker 通过身份、结构与语义门禁后，本次检查点声明的哈希、路径、源文件或大小校验失败会丢弃该批检查点并记录 `checkpoints_discarded`，不丢失原有 operator 阻断，也不跳过验证和审阅。原始结果绑定、已有台账、私有副本完整性和私有存储错误仍停止。新返回的 completed handoff 目标或问题不合法时，在接受前拒绝本次尝试，拒绝原因和 dispatch 来源经 `worker_recovery` 交给后续指挥与 worker，不静默过滤请求。
+
+operator 问题空白、含 NUL 或超过登记长度时，运行时保留原始结果并登记有界说明及转义摘录。操作者须读取 request 的 `source` 所绑定的原始问题，再用正常 `--operator-decision` 回答；普通 resume 只保留等待，不消耗新派发预算。此处理也恢复旧版本因问题文本而登记失败的 operator 请求和已接受 handoff。旧版本已经保存的 `pending_task`／`pending_acceptance` 继续其验证、审阅及接受阶段，随后登记请求，不能提前派发依赖任务；原始产物、接受记录、预算及合法请求身份保持不变。指挥 stop 原因含 NUL 时不登记问题，普通恢复仍提示原有 `--retry-stopped` 出口。
+
 从 `status RUN` 取得运行时 request ID 后提交：
 
 ```bash

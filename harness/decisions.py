@@ -23,6 +23,37 @@ def _text(value, label, limit=4000):
         raise HarnessError(f"operator decision {label} must be nonblank text, at most {limit} characters")
 
 
+def validate_handoff_question(question):
+    """Reject new invalid handoffs before their source task can be accepted."""
+    _text(question, 'question')
+
+
+def decision_question(question, kind):
+    """Keep an attributable decision gate even when its question is malformed.
+
+    Valid questions keep their identities. Invalid operator questions and legacy
+    accepted handoffs get a bounded notice; the source remains byte-for-byte
+    intact and its digest, not the excerpt, binds the operator's answer.
+    """
+    limit = 80019 if kind == 'worker' else 4000
+    try:
+        _text(question, 'question', limit)
+    except HarnessError:
+        if not isinstance(question, str) or kind not in ('worker', 'handoff'):
+            raise
+        # A non-BMP character expands to twelve ASCII bytes in JSON. Keeping
+        # at most 200 source characters leaves room within the 4000-char gate.
+        excerpt = json.dumps(question[:200], ensure_ascii=True)
+        return (
+            "Operator decision required. The original question is blank, contains NUL, "
+            f"or exceeds {limit} characters. Read the bound original worker result "
+            "before deciding whether this task may continue. This notice does not "
+            "approve any operation or change tool permissions. "
+            f"Original question excerpt (JSON-escaped, at most 200 characters): {excerpt}"
+        )
+    return question
+
+
 def validate_decision(value):
     if not isinstance(value, dict) or set(value) != {'schema_version', 'request_id', 'task_id', 'decision', 'summary'}:
         raise HarnessError('operator decision fields invalid')
@@ -76,7 +107,8 @@ class DecisionRecovery:
             validate_work_semantics(result)
             if request['kind'] == 'worker':
                 if (request['task_id'] != request['source_task_id'] or result['status'] != 'blocked'
-                        or result['blocker_kind'] != 'operator' or request['question'] != '\n'.join(result['blockers'])):
+                        or result['blocker_kind'] != 'operator'
+                        or request['question'] != decision_question('\n'.join(result['blockers']), 'worker')):
                     raise HarnessError('decision request does not match operator blocker')
             else:
                 matches = [r for r in result.get('decision_requests', []) if r.get('id') == request['request_key']]
@@ -84,7 +116,7 @@ class DecisionRecovery:
                         or self.run['accepted'][request['source_task_id']].get('worker_source') != source
                         or self.run['accepted'][request['source_task_id']].get('decision_requests') != result.get('decision_requests', [])
                         or len(matches) != 1 or matches[0].get('task_id') != request['task_id']
-                        or matches[0].get('question') != request['question']):
+                        or decision_question(matches[0].get('question'), 'handoff') != request['question']):
                     raise HarnessError('handoff decision is not bound to accepted worker request')
                 tasks = {t['id']: t for t in self.run['tasks']}
                 seen, pending = set(), list(tasks[request['task_id']]['depends_on'])
@@ -128,6 +160,7 @@ class DecisionRecovery:
 
     def register_decision_request(self, task_id, source_task_id, kind, source, question, request_key=''):
         self.decision_context()
+        question = decision_question(question, kind)
         _text(question, 'question', 80019 if kind == 'worker' else 4000)
         if not isinstance(request_key, str) or len(request_key) > 96 or '\0' in request_key:
             raise HarnessError('decision request key invalid')

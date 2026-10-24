@@ -22,8 +22,8 @@ from .contracts import (DETAIL, PLAN, REPLAN, REVIEW, WORK, RepairableFormatErro
                         validate_commander_format_correction, validate_immutable_findings)
 from .memory import Memory, validate_proposals
 from .environment import EnvironmentRecovery
-from .decisions import DecisionRecovery, read_decision
-from .progress import ProgressRecovery
+from .decisions import DecisionRecovery, read_decision, validate_handoff_question
+from .progress import CheckpointDeclarationError, ProgressRecovery
 from .recovery import InvalidOutputRecovery, read_bound_result, snapshot_digest
 from .shared import HookError, Hooks, asset_digest, read_skill, skills_catalog, validate_mcp
 from .util import (HarnessError, ProcessTimeout, append_event, confirm_dispatches_exited,
@@ -279,6 +279,7 @@ class Engine(EnvironmentRecovery, DecisionRecovery, ProgressRecovery, InvalidOut
     def validate_handoff_requests(self, task_id, result):
         tasks = {t["id"]: t for t in self.run["tasks"]}
         for request in result.get("decision_requests", []):
+            validate_handoff_question(request["question"])
             target = request["task_id"]
             if target not in tasks or target in self.run["accepted"] or target == task_id:
                 raise HarnessError("后续决策必须指向尚未接受且依赖当前任务的任务")
@@ -301,7 +302,8 @@ class Engine(EnvironmentRecovery, DecisionRecovery, ProgressRecovery, InvalidOut
             self.register_decision_request(feedback["task_id"], feedback["task_id"], "worker", source,
                                            "\n".join(worker["blockers"]))
         stopped = self.run.get("replan_stopped")
-        if stopped and stopped.get("dispatch_id") and stopped["reason"].strip() and len(stopped["reason"]) <= 4000:
+        if (stopped and stopped.get("dispatch_id") and stopped["reason"].strip()
+                and len(stopped["reason"]) <= 4000 and "\0" not in stopped["reason"]):
             artifact = self.directory / "dispatches" / stopped["dispatch_id"] / "returned-result.json"
             source = {"artifact": str(artifact), "artifact_digest": stopped["source_digest"],
                       "dispatch_id": stopped["dispatch_id"]}
@@ -317,6 +319,15 @@ class Engine(EnvironmentRecovery, DecisionRecovery, ProgressRecovery, InvalidOut
         return next((r for r in self.decision_context() if r["task_id"] == task_id
                      and r["kind"] in ("worker", "handoff")
                      and (r["response"] is None or r["response"]["decision"] == "stop")), None)
+
+    def record_worker_recovery(self, task_id, dispatch_id, job, error):
+        recovery = {"role": "worker", "kind": "implement", "task_id": task_id, "dispatch_id": dispatch_id,
+                    "error": str(error), "error_type": type(error).__name__, "artifact": str(job)}
+        try:
+            recovery["changed_files"] = git.changed(self.worktree, binding=self.run["worktree_binding"])
+        except Exception as inspection_error:
+            recovery["inspection_error"] = str(inspection_error)
+        self.run.setdefault("worker_recovery", {})[task_id] = recovery
 
     @staticmethod
     def decision_required(request):
@@ -864,13 +875,7 @@ class Engine(EnvironmentRecovery, DecisionRecovery, ProgressRecovery, InvalidOut
                 self.run["last_runtime_error"] = {"role": role, "kind": kind, "task_id": task_id,
                                                  "error": str(error), "artifact": str(job)}
             if role == "worker" and invoked:
-                recovery = {"role": role, "kind": kind, "task_id": task_id, "dispatch_id": dispatch_id,
-                            "error": str(error), "error_type": type(error).__name__, "artifact": str(job)}
-                try:
-                    recovery["changed_files"] = git.changed(self.worktree, binding=self.run["worktree_binding"])
-                except Exception as inspection_error:
-                    recovery["inspection_error"] = str(inspection_error)
-                self.run.setdefault("worker_recovery", {})[task_id] = recovery
+                self.record_worker_recovery(task_id, dispatch_id, job, error)
             raise
         finally:
             entry["exit_confirmed"] = (not startup_interrupted
@@ -1534,9 +1539,21 @@ class Engine(EnvironmentRecovery, DecisionRecovery, ProgressRecovery, InvalidOut
             raise HarnessError("worker 返回产物与当前任务结果不一致；保留现场")
         worker_source = {"worker_artifact": str(worker_artifact),
                          "worker_artifact_digest": hashlib.sha256(raw_worker).hexdigest()}
-        self.validate_handoff_requests(tid, result)
-        self.record_checkpoints(tid, worker_dispatch["id"], result,
-                                {"artifact": str(worker_artifact), "artifact_digest": worker_source["worker_artifact_digest"]})
+        try:
+            self.validate_handoff_requests(tid, result)
+        except HarnessError as error:
+            worker_dispatch.update(status="failed", error=str(error))
+            self.run["last_runtime_error"] = {"role": "worker", "kind": "implement", "task_id": tid,
+                                             "error": str(error), "artifact": str(worker_artifact.parent)}
+            self.record_worker_recovery(tid, worker_dispatch["id"], worker_artifact.parent, error)
+            self.save()
+            self.event("worker_result_rejected", task_id=tid, dispatch_id=worker_dispatch["id"], reason=str(error))
+            raise
+        try:
+            self.record_checkpoints(tid, worker_dispatch["id"], result,
+                                    {"artifact": str(worker_artifact), "artifact_digest": worker_source["worker_artifact_digest"]})
+        except CheckpointDeclarationError as error:
+            self.event("checkpoints_discarded", task_id=tid, dispatch_id=worker_dispatch["id"], reason=str(error))
         self.record_ignored_paths("worker", worker_artifact.parent)
         if result["status"] == "blocked":
             self.run["feedback"] = {"task_id": tid, "worker": result, "attempt": attempt, **worker_source}
