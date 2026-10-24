@@ -141,6 +141,50 @@ class DecisionLifecycleTests(RepoCase):
         result = self.engine(backend).resume(engine.run['id'], operator_decision=self.response(engine))
         self.assertEqual(result['status'], 'completed')
 
+    def test_handoff_stop_can_change_after_unrelated_task_is_accepted(self):
+        engine, backend, plan = self.handoff(unrelated=True)
+        initial = engine.start('Implement all work', plan, step=True)
+        self.assertEqual(set(initial['accepted']), {'greet'})
+        request = initial['decision_requests'][0]
+        calls = len(backend.calls)
+        with self.assertRaises(HarnessError):
+            self.engine(backend).resume(engine.run['id'], operator_decision=self.response(engine, 'stop'))
+        self.assertEqual(len(backend.calls), calls)
+        stopped = self.engine(backend).resume(engine.run['id'], step=True)
+        self.assertEqual(set(stopped['accepted']), {'greet', 'other'})
+        self.assertEqual(stopped['operator_decisions'][0]['decision'], 'stop')
+        self.assertFalse(any(c['role'] == 'worker' and c['task_id'] == 'dependent' for c in backend.calls))
+        result = self.engine(backend).resume(engine.run['id'], operator_decision=self.response(engine))
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(set(result['accepted']), {'greet', 'other', 'dependent'})
+        self.assertEqual([r['decision'] for r in result['operator_decisions']], ['stop', 'continue'])
+        self.assertEqual(result['decision_requests'][0]['source'], request['source'])
+        for task_id in ('other', 'dependent'):
+            self.assertTrue(any(c['kind'] == 'review' and c['task_id'] == task_id for c in backend.calls))
+            self.assertTrue(any(d['role'] == 'verification' and d['task_id'] == task_id for d in result['dispatches']))
+        self.assertTrue(any(c['kind'] == 'final_review' for c in backend.calls))
+
+    def test_handoff_answer_is_stale_after_target_worker_invocation(self):
+        engine, backend, plan = self.handoff()
+        engine.start('Implement source and dependent work', plan, step=True)
+        original_change = backend.change
+
+        def block_target(backend, kwargs, packet, result):
+            original_change(backend, kwargs, packet, result)
+            if kwargs['role'] == 'worker' and kwargs['task']['id'] == 'dependent':
+                result.update(status='blocked', blocker_kind='environment', blockers=['Service unavailable'])
+
+        backend.change = block_target
+        with self.assertRaises(HarnessError):
+            self.engine(backend).resume(engine.run['id'], operator_decision=self.response(engine))
+        self.assertTrue(any(c['role'] == 'worker' and c['task_id'] == 'dependent' for c in backend.calls))
+        before = (engine.directory / 'state.json').read_bytes()
+        calls = len(backend.calls)
+        with self.assertRaisesRegex(HarnessError, 'stale after subsequent model invocation'):
+            self.engine(backend).resume(engine.run['id'], operator_decision=self.response(engine, 'stop'))
+        self.assertEqual((engine.directory / 'state.json').read_bytes(), before)
+        self.assertEqual(len(backend.calls), calls)
+
     def test_invalid_combinations_and_tampered_artifacts_have_no_ledger_effects(self):
         engine, backend = self.blocked()
         path = self.response(engine)

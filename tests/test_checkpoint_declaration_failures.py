@@ -50,12 +50,54 @@ class CheckpointDeclarationFailureTests(RepoCase):
         with self.assertRaises(HarnessError):
             engine.start('Implement greet', read_json(ROOT / 'examples' / 'plan.json'))
         self.assertEqual(len(engine.run['decision_requests']), 1)
+        diagnostic = engine.run['feedback']['checkpoints_discarded']
+        dispatch = next(d for d in engine.run['dispatches'] if d['role'] == 'worker')
+        self.assertEqual(diagnostic['task_id'], 'greet')
+        self.assertEqual(diagnostic['dispatch_id'], dispatch['id'])
+        self.assertIn('checkpoint declared input SHA256 mismatch', diagnostic['reason'])
+        self.assertEqual(engine.run['feedback']['worker']['blocker_kind'], 'operator')
+        self.assertEqual(engine.run['feedback']['worker']['blockers'], ['Proceed with the operation?'])
         self.assertEqual(engine.run['accepted'], {})
         self.assertFalse(any(d['role'] == 'verification' for d in engine.run['dispatches']))
         calls = len(backend.calls)
         with self.assertRaises(HarnessError):
             self.engine(backend).resume(engine.run['id'])
         self.assertEqual(len(backend.calls), calls)
+
+    def test_discard_diagnostic_reaches_next_commander_and_worker_after_resume(self):
+        def block_first(backend, kwargs, packet, result):
+            if kwargs['role'] == 'worker' and sum(c['role'] == 'worker' for c in backend.calls) == 1:
+                result.update(status='blocked', blocker_kind='environment', blockers=['Service unavailable'],
+                              checkpoints=[self.declaration(kwargs['cwd'])])
+        backend = ScriptedBackend(block_first)
+        engine = self.engine(backend)
+        with self.assertRaisesRegex(HarnessError, '环境受阻'):
+            engine.start('Implement greet', read_json(ROOT / 'examples' / 'plan.json'))
+        saved = read_json(engine.directory / 'state.json')
+        diagnostic = saved['feedback']['checkpoints_discarded']
+        self.assertEqual(diagnostic['task_id'], 'greet')
+        self.assertEqual(diagnostic['dispatch_id'], saved['dispatches'][-1]['id'])
+        self.assertEqual(saved['feedback']['worker']['blockers'], ['Service unavailable'])
+        self.assertEqual(saved.get('task_checkpoints', []), [])
+        result = self.engine(backend).resume(engine.run['id'])
+        self.assertEqual(result['status'], 'completed')
+        commander = next(c for c in backend.calls if c['role'] == 'commander')
+        workers = [c for c in backend.calls if c['role'] == 'worker']
+        self.assertEqual(commander['packet']['feedback']['checkpoints_discarded'], diagnostic)
+        self.assertEqual(workers[1]['packet']['feedback']['checkpoints_discarded'], diagnostic)
+        dispatches = [d for d in result['dispatches'] if d['role'] == 'worker']
+        self.assertNotEqual(dispatches[0]['id'], dispatches[1]['id'])
+        self.assertTrue(any(d['role'] == 'verification' for d in result['dispatches']))
+        self.assertIn('checkpoints_discarded', (engine.directory / 'events.jsonl').read_text())
+
+    def test_discard_reason_is_bounded_without_changing_operator_gate(self):
+        engine = self.engine(self.backend(blocked=True))
+        with patch.object(engine, 'record_checkpoints', side_effect=CheckpointDeclarationError('x' * 10000)):
+            with self.assertRaises(HarnessError):
+                engine.start('Implement greet', read_json(ROOT / 'examples' / 'plan.json'))
+        self.assertEqual(len(engine.run['feedback']['checkpoints_discarded']['reason']), 2000)
+        self.assertEqual(len(engine.run['decision_requests']), 1)
+        self.assertEqual(engine.run['accepted'], {})
 
     def test_partial_batch_registers_no_checkpoints(self):
         def partial(items, kwargs):

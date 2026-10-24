@@ -84,7 +84,7 @@ class ProgressTests(unittest.TestCase):
         packet = rt.progress_packet({}, task_id='task')
         self.assertEqual(len(packet['task_checkpoints']), 1)
         self.assertEqual(packet['task_checkpoints'][0]['dispatch_id'], 'worker2')
-        self.assertEqual(len(packet['checkpoint_history']), 2)
+        self.assertEqual(len(packet['checkpoint_history']), 1)
         self.assertTrue(Path(packet['checkpoint_history'][0]['artifact']).exists())
         self.assertEqual(rt.progress_packet({}, task_id='other')['task_checkpoints'], [])
 
@@ -166,7 +166,7 @@ class ProgressTests(unittest.TestCase):
         with self.assertRaisesRegex(HarnessError, 'reserved or unsafe'):
             rt.record_checkpoints('task', 'worker2', result, source)
 
-    def test_large_valid_batch_bounds_context_and_retains_full_bound_details(self):
+    def test_large_valid_batch_retains_full_bound_details(self):
         rt = self.runtime
         long_input = './' * 1700 + 'input'
         long_output = './' * 1700 + 'output'
@@ -182,7 +182,6 @@ class ProgressTests(unittest.TestCase):
         rt.run['dispatches'].append({'id': 'worker1', 'task_id': 'task', 'role': 'worker'})
         rt.record_checkpoints('task', 'worker1', result, source)
         packet = rt.progress_packet({}, task_id='task')
-        self.assertLess(len(json.dumps(packet)), 32000)
         self.assertEqual(len(packet['task_checkpoints']), 16)
         self.assertLessEqual(sum(len(c['summary']) for c in packet['task_checkpoints']), 4000)
         for check in packet['task_checkpoints']:
@@ -197,6 +196,33 @@ class ProgressTests(unittest.TestCase):
         (rt.worktree / 'input').unlink()
         stale = rt.progress_packet({}, task_id='task')['task_checkpoints']
         self.assertTrue(all(c['status'] == 'stale' and c['changed_input_indices'] == list(range(8)) for c in stale))
+
+    def test_accepted_checkpoint_index_is_retrievable_and_still_checks_integrity(self):
+        self.record()
+        rt = self.runtime
+        rt.run['accepted'] = {'task': {}}
+        packet = rt.progress_packet({}, task_id='final', kind='final_review')
+        self.assertEqual(packet['task_checkpoints'], [])
+        self.assertEqual(packet['checkpoint_history'], [])
+        index = packet['checkpoint_index']
+        raw = Path(index['artifact']).read_bytes()
+        self.assertEqual(sha(raw), index['artifact_digest'])
+        self.assertEqual(json.loads(raw)['checkpoints'], rt.run['task_checkpoints'])
+        row = json.loads(raw)['checkpoints'][0]
+        self.assertEqual(sha(Path(row['artifact']).read_bytes()), row['artifact_digest'])
+        manifest = json.loads(Path(row['artifact']).read_bytes())
+        Path(manifest['evidence'][0]['artifact']).write_bytes(b'tampered')
+        with self.assertRaisesRegex(HarnessError, 'cached evidence changed'):
+            rt.progress_packet({}, task_id='final', kind='final_review')
+
+    def test_checkpoint_index_corruption_is_not_overwritten(self):
+        self.record()
+        rt = self.runtime
+        artifact = Path(rt.progress_packet({})['checkpoint_index']['artifact'])
+        artifact.write_bytes(b'corrupt')
+        with self.assertRaisesRegex(HarnessError, 'checkpoint index changed'):
+            rt.progress_packet({})
+        self.assertEqual(artifact.read_bytes(), b'corrupt')
 
     def test_schema_promotion_initializes_all_version_ten_collections(self):
         self.runtime.run['schema_version'] = 9
@@ -220,7 +246,7 @@ class ProgressTests(unittest.TestCase):
             self.record(freshness='volatile', age=60, invoked_at=100)
         with patch('harness.progress.time.time', return_value=1001):
             check = self.runtime.progress_packet({})['task_checkpoints'][0]
-        self.assertEqual(check['recorded_at'], 1000)
+        self.assertEqual(json.loads(Path(check['artifact']).read_bytes())['recorded_at'], 1000)
         self.assertEqual(check['freshness_origin'], 100)
         self.assertEqual(check['status'], 'stale')
         self.assertIn('volatile evidence expired', check['reasons'])

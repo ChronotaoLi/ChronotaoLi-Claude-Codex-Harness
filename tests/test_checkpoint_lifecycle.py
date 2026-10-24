@@ -47,7 +47,8 @@ class CheckpointLifecycleTests(RepoCase):
         self.assertEqual(Path(checkpoint['evidence'][0]['artifact']).read_bytes(), original_bytes)
         self.assertEqual(checkpoint['evidence'][0]['path'], str(evidence))
         self.assertEqual(checkpoint['evidence'][0]['artifact_digest'], hashlib.sha256(original_bytes).hexdigest())
-        self.assertTrue(Path(checkpoint['source']['artifact']).is_file())
+        source = workers[1]['packet']['checkpoint_sources'][checkpoint['dispatch_id']]
+        self.assertTrue(Path(source['artifact']).is_file())
         dispatches = [d for d in result['dispatches'] if d['role'] == 'worker']
         self.assertEqual(len({d['id'] for d in dispatches}), 2)
         self.assertTrue(any(d['role'] == 'verification' and d['task_id'] == 'greet' for d in result['dispatches']))

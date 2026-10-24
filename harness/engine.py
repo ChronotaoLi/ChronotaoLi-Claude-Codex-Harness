@@ -1549,14 +1549,19 @@ class Engine(EnvironmentRecovery, DecisionRecovery, ProgressRecovery, InvalidOut
             self.save()
             self.event("worker_result_rejected", task_id=tid, dispatch_id=worker_dispatch["id"], reason=str(error))
             raise
+        checkpoints_discarded = None
         try:
             self.record_checkpoints(tid, worker_dispatch["id"], result,
                                     {"artifact": str(worker_artifact), "artifact_digest": worker_source["worker_artifact_digest"]})
         except CheckpointDeclarationError as error:
             self.event("checkpoints_discarded", task_id=tid, dispatch_id=worker_dispatch["id"], reason=str(error))
+            checkpoints_discarded = {"task_id": tid, "dispatch_id": worker_dispatch["id"],
+                                     "reason": str(error)[:2000]}
         self.record_ignored_paths("worker", worker_artifact.parent)
         if result["status"] == "blocked":
             self.run["feedback"] = {"task_id": tid, "worker": result, "attempt": attempt, **worker_source}
+            if checkpoints_discarded is not None:
+                self.run["feedback"]["checkpoints_discarded"] = checkpoints_discarded
             self.save()
             if result["blocker_kind"] == "operator":
                 self.synchronize_decision_requests()

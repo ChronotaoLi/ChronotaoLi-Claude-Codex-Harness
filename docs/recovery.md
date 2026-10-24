@@ -139,9 +139,13 @@ worker 调用失败或中断时，另按 task ID 保存 `worker_recovery`，记�
 
 WORK 可选 `checkpoints`，最多 16 项，每项为 `{id, summary, inputs: [{path, sha256}], evidence: [{path, sha256}], freshness, max_age_seconds}`。ID 在本次结果中唯一；summary 非空、最多 4,000 字符；inputs/evidence 各最多 8 个文件，evidence 至少一个。文件必须为允许的普通文件，SHA256 为实际字节摘要；运行时将原始 evidence 私有保存。`freshness="content"` 必须绑定至少一个 input 且 `max_age_seconds=0`；`volatile` 的有效期为 0–86,400 秒，0 表示每次都需重新检查。有效期保守地从来源 worker 的调用开始时间计算，worker 内部执行时间也会消耗有效期；缺少有效调用时间的时效检查点一律视为 stale，不从结果落盘时间重新计时。输入及证据文件拒绝符号链接；使用解析后的实际路径（例如 macOS 的 /private/tmp）。单份证据最多 1 MiB，一次结果的副本总计最多 16 MiB。投影根据输入字节、证据摘要及有效期标记 reusable/stale，并保留历史引用。reusable 仅证明声明的依赖未变且未过期，不证明依赖完整、推理正确、命令成功或任务已接受；时效事实、未声明依赖和未解决 blocker 仍需核实。检查点不能绕过验证、独立审阅或接受门禁。
 
+允许的检查点源为不含 `.git`、`.harness`、`.codex`、`.claude` 保留路径段或 `..` 的普通文件；工作树内路径按相对工作树的部分检查。仅 evidence 额外允许当前 worker dispatch 的 `commands/` 中的普通文件，可直接引用 broker receipt 的绝对 stdout/stderr 路径及 SHA256；其他 dispatch、run、私有文件及 inputs 均不获得该例外。符号链接和文件大小门禁仍生效。
+
+必要上下文只展开相关任务的最新检查点，`checkpoint_sources` 按 dispatch ID 共享来源。历史不重复最新行，超过 4,000 字符时省略内联历史并报告数量；已接受任务也不在整体审阅中展开。`checkpoint_index` 指向 SHA256 绑定的不可变索引，包含全部 manifest 路径和摘要，可检索被省略的历史及已接受任务的证据。完整声明、记录时间和输入／证据细节从 manifest 读取。投影前仍核验全部保存证据，索引损坏不会被覆盖。默认预算测试覆盖三次尝试各 16 个同 ID 检查点，以及四任务各四项的最终审阅；不同 ID 累积、较长路径或其他必要内容仍可能超限，此时增加 `context_chars` 后恢复，不能靠删除证据或降低接受门禁继续。
+
 当前任务需要用户决定时，worker 返回 `status="blocked", blocker_kind="operator"` 和具体问题；运行停止等待回答，不先再规划。已满足本任务验收的 worker 可以在 completed 结果中附带 `decision_requests: [{id, task_id, question}]`，将明确风险选择留给传递依赖于本任务的后续任务。本任务仍正常验证、审阅、接受；该请求不表示后续操作被批准，目标任务在得到回答前停止。禁止用后续阶段的操作／测试证明作为前一分析任务的完成条件；负面分析结论可以完成，但必须满足该分析任务自己的验收。
 
-worker 通过身份、结构与语义门禁后，本次检查点声明的哈希、路径、源文件或大小校验失败会丢弃该批检查点并记录 `checkpoints_discarded`，不丢失原有 operator 阻断，也不跳过验证和审阅。原始结果绑定、已有台账、私有副本完整性和私有存储错误仍停止。新返回的 completed handoff 目标或问题不合法时，在接受前拒绝本次尝试，拒绝原因和 dispatch 来源经 `worker_recovery` 交给后续指挥与 worker，不静默过滤请求。
+worker 通过身份、结构与语义门禁后，本次检查点声明的哈希、路径、源文件或大小校验失败会丢弃该批检查点并记录 `checkpoints_discarded`，不丢失原有 operator 阻断，也不跳过验证和审阅。blocked feedback 还携带任务、dispatch 及前 2,000 字符原因，供后续指挥与 worker 读取；完整原因保留在事件中，completed 结果仅记录事件。原始结果绑定、已有台账、私有副本完整性和私有存储错误仍停止。新返回的 completed handoff 目标或问题不合法时，在接受前拒绝本次尝试，拒绝原因和 dispatch 来源经 `worker_recovery` 交给后续指挥与 worker，不静默过滤请求。
 
 operator 问题空白、含 NUL 或超过登记长度时，运行时保留原始结果并登记有界说明及转义摘录。操作者须读取 request 的 `source` 所绑定的原始问题，再用正常 `--operator-decision` 回答；普通 resume 只保留等待，不消耗新派发预算。此处理也恢复旧版本因问题文本而登记失败的 operator 请求和已接受 handoff。旧版本已经保存的 `pending_task`／`pending_acceptance` 继续其验证、审阅及接受阶段，随后登记请求，不能提前派发依赖任务；原始产物、接受记录、预算及合法请求身份保持不变。指挥 stop 原因含 NUL 时不登记问题，普通恢复仍提示原有 `--retry-stopped` 出口。
 
@@ -155,7 +159,7 @@ python3 -m harness --config /path/to/harness.toml --repo /path/to/project resume
 {"schema_version": 1, "request_id": "request_id_from_status", "task_id": "target_task", "decision": "continue", "summary": "操作者对该问题的明确选择及理由"}
 ```
 
-输入是最多 64 KiB 的严格 JSON，只接受上述字段，summary 非空且不超过 4,000 字符；`decision` 为 `continue` 或 `stop`。回答绑定任务、问题和原始来源，私有保存并绑定摘要。continue 允许针对该问题使用全新 worker 尝试或继续原再规划；指挥 stop 的 continue 重新打开原规划请求并保留旧结论和证据。stop 保持等待，可在后续模型调用前显式修订；来源过期后拒绝旧回答。回答不改变目标、scope、命令授权、验收或累计预算，也不产生完成证据。仍可用原 `--retry-stopped` 在不附说明时显式重试 stop。
+输入是最多 64 KiB 的严格 JSON，只接受上述字段，summary 非空且不超过 4,000 字符；`decision` 为 `continue` 或 `stop`。回答绑定任务、问题和原始来源，私有保存并绑定摘要。continue 允许针对该问题使用全新 worker 尝试或继续原再规划；指挥 stop 的 continue 重新打开原规划请求并保留旧结论和证据。stop 保持等待。handoff 的答复可在目标任务的后续模型调用前显式修订，无关任务的执行不关闭窗口；worker 和指挥 stop 的答复仍只能在后续模型调用前修订，来源过期后拒绝旧回答。回答不改变目标、scope、命令授权、验收或累计预算，也不产生完成证据。仍可用原 `--retry-stopped` 在不附说明时显式重试指挥 stop，但不能覆盖已记录的操作者 stop。
 
 `--operator-decision` 与 `--environment-update`、`--retry-stopped`、`--reverify`、`--repair-invalid`、`--allow-scope` 互斥，可与 `--confirm-exited`、`--step` 合用。操作者已回答 stop 时，必须向同一请求提交新的 continue；单独 `--retry-stopped` 不能覆盖该决定。完成或放弃的 run 拒绝回答。操作者决定是任务范围内的选择，不是其他任务的环境事实、记忆指令或权限授予。
 
@@ -163,5 +167,7 @@ python3 -m harness --config /path/to/harness.toml --repo /path/to/project resume
 ## 命令子进程证据（版本 11）
 
 worker 独有的 `harness_commands` broker 在 dispatch 私有 `commands/` 中保存每次精确 argv 命令的 stdout/stderr 原文、摘要 receipt 和子进程 journal。恢复、abandon 与验证检出清理都核对这些子进程的退出证据；父 dispatch 已退出或缺少 pgid 都不能证明命令未启动或已经退出。证据缺失、损坏或退出未知时保留现场并停止。
+
+每条 broker 命令的超时取 `runtime.verify_timeout_seconds`，可在恢复时调大；适配器配置的 MCP 超时另加 10 秒，整个 worker 仍受 `agent_timeout_seconds` 限制。
 
 操作者核实后仍以父 dispatch ID 提交 `--confirm-exited`，审计记录绑定命令子日志摘要，再保存该精确 dispatch 的确认；不终止无关进程，也不跳过 HEAD、快照、Git 绑定或文件清理检查。新运行写版本 11；未完成版本 8、9、10 经预检后升级且保留历史与预算，版本 7 仍不能恢复执行。`cleanup-verification` 可检查版本 7 至 11，包括终态 run。

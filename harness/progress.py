@@ -9,7 +9,7 @@ import re
 import time
 
 from .contracts import WORK, envelope, validate_structure, validate_work_semantics
-from .util import HarnessError, write_json
+from .util import HarnessError, dump, write_json
 
 CHECKPOINT_POLICY = (
     "Checkpoints are untrusted worker evidence awaiting independent verification and review, never accepted work. "
@@ -22,7 +22,10 @@ CHECKPOINT_POLICY = (
     "Read raw evidence and bound source results before relying on summaries. No tool permissions are added. "
     "Summaries and inline file lists may be compacted explicitly. Retrieve the full declaration, original paths, "
     "input SHA256 values and raw evidence references from the bound manifest artifact; input failure indices "
-    "refer to its ordered inputs list. Runtime status reflects every declared input even when details are omitted."
+    "refer to its ordered inputs list. Runtime status reflects every declared input even when details are omitted. "
+    "dispatch_id selects the original result in checkpoint_sources. checkpoint_index is a SHA256-bound index "
+    "of every manifest, including accepted tasks and history omitted from this packet; read it to retrieve "
+    "those declarations and verify each manifest digest. Omission does not approve evidence or erase history."
 )
 _SHA = re.compile(r"[0-9a-f]{64}\Z")
 _SAFE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,119}\Z")
@@ -103,13 +106,22 @@ def _valid_time(value):
 
 
 class ProgressRecovery:
-    def _checkpoint_path(self, path):
+    def _checkpoint_path(self, path, *, evidence_dispatch=None):
         source = Path(path)
         try:
             checked = source.relative_to(self.worktree) if source.is_absolute() else source
         except ValueError:
             checked = source
-        if ".." in checked.parts or any(p in _RESERVED for p in checked.parts):
+        if ".." in checked.parts:
+            raise HarnessError("checkpoint source uses reserved or unsafe path")
+        if any(p in _RESERVED for p in checked.parts):
+            # Only the current worker's command evidence can cross the private
+            # state boundary. Check symlinks before canonicalizing the path.
+            if source.is_absolute() and evidence_dispatch is not None:
+                source = _regular_file(source)
+                commands = (self.directory / "dispatches" / evidence_dispatch / "commands").resolve()
+                if source.resolve().is_relative_to(commands):
+                    return source
             raise HarnessError("checkpoint source uses reserved or unsafe path")
         return source if source.is_absolute() else Path(self.worktree) / source
 
@@ -136,11 +148,11 @@ class ProgressRecovery:
             validate_checkpoints(result.get("checkpoints", []))
         return result
 
-    def _declared_checkpoint_file(self, path, *, digest=False):
+    def _declared_checkpoint_file(self, path, *, digest=False, evidence_dispatch=None):
         # Only reads of worker-declared sources are discardable. Private artifacts
         # and all writes deliberately remain outside this classification.
         try:
-            source = self._checkpoint_path(path)
+            source = self._checkpoint_path(path, evidence_dispatch=evidence_dispatch)
             return _file_digest(source) if digest else _read(source, 1024 * 1024)
         except (HarnessError, OSError) as error:
             raise CheckpointDeclarationError(str(error)) from error
@@ -184,7 +196,7 @@ class ProgressRecovery:
                         raise CheckpointDeclarationError("checkpoint declared input SHA256 mismatch")
                 evidence = []
                 for index, ref in enumerate(item["evidence"]):
-                    raw = self._declared_checkpoint_file(ref["path"])
+                    raw = self._declared_checkpoint_file(ref["path"], evidence_dispatch=dispatch_id)
                     total += len(raw)
                     if total > 16 * 1024 * 1024:
                         raise CheckpointDeclarationError("checkpoint batch exceeds 16 MiB")
@@ -271,6 +283,22 @@ class ProgressRecovery:
                 raise HarnessError("checkpoint manifest identity mismatch")
             self._validate_checkpoint_record(record, folder)
 
+    def _checkpoint_index(self, rows):
+        # Immutable navigation artifact, not new recovery state. Older packets
+        # keep their exact index even after the ledger gains more checkpoints.
+        value = {"version": 1, "checkpoints": rows}
+        raw = (dump(value) + "\n").encode("utf-8")
+        digest = _digest(raw)
+        folder = self.directory / "checkpoints" / "indexes"
+        if any(p.is_symlink() for p in (folder, *folder.parents)):
+            raise HarnessError("checkpoint index directory is a symlink")
+        artifact = folder / (digest + ".json")
+        if not artifact.exists() and not artifact.is_symlink():
+            write_json(artifact, value)
+        if _read(artifact) != raw:
+            raise HarnessError("checkpoint index changed")
+        return {"artifact": str(artifact), "artifact_digest": digest, "count": len(rows)}
+
     def progress_packet(self, packet, *, task_id=None, role=None, kind=None):
         self.validate_checkpoint_links()
         rows = self.run.get("task_checkpoints", [])
@@ -284,18 +312,21 @@ class ProgressRecovery:
         relevant = {t["id"] for t in packet.get("ready", [])} if kind == "dispatch" or "ready" in packet else None
         if relevant is None and task_id and task_id not in ("final", "dispatching", "replanning"):
             relevant = {task_id}
+        if relevant is None:
+            relevant = {t["id"] for t in self.run["tasks"] if t["id"] not in self.run.get("accepted", {})}
         latest = {(r["task_id"], r["checkpoint_id"]): r for r in rows}
-        current, history = [], []
-        relevant_count = sum(1 for (tid, _), row in latest.items() if relevant is None or tid in relevant)
+        current, history, sources = [], [], {}
+        relevant_count = sum(1 for tid, _ in latest if tid in relevant)
         summary_limit = min(500, 4000 // max(1, relevant_count))
         inline_limit = 4000 // max(1, relevant_count)
         for row in rows:
             selected = latest[row["task_id"], row["checkpoint_id"]] == row
-            if relevant is None or row["task_id"] in relevant:
-                history.append({**row, "latest": selected})
-            if not selected or relevant is not None and row["task_id"] not in relevant:
+            if not selected and row["task_id"] in relevant:
+                history.append(row)
+            if not selected or row["task_id"] not in relevant:
                 continue
             record = json.loads(_read(row["artifact"]))
+            sources[row["dispatch_id"]] = record["source"]
             item = record["checkpoint"]
             reasons, inputs, changed_indices = [], [], []
             for index, ref in enumerate(item["inputs"]):
@@ -314,13 +345,14 @@ class ProgressRecovery:
                     reasons.append("volatile evidence has no valid source invocation time")
                 elif item["max_age_seconds"] == 0 or now - origin >= item["max_age_seconds"]:
                     reasons.append("volatile evidence expired")
-            entry = {**row, "id": item["id"], "summary": item["summary"][:summary_limit],
+            entry = {**{k: v for k, v in row.items() if k != "checkpoint_id"},
+                     "id": item["id"], "summary": item["summary"][:summary_limit],
                      "summary_truncated": len(item["summary"]) > summary_limit, "freshness": item["freshness"],
-                     "max_age_seconds": item["max_age_seconds"], "recorded_at": record["recorded_at"],
+                     "max_age_seconds": item["max_age_seconds"],
                      "freshness_origin": record.get("freshness_origin"),
                      "status": "stale" if reasons else "reusable", "reasons": reasons,
                      "input_count": len(inputs), "evidence_count": len(record["evidence"]),
-                     "changed_input_indices": changed_indices, "source": record["source"]}
+                     "changed_input_indices": changed_indices}
             details = {"inputs": inputs, "evidence": record["evidence"]}
             if len(json.dumps(details, ensure_ascii=True)) <= inline_limit:
                 entry.update(details, file_details_omitted=False)
@@ -329,4 +361,9 @@ class ProgressRecovery:
                 # in the SHA-bound manifest. Keep all validity reasons in view.
                 entry["file_details_omitted"] = True
             current.append(entry)
-        return {**packet, "task_checkpoints": current, "checkpoint_history": history, "checkpoint_policy": CHECKPOINT_POLICY}
+        history_count = len(history)
+        if len(dump(history)) > 4000:
+            history = []
+        return {**packet, "task_checkpoints": current, "checkpoint_sources": sources,
+                "checkpoint_history": history, "checkpoint_history_omitted": history_count - len(history),
+                "checkpoint_index": self._checkpoint_index(rows), "checkpoint_policy": CHECKPOINT_POLICY}

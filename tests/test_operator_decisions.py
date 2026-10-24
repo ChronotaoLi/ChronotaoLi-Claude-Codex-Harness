@@ -62,6 +62,9 @@ class OperatorDecisionTests(unittest.TestCase):
         self.assertEqual(len(engine.run['operator_decisions']), 2)
         self.assertEqual(engine.run['accepted'], {})
         engine.validate_decision_links()
+        engine.run['dispatches'].append({'id': 'unrelated', 'task_id': 'two', 'invoked': True})
+        with self.assertRaisesRegex(HarnessError, 'stale after subsequent model invocation'):
+            engine.prepare_operator_decision(engine.response(request, 'stop', 'Stop after unrelated work'))
 
     def test_unknown_scope_and_busy_rejected_without_writes(self):
         engine = self.engine
@@ -137,6 +140,9 @@ class OperatorDecisionTests(unittest.TestCase):
         request = engine.register_decision_request('one', 'one', 'worker', engine.source, 'Select the option')
         engine.record_operator_decision(engine.prepare_operator_decision(engine.response(request)))
         self.assertIsNone(engine.pending_decision('one'))
+        engine.run['dispatches'].append({'id': 'unrelated', 'task_id': 'two', 'invoked': True})
+        with self.assertRaisesRegex(HarnessError, 'stale after subsequent model invocation'):
+            engine.prepare_operator_decision(engine.response(request, 'stop'))
 
     def test_handoff_binds_exact_accepted_worker_and_dependency(self):
         engine = self.engine

@@ -162,9 +162,13 @@ SQLite 是长期记忆的存储真相；JSON 导出和 Markdown handoff 提供�
 
 WORK 可提交带输入和证据 SHA256 的检查点，运行时私有保存原始证据，按声明输入及 content/volatile 有效期投影 reusable/stale。content 至少绑定一个输入；volatile TTL 为 0 时每次重验，非零 TTL 从来源 worker 调用开始计时，不能因长任务结束或恢复而刷新。检查点仅核验声明依赖及证据完整性，不保证依赖完整或结论正确，不替代验证和审阅。新 worker 仍用新进程、新 dispatch，不恢复供应商会话。
 
-worker 通过身份、结构与语义门禁后，本次检查点声明或源文件核对失败只丢弃该批检查点，记录带任务、dispatch 和原因的 `checkpoints_discarded`，继续处理原有 blocker 或正常验证、审阅。部分已保存但未登记的副本仅留作审计，不作为可复用检查点。原始结果绑定、已有检查点台账及私有副本的完整性错误，以及私有存储写入失败，仍直接停止；不由丢弃逻辑吞掉，也不推迟到下一次派发才检查。
+worker 通过身份、结构与语义门禁后，本次检查点声明或源文件核对失败只丢弃该批检查点，记录带任务、dispatch 和原因的 `checkpoints_discarded`，继续处理原有 blocker 或正常验证、审阅。blocked feedback 携带同来源的前 2,000 字符原因，供后续指挥与 worker 修正声明；完整原因保留在事件中，completed 结果仅记录事件。部分已保存但未登记的副本仅留作审计，不作为可复用检查点。原始结果绑定、已有检查点台账及私有副本的完整性错误，以及私有存储写入失败，仍直接停止；不由丢弃逻辑吞掉，也不推迟到下一次派发才检查。
 
-`blocker_kind=operator` 将当前任务停在显式决策边界，回答前不再规划；completed worker 可为传递依赖于本任务的后续任务提交 decision_requests，自身仍经过正常验证和接受。`resume --operator-decision` 按 request ID 记录任务范围内的 continue/stop，绑定来源和摘要；不改变授权、验收或原目标。指挥 stop 的 continue 复用原规划问题及证据，stop 可在下一次模型调用前显式修订，过期来源拒绝。详细格式见恢复协议。
+检查点 evidence 额外允许当前 worker dispatch 的 `commands/` 中的普通文件，可直接使用 broker 返回的 stdout/stderr 路径和摘要。路径归属按真实路径比较，仍拒绝符号链接、父目录跳转及超限文件；inputs 和其他私有路径不获得此例外。
+
+检查点投影仅展开相关任务最新条目；无特定任务时展开未接受任务，整体审阅不展开已接受检查点。来源按 dispatch 共享，重复标识和记录时间从完整 manifest 检索。历史不重复最新行，历史序列化超过 4,000 字符时转为索引检索。每次投影提供内容寻址、SHA256 绑定的不可变 `checkpoint_index`，收录全部台账行；旧索引在新增检查点后仍可读取。索引只是证据导航，不增加接受状态或提升证据可信度；投影前仍校验全部原始结果、manifest 和证据副本。完整 Engine 上下文测试覆盖单任务三次尝试各 16 个同 ID 检查点，以及四任务各四项的整体审阅；更多不同 ID、较长路径或其他必要内容仍可能超限，需增加 `context_chars`。
+
+`blocker_kind=operator` 将当前任务停在显式决策边界，回答前不再规划；completed worker 可为传递依赖于本任务的后续任务提交 decision_requests，自身仍经过正常验证和接受。`resume --operator-decision` 按 request ID 记录任务范围内的 continue/stop，绑定来源和摘要；不改变授权、验收或原目标。handoff 无论是否已答复，都只由目标任务的后续调用使修订窗口过期，无关工作可以继续。worker 和指挥 stop 的答复仍在后续模型调用后过期；指挥 stop 的 continue 复用原规划问题及证据。详细格式见恢复协议。
 
 新返回的 completed 结果在接受前校验 handoff 目标和问题文本；非法请求拒绝本次尝试并保存 `worker_recovery`，使后续指挥和 worker 得到原因，不过滤请求后接受。已明确报告且结构、停止语义合法的 operator 阻断，其问题即使空白、含 NUL 或超过登记长度，也不能变成可由普通 resume 重试的 worker 故障：运行时登记确定性的有界说明和转义摘录，要求读取绑定的原始结果后显式回答。原始结果和接受记录均不改写，合法问题的请求 ID 保持不变。旧 run 已持久化的候选继续既有验证、审阅和接受门禁，旧候选或接受记录中的非法 handoff 文本同样转换为绑定原证据的请求，后续目标任务在回答前不能派发；不重跑已接受任务，不清零预算或提升台账版本。指挥 stop 的原因含 NUL 时仍保留停止状态，通过 `--retry-stopped` 显式重开。
 
@@ -175,7 +179,7 @@ worker 通过身份、结构与语义门禁后，本次检查点声明或源文�
 
 只有 worker 获得 `harness_commands` MCP。`list_commands` 读取已配置命令，`run_command({command_id})` 仅执行 `verification.commands` 和 `permissions.worker_commands` 中与 ID 对应的完整 argv。工具约束 `command_execution` 中的 `worker_command_ids` 与 `permissions.worker_commands`、`verification_command_ids` 与 `verification.commands` 分别逐项对应；worker 优先使用 broker。调用不能附加参数或覆盖 cwd、env，不经 shell 插值。字面 `*` 和换行可原样作为 argv，旧 Bash grants 仍过滤它们。管道或重定向必须配置完整的 `["/bin/sh", "-c", "固定脚本"]`；不会自动拼接命令、授权 `gh`／`ssh`／`curl` 前缀，或借后台运行和权限绕过执行。
 
-每次命令的 stdout/stderr 原文、摘要绑定的 receipt 和子进程 journal 留在 dispatch 私有 `commands/` 目录。所有恢复与清理均核对命令子进程，不能以父 CLI 退出代替子进程退出证据。`--confirm-exited` 使用父 dispatch ID 并审计子日志摘要；确认仍不放宽候选、HEAD、Git 绑定和接受门禁。新台账版本 11，未完成的 8／9／10 在预检通过后升级；cleanup 支持 7 至 11。
+每次命令的 stdout/stderr 原文、摘要绑定的 receipt 和子进程 journal 留在 dispatch 私有 `commands/` 目录。每条命令超时为 `runtime.verify_timeout_seconds`，恢复时可以调大；适配器的 MCP 超时另加 10 秒，worker 总调用仍受 `agent_timeout_seconds` 限制。所有恢复与清理均核对命令子进程，不能以父 CLI 退出代替子进程退出证据。`--confirm-exited` 使用父 dispatch ID 并审计子日志摘要；确认仍不放宽候选、HEAD、Git 绑定和接受门禁。新台账版本 11，未完成的 8／9／10 在预检通过后升级；cleanup 支持 7 至 11。
 
 只读 `harness` MCP 保留记忆只读连接，新增 `file_sha256({path})`、`json_check({path})` 和 `file_diff({left,right})`。相对路径锚定 run 工作树，绝对外部路径允许读取；解析符号链接后只读普通文件并检查文件变化。SHA256 流式读取上限 1 GiB；JSON 与 diff 每个源上限 8 MiB。JSON 严格拒绝重复 key 与非有限数，返回有效性、根类型、值数量、摘要和可用错误位置；非法内容是 `valid=false` 的证据。diff 使用 Python difflib，返回两边摘要、不同／二进制标志，文本输出上限 24,000 字符并报告截断。它们不写文件、不启动子进程、不运行 Git 过滤器。
 

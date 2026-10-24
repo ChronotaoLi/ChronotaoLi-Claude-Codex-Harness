@@ -277,7 +277,7 @@ class DecisionRecovery:
                         or stopped.get('dispatch_id') != request['source']['dispatch_id']):
             raise HarnessError('operator decision does not match stopped replan')
         boundary = request['response']['dispatch_count'] if request['response'] else request['dispatch_count']
-        if any(d.get('invoked', True) and (request['kind'] != 'handoff' or request['response'] is not None
+        if any(d.get('invoked', True) and (request['kind'] != 'handoff'
                    or d.get('task_id') == request['task_id'])
                for d in self.run['dispatches'][boundary:]):
             raise HarnessError('operator decision request stale after subsequent model invocation')

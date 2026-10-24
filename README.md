@@ -179,11 +179,13 @@ python3 -m harness --config /path/to/harness.toml --repo /path/to/project resume
 
 同一任务最新更新的 checks 替代旧检查列表，所有历史声明仍按序保留。选择前只预检已有的当前任务，不检查全部 ready 任务；选中的任务在每次 worker 尝试（含格式修正）前重检，所有报告保留。因此当前任务的一次普通尝试可能记录选择前和派发前两份报告。检查失败不启动本次 worker，也不消耗其尝试或派发预算；当前任务为空时，指挥选择可能已消耗派发预算，选定指令会保存供恢复复用。worker 返回后的验证和审阅不重跑这些前置检查，仍按原门禁独立验收。所有新调用使用新进程、新 dispatch，累计预算不清零；既有 receipt 与批准不能借更新重抽或复用到新候选。
 
-worker 可提交带输入／证据 SHA256 和有效期的 `checkpoints`，供后续全新进程检索已完成的检查。运行时私有保存原始证据，依据声明输入及有效期给出 reusable/stale；它不保证推理正确，也不代替验证与独立审阅。当前任务需用户决定时用 `blocker_kind=operator` 停止；分析任务可在 completed 结果中为依赖它的后续任务提出 `decision_requests`，本任务仍经过正常接受门禁。分析结论与后续操作的 go/no-go 应分开验收。
+worker 可提交带输入／证据 SHA256 和有效期的 `checkpoints`，供后续全新进程检索已完成的检查。运行时私有保存原始证据，依据声明输入及有效期给出 reusable/stale；它不保证推理正确，也不代替验证与独立审阅。evidence 可直接引用当前 worker dispatch 的 broker `commands/` 中的普通文件，inputs 和其他私有路径仍受保留路径限制。当前任务需用户决定时用 `blocker_kind=operator` 停止；分析任务可在 completed 结果中为依赖它的后续任务提出 `decision_requests`，本任务仍经过正常接受门禁。分析结论与后续操作的 go/no-go 应分开验收。
 
-通过 worker 身份、结构和语义门禁后，本次检查点声明或文件核对失败只丢弃检查点并记录原因；原始结果、台账或私有副本的完整性错误仍停止。新返回的非法 handoff 请求在接受前拒绝，后续尝试收到恢复原因。operator 问题文本不合法时仍保留决策门禁，以绑定原始证据的有界说明登记；读取原文后显式回答，普通 resume 不代替决定。旧 run 已保存的候选或接受记录按相同方式恢复问题登记，既有验证、审阅和接受门禁保持有效。
+通过 worker 身份、结构和语义门禁后，本次检查点声明或文件核对失败只丢弃检查点并记录原因；blocked 结果还将有界原因交给后续指挥与 worker，原始 blocker 保留。原始结果、台账或私有副本的完整性错误仍停止。新返回的非法 handoff 请求在接受前拒绝，后续尝试收到恢复原因。operator 问题文本不合法时仍保留决策门禁，以绑定原始证据的有界说明登记；读取原文后显式回答，普通 resume 不代替决定。旧 run 已保存的候选或接受记录按相同方式恢复问题登记，既有验证、审阅和接受门禁保持有效。
 
-操作者从 `status RUN` 取得 request ID，使用 `resume RUN --operator-decision FILE` 回答。严格 JSON 格式为 `{"schema_version":1,"request_id":"request_id_from_status","task_id":"target_task","decision":"continue","summary":"对该问题的明确选择"}`；decision 也可为 stop。continue 只允许对应任务继续新尝试或原再规划，stop 保持等待；均不新增命令权限、扩大范围、降低验收或补造证据。该选项与 environment-update、retry-stopped、reverify、repair-invalid、allow-scope 互斥，可与 step、confirm-exited 合用。格式、来源有效期及完整恢复边界见 [恢复协议](docs/recovery.md#可复用检查点与操作者决定版本-10)。
+检查点上下文共享来源引用，历史不重复最新条目；过大的历史和已接受任务的检查点通过 `checkpoint_index` 的 SHA256 绑定索引按需检索。整体审阅不展开已接受任务的检查点，但完整性门禁仍校验全部保存证据。索引和 manifest 保留完整声明及来源；大量不同检查点或较长内容仍可能需要增加 `context_chars`。
+
+操作者从 `status RUN` 取得 request ID，使用 `resume RUN --operator-decision FILE` 回答。严格 JSON 格式为 `{"schema_version":1,"request_id":"request_id_from_status","task_id":"target_task","decision":"continue","summary":"对该问题的明确选择"}`；decision 也可为 stop。continue 只允许对应任务继续新尝试或原再规划，stop 保持等待；均不新增命令权限、扩大范围、降低验收或补造证据。handoff 答复在目标任务后续模型调用前可显式修订，无关任务的执行不使它过期；其他类型仍在后续模型调用后过期。该选项与 environment-update、retry-stopped、reverify、repair-invalid、allow-scope 互斥，可与 step、confirm-exited 合用。格式、来源有效期及完整恢复边界见 [恢复协议](docs/recovery.md#可复用检查点与操作者决定版本-10)。
 
 确需新增前置文件时，可在待再规划阶段显式扩展新任务可用的范围：
 
@@ -260,7 +262,7 @@ worker 尝试与模型派发在上下文、派发前 hook、快照及预算检�
 
 文件工具只读普通文件，解析符号链接并检查读取期间的文件身份与变化；拒绝设备、FIFO 和目录。相对路径以 run 工作树为基准，绝对路径可读取工作树外证据，与现有 Read 的外部读取能力一致；缺失、权限不足和大小超限均返回具体错误。它们不创建文件，也不提供记忆写入工具。
 
-worker 另获得独有的 `harness_commands` MCP：`list_commands` 列出已配置命令，`run_command({command_id})` 执行对应的精确 argv。工具约束 `command_execution` 中的 `worker_command_ids` 与 `permissions.worker_commands`、`verification_command_ids` 与 `verification.commands` 分别逐项对应；优先使用此 broker。它不接受额外参数、cwd 或 env 覆盖，不进行 shell 插值，也不自动组合命令。stdout/stderr 原文、带摘要的 receipt 和子进程 journal 保存在该 dispatch 私有 `commands/` 目录；返回的摘录不能替代完整证据。
+worker 另获得独有的 `harness_commands` MCP：`list_commands` 列出已配置命令，`run_command({command_id})` 执行对应的精确 argv。工具约束 `command_execution` 中的 `worker_command_ids` 与 `permissions.worker_commands`、`verification_command_ids` 与 `verification.commands` 分别逐项对应；优先使用此 broker。它不接受额外参数、cwd 或 env 覆盖，不进行 shell 插值，也不自动组合命令。stdout/stderr 原文、带摘要的 receipt 和子进程 journal 保存在该 dispatch 私有 `commands/` 目录；返回的摘录不能替代完整证据。每条 broker 命令使用 `runtime.verify_timeout_seconds`，恢复时可以调大；适配器配置的 MCP 超时比它多 10 秒，整个 worker 调用仍受 `agent_timeout_seconds` 限制。
 
 `shared/mcp.json` 支持 stdio 与 HTTP。外部服务可按 `roles` 限定可见性；指挥和审阅服务必须声明 `read_only = true`，该声明由配置维护者负责核实。外部服务需要的凭据只填写环境变量名称。完整示例见 [examples/mcp.json](examples/mcp.json)，其中 OpenWiki 默认关闭，需要填入真实路径，并确保它没有开启 agent 写入能力。
 
