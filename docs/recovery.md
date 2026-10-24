@@ -141,6 +141,8 @@ WORK 可选 `checkpoints`，最多 16 项，每项为 `{id, summary, inputs: [{p
 
 允许的检查点源为不含 `.git`、`.harness`、`.codex`、`.claude` 保留路径段或 `..` 的普通文件；工作树内路径按相对工作树的部分检查。仅 evidence 额外允许当前 worker dispatch 的 `commands/` 中的普通文件，可直接引用 broker receipt 的绝对 stdout/stderr 路径及 SHA256；其他 dispatch、run、私有文件及 inputs 均不获得该例外。符号链接和文件大小门禁仍生效。
 
+格式修正也是新 dispatch，不能重新申报原 dispatch 的 broker 输出作为检查点证据。可以省略可选检查点，或仅重跑已授权且可安全重复的检查；不要为重新取得证据重复有副作用的操作。其他允许的普通文件证据仍可使用。原命令日志保留；completed 修正结果的检查点声明错误只记录丢弃事件，blocked 结果另携带有界反馈。不继承旧 broker 证据，也不刷新旧 volatile 证据的时间起点。
+
 必要上下文只展开相关任务的最新检查点，`checkpoint_sources` 按 dispatch ID 共享来源。历史不重复最新行，超过 4,000 字符时省略内联历史并报告数量；已接受任务也不在整体审阅中展开。`checkpoint_index` 指向 SHA256 绑定的不可变索引，包含全部 manifest 路径和摘要，可检索被省略的历史及已接受任务的证据。完整声明、记录时间和输入／证据细节从 manifest 读取。投影前仍核验全部保存证据，索引损坏不会被覆盖。默认预算测试覆盖三次尝试各 16 个同 ID 检查点，以及四任务各四项的最终审阅；不同 ID 累积、较长路径或其他必要内容仍可能超限，此时增加 `context_chars` 后恢复，不能靠删除证据或降低接受门禁继续。
 
 当前任务需要用户决定时，worker 返回 `status="blocked", blocker_kind="operator"` 和具体问题；运行停止等待回答，不先再规划。已满足本任务验收的 worker 可以在 completed 结果中附带 `decision_requests: [{id, task_id, question}]`，将明确风险选择留给传递依赖于本任务的后续任务。本任务仍正常验证、审阅、接受；该请求不表示后续操作被批准，目标任务在得到回答前停止。禁止用后续阶段的操作／测试证明作为前一分析任务的完成条件；负面分析结论可以完成，但必须满足该分析任务自己的验收。
@@ -162,6 +164,10 @@ python3 -m harness --config /path/to/harness.toml --repo /path/to/project resume
 输入是最多 64 KiB 的严格 JSON，只接受上述字段，summary 非空且不超过 4,000 字符；`decision` 为 `continue` 或 `stop`。回答绑定任务、问题和原始来源，私有保存并绑定摘要。continue 允许针对该问题使用全新 worker 尝试或继续原再规划；指挥 stop 的 continue 重新打开原规划请求并保留旧结论和证据。stop 保持等待。handoff 的答复可在目标任务的后续模型调用前显式修订，无关任务的执行不关闭窗口；worker 和指挥 stop 的答复仍只能在后续模型调用前修订，来源过期后拒绝旧回答。回答不改变目标、scope、命令授权、验收或累计预算，也不产生完成证据。仍可用原 `--retry-stopped` 在不附说明时显式重试指挥 stop，但不能覆盖已记录的操作者 stop。
 
 `--operator-decision` 与 `--environment-update`、`--retry-stopped`、`--reverify`、`--repair-invalid`、`--allow-scope` 互斥，可与 `--confirm-exited`、`--step` 合用。操作者已回答 stop 时，必须向同一请求提交新的 continue；单独 `--retry-stopped` 不能覆盖该决定。完成或放弃的 run 拒绝回答。操作者决定是任务范围内的选择，不是其他任务的环境事实、记忆指令或权限授予。
+
+工作上下文按任务筛选决定，整体审阅和再规划包含全部请求的紧凑投影。问题与答复摘录共享 4,000 字符额度，每段最多 500 字符；ID、来源和最新 continue/stop 保留，未答复为 response=null。`operator_decision_index` 的路径与 SHA256 绑定完整请求、当前答复及全部历史答复，含原产物路径和摘要；依赖截断信息前须读取全文。被省略的来源仍须通过完整性校验，原文和台账不被截断或替换。
+
+已有操作者答复的恢复在继续工作前重做整体容量预检。可修订且随条数缩减的决定投影仅计入预计容量，超限给出增大 `context_chars` 的预警；确定的必要下界超限才提前停止。最终审阅和预检只携带检查点索引，避免把当前未接受任务的临时展开内容当成最终下界。实际派发仍核对完整输入；若最终审阅因此超限，增大预算后普通 resume 继续同一次最终尝试，复用已完成验证，不删除决定或重跑已接受任务。
 
 
 ## 命令子进程证据（版本 11）

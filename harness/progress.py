@@ -312,6 +312,10 @@ class ProgressRecovery:
         relevant = {t["id"] for t in packet.get("ready", [])} if kind == "dispatch" or "ready" in packet else None
         if relevant is None and task_id and task_id not in ("final", "dispatching", "replanning"):
             relevant = {task_id}
+        if kind == "final_review" or task_id == "final":
+            # Final review runs only after every task is accepted. Its capacity
+            # preflight must use that same index-only view, even mid-task.
+            relevant = set()
         if relevant is None:
             relevant = {t["id"] for t in self.run["tasks"] if t["id"] not in self.run.get("accepted", {})}
         latest = {(r["task_id"], r["checkpoint_id"]): r for r in rows}

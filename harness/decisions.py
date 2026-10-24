@@ -7,7 +7,7 @@ import time
 
 from .contracts import WORK, REPLAN, envelope, validate_structure, validate_work_semantics
 from .recovery import read_bound_result, snapshot_digest
-from .util import HarnessError, write_json
+from .util import HarnessError, dump, write_json
 
 
 DECISION_POLICY = (
@@ -305,6 +305,26 @@ class DecisionRecovery:
         self.run.setdefault('operator_decisions', []).append(row)
         self.save()
 
+    def _decision_index(self, records):
+        # Navigation only: validation of every ledger/source precedes projection.
+        # Content addressing preserves references from earlier dispatches.
+        value = {'version': 1, 'requests': records,
+                 'responses': self.run.get('operator_decisions', [])}
+        raw = (dump(value) + '\n').encode('utf-8')
+        digest = hashlib.sha256(raw).hexdigest()
+        folder = self.directory / 'decisions' / 'indexes'
+        if any(p.is_symlink() for p in (folder, *folder.parents)):
+            raise HarnessError('decision index directory is a symlink')
+        artifact = folder / (digest + '.json')
+        try:
+            if not artifact.exists() and not artifact.is_symlink():
+                write_json(artifact, value)
+            if artifact.is_symlink() or artifact.read_bytes() != raw:
+                raise HarnessError('decision index changed')
+        except OSError as error:
+            raise HarnessError('cannot read or write decision index') from error
+        return {'artifact': str(artifact), 'artifact_digest': digest, 'count': len(records)}
+
     def decision_packet(self, packet, *, task_id=None, role=None, kind=None):
         records = self.decision_context()
         if not records:
@@ -314,15 +334,28 @@ class DecisionRecovery:
         relevant = None if kind in ('replan', 'final_review') or task_id == 'final' else {task_id}
         if kind == 'dispatch':
             relevant = {t['id'] for t in packet.get('ready', [])}
+        selected = [r for r in records if relevant is None or r['task_id'] in relevant]
+        # Share an excerpt allowance instead of multiplying full questions and
+        # 4000-character answers by the number of decisions. Choices and IDs
+        # remain explicit; all originals and superseded answers are retrievable.
+        limit = min(500, 4000 // max(1, 2 * len(selected)))
         decisions = []
-        for request in records:
-            if relevant is not None and request['task_id'] not in relevant:
-                continue
+        for request in selected:
             projected = {k: deepcopy(request[k]) for k in
-                ('id', 'task_id', 'source_task_id', 'kind', 'question', 'source', 'artifact', 'artifact_digest', 'response')}
-            if len(projected['question']) > 1000:
-                projected['question'] = projected['question'][:1000]
-                projected['question_truncated'] = True
-                projected['question_instruction'] = 'Read and verify the bound request artifact for the full question before acting.'
+                         ('id', 'task_id', 'source_task_id', 'kind', 'source')}
+            projected.update(question=request['question'][:limit],
+                             question_truncated=len(request['question']) > limit,
+                             response=None)
+            if request['response'] is not None:
+                response = request['response']
+                projected['response'] = {k: response[k] for k in ('id', 'decision')}
+                projected['response'].update(summary=response['summary'][:limit],
+                                             summary_truncated=len(response['summary']) > limit)
             decisions.append(projected)
-        return {**packet, 'operator_decisions': decisions, 'operator_decision_policy': DECISION_POLICY}
+        return {**packet, 'operator_decisions': decisions,
+                'operator_decision_index': self._decision_index(records),
+                'operator_decision_policy': DECISION_POLICY +
+                ' Question and summary excerpts share a bounded allowance. Before acting on a truncated '
+                'question or answer, read the SHA256-bound operator_decision_index: requests are keyed '
+                'by id, responses by request_id; it retains full text, latest answers, all answer history '
+                'and original artifact/digest references. A null response means unanswered.'}

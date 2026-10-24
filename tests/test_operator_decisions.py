@@ -11,7 +11,7 @@ from harness.util import HarnessError, write_json
 
 class Fixture(DecisionRecovery):
     def __init__(self, directory):
-        self.directory = Path(directory)
+        self.directory = Path(directory).resolve()
         self.events = []
         self.saves = 0
         self.run = {'id': 'run_test', 'schema_version': 10, 'status': 'blocked',

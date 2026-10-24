@@ -141,7 +141,8 @@ class Engine(EnvironmentRecovery, DecisionRecovery, ProgressRecovery, InvalidOut
     def final_context_capacity(self, tasks=None, original_tasks=None):
         """Preflight a candidate plan without consuming a dispatch or rejecting estimates.
 
-        Required size excludes unknown future summaries/output/path lengths. The
+        Required size excludes unknown future summaries/output/path lengths and
+        the revisable, count-dependent decision projection. The
         projection reserves bounded summaries, output excerpts and generous paths;
         only the required lower bound can establish that a plan cannot fit.
         """
@@ -169,6 +170,11 @@ class Engine(EnvironmentRecovery, DecisionRecovery, ProgressRecovery, InvalidOut
         }
         required["packet"] = self.runtime_packet(required["packet"], role="reviewer", kind="final_review", task_id="final")
         projected = deepcopy(required)
+        # Decisions are still fully validated and included in the estimate.
+        # Answers can be revised and shared excerpts shrink as requests grow,
+        # so their current projection cannot establish a hard future lower bound.
+        for field in ("operator_decisions", "operator_decision_index", "operator_decision_policy"):
+            required["packet"].pop(field, None)
         packet = projected["packet"]
         runtime = self.config.data["runtime"]
         # Include a UUID-sized suffix as a reserve for distinct recovery artifacts.
@@ -192,6 +198,7 @@ class Engine(EnvironmentRecovery, DecisionRecovery, ProgressRecovery, InvalidOut
             "pending_summary_chars": 600, "verification_output_chars_per_command": 500,
             "verification_commands": len(checks), "tasks": len(tasks),
             "includes_existing_review_history": True, "includes_future_review_history": False,
+            "decisions_in_projection_only": True, "final_checkpoints_index_only": True,
             "projection_is_guarantee": False,
         }
         return report
@@ -528,7 +535,12 @@ class Engine(EnvironmentRecovery, DecisionRecovery, ProgressRecovery, InvalidOut
                 correction = {"error": str(error), "previous_dispatch": previous["id"],
                               "artifact": str(self.directory / "dispatches" / previous["id"]),
                               "instruction": "Correct the reported output format using the current task and files. Recheck the evidence. Return only this dispatch's IDs; do not relax acceptance or discard blocking findings."}
-                if role == "reviewer":
+                if role == "worker":
+                    correction["instruction"] += (
+                        " Broker checkpoint evidence must belong to this dispatch, including during format repair. "
+                        "Other allowed regular-file evidence remains usable. Omit optional checkpoints if necessary; "
+                        "repeat only authorized checks that are safe to repeat, never side effects just to obtain evidence.")
+                elif role == "reviewer":
                     correction = self.review_correction(guard, previous_review)
                 elif role == "commander":
                     correction["source"] = {field: receipt[field] for field in
@@ -1965,7 +1977,7 @@ class Engine(EnvironmentRecovery, DecisionRecovery, ProgressRecovery, InvalidOut
                 tasks = self.validate_tasks(plan)
                 self.run["original_tasks"] = deepcopy(tasks)
                 self.record_plan(tasks, "Initial plan")
-            if not self.run["attempts"] or self.run.get("environment_updates"):
+            if not self.run["attempts"] or self.run.get("environment_updates") or self.run.get("operator_decisions"):
                 self.preflight_final_context()
             if self.run["plan_approval_required"] and not self.run["plan_approved"]:
                 self.run["status"] = "awaiting_approval"

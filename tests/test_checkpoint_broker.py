@@ -1,5 +1,6 @@
 """Real local broker evidence with simulated workers; no provider integration claim."""
 import hashlib
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -17,6 +18,52 @@ def digest(path):
 
 
 class BrokerCheckpointLifecycleTests(RepoCase):
+    def test_format_repair_preserves_broker_evidence_boundary_and_optional_omission(self):
+        for mode in ('old', 'omit', 'repeat'):
+            with self.subTest(mode=mode):
+                receipts = []
+                def repair(backend, kwargs, packet, result):
+                    if kwargs['role'] != 'worker':
+                        return
+                    count = sum(c['role'] == 'worker' for c in backend.calls)
+                    if count == 1 or mode == 'repeat':
+                        manifest = create_manifest(self.config, kwargs['cwd'], kwargs['job'], engine.directory / 'state.json')
+                        receipt = Broker(manifest['artifact'], manifest['artifact_digest']).run_command(
+                            {'command_id': command_id(self.config.data['verification']['commands'][0])})
+                        self.assertEqual(receipt['exit_code'], 0)
+                        receipts.append(receipt)
+                    if count == 1 or mode != 'omit':
+                        receipt = receipts[-1]
+                        result['checkpoints'] = [{'id': 'check', 'summary': 'Observed command output',
+                            'inputs': [], 'evidence': [{'path': receipt['stdout_path'], 'sha256': receipt['stdout_sha256']}],
+                            'freshness': 'volatile', 'max_age_seconds': 60}]
+                    if count == 1:
+                        result['summary'] = 'x' * 4001
+                backend = ScriptedBackend(repair)
+                engine = self.engine(backend)
+                result = engine.start('Implement greet', read_json(ROOT / 'examples' / 'plan.json'))
+                self.assertEqual(result['status'], 'completed')
+                workers = [d for d in result['dispatches'] if d['role'] == 'worker']
+                self.assertEqual(len(workers), 2)
+                self.assertNotEqual(workers[0]['id'], workers[1]['id'])
+                repair_call = [c for c in backend.calls if c['role'] == 'worker'][1]
+                self.assertEqual(repair_call['packet']['format_correction']['previous_dispatch'], workers[0]['id'])
+                self.assertEqual(len(receipts), 2 if mode == 'repeat' else 1)
+                rows = result['task_checkpoints']
+                self.assertEqual(len(rows), 1 if mode == 'repeat' else 0)
+                events = [json.loads(line) for line in (engine.directory / 'events.jsonl').read_text().splitlines()]
+                self.assertEqual(sum(e['event'] == 'output_format_repair' for e in events), 1)
+                discarded = [e for e in events if e['event'] == 'checkpoints_discarded']
+                self.assertEqual(len(discarded), 1 if mode == 'old' else 0)
+                if mode == 'repeat':
+                    saved = read_json(Path(rows[0]['artifact']))
+                    self.assertEqual(saved['freshness_origin'], workers[1]['invoked_at'])
+                    self.assertIn(workers[1]['id'], saved['evidence'][0]['path'])
+                self.assertTrue(Path(receipts[0]['stdout_path']).is_file())
+                self.assertTrue(any(d['role'] == 'verification' for d in result['dispatches']))
+                self.assertTrue(any(c['kind'] == 'review' for c in backend.calls))
+                self.assertTrue(any(c['kind'] == 'final_review' for c in backend.calls))
+
     def test_broker_output_survives_resume_and_retains_acceptance_gates(self):
         receipts = []
 
