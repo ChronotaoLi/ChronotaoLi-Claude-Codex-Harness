@@ -9,10 +9,10 @@ from .util import HarnessError
 
 DEFAULTS = {
     "runtime": {
-        "agent_timeout_seconds": 1200, "verify_timeout_seconds": 300,
+        "agent_timeout_seconds": 1800, "verify_timeout_seconds": 300,
         "max_attempts": 3, "max_final_attempts": 3, "max_total_attempts": 60, "max_replans": 2,
         "max_agent_dispatches": 200,
-        "max_tasks": 20, "context_chars": 32000, "claude_max_turns": 50,
+        "max_tasks": 20, "context_chars": 100000, "claude_max_turns": 50,
     },
     "permissions": {"worker_commands": []},
     "memory": {"task_ttl_days": 180, "knowledge_ttl_days": 180},

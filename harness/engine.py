@@ -22,6 +22,7 @@ from .contracts import (DETAIL, PLAN, REPLAN, REVIEW, WORK, RepairableFormatErro
                         validate_structure, validate_work, validate_work_semantics, validate_approval_repair,
                         validate_commander_format_correction, validate_immutable_findings)
 from .memory import Memory, validate_proposals
+from .requirements import missing_commands
 from .environment import EnvironmentRecovery
 from .decisions import DecisionRecovery, read_decision, validate_handoff_question
 from .progress import CheckpointDeclarationError, ProgressRecovery
@@ -213,6 +214,29 @@ class Engine(EnvironmentRecovery, DecisionRecovery, ProgressRecovery, InvalidOut
             if unknown:
                 raise HarnessError(f"计划引用不存在的 skill：{sorted(unknown)}")
         return tasks
+
+    def report_command_requirements(self):
+        # Recompute from the plan and current grants; the saved report is only
+        # an operator diagnostic and must never authorize a dispatch.
+        missing = missing_commands(self.run["tasks"], self.run["accepted"], self.config.data)
+        report = {"missing": missing}
+        if report != self.run.get("command_requirements"):
+            self.run["command_requirements"] = report
+            self.save()
+            self.event("command_requirements_checked", **report)
+            if missing:
+                print("[harness] 计划存在未授权的任务命令：" + json.dumps(missing, ensure_ascii=True)
+                      + "；对应 worker 派发前必须在 permissions.worker_commands 追加精确 argv。",
+                      file=sys.stderr, flush=True)
+        return missing
+
+    def require_task_commands(self, task_ids):
+        missing = self.report_command_requirements()
+        unmet = {tid: missing[tid] for tid in task_ids if tid in missing}
+        if unmet:
+            raise HarnessError("任务所需命令尚未授权：" + json.dumps(unmet, ensure_ascii=True)
+                               + "；在 permissions.worker_commands 追加这些精确 argv 后普通 resume；"
+                                 "计划批准不授予命令权限，本检查不消耗 worker 尝试或模型派发额度")
 
     def approve_scope_extensions(self, patterns):
         """Record explicit operator authority for new tasks in a pending replan."""
@@ -740,6 +764,7 @@ class Engine(EnvironmentRecovery, DecisionRecovery, ProgressRecovery, InvalidOut
 
     def dispatch_once(self, role, kind, task_id, schema, packet, task=None, previous_review=None):
         if role == "worker":
+            self.require_task_commands([task_id])
             # Includes automatic format corrections and retries after local
             # preparation failure, before either invocation budget is consumed.
             self.check_environment(task_id)
@@ -760,9 +785,10 @@ class Engine(EnvironmentRecovery, DecisionRecovery, ProgressRecovery, InvalidOut
             required["output_constraints"] = review_output_constraints(
                 contract, [p["key"] for p in packet.get("proposed_memories", [])])
         if role != "reviewer":
-            required["available_skills"] = skills_catalog(self.config.asset("skills"))
+            required["available_skills"] = skills_catalog(self.config.asset("skills"), task_only=True)
         if task and role == "worker":
-            required["task_skills"] = {s: read_skill(self.config.asset("skills"), s) for s in task["skills"]}
+            required["task_skills"] = {s: read_skill(self.config.asset("skills"), s)
+                                       for s in task["skills"] if s != "harness-" + role}
         query = (task["title"] + " " + task["description"]) if task else self.run["goal"]
         if role == "commander" and kind == "dispatch":
             query = self.run["goal"] + " " + " ".join(t["title"] for t in packet["ready"])
@@ -1227,6 +1253,7 @@ class Engine(EnvironmentRecovery, DecisionRecovery, ProgressRecovery, InvalidOut
                 self.event("resume_config_relaxed", changes=changes)
                 self.save()
             self.record_environment_update(update)
+            self.report_command_requirements()
             if self.run["tasks"] and self.run["plan_approval_required"] and not self.run["plan_approved"]:
                 if not approve_plan:
                     raise HarnessError("计划等待明确批准；使用 resume --approve-plan 继续")
@@ -1393,6 +1420,7 @@ class Engine(EnvironmentRecovery, DecisionRecovery, ProgressRecovery, InvalidOut
             self.event("broad_scope_warning", revision=revision, scopes=broad)
             print("[harness] 警告：任务范围覆盖全仓库，受保护路径仍禁止修改："
                   + json.dumps(broad, ensure_ascii=True), file=sys.stderr, flush=True)
+        self.report_command_requirements()
 
     def replan(self, trigger):
         pending = self.run.get("pending_replan")
@@ -2004,6 +2032,7 @@ class Engine(EnvironmentRecovery, DecisionRecovery, ProgressRecovery, InvalidOut
                 tasks = self.validate_tasks(plan)
                 self.run["original_tasks"] = deepcopy(tasks)
                 self.record_plan(tasks, "Initial plan")
+            self.report_command_requirements()
             if not self.run["attempts"] or self.run.get("environment_updates") or self.run.get("operator_decisions"):
                 self.preflight_final_context()
             if self.run["plan_approval_required"] and not self.run["plan_approved"]:
@@ -2059,6 +2088,15 @@ class Engine(EnvironmentRecovery, DecisionRecovery, ProgressRecovery, InvalidOut
                     if not runnable:
                         raise self.decision_required(self.task_decision_gate(ready[0]["id"]))
                     ready = runnable
+                    # An existing selection owns its recovery edits/directive.
+                    # Otherwise independent work may proceed while an operator
+                    # supplies another task's explicitly declared commands.
+                    missing = self.report_command_requirements()
+                    if not self.run.get("pending_directive"):
+                        runnable = [t for t in ready if t["id"] not in missing]
+                        if not runnable:
+                            self.require_task_commands([t["id"] for t in ready])
+                        ready = runnable
                     if self.task_attempt(ready):
                         accepted_this_call += 1
                 elif self.final_review(reverify=getattr(self, "reverify_requested", False)):

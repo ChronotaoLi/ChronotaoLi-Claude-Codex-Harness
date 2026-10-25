@@ -18,7 +18,7 @@ class DispatchAccountingTests(RepoCase):
         def lengthy_worker_skill(path, name):
             return "Worker instructions " * 2000 if name == "harness-worker" else read_skill(path, name)
 
-        self.config.data["runtime"].update(max_attempts=1, max_total_attempts=1)
+        self.config.data["runtime"].update(max_attempts=1, max_total_attempts=1, context_chars=32000)
         backend = RecordingBackend()
         engine = self.engine(backend)
         with patch("harness.engine.read_skill", side_effect=lengthy_worker_skill):

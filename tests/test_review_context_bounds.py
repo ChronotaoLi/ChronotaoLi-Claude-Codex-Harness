@@ -35,6 +35,11 @@ def identities(review):
 
 
 class BoundedReviewLifecycleTests(RepoCase):
+    def setUp(self):
+        super().setUp()
+        # Exercise bounded retrieval under an explicitly constrained budget.
+        self.config.data["runtime"]["context_chars"] = 32000
+
     def plan(self):
         return read_json(ROOT / "examples" / "plan.json")
 
@@ -48,7 +53,7 @@ class BoundedReviewLifecycleTests(RepoCase):
         self.assertEqual(read_json(path)["review"]["findings"], original["findings"])
         self.assertEqual(read_json(path)["review"]["summary"], original["summary"])
 
-    def test_maximum_task_rejection_reaches_rework_and_review_with_default_context(self):
+    def test_maximum_task_rejection_reaches_rework_and_review_with_constrained_context(self):
         rejected = maximum_review()
         sizes = []
 

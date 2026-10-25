@@ -1,6 +1,6 @@
 # 验证记录
 
-最近验证日期：2026-10-22。本记录描述已执行的检查，不保证将来账号权限或 CLI 行为不变。
+最近验证日期：2026-10-25。本记录描述已执行的检查，不保证将来账号权限或 CLI 行为不变。
 
 ## 首版离线基线
 
@@ -284,3 +284,16 @@ Codex 0.163.0 的本地 `debug prompt-input` 检查确认：未提交的 AGENTS.
 使用 Python 3.11.17 执行检查点语义、输出契约、记忆作用域、记忆 CLI 和操作控制共 33 项测试，全部通过，15.955 秒；精简 skill 后另执行两个检查点容量测试，全部通过，7.066 秒。日志为 `.harness/v18-python311.log` 和 `.harness/v18-context-python311.log`。未在 Python 3.11 重跑完整套件；`python3.11 -m compileall -q harness tests` 与 `git diff --check` 通过。
 
 独立 `gpt-6.1-sol` 审阅实现、行为测试和文档，并复核精简后的 worker 规则，无未解决的阻断发现。台账保持版本 11，模型 ID、进程与派发隔离、权限、验证和接受门禁不变；记忆保持全局 key，以写事务拒绝跨作用域替换，不迁移数据库或追溯恢复旧版本。上述离线测试使用模拟模型响应及真实本地 Git／验证子进程，不证明真实模型联调通过；本轮未运行 `harness smoke`、`harness.tool_smoke` 或 `harness.permission_smoke`。第十八轮临时审阅文档已按要求删除。
+
+
+## 第 4 轮实测反馈修订验证（2026-10-25，台账 v11）
+
+最终执行 `python3 -m unittest discover -s tests -v`：748 项，747 项通过、1 项因文件系统拒绝非 UTF-8 文件名而跳过，Python 3.15.1，712.108 秒。完整日志保存在 `.harness/checks/field-test-fixes-unittest-final.log`，不提交；`git diff --check` 通过。
+
+新增 19 项离线测试覆盖默认 100,000 字符／1,800 秒及显式配置保留、必要输入与可选记忆计量、角色 skill 去重且额外任务技能仍进入实际 worker、旧计划兼容，以及 `required_commands` 的精确 argv、计划批准不授予命令权限、缺授权时零调用预算、追加授权后的普通恢复、独立任务继续、既有指令恢复、模型计划不重抽和再规划不可变义务。命令预检不执行命令，测试也不将授权存在视为命令执行成功。
+
+首次完整套件发现三处容量测试失败：两项隐含依赖旧默认值，一项因扩写审阅规则使必要输入达到 32,560 字符。将压力测试显式固定为原 32,000 字符，并精简注入的生命周期规则后，相关 21 项测试全部通过，27.887 秒；没有抬高其压力门槛。失败日志和复核日志分别保留在 `.harness/checks/field-test-fixes-unittest.log`、`.harness/checks/field-test-fixes-capacity-recheck.log`，随后重新运行并通过上述完整套件。
+
+使用 Python 3.11.17 对新增用例及受影响的检查点容量、整体上下文和派发计数共 40 项测试复核，全部通过，38.348 秒；日志为 `.harness/checks/field-test-fixes-python311-final.log`。未在 Python 3.11 重跑完整套件。
+
+独立 `gpt-6.1-sol` 审阅实现与恢复门禁，无未解决的阻断发现。台账仍为版本 11，不修改配置的模型 ID，不新增命令授权、自动合并或供应商会话恢复。所有 Harness 流程测试均使用模拟模型响应及真实本地 Git／子进程；未运行真实账号的 `harness smoke`、`harness.tool_smoke` 或 `harness.permission_smoke`，也不据此声称生命周期审阅规则提高了真实模型的缺陷检出率。

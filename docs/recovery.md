@@ -9,7 +9,7 @@
 再规划只处理任务拆分、缺少前置工作和整体验收发现的工程缺口。worker 通过 `blocker_kind` 区分 task、environment 与 operator；operator 等待明确回答，不先再规划；CLI 错误、权限、范围违例和现场不一致不会被包装成自动再规划。非法结果默认停止；明确归属且保留拒绝证据的 invalid_rejected 整体审阅可自动进入修正规划，操作者请求的有界非法结果修正另述。指挥返回 `{action, reason, new_tasks, updates}`：每个 update 仅包含 `id`、`description`、`add_depends_on`，stop 必须提供空操作数组。运行时在原计划上应用增量并重新检查 DAG，要求：
 
 - 保留每个既有任务 ID，已接受任务完全不变。
-- 未接受任务只可更新描述并添加依赖；标题、skills、验收和 allowed_paths 均从台账保留，已有依赖不得删除。
+- 未接受任务只可更新描述并添加依赖；标题、skills、required_commands、验收和 allowed_paths 均从台账保留，已有依赖不得删除。
 - 新任务只使用已有 allowed_paths 中的模式，或操作者显式加入 approved_scope 的模式；不通过推测 glob 包含关系放大范围。
 - 原始任务继续承担最终集成义务，拆分不能删除或重命名它来避开失败。
 - 每次修订保存版本与原因。校验通过后先持久化待应用修订，再归档未接受修改并恢复隔离工作树，保留已接受提交。归档阶段中断时，恢复继续应用同一修订，不重复调用指挥或增加再规划次数；新的归档尝试保留独立目录。
@@ -125,6 +125,7 @@ worker 调用失败或中断时，另按 task ID 保存 `worker_recovery`，记�
 | 状态或原因 | 操作者出口 | 仍须满足的条件 |
 | --- | --- | --- |
 | 提供的计划非法 | 修正 `--plan` 文件后重新 `run` | 此时尚未创建 run 现场 |
+| 任务声明的精确命令未授权 | 追加 `permissions.worker_commands` 后普通 `resume` | 预检不消耗 worker 额度；`--approve-plan` 不授予命令权限，无需环境 blocker 更新 |
 | 等待计划批准 | `resume --approve-plan` | 不以普通 resume 代替批准 |
 | 次数、上下文或超时预算不足 | 按允许范围增加配置后 `resume` | 累计计数不清零，已有结果不重抽 |
 | 旧进程存活或退出未知 | 核实后 `resume --confirm-exited ID`；终态使用 `cleanup-verification RUN --confirm-exited ID` | 确认精确 dispatch，先审计后写入，不终止无关进程 |

@@ -82,6 +82,12 @@ python3 -m harness --config /absolute/path/harness.toml --repo /absolute/path/to
 
 用户提供的计划在创建 run 目录、分支和 worktree 前完成校验，输入错误可直接修正后重试。任务范围应覆盖实现所需的具体测试与夹具，前置工作应有明确归属与依赖顺序。`**`、`**/*` 等常见全仓库模式仍允许使用，但登记计划时会向 stderr 提示并记录 `broad_scope_warning`；这类范围不限制普通项目文件，受保护路径门禁仍生效。
 
+任务可声明 `required_commands`，例如 `[["node", "scripts/lan-share/mode-ui-test.mjs"]]`，最多 32 条不同的完整 argv。这是执行前置条件，不是授权。登记计划和恢复时提前列出所有未授权项；对应 worker 派发前重新与 `verification.commands`、`permissions.worker_commands` 精确比较，不执行命令。参数、空参数、字面 `*` 和换行均原样比较，不接受命令前缀，`verification.setup_commands` 不授予 worker 能力。没有声明的旧计划保持原行为，已知命令应由指挥显式列出，未知参数仍由后续发现阶段报告。
+
+缺少声明命令的任务不会启动 worker 或消耗其尝试；其他就绪且满足权限与决定条件的任务可以继续。已有任务选择和恢复现场保持绑定。没有可执行任务时停止，`status RUN` 显示 `missing_command_requirements`；在配置中追加精确 `permissions.worker_commands` 后普通 `resume` 即可重检，无需 `--environment-update`。计划批准不增加权限；此检查不证明命令存在、执行成功或验收通过，也不新增验证命令。已返回的 worker 结果仍继续原验证和审阅门禁。
+
+角色 skill 自动注入一次，指挥看到的可选任务 skill 目录不包含三个内置角色 skill；不需要额外技能时使用 `skills: []`。旧计划中的角色 skill 引用仍合法，同名 worker 角色内容不会重复注入，其他任务 skill 正常保留。
+
 默认连续执行。需要先检查计划或分步执行时，可显式选择：
 
 ```bash
@@ -319,7 +325,7 @@ Claude worker 通过锚定在工作树真实路径的 `Edit(//.../**)` 规则允
 worker_commands = [["python3", "-m", "unittest", "tests.test_export", "-v"]]
 ```
 
-精确 argv 可包含字面的 `*` 或换行，由命令 broker 原样传递；旧 Bash 授权仍过滤这些 argv，以免 CLI 将其解释为权限模式。需要管道或重定向时，必须显式授权完整的 `["/bin/sh", "-c", "固定脚本"]`，broker 不自行添加 shell。不会自动组合命令或授予 `gh`、`ssh`、`curl` 等命令前缀。需要删除或移动文件时，可显式配置包含具体路径的 `rm` / `mv` argv；默认不授予这些命令。不得使用后台运行或权限绕过来替代 broker。不使用跳过所有权限检查的参数；CLI 自身仍可能允许内建只读命令，这些授权不是操作系统沙箱。必要命令被拒绝时，worker 应报告环境 blocker。当前 Codex 适配器只提供只读模式，因此配置 Codex worker 会提前报错。Codex 只读角色设置 `project_doc_max_bytes=0`，关闭项目指令文件的自动注入；Claude 使用 `--setting-sources ""`，当前适配版本关闭项目／本地来源的指令加载。已提交的项目指令也需由角色按需读取。其他 CLI 内建上下文及工具读取内容仍可能影响模型，32,000 字符预算仅覆盖编排器生成的输入包。
+精确 argv 可包含字面的 `*` 或换行，由命令 broker 原样传递；旧 Bash 授权仍过滤这些 argv，以免 CLI 将其解释为权限模式。需要管道或重定向时，必须显式授权完整的 `["/bin/sh", "-c", "固定脚本"]`，broker 不自行添加 shell。不会自动组合命令或授予 `gh`、`ssh`、`curl` 等命令前缀。需要删除或移动文件时，可显式配置包含具体路径的 `rm` / `mv` argv；默认不授予这些命令。不得使用后台运行或权限绕过来替代 broker。不使用跳过所有权限检查的参数；CLI 自身仍可能允许内建只读命令，这些授权不是操作系统沙箱。必要命令被拒绝时，worker 应报告环境 blocker。当前 Codex 适配器只提供只读模式，因此配置 Codex worker 会提前报错。Codex 只读角色设置 `project_doc_max_bytes=0`，关闭项目指令文件的自动注入；Claude 使用 `--setting-sources ""`，当前适配版本关闭项目／本地来源的指令加载。已提交的项目指令也需由角色按需读取。其他 CLI 内建上下文及工具读取内容仍可能影响模型，100,000 字符预算仅覆盖编排器生成的输入包。
 
 两种只读角色的调用方式不同：Claude 通过工具许可限制可用写入工具和命令，Codex 调用显式传入 `--sandbox read-only`。这些配置不承诺工作树之外的读取隔离；需要更强隔离时使用专用 OS 用户或容器。
 
@@ -365,7 +371,9 @@ python3 -m harness --repo /path/to/project memory export > memory-backup.json
 
 首次执行、应用再规划前，以及已有环境更新或操作者答复的恢复中，预检整体审阅容量。确定的必要内容下界超限时保存计划并停止，允许增加 `context_chars` 后恢复；预计摘要和验证输出可能超限时提前警告。决定摘录会随答复修订或条数变化而缩减，因此仅计入预警估计；检查点按最终全部任务已接受的场景只提供索引，不把当前未接受任务的展开内容计入最终容量。预计容量不是保证，后续历史和实际输出仍可能使输入超限，所有正式派发继续执行完整输入的实际预算检查。
 
-所有输入包与预算报告落在 dispatch 目录。默认 `context_chars = 32000` 是字符预算，不是假称的精确 token 数。
+所有输入包与预算报告落在 dispatch 目录。默认 `context_chars = 100000` 是编排输入的字符上限，不是 token 数或固定输入长度。`context-report.json` 分别记录必要输入 `required_chars`、已加入的可选记忆及其分隔文本 `memory_chars`，两者之和为 `used_chars`；必要输入超限才触发硬门禁，可选记忆按剩余预算整条加入。
+
+默认 `agent_timeout_seconds = 1800`，`claude_max_turns = 50` 保持不变。Claude 的轮数上限针对工具使用循环，一轮可以包含多个工具调用；供应商报告的 `num_turns` 仅用于观测，不能直接与该上限比较。提高上下文与超时上限不保证任意长任务或审阅历史都可完成。
 
 ## 数据与排查
 

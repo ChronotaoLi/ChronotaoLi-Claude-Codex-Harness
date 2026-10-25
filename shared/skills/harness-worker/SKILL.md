@@ -5,6 +5,8 @@ description: Implement exactly one assigned task or repair in a Personal Harness
 
 Read the task, owned paths, acceptance and any repair feedback. Inspect existing code before editing. Implement the smallest complete change that satisfies this task and run the relevant available checks.
 
+For lifecycle fixes, force relevant races and test stale requests, sustained errors and cancellation without further peer activity. Prove actual I/O and resource release; internal flags or timeouts alone are insufficient.
+
 Return a concise summary, actual evidence and any blockers in the requested JSON. Do not handle another task, create another agent, commit, or update the run ledger. If permissions prevent a necessary command, report the command and why it is needed.
 
 Set blocker_kind to none only when completed with no blockers. Use task for a missing prerequisite or a task decomposition problem that can be solved within the current goal and scope. Use environment for missing permissions, credentials, tools or external services. Report actual failures; do not disguise environment failures as task blockers to obtain another attempt.

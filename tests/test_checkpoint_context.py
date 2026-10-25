@@ -9,6 +9,11 @@ from test_runtime_changes import ScriptedBackend
 
 
 class CheckpointContextTests(RepoCase):
+    def setUp(self):
+        super().setUp()
+        # Keep the original pressure limit independent of production defaults.
+        self.config.data['runtime']['context_chars'] = 32000
+
     def backend(self, count, blocked_attempts=0):
         evidence = self.repo.resolve() / 'external-output.bin'
         evidence.write_bytes(b'raw output\n')

@@ -313,6 +313,7 @@ def compose(required: dict, memories: list[dict], budget: int):
         if len(packet) + len(candidate) <= budget:
             packet += candidate
             kept.append(memory["id"])
-    return packet, {"budget_chars": budget, "used_chars": len(packet),
+    return packet, {"budget_chars": budget, "required_chars": len(core),
+                    "memory_chars": len(packet) - len(core), "used_chars": len(packet),
                     "memory_ids": kept, "omitted_memories": len(memories) - len(kept),
                     "method": "structured checkpoint + bounded retrieval; not tokenizer count"}

@@ -4,6 +4,7 @@ from copy import deepcopy
 from pathlib import PurePosixPath
 
 from . import git
+from .config import validate_commands
 from .util import HarnessError
 
 
@@ -29,6 +30,10 @@ PROPOSALS = {"type": "array", "items": PROPOSAL, "maxItems": 8}
 TASK = obj(id=TASK_ID, title=NONBLANK, description=NONBLANK, depends_on=DEPENDENCIES,
            allowed_paths=OBLIGATIONS, acceptance=OBLIGATIONS,
            skills={"type": "array", "items": SKILL_NAME})
+# Optional for existing plans. These are prerequisites, never command grants.
+REQUIRED_COMMANDS = {"type": "array", "items": {"type": "array", "items": TEXT, "minItems": 1},
+                     "maxItems": 32, "uniqueItems": True}
+TASK["properties"]["required_commands"] = REQUIRED_COMMANDS
 PLAN = obj(tasks={"type": "array", "items": TASK, "minItems": 1})
 TASK_UPDATE = obj(id=TASK_ID, description=NONBLANK, add_depends_on=DEPENDENCIES)
 REPLAN = obj(action={"type": "string", "enum": ["revise", "stop"]},
@@ -260,6 +265,14 @@ def validate_commander_format_correction(kind, previous, current):
         raise HarnessError("指挥格式修正不得改变原任务选择或修订操作")
 
 
+def validate_required_commands(task):
+    commands = task.get("required_commands", [])
+    validate_structure(commands, REQUIRED_COMMANDS, "task.required_commands")
+    validate_commands(commands, "task.required_commands")
+    _validate_format(commands, REQUIRED_COMMANDS, "task.required_commands")
+    return commands
+
+
 def validate_plan(plan, max_tasks=20):
     validate_structure(plan, PLAN)
     tasks = plan["tasks"]
@@ -267,6 +280,7 @@ def validate_plan(plan, max_tasks=20):
     if not tasks or len(tasks) > max_tasks or len(set(ids)) != len(ids):
         raise HarnessError("计划必须有 1..max_tasks 个任务，且 ID 唯一")
     for task in tasks:
+        validate_commands(task.get("required_commands", []), "task.required_commands")
         if not re.fullmatch(TASK_ID["pattern"], task["id"]):
             raise HarnessError("任务 ID 只能含字母、数字、下划线和连字符")
         if not task["description"].strip() or not task["title"].strip():
@@ -346,6 +360,8 @@ def validate_revision(current_tasks, proposed_tasks, accepted_ids, max_tasks=20,
             raise HarnessError("再规划不得修改已接受任务")
         if old["acceptance"] != new["acceptance"] or old["allowed_paths"] != new["allowed_paths"]:
             raise HarnessError("再规划不得改变既有验收条件或文件范围")
+        if old.get("required_commands", []) != new.get("required_commands", []):
+            raise HarnessError("再规划不得改变既有任务的 required_commands")
         if not set(old["depends_on"]) <= set(new["depends_on"]):
             raise HarnessError("再规划不得移除既有依赖")
     for ident in proposed.keys() - current.keys():

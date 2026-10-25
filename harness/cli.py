@@ -126,6 +126,13 @@ def status_summary(run):
                 "runtime_failed" if entry.get("status") == "failed" else "unknown")
             outcomes[key] += 1
     result["worker_outcomes"] = outcomes
+    command_report = run.get("command_requirements", {})
+    if not isinstance(command_report, dict) or not isinstance(command_report.get("missing", {}), dict):
+        raise HarnessError("运行台账 command_requirements 诊断无效；使用 status --full 查看原始内容")
+    missing = {tid: argv for tid, argv in command_report.get("missing", {}).items()
+               if tid not in run.get("accepted", {})}
+    if missing:
+        result["missing_command_requirements"] = missing
     feedback = run.get("feedback")
     if isinstance(feedback, dict):
         worker = feedback.get("worker")

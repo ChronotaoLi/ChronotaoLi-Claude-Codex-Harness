@@ -35,11 +35,21 @@ def toml_value(value):
     return json.dumps(value, ensure_ascii=False)
 
 
-def skills_catalog(root: Path):
+ROLE_SKILLS = frozenset({"harness-commander", "harness-worker", "harness-reviewer"})
+
+
+def skills_catalog(root: Path, *, task_only=False):
+    """List readable skills, optionally excluding automatically injected role skills.
+
+    The full catalog remains available for validating existing task plans and
+    explicit MCP retrieval, including plans that reference a builtin role skill.
+    """
     result = []
     for path in sorted(root.glob("*/SKILL.md")):
         if path.is_symlink() or path.parent.is_symlink():
             raise HarnessError("shared skills 不能使用符号链接")
+        if task_only and path.parent.name in ROLE_SKILLS:
+            continue
         match = re.search(r"^description:\s*(.+)$", path.read_text(encoding="utf-8"), re.M)
         result.append({"name": path.parent.name, "description": match.group(1) if match else path.parent.name})
     return result
