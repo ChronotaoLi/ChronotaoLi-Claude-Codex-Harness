@@ -297,3 +297,17 @@ Codex 0.163.0 的本地 `debug prompt-input` 检查确认：未提交的 AGENTS.
 使用 Python 3.11.17 对新增用例及受影响的检查点容量、整体上下文和派发计数共 40 项测试复核，全部通过，38.348 秒；日志为 `.harness/checks/field-test-fixes-python311-final.log`。未在 Python 3.11 重跑完整套件。
 
 独立 `gpt-6.1-sol` 审阅实现与恢复门禁，无未解决的阻断发现。台账仍为版本 11，不修改配置的模型 ID，不新增命令授权、自动合并或供应商会话恢复。所有 Harness 流程测试均使用模拟模型响应及真实本地 Git／子进程；未运行真实账号的 `harness smoke`、`harness.tool_smoke` 或 `harness.permission_smoke`，也不据此声称生命周期审阅规则提高了真实模型的缺陷检出率。
+
+## 第二十轮审阅修订验证（2026-10-25，台账 v11）
+
+执行 `python3 -m unittest discover -s tests -v`：750 项，749 项通过、1 项因本机文件系统拒绝非 UTF-8 文件名而跳过，Python 3.15.1，726.786 秒。完整日志保存在 `.harness/validation/review-v20-offline.log`，不提交；`git diff --check` 通过。
+
+模型计划或再规划新增任务的 `required_commands` 重复或超过 32 条时，现按计划语义错误拒绝，保留原始 receipt，经操作者 `--repair-invalid` 修正，不进入禁止改变计划操作的自动格式修正。新增 2 项生命周期测试包含 6 个子场景，覆盖 plan/replan 的重复与超限，以及 replan 同时含超长 reason；核对普通恢复不追加派发或清零预算、显式修正使用新 dispatch ID、原始结果字节不变、原任务义务保留，并通过正常验证、任务审阅与整体审阅完成。已有操作者计划预检用例另加入重复与 33 条命令，确认创建 run 前拒绝。
+
+在未修改的运行时代码上先运行新增 2 项测试，6 个子场景均检出多余的自动修正派发；日志为 `.harness/validation/review-v20-baseline.log`。首次针对性测试漏算再规划后的两次指挥任务选择，将总派发预期误写为 8；核对 blocker 反馈后的 prep 选择和 greet 重试选择后，改为显式断言两次选择及总派发 10 次。该测试预期修正没有改变运行时调度或预算，初次日志保留在 `.harness/validation/review-v20-focused.log` 和 `.harness/validation/review-v20-python311.log`。
+
+使用 Python 3.11.17 执行 `PYTHONPATH=tests python3.11 -m unittest test_command_requirements -v`：13 项全部通过，26.473 秒；日志为 `.harness/validation/review-v20-python311-final.log`。未在 Python 3.11 重跑完整套件。
+
+独立 `gpt-6.1-sol` 审阅实现、生命周期测试和文档，无未解决的阻断发现，并核对 0／1／32 条命令、33 条、精确重复及特殊 argv 的合同边界。审阅记录保存在 `.harness/validation/review-v20-agent-review.txt`，不提交。旧 run 已进入错误自动格式修正并保存修正结果时，本次修复不迁移其现场或放宽原守卫，仍需保留证据后 abandon 并另行发起运行；README、设计与恢复协议已明确此限制。
+
+台账保持版本 11，schema、模型 ID、进程与派发隔离、命令授权和接受门禁不变。Harness 流程测试使用模拟模型响应及真实本地 Git／验证子进程，不证明真实模型联调通过；本轮未运行 `harness smoke`、`harness.tool_smoke` 或 `harness.permission_smoke`。临时审阅文档 `docs/review-2026-10-25-v20.md` 已按要求删除。

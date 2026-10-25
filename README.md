@@ -84,6 +84,8 @@ python3 -m harness --config /absolute/path/harness.toml --repo /absolute/path/to
 
 任务可声明 `required_commands`，例如 `[["node", "scripts/lan-share/mode-ui-test.mjs"]]`，最多 32 条不同的完整 argv。这是执行前置条件，不是授权。登记计划和恢复时提前列出所有未授权项；对应 worker 派发前重新与 `verification.commands`、`permissions.worker_commands` 精确比较，不执行命令。参数、空参数、字面 `*` 和换行均原样比较，不接受命令前缀，`verification.setup_commands` 不授予 worker 能力。没有声明的旧计划保持原行为，已知命令应由指挥显式列出，未知参数仍由后续发现阶段报告。
 
+模型计划或再规划中的声明重复或超限时，保留非法结果并停止，使用 `resume RUN --repair-invalid DISPATCH_ID` 显式修正；普通恢复不重新抽取计划。操作者提供的非法 `--plan` 在创建 run 前拒绝。已进入旧版错误自动修正流程的现场仍受原守卫约束，详见[恢复协议](docs/recovery.md#阻塞状态与操作者出口)。
+
 缺少声明命令的任务不会启动 worker 或消耗其尝试；其他就绪且满足权限与决定条件的任务可以继续。已有任务选择和恢复现场保持绑定。没有可执行任务时停止，`status RUN` 显示 `missing_command_requirements`；在配置中追加精确 `permissions.worker_commands` 后普通 `resume` 即可重检，无需 `--environment-update`。计划批准不增加权限；此检查不证明命令存在、执行成功或验收通过，也不新增验证命令。已返回的 worker 结果仍继续原验证和审阅门禁。
 
 角色 skill 自动注入一次，指挥看到的可选任务 skill 目录不包含三个内置角色 skill；不需要额外技能时使用 `skills: []`。旧计划中的角色 skill 引用仍合法，同名 worker 角色内容不会重复注入，其他任务 skill 正常保留。

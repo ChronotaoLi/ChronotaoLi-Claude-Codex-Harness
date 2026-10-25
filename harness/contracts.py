@@ -280,7 +280,13 @@ def validate_plan(plan, max_tasks=20):
     if not tasks or len(tasks) > max_tasks or len(set(ids)) != len(ids):
         raise HarnessError("计划必须有 1..max_tasks 个任务，且 ID 唯一")
     for task in tasks:
-        validate_commands(task.get("required_commands", []), "task.required_commands")
+        commands = task.get("required_commands", [])
+        validate_commands(commands, "task.required_commands")
+        # Changing prerequisites is a plan correction, not a text format repair.
+        if len(commands) > REQUIRED_COMMANDS["maxItems"]:
+            raise HarnessError(f"任务 {task['id']} 的 required_commands 最多 {REQUIRED_COMMANDS['maxItems']} 条")
+        if len({tuple(argv) for argv in commands}) != len(commands):
+            raise HarnessError(f"任务 {task['id']} 的 required_commands 不得重复")
         if not re.fullmatch(TASK_ID["pattern"], task["id"]):
             raise HarnessError("任务 ID 只能含字母、数字、下划线和连字符")
         if not task["description"].strip() or not task["title"].strip():

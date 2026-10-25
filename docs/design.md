@@ -57,6 +57,8 @@ OpenWiki 参考的是 Neuroant/OpenWiki。如果原意是 OpenViking，它是另
 
 任务可选 `required_commands` 保存最多 32 条不同的完整 argv，旧任务不补写默认字段。它声明已知执行前置条件，不改变授权或验收。计划登记及恢复保存 `command_requirements` 诊断并记录变化；诊断不参与授权，派发前始终从当前任务和配置重新计算。匹配仅使用 `verification.commands` 与 `permissions.worker_commands` 的精确 argv，不采用前缀、路径归一化、只读命令示例或 fresh checkout 的 setup 授权。模型若未声明或尚不知道命令，仍可能在执行时报告环境阻断。
 
+模型计划或再规划新增任务的 `required_commands` 重复或超过 32 条时，按计划语义错误拒绝，保留原始 receipt，允许操作者通过 `--repair-invalid` 请求一次显式修正。普通恢复复核原结果，不追加派发；不自动去重、截断或进入禁止改变计划操作的文本格式修正。操作者提供的 `--plan` 仍在创建 run 前拒绝。旧 run 已进入错误自动修正流程的处理边界见[恢复协议](recovery.md#阻塞状态与操作者出口)。
+
 调度先保留操作者决定门禁，再从就绪任务中选取命令条件满足者；已有 current_task 或 pending_directive 不得借此换任务。worker 普通调用和格式修正都在本地准备及预算记账前重检，缺少授权时不调用 worker。全部就绪任务均缺命令时停止，保留计划和现场，追加精确 worker 授权后普通恢复即可；无需伪造 worker blocker 或环境更新来源。已返回候选的验证、审阅和接受阶段不增加这个执行前置门禁。再规划保留既有 required_commands，新任务可另行声明。此扩展沿用台账版本 11，现有恢复和共享资产校验规则不变。
 
 ## 调度、再规划与恢复
