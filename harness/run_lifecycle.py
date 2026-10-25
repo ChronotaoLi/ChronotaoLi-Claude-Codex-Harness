@@ -21,8 +21,7 @@ class RunLifecycle(RuntimeService):
         if not runtime.config.data["verification"]["commands"]:
             raise HarnessError("请先配置目标项目的 verification.commands")
         git.reject_submodules(runtime.repo)
-        if plan is not None:
-            runtime.validate_tasks(plan)
+        supplied_tasks = runtime.validate_tasks(plan) if plan is not None else []
         validate_mcp(runtime.config)
         if untracked:
             print("[harness] 主检出存在未跟踪文件；保留原处，不进入隔离 worktree："
@@ -34,7 +33,8 @@ class RunLifecycle(RuntimeService):
                     "attempt_budget_policy": "work",
                     "dispatches": [], "expected_head": git.head(runtime.repo), "feedback": None,
                     "config_path": str(runtime.config.path), "config_snapshot": deepcopy(runtime.config.data),
-                    "asset_digest": asset_digest(runtime.config), "base_commit": git.head(runtime.repo), "original_tasks": [],
+                    "asset_digest": asset_digest(runtime.config), "base_commit": git.head(runtime.repo),
+                    "original_tasks": deepcopy(supplied_tasks),
                     "total_attempts": 0, "replan_attempts": 0, "final_attempts": 0,
                     "review_history": {}, "final_history": [], "plan_history": [], "format_repairs": {},
                     "review_corrections": {}, "review_receipts": {}, "commander_receipts": {},
@@ -268,6 +268,10 @@ class RunLifecycle(RuntimeService):
             runtime.environment_context()
             runtime.confirm_exited(confirm_exited)
             runtime.ensure_exited()
+            if not runtime.run["worktree_binding"]:
+                raise HarnessError("缺少已保存的 worktree Git 绑定，无法安全恢复；"
+                                   f"使用 abandon {ident} 保留证据后重新运行；"
+                                   "若工作树或分支已创建，请核对后手工清理")
             if git.head(runtime.worktree, binding=runtime.run["worktree_binding"]) != runtime.run["expected_head"]:
                 raise HarnessError("worktree HEAD 与检查点不同；请先核对提交，不自动重放")
             update = runtime.prepare_environment_update(environment_update) if environment_update is not None else None

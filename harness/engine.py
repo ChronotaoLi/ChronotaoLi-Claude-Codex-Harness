@@ -357,6 +357,11 @@ class Engine(EnvironmentRecovery, DecisionRecovery, ProgressRecovery, InvalidOut
                 raise HarnessError(f"指挥停止重新规划：{stopped['reason']}；"
                                    f"显式使用 resume --retry-stopped {stopped['target']} 可重试保存的规划请求")
             if not self.run["tasks"]:
+                # Supplied plans survive startup before their first revision.
+                # Model plans must still revalidate any unconsumed receipt.
+                if (supplied_plan is None and self.run["original_tasks"]
+                        and "commander:plan:planning" not in self.run["commander_receipts"]):
+                    supplied_plan = {"tasks": deepcopy(self.run["original_tasks"])}
                 plan = supplied_plan if supplied_plan is not None else self.dispatch("commander", "plan", "planning", PLAN,
                          {"goal": self.run["goal"], "instruction": "Inspect the repository, then decompose the goal into bounded tasks. Each worker does one task. Use real dependencies and observable acceptance. Never change files.",
                           "max_tasks": self.config.data["runtime"]["max_tasks"],

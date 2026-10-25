@@ -325,3 +325,17 @@ Codex 0.163.0 的本地 `debug prompt-input` 检查确认：未提交的 AGENTS.
 使用 Python 3.11.17 运行 `test_checkpoint_reads`、`test_final_packet_builder`、`test_task_phase_handoffs`、`test_commander_receipts`、`test_final_stage_recovery`：43 项全部通过，60.442 秒；日志为 `.harness/refactor/python311-focused.log`。本轮未在 Python 3.11 重跑完整套件。`python3 -m compileall -q harness tests` 与 `git diff --check` 通过。
 
 阶段审阅发现并修复了输入预估的配置变量遮蔽，以及两个委托方法遗漏关键字参数的问题。随后两位独立 `gpt-6.1-sol` 分别审阅生命周期／持久化与证据／上下文／文档，均无未解决的阻断发现；审阅摘要保存为 `.harness/refactor/reviews.json`。Git 提交到台账保存之间的既有限制保留。本轮未执行真实账号的 Harness smoke，离线模拟结果不证明供应商调用可用。
+
+## 第二十一轮审阅修订验证（2026-10-25，台账 v11）
+
+执行 `python3 -m unittest discover -s tests -v`：766 项，765 项通过、1 项因本机文件系统拒绝非 UTF-8 文件名而跳过，Python 3.15.1，748.684 秒。完整日志为 `.harness/validation/v21-fix/full-unittest.log`。
+
+供给计划通过完整校验后，其任务副本随首次台账写入保存；Git 绑定已保存而计划尚未登记时，恢复沿用该计划并重新校验、登记，保留审批门禁。存在未消费的模型规划 receipt 时，仍重新核验原始结果、请求和候选快照，不能用已保存的 `original_tasks` 跳过证据检查。缺少已保存 Git 绑定时明确提示放弃后重新运行，残留工作树与分支需核对后手工清理，不自动推断绑定。
+
+新增 7 项生命周期测试覆盖绑定保存及忽略路径诊断保存后的中断、首次忽略路径扫描中断、计划工件写入失败、审批暂停、无供给计划时的正常规划，以及首次保存／绑定捕获失败时的停止与放弃。两个保存窗口均用三任务依赖链恢复至 completed，核对完整任务字段、唯一计划历史、三个任务的验证与独立审阅、整体验收及主检出隔离。模型规划工件写入失败的四个子场景覆盖完整 receipt 复用、原始结果被修改／删除及候选变化；受损证据均停止，且不新增模型调用。
+
+新增模块单独运行 7 项全部通过，9.154 秒，日志为 `.harness/validation/v21-fix/startup-focused.log`。仅在内存中恢复旧启动／执行方法后，计划工件写入失败用例检出三任务被模型单任务计划替换；仅移除 receipt 排除条件后，三个受损证据子场景均检出门禁被跳过。工作区运行时代码未为这些反向检查替换；探针与结果保存在 `.harness/validation/v21-fix/startup-regressions.log` 及同目录。
+
+使用 Python 3.11.17 执行 `test_startup_recovery`、`test_plan_preflight_diagnostics`、`test_commander_receipts`：28 项全部通过，27.460 秒，日志为 `.harness/validation/v21-fix/python311-focused.log`。本轮未在 Python 3.11 重跑完整套件。`python3.11 -m compileall -q harness tests` 与 `git diff --check` 通过。
+
+独立 `gpt-6.1-sol` 审阅运行时、行为测试和文档，无未解决的阻断发现，并独立通过新增 7 项测试及 16 项指挥 receipt 测试；审阅验证日志位于 `.harness/validation/v21-fix-review/`。台账版本、模型 ID、命令授权和接受门禁保持不变；旧 run 已经遗失且未保存的供给计划无法自动补造。所有 Harness 流程测试使用模拟模型响应及真实本地 Git／验证子进程，不证明真实模型调用成功；本轮未运行 `harness smoke`、`harness.tool_smoke` 或 `harness.permission_smoke`。临时审阅文档 `docs/review-2026-10-25-v21.md` 已按要求移除。
