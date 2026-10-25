@@ -127,6 +127,25 @@ class MemoryCLIReadTests(unittest.TestCase):
                 self.assertFalse(self.path.exists())
                 self.assertEqual(self.exclude.read_bytes(), original_exclude)
 
+    def test_run_note_cannot_hide_same_key_project_fact(self):
+        ledger = self.state / "runs" / "run_current" / "state.json"
+        ledger.parent.mkdir(parents=True)
+        ledger.write_text(json.dumps({"id": "run_current", "status": "paused", "repo": str(self.repo.resolve())}))
+        arguments = ("add", "--key", "storage", "--title", "Storage", "--text", "SQLite project fact")
+        code, output, errors = self.invoke(*arguments)
+        self.assertEqual(code, 0, errors)
+        original_id = output.strip()
+        before = json.loads(self.invoke("export")[1])
+        code, output, errors = self.invoke(*arguments, "--run", "run_current")
+        self.assertEqual(code, 1)
+        self.assertEqual(output, "")
+        self.assertIn("作用域", errors)
+        self.assertEqual(json.loads(self.invoke("export")[1]), before)
+        for extra in ((), ("--run", "run_current"), ("--run", "run_other")):
+            code, output, errors = self.invoke("search", "SQLite", *extra)
+            self.assertEqual(code, 0, errors)
+            self.assertEqual([item["id"] for item in json.loads(output)], [original_id])
+
 
 if __name__ == "__main__":
     unittest.main()

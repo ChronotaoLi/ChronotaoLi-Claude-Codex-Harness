@@ -147,13 +147,15 @@ WORK 可选 `checkpoints`，最多 16 项，每项为 `{id, summary, inputs: [{p
 
 允许的检查点源为不含 `.git`、`.harness`、`.codex`、`.claude` 保留路径段或 `..` 的普通文件；工作树内路径按相对工作树的部分检查。仅 evidence 额外允许当前 worker dispatch 的 `commands/` 中的普通文件，可直接引用 broker receipt 的绝对 stdout/stderr 路径及 SHA256；其他 dispatch、run、私有文件及 inputs 均不获得该例外。符号链接和文件大小门禁仍生效。
 
-格式修正也是新 dispatch，不能重新申报原 dispatch 的 broker 输出作为检查点证据。可以省略可选检查点，或仅重跑已授权且可安全重复的检查；不要为重新取得证据重复有副作用的操作。其他允许的普通文件证据仍可使用。原命令日志保留；completed 修正结果的检查点声明错误只记录丢弃事件，blocked 结果另携带有界反馈。不继承旧 broker 证据，也不刷新旧 volatile 证据的时间起点。
+格式修正也是新 dispatch，不能重新申报原 dispatch 的 broker 输出作为检查点证据。可以省略可选检查点，或仅重跑已授权且可安全重复的检查；不要为重新取得证据重复有副作用的操作。其他允许的普通文件证据仍可使用。原命令日志保留；通过输出契约后，completed 修正结果的检查点核对失败记录丢弃事件，blocked 结果另携带有界反馈。不继承旧 broker 证据，也不刷新旧 volatile 证据的时间起点。
 
 必要上下文只展开相关任务的最新检查点，`checkpoint_sources` 按 dispatch ID 共享来源。历史不重复最新行，超过 4,000 字符时省略内联历史并报告数量；已接受任务也不在整体审阅中展开。`checkpoint_index` 指向 SHA256 绑定的不可变索引，包含全部 manifest 路径和摘要，可检索被省略的历史及已接受任务的证据。完整声明、记录时间和输入／证据细节从 manifest 读取。投影前仍核验全部保存证据，索引损坏不会被覆盖。默认预算测试覆盖三次尝试各 16 个同 ID 检查点，以及四任务各四项的最终审阅；不同 ID 累积、较长路径或其他必要内容仍可能超限，此时增加 `context_chars` 后恢复，不能靠删除证据或降低接受门禁继续。
 
 当前任务需要用户决定时，worker 返回 `status="blocked", blocker_kind="operator"` 和具体问题；运行停止等待回答，不先再规划。已满足本任务验收的 worker 可以在 completed 结果中附带 `decision_requests: [{id, task_id, question}]`，将明确风险选择留给传递依赖于本任务的后续任务。本任务仍正常验证、审阅、接受；该请求不表示后续操作被批准，目标任务在得到回答前停止。禁止用后续阶段的操作／测试证明作为前一分析任务的完成条件；负面分析结论可以完成，但必须满足该分析任务自己的验收。
 
-worker 通过身份、结构与语义门禁后，本次可选检查点声明的哈希、路径、源文件或大小校验失败只丢弃对应项并记录 `checkpoints_discarded`，同批有效项保留；列表上限、重复 ID 等整体错误仍拒绝整批。处理结果先写入 `checkpoints/batches/<dispatch_id>.json`，绑定原始结果、有效 manifest 行及按声明索引记录的丢弃原因；其摘要与有效行一并登记，恢复核验集合完全一致。resolution 已写但台账未保存时继续登记同一结果，不重新计算有效期；私有副本或 resolution 损坏不覆盖。
+worker 通过身份、结构、完成／停止语义及格式门禁后，本次可选检查点的 content 输入／TTL 规则、实际哈希、路径、源文件或大小核对失败只丢弃对应项并记录 `checkpoints_discarded`，同批有效项保留；重复 ID 丢弃整批检查点并记录事件，保留 worker 结果和原始 blocker。合法 environment/operator 等待仍登记反馈及预算豁免，operator 等待须显式答复，environment 等待可提交环境更新。进入逐项处理的结果先写入 `checkpoints/batches/<dispatch_id>.json`，绑定原始结果、有效 manifest 行及按声明索引记录的丢弃原因；其摘要与有效行一并登记，恢复核验集合完全一致。resolution 已写但台账未保存时继续登记同一结果，不重新计算有效期；私有副本或 resolution 损坏不覆盖。
+
+上述丢弃不涵盖输出契约错误。缺字段、错类型、非法枚举仍按结构错误停止；超过 16 项、空 evidence、SHA256 格式非法或字段长度超限等按格式错误处理。身份、结构与完成／停止语义合法的 completed 结果，在自动修正额度和预算允许时新派发一次格式修正；blocked 结果保存 blocker（operator 登记决定请求，task 保存再规划意图）并停止，不自动重派，不获任务预算豁免。
 
 blocked feedback 携带任务、dispatch 及前 2,000 字符原因；完整原因保留在事件中，completed 结果保留事件。原始结果绑定、已有台账、私有副本完整性和私有写入错误仍停止。已保存检查点可跨 dispatch 读取，不能重新登记旧 broker 输出来刷新时效。
 

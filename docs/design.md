@@ -94,7 +94,7 @@ worker 反馈使用共享 9,000 字符序列化额度，保留完成／阻断语
 
 同一项目的多个 run 各有工作树和运行锁，共享项目记忆；跨 run 检索到的知识依然需要核验来源。初始化使用数据库真实路径旁的持久 `.init.lock` 文件和等待式文件锁，覆盖 WAL 设置、建表与迁移，不锁整个 run；常规读写仍使用 SQLite 事务锁。只读 memory 子命令不创建数据库、不迁移或修改 Git 排除配置，已有库使用 SQLite mode=ro，允许 SQLite 管理 WAL 辅助文件。
 
-自动任务记忆保存 commit/run_id/task_id 的结构化来源，召回核对来源 run 及其接受记录。abandoned、来源缺失或无效的任务历史不自动召回；其他 run 已接受的结果带 historical/reference_only 标记。项目知识继续独立核对文件哈希与提交。人工事实默认 project scope，memory add/search --run 可限定运行作用域；旧无 scope 的人工记录标为 unscoped，空 provenance 不再视为已核实。所有记忆都是参考，不替代当前操作者决定或命令授权。read/export 保留历史。每次检索仅对词法命中的来源进行有界台账读取并在请求内缓存，不跨请求缓存状态。
+自动任务记忆保存 commit/run_id/task_id 的结构化来源，召回核对来源 run 及其接受记录。abandoned、来源缺失或无效的任务历史不自动召回；其他 run 已接受的结果带 historical/reference_only 标记。项目知识继续独立核对文件哈希与提交。人工事实默认 project scope，memory add/search --run 可限定运行作用域；旧无 scope 的人工记录标为 unscoped，空 provenance 不再视为已核实。key 保持项目内全局唯一；同名版本替换只允许同一有效作用域，run 还须匹配 run_id。写事务在停用旧记录前拒绝跨作用域冲突，调用方应使用不同 key；所有插入入口遵守此规则，不改数据库结构。旧 unscoped 人工记录与 project 共用替换身份，旧任务记录沿用 source/key 的 run 身份推断；历史版本不追溯重启用。MCP read 与 search 传入相同当前 run，统一计算适用性与历史标记；CLI read/export 保留无 run 视角的历史查询。所有记忆都是参考，不替代当前操作者决定或命令授权。每次检索仅对词法命中的来源进行有界台账读取并在请求内缓存，不跨请求缓存状态。
 
 接受提交与台账保存后，任务记忆、批准提案、接受事件及 post_accept 按持久待办依次完成，成功前不能派发后续任务或 completed。任务记忆使用有界摘要与审阅产物引用，不嵌入契约允许的完整大型审阅。SQLite 将稳定操作 ID、请求摘要和结果 ID 与实际记忆写入同事务保存；恢复重复操作返回原结果，不新增版本、刷新 TTL 或覆盖后来版本。接受事件通过稳定 ID 去重，可选知识提案校验失败保存丢弃诊断，存储故障保留待办供重试。恢复补完待办计入 step 的接受边界。Git commit 与接受台账写入之间的中断仍因 HEAD 不符停止，要求人工核对。
 
@@ -164,7 +164,7 @@ SQLite 是长期记忆的存储真相；JSON 导出和 Markdown handoff 提供�
 
 WORK 可提交带输入和证据 SHA256 的检查点，运行时私有保存原始证据，按声明输入及 content/volatile 有效期投影 reusable/stale。content 至少绑定一个输入；volatile TTL 为 0 时每次重验，非零 TTL 从来源 worker 调用开始计时，不能因长任务结束或恢复而刷新。检查点仅核验声明依赖及证据完整性，不保证依赖完整或结论正确，不替代验证和审阅。新 worker 仍用新进程、新 dispatch，不恢复供应商会话。
 
-worker 通过身份、结构与语义门禁后，本次可选检查点逐项处理；声明或源文件错误只丢弃对应项，列表边界和重复 ID 等整体错误仍拒绝整批。有效项与丢弃原因写入绑定原始结果的 batch resolution，其摘要登记到 checkpoint_batches 后才构成完整台账。恢复核验有效 manifest 集合与 resolution 一致，不把部分副本当作成功登记。checkpoints_discarded 记录任务、dispatch、索引与原因，blocked feedback 携带前 2,000 字符原因；completed 结果保留事件。原始结果、已有台账、resolution 和私有副本的完整性错误，以及私有写入失败仍直接停止。
+worker 通过身份、结构、完成／停止语义及格式门禁后，本次可选检查点逐项处理。content 缺少输入或 TTL 非零，以及源文件、路径、实际哈希等声明核对失败，只丢弃对应项；重复 ID 丢弃整批检查点并记录事件，保留 worker 结果。检查点可用性不属于 worker 完成／停止语义，不得使 operator 决策门禁、environment 反馈或合法等待的预算豁免丢失。结构非法仍停止；超过 16 项、空 evidence、SHA256 格式非法、字段长度超限等格式错误仍走原有有界修正路径，合法 blocked 语义保留阻断但不豁免预算。进入逐项处理的有效项与丢弃原因写入绑定原始结果的 batch resolution，其摘要登记到 checkpoint_batches 后才构成完整台账。恢复核验有效 manifest 集合与 resolution 一致，不把部分副本当作成功登记。checkpoints_discarded 记录任务、dispatch、逐项索引与原因，blocked feedback 携带前 2,000 字符原因；completed 结果保留事件。原始结果、已有台账、resolution 和私有副本的完整性错误，以及私有写入失败仍直接停止。
 
 检查点 evidence 额外允许当前 worker dispatch 的 `commands/` 中的普通文件，可直接使用 broker 返回的 stdout/stderr 路径和摘要。路径归属按真实路径比较，仍拒绝符号链接、父目录跳转及超限文件；inputs 和其他私有路径不获得此例外。
 

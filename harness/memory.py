@@ -128,10 +128,26 @@ class Memory:
                                      or not math.isfinite(ttl_days) or ttl_days <= 0):
             raise HarnessError("ttl_days 必须为正数")
 
-    @staticmethod
-    def _insert(db, *, key, abstract, overview, detail, source, kind, ttl_days, provenance):
+    @classmethod
+    def _insert(cls, db, *, key, abstract, overview, detail, source, kind, ttl_days, provenance):
         now = time.time()
-        old = db.execute("SELECT id FROM memories WHERE key=? AND active=1", (key,)).fetchone()
+        old = db.execute("SELECT * FROM memories WHERE key=? AND active=1", (key,)).fetchone()
+        if old:
+            # Keys remain global. Legacy unscoped records share the project scope;
+            # run-bound records can only replace versions from that same run.
+            def identity(item):
+                scope, source_run = cls._scope(item)
+                if scope in ("project", "unscoped"):
+                    return ("project", None)
+                if scope == "run" and isinstance(source_run, str) and source_run:
+                    return ("run", source_run)
+                return None
+
+            old_scope = identity(cls._decode(old))
+            new_scope = identity({"key": key, "kind": kind, "source": source,
+                                  "provenance": provenance})
+            if old_scope is None or new_scope != old_scope:
+                raise HarnessError(f"记忆 key 已绑定其他作用域，不能替代：{key}")
         db.execute("UPDATE memories SET active=0 WHERE key=?", (key,))
         ident = uid("mem")
         db.execute("""INSERT INTO memories
@@ -335,8 +351,9 @@ class Memory:
         except (OSError, ValueError, TypeError, RecursionError):
             return "missing", {}
 
-    def _applicability(self, item, run_id=None, ledger_cache=None):
-        """Project knowledge is reusable evidence; task history is run-bound context."""
+    @staticmethod
+    def _scope(item):
+        """Resolve scope consistently for writes and reads, including legacy tasks."""
         provenance = item.get("provenance")
         provenance = provenance if isinstance(provenance, dict) else {}
         source_run = provenance.get("run_id")
@@ -351,6 +368,13 @@ class Memory:
                                               else "unscoped"))
         if item["kind"] == "accepted_task":
             scope = "run"
+        return scope, source_run
+
+    def _applicability(self, item, run_id=None, ledger_cache=None):
+        """Project knowledge is reusable evidence; task history is run-bound context."""
+        scope, source_run = self._scope(item)
+        provenance = item.get("provenance")
+        provenance = provenance if isinstance(provenance, dict) else {}
         status = None
         if source_run:
             status = "missing"
@@ -381,7 +405,7 @@ class Memory:
                 "reference_only": True, "applicable": applicable,
                 "historical": bool(source_run and source_run != run_id)}
 
-    def read(self, ident):
+    def read(self, ident, *, run_id=None):
         with self.connect() as db:
             row = db.execute("SELECT * FROM memories WHERE id=?", (ident,)).fetchone()
         if not row:
@@ -389,7 +413,7 @@ class Memory:
         result = self._decode(row)
         result["expired"] = result["expires"] is not None and result["expires"] < time.time()
         result.update(self._staleness(result))
-        result.update(self._applicability(result))
+        result.update(self._applicability(result, run_id))
         return result
 
     def search(self, query, limit=6, level=1, *, run_id=None):

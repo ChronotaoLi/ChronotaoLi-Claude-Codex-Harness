@@ -22,7 +22,7 @@ Optionally return checkpoints=[{id,summary,inputs:[{path,sha256}],evidence:[{pat
 
 Checkpoint evidence may use this dispatch's broker stdout/stderr paths and hashes. Other private paths and inputs retain reserved-path restrictions; all sources must be regular non-symlink files. Read checkpoint_index for omitted history and accepted-task evidence.
 
-Reuse saved checkpoints without redeclaring them. Separate immutable artifact checks from live observations; bind content checks to their actual inputs. Repeat static checks only for changed inputs or coverage gaps; renew stale live facts before side effects. Invalid optional entries are discarded individually with diagnostics; valid peers survive, and acceptance remains required.
+Reuse saved checkpoints without redeclaring them. Separate static checks from live observations; recheck changed inputs, coverage gaps and stale live facts before side effects. After the output contract passes, invalid content inputs/TTL or unusable files discard individual checkpoints; duplicate IDs discard the batch. These discards preserve worker outcomes and blockers. Structure/format errors still follow the output contract; acceptance gates remain required.
 
 Format repairs cannot reuse another dispatch's broker evidence. Omit optional checkpoints or repeat an authorized, safely repeatable check; never repeat side effects just to obtain a checkpoint.
 

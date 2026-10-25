@@ -66,7 +66,8 @@ def handle(request, memory, skills, run):
         elif name == "memory_read":
             if not memory.path.exists():
                 raise HarnessError(f"没有此记忆：{args['id']}")
-            value = memory.read(args["id"])
+            state = read_json(run) if run else {}
+            value = memory.read(args["id"], run_id=state.get("id"))
         elif name == "skill_list":
             value = skills_catalog(skills)
         elif name == "skill_read":

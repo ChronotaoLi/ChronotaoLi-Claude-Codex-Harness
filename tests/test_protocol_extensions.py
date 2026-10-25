@@ -45,8 +45,6 @@ class ProtocolExtensionTests(unittest.TestCase):
                 lambda x: x['checkpoints'][0].update(max_age_seconds=True),
                 lambda x: x['checkpoints'][0].update(max_age_seconds=-1),
                 lambda x: x['checkpoints'][0].update(max_age_seconds=86401),
-                lambda x: x['checkpoints'][0].update(inputs=[]),
-                lambda x: x['checkpoints'][0].update(max_age_seconds=1),
                 lambda x: x['checkpoints'][0].update(evidence=[]),
                 lambda x: x['decision_requests'].append(x['decision_requests'][0]),
                 lambda x: x['decision_requests'][0].update(extra=True),

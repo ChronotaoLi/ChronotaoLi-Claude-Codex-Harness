@@ -170,15 +170,13 @@ def validate_work_semantics(result):
     keys = [proposal["key"] for proposal in result["proposed_memories"]]
     if len(keys) != len(set(keys)):
         raise HarnessError("记忆提案 key 必须唯一")
-    for field in ("checkpoints", "decision_requests"):
-        ids = [item["id"] for item in result.get(field, [])]
-        if len(ids) != len(set(ids)):
-            raise HarnessError(f"worker {field} 的 id 必须唯一")
+    # Optional checkpoint declarations are resolved by progress.record_checkpoints:
+    # a bad item or duplicate batch must not erase completion or a blocker.
+    ids = [item["id"] for item in result.get("decision_requests", [])]
+    if len(ids) != len(set(ids)):
+        raise HarnessError("worker decision_requests 的 id 必须唯一")
     if result.get("decision_requests") and not completed:
         raise HarnessError("后续任务的决策请求只允许随已完成的任务结果提交")
-    for checkpoint in result.get("checkpoints", []):
-        if checkpoint["freshness"] == "content" and (not checkpoint["inputs"] or checkpoint["max_age_seconds"] != 0):
-            raise HarnessError("内容检查点需要绑定输入文件且 max_age_seconds 为 0")
 
 
 def validate_work(result):

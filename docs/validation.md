@@ -272,3 +272,15 @@ Codex 0.163.0 的本地 `debug prompt-input` 检查确认：未提交的 AGENTS.
 使用 Python 3.11.17 执行全部 10 项新增测试，全部通过，28.828 秒；日志为 `.harness/v17-python311-tests.log`。未在 Python 3.11 重跑完整套件。独立 `gpt-6.1-sol` 复核最终运行时、测试与文档，无未解决的阻断发现。
 
 台账保持版本 11，操作者输入契约、完整原文、决定门禁、权限和预算语义不变。决定索引只是可检索证据，实际派发仍检查完整输入预算；更多请求或其他必要内容仍可能要求增大 `context_chars`。所有测试均使用模拟模型响应及真实本地 Git／验证／broker 子进程，不证明真实 CLI 模型联调通过；未运行 `harness smoke`、`harness.tool_smoke` 或 `harness.permission_smoke`。第十七轮临时审阅文档已按要求删除。
+
+## 第十八轮审阅修订验证（2026-10-25，台账 v11）
+
+执行 `python3 -m unittest discover -s tests -v`：729 项，728 项通过、1 项因文件系统拒绝非 UTF-8 文件名而跳过，Python 3.15.1，694.535 秒。完整日志保存在 `.harness/v18-full-suite-final.log`，不提交。
+
+新增 11 项行为测试覆盖检查点 content 输入／TTL 错误的逐项丢弃、重复 ID 的整批丢弃，以及 completed、operator、environment 三类 worker 结果。测试核对有效项和原始声明保留、正常验证与任务／整体审阅仍执行、operator 普通恢复不派发、environment 更新后以新 dispatch 恢复、任务预算豁免及总调用计数。超过 16 项仍走原有有界格式修正，格式非法的 blocked 结果保留阻断且不豁免预算。其他新增用例覆盖记忆跨作用域同名写入拒绝且记录／操作日志不变、同作用域版本替换及幂等、旧 unscoped／任务来源兼容、MCP search/read 元数据一致、CLI 写入冲突不隐藏项目事实，以及损坏计数的可读状态诊断与完整台账原文保留。
+
+首次全量检查发现扩写 worker skill 后，检查点容量用例达到 32,249 字符，超过默认 32,000 上限；该轮中止并保留日志。缩短新增规则、保留完整文档说明后，两个检查点容量用例通过，随后重新执行上述完整套件。默认上下文预算与测试门槛未提高。故障及针对性复核日志分别为 `.harness/v18-context-failure.log`、`.harness/v18-context-recheck.log`。
+
+使用 Python 3.11.17 执行检查点语义、输出契约、记忆作用域、记忆 CLI 和操作控制共 33 项测试，全部通过，15.955 秒；精简 skill 后另执行两个检查点容量测试，全部通过，7.066 秒。日志为 `.harness/v18-python311.log` 和 `.harness/v18-context-python311.log`。未在 Python 3.11 重跑完整套件；`python3.11 -m compileall -q harness tests` 与 `git diff --check` 通过。
+
+独立 `gpt-6.1-sol` 审阅实现、行为测试和文档，并复核精简后的 worker 规则，无未解决的阻断发现。台账保持版本 11，模型 ID、进程与派发隔离、权限、验证和接受门禁不变；记忆保持全局 key，以写事务拒绝跨作用域替换，不迁移数据库或追溯恢复旧版本。上述离线测试使用模拟模型响应及真实本地 Git／验证子进程，不证明真实模型联调通过；本轮未运行 `harness smoke`、`harness.tool_smoke` 或 `harness.permission_smoke`。第十八轮临时审阅文档已按要求删除。

@@ -83,3 +83,33 @@ class OperationalControlsTests(RepoCase):
         code, output, errors = self.invoke(["status", "run_damaged", "--full"])
         self.assertEqual(code, 0, errors)
         self.assertEqual(json.loads(output), damaged)
+
+    def test_damaged_attempt_accounting_keeps_status_readable_and_ledger_unchanged(self):
+        path = self.repo / ".harness" / "runs" / "run_damaged" / "state.json"
+        base = {"id": "run_damaged", "attempts": {"task": 1},
+                "attempt_budget_policy": "work", "dispatches": []}
+        exemption = {"task_id": "task", "attempt_exemption": {"blocker_kind": "operator"}}
+        variants = [{"attempts": value} for value in
+                    (None, 5, ["a"], [["task", 1]], {"task": "1"}, {"task": True}, {"task": -1})]
+        variants += [{"dispatches": value} for value in (None, 5, {})]
+        variants += [
+            {"attempt_budget_policy": "unknown"},
+            {"dispatches": [dict(exemption, task_id=[])]},
+            {"dispatches": [dict(exemption, task_id="missing")]},
+            {"dispatches": [dict(exemption, attempt_exemption=True)]},
+            {"dispatches": [exemption, exemption]},
+        ]
+        for fields in variants:
+            with self.subTest(fields=fields):
+                damaged = {**base, **fields}
+                write_json(path, damaged)
+                original = path.read_bytes()
+                code, output, errors = self.invoke(["status", "run_damaged"])
+                self.assertEqual(code, 1)
+                self.assertEqual(output, "")
+                self.assertIn("status --full", errors)
+                self.assertNotIn("Traceback", errors)
+                code, output, errors = self.invoke(["status", "run_damaged", "--full"])
+                self.assertEqual(code, 0, errors)
+                self.assertEqual(json.loads(output), damaged)
+                self.assertEqual(path.read_bytes(), original)

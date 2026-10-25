@@ -80,6 +80,33 @@ def read_ledger(path):
     return value
 
 
+def status_work_attempts(run):
+    """Reject damaged accounting before deriving a read-only status summary."""
+    diagnostic = "运行台账尝试计数字段无效；使用 status --full 查看原始内容"
+    attempts = run.get("attempts", {})
+    if (not isinstance(attempts, dict)
+            or any(not isinstance(key, str) or type(value) is not int or value < 0
+                   for key, value in attempts.items())):
+        raise HarnessError(diagnostic)
+    policy = run.get("attempt_budget_policy", "all_invocations")
+    if policy not in ("all_invocations", "work"):
+        raise HarnessError(diagnostic)
+    if policy == "work":
+        dispatches = run.get("dispatches", [])
+        if not isinstance(dispatches, list):
+            raise HarnessError(diagnostic)
+        for entry in dispatches:
+            if isinstance(entry, dict) and entry.get("attempt_exemption"):
+                task_id = entry.get("task_id")
+                if (not isinstance(entry["attempt_exemption"], dict)
+                        or not isinstance(task_id, str) or task_id not in attempts):
+                    raise HarnessError(diagnostic)
+    result = work_attempts(run)
+    if any(value < 0 for value in result.values()):
+        raise HarnessError(diagnostic)
+    return result
+
+
 def status_summary(run):
     if not isinstance(run.get("accepted", {}), dict) or not isinstance(run.get("replan_stopped", {}), dict):
         raise HarnessError("运行台账 accepted 或 replan_stopped 字段无效；使用 status --full 查看原始内容")
@@ -87,7 +114,7 @@ def status_summary(run):
     result["accepted_tasks"] = list(run.get("accepted", {}))
     result["budgets"] = {key: run.get(key) for key in
                          ("attempts", "total_attempts", "agent_dispatches", "replan_attempts", "final_attempts")}
-    result["budgets"].update(work_attempts=work_attempts(run),
+    result["budgets"].update(work_attempts=status_work_attempts(run),
                              attempt_budget_policy=run.get("attempt_budget_policy", "all_invocations"))
     dispatches = run.get("dispatches", [])
     dispatches = [entry for entry in dispatches if isinstance(entry, dict)] if isinstance(dispatches, list) else []
