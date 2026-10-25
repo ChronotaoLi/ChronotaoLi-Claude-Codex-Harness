@@ -97,6 +97,36 @@ class MemoryCLIReadTests(unittest.TestCase):
             memory.remember(key="blocked", abstract="Blocked write", overview="", detail="", source="test")
         self.assertEqual(memory.export(), [])
 
+    def test_add_run_binding_and_search_run_option(self):
+        ledger = self.state / "runs" / "run_current" / "state.json"
+        ledger.parent.mkdir(parents=True)
+        ledger.write_text(json.dumps({"id": "run_current", "status": "paused", "repo": str(self.repo.resolve())}))
+        code, output, errors = self.invoke("add", "--key", "decision", "--title", "Upgrade",
+                                           "--text", "SQLite reference", "--run", "run_current")
+        self.assertEqual(code, 0, errors)
+        ident = output.strip()
+        self.assertEqual(json.loads(self.invoke("search", "SQLite")[1]), [])
+        records = json.loads(self.invoke("search", "SQLite", "--run", "run_current")[1])
+        self.assertEqual(records[0]["id"], ident)
+        self.assertEqual(records[0]["scope"], "run")
+        self.assertTrue(records[0]["reference_only"])
+
+    def test_add_rejects_invalid_source_run_before_writing_memory_or_exclusions(self):
+        ledger = self.state / "runs" / "run_current" / "state.json"
+        ledger.parent.mkdir(parents=True)
+        original_exclude = self.exclude.read_bytes()
+        for value in ([], {"id": "run_current", "status": "paused", "repo": "/another/repo"},
+                      {"id": "run_current", "status": "unknown", "repo": str(self.repo.resolve())}):
+            ledger.write_text(json.dumps(value))
+            with self.subTest(value=value):
+                code, output, errors = self.invoke("add", "--key", "decision", "--title", "Upgrade",
+                                                  "--text", "Reference", "--run", "run_current")
+                self.assertEqual(code, 1)
+                self.assertEqual(output, "")
+                self.assertIn("记忆来源运行", errors)
+                self.assertFalse(self.path.exists())
+                self.assertEqual(self.exclude.read_bytes(), original_exclude)
+
 
 if __name__ == "__main__":
     unittest.main()

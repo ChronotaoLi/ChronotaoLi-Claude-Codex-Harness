@@ -49,7 +49,7 @@ class ProgressTests(unittest.TestCase):
         write_json(path, {**result, 'task_id': 'task', 'dispatch_id': dispatch})
         rt.run['dispatches'].append({'id': dispatch, 'task_id': 'task', 'role': 'worker', 'invoked_at': time.time() if invoked_at == 'now' else invoked_at})
         source = {'artifact': str(path), 'artifact_digest': sha(path.read_bytes())}
-        rt.record_checkpoints('task', dispatch, result, source)
+        self.last_discarded = rt.record_checkpoints('task', dispatch, result, source)
         return result, source
 
     def test_raw_copy_reuse_without_original_evidence_and_input_invalidation(self):
@@ -104,6 +104,7 @@ class ProgressTests(unittest.TestCase):
         row = rt.run['task_checkpoints'][0].copy()
         original = Path(row['artifact']).read_bytes()
         rt.run['task_checkpoints'] = []
+        rt.run['checkpoint_batches'] = []
         (rt.worktree / 'output').unlink()
         rt.record_checkpoints('task', 'worker1', result, source)
         self.assertEqual(rt.run['task_checkpoints'], [row])
@@ -120,19 +121,19 @@ class ProgressTests(unittest.TestCase):
         output = rt.worktree / 'output'
         output.unlink()
         output.symlink_to(rt.worktree / 'input')
-        with self.assertRaises(HarnessError):
-            self.record()
+        self.record()
+        self.assertTrue(self.last_discarded)
         self.assertEqual(rt.run['task_checkpoints'], [])
         output.unlink()
         output.write_bytes(b'different')
-        with self.assertRaises(HarnessError):
-            self.record('worker2')
+        self.record('worker2')
+        self.assertTrue(self.last_discarded)
         self.assertEqual(rt.run['task_checkpoints'], [])
 
     def test_size_bound_rejects_before_recording(self):
         (self.runtime.worktree / 'output').write_bytes(b'x' * (1024 * 1024 + 1))
-        with self.assertRaises(HarnessError):
-            self.record()
+        self.record()
+        self.assertTrue(self.last_discarded)
         self.assertEqual(self.runtime.run['task_checkpoints'], [])
 
     def test_audit_failure_does_not_register_checkpoint_and_recovers(self):
@@ -163,8 +164,8 @@ class ProgressTests(unittest.TestCase):
         write_json(source_path, {**result, 'task_id': 'task', 'dispatch_id': 'worker2'})
         source = {'artifact': str(source_path), 'artifact_digest': sha(source_path.read_bytes())}
         rt.run['dispatches'].append({'id': 'worker2', 'task_id': 'task', 'role': 'worker'})
-        with self.assertRaisesRegex(HarnessError, 'reserved or unsafe'):
-            rt.record_checkpoints('task', 'worker2', result, source)
+        discarded = rt.record_checkpoints('task', 'worker2', result, source)
+        self.assertIn('reserved or unsafe', discarded[0]['reason'])
 
     def test_large_valid_batch_retains_full_bound_details(self):
         rt = self.runtime
@@ -266,6 +267,7 @@ class ProgressTests(unittest.TestCase):
         row = self.runtime.run['task_checkpoints'][0]
         record = json.loads(Path(row['artifact']).read_bytes())
         record.pop('freshness_origin')
+        self.runtime.run.pop('checkpoint_batches')
         write_json(Path(row['artifact']), record)
         row['artifact_digest'] = sha(Path(row['artifact']).read_bytes())
         with patch('harness.progress.time.time', return_value=101):

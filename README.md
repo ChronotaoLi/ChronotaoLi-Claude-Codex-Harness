@@ -181,6 +181,10 @@ python3 -m harness --config /path/to/harness.toml --repo /path/to/project resume
 
 worker 可提交带输入／证据 SHA256 和有效期的 `checkpoints`，供后续全新进程检索已完成的检查。运行时私有保存原始证据，依据声明输入及有效期给出 reusable/stale；它不保证推理正确，也不代替验证与独立审阅。evidence 可直接引用当前 worker dispatch 的 broker `commands/` 中的普通文件，inputs 和其他私有路径仍受保留路径限制。当前任务需用户决定时用 `blocker_kind=operator` 停止；分析任务可在 completed 结果中为依赖它的后续任务提出 `decision_requests`，本任务仍经过正常接受门禁。分析结论与后续操作的 go/no-go 应分开验收。
 
+worker 输入的 `handoff_targets` 列出全部尚未接受的直接／传递下游任务 ID 和标题，输出约束与运行时校验使用同一目标集合。没有合法目标时不得猜测 ID 或丢弃必要决定；应报告当前任务的 operator blocker。非法 handoff 仍阻止验证和接受，但此前独立校验成功的检查点可以保存为未接受的参考证据，供新 worker 读取。
+
+检查点逐项校验：一个声明的源文件、哈希或路径错误只丢弃该项，其他有效项保留；列表上限和重复 ID 等整体错误仍拒绝整批。每批处理结果与原始 worker 结果、有效 manifest 一起绑定，恢复不会把部分登记当作整批成功。私有写入失败或已保存证据损坏仍停止。已登记证据可以跨 dispatch 读取，不必重新声明；重新申报旧 broker 输出仍被拒绝，不能刷新时效。将静态安装包检查与动态设备观测分别登记，可减少不必要重测。
+
 通过 worker 身份、结构和语义门禁后，本次检查点声明或文件核对失败只丢弃检查点并记录原因；blocked 结果还将有界原因交给后续指挥与 worker，原始 blocker 保留。原始结果、台账或私有副本的完整性错误仍停止。新返回的非法 handoff 请求在接受前拒绝，后续尝试收到恢复原因。operator 问题文本不合法时仍保留决策门禁，以绑定原始证据的有界说明登记；读取原文后显式回答，普通 resume 不代替决定。旧 run 已保存的候选或接受记录按相同方式恢复问题登记，既有验证、审阅和接受门禁保持有效。
 
 检查点上下文共享来源引用，历史不重复最新条目；过大的历史和已接受任务的检查点通过 `checkpoint_index` 的 SHA256 绑定索引按需检索。整体审阅不展开已接受任务的检查点，但完整性门禁仍校验全部保存证据。索引和 manifest 保留完整声明及来源；大量不同检查点或较长内容仍可能需要增加 `context_chars`。
@@ -221,7 +225,11 @@ python3 -m harness --config /path/to/harness.toml --repo /path/to/project resume
 
 结构与停止语义合法、但原因空白或超长的 stop 同样持久停止并计入再规划次数，原文和格式错误均保留。整体验证以非零退出失败后，空 diff 修正也会直接返回再规划；只有操作者明确使用 `--reverify` 才对未改变的失败快照重验。
 
-`max_attempts` 是每任务累计上限，`max_total_attempts` 是整个 run 的 worker 上限。`max_replans` 计入通过完整校验的指挥再规划结果（包括明确停止），请求故障不扣除它；独立的 `max_agent_dispatches` 默认 200，限制所有角色的模型调用，包括失败和格式修正调用。`max_final_attempts` 默认 3，限制整体验证与审阅尝试；未完成阶段恢复复用当前尝试，重新验证已失败的最终检查则消耗新尝试。达到上限不会通过改名刷新预算。
+新 run 的 `max_attempts` 限制每任务的 `work_attempts`：通过完整结果校验并保存反馈的 environment/operator 阻断不占该额度，其余 worker 调用，包括工程返工、CLI 故障、未知结果和格式修正，仍占额度。`attempts` 和 `total_attempts` 始终累计全部 worker 调用；`max_total_attempts` 仍限制整个 run 的全部 worker 调用，等待也不能绕过此上限。`status` 同时显示两种计数和 `attempt_budget_policy`。没有该策略字段的旧 run 保持原有全部调用计入每任务预算的语义，不追溯豁免历史调用。
+
+豁免与阻断反馈同时保存，绑定原始结果的身份及 SHA256；保存前中断保守计入额度。恢复及每次派发前 hook 之后都重新核验豁免证据，缺失或改变则停止。等待操作者决定的门禁不因预算豁免而解除。
+
+`max_replans` 计入通过完整校验的指挥再规划结果（包括明确停止），请求故障不扣除它；独立的 `max_agent_dispatches` 默认 200，限制所有角色的模型调用，包括失败和格式修正调用。`max_final_attempts` 默认 3，限制整体验证与审阅尝试；未完成阶段恢复复用当前尝试，重新验证已失败的最终检查则消耗新尝试。达到上限不会通过改名刷新预算。
 
 worker 尝试与模型派发在上下文、派发前 hook、快照及预算检查成功后，调用后端前一起持久化。本地准备失败不消耗这些额度；后端调用失败仍计数。格式修正走同一个计数入口。
 
@@ -329,11 +337,13 @@ worker_commands = [["python3", "-m", "unittest", "tests.test_export", "-v"]]
 
 SQLite 存在目标项目 `.harness/memory.sqlite3`，项目之间独立。每条记忆保存来源、时间、类型和版本。相同 `key` 的新记录替代旧记录的默认检索资格，旧记录仍可按 ID 查询。支持 TTL。系统不会自动猜测两条不同 key 的事实是否矛盾。
 
-同一项目的不同 run 使用独立分支和工作树，共享此项目的记忆库；一个 run 接受的记忆可被其他 run 检索，仍需按其来源核实当前代码。数据库初始化使用短时等待锁，覆盖 WAL 设置、建表和迁移，不将整个 run 串行化。`memory search/read/export` 使用只读连接，不建库、不迁移，也不改 Git `info/exclude`；SQLite 仍可能管理 WAL 辅助文件。
+同一项目的不同 run 使用独立分支和工作树，共享此项目的记忆库。任务历史保存结构化的 run、task 和 commit 来源；召回时核对来源台账及任务接受记录，来源已放弃、缺失或无效时不自动召回，仍可通过 `read/export` 审计。其他 run 的有效已接受记录标为 historical，项目知识继续按文件哈希和提交核验后参与检索。所有记忆明确标为 reference_only，不授予当前 run 的命令权限或操作者决定。数据库初始化使用短时等待锁，覆盖 WAL 设置、建表和迁移，不将整个 run 串行化。`memory search/read/export` 使用只读连接，不建库、不迁移，也不改 Git `info/exclude`；SQLite 仍可能管理 WAL 辅助文件。
 
 任务历史仍使用 `task:<run_id>:<task_id>`，保留每次已接受结果。接受台账和任务记忆的摘要来自 reviewer 对代码与证据的独立审阅；worker summary 只保留为原始执行证据。worker 可另行返回 `proposed_memories`，每条包含稳定 key、摘要、事实内容和仓库来源文件；审阅者通过 `approved_memory_keys` 单独批准。运行时将通过检查的提案写入 `knowledge:` 命名空间，并保护操作者维护的记录。代码通过不代表所有记忆提案通过，agent 没有直接写记忆的 MCP 工具。内置 MCP 也使用 SQLite 只读连接，不建库或迁移；库不存在时搜索为空。
 
 自动任务记忆与项目知识默认 TTL 均为 180 天，可用 `[memory]` 的 `task_ttl_days`、`knowledge_ttl_days` 配置，设为 0 表示不过期。操作者手写事实默认不过期。项目知识保存提交和来源文件哈希；检索时来源变化会标记 `possibly_stale` 并降权，保留原记录供查证。类型权重帮助项目知识和手写事实优先于同等相关的任务流水，但不能替代对当前代码的核对。
+
+`memory add` 默认保存项目事实；临时运行说明可用 `--run RUN_ID` 绑定已有 run，仅向该 run 的模型检索公开。CLI 查询这些说明也需 `memory search ... --run RUN_ID`。真正的继续／停止选择应使用 `resume --operator-decision`，不能用记忆替代。旧人工记录保留为 unscoped/reference_only，缺少结构化来源时标记 missing_provenance；旧任务记录可从原 source/key 识别来源 run，但不会因此补造来源完整性证明。来源台账只在单次检索内缓存，后续放弃操作会在下一次检索生效。
 
 ```bash
 python3 -m harness --repo /path/to/project memory add \

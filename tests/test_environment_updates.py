@@ -400,7 +400,7 @@ class EnvironmentUpdateTests(RepoCase):
         self.assertFalse(self.saved(engine).get('environment_updates'))
 
     def test_budget_exhaustion_retains_update_without_authorizing_an_attempt(self):
-        self.config.data['runtime']['max_attempts'] = 1
+        self.config.data['runtime']['max_total_attempts'] = 1
         engine, backend, path, _ = self.blocked()
         before = self.saved(engine)
         with self.assertRaises(HarnessError):
@@ -410,7 +410,7 @@ class EnvironmentUpdateTests(RepoCase):
         for key in ('attempts', 'total_attempts', 'agent_dispatches', 'feedback', 'tasks', 'accepted'):
             self.assertEqual(saved[key], before[key])
         self.assertEqual(len(backend.calls), 1)
-        self.config.data['runtime']['max_attempts'] = 2
+        self.config.data['runtime']['max_total_attempts'] = 2
         result = self.engine(backend).resume(engine.run['id'])
         self.assertEqual(result['status'], 'completed')
         self.assertEqual(len(result['environment_updates']), 1)

@@ -18,6 +18,10 @@
 
 每任务尝试数、整个 run 的 worker 尝试数、有效再规划数、最终验收次数和模型派发数均持久保存且受上限约束。分别由 `max_attempts`、`max_total_attempts`、`max_replans`、`max_final_attempts`、`max_agent_dispatches` 控制。再规划修订通过完整校验后才计数；合法 stop 及下述仅原因文本格式错误的 stop 同样计数，请求故障和未知 skill 不计入有效再规划数。所有实际模型调用（含失败、格式修正）消耗独立的派发额度，默认 200 次。最终验收默认 3 次，独立于任务预算。新任务与 resume 都不清零累计预算；额度耗尽保留待再规划意图，操作者增加预算后继续修正规划。
 
+新 run 保存 `attempt_budget_policy="work"`：`attempts` 和 `total_attempts` 保持所有 worker 调用总数；`max_attempts` 按 `work_attempts` 判断，从任务调用总数扣除已经完整校验并与反馈一起保存的 environment/operator 阻断。豁免保存在对应 dispatch 的 `attempt_exemption`，绑定 blocker 类型、原始结果路径及 SHA256。缺少该策略字段的旧 run 使用 all_invocations，不重算历史预算。格式非法、调用失败或未知结果仍计入任务额度；总 worker 及所有模型派发上限仍包含每次等待调用。
+
+豁免落盘前中断保守计费；落盘后恢复，以及派发前 hook 完成后、扣预算之前，均核验原始结果身份、语义和摘要。不因改变候选、再次恢复或重复回答增加豁免；证据缺失／变化停止，操作者决定仍必须通过原决策门禁。status 同时展示原始调用数与任务预算使用数，不把豁免当作已完成工作。
+
 待再规划意图在任务、run、最终和再规划预算守卫之前持久化。保留原有预算上限：最后一次任务尝试返回 task blocker 时，先停在该上限；操作者增加对应预算后直接恢复指挥再规划，不先重派 worker。结构合法、空操作且明确 stop 的结果若仅原因文本格式错误，也计入次数并持久停止，保留原文、格式诊断和返回产物，不能由普通恢复重新抽取决定。
 
 worker 尝试与派发计数在本地上下文、hooks、MCP 配置、快照和额度预检成功后，调用后端之前同一次保存。准备失败不扣额度，调用后端失败计数；派发前失败也将对应条目标为 failed 并确认没有遗留进程。格式修正共用此入口。
@@ -105,6 +109,8 @@ worker 调用失败或中断时，另按 task ID 保存 `worker_recovery`，记�
 | `environment_updates` | 操作者环境更新审计并登记 | 版本 9 起的有序持久记录；不清除旧声明，最新同任务 checks 替代旧检查列表 |
 | `environment_checks` | 每次前置检查保存报告后 | 追加保存全部报告引用；上下文携带相关任务最新更新的最近检查结果及完整报告引用 |
 | `task_checkpoints` | 合法 worker 结果返回后，证据复制与摘要绑定完成 | 保留历次引用；同任务同检查 ID 采用最新记录，输入变化或过期标为 stale，不改变任务接受状态 |
+| `checkpoint_batches` | 当前 dispatch 各项校验及 resolution 写入完成后，与有效检查点一起保存 | 绑定原始结果、有效 manifest 集合及丢弃原因；恢复不能把部分登记当作完成。旧批次没有此字段仍按旧协议核验 |
+| `dispatches[].attempt_exemption` | 完整合法的 environment/operator blocker 与反馈一起保存 | 仅新 work 预算策略排除该任务额度，保留所有调用计数；消费前核验绑定来源，未知／非法结果不豁免 |
 | `decision_requests` | 当前 operator 阻断、指挥 stop，或来源任务接受且 post_accept 完成 | 请求与原始结果绑定并保留；后续任务请求可从 accepted 中恢复登记，未答复或 stop 时禁止目标任务派发 |
 | `operator_decisions` | 严格校验显式答复后，审计先于台账 | 仅解除匹配请求的等待；后续调用开始后拒绝重交旧答复，不清除已有结果或累计预算 |
 | `accepted[].worker_source / decision_requests` | 任务接受台账保存时 | 保存接受的精确 worker 来源及后续决策请求，不能用其他尝试的结果替代 |
@@ -147,7 +153,11 @@ WORK 可选 `checkpoints`，最多 16 项，每项为 `{id, summary, inputs: [{p
 
 当前任务需要用户决定时，worker 返回 `status="blocked", blocker_kind="operator"` 和具体问题；运行停止等待回答，不先再规划。已满足本任务验收的 worker 可以在 completed 结果中附带 `decision_requests: [{id, task_id, question}]`，将明确风险选择留给传递依赖于本任务的后续任务。本任务仍正常验证、审阅、接受；该请求不表示后续操作被批准，目标任务在得到回答前停止。禁止用后续阶段的操作／测试证明作为前一分析任务的完成条件；负面分析结论可以完成，但必须满足该分析任务自己的验收。
 
-worker 通过身份、结构与语义门禁后，本次检查点声明的哈希、路径、源文件或大小校验失败会丢弃该批检查点并记录 `checkpoints_discarded`，不丢失原有 operator 阻断，也不跳过验证和审阅。blocked feedback 还携带任务、dispatch 及前 2,000 字符原因，供后续指挥与 worker 读取；完整原因保留在事件中，completed 结果仅记录事件。原始结果绑定、已有台账、私有副本完整性和私有存储错误仍停止。新返回的 completed handoff 目标或问题不合法时，在接受前拒绝本次尝试，拒绝原因和 dispatch 来源经 `worker_recovery` 交给后续指挥与 worker，不静默过滤请求。
+worker 通过身份、结构与语义门禁后，本次可选检查点声明的哈希、路径、源文件或大小校验失败只丢弃对应项并记录 `checkpoints_discarded`，同批有效项保留；列表上限、重复 ID 等整体错误仍拒绝整批。处理结果先写入 `checkpoints/batches/<dispatch_id>.json`，绑定原始结果、有效 manifest 行及按声明索引记录的丢弃原因；其摘要与有效行一并登记，恢复核验集合完全一致。resolution 已写但台账未保存时继续登记同一结果，不重新计算有效期；私有副本或 resolution 损坏不覆盖。
+
+blocked feedback 携带任务、dispatch 及前 2,000 字符原因；完整原因保留在事件中，completed 结果保留事件。原始结果绑定、已有台账、私有副本完整性和私有写入错误仍停止。已保存检查点可跨 dispatch 读取，不能重新登记旧 broker 输出来刷新时效。
+
+worker packet 的 `handoff_targets` 列出未接受直接／传递下游的 ID 与标题，输出约束和运行时校验使用同一集合。新返回的 completed handoff 目标或问题不合法时，在验证及接受前拒绝本次尝试，拒绝原因和 dispatch 来源经 `worker_recovery` 交给后续指挥与 worker，不静默过滤请求。独立校验成功的检查点在此门禁前保存，供后续读取未接受证据；这不生成合法决定或推进任务阶段。无合法下游时，必要的选择应作为当前任务的 operator blocker 报告。
 
 operator 问题空白、含 NUL 或超过登记长度时，运行时保留原始结果并登记有界说明及转义摘录。操作者须读取 request 的 `source` 所绑定的原始问题，再用正常 `--operator-decision` 回答；普通 resume 只保留等待，不消耗新派发预算。此处理也恢复旧版本因问题文本而登记失败的 operator 请求和已接受 handoff。旧版本已经保存的 `pending_task`／`pending_acceptance` 继续其验证、审阅及接受阶段，随后登记请求，不能提前派发依赖任务；原始产物、接受记录、预算及合法请求身份保持不变。指挥 stop 原因含 NUL 时不登记问题，普通恢复仍提示原有 `--retry-stopped` 出口。
 

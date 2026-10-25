@@ -99,7 +99,7 @@ class CheckpointDeclarationFailureTests(RepoCase):
         self.assertEqual(len(engine.run['decision_requests']), 1)
         self.assertEqual(engine.run['accepted'], {})
 
-    def test_partial_batch_registers_no_checkpoints(self):
+    def test_partial_batch_registers_valid_checkpoints(self):
         def partial(items, kwargs):
             good = self.declaration(kwargs['cwd'], bad=False)
             good['id'] = 'first-valid'
@@ -107,7 +107,7 @@ class CheckpointDeclarationFailureTests(RepoCase):
         engine = self.engine(self.backend(mutate=partial))
         result = engine.start('Implement greet', read_json(ROOT / 'examples' / 'plan.json'))
         self.assertEqual(set(result['accepted']), {'greet'})
-        self.assertEqual(result.get('task_checkpoints', []), [])
+        self.assertEqual([r['checkpoint_id'] for r in result['task_checkpoints']], ['first-valid'])
 
     def test_unsafe_missing_oversize_and_invalid_fields_are_declarations(self):
         mutations = [
@@ -138,11 +138,14 @@ class CheckpointDeclarationFailureTests(RepoCase):
 
     def assert_declaration(self, engine, dispatch, artifact, bound):
         from harness.util import write_json
+        engine.run['checkpoint_batches'] = []
+        resolution = engine.directory / 'checkpoints' / 'batches' / (dispatch['id'] + '.json')
+        resolution.unlink(missing_ok=True)
         write_json(artifact, bound)
         result = {k: v for k, v in bound.items() if k not in ('task_id', 'dispatch_id')}
         source = {'artifact': str(artifact), 'artifact_digest': digest(artifact)}
-        with self.assertRaises(CheckpointDeclarationError):
-            engine.record_checkpoints('greet', dispatch['id'], result, source)
+        discarded = engine.record_checkpoints('greet', dispatch['id'], result, source)
+        self.assertTrue(discarded)
 
     def test_changed_bound_result_is_fatal_even_with_malformed_declaration(self):
         backend = self.backend()

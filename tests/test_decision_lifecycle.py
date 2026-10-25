@@ -223,7 +223,7 @@ class DecisionLifecycleTests(RepoCase):
         self.assertFalse(any(c['role'] == 'worker' for c in backend.calls[calls:]))
 
     def test_continue_preserves_exhausted_worker_budget(self):
-        self.config.data['runtime']['max_attempts'] = 1
+        self.config.data['runtime']['max_total_attempts'] = 1
         engine, backend = self.blocked()
         before = self.saved(engine)
         with self.assertRaises(HarnessError):
@@ -233,7 +233,7 @@ class DecisionLifecycleTests(RepoCase):
         self.assertEqual(state['attempts'], before['attempts'])
         self.assertEqual(state['total_attempts'], before['total_attempts'])
         self.assertEqual(len(backend.calls), 1)
-        self.config.data['runtime']['max_attempts'] = 2
+        self.config.data['runtime']['max_total_attempts'] = 2
         result = self.engine(backend).resume(engine.run['id'])
         self.assertEqual(result['status'], 'completed')
         self.assertEqual(result['attempts'], {'greet': 2})

@@ -11,6 +11,7 @@ from pathlib import Path
 
 from . import git
 from .adapters import CLIBackend, provider_usage
+from .budgets import AttemptAccounting, work_attempts
 from .command_server import command_id
 from .context import (FINAL_REVIEW_INSTRUCTION, capacity_report, compact_checks,
                       compact_feedback, compact_plan, compact_review, compact_reviews, compose,
@@ -43,7 +44,7 @@ class InvalidReviewRejection(HarnessError):
                             "dispatch_id": receipt["dispatch_id"]}
 
 
-class Engine(EnvironmentRecovery, DecisionRecovery, ProgressRecovery, InvalidOutputRecovery):
+class Engine(EnvironmentRecovery, DecisionRecovery, ProgressRecovery, InvalidOutputRecovery, AttemptAccounting):
     def __init__(self, config, repo, state=None, backend=None, commander="astra"):
         self.config = config
         self.repo = git.repository(Path(repo))
@@ -118,6 +119,7 @@ class Engine(EnvironmentRecovery, DecisionRecovery, ProgressRecovery, InvalidOut
                    "feedback": self.run.get("feedback"), "expected_head": self.run["expected_head"],
                    "original_tasks": self.run["original_tasks"], "base_commit": self.run["base_commit"],
                    "total_attempts": self.run["total_attempts"], "replan_attempts": self.run["replan_attempts"],
+                   "work_attempts": work_attempts(self.run),
                    "final_history": self.run["final_history"], "plan_revision": len(self.run["plan_history"]),
                    "environment_updates": deepcopy(self.run.get("environment_updates", [])),
                    "environment_checks": deepcopy(self.run.get("environment_checks", [])),
@@ -283,21 +285,29 @@ class Engine(EnvironmentRecovery, DecisionRecovery, ProgressRecovery, InvalidOut
         packet = self.decision_packet(packet, role=role, kind=kind, task_id=task_id)
         return self.progress_packet(packet, role=role, kind=kind, task_id=task_id)
 
-    def validate_handoff_requests(self, task_id, result):
+    def handoff_targets(self, task_id):
+        """Project only unaccepted transitive descendants, in plan order."""
         tasks = {t["id"]: t for t in self.run["tasks"]}
-        for request in result.get("decision_requests", []):
-            validate_handoff_question(request["question"])
-            target = request["task_id"]
-            if target not in tasks or target in self.run["accepted"] or target == task_id:
-                raise HarnessError("后续决策必须指向尚未接受且依赖当前任务的任务")
-            seen, pending = set(), list(tasks[target]["depends_on"])
+        targets = []
+        for task in self.run["tasks"]:
+            if task["id"] == task_id or task["id"] in self.run["accepted"]:
+                continue
+            seen, pending = set(), list(task["depends_on"])
             while pending:
                 ident = pending.pop()
                 if ident not in seen:
                     seen.add(ident)
                     pending.extend(tasks[ident]["depends_on"])
-            if task_id not in seen:
-                raise HarnessError("后续决策目标必须依赖当前任务；不能阻断无关任务")
+            if task_id in seen:
+                targets.append({"id": task["id"], "title": task.get("title", task["id"])})
+        return targets
+
+    def validate_handoff_requests(self, task_id, result):
+        targets = {task["id"] for task in self.handoff_targets(task_id)}
+        for request in result.get("decision_requests", []):
+            validate_handoff_question(request["question"])
+            if request["task_id"] not in targets:
+                raise HarnessError("后续决策必须指向尚未接受且依赖当前任务的任务")
 
     def synchronize_decision_requests(self):
         """Reconstruct request registration across result/acceptance save windows."""
@@ -527,8 +537,7 @@ class Engine(EnvironmentRecovery, DecisionRecovery, ProgressRecovery, InvalidOut
                 # Keep a returned invalid correction attached until the terminal
                 # guard is durable; an interruption must not turn it into a retry.
                 if role == "worker":
-                    attempts = self.run["attempts"][task_id]
-                    if attempts >= self.config.data["runtime"]["max_attempts"]:
+                    if self.task_budget_used(task_id) >= self.config.data["runtime"]["max_attempts"]:
                         raise HarnessError(f"{task_id} 已达尝试次数上限；格式修复也计入预算") from error
                     if self.run["total_attempts"] >= self.config.data["runtime"]["max_total_attempts"]:
                         raise HarnessError("已达 run 总尝试次数上限；格式修复也计入预算") from error
@@ -743,6 +752,10 @@ class Engine(EnvironmentRecovery, DecisionRecovery, ProgressRecovery, InvalidOut
                     "rules": self.config.asset("rules").read_text(encoding="utf-8"),
                     "role_skill": read_skill(self.config.asset("skills"), "harness-" + role),
                     "packet": packet, "output_constraints": output_constraints(contract)}
+        if role == "worker":
+            required["output_constraints"].append({
+                "path": "response.decision_requests[].task_id",
+                "enum": [target["id"] for target in self.handoff_targets(task_id)]})
         if role == "reviewer":
             required["output_constraints"] = review_output_constraints(
                 contract, [p["key"] for p in packet.get("proposed_memories", [])])
@@ -753,7 +766,7 @@ class Engine(EnvironmentRecovery, DecisionRecovery, ProgressRecovery, InvalidOut
         query = (task["title"] + " " + task["description"]) if task else self.run["goal"]
         if role == "commander" and kind == "dispatch":
             query = self.run["goal"] + " " + " ".join(t["title"] for t in packet["ready"])
-        memories = self.memory.search(query, level=1)
+        memories = self.memory.search(query, level=1, run_id=self.run["id"])
         prompt, report = compose(required, memories, self.config.data["runtime"]["context_chars"])
         write_json(job / "context-report.json", report)
         self.emit_hook("context_prepared", {"report": report}, job)
@@ -777,6 +790,7 @@ class Engine(EnvironmentRecovery, DecisionRecovery, ProgressRecovery, InvalidOut
             validate_mcp(self.config, roles=(role,))
             before = self.snapshot()
             entry["snapshot_digest"] = snapshot_digest(before)
+            self.validate_attempt_accounting()
             self.validate_invalid_repair_source(f"{role}:{kind}:{task_id}", before)
             if role == "commander":
                 self.commander_format_source(f"{role}:{kind}:{task_id}", packet, before)
@@ -786,7 +800,7 @@ class Engine(EnvironmentRecovery, DecisionRecovery, ProgressRecovery, InvalidOut
             # Provider failures still count; local context/hook/MCP/snapshot failures do not.
             if role == "worker":
                 attempts = self.run["attempts"].get(task_id, 0)
-                if attempts >= self.config.data["runtime"]["max_attempts"]:
+                if self.task_budget_used(task_id) >= self.config.data["runtime"]["max_attempts"]:
                     raise HarnessError(f"{task_id} 已达尝试次数上限；格式修复也计入预算")
                 if self.run["total_attempts"] >= self.config.data["runtime"]["max_total_attempts"]:
                     raise HarnessError("已达 run 总尝试次数上限；格式修复也计入预算")
@@ -927,6 +941,7 @@ class Engine(EnvironmentRecovery, DecisionRecovery, ProgressRecovery, InvalidOut
         worktree = self.state / "worktrees" / ident
         self.run = {"schema_version": 11, "id": ident, "repo": str(self.repo), "goal": goal, "status": "planning", "commander": self.commander,
                     "branch": "harness/" + ident, "worktree": str(worktree), "tasks": [], "accepted": {}, "attempts": {},
+                    "attempt_budget_policy": "work",
                     "dispatches": [], "expected_head": git.head(self.repo), "feedback": None,
                     "config_path": str(self.config.path), "config_snapshot": deepcopy(self.config.data),
                     "asset_digest": asset_digest(self.config), "base_commit": git.head(self.repo), "original_tasks": [],
@@ -935,7 +950,7 @@ class Engine(EnvironmentRecovery, DecisionRecovery, ProgressRecovery, InvalidOut
                     "review_corrections": {}, "review_receipts": {}, "commander_receipts": {},
                     "invalid_repairs": {}, "approved_scope": [],
                     "environment_updates": [], "environment_checks": [],
-                    "decision_requests": [], "operator_decisions": [], "task_checkpoints": [],
+                    "decision_requests": [], "operator_decisions": [], "task_checkpoints": [], "checkpoint_batches": [],
                     "worktree_binding": {}, "ignored_baseline": [],
                     "pending_format_corrections": {}, "agent_dispatches": 0,
                     "plan_approval_required": pause_after_plan, "plan_approved": not pause_after_plan}
@@ -985,6 +1000,7 @@ class Engine(EnvironmentRecovery, DecisionRecovery, ProgressRecovery, InvalidOut
             raise HarnessError("Run 属于另一个项目")
         validate_command_directories(self.run["dispatches"], self.directory)
         self.validate_recovery_links()
+        self.validate_attempt_accounting()
         self.validate_environment_links()
         self.validate_decision_links()
         self.validate_checkpoint_links()
@@ -1396,7 +1412,7 @@ class Engine(EnvironmentRecovery, DecisionRecovery, ProgressRecovery, InvalidOut
         if self.run["total_attempts"] >= self.config.data["runtime"]["max_total_attempts"]:
             raise HarnessError("已达 run 总尝试次数上限；不通过新增任务绕过预算")
         tid = trigger.get("task_id")
-        if tid and self.run["attempts"].get(tid, 0) >= self.config.data["runtime"]["max_attempts"]:
+        if tid and self.task_budget_used(tid) >= self.config.data["runtime"]["max_attempts"]:
             raise HarnessError(f"{tid} 已达尝试次数上限；不通过重新命名任务绕过预算")
         if final and self.run["final_attempts"] >= self.config.data["runtime"]["max_final_attempts"]:
             raise HarnessError("整体审阅已达尝试次数上限；不再派发修正任务")
@@ -1415,7 +1431,8 @@ class Engine(EnvironmentRecovery, DecisionRecovery, ProgressRecovery, InvalidOut
             {"goal": self.run["goal"], **self.plan_context(),
              "accepted": self.accepted_context(), "trigger": compact_feedback(trigger),
              "approved_scope": deepcopy(self.run.get("approved_scope", [])),
-             "attempts": self.run["attempts"], "total_attempts": self.run["total_attempts"],
+             "attempts": self.run["attempts"], "work_attempts": work_attempts(self.run),
+             "total_attempts": self.run["total_attempts"],
              "max_tasks": self.config.data["runtime"]["max_tasks"],
              "remaining_replans": self.config.data["runtime"]["max_replans"] - attempt,
              "tool_constraints": self.tool_constraints(),
@@ -1491,7 +1508,7 @@ class Engine(EnvironmentRecovery, DecisionRecovery, ProgressRecovery, InvalidOut
         if current:
             task = next(t for t in self.run["tasks"] if t["id"] == current)
             self.check_task_scope(task)
-        if current and self.run["attempts"].get(current, 0) >= self.config.data["runtime"]["max_attempts"]:
+        if current and self.task_budget_used(current) >= self.config.data["runtime"]["max_attempts"]:
             raise HarnessError(f"{current} 已达尝试次数上限")
         if self.run["total_attempts"] >= self.config.data["runtime"]["max_total_attempts"]:
             raise HarnessError("已达 run 总尝试次数上限")
@@ -1513,13 +1530,13 @@ class Engine(EnvironmentRecovery, DecisionRecovery, ProgressRecovery, InvalidOut
             directive = self.dispatch("commander", "dispatch", "dispatching", schema,
                         {"goal": self.run["goal"], "ready": ready, "accepted": self.accepted_context(),
                          "feedback": compact_feedback(self.run.get("feedback")), "attempts": self.run["attempts"],
+                         "work_attempts": work_attempts(self.run),
                          "recovery": deepcopy(self.run.get("worker_recovery", {}).get(current)) if current in {t["id"] for t in ready} else None,
                          "tool_constraints": self.tool_constraints(),
                          "instruction": "Select one ready task. Give a focused implementation or repair instruction, retaining its original scope and acceptance."}, task=ready[0])
         task = next(t for t in ready if t["id"] == directive["selected_task"])
         tid = task["id"]
-        attempt = self.run["attempts"].get(tid, 0) + 1
-        if attempt > self.config.data["runtime"]["max_attempts"]:
+        if self.task_budget_used(tid) >= self.config.data["runtime"]["max_attempts"]:
             raise HarnessError(f"{tid} 已达尝试次数上限")
         self.run["current_task"] = tid
         if not saved_directive and not pristine:
@@ -1534,6 +1551,7 @@ class Engine(EnvironmentRecovery, DecisionRecovery, ProgressRecovery, InvalidOut
                   "feedback": compact_feedback(self.run.get("feedback"), prior_reviews), "prior_reviews": prior_reviews,
                   "recovery": deepcopy(self.run.get("worker_recovery", {}).get(tid)),
                   "dependencies": {d: self.accepted_context()[d] for d in task["depends_on"]},
+                  "handoff_targets": self.handoff_targets(tid),
                   "verification_commands": self.config.data["verification"]["commands"],
                   "tool_constraints": self.tool_constraints()}, task=task)
         validate_work(result)
@@ -1551,6 +1569,20 @@ class Engine(EnvironmentRecovery, DecisionRecovery, ProgressRecovery, InvalidOut
             raise HarnessError("worker 返回产物与当前任务结果不一致；保留现场")
         worker_source = {"worker_artifact": str(worker_artifact),
                          "worker_artifact_digest": hashlib.sha256(raw_worker).hexdigest()}
+        checkpoints_discarded = None
+        try:
+            discarded = self.record_checkpoints(tid, worker_dispatch["id"], result,
+                                    {"artifact": str(worker_artifact), "artifact_digest": worker_source["worker_artifact_digest"]})
+            if discarded:
+                reason = "; ".join(f"checkpoint[{item['index']}]: {item['reason']}" for item in discarded)
+                self.event("checkpoints_discarded", task_id=tid, dispatch_id=worker_dispatch["id"],
+                           reason=reason, discarded=discarded)
+                checkpoints_discarded = {"task_id": tid, "dispatch_id": worker_dispatch["id"],
+                                         "reason": reason[:2000], "count": len(discarded)}
+        except CheckpointDeclarationError as error:
+            self.event("checkpoints_discarded", task_id=tid, dispatch_id=worker_dispatch["id"], reason=str(error))
+            checkpoints_discarded = {"task_id": tid, "dispatch_id": worker_dispatch["id"],
+                                     "reason": str(error)[:2000]}
         try:
             self.validate_handoff_requests(tid, result)
         except HarnessError as error:
@@ -1561,17 +1593,10 @@ class Engine(EnvironmentRecovery, DecisionRecovery, ProgressRecovery, InvalidOut
             self.save()
             self.event("worker_result_rejected", task_id=tid, dispatch_id=worker_dispatch["id"], reason=str(error))
             raise
-        checkpoints_discarded = None
-        try:
-            self.record_checkpoints(tid, worker_dispatch["id"], result,
-                                    {"artifact": str(worker_artifact), "artifact_digest": worker_source["worker_artifact_digest"]})
-        except CheckpointDeclarationError as error:
-            self.event("checkpoints_discarded", task_id=tid, dispatch_id=worker_dispatch["id"], reason=str(error))
-            checkpoints_discarded = {"task_id": tid, "dispatch_id": worker_dispatch["id"],
-                                     "reason": str(error)[:2000]}
         self.record_ignored_paths("worker", worker_artifact.parent)
         if result["status"] == "blocked":
             self.run["feedback"] = {"task_id": tid, "worker": result, "attempt": attempt, **worker_source}
+            self.record_attempt_exemption(worker_dispatch, result, worker_source)
             if checkpoints_discarded is not None:
                 self.run["feedback"]["checkpoints_discarded"] = checkpoints_discarded
             self.save()
@@ -1805,6 +1830,8 @@ class Engine(EnvironmentRecovery, DecisionRecovery, ProgressRecovery, InvalidOut
             "task_memory": {"key": f"task:{self.run['id']}:{tid}", "abstract": task["title"][:500],
                             "overview": accepted["summary"], "detail": dump(detail),
                             "source": f"git:{commit};run:{self.run['id']}", "kind": "accepted_task",
+                            "provenance": {"commit": commit, "run_id": self.run["id"],
+                                           "task_id": tid, "scope": "run", "reference_only": True},
                             "ttl_days": self.config.data["memory"]["task_ttl_days"] or None},
             "proposals": pending["proposals"], "approved_keys": pending["approved_keys"],
             "knowledge_ttl_days": self.config.data["memory"]["knowledge_ttl_days"] or None,

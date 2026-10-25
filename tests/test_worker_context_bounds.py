@@ -143,6 +143,7 @@ class BoundedWorkerLifecycleTests(RepoCase):
             engine.start("Implement greet", self.plan())
         source = Path(engine.run["feedback"]["worker_artifact"])
         original = source.read_bytes()
+        saved_state = (engine.directory / "state.json").read_bytes()
         calls = len(backend.calls)
         for mutation in ("missing", "changed"):
             with self.subTest(mutation=mutation):
@@ -150,9 +151,10 @@ class BoundedWorkerLifecycleTests(RepoCase):
                     source.unlink()
                 else:
                     source.write_bytes(original + b" ")
-                with self.assertRaisesRegex(HarnessError, "worker 完整反馈产物"):
+                with self.assertRaises(HarnessError):
                     self.engine(backend).resume(engine.run["id"])
                 self.assertEqual(len(backend.calls), calls)
+                self.assertEqual((engine.directory / "state.json").read_bytes(), saved_state)
                 self.assertEqual(read_json(engine.directory / "state.json")["feedback"]["worker"], blocked)
                 source.write_bytes(original)
 

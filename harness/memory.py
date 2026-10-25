@@ -270,7 +270,7 @@ class Memory:
         if not provenance:
             if item["kind"] == "project_knowledge":
                 return invalid
-            return {"possibly_stale": False, "stale_reasons": []}
+            return {"possibly_stale": True, "stale_reasons": ["missing_provenance"]}
         hashes = provenance.get("source_hashes", {})
         commit = provenance.get("commit")
         if (not isinstance(hashes, dict) or len(hashes) > 10
@@ -311,6 +311,76 @@ class Memory:
                 reasons.append(commit_cache[commit])
         return {"possibly_stale": bool(reasons), "stale_reasons": reasons}
 
+    def _source_ledger(self, source_run):
+        try:
+            ledger_path = self.path.parent / "runs" / source_run / "state.json"
+            if not ledger_path.resolve().is_relative_to((self.path.parent / "runs").resolve()):
+                raise ValueError("source ledger outside state")
+            with ledger_path.open("rb") as stream:
+                data = stream.read(16 * 1024 * 1024 + 1)
+            if len(data) > 16 * 1024 * 1024:
+                raise ValueError("oversized source ledger")
+            ledger = json.loads(data)
+            if not isinstance(ledger, dict):
+                raise ValueError("invalid source ledger")
+            status = ledger.get("status") if ledger.get("id") == source_run else "invalid"
+            if not isinstance(status, str) or status not in {
+                    "planning", "running", "blocked", "interrupted", "awaiting_approval",
+                    "paused", "completed", "abandoned"}:
+                status = "invalid"
+            if self.path.parent.name == ".harness":
+                if not isinstance(ledger.get("repo"), str) or Path(ledger["repo"]).resolve() != self.path.parent.parent.resolve():
+                    status = "invalid"
+            return status, ledger
+        except (OSError, ValueError, TypeError, RecursionError):
+            return "missing", {}
+
+    def _applicability(self, item, run_id=None, ledger_cache=None):
+        """Project knowledge is reusable evidence; task history is run-bound context."""
+        provenance = item.get("provenance")
+        provenance = provenance if isinstance(provenance, dict) else {}
+        source_run = provenance.get("run_id")
+        if item["kind"] == "accepted_task" and not source_run:
+            match = re.search(r"(?:^|;)run:([^;]+)", item["source"])
+            source_run = match.group(1) if match else None
+            if not source_run and item["key"].startswith("task:"):
+                parts = item["key"].split(":", 2)
+                source_run = parts[1] if len(parts) == 3 else None
+        scope = provenance.get("scope", ("run" if item["kind"] == "accepted_task"
+                                              else "project" if item["kind"] == "project_knowledge"
+                                              else "unscoped"))
+        if item["kind"] == "accepted_task":
+            scope = "run"
+        status = None
+        if source_run:
+            status = "missing"
+            if isinstance(source_run, str) and re.fullmatch(r"[A-Za-z0-9_-]+", source_run):
+                ledger_cache = ledger_cache if ledger_cache is not None else {}
+                if source_run not in ledger_cache:
+                    ledger_cache[source_run] = self._source_ledger(source_run)
+                status, ledger = ledger_cache[source_run]
+                try:
+                    if item["kind"] == "accepted_task" and status != "missing":
+                        task_id = provenance.get("task_id")
+                        if not task_id and item["key"].startswith(f"task:{source_run}:"):
+                            task_id = item["key"].split(":", 2)[2]
+                        accepted = ledger.get("accepted", {})
+                        record = accepted.get(task_id) if isinstance(accepted, dict) and isinstance(task_id, str) else None
+                        if not isinstance(record, dict):
+                            status = "invalid"
+                        elif provenance.get("commit") and record.get("commit") != provenance["commit"]:
+                            status = "invalid"
+                except (OSError, ValueError, KeyError, TypeError, RecursionError):
+                    status = "missing"
+        applicable = isinstance(scope, str) and scope in ("project", "unscoped", "run")
+        if scope == "run":
+            applicable = bool(source_run and source_run == run_id)
+            if item["kind"] == "accepted_task":
+                applicable = status not in (None, "abandoned", "missing", "invalid")
+        return {"scope": scope, "source_run_id": source_run, "source_run_status": status,
+                "reference_only": True, "applicable": applicable,
+                "historical": bool(source_run and source_run != run_id)}
+
     def read(self, ident):
         with self.connect() as db:
             row = db.execute("SELECT * FROM memories WHERE id=?", (ident,)).fetchone()
@@ -319,20 +389,24 @@ class Memory:
         result = self._decode(row)
         result["expired"] = result["expires"] is not None and result["expires"] < time.time()
         result.update(self._staleness(result))
+        result.update(self._applicability(result))
         return result
 
-    def search(self, query, limit=6, level=1):
+    def search(self, query, limit=6, level=1, *, run_id=None):
         if level not in (0, 1, 2) or not 1 <= limit <= 20:
             raise HarnessError("level 应为 0/1/2，limit 应为 1..20")
         now, q = time.time(), terms(query)
         with self.connect() as db:
             rows = db.execute("SELECT * FROM memories WHERE active=1 AND (expires IS NULL OR expires>?)", (now,)).fetchall()
-        found, source_cache, commit_cache = [], {}, {}
+        found, source_cache, commit_cache, ledger_cache = [], {}, {}, {}
         for row in rows:
             item = self._decode(row)
             tokens = terms(item["abstract"] + " " + item["overview"] + " " + item["detail"])
             overlap = len(q & tokens)
             if q and not overlap:
+                continue
+            item.update(self._applicability(item, run_id, ledger_cache))
+            if not item["applicable"]:
                 continue
             age = max(0, (now - item["created"]) / 86400)
             score = ((overlap / max(1, len(q))) * 10 + math.exp(-age / 90)) * KIND_WEIGHTS.get(item["kind"], 1)
@@ -348,10 +422,12 @@ class Memory:
             if level >= 2:
                 selected["detail"] = item["detail"]
             selected.update({key: item[key] for key in ("possibly_stale", "stale_reasons")})
+            selected.update({key: item[key] for key in ("scope", "source_run_id", "source_run_status",
+                                                       "reference_only", "applicable", "historical")})
             results.append(selected)
         return results
 
     def export(self):
         with self.connect() as db:
             rows = db.execute("SELECT * FROM memories ORDER BY created").fetchall()
-        return [self._decode(row) for row in rows]
+        return [{**self._decode(row), **self._applicability(self._decode(row))} for row in rows]

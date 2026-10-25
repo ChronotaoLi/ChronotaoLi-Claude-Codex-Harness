@@ -167,7 +167,21 @@ class KnowledgeMemoryTests(unittest.TestCase):
         self.assertTrue(self.memory.read(new)["expired"])
         self.assertEqual(len(self.memory.export()), 2)
 
+    def test_source_verified_project_knowledge_remains_reusable_after_run_abandonment(self):
+        ident = self.promote()[0]
+        directory = self.memory.path.parent / "runs" / "run_test"
+        directory.mkdir(parents=True)
+        (directory / "state.json").write_text(json.dumps({"id": "run_test", "status": "abandoned"}))
+        record = self.memory.search("SQLite", run_id="run_new")[0]
+        self.assertEqual(record["id"], ident)
+        self.assertEqual(record["scope"], "project")
+        self.assertEqual(record["source_run_status"], "abandoned")
+        self.assertFalse(record["possibly_stale"])
+
     def test_kind_weight_prefers_project_knowledge_over_matching_task_history(self):
+        directory = self.memory.path.parent / "runs" / "run"
+        directory.mkdir(parents=True)
+        (directory / "state.json").write_text(json.dumps({"id": "run", "status": "completed", "accepted": {"task": {"commit": self.commit}}}))
         self.memory.remember(key="task:run:task", abstract=self.proposal["abstract"],
                     overview=self.proposal["content"], detail=self.proposal["content"], source="run", kind="accepted_task")
         self.promote()
@@ -176,9 +190,13 @@ class KnowledgeMemoryTests(unittest.TestCase):
         self.assertEqual(found[1]["kind"], "accepted_task")
 
     def test_stale_high_weight_record_cannot_hide_fresh_record_at_limit_one(self):
+        directory = self.memory.path.parent / "runs" / "run"
+        directory.mkdir(parents=True)
+        (directory / "state.json").write_text(json.dumps({"id": "run", "status": "completed", "accepted": {"task": {"commit": self.commit}}}))
         self.promote()
         fresh = self.memory.remember(key="task:run:task", abstract=self.proposal["abstract"],
-                    overview=self.proposal["content"], detail=self.proposal["content"], source="run", kind="accepted_task")
+                    overview=self.proposal["content"], detail=self.proposal["content"], source="run", kind="accepted_task",
+                    provenance={"commit": self.commit, "run_id": "run"})
         self.assertEqual(self.memory.search("SQLite storage", limit=1)[0]["kind"], "project_knowledge")
         (self.repo / "storage.py").write_text("DATABASE = 'PostgreSQL'\n")
         self.assertEqual(self.memory.search("SQLite storage", limit=1)[0]["id"], fresh)

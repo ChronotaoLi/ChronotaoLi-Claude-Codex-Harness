@@ -60,7 +60,9 @@ def handle(request, memory, skills, run):
             value = {"file_sha256": file_sha256, "json_check": json_check,
                      "file_diff": file_diff}[name](**args, base=base)
         elif name == "memory_search":
-            value = memory.search(args["query"], level=args.get("level", 1)) if memory.path.exists() else []
+            state = read_json(run) if run else {}
+            value = memory.search(args["query"], level=args.get("level", 1),
+                                  run_id=state.get("id")) if memory.path.exists() else []
         elif name == "memory_read":
             if not memory.path.exists():
                 raise HarnessError(f"没有此记忆：{args['id']}")

@@ -13,12 +13,16 @@ You may propose a small number of reusable project facts in proposed_memories. E
 
 A dependency summary is a navigation aid. Read the referenced source when correctness depends on it. Memory may describe a different revision.
 
+Choose decision_requests.task_id only from handoff_targets (eligible unaccepted downstream IDs/titles, including transitive dependents). An empty list permits no requests. A necessary choice for this task or without a listed target requires an operator blocker; never omit or redirect it.
+
 Use blocker_kind=operator when this task needs an explicit user choice; state the concrete question and stop. If this task already satisfies its own acceptance, return completed and optionally decision_requests=[{id,task_id,question}] for downstream tasks that transitively depend on this task. Do not block completed analysis solely because a later operation still needs a risk decision. A request does not authorize that operation; the source task still undergoes verification and review.
 
 Optionally return checkpoints=[{id,summary,inputs:[{path,sha256}],evidence:[{path,sha256}],freshness,max_age_seconds}] for actual saved evidence. Use unique IDs, exact file hashes and complete declared dependencies. content requires at least one input and max_age_seconds=0; volatile allows 0–86400 seconds, with 0 requiring recheck every time. The runtime privately saves evidence and marks hash/freshness eligibility, not correctness. Read relevant reusable evidence instead of repeating unchanged checks; recheck stale facts, volatile facts when due, and any undeclared dependencies. Neither checkpoints nor operator/environment assertions prove acceptance or expand permissions.
 
 
 Checkpoint evidence may use this dispatch's broker stdout/stderr paths and hashes. Other private paths and inputs retain reserved-path restrictions; all sources must be regular non-symlink files. Read checkpoint_index for omitted history and accepted-task evidence.
+
+Reuse saved checkpoints without redeclaring them. Separate immutable artifact checks from live observations; bind content checks to their actual inputs. Repeat static checks only for changed inputs or coverage gaps; renew stale live facts before side effects. Invalid optional entries are discarded individually with diagnostics; valid peers survive, and acceptance remains required.
 
 Format repairs cannot reuse another dispatch's broker evidence. Omit optional checkpoints or repeat an authorized, safely repeatable check; never repeat side effects just to obtain a checkpoint.
 

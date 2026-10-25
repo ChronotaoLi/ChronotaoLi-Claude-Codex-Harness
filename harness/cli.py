@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import re
 import shutil
 import signal
 import sqlite3
@@ -12,6 +13,7 @@ from pathlib import Path
 
 from . import git
 from .adapters import DemoBackend
+from .budgets import work_attempts
 from .cleanup import cleanup_verification
 from .config import Config
 from .engine import Engine
@@ -85,6 +87,8 @@ def status_summary(run):
     result["accepted_tasks"] = list(run.get("accepted", {}))
     result["budgets"] = {key: run.get(key) for key in
                          ("attempts", "total_attempts", "agent_dispatches", "replan_attempts", "final_attempts")}
+    result["budgets"].update(work_attempts=work_attempts(run),
+                             attempt_budget_policy=run.get("attempt_budget_policy", "all_invocations"))
     dispatches = run.get("dispatches", [])
     dispatches = [entry for entry in dispatches if isinstance(entry, dict)] if isinstance(dispatches, list) else []
     outcomes = dict.fromkeys(("completed", "task_blocked", "environment_blocked", "operator_blocked", "runtime_failed", "unknown"), 0)
@@ -183,6 +187,13 @@ def manage_memory(args, repo, state):
     path = state / "memory.sqlite3"
     adding = args.memory_command == "add"
     if adding:
+        run_id = getattr(args, "run", None)
+        if run_id:
+            if not re.fullmatch(r"[A-Za-z0-9_-]+", run_id):
+                raise HarnessError("无效运行 ID")
+            source_status, _ = Memory(path, repo=repo, read_only=True)._source_ledger(run_id)
+            if source_status in ("missing", "invalid"):
+                raise HarnessError("记忆来源运行缺失、无效或不属于当前项目")
         git.ignore_state(repo)
     elif not path.exists():
         if args.memory_command == "read":
@@ -192,9 +203,11 @@ def manage_memory(args, repo, state):
     memory = Memory(path, repo=repo, read_only=not adding)
     if adding:
         print(memory.remember(key=args.key, abstract=args.title, overview=args.text, detail=args.text,
-                              source=args.source, ttl_days=args.ttl_days))
+                              source=args.source, ttl_days=args.ttl_days,
+                              provenance={"scope": "run" if run_id else "project",
+                                          "reference_only": True, **({"run_id": run_id} if run_id else {})}))
     elif args.memory_command == "search":
-        print(dump(memory.search(args.query, level=args.level)))
+        print(dump(memory.search(args.query, level=args.level, run_id=args.run)))
     elif args.memory_command == "read":
         print(dump(memory.read(args.id)))
     else:
@@ -255,9 +268,11 @@ def _main(argv=None):
     add.add_argument("--text", required=True)
     add.add_argument("--source", default="operator")
     add.add_argument("--ttl-days", type=float)
+    add.add_argument("--run", help="Bind this reference record to one run")
     search = msub.add_parser("search")
     search.add_argument("query")
     search.add_argument("--level", type=int, choices=[0, 1, 2], default=1)
+    search.add_argument("--run", help="Include reference records scoped to this run")
     read = msub.add_parser("read")
     read.add_argument("id")
     msub.add_parser("export")
