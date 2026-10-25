@@ -228,7 +228,7 @@ python3 -m harness --repo /path/to/project memory export > memory-backup.json
   worktrees/<run_id>/   # 隔离分支中的代码
 ```
 
-运行时只把 `/.harness/` 加入目标项目的本地 `.git/info/exclude`，不改已跟踪 `.gitignore`。不要提交私有运行现场、凭据或生成 MCP 配置；日志可能包含代码与业务内容。
+运行时只把 `/.harness/` 加入目标项目的本地 `.git/info/exclude`，不改已跟踪 `.gitignore`。`.harness/` 属于被忽略的私有运行目录，不要提交运行现场、凭据或生成 MCP 配置；日志可能包含代码与业务内容。离线开发验证产物集中到 `.harness/validation/<批次>/`，登记结果并被后续验证覆盖后可清理，当前 `.harness/refactor/` 不迁移；详见[验证记录](docs/validation.md)。
 
 `status RUN --full` 的 `provider_usage` 及 `dispatch_finished` 事件记录供应商实际返回的用量，缺失用量不当作零，报告成本不等于实际账单。长进程每 60 秒提示仍在运行，实际超时独立生效。错误、中断、Git 提交与检查点之间的窗口见[恢复协议](docs/recovery.md)。
 

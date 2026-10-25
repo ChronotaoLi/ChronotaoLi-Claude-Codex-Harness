@@ -2,6 +2,8 @@
 
 最近验证日期：2026-10-25。本记录描述已执行的检查，不保证将来账号权限或 CLI 行为不变。
 
+`.harness/` 是被 Git 忽略的私有运行目录。离线开发验证产物以后集中放在 `.harness/validation/<批次>/`，不在根目录按版本堆积；当前 `.harness/refactor/` 不迁移。旧离线原始日志与临时探针在结果登记并被后续验证覆盖后可清理，历史摘要不等同于仍留有原始日志。此规则不用于清理真实调用证据或 run 台账。
+
 ## 首版离线基线
 
 `python3 -W error::ResourceWarning -m unittest discover -s tests -v`：27 项通过。
@@ -88,7 +90,7 @@ python3 -m harness smoke --commander fable
 
 还覆盖工作树隐藏 `.harness` 的 worker／整体审阅／hook 门禁、submodule 提前拒绝、恢复 mtime 与隐藏索引标记下的内容快照、验证生成文件的本地排除恢复、配置和 MCP 诊断、状态摘要与完整台账、放弃运行与清理。清理检查独立核对实际文件内容、拒绝隐藏索引标记和忽略文件；测试验证删除后的记账中断可恢复，以及 resume 不会覆盖并发放弃操作。
 
-本次未运行真实模型 smoke。测试使用模拟模型响应、真实 Git 和本地子进程，不能证明当前真实模型调用、复杂规划或供应商故障恢复可用。完整测试日志保存在 `.harness/validation/review-fixes-2026-10-22-final-unittest.log`，不提交运行日志。设计与使用说明已同步，原临时审阅文档已删除。
+本次未运行真实模型 smoke。测试使用模拟模型响应、真实 Git 和本地子进程，不能证明当前真实模型调用、复杂规划或供应商故障恢复可用。设计与使用说明已同步，原临时审阅文档已删除。
 
 ## 后续设计评审修复（2026-10-22，台账 v5）
 
@@ -98,11 +100,11 @@ python3 -m harness smoke --commander fable
 
 同任务 worker 故障来源与跨任务隔离、post_accept/on_error 独立日志、整体验证失败后空 diff 修正的再规划、未知配置键、无配置的状态和记忆操作均有回归测试。显式退出确认覆盖精确 dispatch、未知 ID 整批拒绝、审计事件、PGID 复用后的恢复和放弃、保留 HEAD 与忽略文件的删除门禁。单任务一次通过流程最多 15 次全量快照，验证 hook 修改仍阻止进入审阅；空白调度指令必须经新 dispatch 修正才能传给 worker。
 
-`python3 -m harness demo` 完成，stdout 可直接解析为单个 JSON；模型调用标记为 false。本次未运行真实模型 smoke，以上离线结果不证明真实账号或供应商调用可用。日志位于 `.harness/review-fixes-final-tests.log`，demo 结果及日志位于 `.harness/review-demo.json` 与 `.harness/review-demo.log`，均不提交。使用说明与设计约束已同步，临时评审文件已删除。
+`python3 -m harness demo` 完成，stdout 可直接解析为单个 JSON；模型调用标记为 false。本次未运行真实模型 smoke，以上离线结果不证明真实账号或供应商调用可用。使用说明与设计约束已同步，临时评审文件已删除。
 
 ## 恢复与权限边界修订（2026-10-22，台账 v6）
 
-执行 `python3 -m unittest discover -s tests -v`：344 项，343 项通过、1 项跳过，耗时 114.048 秒。跳过项仍为本机文件系统无法创建非 UTF-8 文件名。完整日志位于 `.harness/validation-2026-10-22-final.log`，不提交。运行时代码通过 Python 3.11 语法解析；这不等同于在 Python 3.11 执行完整测试。
+执行 `python3 -m unittest discover -s tests -v`：344 项，343 项通过、1 项跳过，耗时 114.048 秒。跳过项仍为本机文件系统无法创建非 UTF-8 文件名。运行时代码通过 Python 3.11 语法解析；这不等同于在 Python 3.11 执行完整测试。
 
 新增行为覆盖：格式修正返回失败后结束 pending 状态，连续恢复改为普通尝试并携带最新故障来源；未返回结果的 CLI 故障保留修正；结果原子落盘与清理之间的中断不重放。语义非法且含拒绝或 blocking 的审阅保存为 invalid_rejected，保留原文与摘要，在 hook 通过后进入返工或有界再规划；approve 携带非法 blocking 也不能接受。恢复、空 diff 修正、预算耗尽和 --reverify 均不能对同一整体快照重抽；无拒绝的非法批准仍停止。候选变化保留旧审阅与修正依据，篡改证据仍阻止恢复；旧 v5 台账不能由新恢复语义直接执行。
 
@@ -113,7 +115,7 @@ python3 -m harness smoke --commander fable
 
 ## Git 绑定、指挥恢复与可选新检出验证（2026-10-22，台账 v7）
 
-最终执行 `python3 -m unittest discover -s tests -v`：402 项，401 项通过、1 项跳过，耗时 304.243 秒（Python 3.15.0）。跳过项仍为本机文件系统无法创建非 UTF-8 文件名。完整日志位于 `.harness/validation/design-implementation-2026-10-22-final.log`，不提交。`python3 -m compileall -q harness tests`、运行时代码的 Python 3.11 语法解析与 `git diff --check` 通过；语法解析不等于在 Python 3.11 运行测试。
+最终执行 `python3 -m unittest discover -s tests -v`：402 项，401 项通过、1 项跳过，耗时 304.243 秒（Python 3.15.0）。跳过项仍为本机文件系统无法创建非 UTF-8 文件名。`python3 -m compileall -q harness tests`、运行时代码的 Python 3.11 语法解析与 `git diff --check` 通过；语法解析不等于在 Python 3.11 运行测试。
 
 新增行为覆盖：工作树 `.git` 改向、符号链接、实际管理目录重名、反向链接和公共目录变化、嵌套符号分支、环境 Git 参数重定向，以及 detached 提交绑定；接受、恢复、移除和记忆来源核验拒绝错误绑定，主分支和主索引保持不变。文件与目录互换可快照、接受和归档恢复，新增暂存的 gitlink 仍被拒绝。
 
@@ -121,16 +123,16 @@ python3 -m harness smoke --commander fable
 
 可选 fresh_checkout 覆盖忽略文件使任务通过但新检出整体验证失败、显式依赖准备成功、准备修改受检文件被拒绝、准备首步失败不执行后续步骤、恢复使用新检出且不重复 worker、审阅恢复复用已有验证、验证 Git 绑定变化及源候选被修改。忽略路径诊断传入审阅；初始化中断或基线产物写入失败后，恢复仍使用台账中的原始基线。
 
-`python3 -m harness demo` 完成，stdout 为单个 JSON，明确记录 `simulation: true`、`models_called: false`。结果和日志位于 `.harness/validation/design-implementation-demo.json` 与 `.harness/validation/design-implementation-demo.log`。本次没有真实模型调用；以上测试使用模拟模型响应、真实 Git 和本地子进程，不证明当前账号、Claude 原生权限判定或真实供应商故障恢复可用。使用说明和设计约束已同步，临时审阅文档 `docs/review-2026-10-22.md` 已删除。
+`python3 -m harness demo` 完成，stdout 为单个 JSON，明确记录 `simulation: true`、`models_called: false`。本次没有真实模型调用；以上测试使用模拟模型响应、真实 Git 和本地子进程，不证明当前账号、Claude 原生权限判定或真实供应商故障恢复可用。使用说明和设计约束已同步，临时审阅文档 `docs/review-2026-10-22.md` 已删除。
 
 ## 受控恢复与维护修订（2026-10-22，台账 v8）
 
 完整执行 `python3 -m unittest discover -s tests -v`，分别使用以下两个解释器：
 
-| Python | 测试结果 | 耗时 | 私有日志 |
-| --- | --- | --- | --- |
-| 3.15.0 | 447 项，446 通过、1 跳过 | 435.810 秒 | `.harness/validation/design-v8-python-current.log` |
-| 3.11.17 | 447 项，446 通过、1 跳过 | 440.123 秒 | `.harness/validation/design-v8-python311.log` |
+| Python | 测试结果 | 耗时 |
+| --- | --- | --- |
+| 3.15.0 | 447 项，446 通过、1 跳过 | 435.810 秒 |
+| 3.11.17 | 447 项，446 通过、1 跳过 | 440.123 秒 |
 
 两次跳过均为本机文件系统拒绝实际创建非 UTF-8 文件名。Python 3.11.17 安装在本仓库 `.harness/python/`，本次已实际运行完整测试，不再仅以语法解析作为该版本的验证。新增 GitHub Actions 配置在 Python 3.11 和 3.x 执行同一离线测试命令；本记录不声称远程 CI 已运行。`python3 -m compileall -q harness tests` 与 `git diff --check` 通过。
 
@@ -138,7 +140,7 @@ python3 -m harness smoke --commander fable
 
 范围授权测试验证整批校验、审计、原任务范围和验收不变，以及已返回的越界修订获授权后继续校验同一结果。清理测试覆盖预览、运行锁、进程退出、路径与 Git 绑定、修改及忽略文件拒绝、精确注销缺失检出、部分清理、中断恢复和 Git 管理目录名称复用；原运行和验证证据保留。还覆盖缺失审阅产物更新 dispatch 诊断、旧审阅原始摘要的检索去重，以及指令文件新增／修改／删除／重命名进入任务和整体审阅输入。
 
-`python3 -m harness demo` 完成，stdout 可解析为单个 JSON，记录 `simulation: true`、`models_called: false`；结果和日志位于 `.harness/validation/design-v8-demo.json` 与 `.harness/validation/design-v8-demo.log`。
+`python3 -m harness demo` 完成，stdout 可解析为单个 JSON，记录 `simulation: true`、`models_called: false`。
 
 本次另执行一次真实 `python3 -m harness.permission_smoke`，使用 Claude Code 2.1.308 和精确 worker 模型 `claude-opus-5-5`，dispatch 为 `e388fab9-e345-44f9-9678-088bdc6c5e4a`。11 次实际工具调用中，工作树内 Read/Edit/Write、`.git` 读取、精确 Bash 命令及工作树外 Read 共 6 项允许控制成功；追加未授权参数、未列命令、工作树外 Edit/Write 和 `.git` Edit 共 5 项均被拒绝。每项拒绝都有匹配工具 ID 与输入的供应商 `permission_denials` 及错误工具结果，同时核对边界文件字节，未使用模型文字作为通过依据。供应商结果记录 12 轮、成本字段 0.1453248 美元。
 
@@ -148,7 +150,7 @@ python3 -m harness smoke --commander fable
 
 ## v8 审阅后的恢复与诊断修订（2026-10-22）
 
-最终执行 `python3 -m unittest discover -s tests -v`：481 项，480 项通过、1 项跳过，耗时 449.788 秒（Python 3.15.0）。跳过原因仍为本机文件系统拒绝实际创建非 UTF-8 文件名。完整日志保存在 `.harness/validation/review-v8-implementation-verified.log`，不提交。
+最终执行 `python3 -m unittest discover -s tests -v`：481 项，480 项通过、1 项跳过，耗时 449.788 秒（Python 3.15.0）。跳过原因仍为本机文件系统拒绝实际创建非 UTF-8 文件名。
 
 新增检查覆盖自动格式修正耗尽后的显式一次修正、最初与失败修正结果的双重摘要绑定、原审阅结论和指挥决定固定、累计预算、返回结果落盘中断及候选失效归档。旧 v8 指挥修正缺少原始摘要时，普通恢复、显式修正和候选变化均不能重新派发或接受无法核验的决定；已有摘要的 reviewer 守卫可继续按受控条件恢复。
 
@@ -156,7 +158,7 @@ python3 -m harness smoke --commander fable
 
 还覆盖全部 hook 的运行定位字段、全新验证目录与源工作树区分、错误与恢复事件、非法显式计划不创建运行现场、全仓库范围提示中断后保留原验收，以及未跟踪／忽略文件诊断不删除任何内容。README 与设计文档同步更新，并增加阻塞状态与操作者出口表。
 
-另使用仓库私有 Python 3.11.17 执行 `test_process_exit_recovery.py`：4 项全部通过，耗时 4.580 秒；日志位于 `.harness/validation/review-v8-process-python311.log`。本轮未在 Python 3.11 重跑完整测试集。运行时代码的 Python 3.11 语法解析、`python3 -m compileall -q harness tests` 和 `git diff --check` 通过。
+另使用仓库私有 Python 3.11.17 执行 `test_process_exit_recovery.py`：4 项全部通过，耗时 4.580 秒。本轮未在 Python 3.11 重跑完整测试集。运行时代码的 Python 3.11 语法解析、`python3 -m compileall -q harness tests` 和 `git diff --check` 通过。
 
 本次未调用真实模型或执行 smoke，离线模型响应与本地进程测试不证明真实账号或供应商调用可用。临时审阅文档 `docs/review-2026-10-22-v8.md` 已按要求删除。
 
@@ -164,7 +166,7 @@ python3 -m harness smoke --commander fable
 
 本轮提前校验启用的 MCP 配置，在 run 创建前及派发计数前报告服务和字段错误；允许主检出保留未跟踪文件并提示其不进入工作树；记录供应商用量并将进程心跳间隔调为 60 秒。规划说明补充所需测试、夹具与前置工作的归属，详细恢复语义移到 [恢复协议](recovery.md)。任务预算、现有恢复出口和默认 32,000 字符预算保持原有语义，没有新增台账状态或版本。
 
-完整执行 `python3 -m unittest discover -s tests -v`：**499 项，498 通过、1 跳过，452.501 秒**（Python 3.15.0）。跳过项仍为本机文件系统拒绝实际创建非 UTF-8 文件名。新增的 MCP、启动隔离及用量观测三组测试另在 Python 3.11.17 执行，**18 项全部通过，12.862 秒**；本轮未在 Python 3.11 重跑完整测试集。`python3 -m compileall -q harness tests` 与 `git diff --check` 通过。离线日志分别为 `.harness/validation/review-v9-implementation-unittest.log` 与 `.harness/validation/review-v9-python311.log`。
+完整执行 `python3 -m unittest discover -s tests -v`：**499 项，498 通过、1 跳过，452.501 秒**（Python 3.15.0）。跳过项仍为本机文件系统拒绝实际创建非 UTF-8 文件名。新增的 MCP、启动隔离及用量观测三组测试另在 Python 3.11.17 执行，**18 项全部通过，12.862 秒**；本轮未在 Python 3.11 重跑完整测试集。`python3 -m compileall -q harness tests` 与 `git diff --check` 通过。
 
 新增行为覆盖：缺失连接字段及非法配置类型在创建 run/分支前被拒绝；pre_agent 后的 MCP 配置错误不消耗任务或派发次数，恢复原配置后可继续；主检出同名未跟踪文件与笔记在完整任务运行后保留，暂存和已跟踪修改仍阻止启动；诊断路径转义并限制显示长度。用量测试以真实本地子进程模拟 CLI 输出，覆盖成功、CLI/协议失败、缺失及非法指标、模型自报费用不作计量、receipt 恢复不重复记录，以及观测故障不改变接受结果。它们不证明真实模型调用可用。
 
@@ -189,7 +191,7 @@ python3 -m harness smoke --commander fable
 
 ## 第十轮审阅修订验证（台账 v8）
 
-2026-10-22 执行 `python3 -m unittest discover -s tests -v`：514 项，513 项通过、1 项跳过（Python 3.15.0，482.060 秒）。跳过原因仍为本机文件系统拒绝实际创建非 UTF-8 文件名。日志保存在本仓库私有 `.harness/validation/review-v10-offline.log`，不提交。
+2026-10-22 执行 `python3 -m unittest discover -s tests -v`：514 项，513 项通过、1 项跳过（Python 3.15.0，482.060 秒）。跳过原因仍为本机文件系统拒绝实际创建非 UTF-8 文件名。
 
 本轮修订覆盖：文件 stdin 在延迟读取大输入时完整传递 UTF-8 字节；首次拒绝的不可变 finding 格式错误保留为 invalid_rejected，维持原始产物摘要和 post_agent 门禁；Codex 只读调用关闭项目指令自动注入；恢复时拒绝类型、互斥或派发引用不一致的台账；显式增加 max_tasks 后复用已返回的超限修订，并保留 stop 的显式重试要求。worker 返回到阶段持久化之间的重复派发窗口仅补充文档，未新增旧结果消费协议。
 
@@ -199,7 +201,7 @@ Codex 0.163.0 的本地 `debug prompt-input` 检查确认：未提交的 AGENTS.
 
 ## 第十一轮审阅修订验证（台账 v8）
 
-2026-10-22 执行 `python3 -m unittest discover -s tests -v`：520 项，519 项通过、1 项跳过（Python 3.15.0，531.499 秒）。跳过原因仍为本机文件系统拒绝实际创建非 UTF-8 文件名。完整日志保存在本仓库私有 `.harness/validation/review-v11-offline.log`，不提交。
+2026-10-22 执行 `python3 -m unittest discover -s tests -v`：520 项，519 项通过、1 项跳过（Python 3.15.0，531.499 秒）。跳过原因仍为本机文件系统拒绝实际创建非 UTF-8 文件名。
 
 本轮新增 6 项行为测试，并调整已有整体审阅用例。自动格式额度已用后，新候选首次拒绝若仅摘要或 finding ID 格式非法，保存为 `invalid_rejected` 并进入任务返工或整体修正规划；测试核对原始产物、内容摘要、派发次数和累计额度，以及 post_agent 失败后复用同一结果、独立重试 hook 的恢复行为。已保存的拒绝型 exhausted 守卫仍阻断同一快照，批准及修正结果继续遵守原有门禁。
 
@@ -209,106 +211,106 @@ Codex 0.163.0 的本地 `debug prompt-input` 检查确认：未提交的 AGENTS.
 
 ## 第十二轮审阅修订验证（2026-10-23，台账 v8）
 
-执行 `python3 -m unittest discover -s tests -v`：524 项，523 项通过、1 项跳过（Python 3.15.0，511.501 秒）。跳过原因仍为本机文件系统拒绝实际创建非 UTF-8 文件名。完整日志保存在本仓库私有 `.harness/validation/review-v12-offline.log`，不提交。
+执行 `python3 -m unittest discover -s tests -v`：524 项，523 项通过、1 项跳过（Python 3.15.0，511.501 秒）。跳过原因仍为本机文件系统拒绝实际创建非 UTF-8 文件名。
 
 本轮新增 4 项行为测试。`--reverify` 的授权在本次恢复首次进入整体验收时消费：已返回修订产生新快照、续跑未完成验证及超时恢复三种路径中，后续非零失败和空 diff 修正均保留失败证据并请求再规划，不额外消耗最终尝试，也不误记显式重验事件。测试核对最终尝试数、验证派发数、接受提交及 `unchanged_corrections` 触发内容。
 
-恢复未完成的 run 时，`--reverify` 与 `--retry-stopped` 对 final 和任务目标均互斥。测试核对拒绝组合后台账及事件字节不变、原 stop 保留、没有新派发，即使同时提供有效的 `--confirm-exited` 也不会先写入退出确认；随后单独重试停止规划仍能确认退出并重新调用指挥。仅在内存中恢复基线提交的原始 `resume` 与 `final_review` 方法时，四项新增测试均检出旧行为；负向验证日志为 `.harness/validation/review-v12-regression-baseline.log`。
+恢复未完成的 run 时，`--reverify` 与 `--retry-stopped` 对 final 和任务目标均互斥。测试核对拒绝组合后台账及事件字节不变、原 stop 保留、没有新派发，即使同时提供有效的 `--confirm-exited` 也不会先写入退出确认；随后单独重试停止规划仍能确认退出并重新调用指挥。仅在内存中恢复基线提交的原始 `resume` 与 `final_review` 方法时，四项新增测试均检出旧行为。
 
-另使用 Python 3.11.17 执行全部 4 项新增测试，均通过，耗时 12.173 秒，日志为 `.harness/validation/review-v12-python311.log`；本轮未在 Python 3.11 重跑完整套件。`python3 -m compileall -q harness tests`、CLI 恢复帮助输出与 `git diff --check` 检查通过。
+另使用 Python 3.11.17 执行全部 4 项新增测试，均通过，耗时 12.173 秒；本轮未在 Python 3.11 重跑完整套件。`python3 -m compileall -q harness tests`、CLI 恢复帮助输出与 `git diff --check` 检查通过。
 
 台账保持版本 8，没有新增恢复子状态。上述测试使用模拟模型响应及真实本地 Git、验证子进程，不证明真实模型调用行为；本轮未运行 `python3 -m harness smoke`。README、设计、恢复协议及 CLI 帮助已同步，临时审阅文档 `docs/review-2026-10-22-v12.md` 已按要求删除。
 
 ## 第十三轮审阅修订验证（2026-10-23，台账 v8）
 
-执行 `python3 -m unittest discover -s tests -v`：526 项，525 项通过、1 项跳过（Python 3.15.0，519.838 秒）。跳过原因仍为本机文件系统拒绝实际创建非 UTF-8 文件名。完整日志保存在本仓库私有 `.harness/validation/review-v13-offline.log`，不提交。
+执行 `python3 -m unittest discover -s tests -v`：526 项，525 项通过、1 项跳过（Python 3.15.0，519.838 秒）。跳过原因仍为本机文件系统拒绝实际创建非 UTF-8 文件名。
 
 本轮新增 2 项行为测试。整体验收预算耗尽时，`--reverify` 不再取消待再规划意图；测试核对原请求、指挥 receipt、最终失败历史、原始失败产物、派发及累计计数保持不变，也不写取消或显式重验事件。增加预算后分别验证普通 `resume` 继续再规划，以及显式 `--reverify` 完成新的最终尝试。旧 v8 已经丢失待再规划意图的现场也有独立覆盖：预算不足时不记录显式重验事件，增加预算后仍可显式重验并保留原失败证据，不自动重建旧请求。
 
-全部整体验收恢复测试 18 项另行通过，耗时 35.698 秒，日志为 `.harness/validation/review-v13-final-stage.log`。仅在内存中分别恢复基线 `a3b651e` 的 `execute` 和 `final_review` 方法时，对应新增测试分别检出再规划意图丢失和过早记录重验事件；负向验证日志为 `.harness/validation/review-v13-regression-baseline.log`。
+全部整体验收恢复测试 18 项另行通过，耗时 35.698 秒。仅在内存中分别恢复基线 `a3b651e` 的 `execute` 和 `final_review` 方法时，对应新增测试分别检出再规划意图丢失和过早记录重验事件。
 
-另使用 Python 3.11.17 执行全部 2 项新增测试，均通过，耗时 5.668 秒，日志为 `.harness/validation/review-v13-python311.log`；本轮未在 Python 3.11 重跑完整套件。`python3 -m compileall -q harness tests` 与 `git diff --check` 通过。
+另使用 Python 3.11.17 执行全部 2 项新增测试，均通过，耗时 5.668 秒；本轮未在 Python 3.11 重跑完整套件。`python3 -m compileall -q harness tests` 与 `git diff --check` 通过。
 
 已完成 run 的恢复参数行为及损坏恢复链接阻止 `abandon` 的限制仅补充文档，未放宽台账、进程或清理门禁。台账保持版本 8，没有新增恢复子状态或 CLI 参数，模型 ID 与派发生命周期保持不变。上述测试使用模拟模型响应及真实本地 Git、验证子进程，不证明真实模型调用行为；本轮未运行 `python3 -m harness smoke` 或调用真实模型。README、设计与恢复协议已同步，临时审阅文档 `docs/review-2026-10-23-v13.md` 已按要求删除。
 
 ## 环境更新与前置检查验证（2026-10-23，台账 v9）
 
-执行 `python3 -m unittest discover -s tests -v`：556 项，555 项通过、1 项跳过（Python 3.15.0，528.168 秒）。跳过原因仍为本机文件系统拒绝非 UTF-8 文件名。完整日志保存在 `.harness/validation/environment-update-offline.log`，不提交。
+执行 `python3 -m unittest discover -s tests -v`：556 项，555 项通过、1 项跳过（Python 3.15.0，528.168 秒）。跳过原因仍为本机文件系统拒绝非 UTF-8 文件名。
 
 新增 30 项行为测试覆盖操作者环境更新进入后续指挥、worker、任务及整体审阅，原任务义务和累计预算保留；失败前置检查不派发模型，补齐条件后普通恢复；输入副本与来源摘要校验、重复提交、审计及台账保存中断、历史检查替换、上下文溢出、预算耗尽、旧来源过期，以及已有指挥 receipt／待派发指令不能被环境更新替换。越界写入仍由原文件范围门禁拒绝；worker 格式修正前重新检查前置条件，worker 已完成后续接审阅则不重跑前置检查。命令声明检查通过不执行对应命令。CLI 测试覆盖参数传递、错误出口、worker 结果分类和过期阻断诊断。
 
 版本 8 的普通恢复与首次接收更新升级到版本 9 均通过；独立清理的终态确认覆盖版本 7、8、9，保留原状态与验证证据。检查原始环境更新和检查报告不改变模型 ID、命令授权、接受条件或派发预算。
 
-使用 Python 3.11.17 执行 `PYTHONPATH=tests python3.11 -m unittest test_environment_updates test_environment_cli -v`：全部 30 项新增测试通过，33.100 秒；日志为 `.harness/validation/environment-update-python311.log`。本轮未在 Python 3.11 重跑完整套件。全部 Python 文件的 3.11 语法解析及 `git diff --check` 通过。
+使用 Python 3.11.17 执行 `PYTHONPATH=tests python3.11 -m unittest test_environment_updates test_environment_cli -v`：全部 30 项新增测试通过，33.100 秒。本轮未在 Python 3.11 重跑完整套件。全部 Python 文件的 3.11 语法解析及 `git diff --check` 通过。
 
 测试使用模拟模型响应及真实本地 Git、验证子进程；前置检查自身不启动子进程。这些测试不证明真实 CLI 会正确理解环境更新，本轮未运行 Harness 的真实模型 `smoke`。README、设计与恢复协议已同步，私有证据不纳入 Git。
 
 ## 第十四轮审阅修订验证（2026-10-23，台账 v9）
 
-执行 `python3 -m unittest discover -s tests -v`：562 项，561 项通过、1 项跳过（Python 3.15.0，591.827 秒）。跳过原因仍为本机文件系统拒绝非 UTF-8 文件名。完整日志保存在 `.harness/validation/review-v14-offline.log`，不提交。`git diff --check` 通过。
+执行 `python3 -m unittest discover -s tests -v`：562 项，561 项通过、1 项跳过（Python 3.15.0，591.827 秒）。跳过原因仍为本机文件系统拒绝非 UTF-8 文件名。`git diff --check` 通过。
 
 新增 6 项行为测试覆盖：再规划后多个 ready 任务中，无关任务的失败环境检查不阻止被选任务接受，也不追加无关检查记录；指挥选中受阻任务后仅扣指挥派发预算，保存指令，反复恢复不重派指挥，修复条件后使用原指令；后续模型调用前中断遗留 interrupted 或 running 时仍可登记环境更新；已有指挥 receipt 的中断状态和已放弃运行继续拒绝更新。大型合法更新在上下文超限后保留原产物与预算，增加上下文预算并满足声明检查后可完成运行，原更新字节和台账引用不变。
 
-执行 `python3 -m unittest discover -s tests -p 'test_environment*.py' -v`：36 项全部通过，41.504 秒。使用 Python 3.11.17 单独执行全部 6 项新增测试，均通过，11.583 秒；本轮未在 Python 3.11 重跑完整套件。日志分别保存在 `.harness/validation/review-v14-environment.log` 和 `.harness/validation/review-v14-python311.log`，不提交。
+执行 `python3 -m unittest discover -s tests -p 'test_environment*.py' -v`：36 项全部通过，41.504 秒。使用 Python 3.11.17 单独执行全部 6 项新增测试，均通过，11.583 秒；本轮未在 Python 3.11 重跑完整套件。
 
-仅在内存中恢复基线 b56c948 的 `task_attempt` 或 `prepare_environment_update` 后，两个任务选择用例和中断更新资格用例均检出原问题；后者分别覆盖 interrupted 与遗留 running。负向验证日志保存在 `.harness/validation/review-v14-regression-baseline.log`，工作区源文件未因此替换。
+仅在内存中恢复基线 b56c948 的 `task_attempt` 或 `prepare_environment_update` 后，两个任务选择用例和中断更新资格用例均检出原问题；后者分别覆盖 interrupted 与遗留 running；工作区源文件未因此替换。
 
 台账保持版本 9，没有新增 CLI 参数或恢复子状态，保留历史环境更新的输入契约。`gpt-6.1-sol` 独立审阅未发现运行时缺陷；发现的恢复文档预算表述遗漏已修正。上述测试使用模拟模型响应及真实本地 Git、验证子进程，不证明真实模型调用行为；本轮未运行 Harness 的真实模型 `smoke`。README、设计与恢复协议已同步。
 
 ## 第十六轮验证补记（2026-10-24，台账 v11）
 
-依据保留的 `.harness/v16-full-suite.log` 补记提交 `39cce24` 的离线验证：`python3 -m unittest discover -s tests -v` 共 682 项，681 项通过、1 项因文件系统拒绝非 UTF-8 文件名而跳过，Python 3.15.0，589.373 秒。该快照的套件覆盖 v10 的检查点／操作者决定、v11 的命令 broker／只读文件工具，以及第十六轮修订；此处不补造各功能引入时未登记的独立验证结果。
+依据当时完整套件的日志补记提交 `39cce24` 的离线验证：`python3 -m unittest discover -s tests -v` 共 682 项，681 项通过、1 项因文件系统拒绝非 UTF-8 文件名而跳过，Python 3.15.0，589.373 秒。该快照的套件覆盖 v10 的检查点／操作者决定、v11 的命令 broker／只读文件工具，以及第十六轮修订；此处不补造各功能引入时未登记的独立验证结果。
 
 第十六轮修订验证了 broker 输出作为当前派发检查点证据、handoff stop 在无关任务接受后可改答 continue、丢弃原因传入后续上下文，以及检查点来源去重和不可变索引检索。完整 Engine 流程覆盖三次尝试各 16 项同 ID 检查点及四任务各四项的最终审阅。63 项针对性测试也通过，独立 `gpt-6.1-sol` 审阅无未解决的阻断发现。模型响应为模拟数据，Git、验证和 broker 子进程在本地真实执行；未运行真实账号的 smoke 联调。
 
 ## 第十七轮审阅修订验证（2026-10-24，台账 v11）
 
-执行 `python3 -m unittest discover -s tests -v`：692 项，691 项通过、1 项因文件系统拒绝非 UTF-8 文件名而跳过，Python 3.15.0，652.831 秒。完整日志保存在 `.harness/v17-full-suite.log`，不提交。50 项针对性测试全部通过，60.895 秒，日志为 `.harness/v17-focused-tests.log`；`git diff --check` 通过。
+执行 `python3 -m unittest discover -s tests -v`：692 项，691 项通过、1 项因文件系统拒绝非 UTF-8 文件名而跳过，Python 3.15.0，652.831 秒。50 项针对性测试全部通过，60.895 秒；`git diff --check` 通过。
 
 新增 10 项行为测试覆盖四任务各 4,000 字符答复和八任务短决定的完整 Engine 上下文、旧决定索引不随新答复变化、未答复和 stop→continue 历史检索、被省略来源／历史答复及索引的篡改拒绝、索引文件和父目录符号链接拒绝。容量测试验证决定内容只进入预警估计，恢复在后续派发前执行预检；未接受任务的 14 项检查点在最终预检中只提供索引，普通恢复能在原预算内完成，不把临时展开内容当作最终硬下界。
 
 格式修正生命周期测试使用真实本地 broker，分别验证沿用旧 dispatch 输出时仅丢弃可选检查点、省略检查点时继续正常接受、显式重复安全检查后可保存本 dispatch 的新证据。三种路径均保留新派发身份以及验证、任务审阅和整体审阅；跨 dispatch 的旧 volatile 输出不获得路径例外，只有重新执行取得的新证据使用修正 dispatch 的时间起点。
 
-使用 Python 3.11.17 执行全部 10 项新增测试，全部通过，28.828 秒；日志为 `.harness/v17-python311-tests.log`。未在 Python 3.11 重跑完整套件。独立 `gpt-6.1-sol` 复核最终运行时、测试与文档，无未解决的阻断发现。
+使用 Python 3.11.17 执行全部 10 项新增测试，全部通过，28.828 秒。未在 Python 3.11 重跑完整套件。独立 `gpt-6.1-sol` 复核最终运行时、测试与文档，无未解决的阻断发现。
 
 台账保持版本 11，操作者输入契约、完整原文、决定门禁、权限和预算语义不变。决定索引只是可检索证据，实际派发仍检查完整输入预算；更多请求或其他必要内容仍可能要求增大 `context_chars`。所有测试均使用模拟模型响应及真实本地 Git／验证／broker 子进程，不证明真实 CLI 模型联调通过；未运行 `harness smoke`、`harness.tool_smoke` 或 `harness.permission_smoke`。第十七轮临时审阅文档已按要求删除。
 
 ## 第十八轮审阅修订验证（2026-10-25，台账 v11）
 
-执行 `python3 -m unittest discover -s tests -v`：729 项，728 项通过、1 项因文件系统拒绝非 UTF-8 文件名而跳过，Python 3.15.1，694.535 秒。完整日志保存在 `.harness/v18-full-suite-final.log`，不提交。
+执行 `python3 -m unittest discover -s tests -v`：729 项，728 项通过、1 项因文件系统拒绝非 UTF-8 文件名而跳过，Python 3.15.1，694.535 秒。
 
 新增 11 项行为测试覆盖检查点 content 输入／TTL 错误的逐项丢弃、重复 ID 的整批丢弃，以及 completed、operator、environment 三类 worker 结果。测试核对有效项和原始声明保留、正常验证与任务／整体审阅仍执行、operator 普通恢复不派发、environment 更新后以新 dispatch 恢复、任务预算豁免及总调用计数。超过 16 项仍走原有有界格式修正，格式非法的 blocked 结果保留阻断且不豁免预算。其他新增用例覆盖记忆跨作用域同名写入拒绝且记录／操作日志不变、同作用域版本替换及幂等、旧 unscoped／任务来源兼容、MCP search/read 元数据一致、CLI 写入冲突不隐藏项目事实，以及损坏计数的可读状态诊断与完整台账原文保留。
 
-首次全量检查发现扩写 worker skill 后，检查点容量用例达到 32,249 字符，超过默认 32,000 上限；该轮中止并保留日志。缩短新增规则、保留完整文档说明后，两个检查点容量用例通过，随后重新执行上述完整套件。默认上下文预算与测试门槛未提高。故障及针对性复核日志分别为 `.harness/v18-context-failure.log`、`.harness/v18-context-recheck.log`。
+首次全量检查发现扩写 worker skill 后，检查点容量用例达到 32,249 字符，超过默认 32,000 上限；该轮中止。缩短新增规则、保留完整文档说明后，两个检查点容量用例通过，随后重新执行上述完整套件。默认上下文预算与测试门槛未提高。
 
-使用 Python 3.11.17 执行检查点语义、输出契约、记忆作用域、记忆 CLI 和操作控制共 33 项测试，全部通过，15.955 秒；精简 skill 后另执行两个检查点容量测试，全部通过，7.066 秒。日志为 `.harness/v18-python311.log` 和 `.harness/v18-context-python311.log`。未在 Python 3.11 重跑完整套件；`python3.11 -m compileall -q harness tests` 与 `git diff --check` 通过。
+使用 Python 3.11.17 执行检查点语义、输出契约、记忆作用域、记忆 CLI 和操作控制共 33 项测试，全部通过，15.955 秒；精简 skill 后另执行两个检查点容量测试，全部通过，7.066 秒。未在 Python 3.11 重跑完整套件；`python3.11 -m compileall -q harness tests` 与 `git diff --check` 通过。
 
 独立 `gpt-6.1-sol` 审阅实现、行为测试和文档，并复核精简后的 worker 规则，无未解决的阻断发现。台账保持版本 11，模型 ID、进程与派发隔离、权限、验证和接受门禁不变；记忆保持全局 key，以写事务拒绝跨作用域替换，不迁移数据库或追溯恢复旧版本。上述离线测试使用模拟模型响应及真实本地 Git／验证子进程，不证明真实模型联调通过；本轮未运行 `harness smoke`、`harness.tool_smoke` 或 `harness.permission_smoke`。第十八轮临时审阅文档已按要求删除。
 
 
 ## 第 4 轮实测反馈修订验证（2026-10-25，台账 v11）
 
-最终执行 `python3 -m unittest discover -s tests -v`：748 项，747 项通过、1 项因文件系统拒绝非 UTF-8 文件名而跳过，Python 3.15.1，712.108 秒。完整日志保存在 `.harness/checks/field-test-fixes-unittest-final.log`，不提交；`git diff --check` 通过。
+最终执行 `python3 -m unittest discover -s tests -v`：748 项，747 项通过、1 项因文件系统拒绝非 UTF-8 文件名而跳过，Python 3.15.1，712.108 秒。`git diff --check` 通过。
 
 新增 19 项离线测试覆盖默认 100,000 字符／1,800 秒及显式配置保留、必要输入与可选记忆计量、角色 skill 去重且额外任务技能仍进入实际 worker、旧计划兼容，以及 `required_commands` 的精确 argv、计划批准不授予命令权限、缺授权时零调用预算、追加授权后的普通恢复、独立任务继续、既有指令恢复、模型计划不重抽和再规划不可变义务。命令预检不执行命令，测试也不将授权存在视为命令执行成功。
 
-首次完整套件发现三处容量测试失败：两项隐含依赖旧默认值，一项因扩写审阅规则使必要输入达到 32,560 字符。将压力测试显式固定为原 32,000 字符，并精简注入的生命周期规则后，相关 21 项测试全部通过，27.887 秒；没有抬高其压力门槛。失败日志和复核日志分别保留在 `.harness/checks/field-test-fixes-unittest.log`、`.harness/checks/field-test-fixes-capacity-recheck.log`，随后重新运行并通过上述完整套件。
+首次完整套件发现三处容量测试失败：两项隐含依赖旧默认值，一项因扩写审阅规则使必要输入达到 32,560 字符。将压力测试显式固定为原 32,000 字符，并精简注入的生命周期规则后，相关 21 项测试全部通过，27.887 秒；没有抬高其压力门槛，随后重新运行并通过上述完整套件。
 
-使用 Python 3.11.17 对新增用例及受影响的检查点容量、整体上下文和派发计数共 40 项测试复核，全部通过，38.348 秒；日志为 `.harness/checks/field-test-fixes-python311-final.log`。未在 Python 3.11 重跑完整套件。
+使用 Python 3.11.17 对新增用例及受影响的检查点容量、整体上下文和派发计数共 40 项测试复核，全部通过，38.348 秒。未在 Python 3.11 重跑完整套件。
 
 独立 `gpt-6.1-sol` 审阅实现与恢复门禁，无未解决的阻断发现。台账仍为版本 11，不修改配置的模型 ID，不新增命令授权、自动合并或供应商会话恢复。所有 Harness 流程测试均使用模拟模型响应及真实本地 Git／子进程；未运行真实账号的 `harness smoke`、`harness.tool_smoke` 或 `harness.permission_smoke`，也不据此声称生命周期审阅规则提高了真实模型的缺陷检出率。
 
 ## 第二十轮审阅修订验证（2026-10-25，台账 v11）
 
-执行 `python3 -m unittest discover -s tests -v`：750 项，749 项通过、1 项因本机文件系统拒绝非 UTF-8 文件名而跳过，Python 3.15.1，726.786 秒。完整日志保存在 `.harness/validation/review-v20-offline.log`，不提交；`git diff --check` 通过。
+执行 `python3 -m unittest discover -s tests -v`：750 项，749 项通过、1 项因本机文件系统拒绝非 UTF-8 文件名而跳过，Python 3.15.1，726.786 秒。`git diff --check` 通过。
 
 模型计划或再规划新增任务的 `required_commands` 重复或超过 32 条时，现按计划语义错误拒绝，保留原始 receipt，经操作者 `--repair-invalid` 修正，不进入禁止改变计划操作的自动格式修正。新增 2 项生命周期测试包含 6 个子场景，覆盖 plan/replan 的重复与超限，以及 replan 同时含超长 reason；核对普通恢复不追加派发或清零预算、显式修正使用新 dispatch ID、原始结果字节不变、原任务义务保留，并通过正常验证、任务审阅与整体审阅完成。已有操作者计划预检用例另加入重复与 33 条命令，确认创建 run 前拒绝。
 
-在未修改的运行时代码上先运行新增 2 项测试，6 个子场景均检出多余的自动修正派发；日志为 `.harness/validation/review-v20-baseline.log`。首次针对性测试漏算再规划后的两次指挥任务选择，将总派发预期误写为 8；核对 blocker 反馈后的 prep 选择和 greet 重试选择后，改为显式断言两次选择及总派发 10 次。该测试预期修正没有改变运行时调度或预算，初次日志保留在 `.harness/validation/review-v20-focused.log` 和 `.harness/validation/review-v20-python311.log`。
+在未修改的运行时代码上先运行新增 2 项测试，6 个子场景均检出多余的自动修正派发。首次针对性测试漏算再规划后的两次指挥任务选择，将总派发预期误写为 8；核对 blocker 反馈后的 prep 选择和 greet 重试选择后，改为显式断言两次选择及总派发 10 次。该测试预期修正没有改变运行时调度或预算。
 
-使用 Python 3.11.17 执行 `PYTHONPATH=tests python3.11 -m unittest test_command_requirements -v`：13 项全部通过，26.473 秒；日志为 `.harness/validation/review-v20-python311-final.log`。未在 Python 3.11 重跑完整套件。
+使用 Python 3.11.17 执行 `PYTHONPATH=tests python3.11 -m unittest test_command_requirements -v`：13 项全部通过，26.473 秒。未在 Python 3.11 重跑完整套件。
 
-独立 `gpt-6.1-sol` 审阅实现、生命周期测试和文档，无未解决的阻断发现，并核对 0／1／32 条命令、33 条、精确重复及特殊 argv 的合同边界。审阅记录保存在 `.harness/validation/review-v20-agent-review.txt`，不提交。旧 run 已进入错误自动格式修正并保存修正结果时，本次修复不迁移其现场或放宽原守卫，仍需保留证据后 abandon 并另行发起运行；README、设计与恢复协议已明确此限制。
+独立 `gpt-6.1-sol` 审阅实现、生命周期测试和文档，无未解决的阻断发现，并核对 0／1／32 条命令、33 条、精确重复及特殊 argv 的合同边界。旧 run 已进入错误自动格式修正并保存修正结果时，本次修复不迁移其现场或放宽原守卫，仍需保留证据后 abandon 并另行发起运行；README、设计与恢复协议已明确此限制。
 
 台账保持版本 11，schema、模型 ID、进程与派发隔离、命令授权和接受门禁不变。Harness 流程测试使用模拟模型响应及真实本地 Git／验证子进程，不证明真实模型联调通过；本轮未运行 `harness smoke`、`harness.tool_smoke` 或 `harness.permission_smoke`。临时审阅文档 `docs/review-2026-10-25-v20.md` 已按要求删除。
 
