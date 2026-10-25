@@ -109,7 +109,7 @@ class InvalidRepairBoundaryTests(RepoCase):
                 Path(path).write_bytes(b"{")
                 raise KeyboardInterrupt()
 
-        with patch("harness.engine.write_json", side_effect=interrupt):
+        with patch("harness.dispatch.write_json", side_effect=interrupt):
             with self.assertRaises(KeyboardInterrupt):
                 engine.start("Implement greet", read_json(ROOT / "examples/plan.json"))
         key = "reviewer:final_review:final"

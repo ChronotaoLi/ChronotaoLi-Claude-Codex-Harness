@@ -153,7 +153,7 @@ class WorkerCorrectionRecoveryTests(RepoCase):
                 interrupted_artifact = Path(path)
                 raise KeyboardInterrupt()
 
-        with patch("harness.engine.write_json", side_effect=write_then_interrupt):
+        with patch("harness.dispatch.write_json", side_effect=write_then_interrupt):
             with self.assertRaises(KeyboardInterrupt):
                 engine.start("Implement greet", self.plan())
         self.assertIsNotNone(interrupted_artifact)

@@ -21,7 +21,7 @@ class DispatchAccountingTests(RepoCase):
         self.config.data["runtime"].update(max_attempts=1, max_total_attempts=1, context_chars=32000)
         backend = RecordingBackend()
         engine = self.engine(backend)
-        with patch("harness.engine.read_skill", side_effect=lengthy_worker_skill):
+        with patch("harness.packets.read_skill", side_effect=lengthy_worker_skill):
             with self.assertRaises(HarnessError):
                 engine.start("Implement greet", self.plan())
             for _ in range(2):

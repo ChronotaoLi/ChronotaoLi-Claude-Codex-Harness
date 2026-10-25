@@ -30,7 +30,7 @@ class CommanderReceiptTests(RepoCase):
                 interrupted = True
                 raise KeyboardInterrupt()
 
-        with patch("harness.engine.write_json", side_effect=interrupt), self.assertRaises(KeyboardInterrupt):
+        with patch("harness.dispatch.write_json", side_effect=interrupt), self.assertRaises(KeyboardInterrupt):
             engine.start("Implement greet", plan, **start_kwargs)
         self.assertTrue(interrupted)
         return read_json(engine.directory / "state.json")
@@ -337,7 +337,7 @@ class CommanderReceiptTests(RepoCase):
                 if writes == 2:
                     raise KeyboardInterrupt()
 
-        with patch("harness.engine.write_json", side_effect=interrupt_stop_artifact):
+        with patch("harness.planning.write_json", side_effect=interrupt_stop_artifact):
             with self.assertRaises(KeyboardInterrupt):
                 engine.start("Implement greet", self.plan())
         saved = read_json(engine.directory / "state.json")

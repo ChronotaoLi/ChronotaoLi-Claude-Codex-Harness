@@ -311,3 +311,15 @@ Codex 0.163.0 的本地 `debug prompt-input` 检查确认：未提交的 AGENTS.
 独立 `gpt-6.1-sol` 审阅实现、生命周期测试和文档，无未解决的阻断发现，并核对 0／1／32 条命令、33 条、精确重复及特殊 argv 的合同边界。审阅记录保存在 `.harness/validation/review-v20-agent-review.txt`，不提交。旧 run 已进入错误自动格式修正并保存修正结果时，本次修复不迁移其现场或放宽原守卫，仍需保留证据后 abandon 并另行发起运行；README、设计与恢复协议已明确此限制。
 
 台账保持版本 11，schema、模型 ID、进程与派发隔离、命令授权和接受门禁不变。Harness 流程测试使用模拟模型响应及真实本地 Git／验证子进程，不证明真实模型联调通过；本轮未运行 `harness smoke`、`harness.tool_smoke` 或 `harness.permission_smoke`。临时审阅文档 `docs/review-2026-10-25-v20.md` 已按要求删除。
+
+## Engine 职责拆分与实现收敛验证（2026-10-25，台账 v11）
+
+`Engine` 从 2,111 行拆分为 444 行的运行设施与调度入口，通过显式委托组合运行生命周期、规划、派发、返回结果接收、验证、任务验收、整体验收和输入包组件。组件始终读取当前 Engine 台账，不缓存旧 run 或绑定回调。任务审阅到待接受、提交到接受后待办的多字段转换集中保存，冲突阶段在提交前拒绝；持久化版本、模型 ID、预算、权限与已有接受门禁保持不变。
+
+检查点的一次完整校验／投影内复用源结果、manifest、证据长度和批次校验结果，每份绑定产物读取一次；后续调用仍重新核验篡改、符号链接、批次完整性及当前输入。最终审阅与容量预估共用输入构造器，保留必要下界、预计容量、决定投影和检查点索引的区别。README 从 434 行缩减为 239 行，唯一的恢复与兼容细则保留在恢复协议；46 个本地文档链接检查通过。
+
+执行 `python3 -m unittest discover -s tests -v`：759 项，758 项通过、1 项因本机文件系统拒绝非 UTF-8 文件名而跳过，Python 3.15.1，743.662 秒。完整日志为 `.harness/refactor/full-unittest.log`。新增 9 项测试覆盖单次读取复用及后续篡改、输入包与证据一致性、修正规划和新台账可见性、阶段冲突拒绝、提交与后续待办共同保存后的中断恢复。已有故障注入仅将被移动函数的 patch 位置调整到新所属模块，保留行为断言。
+
+使用 Python 3.11.17 运行 `test_checkpoint_reads`、`test_final_packet_builder`、`test_task_phase_handoffs`、`test_commander_receipts`、`test_final_stage_recovery`：43 项全部通过，60.442 秒；日志为 `.harness/refactor/python311-focused.log`。本轮未在 Python 3.11 重跑完整套件。`python3 -m compileall -q harness tests` 与 `git diff --check` 通过。
+
+阶段审阅发现并修复了输入预估的配置变量遮蔽，以及两个委托方法遗漏关键字参数的问题。随后两位独立 `gpt-6.1-sol` 分别审阅生命周期／持久化与证据／上下文／文档，均无未解决的阻断发现；审阅摘要保存为 `.harness/refactor/reviews.json`。Git 提交到台账保存之间的既有限制保留。本轮未执行真实账号的 Harness smoke，离线模拟结果不证明供应商调用可用。

@@ -67,7 +67,7 @@ class TaskStageRecoveryTests(RepoCase):
             run_process(argv, cwd, log, **kwargs)
             raise KeyboardInterrupt()
 
-        with patch("harness.engine.run_process", side_effect=interrupt_after_command), self.assertRaises(KeyboardInterrupt):
+        with patch("harness.verification.run_process", side_effect=interrupt_after_command), self.assertRaises(KeyboardInterrupt):
             engine.start("Implement greet", self.plan())
         pending = deepcopy(engine.run["pending_task"])
         self.assertEqual(pending["stage"], "verifying")

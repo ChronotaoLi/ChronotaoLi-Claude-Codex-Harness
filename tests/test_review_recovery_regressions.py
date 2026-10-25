@@ -278,7 +278,7 @@ class ReviewRecoveryRegressionTests(RepoCase):
 
         backend = ScriptedBackend(correct_in_second_task)
         engine = self.engine(backend)
-        with patch("harness.engine.run_process", side_effect=final_gate):
+        with patch("harness.verification.run_process", side_effect=final_gate):
             result = engine.start("Implement greet", self.plan())
         self.assertEqual(result["status"], "completed")
         replans = [call for call in backend.calls if call["kind"] == "replan"]

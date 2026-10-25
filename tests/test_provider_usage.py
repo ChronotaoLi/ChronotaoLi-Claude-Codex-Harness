@@ -186,7 +186,7 @@ class ProviderUsageTests(RepoCase):
                 raise OSError("telemetry event unavailable")
             return original(event, **fields)
 
-        with patch("harness.engine.provider_usage", side_effect=OSError("telemetry read unavailable")), \
+        with patch("harness.dispatch.provider_usage", side_effect=OSError("telemetry read unavailable")), \
                 patch.object(engine, "event", side_effect=unavailable_event):
             result = engine.start("Implement greet", self.plan())
         self.assertEqual(result["status"], "completed")

@@ -16,7 +16,8 @@ def snapshot_digest(snapshot):
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
-def read_bound_result(receipt, label, *, bind=None):
+def read_bound_bytes(receipt, label, *, bind=None):
+    """Read and bind original bytes before parsing or any later lifecycle gate."""
     try:
         raw = Path(receipt["artifact"]).read_bytes()
     except OSError as error:
@@ -27,6 +28,11 @@ def read_bound_result(receipt, label, *, bind=None):
     if "artifact_digest" not in receipt and bind is not None:
         receipt["artifact_digest"] = digest
         bind()
+    return raw, digest
+
+
+def read_bound_result(receipt, label, *, bind=None):
+    raw, digest = read_bound_bytes(receipt, label, bind=bind)
     try:
         result = json.loads(raw)
     except (ValueError, UnicodeError) as error:

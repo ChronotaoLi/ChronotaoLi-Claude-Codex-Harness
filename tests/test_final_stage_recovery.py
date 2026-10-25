@@ -22,7 +22,7 @@ class FinalStageRecoveryTests(RepoCase):
                 raise error
             return write_json(path, value)
 
-        with patch("harness.engine.write_json", side_effect=stop), self.assertRaises(type(error)):
+        with patch("harness.finalization.write_json", side_effect=stop), self.assertRaises(type(error)):
             engine.start("Implement greet", self.plan())
 
     def test_snapshot_write_interruption_resumes_allocated_final_attempt(self):
@@ -135,7 +135,7 @@ class FinalStageRecoveryTests(RepoCase):
     def test_timeout_resumes_same_snapshot_with_new_bounded_attempt_and_preserves_failure(self):
         backend = ScriptedBackend()
         engine = self.engine(backend)
-        with patch("harness.engine.run_process", side_effect=self.fail_final_check(timed_out=True)), self.assertRaisesRegex(HarnessError, "整体验证超时"):
+        with patch("harness.verification.run_process", side_effect=self.fail_final_check(timed_out=True)), self.assertRaisesRegex(HarnessError, "整体验证超时"):
             engine.start("Implement greet", self.plan())
         failed = engine.run["final_history"][-1]
         self.assertEqual(failed["status"], "verification_failed")
@@ -156,7 +156,7 @@ class FinalStageRecoveryTests(RepoCase):
         self.config.data["runtime"]["max_replans"] = 0
         backend = ScriptedBackend()
         engine = self.engine(backend)
-        with patch("harness.engine.run_process", side_effect=self.fail_final_check(timed_out=False)), self.assertRaises(HarnessError):
+        with patch("harness.verification.run_process", side_effect=self.fail_final_check(timed_out=False)), self.assertRaises(HarnessError):
             engine.start("Implement greet", self.plan())
         checks = self.final_checks(engine.run)
         with self.assertRaisesRegex(HarnessError, "--reverify"):
@@ -173,7 +173,7 @@ class FinalStageRecoveryTests(RepoCase):
         self.config.data["runtime"]["max_final_attempts"] = 1
         backend = ScriptedBackend()
         engine = self.engine(backend)
-        with patch("harness.engine.run_process", side_effect=self.fail_final_check(timed_out=True)), self.assertRaises(HarnessError):
+        with patch("harness.verification.run_process", side_effect=self.fail_final_check(timed_out=True)), self.assertRaises(HarnessError):
             engine.start("Implement greet", self.plan())
         dispatches = engine.run["dispatches"]
         with self.assertRaisesRegex(HarnessError, "整体审阅已达尝试次数"):
@@ -201,7 +201,7 @@ class FinalStageRecoveryTests(RepoCase):
 
         backend = ScriptedBackend(corrective)
         engine = self.engine(backend)
-        with patch("harness.engine.run_process", side_effect=fail_first_final):
+        with patch("harness.verification.run_process", side_effect=fail_first_final):
             result = engine.start("Implement greet", self.plan())
         self.assertEqual(result["status"], "completed")
         self.assertEqual(set(result["accepted"]), {"greet", "correct"})
@@ -277,7 +277,7 @@ class FinalStageRecoveryTests(RepoCase):
 
         backend = ScriptedBackend(unavailable_commander)
         engine = self.engine(backend)
-        with patch("harness.engine.run_process", side_effect=self.fail_final_check(timed_out=False)), self.assertRaisesRegex(HarnessError, "Commander service"):
+        with patch("harness.verification.run_process", side_effect=self.fail_final_check(timed_out=False)), self.assertRaisesRegex(HarnessError, "Commander service"):
             engine.start("Implement greet", self.plan())
         self.assertEqual(engine.run["pending_replan"]["stage"], "request")
         result = self.engine(backend).resume(engine.run["id"], reverify=True)
@@ -293,7 +293,7 @@ class FinalStageRecoveryTests(RepoCase):
                 self.config.data["runtime"]["max_final_attempts"] = 1
                 backend = ScriptedBackend()
                 engine = self.engine(backend)
-                with patch("harness.engine.run_process", side_effect=self.fail_final_check(timed_out=False)), \
+                with patch("harness.verification.run_process", side_effect=self.fail_final_check(timed_out=False)), \
                         self.assertRaisesRegex(HarnessError, "整体审阅已达尝试次数"):
                     engine.start("Implement greet", self.plan())
                 before = read_json(engine.directory / "state.json")
@@ -343,7 +343,7 @@ class FinalStageRecoveryTests(RepoCase):
         self.config.data["runtime"]["max_final_attempts"] = 1
         backend = ScriptedBackend()
         engine = self.engine(backend)
-        with patch("harness.engine.run_process", side_effect=self.fail_final_check(timed_out=False)), \
+        with patch("harness.verification.run_process", side_effect=self.fail_final_check(timed_out=False)), \
                 self.assertRaisesRegex(HarnessError, "整体审阅已达尝试次数"):
             engine.start("Implement greet", self.plan())
         state_path = engine.directory / "state.json"
@@ -403,7 +403,7 @@ class FinalStageRecoveryTests(RepoCase):
                 raise KeyboardInterrupt()
             return emit(name, payload, folder)
 
-        with patch("harness.engine.run_process", side_effect=self.fail_final_check(timed_out=False)):
+        with patch("harness.verification.run_process", side_effect=self.fail_final_check(timed_out=False)):
             with patch.object(engine.hooks, "emit", side_effect=interrupt_returned_revision), self.assertRaises(KeyboardInterrupt):
                 engine.start("Implement greet", self.plan())
             self.assertEqual(engine.run["pending_replan"]["stage"], "request")
@@ -440,13 +440,13 @@ class FinalStageRecoveryTests(RepoCase):
         backend = ScriptedBackend(noop_correction)
         engine = self.engine(backend)
         if timed_out:
-            with patch("harness.engine.run_process", side_effect=self.fail_final_check(timed_out=True)), self.assertRaisesRegex(HarnessError, "整体验证超时"):
+            with patch("harness.verification.run_process", side_effect=self.fail_final_check(timed_out=True)), self.assertRaisesRegex(HarnessError, "整体验证超时"):
                 engine.start("Implement greet", self.plan())
         else:
             self.stop_snapshot_write(engine, KeyboardInterrupt())
             self.assertEqual(engine.run["final_history"][0]["status"], "running")
         resumed = self.engine(backend)
-        with patch("harness.engine.run_process", side_effect=self.fail_final_check(timed_out=False)), self.assertRaisesRegex(HarnessError, "停止重新规划"):
+        with patch("harness.verification.run_process", side_effect=self.fail_final_check(timed_out=False)), self.assertRaisesRegex(HarnessError, "停止重新规划"):
             resumed.resume(engine.run["id"], reverify=True)
 
         run = resumed.run

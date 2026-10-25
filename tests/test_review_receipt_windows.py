@@ -22,7 +22,7 @@ class ReviewReceiptWindowTests(RepoCase):
                 interrupted, artifact = True, Path(path)
                 raise KeyboardInterrupt()
 
-        with patch("harness.engine.write_json", side_effect=write_then_interrupt), self.assertRaises(KeyboardInterrupt):
+        with patch("harness.dispatch.write_json", side_effect=write_then_interrupt), self.assertRaises(KeyboardInterrupt):
             engine.start("Implement greet", self.plan())
         self.assertIsNotNone(artifact)
         self.assertTrue(artifact.is_file())

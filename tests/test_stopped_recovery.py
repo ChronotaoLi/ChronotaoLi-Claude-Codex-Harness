@@ -76,7 +76,7 @@ class StoppedRecoveryTests(RepoCase):
 
                 backend = ScriptedBackend(block_task)
                 engine = self.engine(backend)
-                with patch("harness.engine.run_process", side_effect=fail_final), self.assertRaisesRegex(HarnessError, "停止重新规划"):
+                with patch("harness.verification.run_process", side_effect=fail_final), self.assertRaisesRegex(HarnessError, "停止重新规划"):
                     engine.start("Implement greet", self.plan())
                 self.assertEqual(engine.run["replan_stopped"]["target"], target)
                 # Even an explicit exit confirmation must wait until the option

@@ -7,7 +7,8 @@ from pathlib import Path
 from harness.adapters import CLIBackend
 from harness.command_server import command_id
 from harness.config import Config
-from harness.engine import Engine
+from harness.packets import PacketBuilder
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -61,9 +62,7 @@ class CommandAdapterTests(unittest.TestCase):
             self.assertNotIn('mcp__harness_commands', allow)
 
     def test_constraint_packet_ids_match_manifest_ids_and_argv(self):
-        engine = object.__new__(Engine)
-        engine.config = self.config
-        packet = engine.tool_constraints()
+        packet = PacketBuilder(SimpleNamespace(config=self.config)).tool_constraints()
         routing = packet['command_execution']
         self.assertTrue(routing['worker_only'])
         self.assertEqual(routing['tool'], 'mcp__harness_commands__run_command')

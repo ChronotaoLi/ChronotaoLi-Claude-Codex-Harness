@@ -150,7 +150,7 @@ class InvalidReviewRecoveryTests(RepoCase):
             if Path(path).name == "returned-result.json" and value.get("task_id") == "final":
                 raise KeyboardInterrupt()
 
-        with patch("harness.engine.write_json", side_effect=interrupt), self.assertRaises(KeyboardInterrupt):
+        with patch("harness.dispatch.write_json", side_effect=interrupt), self.assertRaises(KeyboardInterrupt):
             engine.start("Implement greet", self.plan())
         calls = copy.deepcopy(backend.calls)
         resumed = self.engine(backend)

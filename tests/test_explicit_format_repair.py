@@ -194,7 +194,7 @@ class ExplicitFormatRepairTests(RepoCase):
             if not interrupted and Path(path).name == "returned-result.json":
                 interrupted = True
                 raise KeyboardInterrupt()
-        with patch("harness.engine.write_json", side_effect=interrupt), self.assertRaises(KeyboardInterrupt):
+        with patch("harness.dispatch.write_json", side_effect=interrupt), self.assertRaises(KeyboardInterrupt):
             self.engine(backend).resume(engine.run["id"], repair_invalid=source["dispatch_id"])
         calls = len(backend.calls)
         result = self.engine(backend).resume(engine.run["id"])

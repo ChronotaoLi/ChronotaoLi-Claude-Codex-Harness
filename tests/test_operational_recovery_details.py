@@ -29,7 +29,7 @@ class OperationalRecoveryDetailsTests(RepoCase):
         ledger = (engine.directory / "state.json").read_bytes()
         calls = copy.deepcopy(backend.calls)
         with patch.object(self.config, "resume_changes", side_effect=AssertionError("must not revalidate completed config")), \
-             patch("harness.engine.asset_digest", return_value="changed assets"):
+             patch("harness.run_lifecycle.asset_digest", return_value="changed assets"):
             result = self.engine(backend).resume(completed["id"])
         self.assertEqual(result, completed)
         self.assertEqual(backend.calls, calls)

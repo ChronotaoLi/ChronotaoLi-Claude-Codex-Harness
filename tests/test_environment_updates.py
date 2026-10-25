@@ -526,7 +526,7 @@ class EnvironmentUpdateTests(RepoCase):
                 return 'Required operator context ' * 4000
             return read_skill(directory, name)
 
-        with patch('harness.engine.read_skill', side_effect=large_commander_skill):
+        with patch('harness.packets.read_skill', side_effect=large_commander_skill):
             with self.assertRaises(HarnessError):
                 self.engine(backend).resume(engine.run['id'], environment_update=path)
         saved = self.saved(engine)

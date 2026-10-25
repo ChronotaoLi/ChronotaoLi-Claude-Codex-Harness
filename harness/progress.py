@@ -30,6 +30,15 @@ class CheckpointDeclarationError(HarnessError):
     """An optional current declaration is unusable; bound state remains authoritative."""
 
 
+class _CheckpointValidation:
+    """Validated data owned by one synchronous operation, never by a runtime."""
+
+    def __init__(self):
+        self.sources = {}
+        self.manifests = {}
+        self.records = {}
+
+
 def validate_checkpoints(items):
     if not isinstance(items, list) or len(items) > 16:
         raise HarnessError("checkpoints must be an array of at most 16 entries")
@@ -119,11 +128,14 @@ class ProgressRecovery:
             raise HarnessError("checkpoint source uses reserved or unsafe path")
         return source if source.is_absolute() else Path(self.worktree) / source
 
-    def _checkpoint_source(self, task_id, dispatch_id, source, *, validate_declarations=True):
+    def _checkpoint_source(self, task_id, dispatch_id, source, *, validate_declarations=True, _validation=None):
         expected = self.directory / "dispatches" / dispatch_id / "returned-result.json"
         if (not isinstance(source, dict) or source.get("artifact") != str(expected)
                 or not isinstance(source.get("artifact_digest"), str) or not _SHA.fullmatch(source["artifact_digest"])):
             raise HarnessError("checkpoint requires bound original result SHA256")
+        key = task_id, dispatch_id, source["artifact_digest"], validate_declarations
+        if _validation is not None and key in _validation.sources:
+            return _validation.sources[key]
         raw = _read(expected)
         if _digest(raw) != source["artifact_digest"]:
             raise HarnessError("checkpoint original result changed")
@@ -140,6 +152,8 @@ class ProgressRecovery:
         validate_work_semantics(checked)
         if validate_declarations:
             validate_checkpoints(result.get("checkpoints", []))
+        if _validation is not None:
+            _validation.sources[key] = result
         return result
 
     def _declared_checkpoint_file(self, path, *, digest=False, evidence_dispatch=None):
@@ -266,7 +280,26 @@ class ProgressRecovery:
         self.save()
         return deepcopy(discarded)
 
-    def _checkpoint_resolution(self, batch):
+    def _checkpoint_manifest(self, row, validation):
+        cached = validation.manifests.get(row["artifact"])
+        if cached is not None:
+            digest, record = cached
+            if digest != row["artifact_digest"]:
+                raise HarnessError("checkpoint manifest changed")
+            return record
+        raw = _read(row["artifact"])
+        digest = _digest(raw)
+        if digest != row["artifact_digest"]:
+            raise HarnessError("checkpoint manifest changed")
+        try:
+            record = json.loads(raw)
+        except (ValueError, UnicodeError) as error:
+            raise HarnessError("checkpoint manifest invalid JSON") from error
+        validation.manifests[row["artifact"]] = digest, record
+        return record
+
+    def _checkpoint_resolution(self, batch, *, _validation=None):
+        validation = _validation if _validation is not None else _CheckpointValidation()
         if (not isinstance(batch, dict) or set(batch) != {"task_id", "dispatch_id", "artifact", "artifact_digest"}
                 or not all(isinstance(v, str) for v in batch.values())
                 or not _SAFE.fullmatch(batch["dispatch_id"]) or not _SHA.fullmatch(batch["artifact_digest"])):
@@ -285,7 +318,8 @@ class ProgressRecovery:
                 or value["task_id"] != batch["task_id"] or value["dispatch_id"] != batch["dispatch_id"]
                 or not isinstance(value["rows"], list) or not isinstance(value["discarded"], list)):
             raise HarnessError("invalid checkpoint batch resolution")
-        original = self._checkpoint_source(batch["task_id"], batch["dispatch_id"], value["source"], validate_declarations=False)
+        original = self._checkpoint_source(batch["task_id"], batch["dispatch_id"], value["source"],
+                                           validate_declarations=False, _validation=validation)
         items = original.get("checkpoints", [])
         if not isinstance(items, list) or not 1 <= len(items) <= 16:
             raise HarnessError("invalid checkpoint batch declarations")
@@ -308,27 +342,25 @@ class ProgressRecovery:
                     or not isinstance(row["checkpoint_id"], str) or not _SAFE.fullmatch(row["checkpoint_id"])
                     or row["artifact"] != str(folder / (row["checkpoint_id"] + ".json"))):
                 raise HarnessError("checkpoint batch row conflict")
-            manifest = _read(row["artifact"])
-            if _digest(manifest) != row["artifact_digest"]:
-                raise HarnessError("checkpoint manifest changed")
-            try:
-                record = json.loads(manifest)
-            except (ValueError, UnicodeError) as error:
-                raise HarnessError("checkpoint manifest invalid JSON") from error
+            record = self._checkpoint_manifest(row, validation)
             if not isinstance(record, dict) or record.get("checkpoint") != item or record.get("source") != value["source"]:
                 raise HarnessError("checkpoint batch manifest conflict")
-            self._validate_checkpoint_record(record, folder)
-            total += sum(len(_read(ref["artifact"], 1024 * 1024)) for ref in record["evidence"])
+            total += self._validate_checkpoint_record(record, folder, _validation=validation)
             if total > 16 * 1024 * 1024:
                 raise HarnessError("checkpoint batch exceeds 16 MiB")
         return value
 
-    def _validate_checkpoint_record(self, record, folder):
+    def _validate_checkpoint_record(self, record, folder, *, _validation=None):
+        validation = _validation if _validation is not None else _CheckpointValidation()
+        key = id(record), folder
+        if key in validation.records:
+            return validation.records[key][1]
         item = record.get("checkpoint")
         validate_checkpoints([item])
         if type(record.get("recorded_at")) not in (int, float) or not 0 <= record["recorded_at"] < float("inf"):
             raise HarnessError("checkpoint timestamp invalid")
-        original = self._checkpoint_source(record["task_id"], record["dispatch_id"], record.get("source"), validate_declarations=False)
+        original = self._checkpoint_source(record["task_id"], record["dispatch_id"], record.get("source"),
+                                           validate_declarations=False, _validation=validation)
         origin = record.get("freshness_origin")
         if origin is not None:
             dispatch = next(d for d in self.run["dispatches"] if d["id"] == record["dispatch_id"])
@@ -341,13 +373,24 @@ class ProgressRecovery:
         evidence = record.get("evidence")
         if not isinstance(evidence, list) or len(evidence) != len(item["evidence"]):
             raise HarnessError("checkpoint evidence references invalid")
+        total = 0
         for index, (ref, declared) in enumerate(zip(evidence, item["evidence"])):
             expected = folder / f"{item['id']}-{index}.bin"
-            if (ref != {**declared, "artifact": str(expected), "artifact_digest": declared["sha256"]}
-                    or _digest(_read(expected, 1024 * 1024)) != declared["sha256"]):
+            if ref != {**declared, "artifact": str(expected), "artifact_digest": declared["sha256"]}:
                 raise HarnessError("checkpoint cached evidence changed")
+            raw = _read(expected, 1024 * 1024)
+            if _digest(raw) != declared["sha256"]:
+                raise HarnessError("checkpoint cached evidence changed")
+            total += len(raw)
+        # Keep the record alive with its result so object IDs cannot be reused.
+        validation.records[key] = record, total
+        return total
 
     def validate_checkpoint_links(self):
+        self._validated_checkpoint_links()
+
+    def _validated_checkpoint_links(self):
+        validation = _CheckpointValidation()
         rows = self.run.get("task_checkpoints", [])
         if not isinstance(rows, list) or rows and self.run["schema_version"] < 10:
             raise HarnessError("invalid checkpoint ledger schema")
@@ -363,28 +406,23 @@ class ProgressRecovery:
             if key in seen or row["task_id"] not in tasks or row["artifact"] != str(folder / (row["checkpoint_id"] + ".json")):
                 raise HarnessError("checkpoint ledger reference invalid")
             seen.add(key)
-            raw = _read(row["artifact"])
-            if _digest(raw) != row["artifact_digest"]:
-                raise HarnessError("checkpoint manifest changed")
-            try:
-                record = json.loads(raw)
-            except (ValueError, UnicodeError) as error:
-                raise HarnessError("checkpoint manifest invalid JSON") from error
+            record = self._checkpoint_manifest(row, validation)
             if not isinstance(record, dict) or record.get("task_id") != row["task_id"] or record.get("dispatch_id") != row["dispatch_id"] or record.get("checkpoint", {}).get("id") != row["checkpoint_id"]:
                 raise HarnessError("checkpoint manifest identity mismatch")
-            self._validate_checkpoint_record(record, folder)
+            self._validate_checkpoint_record(record, folder, _validation=validation)
         batches = self.run.get("checkpoint_batches", [])
         if not isinstance(batches, list):
             raise HarnessError("invalid checkpoint batch ledger")
         batch_ids = set()
         for batch in batches:
-            resolution = self._checkpoint_resolution(batch)
+            resolution = self._checkpoint_resolution(batch, _validation=validation)
             dispatch_id = batch["dispatch_id"]
             if dispatch_id in batch_ids or batch["task_id"] not in tasks:
                 raise HarnessError("duplicate or unknown checkpoint batch")
             batch_ids.add(dispatch_id)
             if [r for r in rows if r["dispatch_id"] == dispatch_id] != resolution["rows"]:
                 raise HarnessError("checkpoint dispatch ledger is incomplete")
+        return validation
 
     def _checkpoint_index(self, rows):
         # Immutable navigation artifact, not new recovery state. Older packets
@@ -403,7 +441,7 @@ class ProgressRecovery:
         return {"artifact": str(artifact), "artifact_digest": digest, "count": len(rows)}
 
     def progress_packet(self, packet, *, task_id=None, role=None, kind=None):
-        self.validate_checkpoint_links()
+        validation = self._validated_checkpoint_links()
         rows = self.run.get("task_checkpoints", [])
         if not rows:
             return packet
@@ -432,7 +470,7 @@ class ProgressRecovery:
                 history.append(row)
             if not selected or row["task_id"] not in relevant:
                 continue
-            record = json.loads(_read(row["artifact"]))
+            record = self._checkpoint_manifest(row, validation)
             sources[row["dispatch_id"]] = record["source"]
             item = record["checkpoint"]
             reasons, inputs, changed_indices = [], [], []
