@@ -72,14 +72,18 @@ def provider_usage(job, provider):
         return None
 
 
-def provider_schema(schema):
+def provider_schema(schema, strict=False):
     """Project our richer local contract onto both CLIs' common schema core."""
     core = {"type", "properties", "required", "additionalProperties", "items", "enum"}
     result = {key: deepcopy(value) for key, value in schema.items() if key in core}
     if "properties" in result:
-        result["properties"] = {name: provider_schema(value) for name, value in result["properties"].items()}
+        result["properties"] = {name: provider_schema(value, strict) for name, value in result["properties"].items()}
+        if strict:
+            # Codex strict outputs reject optional keys; the local contract
+            # still accepts their absence in supplied and legacy artifacts.
+            result["required"] = list(result["properties"])
     if "items" in result:
-        result["items"] = provider_schema(result["items"])
+        result["items"] = provider_schema(result["items"], strict)
     return result
 
 
@@ -119,7 +123,7 @@ class CLIBackend:
                 "args": [str(Path(__file__).with_name("command_entry.py").resolve()),
                          "--manifest", manifest["artifact"], "--sha256", manifest["artifact_digest"]]}
         write_json(job / "mcp.json", claude)
-        wire_schema = provider_schema(schema)
+        wire_schema = provider_schema(schema, strict=model["cli"] == "codex")
         write_json(job / "provider-schema.json", wire_schema)
         if model["cli"] == "codex":
             return ["codex", "exec", "--model", model["model"], "--ephemeral", "--ignore-user-config",

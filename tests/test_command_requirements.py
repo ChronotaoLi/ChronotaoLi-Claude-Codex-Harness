@@ -3,8 +3,10 @@ import copy
 from pathlib import Path
 from unittest.mock import patch
 
+from harness.adapters import CLIBackend, DemoBackend
 from harness.contracts import WORK, validate_plan, validate_revision
 from harness.cli import status_summary
+from harness.engine import Engine
 from harness.requirements import missing_commands
 from harness.util import HarnessError, read_json
 from test_harness import ROOT, RepoCase
@@ -290,3 +292,46 @@ class CommandRequirementsTests(RepoCase):
         validate_revision(old, old + [new], [])
         self.assertEqual(old, original)
         self.assertNotIn('required_commands', old[0])
+
+
+class WireSchemaBackend(CLIBackend):
+    """Builds each real provider command, then answers like the demo backend."""
+    def __init__(self, config, state):
+        super().__init__(config, state)
+        self.wire = []
+
+    def invoke(self, **kwargs):
+        self.command(kwargs['role'], kwargs['model'], kwargs['cwd'], kwargs['job'],
+                     kwargs['schema'], kwargs['run_path'])
+        self.wire.append((kwargs['role'], kwargs['kind'], kwargs['model']['cli'],
+                          read_json(kwargs['job'] / 'provider-schema.json')))
+        return DemoBackend().invoke(**kwargs)
+
+
+class ProviderWireSchemaTests(RepoCase):
+    def objects(self, schema):
+        if 'properties' in schema:
+            yield schema
+            for value in schema['properties'].values():
+                yield from self.objects(value)
+        if 'items' in schema:
+            yield from self.objects(schema['items'])
+
+    def test_codex_outputs_require_every_key_while_local_plan_field_stays_optional(self):
+        backend = WireSchemaBackend(self.config, self.repo / '.harness')
+        engine = Engine(self.config, self.repo, backend=backend)
+        self.assertEqual(engine.start('Implement greet')['status'], 'completed')
+        codex = [(kind, schema) for role, kind, cli, schema in backend.wire if cli == 'codex']
+        self.assertIn('plan', [kind for kind, _ in codex])
+        self.assertIn('final_review', [kind for kind, _ in codex])
+        for kind, schema in codex:
+            for node in self.objects(schema):
+                with self.subTest(kind=kind, keys=sorted(node['properties'])):
+                    self.assertEqual(sorted(node['required']), sorted(node['properties']))
+        plan = next(schema for kind, schema in codex if kind == 'plan')
+        self.assertIn('required_commands', plan['properties']['tasks']['items']['required'])
+        # The demo plan omits the field; local validation still accepts it.
+        self.assertNotIn('required_commands', engine.run['original_tasks'][0])
+        worker = [schema for role, _, cli, schema in backend.wire if role == 'worker']
+        self.assertTrue(worker)
+        self.assertNotIn('checkpoints', worker[0]['required'])

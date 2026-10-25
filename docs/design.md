@@ -164,6 +164,8 @@ Claude worker 通过 `Edit(//<resolved-worktree>/**)` 将内置 Edit、Write 写
 
 完整输出契约保存在 schema.json 并由本地校验。两种供应商使用仅含基础类型、字段、必填、枚举与数组项结构的投影，另存 provider-schema.json；模型输入的 output_constraints 从同一契约生成长度、数量、非空、唯一性及标识符格式限制，本地仍强制执行，不假设两端支持相同 JSON Schema 扩展。
 
+Codex 的 provider-schema.json 另递归将每个对象的全部 properties 列入 required，以满足 [OpenAI 严格结构化输出的字段要求](https://developers.openai.com/api/docs/guides/structured-outputs#all-fields-must-be-required)。因此 Codex 生成的计划和再规划新增任务必须包含 required_commands，无已知命令前置条件时返回空数组。转换仅作用于供应商投影；本地完整契约仍允许旧计划或操作者提供的计划省略该字段，Claude 投影也保留原有可选字段语义。
+
 审阅输入另提供 uniqueBy=id、blocking 条件下 evidence 至少一项且类别不能为 preference、approved_memory_keys 的提案子集等机器可读约束。无提案包括 final_review 时批准数组 maxItems=0。预估最终上下文与实际派发使用同一生成函数；这些约束不扩展供应商 wire schema，也不替代本地校验。
 
 校验先检查身份、结构、权限及任务／审阅语义，再检查这些可修复格式限制。仅格式错误允许每个角色／调用类型／任务组合在整个 run 内自动修复一次，额度不随 resume、新尝试或新快照清零。指挥任务选择固定使用任务身份 `dispatching`，再规划固定使用 `replanning`；两种调用类型各自在整个 run 内共享一次自动格式修正额度和一次显式修正额度，不按工程任务、worker 尝试或再规划轮次重置。格式修正单独保存，不混入任务反馈，成功或候选失效时清除待修正状态。当前计划格式边界由规划检查作为硬错误拒绝。修复启动新进程、新 dispatch，传入错误和上次证据引用，必须重新检查当前文件；worker 修复同时消耗任务及整个 run 的尝试预算。缺字段、错类型、无效枚举、身份不匹配、越权、语义矛盾或 CLI 故障均不走该路径。

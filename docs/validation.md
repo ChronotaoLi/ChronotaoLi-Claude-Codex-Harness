@@ -339,3 +339,11 @@ Codex 0.163.0 的本地 `debug prompt-input` 检查确认：未提交的 AGENTS.
 使用 Python 3.11.17 执行 `test_startup_recovery`、`test_plan_preflight_diagnostics`、`test_commander_receipts`：28 项全部通过，27.460 秒，日志为 `.harness/validation/v21-fix/python311-focused.log`。本轮未在 Python 3.11 重跑完整套件。`python3.11 -m compileall -q harness tests` 与 `git diff --check` 通过。
 
 独立 `gpt-6.1-sol` 审阅运行时、行为测试和文档，无未解决的阻断发现，并独立通过新增 7 项测试及 16 项指挥 receipt 测试；审阅验证日志位于 `.harness/validation/v21-fix-review/`。台账版本、模型 ID、命令授权和接受门禁保持不变；旧 run 已经遗失且未保存的供给计划无法自动补造。所有 Harness 流程测试使用模拟模型响应及真实本地 Git／验证子进程，不证明真实模型调用成功；本轮未运行 `harness smoke`、`harness.tool_smoke` 或 `harness.permission_smoke`。临时审阅文档 `docs/review-2026-10-25-v21.md` 已按要求移除。
+
+## Codex 输出 schema 兼容修复验证（2026-10-25，台账 v11）
+
+执行 `python3 -m unittest discover -s tests -v`：767 项，766 项通过、1 项因本机文件系统拒绝非 UTF-8 文件名而跳过，Python 3.15.1，829.455 秒。`git diff --check` 与设计、验证文档的本地链接目标检查通过。
+
+新增 1 项完整 Engine 生命周期测试，在构造实际供应商命令后使用模拟响应完成规划、执行、任务审阅和整体验收。检查 Codex 输出 schema 各层对象的所有字段均为必填、计划中的 required_commands 已纳入 required，同时本地仍接受省略该字段的旧计划，Claude worker 的 checkpoints 仍为可选。另以离线 schema 检查确认计划与再规划的投影仅改变 required，不修改原始契约，且 required_commands 省略或为空数组时均通过本地计划校验。
+
+本次仅调整 Codex 的供应商 schema 投影，设计文档已说明其与本地可选字段契约的区别。没有运行真实账号的 `harness smoke`、`harness.tool_smoke` 或 `harness.permission_smoke`；离线测试不证明真实 CLI 或模型调用成功。
