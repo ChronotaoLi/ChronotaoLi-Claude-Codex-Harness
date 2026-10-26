@@ -132,6 +132,40 @@ class ProviderUsageTests(RepoCase):
         self.assertEqual(engine.run["dispatches"][-1]["provider_usage"]["num_turns"], 3)
         self.assertEqual(self.events(engine)[-1]["status"], "failed")
 
+    def test_turn_limit_reason_survives_nonzero_exit_and_does_not_accept_candidate(self):
+        backend = self.backend({"worker": {"exit_code": 1, "envelope": {
+            "is_error": True, "subtype": "error_max_turns", "num_turns": 101,
+            "errors": ["Reached maximum number of turns (100)"], "result": "MODEL_PRIVATE_BODY"}}})
+        engine = self.engine(backend)
+        with self.assertRaisesRegex(HarnessError, "error_max_turns") as caught:
+            engine.start("Implement greet", self.plan())
+        self.assertIn("Reached maximum number of turns (100)", str(caught.exception))
+        self.assertNotIn("MODEL_PRIVATE_BODY", str(caught.exception))
+        self.assertEqual(engine.run["last_runtime_error"]["error"], str(caught.exception))
+        self.assertEqual(engine.run["accepted"], {})
+        self.assertEqual(engine.run["attempts"], {"greet": 1})
+        self.assertEqual(len(backend.calls), 1)
+
+    def test_reported_turn_count_does_not_override_success(self):
+        self.config.data['runtime']['claude_max_turns'] = 100
+        engine = self.engine(self.backend({"worker": {"envelope": {"num_turns": 256}}}))
+        result = engine.start("Implement greet", self.plan())
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(result['attempts'], {'greet': 1})
+
+    def test_large_cli_error_is_bounded_and_preserves_raw_evidence(self):
+        for subtype in ('error_test', {'malformed': 'x' * 10000}):
+            with self.subTest(subtype_type=type(subtype).__name__):
+                backend = self.backend({"worker": {"exit_code": 9, "envelope": {
+                    "is_error": True, "subtype": subtype, "errors": ['error\n' + 'x' * 3000] * 10}}})
+                engine = self.engine(backend)
+                with self.assertRaisesRegex(HarnessError, 'worker CLI exit=9') as caught:
+                    engine.start("Implement greet", self.plan())
+                self.assertLess(len(str(caught.exception)), 1500)
+                job = engine.directory / 'dispatches' / engine.run['dispatches'][-1]['id']
+                self.assertEqual(len(read_json(job / 'process.stdout')['errors']), 10)
+                self.assertEqual(engine.run['accepted'], {})
+
     def test_missing_and_invalid_metrics_remain_unknown_without_blocking_acceptance(self):
         options = {"worker": {"envelope": {
             "total_cost_usd": float("nan"), "num_turns": True,

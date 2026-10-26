@@ -14,6 +14,7 @@ from .contracts import (
     WORK,
 )
 from .memory import validate_proposals
+from .path_evidence import validate_dispatch_indexes
 from .progress import CheckpointDeclarationError
 from .recovery import snapshot_digest
 from .services import RuntimeService
@@ -439,6 +440,7 @@ class TaskLifecycle(RuntimeService):
             raise
         if snapshot_digest(runtime.snapshot()) != pending["snapshot_digest"]:
             raise HarnessError("审阅后文件发生变化；禁止接受旧审阅结果")
+        validate_dispatch_indexes(runtime.directory, runtime.run["dispatches"])
         paths = git.check_scope(runtime.worktree, task["allowed_paths"], binding=runtime.run["worktree_binding"])
         commit = git.accept(runtime.worktree, paths, runtime.run["id"], tid, binding=runtime.run["worktree_binding"])
         accepted = {"commit": commit, "summary": pending["review"]["summary"], "summary_source": "reviewer",

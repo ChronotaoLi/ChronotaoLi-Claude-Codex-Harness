@@ -6,6 +6,7 @@ from copy import deepcopy
 from pathlib import Path
 
 from . import git
+from .path_evidence import validate_dispatch_indexes
 from .services import RuntimeService
 from .shared import asset_digest, validate_mcp
 from .util import HarnessError, lock, read_json, uid, validate_command_directories
@@ -271,6 +272,7 @@ class RunLifecycle(RuntimeService):
                 raise HarnessError("缺少已保存的 worktree Git 绑定，无法安全恢复；"
                                    f"使用 abandon {ident} 保留证据后重新运行；"
                                    "若工作树或分支已创建，请核对后手工清理")
+            validate_dispatch_indexes(runtime.directory, runtime.run["dispatches"])
             if git.head(runtime.worktree, binding=runtime.run["worktree_binding"]) != runtime.run["expected_head"]:
                 raise HarnessError("worktree HEAD 与检查点不同；请先核对提交，不自动重放")
             runtime.recover_replan_worker_correction()

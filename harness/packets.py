@@ -10,6 +10,7 @@ from .context import (
     instruction_file_changes,
 )
 from .contracts import envelope, output_constraints, REVIEW, review_output_constraints
+from .path_evidence import project_paths
 from .services import RuntimeService
 from .shared import read_skill, skills_catalog
 from .util import HarnessError
@@ -55,6 +56,7 @@ class PacketBuilder(RuntimeService):
     def role_input(self, *, role, kind, task_id, schema, dispatch_id, packet, task=None):
         """Construct the same mandatory role envelope for dispatch and estimates."""
         runtime = self.runtime
+        packet = project_paths(packet, runtime.directory)
         contract = envelope(schema, task_id, dispatch_id)
         required = {
             "role": role, "kind": kind, "task_id": task_id, "dispatch_id": dispatch_id,

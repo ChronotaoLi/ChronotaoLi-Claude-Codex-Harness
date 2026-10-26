@@ -72,6 +72,33 @@ def provider_usage(job, provider):
         return None
 
 
+def claude_error_summary(value):
+    """Expose bounded CLI diagnostics, never model-generated result text."""
+    if (not isinstance(value, dict) or value.get("type") != "result"
+            or not (value.get("is_error") or value.get("subtype", "success") != "success")):
+        return ""
+    details = []
+    subtype = value.get("subtype")
+    if isinstance(subtype, str):
+        details.append(json.dumps(subtype[:128], ensure_ascii=False))
+    errors = value.get("errors")
+    if isinstance(errors, list):
+        details.extend(json.dumps(message[:240], ensure_ascii=False)
+                       for message in errors[:3] if isinstance(message, str))
+    return "Claude " + "; ".join(details) if details else "Claude reported an error"
+
+
+def cli_error_summary(job, provider):
+    if provider != "claude":
+        return ""
+    try:
+        with (job / "process.stdout").open("rb") as stream:
+            raw = stream.read(_USAGE_MAX_BYTES + 1)
+        return claude_error_summary(json.loads(raw)) if len(raw) <= _USAGE_MAX_BYTES else ""
+    except (OSError, ValueError, UnicodeError, RecursionError):
+        return ""
+
+
 def provider_schema(schema, strict=False):
     """Project our richer local contract onto both CLIs' common schema core."""
     core = {"type", "properties", "required", "additionalProperties", "items", "enum"}
@@ -173,7 +200,9 @@ class CLIBackend:
         code = run_process(argv, cwd, job / "process", stdin=prompt,
                            timeout=self.config.data["runtime"]["agent_timeout_seconds"], env=env, on_start=on_start)
         if code:
-            raise HarnessError(f"{role} CLI exit={code}；{job}\n{tail(job / 'process.stderr')}")
+            diagnostic = cli_error_summary(job, model["cli"])
+            detail = f"；{diagnostic}" if diagnostic else ""
+            raise HarnessError(f"{role} CLI exit={code}{detail}；{job}\n{tail(job / 'process.stderr')}")
         if model["cli"] == "codex":
             if not (job / "response.json").exists():
                 raise HarnessError(f"Codex 未输出结构化结果：{job}")
@@ -181,7 +210,7 @@ class CLIBackend:
         result = self.read_result(job / "process.stdout", "Claude")
         write_json(job / "provider-result.json", result)
         if result.get("is_error") or result.get("subtype", "success") != "success":
-            raise HarnessError(f"Claude 未成功完成：{result.get('subtype')}；日志：{job}")
+            raise HarnessError(f"Claude 未成功完成：{claude_error_summary(result) or 'unclassified CLI error'}；日志：{job}")
         value = result.get("structured_output")
         if value is None:
             try:

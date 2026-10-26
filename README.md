@@ -208,6 +208,8 @@ python3 -m harness --repo /path/to/project memory export > memory-backup.json
 
 上下文采用结构化检查点、有界检索和原始证据引用，在任务边界写 `handoff.json`／`handoff.md`；每次指挥调用重新构建输入。默认 `context_chars = 100000` 是编排输入字符上限，不是 token 数；必要约束超限就停止，可选记忆按整条移除。CLI 内部上下文不在该预算内。
 
+大量变更路径与恢复路径使用 SHA256 绑定的完整索引，按需检索，不重复塞进模型输入。相同清单共用索引，原始范围、验收、diff 与快照仍保留；索引缺失或损坏会阻止继续，不能靠截断路径绕过门禁。详见[上下文与诊断产物](docs/recovery.md#上下文与诊断产物)。
+
 默认 `agent_timeout_seconds = 3600`、`claude_max_turns = 50`。超时是整次模型调用的墙钟时限；超时的 worker 消耗一次工作尝试，已写修改保留供恢复核对，持续产出不会自动延长时限。已有配置显式设置的超时保持原值，可在恢复前调大。完整输入和 `context-report.json` 保存在 dispatch 目录；容量预检、日志摘录与预算字段见[上下文与诊断产物](docs/recovery.md#上下文与诊断产物)。增大预算不保证任意长任务都能完成。
 
 ## 数据与排查

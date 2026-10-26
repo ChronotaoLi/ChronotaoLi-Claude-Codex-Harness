@@ -15,6 +15,7 @@ from .contracts import (
     validate_work_semantics,
 )
 from .receipts import InvalidReviewRejection
+from .path_evidence import validate_dispatch_indexes, validate_indexes
 from .recovery import snapshot_digest
 from .services import RuntimeService
 from .shared import validate_mcp
@@ -25,6 +26,7 @@ class Dispatcher(RuntimeService):
     def dispatch(self, role, kind, task_id, schema, packet, task=None):
         # A format correction is a new process, never a provider-session resume.
         runtime = self.runtime
+        validate_dispatch_indexes(runtime.directory, runtime.run["dispatches"])
         key = f"{role}:{kind}:{task_id}"
         packet = runtime.runtime_packet(packet, role=role, kind=kind, task_id=task_id)
         packet = runtime.invalid_repair_packet(key, packet)
@@ -88,6 +90,7 @@ class Dispatcher(RuntimeService):
                 else:
                     result = runtime.dispatch_once(role, kind, task_id, schema, packet, task, previous_review)
                 runtime.ensure_exited()
+                validate_dispatch_indexes(runtime.directory, runtime.run["dispatches"])
                 repair = runtime.active_invalid_repair(key)
                 if repair:
                     repair.update(status="completed", corrected_dispatch_id=receipts[key]["dispatch_id"])
@@ -213,6 +216,9 @@ class Dispatcher(RuntimeService):
         runtime.run["dispatches"].append({"id": dispatch_id, "role": role, "kind": kind, "task_id": task_id,
                                        "status": "running", "pgid": None, "process_state": "prepared", "invoked": False})
         entry = runtime.run["dispatches"][-1]
+        path_evidence = list(required["packet"].get("path_evidence_indexes", {}).values())
+        if path_evidence:
+            entry["path_evidence"] = path_evidence
         if role == "worker":
             (job / "commands").mkdir()
             entry["command_directory"] = str(job / "commands")
@@ -227,6 +233,7 @@ class Dispatcher(RuntimeService):
         startup_interrupted = False
         try:
             runtime.emit_hook("pre_agent", entry, job)
+            validate_indexes(runtime.directory, path_evidence)
             validate_mcp(runtime.config, roles=(role,))
             before = runtime.snapshot()
             entry["snapshot_digest"] = snapshot_digest(before)
