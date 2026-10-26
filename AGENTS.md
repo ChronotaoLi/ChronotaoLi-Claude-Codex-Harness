@@ -9,3 +9,4 @@ Tests must exercise lifecycle behavior, acceptance gates, isolation, retrieval o
 Preserve exact model IDs configured by the user. Workers and reviewers must get fresh processes and dispatch IDs; never add implicit resume, model fallback, recursive agents, or automatic merges.
 Do not claim a simulated test proves a model call works. `python3 -m harness smoke` invokes real accounts and is a separate integration check.
 Keep private run state under `.harness/`; avoid committing transcripts, credentials or generated MCP configuration.
+Keep external-project field-test reports and in-progress test logs under ignored `.harness/`, not in versioned project documentation. `docs/validation.md` records completed Harness verification results, not test progress or external task status.
