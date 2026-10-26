@@ -186,7 +186,7 @@ class CLIBackend:
                 "--setting-sources", "", "--settings", json.dumps(settings),
                 "--strict-mcp-config", "--mcp-config", str(job / "mcp.json"),
                 "--output-format", "json", "--json-schema", json.dumps(wire_schema),
-                "--max-turns", str(self.config.data["runtime"]["claude_max_turns"]),
+                "--max-turns", str(self.config.claude_max_turns(role)),
                 "--permission-mode", "dontAsk", "--disallowedTools", "Agent,Task",
                 "--tools", tools]
 

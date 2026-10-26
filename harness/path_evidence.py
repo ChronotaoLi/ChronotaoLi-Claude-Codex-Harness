@@ -23,7 +23,7 @@ PATH_EVIDENCE_POLICY = (
 def _folder(directory):
     folder = Path(directory) / "path-indexes"
     if not folder.is_absolute() or any(p.is_symlink() for p in (folder, *folder.parents)):
-        raise HarnessError("path evidence index directory is a symlink")
+        raise HarnessError(f"path evidence index directory is a symlink: {ascii(str(folder))}")
     return folder
 
 
@@ -36,9 +36,9 @@ def _write_index(directory, paths):
         if not artifact.exists() and not artifact.is_symlink():
             write_json(artifact, value)
         if artifact.is_symlink() or artifact.read_bytes() != raw:
-            raise HarnessError("path evidence index changed; preserve the original evidence")
+            raise HarnessError(f"path evidence index changed: {ascii(str(artifact))}; preserve the original evidence")
     except OSError as error:
-        raise HarnessError("cannot read or write path evidence index") from error
+        raise HarnessError(f"cannot read or write path evidence index: {ascii(str(artifact))}") from error
     return {"artifact": str(artifact), "artifact_digest": digest, "count": len(paths)}
 
 
@@ -56,20 +56,22 @@ def validate_indexes(directory, references):
             raise HarnessError("invalid path evidence digest or count")
         artifact = _folder(directory) / (digest + ".json")
         if ref["artifact"] != str(artifact) or artifact.is_symlink():
-            raise HarnessError("path evidence index reference changed")
+            raise HarnessError(
+                f"path evidence index reference changed: expected {ascii(str(artifact))}, "
+                f"actual {ascii(ref['artifact'])}")
         try:
             raw = artifact.read_bytes()
             if hashlib.sha256(raw).hexdigest() != digest:
-                raise HarnessError("path evidence index changed")
+                raise HarnessError(f"path evidence index changed: {ascii(str(artifact))}")
             value = json.loads(raw)
         except (OSError, ValueError, UnicodeError) as error:
-            raise HarnessError("path evidence index missing or unreadable") from error
+            raise HarnessError(f"path evidence index missing or unreadable: {ascii(str(artifact))}") from error
         if (not isinstance(value, dict) or set(value) != {"version", "paths"}
                 or type(value["version"]) is not int or value["version"] != 1
                 or not isinstance(value["paths"], list)
                 or any(not isinstance(p, str) for p in value["paths"])
                 or len(value["paths"]) != ref["count"]):
-            raise HarnessError("path evidence index content disagrees with reference")
+            raise HarnessError(f"path evidence index content disagrees with reference: {ascii(str(artifact))}")
 
 
 def validate_dispatch_indexes(directory, dispatches):

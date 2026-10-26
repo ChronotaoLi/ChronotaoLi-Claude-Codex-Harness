@@ -76,11 +76,57 @@ class PathEvidenceTests(unittest.TestCase):
         ref = next(iter(projected["path_evidence_indexes"].values()))
         artifact = Path(ref['artifact'])
         artifact.write_bytes(b'{}')
-        with self.assertRaisesRegex(HarnessError, 'index changed'):
+        with self.assertRaisesRegex(HarnessError, 'index changed') as raised:
             project_paths(packet, self.directory)
+        self.assertIn(ascii(str(artifact)), str(raised.exception))
         self.assertEqual(artifact.read_bytes(), b'{}')
         with self.assertRaises(HarnessError):
             validate_indexes(self.directory, [ref])
+
+    def test_integrity_failures_identify_safe_paths_and_preserve_retrievable_evidence(self):
+        directory = self.directory / 'run\nwith\x1b-control-\u202e'
+        packet = {"changed_files": self.paths()}
+        projected = project_paths(packet, directory)
+        ref = next(iter(projected["path_evidence_indexes"].values()))
+        artifact = Path(ref['artifact'])
+        original = artifact.read_bytes()
+        for mutation in ('missing', 'changed', 'symlink', 'reference', 'count'):
+            with self.subTest(mutation=mutation):
+                changed_ref = dict(ref)
+                target = directory / 'preserved'
+                if mutation == 'missing':
+                    artifact.unlink()
+                elif mutation == 'changed':
+                    artifact.write_bytes(b'{}')
+                elif mutation == 'symlink':
+                    target.write_bytes(original)
+                    artifact.unlink()
+                    artifact.symlink_to(target)
+                elif mutation == 'reference':
+                    changed_ref['artifact'] = 'wrong\nreference\x1b\u202e'
+                else:
+                    changed_ref['count'] += 1
+                with self.assertRaises(HarnessError) as raised:
+                    validate_indexes(directory, [changed_ref])
+                message = str(raised.exception)
+                self.assertIn(ascii(str(artifact)), message)
+                self.assertFalse(any(ord(c) < 32 or ord(c) > 126 for c in message))
+                if mutation in ('reference', 'symlink'):
+                    self.assertIn('expected ' + ascii(str(artifact)), message)
+                    self.assertIn('actual ' + ascii(changed_ref['artifact']), message)
+                if mutation == 'missing':
+                    self.assertFalse(artifact.exists())
+                elif mutation == 'changed':
+                    self.assertEqual(artifact.read_bytes(), b'{}')
+                elif mutation == 'symlink':
+                    self.assertTrue(artifact.is_symlink())
+                    self.assertEqual(target.read_bytes(), original)
+                    artifact.unlink()
+                else:
+                    self.assertEqual(artifact.read_bytes(), original)
+                artifact.write_bytes(original)
+                validate_indexes(directory, [ref])
+                self.assertEqual(resolved(projected, projected['changed_files']), packet['changed_files'])
 
     def test_symlink_cannot_redirect_index_or_its_parent(self):
         packet = {"changed_files": self.paths()}
@@ -193,8 +239,9 @@ class PathEvidenceLifecycleTests(RepoCase):
                 saved['path'].unlink()
             else:
                 saved['path'].write_bytes(b'{}')
-            with self.assertRaisesRegex(HarnessError, 'path evidence index'):
+            with self.assertRaisesRegex(HarnessError, 'path evidence index') as raised:
                 self.engine(backend).resume(engine.run['id'])
+            self.assertIn(ascii(str(saved['path'])), str(raised.exception))
             self.assertEqual(len(backend.calls), calls)
             saved['path'].write_bytes(saved['raw'])
         result = self.engine(backend).resume(engine.run['id'])

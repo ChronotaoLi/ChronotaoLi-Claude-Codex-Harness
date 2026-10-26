@@ -29,6 +29,9 @@ max_replans = 2
 max_tasks = 20
 context_chars = 100000
 claude_max_turns = 50
+# 单次 Claude 派发的轮数保护，不是任务工具总次数；未列角色沿用上面的值。
+# worker 的 200 是长任务起始配置，需按实际到限率、验收和重复工作校准。
+claude_max_turns_by_role = { worker = 200 }
 
 [permissions]
 # 额外授权给 Claude worker 的精确 argv，由命令 MCP 按 ID 执行；* 和换行按字面传入。

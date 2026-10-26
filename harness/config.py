@@ -13,6 +13,7 @@ DEFAULTS = {
         "max_attempts": 3, "max_final_attempts": 3, "max_total_attempts": 60, "max_replans": 2,
         "max_agent_dispatches": 200,
         "max_tasks": 20, "context_chars": 100000, "claude_max_turns": 50,
+        "claude_max_turns_by_role": {},
     },
     "permissions": {"worker_commands": []},
     "memory": {"task_ttl_days": 180, "knowledge_ttl_days": 180},
@@ -23,6 +24,11 @@ RESUME_INCREASES = (
     "claude_max_turns", "max_attempts", "max_final_attempts", "max_total_attempts",
     "max_replans", "max_agent_dispatches", "max_tasks",
 )
+DISPATCH_ROLES = ("commander", "worker", "reviewer")
+
+
+def claude_turn_limit(runtime, role):
+    return runtime.get("claude_max_turns_by_role", {}).get(role, runtime["claude_max_turns"])
 
 # Arguments may be appended only after --, where they cannot enable Git's
 # external diff drivers or output-file options. This is a CLI permission aid,
@@ -113,11 +119,22 @@ class Config:
         if data["roles"]["worker"]["cli"] == "codex":
             raise HarnessError("当前 Codex 适配器仅支持只读角色，不能配置为 worker")
         for key in DEFAULTS["runtime"]:
+            if key == "claude_max_turns_by_role":
+                continue
             value = data["runtime"][key]
             if type(value) is not int or value < 0 or (key != "max_replans" and value == 0):
                 if key == "max_replans":
                     raise HarnessError(f"runtime.{key} 必须为非负整数")
                 raise HarnessError(f"runtime.{key} 必须为正整数")
+        limits = data["runtime"].get("claude_max_turns_by_role", {})
+        if not isinstance(limits, dict):
+            raise HarnessError("runtime.claude_max_turns_by_role 必须为角色配置表")
+        for role, value in limits.items():
+            field = f"runtime.claude_max_turns_by_role.{role}"
+            if role not in DISPATCH_ROLES:
+                raise HarnessError(f"未知配置键：{field}；角色为 commander、worker、reviewer")
+            if type(value) is not int or value <= 0:
+                raise HarnessError(f"{field} 必须为正整数")
         for key in DEFAULTS["memory"]:
             if type(data["memory"][key]) is not int or data["memory"][key] < 0:
                 raise HarnessError(f"memory.{key} 必须为非负整数；0 表示不设到期时间")
@@ -138,6 +155,17 @@ class Config:
         self.validate(previous)
         self.validate(current)
         changes = {}
+        # Compare effective limits before removing the scalar fallback. A removed
+        # override must not silently lower a role's budget during recovery.
+        for role in DISPATCH_ROLES:
+            old = claude_turn_limit(previous["runtime"], role)
+            new = claude_turn_limit(current["runtime"], role)
+            if new < old:
+                raise HarnessError(f"配置已改变：恢复时 {role} 的 Claude 轮数上限只能保持或增大（{old} → {new}）")
+        old_limits = previous["runtime"].pop("claude_max_turns_by_role")
+        new_limits = current["runtime"].pop("claude_max_turns_by_role")
+        if new_limits != old_limits:
+            changes["claude_max_turns_by_role"] = {"old": old_limits, "new": new_limits}
         for key in RESUME_INCREASES:
             old, new = previous["runtime"].pop(key), current["runtime"].pop(key)
             if new < old:
@@ -166,6 +194,9 @@ class Config:
     def readonly_commands():
         """Read-only command examples; append paths/patterns after their --."""
         return [list(command) for command in READONLY_COMMANDS]
+
+    def claude_max_turns(self, role):
+        return claude_turn_limit(self.data["runtime"], role)
 
     @property
     def root(self):

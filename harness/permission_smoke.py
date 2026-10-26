@@ -176,6 +176,7 @@ def permission_smoke(config, repo, *, timeout=180, max_turns=16, max_budget_usd=
     probe_config.data["verification"]["commands"] = []
     probe_config.data["permissions"]["worker_commands"] = [[sys.executable, "permission_control.py"]]
     probe_config.data["runtime"]["claude_max_turns"] = max_turns
+    probe_config.data["runtime"]["claude_max_turns_by_role"] = {"worker": max_turns}
     write_json(directory / "external-mcp.json", {"servers": {}})
     probe_config.data["shared"]["mcp"] = str(directory / "external-mcp.json")
     argv = CLIBackend(probe_config, directory / "state").command(

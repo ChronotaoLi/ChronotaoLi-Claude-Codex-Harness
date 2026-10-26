@@ -183,6 +183,7 @@ def tool_smoke(config, repo, *, timeout=180, max_turns=20, max_budget_usd=1.0):
     probe.data['verification']['commands'] = []
     probe.data['permissions']['worker_commands'] = fixture['commands']
     probe.data['runtime']['claude_max_turns'] = max_turns
+    probe.data['runtime']['claude_max_turns_by_role'] = {'worker': max_turns}
     write_json(directory / 'external-mcp.json', {'servers': {}})
     probe.data['shared']['mcp'] = str(directory / 'external-mcp.json')
     argv = CLIBackend(probe, directory / 'state').command('worker', model, Path(fixture['worktree']), job, {}, None)

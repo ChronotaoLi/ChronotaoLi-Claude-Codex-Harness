@@ -210,7 +210,17 @@ python3 -m harness --repo /path/to/project memory export > memory-backup.json
 
 大量变更路径与恢复路径使用 SHA256 绑定的完整索引，按需检索，不重复塞进模型输入。相同清单共用索引，原始范围、验收、diff 与快照仍保留；索引缺失或损坏会阻止继续，不能靠截断路径绕过门禁。详见[上下文与诊断产物](docs/recovery.md#上下文与诊断产物)。
 
-默认 `agent_timeout_seconds = 3600`、`claude_max_turns = 50`。超时是整次模型调用的墙钟时限；超时的 worker 消耗一次工作尝试，已写修改保留供恢复核对，持续产出不会自动延长时限。已有配置显式设置的超时保持原值，可在恢复前调大。完整输入和 `context-report.json` 保存在 dispatch 目录；容量预检、日志摘录与预算字段见[上下文与诊断产物](docs/recovery.md#上下文与诊断产物)。增大预算不保证任意长任务都能完成。
+默认 `agent_timeout_seconds = 3600`、全局 `claude_max_turns = 50`。可用 `claude_max_turns_by_role` 为单次 Claude 派发设置角色覆盖；仓库示例给 worker 200 轮，未列角色沿用全局值，旧配置不自动增加。它是工具使用循环的资源保护，一轮可有多个工具调用，不是任务累计工具次数，也不表示验收进度。Codex 不使用此参数；供应商的 `num_turns` 仅供观测，不能直接比较判定到限。
+
+```toml
+[runtime]
+claude_max_turns = 50
+claude_max_turns_by_role = { worker = 200 }
+```
+
+覆盖键只接受 `commander`、`worker`、`reviewer`，值必须为正整数；Fable 指挥使用 `commander` 的值。200 是长任务的起始配置，需结合到限率、最终验收和恢复重复工作调整，不保证任意任务都能完成。恢复只允许保持或提高各角色实际生效的上限；移除覆盖也会检查回退后的值。
+
+超时是整次模型调用的墙钟时限，持续产出不会自动延长。轮数耗尽或超时的 worker 消耗一次工作尝试，已写修改及错误证据保留供恢复核对；增加容量不会清零任务、总调用或派发预算。完整输入和 `context-report.json` 保存在 dispatch 目录；容量预检、日志摘录与预算字段见[上下文与诊断产物](docs/recovery.md#上下文与诊断产物)。
 
 ## 数据与排查
 

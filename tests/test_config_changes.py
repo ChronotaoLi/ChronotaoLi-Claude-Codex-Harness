@@ -49,6 +49,8 @@ class ConfigChangesTests(unittest.TestCase):
 
     def test_runtime_budgets_reject_boolean_zero_and_negative_values(self):
         for key in self.data["runtime"]:
+            if key == "claude_max_turns_by_role":
+                continue
             for value in (True, False, -1, 0):
                 if key == "max_replans" and type(value) is int and value == 0:
                     continue
