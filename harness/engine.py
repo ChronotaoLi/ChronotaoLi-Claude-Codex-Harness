@@ -316,6 +316,9 @@ class Engine(EnvironmentRecovery, DecisionRecovery, ProgressRecovery, InvalidOut
     def replan(self, trigger):
         return self._planning.replan(trigger)
 
+    def recover_replan_worker_correction(self):
+        return self._planning.recover_replan_worker_correction()
+
     def record_replan_stop(self, trigger, result, attempt, **diagnostics):
         return self._planning.record_replan_stop(trigger, result, attempt, **diagnostics)
 

@@ -106,14 +106,14 @@ class Planner(RuntimeService):
                   + json.dumps(broad, ensure_ascii=True), file=sys.stderr, flush=True)
         runtime.report_command_requirements()
 
-    def replan(self, trigger):
+    def validate_replan_selection(self, trigger):
+        """Recheck the immutable selection that routed this task to replanning."""
         runtime = self.runtime
-        pending = runtime.run.get("pending_replan")
-        if pending and pending["stage"] == "validated":
-            return runtime.apply_pending_revision()
         if trigger.get("coordination"):
             source = trigger["coordination"]
-            if not isinstance(source, dict):
+            if (not isinstance(source, dict)
+                    or any(not isinstance(source.get(key), str) or not source[key] for key in
+                           ("artifact", "artifact_digest", "dispatch_id", "snapshot_digest", "instruction"))):
                 raise HarnessError("再规划选择来源无效；保留证据")
             entry = next((d for d in runtime.run["dispatches"] if d["id"] == source.get("dispatch_id")), None)
             if (not entry or (entry["role"], entry["kind"], entry["task_id"]) !=
@@ -126,6 +126,56 @@ class Planner(RuntimeService):
             validate(result, envelope(task_directive([trigger["task_id"]]), "dispatching", source["dispatch_id"]))
             if result.get("action") != "replan" or result["instruction"] != source["instruction"]:
                 raise HarnessError("再规划选择与原指挥结果不符；保留原选择和证据")
+
+    def recover_replan_worker_correction(self):
+        """Retire only a worker correction superseded by a saved replan selection.
+
+        Older runs could retain it at a pending or stopped replan boundary. This
+        is recovery bookkeeping, not approval to restart a stopped request.
+        """
+        runtime = self.runtime
+        pending = runtime.run.get("pending_replan")
+        stopped = runtime.run.get("replan_stopped")
+        if pending and pending.get("stage") not in ("pending", "request"):
+            return  # A validated revision owns its existing archive/reset recovery.
+        boundary = pending or stopped
+        if not boundary:
+            return
+        trigger = boundary.get("trigger", {})
+        if not isinstance(trigger, dict) or not trigger.get("coordination"):
+            return
+        tid = trigger.get("task_id")
+        key = f"worker:implement:{tid}"
+        correction = runtime.run["pending_format_corrections"].get(key)
+        if correction is None:
+            return
+        if (pending and stopped or runtime.run.get("current_task") != tid
+                or tid in runtime.run["accepted"] or stopped and stopped.get("target") != tid):
+            raise HarnessError("待修正 worker 与再规划任务边界不符；保留原状态")
+        self.validate_replan_selection(trigger)
+        selection_id = trigger["coordination"]["dispatch_id"]
+        entries = runtime.run["dispatches"]
+        positions = {entry["id"]: i for i, entry in enumerate(entries)}
+        selection_position = positions[selection_id]
+        origins = [correction["correction"].get("previous_dispatch")]
+        if correction.get("dispatch_id"):
+            origins.append(correction["dispatch_id"])
+        if (any(origin not in positions or positions[origin] >= selection_position for origin in origins)
+                or any(entry["role"] == "worker" and entry["task_id"] == tid and entry.get("invoked", True)
+                       for entry in entries[selection_position + 1:])):
+            raise HarnessError("待修正 worker 未被原再规划选择取代；保留原状态")
+        # Audit before mutation; an interrupted save can safely repeat cleanup.
+        runtime.event("replan_worker_correction_retired", task_id=tid, selection_dispatch_id=selection_id,
+                      correction=deepcopy(correction))
+        runtime.run["pending_format_corrections"].pop(key)
+        runtime.save()
+
+    def replan(self, trigger):
+        runtime = self.runtime
+        pending = runtime.run.get("pending_replan")
+        if pending and pending["stage"] == "validated":
+            return runtime.apply_pending_revision()
+        self.validate_replan_selection(trigger)
         # Persist the route before any budget guard. Increasing a budget must
         # continue this request, never rerun the worker that reported the blocker.
         if not pending:

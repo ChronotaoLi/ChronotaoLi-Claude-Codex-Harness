@@ -270,8 +270,11 @@ class DecisionRecovery:
             raise HarnessError('operator decision request unknown or task accepted')
         busy = ('pending_task', 'pending_acceptance', 'pending_post_accept', 'pending_replan', 'pending_directive',
                 'review_receipts', 'commander_receipts', 'pending_format_corrections', 'review_corrections')
-        if any(self.run.get(key) for key in busy) or any(r.get('status') == 'pending' for r in self.run.get('invalid_repairs', {}).values()):
-            raise HarnessError('pending lifecycle gates reject operator decisions')
+        active = [key for key in busy if self.run.get(key)]
+        if any(r.get('status') == 'pending' for r in self.run.get('invalid_repairs', {}).values()):
+            active.append('invalid_repairs')
+        if active:
+            raise HarnessError('pending lifecycle gates reject operator decisions: ' + ', '.join(active))
         stopped = self.run.get('replan_stopped')
         if stopped and (request['kind'] != 'replan_stop' or stopped.get('target') != request['task_id']
                         or stopped.get('reason') != request['question']

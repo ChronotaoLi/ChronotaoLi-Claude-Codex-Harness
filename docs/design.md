@@ -95,7 +95,7 @@ OpenWiki 参考的是 Neuroant/OpenWiki。如果原意是 OpenViking，它是另
 - 已返回的指挥与审阅结果绑定原请求、代码快照和产物摘要；恢复继续校验同一结果，不能重抽以消除拒绝。
 - 任务、总 worker、派发、再规划与最终验收预算累计保存。准备失败不扣调用额度，所有实际 worker 调用都计入 attempts/total_attempts。新 run 的 max_attempts 使用 work_attempts，仅扣除通过完整校验并保存的 environment/operator 阻断；max_total_attempts 与派发上限仍包含它们。旧 run 缺少 attempt_budget_policy 时保持原计数语义。豁免绑定原始结果并在恢复和派发前 hook 之后核验，未知或非法结果不豁免；操作者可按允许范围增大预算。
 - 再规划保留既有任务的身份、验收和范围，只追加前置工作、描述细化与依赖；已接受任务不变。额外范围必须由操作者显式授权。
-- 指挥任务选择返回 `selected_task`、`instruction` 和 `action=implement|replan`。旧结果省略 action 等价 implement；Codex 投影仍要求全部字段。replan 将原反馈和摘要绑定的选择结果一起转入持久待再规划，不先启动 worker；可按已有协议修订或 stop。返回结果、选择快照和预算仍须核验，格式修正不得改变 action。验收不可达必须停止或补齐前置工作，不将报告完成解释为任务完成。
+- 指挥任务选择返回 `selected_task`、`instruction` 和 `action=implement|replan`。旧结果省略 action 等价 implement；Codex 投影仍要求全部字段。replan 将原反馈和摘要绑定的选择结果一起转入持久待再规划，同一次保存清除同任务已被取代的待执行 worker 格式修正，不先启动 worker；可按已有协议修订或 stop。旧待再规划或停止状态中的同类残留，仅在恢复预检及选择来源、快照、任务与派发顺序核验后清理，不自动重开 stop，不清零累计额度或清除其他门禁。返回结果、选择快照和预算仍须核验，格式修正不得改变 action。验收不可达必须停止或补齐前置工作，不将报告完成解释为任务完成。
 - 验证、审阅和接受阶段在同一快照上复用已有证据。代码变化使旧批准失效，进程退出未知、Git 绑定异常或证据篡改均停止。
 - 恢复出口不能跳过接受条件；恢复未完成的 run 时，`--reverify` 只作用于当前恢复的首次整体验收，与 `--retry-stopped` 互斥，整体验收预算耗尽时不取消待再规划意图。无法继续时保留现场；台账恢复链接有效且进程退出已确认时可 abandon，链接损坏时同样停止该操作。最终集成始终由操作者完成。
 

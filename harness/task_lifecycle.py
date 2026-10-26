@@ -124,6 +124,7 @@ class TaskLifecycle(RuntimeService):
             runtime.run["pending_replan"] = {"stage": "pending", "trigger": trigger}
             runtime.run["commander_receipts"].pop("commander:dispatch:dispatching")
             runtime.run.pop("pending_directive", None)
+            runtime.run["pending_format_corrections"].pop(f"worker:implement:{tid}", None)
             runtime.save()
             runtime.replan(trigger)
             return False

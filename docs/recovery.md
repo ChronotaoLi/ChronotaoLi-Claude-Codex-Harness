@@ -21,7 +21,9 @@ Claude 使用 `--no-session-persistence`，Codex 使用 `--ephemeral`；没有 r
 
 指挥选择就绪任务时，以目标和所有就绪任务的标题检索记忆，避免只使用列表首项的任务信息。
 
-选择结果为 `selected_task`、`instruction` 和 `action=implement|replan`，旧结果省略 action 按 implement 处理。replan 可用于审阅反馈暴露的缺少前置条件或验收不可达问题，直接进入既有再规划，不先消耗一次 worker 尝试。运行时同一次保存消费选择 receipt 并登记 pending_replan，绑定选择原文摘要及候选快照；再规划预算或调用失败后恢复继续该路线，原选择被篡改或候选变化则停止。格式修正只能修正文案，不能将 replan 改成 implement。
+选择结果为 `selected_task`、`instruction` 和 `action=implement|replan`，旧结果省略 action 按 implement 处理。replan 可用于审阅反馈暴露的缺少前置条件或验收不可达问题，直接进入既有再规划，不先消耗一次 worker 尝试。运行时同一次保存消费选择 receipt、登记 pending_replan，并清除同任务已被取代的待执行 worker 格式修正，绑定选择原文摘要及候选快照；原结果、故障证据与累计修正额度保留。再规划预算或调用失败后恢复继续该路线，原选择被篡改或候选变化则停止。格式修正只能修正文案，不能将 replan 改成 implement。
+
+旧 run 若在上述转换后仍残留同任务 worker 修正，`resume` 在配置、进程退出、Git 绑定及 HEAD 预检后兼容清理。只处理带 `coordination` 来源的 pending/request 再规划或匹配的停止状态：核验原选择的身份、路径、摘要和当前候选快照，确认任务仍未接受、修正来源早于该选择，且此后没有同任务 worker 调用，再审计并保存清理。其他任务、角色的修正和阶段门禁均保留；已校验修订继续原归档恢复。清理不自动重开 stop、不改变预算或接受条件；操作者答复仍须通过原门禁，拒绝时列出活动门禁名称。
 
 再规划处理任务拆分、缺少前置工作、验收不可达判断和整体验收发现的工程缺口。worker 通过 `blocker_kind` 区分 task、environment 与 operator；operator 等待明确回答，不先再规划；CLI 错误、权限、范围违例和现场不一致不会被包装成自动再规划。非法结果默认停止；明确归属且保留拒绝证据的 invalid_rejected 整体审阅可自动进入修正规划，操作者请求的有界非法结果修正另述。指挥返回 `{action, reason, new_tasks, updates}`：每个 update 仅包含 `id`、`description`、`add_depends_on`，stop 必须提供空操作数组。运行时在原计划上应用增量并重新检查 DAG，要求：
 
@@ -122,7 +124,7 @@ worker 的失败反馈共享 9,000 字符的序列化摘录额度，保留状态
 
 ## 指挥结果与受控修正
 
-指挥 plan、replan 和 dispatch 同样采用派发前 receipt：保存原 schema、输入包及摘要、dispatch、候选摘要、返回位置；结果原子落盘后继续原身份、结构、任务语义和格式校验。replan 另绑定持久请求 ID，合法新修订不能误用前次结果。结果摘要确定后缺失或篡改停止。post_agent 使用独立日志，保留至少一次语义；receipt 与计划、停止或已校验修订在同一次台账保存中消费。模型生成的任务选择先保存为 pending_directive，worker 本地准备失败保留它，调用后端前与尝试预算一起消费。已返回的指挥结果不再由普通恢复重新抽取；未返回结果的故障仍可显式恢复，格式修正保持原有一次额度。
+指挥 plan、replan 和 dispatch 同样采用派发前 receipt：保存原 schema、输入包及摘要、dispatch、候选摘要、返回位置；结果原子落盘后继续原身份、结构、任务语义和格式校验。replan 另绑定持久请求 ID，合法新修订不能误用前次结果。结果摘要确定后缺失或篡改停止。post_agent 使用独立日志，保留至少一次语义；receipt 与计划、停止或已校验修订在同一次台账保存中消费。模型生成的 implement 任务选择先保存为 pending_directive，worker 本地准备失败保留它，调用后端前与尝试预算一起消费；replan 选择直接登记 pending_replan。已返回的指挥结果不再由普通恢复重新抽取；未返回结果的故障仍可显式恢复，格式修正保持原有一次额度。
 
 `resume --repair-invalid DISPATCH_ID` 提供独立、显式且有界的输出修正入口。仅匹配当前未消费的 receipt，先验证原字节摘要、派发身份、结构、当前快照，以及指挥请求摘要和 replan 请求归属。语义修正适用对象为非法 plan/revise，或 verdict 为 approve、没有 blocking finding，但重复 finding ID／批准未知记忆 key 的审阅。自动格式修正额度耗尽后，仅可变字段格式非法的指挥任务选择、revise 和无阻断 approve 也可使用同一显式额度；不得在自动修正尚未耗尽时取得额外派发。
 
@@ -150,10 +152,10 @@ worker 的失败反馈共享 9,000 字符的序列化摘录额度，保留状态
 | `pending_task` | worker 结果检查完成 | 验证失败、候选变化或任务审阅结束时清除；与 `pending_replan` 互斥 |
 | `pending_acceptance` | 任务审阅通过 | 候选变化或接受台账保存时清除 |
 | `pending_post_accept` | 接受提交及台账保存 | 记忆、事件和 post_accept 均完成后清除 |
-| `pending_replan` | task blocker、整体失败或显式重试 stop | 修订登记、stop 或允许的 reverify 取消时清除 |
-| `pending_directive` | 已校验的指挥任务选择 | worker 调用前与预算一起消费；本地准备失败保留 |
+| `pending_replan` | task blocker、整体失败、指挥任务选择 `action=replan`（同一次保存消费选择 receipt），或显式重开 stop | 修订登记、stop 或允许的 reverify 取消时清除 |
+| `pending_directive` | 已校验的 implement 任务选择；replan 选择不进入 | worker 调用前与预算一起消费；本地准备失败保留 |
 | `review_receipts` / `commander_receipts` | 调用前保存接收意图 | 结果被阶段状态消费、转入修正或允许的候选失效时清除 |
-| `pending_format_corrections` | 格式错误后准备修正 | 成功、额度耗尽或候选失效时清除；worker 返回即清除。尚未启动时允许没有新 dispatch ID |
+| `pending_format_corrections` | 格式错误后准备修正 | 成功、额度耗尽或候选失效时清除；worker 返回或同任务指挥选择 replan 时清除。旧再规划残留只经来源校验后兼容清理；尚未启动时允许没有新 dispatch ID |
 | `review_corrections` | 首次需要格式修正的审阅 | 审阅被消费或候选失效时清除；可与 receipt、待修正状态并存 |
 | `invalid_repairs` | 操作者授权显式修正 | 完成、失败或失效后仍保留来源与额度记录 |
 | `format_repairs` | 修正调用前 | 累计额度不因新候选或 resume 清零 |

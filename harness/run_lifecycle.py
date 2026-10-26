@@ -273,6 +273,7 @@ class RunLifecycle(RuntimeService):
                                    "若工作树或分支已创建，请核对后手工清理")
             if git.head(runtime.worktree, binding=runtime.run["worktree_binding"]) != runtime.run["expected_head"]:
                 raise HarnessError("worktree HEAD 与检查点不同；请先核对提交，不自动重放")
+            runtime.recover_replan_worker_correction()
             update = runtime.prepare_environment_update(environment_update) if environment_update is not None else None
             decision_values, decisions = (runtime.prepare_operator_decisions(operator_decision)
                                           if operator_decision is not None else ([], []))
