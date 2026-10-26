@@ -19,7 +19,7 @@ model = "gpt-6.1-sol"
 effort = "high"
 
 [runtime]
-agent_timeout_seconds = 1800
+agent_timeout_seconds = 3600
 verify_timeout_seconds = 300
 max_attempts = 3
 max_final_attempts = 3

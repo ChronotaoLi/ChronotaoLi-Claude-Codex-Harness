@@ -11,8 +11,8 @@ from pathlib import Path
 from . import git
 from .budgets import work_attempts
 from .context import compact_feedback
-from .contracts import apply_revision, REPLAN, validate_plan
-from .recovery import snapshot_digest
+from .contracts import apply_revision, envelope, REPLAN, task_directive, validate, validate_plan
+from .recovery import read_bound_result, snapshot_digest
 from .requirements import missing_commands
 from .services import RuntimeService
 from .shared import skills_catalog
@@ -111,6 +111,21 @@ class Planner(RuntimeService):
         pending = runtime.run.get("pending_replan")
         if pending and pending["stage"] == "validated":
             return runtime.apply_pending_revision()
+        if trigger.get("coordination"):
+            source = trigger["coordination"]
+            if not isinstance(source, dict):
+                raise HarnessError("再规划选择来源无效；保留证据")
+            entry = next((d for d in runtime.run["dispatches"] if d["id"] == source.get("dispatch_id")), None)
+            if (not entry or (entry["role"], entry["kind"], entry["task_id"]) !=
+                    ("commander", "dispatch", "dispatching") or not entry.get("invoked", True)
+                    or source.get("artifact") != str(runtime.directory / "dispatches" / entry["id"] / "returned-result.json")
+                    or entry.get("snapshot_digest") != source["snapshot_digest"]
+                    or snapshot_digest(runtime.snapshot()) != source["snapshot_digest"]):
+                raise HarnessError("再规划选择的来源或代码快照已变化；保留原选择和证据")
+            result, _ = read_bound_result(source, "再规划选择")
+            validate(result, envelope(task_directive([trigger["task_id"]]), "dispatching", source["dispatch_id"]))
+            if result.get("action") != "replan" or result["instruction"] != source["instruction"]:
+                raise HarnessError("再规划选择与原指挥结果不符；保留原选择和证据")
         # Persist the route before any budget guard. Increasing a budget must
         # continue this request, never rerun the worker that reported the blocker.
         if not pending:

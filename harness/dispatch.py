@@ -174,7 +174,7 @@ class Dispatcher(RuntimeService):
                                             ("artifact", "artifact_digest", "dispatch_id", "snapshot_digest")}
                     correction["instruction"] = (
                         "Correct only the reported text format using this dispatch's IDs. Read source.artifact. "
-                        "Preserve the original selected_task, or action, new_tasks and updates exactly. "
+                        "Preserve the original selected_task and action (omitted action means implement), or action, new_tasks and updates exactly. "
                         "Do not change scope, acceptance or the selected revision operations.")
                 packet = {**packet, "format_correction": correction}
                 pending[key] = {"correction": correction,

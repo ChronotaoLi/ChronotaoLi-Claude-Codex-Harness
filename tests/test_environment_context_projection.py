@@ -20,7 +20,7 @@ class EnvironmentProjectionTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.env = Projection()
-        self.env.directory = Path(self.temp.name)
+        self.env.directory = Path(self.temp.name).resolve()
         self.env.run = {'id': 'run', 'schema_version': 10, 'environment_updates': [], 'environment_checks': []}
 
     def add(self, task, summary, checks=None, passed=True):
@@ -52,13 +52,18 @@ class EnvironmentProjectionTests(unittest.TestCase):
                 ({}, {'task': {'id': 'a'}}, ['a']),
                 ({'kind': 'dispatch'}, {'ready': [{'id': 'b'}]}, ['b']),
                 ({'kind': 'replan'}, {'trigger': {'task_id': 'a'}}, ['a']),
-                ({'kind': 'final_review'}, {}, ['b', 'a'])]:
+                ({'kind': 'final_review'}, {}, ['b', 'a']),
+                ({'kind': 'replan'}, {'trigger': {'task_id': 'final'}}, ['b', 'a'])]:
             packet.update(acceptance=['must pass'], tool_constraints={'permissions': []}, blockers=['unresolved'])
             result = self.env.environment_packet(packet, **kwargs)
             self.assertEqual([r['task_id'] for r in result['environment_updates']], expected)
             for key in packet:
                 self.assertEqual(result[key], packet[key])
-            self.assertEqual(len(result['environment_history']), 3)
+            self.assertEqual({r['task_id'] for r in result['environment_history']}, set(expected))
+            index = result['environment_index']
+            raw = Path(index['artifact']).read_bytes()
+            self.assertEqual(hashlib.sha256(raw).hexdigest(), index['artifact_digest'])
+            self.assertEqual(len(json.loads(raw)['updates']), 3)
             for row in result['environment_history']:
                 self.assertEqual(hashlib.sha256(Path(row['artifact']).read_bytes()).hexdigest(), row['artifact_digest'])
 
@@ -83,3 +88,45 @@ class EnvironmentProjectionTests(unittest.TestCase):
             with self.assertRaises(HarnessError):
                 self.env.environment_packet({}, task_id='unrelated')
             path.write_bytes(original)
+
+    def test_repeated_checks_have_bounded_projection_and_immutable_full_index(self):
+        self.add('a', 'A', [dict(kind='executable', name='python3')], passed=False)
+        self.add('b', 'B', [dict(kind='executable', name='python3')])
+        first = self.env.environment_packet({}, task_id='a')
+        old_index = first['environment_index']
+        old_raw = Path(old_index['artifact']).read_bytes()
+        original = dict(self.env.run['environment_checks'][0])
+        report = json.loads(Path(original['artifact']).read_bytes())
+        for i in range(100):
+            path = self.env.directory / f'repeated-{i}.json'
+            write_json(path, dict(report, observed_at=i + 2))
+            self.env.run['environment_checks'].append(dict(original, artifact=str(path),
+                artifact_digest=hashlib.sha256(path.read_bytes()).hexdigest()))
+        packet = self.env.environment_packet({}, task_id='a')
+        self.assertEqual(len(packet['environment_check_history']), 1)
+        self.assertEqual({r['task_id'] for r in packet['environment_history']}, {'a'})
+        self.assertFalse(packet['environment_observations'][0]['passed'])
+        self.assertEqual(packet['environment_observations'][0]['failed_check_indices'], [0])
+        self.assertLess(abs(len(json.dumps(packet)) - len(json.dumps(first))), 100)
+        index = json.loads(Path(packet['environment_index']['artifact']).read_bytes())
+        self.assertEqual(len(index['checks']), 102)
+        self.assertEqual(Path(old_index['artifact']).read_bytes(), old_raw)
+        # Recovery validates reports absent from the current task and latest view.
+        for row in (original, self.env.run['environment_checks'][1]):
+            path = Path(row['artifact'])
+            raw = path.read_bytes()
+            path.write_bytes(raw + b' ')
+            with self.assertRaises(HarnessError):
+                self.env.environment_context()
+            with self.assertRaises(HarnessError):
+                self.env.environment_packet({}, task_id='unrelated')
+            path.write_bytes(raw)
+
+    def test_corrupt_existing_index_is_preserved_and_rejected(self):
+        self.add('a', 'A')
+        ref = self.env.environment_packet({}, task_id='a')['environment_index']
+        path = Path(ref['artifact'])
+        path.write_bytes(b'corrupt')
+        with self.assertRaises(HarnessError):
+            self.env.environment_packet({}, task_id='a')
+        self.assertEqual(path.read_bytes(), b'corrupt')

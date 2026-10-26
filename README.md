@@ -96,6 +96,8 @@ python3 -m harness --config /path/to/harness.toml --repo /path/to/project resume
 
 全部任务接受并提交后重新运行验证，由新的审阅实例对照原始目标、原始任务约束和整条分支 diff 验收。整体拒绝须经正常修复任务门禁，不能靠反复恢复重抽审阅结论。记忆在任务接受后写入，知识提案还须逐项获批。
 
+返工时指挥可直接转再规划，缺少前置条件时补充任务，验收在当前边界内不可达时停止，无需先重复派发 worker。操作者接受风险不改变验收；停止后的部分交付与恢复出口见[验收不可达](docs/recovery.md#验收不可达)。
+
 一条 run 按 DAG 串行执行，复用工作树和已接受代码。Git worktree 是任务隔离，不是操作系统安全沙箱；范围检查发生在接受前，忽略文件和外部服务副作用不在 Git 快照覆盖范围内。CLI、hooks、验证命令和 MCP 服务以当前用户权限运行。更强隔离需专用 OS 用户或容器。
 
 需要验证交付提交不依赖 worker 留下的忽略文件时：
@@ -131,7 +133,7 @@ python3 -m harness --repo /path/to/project cleanup-verification RUN
 | 等待计划批准 | `resume RUN --approve-plan` |
 | 精确命令未授权 | 追加配置后普通 `resume RUN` |
 | 已保存 worker 环境阻断 | 修复条件后 `resume RUN --environment-update FILE` |
-| 等待用户决定 | 从 status 取 request ID，`resume RUN --operator-decision FILE` |
+| 等待用户决定 | 从 status 取 request ID，`resume RUN --operator-decision FILE`；可重复参数一次回答多项 |
 | 指挥明确停止 | `resume RUN --retry-stopped TASK_ID`，整体阶段用 `final` |
 | 再规划需要额外范围 | `resume RUN --allow-scope 'config/**'`；停止状态另需显式重试 |
 | 最终验证普通非零退出 | 正常修正规划；确认环境已修复时可显式 `resume RUN --reverify` |
@@ -206,7 +208,7 @@ python3 -m harness --repo /path/to/project memory export > memory-backup.json
 
 上下文采用结构化检查点、有界检索和原始证据引用，在任务边界写 `handoff.json`／`handoff.md`；每次指挥调用重新构建输入。默认 `context_chars = 100000` 是编排输入字符上限，不是 token 数；必要约束超限就停止，可选记忆按整条移除。CLI 内部上下文不在该预算内。
 
-默认 `agent_timeout_seconds = 1800`、`claude_max_turns = 50`。完整输入和 `context-report.json` 保存在 dispatch 目录；容量预检、日志摘录与预算字段见[上下文与诊断产物](docs/recovery.md#上下文与诊断产物)。增大预算不保证任意长任务都能完成。
+默认 `agent_timeout_seconds = 3600`、`claude_max_turns = 50`。超时是整次模型调用的墙钟时限；超时的 worker 消耗一次工作尝试，已写修改保留供恢复核对，持续产出不会自动延长时限。已有配置显式设置的超时保持原值，可在恢复前调大。完整输入和 `context-report.json` 保存在 dispatch 目录；容量预检、日志摘录与预算字段见[上下文与诊断产物](docs/recovery.md#上下文与诊断产物)。增大预算不保证任意长任务都能完成。
 
 ## 数据与排查
 

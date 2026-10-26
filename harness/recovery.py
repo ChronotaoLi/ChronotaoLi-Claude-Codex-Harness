@@ -86,7 +86,7 @@ class InvalidOutputRecovery:
             if key.startswith("commander:"):
                 correction["instruction"] = (
                     "Read the original result and failed_result. Correct only the reported text formatting. "
-                    "Preserve selected_task for task selection, or action, new_tasks and updates exactly for a revision. "
+                    "Preserve selected_task and action (omitted action means implement) for task selection, or action, new_tasks and updates exactly for a revision. "
                     "Use this dispatch's IDs. All original goal, scope, acceptance and budget constraints remain binding.")
         return {**packet, "invalid_output_correction": correction}
 

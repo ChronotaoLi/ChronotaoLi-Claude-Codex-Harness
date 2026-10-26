@@ -202,6 +202,8 @@ class Engine(EnvironmentRecovery, DecisionRecovery, ProgressRecovery, InvalidOut
         return targets
 
     def validate_handoff_requests(self, task_id, result):
+        if result.get("status") == "blocked":
+            return
         targets = {task["id"] for task in self.handoff_targets(task_id)}
         for request in result.get("decision_requests", []):
             validate_handoff_question(request["question"])

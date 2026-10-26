@@ -2,6 +2,7 @@
 from copy import deepcopy
 import hashlib
 import json
+from os import PathLike
 from pathlib import Path
 import time
 
@@ -292,18 +293,58 @@ class DecisionRecovery:
     def prepare_operator_decision(self, path):
         return self._prepare_decision(read_decision(path))
 
+    def prepare_operator_decisions(self, paths):
+        """Validate an entire submission before creating any decision artifacts."""
+        if isinstance(paths, (str, PathLike)):
+            paths = [paths]
+        values = [read_decision(path) for path in paths]
+        if not values:
+            raise HarnessError('operator decision batch must not be empty')
+        if len({value['request_id'] for value in values}) != len(values):
+            raise HarnessError('duplicate operator decision request in batch')
+        records = []
+        for value in values:
+            record = self._prepare_decision(value)
+            if record is not None:
+                record['sequence'] += len(records)
+                records.append(record)
+        return values, records
+
     def record_operator_decision(self, record):
-        if record is None:
+        self.record_operator_decisions([] if record is None else [record])
+
+    def record_operator_decisions(self, records):
+        """Prewrite immutable evidence, then publish all answers in one ledger save.
+
+        Orphan artifacts from an interrupted prewrite are harmless and are reused
+        on retry. No model may run before this method has returned successfully.
+        """
+        prepared_records = []
+        seen = set()
+        for record in records:
+            value = validate_decision({k: record[k] for k in
+                ('schema_version', 'request_id', 'task_id', 'decision', 'summary')})
+            if value['request_id'] in seen:
+                raise HarnessError('duplicate operator decision request in batch')
+            seen.add(value['request_id'])
+            prepared = self._prepare_decision(value)
+            if prepared is None:
+                continue
+            prepared['sequence'] += len(prepared_records)
+            if any(record.get(k) != prepared[k] for k in prepared if k != 'recorded_at'):
+                raise HarnessError('prepared operator decision changed')
+            prepared_records.append(record)
+        if not prepared_records:
             return
-        value = validate_decision({k: record[k] for k in ('schema_version', 'request_id', 'task_id', 'decision', 'summary')})
-        prepared = self._prepare_decision(value)
-        if prepared is None:
-            return
-        if any(record.get(k) != prepared[k] for k in prepared if k != 'recorded_at'):
-            raise HarnessError('prepared operator decision changed')
-        row = self._decision_artifact(record, 'operator_decision_recorded')
-        self.run.setdefault('operator_decisions', []).append(row)
-        self.save()
+        rows = [self._decision_artifact(record, 'operator_decision_recorded')
+                for record in prepared_records]
+        old = self.run.get('operator_decisions', [])
+        self.run['operator_decisions'] = [*old, *rows]
+        try:
+            self.save()
+        except BaseException:
+            self.run['operator_decisions'] = old
+            raise
 
     def _decision_index(self, records):
         # Navigation only: validation of every ledger/source precedes projection.

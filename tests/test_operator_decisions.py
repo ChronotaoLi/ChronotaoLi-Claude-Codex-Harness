@@ -49,6 +49,30 @@ class OperatorDecisionTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.engine = Fixture(self.temp.name)
 
+    def test_empty_and_duplicate_batches_leave_ledger_and_artifacts_unchanged(self):
+        engine = self.engine
+        request = engine.request()
+        path = engine.response(request)
+        before = set((engine.directory / 'decisions').iterdir())
+        saves = engine.saves
+        for paths in ([], [path, path]):
+            with self.assertRaises(HarnessError):
+                engine.prepare_operator_decisions(paths)
+        self.assertEqual(engine.run['operator_decisions'], [])
+        self.assertEqual(engine.saves, saves)
+        self.assertEqual(set((engine.directory / 'decisions').iterdir()), before)
+
+    def test_batch_record_rechecks_expiry_before_creating_response_artifacts(self):
+        engine = self.engine
+        request = engine.request()
+        values, records = engine.prepare_operator_decisions([engine.response(request)])
+        engine.run['dispatches'].append({'id': 'later', 'task_id': 'one', 'invoked': True})
+        before = set((engine.directory / 'decisions').iterdir())
+        with self.assertRaisesRegex(HarnessError, 'stale'):
+            engine.record_operator_decisions(records)
+        self.assertEqual(engine.run['operator_decisions'], [])
+        self.assertEqual(set((engine.directory / 'decisions').iterdir()), before)
+
     def test_stop_then_continue_is_explicit_and_idempotent(self):
         engine = self.engine
         request = engine.request()

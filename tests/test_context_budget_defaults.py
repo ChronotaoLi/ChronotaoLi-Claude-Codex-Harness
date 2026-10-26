@@ -25,12 +25,12 @@ class RuntimeBudgetDefaultsTests(unittest.TestCase):
             with self.subTest(runtime=runtime):
                 config = self.load_runtime(runtime)
                 self.assertEqual(config.data["runtime"]["context_chars"], 100000)
-                self.assertEqual(config.data["runtime"]["agent_timeout_seconds"], 1800)
+                self.assertEqual(config.data["runtime"]["agent_timeout_seconds"], 3600)
 
     def test_checked_in_defaults_and_explicit_overrides_remain_distinct(self):
         config = Config.load(ROOT / "harness.toml")
         self.assertEqual(config.data["runtime"]["context_chars"], 100000)
-        self.assertEqual(config.data["runtime"]["agent_timeout_seconds"], 1800)
+        self.assertEqual(config.data["runtime"]["agent_timeout_seconds"], 3600)
         override = self.load_runtime(
             "[runtime]\ncontext_chars = 32000\nagent_timeout_seconds = 90\n\n"
         )
@@ -44,7 +44,7 @@ class RuntimeBudgetDefaultsTests(unittest.TestCase):
         current = self.load_runtime("")
         self.assertEqual(current.resume_changes(previous.data), {
             "context_chars": {"old": 32000, "new": 100000},
-            "agent_timeout_seconds": {"old": 1200, "new": 1800},
+            "agent_timeout_seconds": {"old": 1200, "new": 3600},
         })
 
 

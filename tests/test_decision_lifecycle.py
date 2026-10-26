@@ -42,6 +42,88 @@ class DecisionLifecycleTests(RepoCase):
         self.assertEqual(len(engine.run['decision_requests']), 1)
         return engine, backend
 
+    def batch_handoff(self):
+        def change(backend, kwargs, packet, result):
+            if kwargs['role'] == 'worker' and kwargs['task']['id'] == 'greet':
+                result['decision_requests'] = [
+                    {'id': 'first', 'task_id': 'dependent', 'question': 'Proceed first?'},
+                    {'id': 'second', 'task_id': 'dependent', 'question': 'Proceed second?'}]
+            elif kwargs['role'] == 'worker':
+                with (kwargs['cwd'] / 'hello.py').open('a') as stream:
+                    stream.write('# dependent\n')
+        backend = ScriptedBackend(change)
+        engine = self.engine(backend)
+        with self.assertRaises(HarnessError):
+            engine.start('Implement both', self.plan(dependent=True))
+        paths = []
+        for index, request in enumerate(engine.run['decision_requests']):
+            path = self.repo / f'answer-{index}.json'
+            write_json(path, {'schema_version': 1, 'request_id': request['id'],
+                              'task_id': request['task_id'], 'decision': 'continue', 'summary': 'Proceed'})
+            paths.append(path)
+        return engine, backend, paths
+
+    def test_batch_rejects_invalid_or_duplicate_before_any_answer_write(self):
+        engine, backend, paths = self.batch_handoff()
+        calls = len(backend.calls)
+        invalid = self.repo / 'bad-answer.json'
+        write_json(invalid, dict(read_json(paths[1]), request_id='unknown'))
+        for batch in ([paths[0], invalid], [paths[0], paths[0]]):
+            with self.assertRaises(HarnessError):
+                self.engine(backend).resume(engine.run['id'], operator_decision=batch)
+            self.assertEqual(self.saved(engine)['operator_decisions'], [])
+            self.assertEqual(len(backend.calls), calls)
+        result = self.engine(backend).resume(engine.run['id'], operator_decision=paths)
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(len(result['operator_decisions']), 2)
+        call = next(c for c in backend.calls if c['role'] == 'worker' and c['task_id'] == 'dependent')
+        self.assertTrue(all(r['response']['decision'] == 'continue' for r in call['packet']['operator_decisions']))
+
+    def test_batch_stop_saves_every_answer_and_retries_idempotently_without_calls(self):
+        engine, backend, paths = self.batch_handoff()
+        write_json(paths[1], dict(read_json(paths[1]), decision='stop'))
+        calls = len(backend.calls)
+        for unused in range(2):
+            with self.assertRaisesRegex(HarnessError, '操作者决定停止'):
+                self.engine(backend).resume(engine.run['id'], operator_decision=paths)
+            self.assertEqual(len(self.saved(engine)['operator_decisions']), 2)
+            self.assertEqual(len(backend.calls), calls)
+        write_json(paths[1], dict(read_json(paths[1]), decision='continue', summary='Explicitly continue'))
+        self.assertEqual(self.engine(backend).resume(engine.run['id'], operator_decision=paths)['status'], 'completed')
+
+    def test_batch_save_failure_rolls_back_memory_and_restart_recovers(self):
+        engine, backend, paths = self.batch_handoff()
+        values, records = engine.prepare_operator_decisions(paths)
+        with patch.object(engine, 'save', side_effect=OSError('disk unavailable')):
+            with self.assertRaises(OSError):
+                engine.record_operator_decisions(records)
+        self.assertEqual(engine.run['operator_decisions'], [])
+        self.assertEqual(self.saved(engine)['operator_decisions'], [])
+        result = self.engine(backend).resume(engine.run['id'], operator_decision=paths)
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(len(result['operator_decisions']), len(values))
+
+    def test_batch_interrupted_prewrite_has_no_partial_ledger_and_recovers(self):
+        engine, backend, paths = self.batch_handoff()
+        resumed = self.engine(backend)
+        original = resumed._decision_artifact
+        count = 0
+        def interrupt(record, category):
+            nonlocal count
+            count += 1
+            if count == 2:
+                raise KeyboardInterrupt()
+            return original(record, category)
+        calls = len(backend.calls)
+        with patch.object(resumed, '_decision_artifact', side_effect=interrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                resumed.resume(engine.run['id'], operator_decision=paths)
+        self.assertEqual(self.saved(engine)['operator_decisions'], [])
+        self.assertEqual(len(backend.calls), calls)
+        result = self.engine(backend).resume(engine.run['id'], operator_decision=paths)
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual([r['sequence'] for r in result['operator_decisions']], [1, 2])
+
     def test_operator_block_stops_without_replan_and_plain_resume_spends_no_budget(self):
         engine, backend = self.blocked()
         before = self.saved(engine)

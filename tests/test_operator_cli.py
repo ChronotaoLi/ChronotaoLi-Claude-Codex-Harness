@@ -21,6 +21,16 @@ class OperatorCLITests(unittest.TestCase):
         self.assertTrue(engine.resume.call_args.kwargs["step"])
         self.assertIn("decision source has changed", errors.getvalue())
 
+    def test_repeated_decision_paths_reach_engine_as_one_batch(self):
+        engine = Mock()
+        engine.resume.side_effect = HarnessError("batch rejected")
+        with patch("harness.cli.Config.load"), patch("harness.cli.git.repository", return_value=Path("/tmp/repo")), \
+                patch("harness.cli.Engine", return_value=engine), contextlib.redirect_stderr(io.StringIO()):
+            code = _main(["resume", "run_test", "--operator-decision", "a.json",
+                          "--operator-decision", "b.json"])
+        self.assertEqual(code, 1)
+        self.assertEqual(engine.resume.call_args.kwargs["operator_decision"], [Path("a.json"), Path("b.json")])
+
     def test_status_exposes_only_unanswered_current_requests(self):
         run = {"accepted": {}, "decision_requests": [
             {"id": "worker", "task_id": "work", "kind": "worker", "question": "Choose approach"},

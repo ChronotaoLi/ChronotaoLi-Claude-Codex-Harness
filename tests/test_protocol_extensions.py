@@ -47,12 +47,18 @@ class ProtocolExtensionTests(unittest.TestCase):
                 lambda x: x['checkpoints'][0].update(max_age_seconds=86401),
                 lambda x: x['checkpoints'][0].update(evidence=[]),
                 lambda x: x['decision_requests'].append(x['decision_requests'][0]),
-                lambda x: x['decision_requests'][0].update(extra=True),
-                lambda x: x.update(status='blocked', blocker_kind='operator', blockers=['Choose'])]:
+                lambda x: x['decision_requests'][0].update(extra=True)]:
             value = deepcopy(good)
             mutation(value)
             with self.subTest(value=value), self.assertRaises(HarnessError):
                 validate_work(value)
+
+        # A valid blocker survives inapplicable handoff declarations unchanged;
+        # their registration and diagnostics belong to the lifecycle boundary.
+        blocked = dict(deepcopy(good), status='blocked', blocker_kind='operator', blockers=['Choose'])
+        original = deepcopy(blocked)
+        validate_work(blocked)
+        self.assertEqual(blocked, original)
 
     def test_volatile_zero_and_maximum_ttl_are_valid(self):
         for ttl in (0, 86400):

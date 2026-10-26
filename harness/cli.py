@@ -275,8 +275,8 @@ def _main(argv=None):
                         help="显式修正当前非法计划或无拒绝的非法批准元数据；保留证据和累计预算")
     resume.add_argument("--environment-update", type=Path, metavar="FILE",
                         help="提供操作者环境澄清 JSON 文件；不扩展权限、文件范围或命令授权")
-    resume.add_argument("--operator-decision", type=Path, metavar="FILE",
-                        help="回答 status 中的操作者决策请求；绑定任务和原始证据，不跳过验收或授予命令权限")
+    resume.add_argument("--operator-decision", type=Path, action="append", metavar="FILE",
+                        help="回答 status 中的操作者决策请求；可重复指定，整批校验保存后继续，不跳过验收或授予命令权限")
     resume.add_argument("--allow-scope", action="append", metavar="PATTERN",
                         help="为待再规划显式授权新增文件范围模式；可重复指定，不改变原任务范围")
     status = sub.add_parser("status")
@@ -355,7 +355,8 @@ def _main(argv=None):
             if args.environment_update is not None:
                 options["environment_update"] = args.environment_update
             if args.operator_decision is not None:
-                options["operator_decision"] = args.operator_decision
+                options["operator_decision"] = (args.operator_decision[0] if len(args.operator_decision) == 1
+                                                else args.operator_decision)
             if args.allow_scope:
                 options["allow_scope"] = args.allow_scope
             result = Engine(config, repo).resume(args.run_id, approve_plan=args.approve_plan, step=args.step,

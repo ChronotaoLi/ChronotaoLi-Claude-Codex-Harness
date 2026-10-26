@@ -21,7 +21,9 @@ Claude 使用 `--no-session-persistence`，Codex 使用 `--ephemeral`；没有 r
 
 指挥选择就绪任务时，以目标和所有就绪任务的标题检索记忆，避免只使用列表首项的任务信息。
 
-再规划只处理任务拆分、缺少前置工作和整体验收发现的工程缺口。worker 通过 `blocker_kind` 区分 task、environment 与 operator；operator 等待明确回答，不先再规划；CLI 错误、权限、范围违例和现场不一致不会被包装成自动再规划。非法结果默认停止；明确归属且保留拒绝证据的 invalid_rejected 整体审阅可自动进入修正规划，操作者请求的有界非法结果修正另述。指挥返回 `{action, reason, new_tasks, updates}`：每个 update 仅包含 `id`、`description`、`add_depends_on`，stop 必须提供空操作数组。运行时在原计划上应用增量并重新检查 DAG，要求：
+选择结果为 `selected_task`、`instruction` 和 `action=implement|replan`，旧结果省略 action 按 implement 处理。replan 可用于审阅反馈暴露的缺少前置条件或验收不可达问题，直接进入既有再规划，不先消耗一次 worker 尝试。运行时同一次保存消费选择 receipt 并登记 pending_replan，绑定选择原文摘要及候选快照；再规划预算或调用失败后恢复继续该路线，原选择被篡改或候选变化则停止。格式修正只能修正文案，不能将 replan 改成 implement。
+
+再规划处理任务拆分、缺少前置工作、验收不可达判断和整体验收发现的工程缺口。worker 通过 `blocker_kind` 区分 task、environment 与 operator；operator 等待明确回答，不先再规划；CLI 错误、权限、范围违例和现场不一致不会被包装成自动再规划。非法结果默认停止；明确归属且保留拒绝证据的 invalid_rejected 整体审阅可自动进入修正规划，操作者请求的有界非法结果修正另述。指挥返回 `{action, reason, new_tasks, updates}`：每个 update 仅包含 `id`、`description`、`add_depends_on`，stop 必须提供空操作数组。运行时在原计划上应用增量并重新检查 DAG，要求：
 
 - 保留每个既有任务 ID，已接受任务完全不变。
 - 未接受任务只可更新描述并添加依赖；标题、skills、required_commands、验收和 allowed_paths 均从台账保留，已有依赖不得删除。
@@ -46,6 +48,12 @@ worker 尝试与派发计数在本地上下文、hooks、MCP 配置、快照和�
 整体验证以非零退出失败后的空 diff 修正采用相同处理：保留失败记录，直接请求新的修正规划，不额外消耗最终尝试来重跑相同代码。显式 `--reverify` 仍可用于操作者确认环境已修复的情况。
 
 恢复配置允许增加上下文预算、agent/验证超时、Claude 轮数、次数上限及任务容量 `max_tasks`，不可减少。超限修订提高容量后重验同一 receipt，不重抽结果；已保存 stop 仍须显式 `--retry-stopped` 或匹配的操作者决定。可以追加精确 `worker_commands` argv，已有授权不可删除或修改；记录配置放宽事件。模型 ID、供应商、effort、验证命令和共享资产不允许在同一 run 改变。进程退出及 Git 绑定、HEAD 检查仍先执行。新运行版本为 11；未完成版本 8、9、10 通过恢复预检后升级，历史及预算保留，共享资产摘要仍必须匹配。版本 7 及更早不能直接恢复执行。已完成 run 普通恢复直接返回原结果，不升级、不比较执行配置及共享资产。
+
+## 验收不可达
+
+若当前范围和操作者决定排除了满足某条验收所需的工作，应保留该项阻断，停止重复提交相同候选。worker 返回 `blocked/task`，指明验收项、证据和无法继续的边界；指挥也可在返工选择中直接返回 `action=replan`，随后在无可行修订时 stop。已回答的风险选择不应被反复询问，`continue` 不豁免验收，完成失败报告也不等于原任务完成。尝试或再规划预算耗尽仍会停止，增加预算不是解决不可达条件的证据。
+
+操作者可以回答 stop，保留现场；核对已接受提交后从 run 分支手动集成需要的部分，再用 `abandon RUN` 收尾。未接受的候选另行检查，不视为已交付；run 不标为 completed。只有前置条件或可行范围确有变化时，才按既有显式恢复出口继续，原验收和总预算保持约束。
 
 ## 环境更新
 
@@ -72,11 +80,11 @@ python3 -m harness --config /path/to/harness.toml --repo /path/to/project resume
 
 接受更新前在 run 锁内核对进程退出、Git 绑定、HEAD、当前任务与范围，以及保存的环境 blocker 来源身份和原结果摘要。只接受当前未接受任务的 worker 环境阻断边界；首次后续模型调用前中断，即使状态为 interrupted 或遗留 running，仍按这些证据判断资格。后续模型调用使旧来源失效，包括已开始但失败的指挥调用；需在新的 worker 环境阻断后再提交更新。存在待处理任务／最终验证或审阅、接受及接受后待办、再规划／指挥 stop、pending_directive、commander/reviewer receipt、待格式修正或活动非法结果修正时拒绝。完成或放弃状态拒绝更新；与 reverify、retry-stopped、allow-scope、repair-invalid 互斥，step 可合用。不得通过更新清除任何 receipt、修正守卫、已保存拒绝或批准快照。
 
-更新输入复制到私有产物并绑定摘要，原输入文件不再是恢复依赖。所有历史更新、来源及检查报告在投影前核验；缺失或篡改时停止。有效来源的重复相同更新幂等，审计事件可因中断重复但台账只有一条引用。上下文只包含相关任务的最新摘要及紧凑检查结果：worker／任务 reviewer 看当前任务，dispatch 看 ready 任务，replan 看触发任务，final reviewer 看各任务。完整历史、checks、argv 和报告保留路径与 SHA256 引用；依赖省略的细节前须读取并核验产物，失败检查先查看详情。原目标、验收、范围、实际权限及未解决 blocker 始终保留，任务环境断言不得推广到其他任务。整体容量预估采用相同投影。
+更新输入复制到私有产物并绑定摘要，原输入文件不再是恢复依赖。所有历史更新、来源及检查报告在恢复及投影前核验；缺失或篡改时停止。有效来源的重复相同更新幂等，审计事件可因中断重复但台账只有一条引用。上下文只包含相关任务的最新摘要及紧凑检查结果：worker／任务 reviewer 看当前任务，dispatch 看 ready 任务，replan 看触发任务，final reviewer 看各任务。完整历史、checks、argv 和报告保留路径与 SHA256 引用；依赖省略的细节前须读取并核验产物，失败检查先查看详情。原目标、验收、范围、实际权限及未解决 blocker 始终保留，任务环境断言不得推广到其他任务。整体容量预估采用相同投影。
 
 更新登记后历史不可撤回；最新同任务摘要及 checks 可替代旧环境假设及检查列表，不覆盖验收或权限。旧声明及报告以可检索引用保留，不重复内联全部文字或命令。历史输入契约不收紧；合法输入的紧凑投影仍可能超出上下文预算，届时增加 `context_chars` 后恢复。
 
-同一任务最新更新的 checks 替代先前检查列表，所有历史声明仍按序发送。选择前只预检已有的 current_task，不检查全部 ready 任务；选中任务在后续每次 worker 尝试（含格式修正）前仍重检，所有报告保留。已有当前任务的一次普通尝试可能在选择前与派发前分别记录报告，输入使用最近一份。检查失败不启动本次 worker，不消耗其尝试或派发预算。current_task 为空时，指挥选择可能已消耗派发预算；其选定指令保存到 pending_directive，后续恢复复用，修复条件后启动 worker 才消费该指令。worker 已返回并进入验证／审阅后不重跑这些前置检查；正常验证、独立审阅、快照和接受门禁仍全部执行，检查成功或操作者声明本身不是完成证据。
+同一任务最新更新的 checks 替代先前检查列表；`environment_history` 仅内联相关任务的更新引用，`environment_check_history` 仅保留每个相关 update 的最新报告引用。`environment_index` 提供内容寻址的不可变 JSON 路径、SHA256、update_count 与 check_count，索引的 updates/checks 保存完整台账引用。旧报告和其他任务历史按索引检索；已有索引损坏时拒绝覆盖，新增观测不会改变旧索引。选择前只预检已有的 current_task，不检查全部 ready 任务；选中任务在后续每次 worker 尝试（含格式修正）前仍重检，所有报告保留。已有当前任务的一次普通尝试可能在选择前与派发前分别记录报告，输入使用最近一份。检查失败不启动本次 worker，不消耗其尝试或派发预算。current_task 为空时，指挥选择可能已消耗派发预算；其选定指令保存到 pending_directive，后续恢复复用，修复条件后启动 worker 才消费该指令。worker 已返回并进入验证／审阅后不重跑这些前置检查；正常验证、独立审阅、快照和接受门禁仍全部执行，检查成功或操作者声明本身不是完成证据。
 
 状态摘要的 worker_outcomes 仅分类 worker 自报完成、任务／环境／操作者阻断、运行故障与未知结果，不替代 accepted 或 completed 门禁。last_environment_blocker 是最近环境阻断的历史诊断；后续模型调用开始后标为 stale。stale=false 也不代表具备环境更新资格：更新仍需通过进程退出、来源摘要、任务范围和待处理阶段等检查。
 
@@ -210,6 +218,8 @@ worker 通过身份、结构、完成／停止语义及格式门禁后，本次�
 
 blocked feedback 携带任务、dispatch 及前 2,000 字符原因；完整原因保留在事件中，completed 结果保留事件。原始结果绑定、已有台账、私有副本完整性和私有写入错误仍停止。已保存检查点可跨 dispatch 读取，不能重新登记旧 broker 输出来刷新时效。
 
+结构、格式及主状态合法的 blocked 结果若附带 `decision_requests`，不登记这些后续请求，仅记录 `decision_requests_discarded` 事件及原结果摘要。原始结果和反馈保持不变，阻断、合法检查点、environment/operator 尝试豁免继续登记；恢复和来源校验采用同一语义。字段类型、格式或主状态非法仍拒绝，不因此绕过接受门禁。
+
 worker packet 的 `handoff_targets` 列出未接受直接／传递下游的 ID 与标题，输出约束和运行时校验使用同一集合。新返回的 completed handoff 目标或问题不合法时，在验证及接受前拒绝本次尝试，拒绝原因和 dispatch 来源经 `worker_recovery` 交给后续指挥与 worker，不静默过滤请求。独立校验成功的检查点在此门禁前保存，供后续读取未接受证据；这不生成合法决定或推进任务阶段。无合法下游时，必要的选择应作为当前任务的 operator blocker 报告。
 
 operator 问题空白、含 NUL 或超过登记长度时，运行时保留原始结果并登记有界说明及转义摘录。操作者须读取 request 的 `source` 所绑定的原始问题，再用正常 `--operator-decision` 回答；普通 resume 只保留等待，不消耗新派发预算。此处理也恢复旧版本因问题文本而登记失败的 operator 请求和已接受 handoff。旧版本已经保存的 `pending_task`／`pending_acceptance` 继续其验证、审阅及接受阶段，随后登记请求，不能提前派发依赖任务；原始产物、接受记录、预算及合法请求身份保持不变。指挥 stop 原因含 NUL 时不登记问题，普通恢复仍提示原有 `--retry-stopped` 出口。
@@ -225,6 +235,8 @@ python3 -m harness --config /path/to/harness.toml --repo /path/to/project resume
 ```
 
 输入是最多 64 KiB 的严格 JSON，只接受上述字段，summary 非空且不超过 4,000 字符；`decision` 为 `continue` 或 `stop`。回答绑定任务、问题和原始来源，私有保存并绑定摘要。continue 允许针对该问题使用全新 worker 尝试或继续原再规划；指挥 stop 的 continue 重新打开原规划请求并保留旧结论和证据。stop 保持等待。handoff 的答复可在目标任务的后续模型调用前显式修订，无关任务的执行不关闭窗口；worker 和指挥 stop 的答复仍只能在后续模型调用前修订，来源过期后拒绝旧回答。回答不改变目标、scope、命令授权、验收或累计预算，也不产生完成证据。仍可用原 `--retry-stopped` 在不附说明时显式重试指挥 stop，但不能覆盖已记录的操作者 stop。
+
+`--operator-decision` 可重复指定多个文件。整批先验证，重复 request ID 或任一非法／过期答复使整批拒绝且不登记答复；通过后预写不可变证据并一次保存全部答复，再进入调度。任一 stop 使本次恢复保存整批后停止，不派发模型。预写中断后按原文件和原顺序重试，已落盘但未登记的产物会复用；改变顺序可能因 sequence 冲突而停止。每个任务仍需全部相关问题答复才可派发，无关任务沿用原调度规则。
 
 `--operator-decision` 与 `--environment-update`、`--retry-stopped`、`--reverify`、`--repair-invalid`、`--allow-scope` 互斥，可与 `--confirm-exited`、`--step` 合用。操作者已回答 stop 时，必须向同一请求提交新的 continue；单独 `--retry-stopped` 不能覆盖该决定。完成或放弃的 run 拒绝回答。操作者决定是任务范围内的选择，不是其他任务的环境事实、记忆指令或权限授予。
 
@@ -336,7 +348,7 @@ SQLite 存在目标项目 `.harness/memory.sqlite3`，项目之间独立。每�
 
 所有输入包与预算报告落在 dispatch 目录。默认 `context_chars = 100000` 是编排输入的字符上限，不是 token 数或固定输入长度。`context-report.json` 分别记录必要输入 `required_chars`、已加入的可选记忆及其分隔文本 `memory_chars`，两者之和为 `used_chars`；必要输入超限才触发硬门禁，可选记忆按剩余预算整条加入。
 
-默认 `agent_timeout_seconds = 1800`，`claude_max_turns = 50` 保持不变。Claude 的轮数上限针对工具使用循环，一轮可以包含多个工具调用；供应商报告的 `num_turns` 仅用于观测，不能直接与该上限比较。提高上下文与超时上限不保证任意长任务或审阅历史都可完成。
+默认 `agent_timeout_seconds = 3600`，`claude_max_turns = 50` 保持不变。Claude 的轮数上限针对工具使用循环，一轮可以包含多个工具调用；供应商报告的 `num_turns` 仅用于观测，不能直接与该上限比较。此超时是整次调用的固定墙钟上限，持续输出或工具运行不会自动延长；超时 worker 计入工作尝试，文件改动保留在工作树。已有配置显式设置的时限保持原值，恢复时可调大。提高上下文与超时上限不保证任意长任务或审阅历史都可完成。
 
 模型调用结束时，`dispatch_finished` 事件和台账对应 dispatch 的 `provider_usage` 记录 CLI 实际返回的用量，可通过 `status RUN --full` 查看。Claude 包括其报告的美元成本、轮数及 token 字段；Codex 包括完成轮数及报告的 token 字段，不推算美元成本。来源是供应商输出，模型自行声明的费用不作计量；缺失、损坏、过大的输出或中断可能没有记录，不将未知用量当作零。报告成本不等于账号实际账单，观测不改变预算或接受条件，恢复已有审阅结果不重复累计。长时间进程每 60 秒输出一次仍在运行提示，配置的实际超时仍单独生效。
 

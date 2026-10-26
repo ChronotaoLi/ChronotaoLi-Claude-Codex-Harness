@@ -6,7 +6,6 @@ from copy import deepcopy
 from pathlib import Path
 
 from . import git
-from .decisions import read_decision
 from .services import RuntimeService
 from .shared import asset_digest, validate_mcp
 from .util import HarnessError, lock, read_json, uid, validate_command_directories
@@ -275,8 +274,8 @@ class RunLifecycle(RuntimeService):
             if git.head(runtime.worktree, binding=runtime.run["worktree_binding"]) != runtime.run["expected_head"]:
                 raise HarnessError("worktree HEAD 与检查点不同；请先核对提交，不自动重放")
             update = runtime.prepare_environment_update(environment_update) if environment_update is not None else None
-            decision_value = read_decision(operator_decision) if operator_decision is not None else None
-            decision = runtime._prepare_decision(decision_value) if decision_value is not None else None
+            decision_values, decisions = (runtime.prepare_operator_decisions(operator_decision)
+                                          if operator_decision is not None else ([], []))
             if retry_stopped is not None:
                 stopped = runtime.run.get("replan_stopped")
                 if not stopped or stopped["target"] != retry_stopped:
@@ -295,15 +294,16 @@ class RunLifecycle(RuntimeService):
                 runtime.run["schema_version"] = 11
                 runtime.event("run_schema_upgraded", previous_version=previous_version, schema_version=11)
                 runtime.save()
-            runtime.record_operator_decision(decision)
+            runtime.record_operator_decisions(decisions)
             if operator_decision is not None:
-                value = decision_value
-                if value["decision"] == "stop":
+                if any(value["decision"] == "stop" for value in decision_values):
                     error = HarnessError("操作者决定停止；决定与原证据已保存，未派发模型")
                     runtime.stop(error)
                     raise error
-                request = next(r for r in runtime.decision_context() if r["id"] == value["request_id"])
-                if request["kind"] == "replan_stop" and runtime.run.get("replan_stopped"):
+                answered_ids = {value["request_id"] for value in decision_values}
+                request = next((r for r in runtime.decision_context()
+                                if r["id"] in answered_ids and r["kind"] == "replan_stop"), None)
+                if request is not None and runtime.run.get("replan_stopped"):
                     if runtime.run["replan_stopped"].get("dispatch_id") != request["source"]["dispatch_id"]:
                         raise HarnessError("操作者决定不能重开另一次指挥停止；请回答当前请求")
                     stopped = runtime.run.pop("replan_stopped")

@@ -10,7 +10,7 @@ from . import git
 from .budgets import work_attempts
 from .context import compact_checks, compact_feedback, compact_reviews, instruction_file_changes
 from .contracts import (
-    DETAIL, envelope, obj, REVIEW, review_approved, validate_review, validate_structure, validate_work,
+    envelope, REVIEW, review_approved, task_directive, validate_review, validate_structure, validate_work,
     WORK,
 )
 from .memory import validate_proposals
@@ -102,16 +102,31 @@ class TaskLifecycle(RuntimeService):
             directive = {"selected_task": ready[0]["id"],
                          "instruction": "Implement this task within its complete stated scope and acceptance. Inspect dependency evidence and follow the supplied tool and verification constraints."}
         else:
-            schema = obj(selected_task={"type": "string", "enum": [t["id"] for t in ready]}, instruction=DETAIL)
+            schema = task_directive(t["id"] for t in ready)
             directive = runtime.dispatch("commander", "dispatch", "dispatching", schema,
                         {"goal": runtime.run["goal"], "ready": ready, "accepted": runtime.accepted_context(),
                          "feedback": compact_feedback(runtime.run.get("feedback")), "attempts": runtime.run["attempts"],
                          "work_attempts": work_attempts(runtime.run),
                          "recovery": deepcopy(runtime.run.get("worker_recovery", {}).get(current)) if current in {t["id"] for t in ready} else None,
                          "tool_constraints": runtime.tool_constraints(),
-                         "instruction": "Select one ready task. Give a focused implementation or repair instruction, retaining its original scope and acceptance."}, task=ready[0])
+                         "instruction": "Select one ready task and return action=implement for a feasible implementation or repair. Return action=replan when feedback exposes missing prerequisites or acceptance that cannot be met within current scope and decisions; explain the unmet requirement in instruction. Replanning can stop without another worker. Retain the original acceptance: completing a report of unresolved failures is not completing the task."}, task=ready[0])
         task = next(t for t in ready if t["id"] == directive["selected_task"])
         tid = task["id"]
+        if directive.get("action", "implement") == "replan":
+            receipt = runtime.run["commander_receipts"]["commander:dispatch:dispatching"]
+            trigger = {"task_id": tid, "feedback": deepcopy(runtime.run.get("feedback")),
+                       "coordination": {**{key: receipt[key] for key in
+                           ("artifact", "artifact_digest", "dispatch_id", "snapshot_digest")},
+                           "instruction": directive["instruction"]}}
+            # Consume the selection and publish its successor in one save. Resume
+            # must replan even if the next call's budget or preparation fails.
+            runtime.run["current_task"] = tid
+            runtime.run["pending_replan"] = {"stage": "pending", "trigger": trigger}
+            runtime.run["commander_receipts"].pop("commander:dispatch:dispatching")
+            runtime.run.pop("pending_directive", None)
+            runtime.save()
+            runtime.replan(trigger)
+            return False
         if runtime.task_budget_used(tid) >= runtime.config.data["runtime"]["max_attempts"]:
             raise HarnessError(f"{tid} 已达尝试次数上限")
         runtime.run["current_task"] = tid
@@ -145,6 +160,10 @@ class TaskLifecycle(RuntimeService):
             raise HarnessError("worker 返回产物与当前任务结果不一致；保留现场")
         worker_source = {"worker_artifact": str(worker_artifact),
                          "worker_artifact_digest": hashlib.sha256(raw_worker).hexdigest()}
+        if result["status"] == "blocked" and result.get("decision_requests"):
+            runtime.event("decision_requests_discarded", task_id=tid, dispatch_id=worker_dispatch["id"],
+                          reason="handoff requests do not apply to blocked worker results",
+                          count=len(result["decision_requests"]), **worker_source)
         checkpoints_discarded = None
         try:
             discarded = runtime.record_checkpoints(tid, worker_dispatch["id"], result,

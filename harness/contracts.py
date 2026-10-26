@@ -177,11 +177,13 @@ def validate_work_semantics(result):
         raise HarnessError("记忆提案 key 必须唯一")
     # Optional checkpoint declarations are resolved by progress.record_checkpoints:
     # a bad item or duplicate batch must not erase completion or a blocker.
-    ids = [item["id"] for item in result.get("decision_requests", [])]
-    if len(ids) != len(set(ids)):
-        raise HarnessError("worker decision_requests 的 id 必须唯一")
-    if result.get("decision_requests") and not completed:
-        raise HarnessError("后续任务的决策请求只允许随已完成的任务结果提交")
+    # Handoffs have no effect on a blocked result. Keep their original bytes
+    # for source validation, but never let their semantics erase the blocker.
+    # Structure and format are still checked by the caller for every result.
+    if completed:
+        ids = [item["id"] for item in result.get("decision_requests", [])]
+        if len(ids) != len(set(ids)):
+            raise HarnessError("worker decision_requests 的 id 必须唯一")
 
 
 def validate_work(result):
@@ -263,6 +265,15 @@ def validate_commander_format_correction(kind, previous, current):
     fields = ("selected_task",) if kind == "dispatch" else ("action", "new_tasks", "updates")
     if kind not in ("dispatch", "replan") or any(previous[field] != current[field] for field in fields):
         raise HarnessError("指挥格式修正不得改变原任务选择或修订操作")
+    if kind == "dispatch" and previous.get("action", "implement") != current.get("action", "implement"):
+        raise HarnessError("指挥格式修正不得改变原派发或再规划选择")
+
+
+def task_directive(task_ids):
+    """Old selection receipts remain executable; new providers may route to replan."""
+    schema = obj(selected_task={"type": "string", "enum": list(task_ids)}, instruction=DETAIL)
+    schema["properties"]["action"] = {"type": "string", "enum": ["implement", "replan"]}
+    return schema
 
 
 def validate_required_commands(task):
