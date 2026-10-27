@@ -209,8 +209,11 @@ class Dispatcher(RuntimeService):
         query = (task["title"] + " " + task["description"]) if task else runtime.run["goal"]
         if role == "commander" and kind == "dispatch":
             query = runtime.run["goal"] + " " + " ".join(t["title"] for t in packet["ready"])
-        memories = runtime.memory.search(query, level=1, run_id=runtime.run["id"])
-        prompt, report = compose(required, memories, runtime.config.data["runtime"]["context_chars"])
+        memory_diagnostics = {}
+        memories = runtime.memory.search(query, level=1, run_id=runtime.run["id"],
+                                         diagnostics=memory_diagnostics)
+        prompt, report = compose(required, memories, runtime.config.data["runtime"]["context_chars"],
+                                 memory_diagnostics=memory_diagnostics)
         write_json(job / "context-report.json", report)
         runtime.emit_hook("context_prepared", {"report": report}, job)
         runtime.run["dispatches"].append({"id": dispatch_id, "role": role, "kind": kind, "task_id": task_id,

@@ -1,5 +1,17 @@
 # 验证记录
 
+## 记忆检索与恢复入口改进验证（2026-10-27，台账 v11）
+
+执行 `python3 -m unittest discover -s tests -v`：852 项，851 项通过、1 项因本机文件系统拒绝非 UTF-8 文件名而跳过，Python 3.15.2，753.530 秒。完整日志为 `.harness/validation/design-implementation-20261027/full-unittest.log`。本轮作为一个实施批次完成来源状态与文件绑定、精确 key/元数据查询、有界检索诊断、来源分组排序、恢复共享常量和只读历史查询。
+
+新增 30 项行为测试覆盖未绑定/匹配/变化/不可用来源、未知原因优先级、固定 HEAD 的精确路径及原始字节比较、整批绑定失败不替代当前记录、符号链接/大小/数量限制、主检出与旧 run 工作树的来源差异、原样 Unicode/空格/大小写 key、CLI 和 stdio MCP 的 query/key 互斥、缺库只读、历史审计不重新启用旧版本、词项集合计分及分组后 limit。检索诊断测试验证完整阶段计数、四十条明细/查询截断、单次来源缓存、实际 worker 的三种元数据召回、跳过大条目后的 ID 对应，以及落盘报告与 hook 一致且不进入提示词。七个恢复准备入口场景覆盖额外 replan_stopped、pending repair、completed repair receipt 未消费/已消费，核对台账、文件和预算不变。
+
+Python 3.11.17 对全部 30 项新增测试复核通过：记忆模块 18 项，1.595 秒；上下文与恢复入口 12 项，4.597 秒。日志为同目录 `python311-memory.log`、`python311-context-recovery.log`。未在 Python 3.11 重跑完整套件。`python3.11 -m compileall -q harness tests`、`git diff --check` 和更新文档的本地链接目标检查通过。
+
+两位独立 `gpt-6.1-sol` 分别审阅记忆实现及上下文/恢复门禁，均无未解决阻断发现，并分别通过 68 项、66 项定向测试；摘要与日志保存在同目录 `reviews.json`、`review-memory/`、`review-context-recovery/`。数据库结构、台账 v11、原来源字段语义、模型 ID、进程/派发隔离、权限和接受门禁保持不变。来源匹配不证明内容正确；历史查询不改变 active；CLI 仍要求在拥有项目 `.harness` 的主检出绑定文件，不自动路由 run 工作树的数据库。
+
+上述 Harness 生命周期测试使用模拟模型响应及真实本地 Git/验证子进程；stdio MCP 测试验证本地协议入口，不证明真实客户端或模型会使用新 key 参数。本轮未运行真实账号的 `harness smoke`、`harness.tool_smoke` 或 `harness.permission_smoke`。
+
 最近验证日期：2026-10-26。本记录仅保存 Harness 已完成的验证结果，不记录测试进度或外部项目任务状态。实测过程与外部项目报告放在被 Git 忽略的 `.harness/`。既有结果不保证将来账号权限或 CLI 行为不变。
 
 ## 角色轮数预算与路径证据诊断验证（2026-10-26，台账 v11）

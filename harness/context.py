@@ -301,7 +301,7 @@ def compact_feedback(feedback, prior_reviews=()):
     return compact(feedback)
 
 
-def compose(required: dict, memories: list[dict], budget: int):
+def compose(required: dict, memories: list[dict], budget: int, *, memory_diagnostics=None):
     """Lossless required packet, whole optional records, references to full evidence."""
     core = dump(required)
     if len(core) > budget:
@@ -313,7 +313,19 @@ def compose(required: dict, memories: list[dict], budget: int):
         if len(packet) + len(candidate) <= budget:
             packet += candidate
             kept.append(memory["id"])
-    return packet, {"budget_chars": budget, "required_chars": len(core),
-                    "memory_chars": len(packet) - len(core), "used_chars": len(packet),
-                    "memory_ids": kept, "omitted_memories": len(memories) - len(kept),
-                    "method": "structured checkpoint + bounded retrieval; not tokenizer count"}
+    report = {"budget_chars": budget, "required_chars": len(core),
+              "memory_chars": len(packet) - len(core), "used_chars": len(packet),
+              "memory_ids": kept, "omitted_memories": len(memories) - len(kept),
+              "method": "structured checkpoint + bounded retrieval; not tokenizer count"}
+    if memory_diagnostics is not None:
+        retrieval = deepcopy(memory_diagnostics)
+        retrieval["counts"].update(included=len(kept), capacity_excluded=len(memories) - len(kept))
+        included = set(kept)
+        returned = {memory["id"] for memory in memories}
+        for candidate in retrieval["candidates"]:
+            if candidate["id"] in returned:
+                candidate["included"] = candidate["id"] in included
+                if not candidate["included"]:
+                    candidate["exclusion_stage"] = "capacity"
+        report["memory_retrieval"] = retrieval
+    return packet, report

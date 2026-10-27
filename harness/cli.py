@@ -17,7 +17,7 @@ from .budgets import work_attempts
 from .cleanup import cleanup_verification
 from .config import Config
 from .engine import Engine
-from .memory import Memory
+from .memory import Memory, bind_source_files
 from .shared import mcp_configs, toml_value
 from .util import HarnessError, dump, read_json, write_json
 
@@ -220,7 +220,10 @@ def show_status(args, state):
 def manage_memory(args, repo, state):
     path = state / "memory.sqlite3"
     adding = args.memory_command == "add"
+    if args.memory_command == "search":
+        Memory.validate_search(args.query, key=getattr(args, "key", None), level=args.level)
     if adding:
+        source_binding = bind_source_files(repo, getattr(args, "source_file", []))
         run_id = getattr(args, "run", None)
         if run_id:
             if not re.fullmatch(r"[A-Za-z0-9_-]+", run_id):
@@ -239,9 +242,12 @@ def manage_memory(args, repo, state):
         print(memory.remember(key=args.key, abstract=args.title, overview=args.text, detail=args.text,
                               source=args.source, ttl_days=args.ttl_days,
                               provenance={"scope": "run" if run_id else "project",
-                                          "reference_only": True, **({"run_id": run_id} if run_id else {})}))
+                                          "reference_only": True, **({"run_id": run_id} if run_id else {}),
+                                          **source_binding}))
     elif args.memory_command == "search":
-        print(dump(memory.search(args.query, level=args.level, run_id=args.run)))
+        print(dump(memory.search(args.query, key=args.key, level=args.level, run_id=args.run)))
+    elif args.memory_command == "history":
+        print(dump(memory.history(args.key)))
     elif args.memory_command == "read":
         print(dump(memory.read(args.id)))
     else:
@@ -301,14 +307,18 @@ def _main(argv=None):
     add.add_argument("--title", required=True)
     add.add_argument("--text", required=True)
     add.add_argument("--source", default="operator")
+    add.add_argument("--source-file", action="append", default=[], help="Bind a committed raw-byte-identical repository file (repeatable)")
     add.add_argument("--ttl-days", type=float)
     add.add_argument("--run", help="Bind this reference record to one run")
     search = msub.add_parser("search")
-    search.add_argument("query")
+    search.add_argument("query", nargs="?")
+    search.add_argument("--key", help="Match the original key exactly")
     search.add_argument("--level", type=int, choices=[0, 1, 2], default=1)
     search.add_argument("--run", help="Include reference records scoped to this run")
     read = msub.add_parser("read")
     read.add_argument("id")
+    history = msub.add_parser("history")
+    history.add_argument("key")
     msub.add_parser("export")
     args = parser.parse_args(argv)
     if args.command == "status" and args.full and not args.run_id:

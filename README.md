@@ -198,15 +198,25 @@ python3 -m harness --repo /path/to/project memory add \
   --text "项目使用 PostgreSQL，迁移通过 Alembic 管理。" \
   --source "docs/architecture.md"
 python3 -m harness --repo /path/to/project memory search "数据库迁移" --level 1
+python3 -m harness --repo /path/to/project memory search --key architecture.storage
 python3 -m harness --repo /path/to/project memory read mem_实际ID
+python3 -m harness --repo /path/to/project memory history architecture.storage
 python3 -m harness --repo /path/to/project memory export > memory-backup.json
 ```
 
 `memory add` 默认保存项目事实，`--run RUN` 保存仅用于该 run 的参考说明，查询也需相同 `--run`。key 在项目内全局唯一，版本替换须作用域一致，旧版本仍可 read/export。真正的继续／停止选择应使用 `--operator-decision`。所有记忆均为 `reference_only`，不授予权限或替代操作者决定。
 
-自动任务历史与知识默认 TTL 为 180 天，可通过 `[memory]` 的 `task_ttl_days`／`knowledge_ttl_days` 调整，0 表示不过期；操作者事实默认不过期。来源变化会降权，放弃或来源无效的任务历史不自动召回。检索是本地词法排序，没有 embedding 或自动语义冲突合并。作用域、旧记录与只读 SQLite 行为见[记忆兼容参考](docs/recovery.md#记忆作用域与来源兼容)。
+需绑定文件依据时，在拥有该项目 `.harness` 的主检出使用 `memory add ... --source-file docs/architecture.md`，可重复指定，规范化去重后最多十个文件。文件须在同一次 HEAD 中已提交，且工作区原始字节与 Git blob 相同；不支持符号链接，也不执行换行或 Git 过滤器转换。`--source` 仍只是说明文字。`--run` 只限定作用域；不要把 `--repo` 指向 Harness 的 run 工作树，当前不会自动路由到主库。
+
+`search QUERY` 使用本地词法匹配，正文、完整 key、`knowledge:`／`task:` 前缀后的完整名称及来源路径均可命中；任务文本也使用这些规则自动召回。已知名字时用 `search --key KEY` 原样等值查询，不裁剪空格、折叠大小写或归一化 Unicode。两种查询仍过滤失活、过期和不适用记录。`history KEY` 列出所有版本、来源状态和替代关系供审计，不恢复旧版或改变默认召回。
+
+查询返回 `source_status`：`unbound` 未绑定、`matching` 声明来源匹配、`changed` 已变化、`unavailable` 不可用、`not_checked` 未完成核验、`invalid` 来源格式无效。原 `possibly_stale` 和原因列表保留；匹配不证明内容正确或来源已合入当前分支。较早 run 工作树核对主检出后来绑定的文件时，出现 changed/unavailable 是正常结果。
+
+自动任务历史与知识默认 TTL 为 180 天，可通过 `[memory]` 的 `task_ttl_days`／`knowledge_ttl_days` 调整，0 表示不过期；操作者事实默认不过期。检索先排列优先参考，再排列来源变化、不可用、非法或原因未知的需复核记录，组内保留相关性、时间、类型和原有过时降权。未绑定／未核验记录不额外降组，放弃或来源无效的任务历史不自动召回。默认六条仍不能保证某条声明必然进入上下文；必要要求应写入任务验收。没有 embedding 或自动语义冲突合并。完整限制见[记忆兼容参考](docs/recovery.md#记忆作用域与来源兼容)。
 
 上下文采用结构化检查点、有界检索和原始证据引用，在任务边界写 `handoff.json`／`handoff.md`；每次指挥调用重新构建输入。默认 `context_chars = 100000` 是编排输入字符上限，不是 token 数；必要约束超限就停止，可选记忆按整条移除。CLI 内部上下文不在该预算内。
+
+dispatch 私有 `context-report.json` 中的 `memory_retrieval` 记录候选、匹配、作用域、数量上限与容量筛选计数，最多四十条明细，并按实际 ID 标记装入情况。报告也随既有 `context_prepared` hook 传递，不加入模型提示词。
 
 大量变更路径与恢复路径使用 SHA256 绑定的完整索引，按需检索，不重复塞进模型输入。相同清单共用索引，原始范围、验收、diff 与快照仍保留；索引缺失或损坏会阻止继续，不能靠截断路径绕过门禁。详见[上下文与诊断产物](docs/recovery.md#上下文与诊断产物)。
 

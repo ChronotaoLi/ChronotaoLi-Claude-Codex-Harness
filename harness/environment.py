@@ -11,7 +11,7 @@ import shutil
 import time
 
 from .contracts import WORK, envelope, validate_structure, validate_work_semantics
-from .recovery import read_bound_result, snapshot_digest
+from .recovery import RECOVERY_BUSY_KEYS, read_bound_result, snapshot_digest
 from .util import HarnessError, dump, write_json
 
 
@@ -283,8 +283,7 @@ class EnvironmentRecovery:
         if (self.run.get("current_task") != task_id
                 or task_id in self.run["accepted"] or feedback.get("task_id") != task_id):
             raise HarnessError("--environment-update 仅用于当前未接受任务的环境阻断")
-        busy = ("pending_task", "pending_acceptance", "pending_post_accept", "pending_replan", "pending_directive",
-                "replan_stopped", "review_receipts", "commander_receipts", "pending_format_corrections", "review_corrections")
+        busy = (*RECOVERY_BUSY_KEYS, "replan_stopped")
         if any(self.run.get(key) for key in busy) or any(
                 self.active_invalid_repair(key) for key in self.run["invalid_repairs"]):
             raise HarnessError("已有待处理阶段、指令、receipt 或修正；不能用环境更新替换原请求")

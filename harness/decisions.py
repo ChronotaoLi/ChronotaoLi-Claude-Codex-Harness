@@ -7,7 +7,7 @@ from pathlib import Path
 import time
 
 from .contracts import WORK, REPLAN, envelope, validate_structure, validate_work_semantics
-from .recovery import read_bound_result, snapshot_digest
+from .recovery import RECOVERY_BUSY_KEYS, read_bound_result, snapshot_digest
 from .util import HarnessError, dump, write_json
 
 
@@ -268,9 +268,7 @@ class DecisionRecovery:
         request = next((r for r in records if r['id'] == value['request_id']), None)
         if request is None or request['task_id'] != value['task_id'] or value['task_id'] in self.run['accepted']:
             raise HarnessError('operator decision request unknown or task accepted')
-        busy = ('pending_task', 'pending_acceptance', 'pending_post_accept', 'pending_replan', 'pending_directive',
-                'review_receipts', 'commander_receipts', 'pending_format_corrections', 'review_corrections')
-        active = [key for key in busy if self.run.get(key)]
+        active = [key for key in RECOVERY_BUSY_KEYS if self.run.get(key)]
         if any(r.get('status') == 'pending' for r in self.run.get('invalid_repairs', {}).values()):
             active.append('invalid_repairs')
         if active:

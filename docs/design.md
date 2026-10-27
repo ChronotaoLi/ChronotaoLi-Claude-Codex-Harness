@@ -133,6 +133,18 @@ worker 反馈使用共享 9,000 字符序列化额度，保留完成／阻断语
 
 自动任务历史和项目知识默认有 180 天召回期限，操作者事实默认无期限；均保留历史证据。知识来源改变或提交不可核实时，召回标记 possibly_stale 并降权。类型权重只作为相关性排序的辅助信号，不把人工记录视为永远正确。没有自动模型整理或语义冲突覆盖。
 
+来源表达与检索排序分别实现。`source_status` 是读取投影，按 invalid、无绑定的 unbound、changed、unavailable、not_checked、matching 的优先级归纳既有核验结果，不修改 SQLite 结构、历史 provenance、possibly_stale 或完整原因。原因按第一个冒号前的代码分类，文件名保留。旧空人工来源仍带 missing_provenance 与 0.7 折减；无 repo 的合法绑定显示 not_checked，未绑定仍显示 unbound。matching 只表示已声明来源匹配，不证明事实正确、依赖完整或提交已合入当前分支。
+
+人工文件绑定是显式操作：`memory add --source-file` 先拒绝越界、保留路径等非法输入，再词法规范化并去重，最多十个文件、每个 2 MiB。固定一个 HEAD，以精确 Git 路径读取普通文件 blob，与主检出原始字节比较，保存 commit 和 SHA256；不调用过滤器、不跟随符号链接，也不凭 Git clean 状态判断。整批在版本替换前核对，既有事务继续保护人工所有权和作用域。`--source` 不隐式变成路径；CLI 主检出绑定与 run 工作树读取分别核验，不为匹配而改变历史分支或自动路由数据库。
+
+精确 key 查询和普通词法查询共用有效期、active、适用性与来源门禁。精确查询保留输入的大小写、空格和 Unicode 原貌；普通查询增加完整小写 key、已知命名空间去前缀后的完整名称以及合法来源路径词项。同词命中多个字段只计一次。历史来源路径仅在检索投影中规范化，原始来源键和接受证据不改写；公共 knowledge/task 前缀不单独制造命中。已知自由文本 key 应使用精确入口，普通词法查询不承诺跨语言或任意路径匹配。
+
+匹配且适用的记录先按来源原因分为 preferred／needs_review 两组，再使用原相关性、时间、类型权重和过时折减作组内排序，最后截断 limit。任一 source_changed、source_unavailable、commit_unavailable、invalid_provenance 或未知原因进入需复核组；无原因、missing_provenance 及仅未核验原因仍在优先组。未知原因的来源状态为 not_checked（无绑定时为 unbound），不会被宣称已证明非法。两组均为 reference_only，排序不授予事实权威或必然召回保证。
+
+检索诊断在同一次 search 中累计 active 未过期候选、匹配、作用域、排序及 limit 计数；不扫描被 SQL 排除的历史，不额外核验作用域排除项。compose 按实际装入 ID 补充 included／capacity_excluded，保持原列表 API 和报告字段。查询摘录最多 1,024 字符并附全文 SHA256；明细最多四十条、优先返回项，每条最多十个命中词项，长字段最多 256 字符且明确截断。报告不保存候选正文、不进入提示词，只写 dispatch 的 context-report.json 并随已有上下文 hook 传递。计数不受明细上限影响，后续检索仍重新核验来源。
+
+`memory history KEY` 与 read ID 同属只读审计，按原 key 返回所有版本、active、expired、scope、historical、source_status、来源及 supersedes；来源再次匹配不重新激活旧版本。它不参与自动召回、不新增 MCP history，不以 inactive 或相同哈希推断撤回意图。
+
 词法记忆检索仍扫描有效记录，并在单次请求内缓存来源核验。暂不引入索引或跨请求缓存，以保留当前过期、来源变化和排序语义；数千条以上记录的检索成本需要单独测量，当前没有大规模记忆库的延迟保证。
 
 同一项目的多个 run 各有工作树和运行锁，共享项目记忆；跨 run 检索到的知识依然需要核验来源。初始化使用数据库真实路径旁的持久 `.init.lock` 文件和等待式文件锁，覆盖 WAL 设置、建表与迁移，不锁整个 run；常规读写仍使用 SQLite 事务锁。只读 memory 子命令不创建数据库、不迁移或修改 Git 排除配置，已有库使用 SQLite mode=ro，允许 SQLite 管理 WAL 辅助文件。

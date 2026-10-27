@@ -28,6 +28,80 @@ def terms(text: str) -> set[str]:
     return words
 
 
+def normalize_source_path(name):
+    """Validate before lexical normalization; never change stored historical paths."""
+    if not isinstance(name, str):
+        raise HarnessError("无效记忆来源路径")
+    relative = PurePosixPath(name)
+    if (not name or not relative.parts or "\\" in name or "\0" in name
+            or relative.is_absolute() or ".." in relative.parts
+            or relative.parts[0] in (".git", ".harness")):
+        raise HarnessError(f"无效记忆来源路径：{name}")
+    return relative.as_posix()
+
+
+def bind_source_files(repo, names):
+    """Bind a complete batch to one HEAD using raw regular-file blob bytes."""
+    root = Path(repo).resolve()
+    names = list(dict.fromkeys(normalize_source_path(name) for name in names))
+    if len(names) > 10:
+        raise HarnessError("记忆来源最多十个不同文件")
+    if not names:
+        return {}
+    commit = git.git(root, "rev-parse", "--verify", "HEAD").strip()
+    hashes = {}
+    for name in names:
+        tree = git.git_process(root, "ls-tree", "-z", commit, "--", ":(literal)" + name)
+        entries = tree.stdout.split(b"\0") if not tree.returncode else []
+        entry = next((entry for entry in entries if b"\t" in entry
+                      and entry.split(b"\t", 1)[1] == name.encode("utf-8")), None)
+        if entry is None:
+            raise HarnessError(f"HEAD 无此精确路径：{name}")
+        metadata = entry.split(b"\t", 1)[0].split()
+        if metadata[0] == b"120000":
+            raise HarnessError(f"不支持符号链接来源：{name}")
+        if metadata[0] not in (b"100644", b"100755") or metadata[1] != b"blob":
+            raise HarnessError(f"来源不是普通文件：{name}")
+        current = root
+        for part in PurePosixPath(name).parts:
+            current = current / part
+            if current.is_symlink():
+                raise HarnessError(f"不支持符号链接来源：{name}")
+        path = _source_path(root, name)
+        size = git.git(root, "cat-file", "-s", metadata[2].decode("ascii"))
+        if int(size) > MAX_SOURCE_BYTES:
+            raise HarnessError(f"记忆来源文件过大：{name}")
+        blob = git.git_process(root, "cat-file", "blob", metadata[2].decode("ascii"))
+        data = path.read_bytes()
+        if len(data) > MAX_SOURCE_BYTES:
+            raise HarnessError(f"记忆来源文件过大：{name}")
+        if blob.returncode or data != blob.stdout:
+            raise HarnessError(f"工作区与 blob 原始字节不同：{name}")
+        hashes[name] = hashlib.sha256(data).hexdigest()
+    return {"commit": commit, "source_hashes": hashes}
+
+
+def source_status(item):
+    codes = {reason.split(":", 1)[0] for reason in item["stale_reasons"]}
+    provenance = item.get("provenance")
+    if "invalid_provenance" in codes:
+        return "invalid"
+    if not isinstance(provenance, dict) or not (provenance.get("source_hashes") or provenance.get("commit")):
+        return "unbound"
+    if "source_changed" in codes:
+        return "changed"
+    if codes & {"source_unavailable", "commit_unavailable"}:
+        return "unavailable"
+    if codes - {"missing_provenance"}:
+        return "not_checked"
+    return "matching"
+
+
+def ranking_group(item):
+    codes = {reason.split(":", 1)[0] for reason in item["stale_reasons"]}
+    return "needs_review" if codes - {"missing_provenance", "source_not_checked", "commit_not_checked"} else "preferred"
+
+
 def _source_path(root, name):
     relative = PurePosixPath(name)
     if (not name or not relative.parts or "\\" in name or "\0" in name or relative.is_absolute()
@@ -414,41 +488,119 @@ class Memory:
         result["expired"] = result["expires"] is not None and result["expires"] < time.time()
         result.update(self._staleness(result))
         result.update(self._applicability(result, run_id))
+        result["source_status"] = source_status(result)
         return result
 
-    def search(self, query, limit=6, level=1, *, run_id=None):
-        if level not in (0, 1, 2) or not 1 <= limit <= 20:
+    @staticmethod
+    def validate_search(query=None, *, key=None, level=1, limit=6):
+        if (query is None) == (key is None):
+            raise HarnessError("query 和 key 必须且只能提供一个")
+        if query is not None and not isinstance(query, str) or key is not None and (not isinstance(key, str) or not key):
+            raise HarnessError("query 必须为字符串，key 必须为非空字符串")
+        if isinstance(level, bool) or not isinstance(level, int) or level not in (0, 1, 2) or isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 20:
             raise HarnessError("level 应为 0/1/2，limit 应为 1..20")
-        now, q = time.time(), terms(query)
+
+    def search(self, query=None, limit=6, level=1, *, key=None, run_id=None, diagnostics=None):
+        self.validate_search(query, key=key, level=level, limit=limit)
+        text = key if key is not None else query
+        now, q = time.time(), terms(query) if query is not None else set()
         with self.connect() as db:
             rows = db.execute("SELECT * FROM memories WHERE active=1 AND (expires IS NULL OR expires>?)", (now,)).fetchall()
-        found, source_cache, commit_cache, ledger_cache = [], {}, {}, {}
+        found, excluded, source_cache, commit_cache, ledger_cache = [], [], {}, {}, {}
+        counts = dict(active_candidates=len(rows), matched=0, scope_excluded=0, applicable=0,
+                      returned=0, limit_excluded=0)
         for row in rows:
             item = self._decode(row)
-            tokens = terms(item["abstract"] + " " + item["overview"] + " " + item["detail"])
-            overlap = len(q & tokens)
-            if q and not overlap:
+            body = terms(item["abstract"] + " " + item["overview"] + " " + item["detail"])
+            keys = {item["key"].lower()}
+            if item["key"].startswith(("knowledge:", "task:")):
+                keys.add(item["key"].split(":", 1)[1].lower())
+            paths = set()
+            provenance = item.get("provenance")
+            hashes = provenance.get("source_hashes", {}) if isinstance(provenance, dict) else {}
+            if isinstance(hashes, dict):
+                for name in hashes:
+                    try:
+                        paths.add(normalize_source_path(name).lower())
+                    except HarnessError:
+                        pass
+            matches = {"body": q & body, "key": q & keys, "path": q & paths}
+            matched = set().union(*matches.values())
+            detail = {"id": item["id"], "key": item["key"][:256],
+                      "key_truncated": len(item["key"]) > 256,
+                      "match_modes": (["exact_key"] if item["key"] == key else []) if key is not None else [mode for mode, values in matches.items() if values],
+                      "matched_terms": [term[:256] for term in sorted(matched)[:10]],
+                      "terms_truncated": len(matched) > 10 or any(len(term) > 256 for term in matched),
+                      "score": None, "source_status": None, "ranking_group": None,
+                      "exclusion_stage": None, "returned": False}
+            if key is not None and item["key"] != key or key is None and q and not matched:
+                detail["exclusion_stage"] = "match"
+                if diagnostics is not None and len(excluded) < 40:
+                    excluded.append(detail)
                 continue
+            counts["matched"] += 1
             item.update(self._applicability(item, run_id, ledger_cache))
             if not item["applicable"]:
+                counts["scope_excluded"] += 1
+                detail["exclusion_stage"] = "scope"
+                if diagnostics is not None and len(excluded) < 40:
+                    excluded.append(detail)
                 continue
+            counts["applicable"] += 1
             age = max(0, (now - item["created"]) / 86400)
+            overlap = 1 if key is not None else len(matched)
             score = ((overlap / max(1, len(q))) * 10 + math.exp(-age / 90)) * KIND_WEIGHTS.get(item["kind"], 1)
             item.update(self._staleness(item, source_cache, commit_cache))
+            item["source_status"] = source_status(item)
+            group = ranking_group(item)
             if item["possibly_stale"]:
                 score *= 0.7
-            found.append((score, item))
-        results = []
-        for _, item in sorted(found, key=lambda pair: pair[0], reverse=True)[:limit]:
-            selected = {key: item[key] for key in ("id", "key", "abstract", "source", "kind", "created", "provenance")}
+            detail.update(score=score, source_status=item["source_status"], ranking_group=group)
+            found.append((group, score, item, detail))
+        found.sort(key=lambda entry: (entry[0] == "preferred", entry[1]), reverse=True)
+        results, returned_details = [], []
+        counts["returned"] = min(limit, len(found))
+        counts["limit_excluded"] = max(0, len(found) - limit)
+        for index, (_, _, item, detail) in enumerate(found):
+            if index >= limit:
+                detail["exclusion_stage"] = "limit"
+                if diagnostics is not None and len(excluded) < 40:
+                    excluded.append(detail)
+                continue
+            detail["returned"] = True
+            returned_details.append(detail)
+            selected = {name: item[name] for name in ("id", "key", "abstract", "source", "kind", "created", "provenance",
+                "possibly_stale", "stale_reasons", "source_status", "scope", "source_run_id", "source_run_status",
+                "reference_only", "applicable", "historical")}
             if level >= 1:
                 selected["overview"] = item["overview"]
             if level >= 2:
                 selected["detail"] = item["detail"]
-            selected.update({key: item[key] for key in ("possibly_stale", "stale_reasons")})
-            selected.update({key: item[key] for key in ("scope", "source_run_id", "source_run_status",
-                                                       "reference_only", "applicable", "historical")})
             results.append(selected)
+        if diagnostics is not None:
+            details = (returned_details + excluded)[:40]
+            diagnostics.clear()
+            diagnostics.update(mode="key" if key is not None else "query", query_excerpt=text[:1024],
+                query_sha256=hashlib.sha256(text.encode("utf-8")).hexdigest(), query_truncated=len(text) > 1024,
+                counts=counts, candidates=details, details_truncated=counts["active_candidates"] > len(details))
+        return results
+
+    def history(self, key):
+        if not isinstance(key, str) or not key:
+            raise HarnessError("key 必须为非空字符串")
+        if not self.path.exists():
+            return []
+        with self.connect() as db:
+            rows = db.execute("SELECT * FROM memories WHERE key=? ORDER BY created, rowid", (key,)).fetchall()
+        results, source_cache, commit_cache, ledger_cache = [], {}, {}, {}
+        now = time.time()
+        for row in rows:
+            item = self._decode(row)
+            item["expired"] = item["expires"] is not None and item["expires"] < now
+            item.update(self._staleness(item, source_cache, commit_cache))
+            item.update(self._applicability(item, ledger_cache=ledger_cache))
+            item["source_status"] = source_status(item)
+            results.append(item)
         return results
 
     def export(self):

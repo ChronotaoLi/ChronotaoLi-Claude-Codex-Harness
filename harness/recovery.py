@@ -11,6 +11,14 @@ from .contracts import (REVIEW, RepairableFormatError, apply_revision, envelope,
 from .util import HarnessError
 
 
+# Shared pending lifecycle gates; each recovery entry keeps its own extra checks.
+RECOVERY_BUSY_KEYS = (
+    "pending_task", "pending_acceptance", "pending_post_accept",
+    "pending_replan", "pending_directive", "review_receipts",
+    "commander_receipts", "pending_format_corrections", "review_corrections",
+)
+
+
 def snapshot_digest(snapshot):
     encoded = json.dumps(snapshot, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()

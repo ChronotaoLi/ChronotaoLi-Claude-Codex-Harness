@@ -201,6 +201,10 @@ worker 的失败反馈共享 9,000 字符的序列化摘录额度，保留状态
 | 启动中断且 `worktree_binding` 仍为空 | `abandon RUN` 保留证据后重新 `run` | 没有已保存的可信绑定，不能 resume 或自动推断；若工作树或 `harness/<run>` 分支已创建，核对后手工执行 `git worktree remove` 并删除该分支 |
 | 移除工作树被未保存文件阻止 | 核对诊断路径、归档或清理后重试移除 | 忽略文件也不得未经核对删除 |
 
+环境更新与操作者决定共用九个待处理阶段键：`pending_task`、`pending_acceptance`、`pending_post_accept`、`pending_replan`、`pending_directive`、`review_receipts`、`commander_receipts`、`pending_format_corrections`、`review_corrections`。环境更新另将 `replan_stopped` 视为忙碌；决定答复则单独核对停止请求的目标、原因及来源。两入口保留各自的 invalid repair 判断：pending 修正阻断，completed 修正的匹配 receipt 未消费时仍阻断，消费后不会仅因历史修正完成而永久阻断。准备门禁不写入更新或答复，也不消耗模型预算；原台账版本与证据保存顺序不变。
+
+来源过期判断仍有意保留入口差异：环境更新只计来源之后 worker／commander／reviewer 的后续模型调用；worker／replan_stop 决定登记计来源之后的全部 dispatch；决定答复或修订从保存的 `dispatch_count` 起算，handoff 只计目标任务。后两处以 `.get("invoked", True)` 判断，因此没有 invoked 字段的 verification 也会被表达式计入；目前未发现该差异在正常可达流程中造成错误过期，不将状态注入测试视为实际生命周期缺陷证明。status 对三种模型角色按 `invoked is not False` 保守诊断原始坏台账。
+
 供给计划随首次台账保存，Git 绑定已保存但计划尚未登记时，普通恢复沿用原任务、验收、范围、依赖与命令前置条件，不追加模型规划派发；`--pause-after-plan` 仍等待显式批准。该保证不补造缺失的 Git 绑定，也不迁移旧 run 中已经遗失的计划。修复前若供给计划尚未保存、`tasks` 和 `original_tasks` 均为空，台账无法辨认原计划来源；应保留证据后 `abandon`，再用原 `--plan` 重新运行。
 
 旧版本若已为重复或超限的 `required_commands` 派发自动格式修正并保存修正结果，本次校验调整不会迁移该现场。原始证据、receipt 和修正守卫继续生效，普通 `resume` 或 `--repair-invalid` 不能绕过已经形成的阻塞；需保留现场后 `abandon`，另行发起新 run。上述语义修正出口适用于尚未进入该错误自动修正流程的结果，不提供台账重写或预算重置。
@@ -331,7 +335,7 @@ Claude worker 通过锚定在工作树真实路径的 `Edit(//.../**)` 规则允
 
 SQLite 存在目标项目 `.harness/memory.sqlite3`，项目之间独立。每条记忆保存来源、时间、类型和版本。相同 `key` 在相同有效作用域内的新记录替代旧记录的默认检索资格，旧记录仍可按 ID 查询。key 在项目内全局唯一；项目与 run、不同 run 之间的同名写入在事务内拒绝，原记录保持有效，需要使用不同 key。旧 unscoped 人工记录按项目作用域处理版本替换，读取时仍保留原标记。支持 TTL。系统不会自动猜测两条不同 key 的事实是否矛盾。
 
-同一项目的不同 run 使用独立分支和工作树，共享此项目的记忆库。任务历史保存结构化的 run、task 和 commit 来源；召回时核对来源台账及任务接受记录，来源已放弃、缺失或无效时不自动召回，仍可通过 `read/export` 审计。其他 run 的有效已接受记录标为 historical，项目知识继续按文件哈希和提交核验后参与检索。所有记忆明确标为 reference_only，不授予当前 run 的命令权限或操作者决定。数据库初始化使用短时等待锁，覆盖 WAL 设置、建表和迁移，不将整个 run 串行化。`memory search/read/export` 使用只读连接，不建库、不迁移，也不改 Git `info/exclude`；SQLite 仍可能管理 WAL 辅助文件。
+同一项目的不同 run 使用独立分支和工作树，共享此项目的记忆库。任务历史保存结构化的 run、task 和 commit 来源；召回时核对来源台账及任务接受记录，来源已放弃、缺失或无效时不自动召回，仍可通过 `read/history/export` 审计。其他 run 的有效已接受记录标为 historical，项目知识继续按文件哈希和提交核验后参与检索。所有记忆明确标为 reference_only，不授予当前 run 的命令权限或操作者决定。数据库初始化使用短时等待锁，覆盖 WAL 设置、建表和迁移，不将整个 run 串行化。`memory search/read/history/export` 使用只读连接，不建库、不迁移，也不改 Git `info/exclude`；SQLite 仍可能管理 WAL 辅助文件。
 
 任务历史仍使用 `task:<run_id>:<task_id>`，保留每次已接受结果。接受台账和任务记忆的摘要来自 reviewer 对代码与证据的独立审阅；worker summary 只保留为原始执行证据。worker 可另行返回 `proposed_memories`，每条包含稳定 key、摘要、事实内容和仓库来源文件；审阅者通过 `approved_memory_keys` 单独批准。运行时将通过检查的提案写入 `knowledge:` 命名空间，并保护操作者维护的记录。代码通过不代表所有记忆提案通过，agent 没有直接写记忆的 MCP 工具。内置 MCP 也使用 SQLite 只读连接，不建库或迁移；库不存在时搜索为空。
 
@@ -340,6 +344,27 @@ SQLite 存在目标项目 `.harness/memory.sqlite3`，项目之间独立。每�
 `memory add` 默认保存项目事实；临时运行说明可用 `--run RUN_ID` 绑定已有 run，仅向该 run 的模型检索公开，不能替代同名项目事实或其他 run 的说明。CLI 查询这些说明也需 `memory search ... --run RUN_ID`；MCP 的 search/read 都以当前 run 计算 applicable/historical，CLI read 保持无 run 视角的历史查询。新规则不自动恢复此前已被替代的版本，可用 read/export 核对后重新写入适当的新 key。真正的继续／停止选择应使用 `resume --operator-decision`，不能用记忆替代。旧人工记录保留为 unscoped/reference_only，缺少结构化来源时标记 missing_provenance；旧任务记录可从原 source/key 识别来源 run，但不会因此补造来源完整性证明。来源台账只在单次检索内缓存，后续放弃操作会在下一次检索生效。
 
 检索是支持英文词项和中文二元词的本地词法排序，含时间衰减；没有把它称为 embedding / GraphRAG。`memory export` 输出包含历史版本的 JSON，便于备份或迁移。
+
+`memory search QUERY` 与 `memory search --key KEY` 必须且只能选一种，MCP `memory_search` 的 query/key 同样互斥。显式空 query 沿用全候选检索，空 key 拒绝；缺库也先检查参数，合法缺库查询返回空列表。key 按原字符串等值比较，大小写、首尾空格和 Unicode 规范形式不同均不相等。精确查询仍执行默认 active、有效期和作用域筛选，level 0/1/2 不变。普通查询另索引完整 key、knowledge/task 命名空间正文和合法来源路径；这些匹配也会影响派发自动召回，不把 `--source` 说明当作路径。
+
+`memory history KEY` 按创建顺序列出该 key 的全部版本，保留替代链和当前来源核验状态；无 run 上下文，使用与 CLI read 相同的审计视角。未知 key 或缺库返回空列表。该入口不会激活旧版、刷新 TTL、写入或迁移旧库，也不会把历史结果接入自动召回；没有 MCP history 工具。
+
+文件绑定只由 `memory add --source-file PATH` 触发，重复路径在词法规范化后去重。绝对路径、父目录跳转、反斜杠、NUL、保留目录及越界解析拒绝；大小写、空格和 Unicode 保留。固定一次 HEAD，按其中的精确路径读取普通 blob 并比较工作区原始字节，最多十个文件、每个 2 MiB；任一失败不替代旧 active 版本。符号链接不支持，换行转换、clean/smudge、LFS 等可能导致 Git clean 但原始字节不同，错误不会据此推断具体原因，也不运行用户过滤器。
+
+应在拥有项目 `.harness` 的主检出操作；`--run` 只限定作用域，不选择读取位置。把 `--repo` 指向 run 工作树当前可能新建独立库，带 `--run` 通常找不到台账，不受支持；运行时没有自动归属拒绝或主库路由，也没有禁止普通 linked worktree。run 内检索使用自己的工作树核验，主检出后来的文件可能在旧 run 中 changed/unavailable，不自动更新分支或提交文件。
+
+`source_status` 读取摘要按以下优先级给出，完整 stale_reasons 保留：
+
+| 条件 | 状态 |
+| --- | --- |
+| 现有核验报告 invalid_provenance | invalid |
+| 无文件哈希和 commit 绑定 | unbound |
+| 任一 source_changed | changed |
+| 任一 source_unavailable 或 commit_unavailable | unavailable |
+| 未完成核验或未知原因 | not_checked |
+| 已声明绑定全部匹配 | matching |
+
+旧空人工来源仍为 unbound，保留 missing_provenance 和原 0.7 折减；无 repo 的未绑定记录不因 source_not_checked 变成有绑定。matching 不证明内容正确、来源依赖完整或提交已合入，也不消除 historical。排序先 preferred、后 needs_review，组内保留旧分数；变化、不可用、非法或未知原因进入后组，只有未绑定／未核验原因的记录不额外降组。所有状态与历史字段均为投影，不迁移 SQLite 或修改默认资格。
 
 ## 上下文与诊断产物
 
@@ -356,6 +381,8 @@ SQLite 存在目标项目 `.harness/memory.sqlite3`，项目之间独立。每�
 首次执行、应用再规划前，以及已有环境更新或操作者答复的恢复中，预检整体审阅容量。确定的必要内容下界超限时保存计划并停止，允许增加 `context_chars` 后恢复；预计摘要和验证输出可能超限时提前警告。决定摘录会随答复修订或条数变化而缩减，因此仅计入预警估计；检查点按最终全部任务已接受的场景只提供索引，不把当前未接受任务的展开内容计入最终容量。预计容量不是保证，后续历史和实际输出仍可能使输入超限，所有正式派发继续执行完整输入的实际预算检查。
 
 所有输入包与预算报告落在 dispatch 目录。默认 `context_chars = 100000` 是编排输入的字符上限，不是 token 数或固定输入长度。`context-report.json` 分别记录必要输入 `required_chars`、已加入的可选记忆及其分隔文本 `memory_chars`，两者之和为 `used_chars`；必要输入超限才触发硬门禁，可选记忆按剩余预算整条加入。
+
+报告的 `memory_retrieval.counts` 区分 active_candidates、matched、scope_excluded、applicable、returned、limit_excluded、included、capacity_excluded。八条适用、六条返回、三条装入时，数量上限排除为二、容量排除为三；排第一的大记录可能被跳过而后续小记录进入，明细按实际 ID 标记。查询摘录最多 1,024 字符，附完整 SHA256；最多四十条明细、每条最多十个命中词、长文本最多 256 字符并标注截断，阶段计数仍完整。未执行的来源核验或评分为 null，不为报告重扫来源。报告随 context_prepared（或既有 context_compacted 别名）hook 传递，不放入提示词，也不解释 SQL 已排除的每条历史记录。
 
 默认 `agent_timeout_seconds = 3600`，全局 `claude_max_turns = 50`。可选 `runtime.claude_max_turns_by_role = { worker = 200 }` 按 commander、worker、reviewer 设置正整数覆盖；Fable 指挥使用 commander，Codex 不使用此限制。仓库示例显式设置 worker 200，旧配置省略覆盖仍沿用原全局值。恢复允许添加、提高或移除覆盖，但各角色实际生效值不得减少；例如原 worker 200、全局 50 时，直接删除 worker 覆盖会拒绝恢复，将全局提高到至少 200 后才可删除。全局值自身仍不可降低，合法变更沿用配置变更审计，不清零累计预算。
 
