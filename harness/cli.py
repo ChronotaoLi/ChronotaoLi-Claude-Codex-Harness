@@ -209,7 +209,10 @@ def show_status(args, state):
         print(dump(ledger if args.full else status_summary(ledger)))
         return
     # The read-only observation layer owns the list; stdout fields are unchanged.
-    listing = observe.list_runs(state)
+    try:
+        listing = observe.list_runs(state)
+    except observe.ObserveError as error:
+        raise HarnessError(f"无法读取运行目录 {state / 'runs'}：{error}") from error
     for item in listing["skipped"]:
         print(f"harness: 跳过无法读取的运行台账 {state / item['path']}：{item['reason']}", file=sys.stderr)
     for path in listing["incomplete"]:

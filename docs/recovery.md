@@ -264,7 +264,9 @@ worker 独有的 `harness_commands` broker 在 dispatch 私有 `commands/` 中�
 
 ## 操作记录与观察事件
 
-`run` 在首次台账保存时写入可选信息字段 `created_by_operation`（操作记录 ID，或没有记录对象时为 null）。`load_run` 的必需字段表不包含它，旧 run 没有该字段也照常加载、升级与恢复，不补写。首次保存成功后，运行时尽力追加 `run_created` 事件（带 `operation_id`）、向 stderr 输出一行 `[harness-json] {"event":"run_created","run_id":"...","operation_id":...}` 通知，并把 run ID 写进操作记录；`resume` 在全部恢复门禁通过后同样追加 `run_resumed` 事件与通知。任何一步失败只打印 `[harness] 警告：...`，不改变生命周期、保存顺序或退出码；首次保存发生在 worktree 绑定之前，因此通知失败不会留下无绑定的 run。被门禁拒绝的 resume 与已完成 run 的普通 resume 不写事件，台账与事件文件保持不变。
+`run` 在首次台账保存时写入可选信息字段 `created_by_operation`（操作记录 ID，或没有记录对象时为 null）。`load_run` 的必需字段表不包含它，旧 run 没有该字段也照常加载、升级与恢复，不补写。首次保存成功后，运行时尽力追加 `run_created` 事件（带 `operation_id`）、向 stderr 输出一行 `[harness-json] {"event":"run_created","run_id":"...","operation_id":...}` 通知，并把 run ID 写进操作记录；`resume` 在自身预检门禁（含计划批准）通过后、进入 `execute()` 前同样追加 `run_resumed` 事件与通知。观察步骤的普通异常只打印 `[harness] 警告：...`，不改变生命周期、保存顺序或退出码；Ctrl-C 等进程中断仍适用既有中断窗口与恢复限制。
+
+`run_resumed` 表示进入执行阶段，不表示已经派发模型。恢复预检拒绝时不写该事件、不输出该通知，但拒绝前已经保存的记录仍保留，例如退出确认审计、旧台账升级、配置放宽和命令授权检查。进入 `execute()` 后仍可能在派发前停止，例如指挥停止而未显式重试、缺少命令授权、等待操作者决定或没有可执行任务；此时先写 `run_resumed`，再沿用既有停止流程写 `run_stopped`、保存 blocked 状态并触发 on_error hook。已完成 run 的普通 resume 不写运行事件，台账与事件文件保持不变。
 
 `<目标项目>/.harness/operations/*.json` 不参与任何恢复判断：恢复预检、进程退出、Git 绑定、证据与预算门禁都不读取它，记录缺失、损坏或与台账不一致也不阻止 resume、abandon 或清理。`dashboard` 与 `status` 不取 `run.lock`、不写台账或事件，运行中的 run 可以同时被观察；页面显示的 `running` 只是台账值，进程是否仍在工作仍以恢复时的退出检查为准。记录字段与网页限制见[操作与观察](operations.md)。
 

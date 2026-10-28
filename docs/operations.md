@@ -76,7 +76,11 @@ python3 -m harness --repo /abs/project dashboard --port 8765
 
 记录不保存环境变量值、凭据、`--plan`／`--environment-update`／`--operator-decision` 的文件内容或生成的 MCP 配置。
 
-run 身份的关联：`run` 的首次台账保存随同写入可选字段 `created_by_operation`（不是额外一次保存），保存成功后追加 `run_created` 事件（带 `operation_id`）、在 stderr 输出一行 `[harness-json] {"event":"run_created","run_id":"...","operation_id":"..."}`，并立即把 `run_id` 写进记录，长时间运行或被强制终止时也能关联。`resume` 在通过全部恢复门禁之后同样追加 `run_resumed` 事件与通知。被门禁拒绝的 resume 与已完成 run 的普通 resume 不写事件，但只要台账文件存在，记录结束时仍关联参数中的 run ID。加载配置失败时没有记录（记录在 `Config.load` 之后才创建）；创建 run 之前失败（仓库基线不满足、计划非法等）时记录保留但没有 `run_id`；resume 在预检阶段被强制终止时记录也可能没有 `run_id`。
+run 身份的关联：`run` 的首次台账保存随同写入可选字段 `created_by_operation`（不是额外一次保存），保存成功后追加 `run_created` 事件（带 `operation_id`）、在 stderr 输出一行 `[harness-json] {"event":"run_created","run_id":"...","operation_id":"..."}`，并立即把 `run_id` 写进记录，长时间运行或被强制终止时也能关联。`resume` 在自身预检门禁（含计划批准）通过后、进入 `execute()` 前同样追加 `run_resumed` 事件与通知。
+
+`run_resumed` 不表示已经派发模型：缺少命令授权、等待操作者决定等执行阶段门禁仍可使它紧接一条 `run_stopped`，并沿用原有停止记账和 on_error hook。恢复预检拒绝时不写 `run_resumed`、不输出该通知，但之前保存的退出确认审计、台账升级、配置放宽、命令授权检查等记录仍保留。已完成 run 的普通 resume 不写运行事件，台账与事件文件保持不变。完整边界见[恢复协议](recovery.md#操作记录与观察事件)。
+
+上述拒绝或已完成返回只要对应台账文件存在，操作记录结束时仍关联参数中的 run ID。加载配置失败时没有记录（记录在 `Config.load` 之后才创建）；创建 run 之前失败（仓库基线不满足、计划非法等）时记录保留但没有 `run_id`；resume 在预检阶段被强制终止时记录也可能没有 `run_id`。
 
 限制：非 Git 检出或包目录上级不是检出根时 `revision`／`runtime_modified` 为 null；`runtime_modified` 也会因 `harness/` 下的未跟踪文件为 true；`cli.version` 是启动时 PATH 中的 CLI，不证明派发实际使用了同一个二进制。
 
@@ -182,7 +186,7 @@ run 列表 → run 详情 → 文件查看。详情包含：目标、台账状�
 ### 限制
 
 - 只绑定 127.0.0.1，不开放远端访问；只接受 GET／HEAD；同时连接最多 8 个，超出返回 503；慢客户端约 10 秒后断开。
-- 服务在启动时固定持有 `.harness` 目录的描述符；目录被删除重建后需重启服务。目标项目还没有 `.harness` 目录时 `dashboard` 直接报错退出 1，而 `status` 列表为空。
-- 首／末事件时间只在 `events.jsonl` 头／尾 64 KiB 内查找；`state.json` 超过 64 MiB 不解析；操作记录最多扫描 1000 个文件、每个 256 KiB；文件索引最多 2000 项。
+- 服务在启动时固定持有 `.harness` 目录的描述符；目录被删除重建后需重启服务。目标项目还没有 `.harness` 目录时 `dashboard` 直接报错退出 1，而 `status` 列表为空。`.harness/runs` 本身是符号链接或不可读时，`status` 列表输出包含目录路径的诊断并退出 1；`status RUN` 保留既有的直接台账读取方式，不使用列表的符号链接拒绝规则，但仍须能读取该文件。
+- 首／末事件时间只在 `events.jsonl` 头／尾 64 KiB 内查找；dispatch 结束时间只取尾部 64 KiB 中的事件，较早调用可能显示不可用；`state.json` 超过 64 MiB 不解析；操作记录最多扫描 1000 个文件、每个 256 KiB；文件索引最多 2000 项。
 - 损坏的台账在列表中跳过并给诊断；详情仍尽量显示并标出 `ledger_error`／`summary_error`；旧 `schema_version` 没有的区块标“不可用”。
 - 不汇总多个项目，不按公开单价估算账单，观察结果不改变任何预算。页面尚未做过浏览器人工验收，当前验证只覆盖 HTTP 接口。

@@ -1,12 +1,18 @@
 """Read-only observation data layer: ledger projection, cost classes, events, operations."""
+import contextlib
+import errno
+import io
 import json
+import os
+import subprocess
+import sys
 import tempfile
 import unittest
 import uuid
 from pathlib import Path
 from unittest.mock import patch
 
-from harness import observe
+from harness import cli, observe
 from harness.cli import status_summary
 from harness.util import read_json, write_json
 from test_harness import RepoCase
@@ -539,6 +545,64 @@ class RootDescriptorTests(StateCase):
         with self.assertRaises(observe.NotFound):
             observer.run_detail("run_new")
         self.assertEqual([item["id"] for item in observe.list_runs(self.state)["runs"]], ["run_new"])
+
+
+class StatusListDiagnosticsTests(RepoCase):
+    def snapshot(self, root):
+        result = {}
+        for path in [root, *root.rglob("*")]:
+            info = path.lstat()
+            content = (os.readlink(path) if path.is_symlink() else
+                       path.read_bytes() if path.is_file() else None)
+            result[str(path.relative_to(root))] = (info.st_mode, info.st_mtime_ns, content)
+        return result
+
+    def test_status_list_refuses_symlinked_runs_with_path_diagnostic(self):
+        state = self.repo / ".harness"
+        state.mkdir()
+        external = self.repo / "external-runs"
+        write_json(external / "run_hidden" / "state.json", ledger("run_hidden"))
+        runs = state / "runs"
+        runs.symlink_to(external, target_is_directory=True)
+        before = self.snapshot(state), self.snapshot(external)
+
+        result = subprocess.run([sys.executable, "-m", "harness", "--repo", str(self.repo), "status"],
+                                cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True)
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertIn(str(runs), result.stderr)
+        self.assertIn("符号链接", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertEqual((self.snapshot(state), self.snapshot(external)), before)
+
+    def test_status_list_reports_unreadable_runs_without_empty_success_or_writes(self):
+        state = self.repo / ".harness"
+        runs = state / "runs"
+        write_json(runs / "run_unreadable" / "state.json", ledger("run_unreadable"))
+        before = self.snapshot(state)
+        real_open = os.open
+        denied = []
+
+        def unreadable_open(path, flags, mode=0o777, *, dir_fd=None):
+            if path == "runs" and dir_fd is not None:
+                denied.append(path)
+                raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), str(runs))
+            return real_open(path, flags, mode, dir_fd=dir_fd)
+
+        output, errors = io.StringIO(), io.StringIO()
+        # Inject at the OS boundary so EACCES is exercised even under root.
+        with patch("harness.observe.os.open", side_effect=unreadable_open), \
+                contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+            code = cli.main(["--repo", str(self.repo), "status"])
+
+        self.assertEqual(denied, ["runs"])
+        self.assertEqual(code, 1)
+        self.assertEqual(output.getvalue(), "")
+        self.assertIn(str(runs), errors.getvalue())
+        self.assertIn(os.strerror(errno.EACCES), errors.getvalue())
+        self.assertNotIn("Traceback", errors.getvalue())
+        self.assertEqual(self.snapshot(state), before)
 
 
 class PathPolicyTests(unittest.TestCase):

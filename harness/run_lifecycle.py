@@ -68,10 +68,9 @@ class RunLifecycle(RuntimeService):
     def announce(self, event):
         """Observation after a successful save: event, machine-readable stderr line, operation link.
 
-        Every step is best effort. The first save precedes the worktree binding,
-        so a failure here must not leave an unbound run: it only emits a warning
-        (which itself cannot raise) and never changes the lifecycle, the save
-        order or the exit status.
+        Ordinary observation errors only emit warnings and do not change the
+        lifecycle, save order or exit status. Process interrupts still follow
+        the existing recovery limits; the first save precedes worktree binding.
         """
         runtime = self.runtime
         operation = runtime.operation
@@ -364,7 +363,7 @@ class RunLifecycle(RuntimeService):
                 runtime.run["plan_approved"] = True
                 runtime.event("plan_approved")
                 runtime.save()
-            # Announce only once every recovery gate has passed: a rejected
-            # resume must leave the ledger and its events byte-identical.
+            # Announce after resume() gates pass; earlier explicit audit writes
+            # survive rejection. Stops inside execute() still emit run_stopped.
             self.announce("run_resumed")
             return runtime.execute(step=step)

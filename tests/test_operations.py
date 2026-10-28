@@ -174,7 +174,7 @@ class OperationRecordTests(OperationCase):
         self.assertEqual(self.record("op-start"), start)
         self.assertEqual(self.ledger(run_id)["created_by_operation"], "op-start")
 
-    def test_rejected_resume_links_record_without_touching_run_evidence(self):
+    def test_early_rejected_resume_links_record_without_touching_run_evidence(self):
         code, output, errors = self.invoke(["run", "Implement greet", "--pause-after-plan", "--operation-id", "op-paused"])
         self.assertEqual(code, 0, errors)
         run_id = json.loads(output)["id"]
@@ -191,6 +191,91 @@ class OperationRecordTests(OperationCase):
         self.assertEqual((record["status"], record["run_id"], record["exit_status"], record["error_type"]),
                          ("finished", run_id, 1, "HarnessError"))
         self.assertEqual(record["arguments"]["confirm_exited"], ["dispatch_unknown"])
+
+    def test_resume_stopped_before_dispatch_keeps_events_hooks_and_budgets(self):
+        plan = read_json(ROOT / "examples" / "plan.json")
+        plan["tasks"][0]["required_commands"] = [["required-tool", "run", "--exact"]]
+        plan_path = self.repo / "input-plan.json"
+        write_json(plan_path, plan)
+        backend = Mock(spec=DemoBackend)
+        backend.invoke.side_effect = AssertionError("Blocked commands must not dispatch a model")
+        code, output, errors = self.invoke(["run", "Implement greet", "--plan", str(plan_path),
+                                            "--operation-id", "op-missing"], backend)
+        self.assertEqual(code, 1, errors)
+        self.assertEqual(output, "")
+        run_id = self.record("op-missing")["run_id"]
+        directory = self.state / "runs" / run_id
+        events_path = directory / "events.jsonl"
+        for index in range(2):
+            operation_id = f"op-stopped-{index}"
+            before = self.ledger(run_id)
+            events_before = events_path.read_bytes()
+            with patch.object(Engine, "emit_hook", autospec=True, side_effect=Engine.emit_hook) as hook:
+                code, output, errors = self.invoke(["resume", run_id, "--operation-id", operation_id], backend)
+            self.assertEqual(code, 1, errors)
+            self.assertEqual(output, "")
+            self.assertIn(notice("run_resumed", run_id, operation_id), errors.splitlines())
+            events_after = events_path.read_bytes()
+            self.assertTrue(events_after.startswith(events_before))
+            appended = [json.loads(line) for line in events_after[len(events_before):].splitlines()]
+            self.assertEqual([event["event"] for event in appended], ["run_resumed", "run_stopped"])
+            self.assertEqual(appended[0]["operation_id"], operation_id)
+            saved = self.ledger(run_id)
+            self.assertEqual(saved["status"], "blocked")
+            self.assertEqual(saved["error_hook_attempts"], before["error_hook_attempts"] + 1)
+            for key in ("dispatches", "attempts", "total_attempts", "agent_dispatches", "accepted"):
+                self.assertEqual(saved[key], before[key], key)
+            hook.assert_called_once()
+            self.assertEqual(hook.call_args.args[1], "on_error")
+            self.assertEqual(hook.call_args.args[3], directory.resolve() / "hooks" / f"error-{saved['error_hook_attempts']}")
+            record = self.record(operation_id)
+            self.assertEqual((record["run_id"], record["status"], record["exit_status"]),
+                             (run_id, "finished", 1))
+        backend.invoke.assert_not_called()
+
+    def test_approval_rejection_keeps_prior_grant_audit_without_resume_notice(self):
+        command = ["required-tool", "run", "--exact"]
+        plan = read_json(ROOT / "examples" / "plan.json")
+        plan["tasks"][0]["required_commands"] = [command]
+        plan_path = self.repo / "input-plan.json"
+        write_json(plan_path, plan)
+        backend = Mock(spec=DemoBackend)
+        backend.invoke.side_effect = AssertionError("Unapproved plans must not dispatch a model")
+        code, output, errors = self.invoke(["run", "Implement greet", "--plan", str(plan_path),
+                                            "--pause-after-plan", "--operation-id", "op-approval"], backend)
+        self.assertEqual(code, 0, errors)
+        run_id = json.loads(output)["id"]
+        directory = self.state / "runs" / run_id
+        state_path, events_path = directory / "state.json", directory / "events.jsonl"
+        before = self.ledger(run_id)
+        for index, add_grant in enumerate((False, True, False)):
+            with self.subTest(add_grant=add_grant, index=index):
+                if add_grant:
+                    self.config.data["permissions"]["worker_commands"].append(command)
+                state_before, events_before = state_path.read_bytes(), events_path.read_bytes()
+                operation_id = f"op-approval-reject-{index}"
+                code, output, errors = self.invoke(["resume", run_id, "--operation-id", operation_id], backend)
+                self.assertEqual(code, 1, errors)
+                self.assertEqual(output, "")
+                self.assertNotIn("[harness-json]", errors)
+                saved = self.ledger(run_id)
+                self.assertFalse(saved["plan_approved"])
+                for key in ("status", "dispatches", "attempts", "total_attempts", "agent_dispatches", "accepted"):
+                    self.assertEqual(saved[key], before[key], key)
+                self.assertNotIn("error_hook_attempts", saved)
+                if add_grant:
+                    self.assertNotEqual(state_path.read_bytes(), state_before)
+                    self.assertTrue(events_path.read_bytes().startswith(events_before))
+                    appended = [json.loads(line) for line in events_path.read_bytes()[len(events_before):].splitlines()]
+                    self.assertEqual([event["event"] for event in appended],
+                                     ["resume_config_relaxed", "command_requirements_checked"])
+                    self.assertEqual(saved["config_snapshot"]["permissions"]["worker_commands"], [command])
+                    self.assertEqual(saved["command_requirements"], {"missing": {}})
+                else:
+                    self.assertEqual((state_path.read_bytes(), events_path.read_bytes()), (state_before, events_before))
+                record = self.record(operation_id)
+                self.assertEqual((record["run_id"], record["exit_status"]), (run_id, 1))
+        backend.invoke.assert_not_called()
 
     def test_operation_id_is_validated_before_any_write(self):
         for invalid in ("", "-leading", "has space", "a/b", "x" * 65, "..", "opü"):
