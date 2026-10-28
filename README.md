@@ -208,7 +208,7 @@ python3 -m harness --repo /path/to/project memory export > memory-backup.json
 
 需绑定文件依据时，在拥有该项目 `.harness` 的主检出使用 `memory add ... --source-file docs/architecture.md`，可重复指定，规范化去重后最多十个文件。文件须在同一次 HEAD 中已提交，且工作区原始字节与 Git blob 相同；不支持符号链接，也不执行换行或 Git 过滤器转换。`--source` 仍只是说明文字。`--run` 只限定作用域；不要把 `--repo` 指向 Harness 的 run 工作树，当前不会自动路由到主库。
 
-`search QUERY` 使用本地词法匹配，正文、完整 key、`knowledge:`／`task:` 前缀后的完整名称及来源路径均可命中；任务文本也使用这些规则自动召回。已知名字时用 `search --key KEY` 原样等值查询，不裁剪空格、折叠大小写或归一化 Unicode。两种查询仍过滤失活、过期和不适用记录。`history KEY` 列出所有版本、来源状态和替代关系供审计，不恢复旧版或改变默认召回。
+`search QUERY` 使用本地词法匹配，正文之外也匹配可形成完整词项的 key、`knowledge:` 去前缀名称及来源路径；任务文本也使用这些规则自动召回。运行时生成的 `task:<run_id>:<task_id>` 不按 key 名称词法命中，应通过正文（任务标题与摘要）或精确 key 查找。已知名字时用 `search --key KEY` 原样等值查询，不裁剪空格、折叠大小写或归一化 Unicode。两种查询仍过滤失活、过期和不适用记录。`history KEY` 列出所有版本、来源状态和替代关系供审计，不恢复旧版或改变默认召回。
 
 查询返回 `source_status`：`unbound` 未绑定、`matching` 声明来源匹配、`changed` 已变化、`unavailable` 不可用、`not_checked` 未完成核验、`invalid` 来源格式无效。原 `possibly_stale` 和原因列表保留；匹配不证明内容正确或来源已合入当前分支。较早 run 工作树核对主检出后来绑定的文件时，出现 changed/unavailable 是正常结果。
 
@@ -216,7 +216,7 @@ python3 -m harness --repo /path/to/project memory export > memory-backup.json
 
 上下文采用结构化检查点、有界检索和原始证据引用，在任务边界写 `handoff.json`／`handoff.md`；每次指挥调用重新构建输入。默认 `context_chars = 100000` 是编排输入字符上限，不是 token 数；必要约束超限就停止，可选记忆按整条移除。CLI 内部上下文不在该预算内。
 
-dispatch 私有 `context-report.json` 中的 `memory_retrieval` 记录候选、匹配、作用域、数量上限与容量筛选计数，最多四十条明细，并按实际 ID 标记装入情况。报告也随既有 `context_prepared` hook 传递，不加入模型提示词。
+dispatch 私有 `context-report.json` 中的 `memory_retrieval` 记录候选、匹配、作用域、数量上限与容量筛选计数。最多四十条明细，依次优先保留返回项、数量上限排除项、作用域排除项和未匹配项，并按实际 ID 标记装入情况；计数完整，明细不保证涵盖全部排除项。报告也随既有 `context_prepared` hook 传递，不加入模型提示词。
 
 大量变更路径与恢复路径使用 SHA256 绑定的完整索引，按需检索，不重复塞进模型输入。相同清单共用索引，原始范围、验收、diff 与快照仍保留；索引缺失或损坏会阻止继续，不能靠截断路径绕过门禁。详见[上下文与诊断产物](docs/recovery.md#上下文与诊断产物)。
 

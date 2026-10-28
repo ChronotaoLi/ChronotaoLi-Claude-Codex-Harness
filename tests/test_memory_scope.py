@@ -56,6 +56,22 @@ class MemoryScopeTests(unittest.TestCase):
         result = json.loads(handle(request, self.memory, None, old)['content'][0]['text'])
         self.assertEqual(result[0]['id'], ident)
 
+    def test_generated_task_keys_use_body_or_exact_lookup(self):
+        self.ledger('run_old', 'completed')
+        key = 'task:run_old:task'
+        ident = self.remember(key, kind='accepted_task')
+        for query in (key, 'run_old:task', 'run_old', 'task'):
+            with self.subTest(query=query):
+                self.assertEqual(self.memory.search(query, run_id='run_new'), [])
+        for search in ({'query': 'upgrade'}, {'key': key}):
+            item = self.memory.search(**search, run_id='run_new')[0]
+            self.assertEqual(item['id'], ident)
+            self.assertTrue(item['historical'])
+            self.assertTrue(item['reference_only'])
+        # Existing manually named keys keep their single-component suffix lookup.
+        manual = self.remember('task:deploy')
+        self.assertEqual(self.memory.search('deploy')[0]['id'], manual)
+
     def test_legacy_operator_is_unscoped_reference_and_not_fresh(self):
         self.remember('operator')
         item = self.memory.search('upgrade')[0]

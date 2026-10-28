@@ -239,6 +239,56 @@ class RetrievalUpdatesTests(unittest.TestCase):
         self.assertTrue(detail['terms_truncated'])
         self.assertTrue(all(len(term) <= 256 for term in detail['matched_terms']))
 
+    def test_limit_diagnostics_survive_many_unmatched_records(self):
+        for index in range(34):
+            self.add(f'noise-{index}', abstract='unrelated')
+        matched = {self.add(f'hit-{index}', abstract='needle') for index in range(8)}
+        report = {}
+        results = self.memory.search('needle', diagnostics=report)
+        self.assertEqual(results, self.memory.search('needle'))
+        returned = {item['id'] for item in results}
+        excluded = {item['id'] for item in report['candidates'] if item['exclusion_stage'] == 'limit'}
+        self.assertEqual(excluded, matched - returned)
+        self.assertEqual(report['counts'], dict(active_candidates=42, matched=8, scope_excluded=0,
+                                               applicable=8, returned=6, limit_excluded=2))
+        self.assertEqual([item['exclusion_stage'] for item in report['candidates']],
+                         [None] * 6 + ['limit'] * 2 + ['match'] * 32)
+        self.assertTrue(report['details_truncated'])
+
+    def test_limit_diagnostics_precede_scope_exclusions_without_changing_retrieval(self):
+        for index in range(40):
+            self.add(f'noise-{index}', abstract='unrelated')
+            self.add(f'scoped-{index}', abstract='needle', provenance={'scope': 'run', 'run_id': 'other'})
+        matched = {self.add(f'hit-{index}', abstract='needle') for index in range(8)}
+        report = {}
+        results = self.memory.search('needle', diagnostics=report)
+        self.assertEqual(results, self.memory.search('needle'))
+        returned = {item['id'] for item in results}
+        excluded = {item['id'] for item in report['candidates'] if item['exclusion_stage'] == 'limit'}
+        self.assertEqual(excluded, matched - returned)
+        self.assertEqual(report['counts'], dict(active_candidates=88, matched=48, scope_excluded=40,
+                                               applicable=8, returned=6, limit_excluded=2))
+        self.assertEqual([item['exclusion_stage'] for item in report['candidates']],
+                         [None] * 6 + ['limit'] * 2 + ['scope'] * 32)
+        self.assertTrue(report['details_truncated'])
+
+    def test_scope_diagnostics_preserve_query_and_exact_key_targets(self):
+        for index in range(40):
+            self.add(f'aaa-noise-{index}', abstract='unrelated')
+        target = self.add('zzz-target', abstract='needle', provenance={'scope': 'run', 'run_id': 'other'})
+        for search in ({'query': 'needle'}, {'key': 'zzz-target'}):
+            with self.subTest(search=search):
+                report = {}
+                with patch.object(self.memory, '_staleness', side_effect=AssertionError('excluded source read')):
+                    self.assertEqual(self.memory.search(**search, diagnostics=report), [])
+                self.assertEqual(report['counts'], dict(active_candidates=41, matched=1, scope_excluded=1,
+                                                       applicable=0, returned=0, limit_excluded=0))
+                self.assertEqual(report['candidates'][0]['id'], target)
+                self.assertEqual(report['candidates'][0]['exclusion_stage'], 'scope')
+                self.assertIsNone(report['candidates'][0]['source_status'])
+                self.assertEqual(len(report['candidates']), 40)
+                self.assertTrue(report['details_truncated'])
+
     def test_history_audits_all_versions_without_reactivation(self):
         first = self.add('history', provenance=bind_source_files(self.repo, ['docs/x.md']))
         self.file.write_text('second\n')
@@ -268,8 +318,12 @@ class RetrievalUpdatesTests(unittest.TestCase):
                           Memory(self.path, read_only=True), self.repo, None)
         ident = self.add('中文 With Space')
         self.assertEqual(json.loads(call({'key': '中文 With Space'})['content'][0]['text'])[0]['id'], ident)
+        self.assertEqual(json.loads(call({'query': 'alpha'})['content'][0]['text'])[0]['id'], ident)
+        for args in ({}, {'query': 'alpha', 'key': '中文 With Space'}, {'query': 'alpha', 'extra': True}):
+            self.assertTrue(call(args)['isError'])
         self.path.unlink()
-        for args in ({}, {'query': '', 'key': 'x'}, {'key': ''}, {'query': None}, {'key': None}):
+        for args in ({}, {'query': '', 'key': 'x'}, {'key': ''}, {'query': None}, {'key': None},
+                     {'query': '', 'extra': True}):
             self.assertTrue(call(args)['isError'])
         for args in ({'query': ''}, {'key': 'x'}):
             self.assertFalse(call(args)['isError'])

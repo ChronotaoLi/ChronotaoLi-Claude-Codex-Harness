@@ -345,7 +345,7 @@ SQLite 存在目标项目 `.harness/memory.sqlite3`，项目之间独立。每�
 
 检索是支持英文词项和中文二元词的本地词法排序，含时间衰减；没有把它称为 embedding / GraphRAG。`memory export` 输出包含历史版本的 JSON，便于备份或迁移。
 
-`memory search QUERY` 与 `memory search --key KEY` 必须且只能选一种，MCP `memory_search` 的 query/key 同样互斥。显式空 query 沿用全候选检索，空 key 拒绝；缺库也先检查参数，合法缺库查询返回空列表。key 按原字符串等值比较，大小写、首尾空格和 Unicode 规范形式不同均不相等。精确查询仍执行默认 active、有效期和作用域筛选，level 0/1/2 不变。普通查询另索引完整 key、knowledge/task 命名空间正文和合法来源路径；这些匹配也会影响派发自动召回，不把 `--source` 说明当作路径。
+`memory search QUERY` 与 `memory search --key KEY` 必须且只能选一种，MCP `memory_search` 的 query/key 同样互斥。MCP 输入 schema 使用普通对象，在 description 中说明二选一，不使用根级 oneOf/anyOf/allOf；服务端仍独立拒绝同时提供、均未提供及多余参数，不依赖客户端改写或校验。显式空 query 沿用全候选检索，空 key 拒绝；缺库也先检查参数，合法缺库查询返回空列表。key 按原字符串等值比较，大小写、首尾空格和 Unicode 规范形式不同均不相等。精确查询仍执行默认 active、有效期和作用域筛选，level 0/1/2 不变。普通查询在正文之外匹配可形成完整词项的 key、`knowledge:` 去前缀名称和合法来源路径；运行时生成的 `task:<run_id>:<task_id>` 应通过正文（任务标题与摘要）或精确 key 查找，不能按 key 名称词法命中。这些匹配也会影响派发自动召回，不把 `--source` 说明当作路径。
 
 `memory history KEY` 按创建顺序列出该 key 的全部版本，保留替代链和当前来源核验状态；无 run 上下文，使用与 CLI read 相同的审计视角。未知 key 或缺库返回空列表。该入口不会激活旧版、刷新 TTL、写入或迁移旧库，也不会把历史结果接入自动召回；没有 MCP history 工具。
 

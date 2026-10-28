@@ -38,11 +38,21 @@ class MCPReadOnlyTests(unittest.TestCase):
             self.request(1, "memory_search", {"query": "storage"}),
             self.request(2, "memory_read", {"id": "missing"}),
             self.request(3, "skill_list"),
+            {"jsonrpc": "2.0", "id": 4, "method": "tools/list"},
         ])
         self.assertEqual(json.loads(responses[1]["result"]["content"][0]["text"]), [])
         self.assertFalse(responses[1]["result"]["isError"])
         self.assertTrue(responses[2]["result"]["isError"])
         self.assertFalse(responses[3]["result"]["isError"])
+        tools = {tool["name"]: tool for tool in responses[4]["result"]["tools"]}
+        for tool in tools.values():
+            with self.subTest(tool=tool["name"]):
+                schema = tool["inputSchema"]
+                self.assertEqual(schema["type"], "object")
+                self.assertFalse(set(schema) & {"oneOf", "anyOf", "allOf"})
+        search_schema = tools["memory_search"]["inputSchema"]
+        self.assertEqual(set(search_schema["properties"]), {"query", "key", "level"})
+        self.assertFalse(search_schema["additionalProperties"])
         self.assertFalse(self.state.exists())
 
     def test_file_tools_protocol_preserves_files_and_missing_state(self):

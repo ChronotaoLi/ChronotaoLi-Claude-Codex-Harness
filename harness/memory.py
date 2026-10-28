@@ -507,6 +507,7 @@ class Memory:
         with self.connect() as db:
             rows = db.execute("SELECT * FROM memories WHERE active=1 AND (expires IS NULL OR expires>?)", (now,)).fetchall()
         found, excluded, source_cache, commit_cache, ledger_cache = [], [], {}, {}, {}
+        scoped, unmatched = [], []
         counts = dict(active_candidates=len(rows), matched=0, scope_excluded=0, applicable=0,
                       returned=0, limit_excluded=0)
         for row in rows:
@@ -535,16 +536,16 @@ class Memory:
                       "exclusion_stage": None, "returned": False}
             if key is not None and item["key"] != key or key is None and q and not matched:
                 detail["exclusion_stage"] = "match"
-                if diagnostics is not None and len(excluded) < 40:
-                    excluded.append(detail)
+                if diagnostics is not None and len(unmatched) < 40:
+                    unmatched.append(detail)
                 continue
             counts["matched"] += 1
             item.update(self._applicability(item, run_id, ledger_cache))
             if not item["applicable"]:
                 counts["scope_excluded"] += 1
                 detail["exclusion_stage"] = "scope"
-                if diagnostics is not None and len(excluded) < 40:
-                    excluded.append(detail)
+                if diagnostics is not None and len(scoped) < 40:
+                    scoped.append(detail)
                 continue
             counts["applicable"] += 1
             age = max(0, (now - item["created"]) / 86400)
@@ -578,7 +579,8 @@ class Memory:
                 selected["detail"] = item["detail"]
             results.append(selected)
         if diagnostics is not None:
-            details = (returned_details + excluded)[:40]
+            # Prefer candidates closest to selection over unrelated records.
+            details = (returned_details + excluded + scoped + unmatched)[:40]
             diagnostics.clear()
             diagnostics.update(mode="key" if key is not None else "query", query_excerpt=text[:1024],
                 query_sha256=hashlib.sha256(text.encode("utf-8")).hexdigest(), query_truncated=len(text) > 1024,
