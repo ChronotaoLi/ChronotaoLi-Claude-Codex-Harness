@@ -69,7 +69,8 @@ class IndependentCLICommandsTests(RepoCase):
         prefix = ["--repo", str(self.repo)]
         if config_path is not None:
             prefix.extend(["--config", str(config_path)])
-        with contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+        with patch("harness.operations.probe_cli", return_value={"path": None, "version": None}), \
+                contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
             code = main([*prefix, *args])
         return code, output.getvalue(), errors.getvalue()
 

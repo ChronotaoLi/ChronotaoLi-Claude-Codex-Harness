@@ -69,7 +69,9 @@ python3 -m harness --config /absolute/path/harness.toml --repo /absolute/path/to
 
 未传入 `--config` 时使用本 Harness 仓库的默认配置，不会按 `--repo` 自动选择目标项目配置。`run` 启动时输出实际配置路径和验证命令。后续 `resume` 应使用同一份配置；共享资源路径相对于配置文件所在目录。
 
-配置拒绝未知节和键，并指出完整路径。非 editable 安装不附带默认 `harness.toml` 与 `shared/`，执行任务需显式提供配置；`status`、`memory` 和 `cleanup-verification` 不依赖配置。运行事件和诊断写 stderr，`run`、`resume`、`demo` 的 stdout 保持单个 JSON 结果。
+从 Harness 源码目录对任意项目执行时，`--config`、`--repo` 等全局参数必须写在子命令之前，路径使用绝对路径。先运行 `doctor` 核对回显的 `harness.package`、`harness.revision`、`config.sha256` 与 `shared` 路径，确认加载的是预期的包和配置，而不是同名模块或另一份安装。每次 `run`／`resume` 自动在目标项目 `.harness/operations/` 写一份操作记录，可用 `--operation-id ID` 指定 ID，同名记录已存在时拒绝。统一入口、外层 agent 的操作边界、记录与报告模板见[操作与观察](docs/operations.md)。
+
+配置拒绝未知节和键，并指出完整路径。非 editable 安装不附带默认 `harness.toml` 与 `shared/`，执行任务需显式提供配置；`status`、`dashboard`、`memory` 和 `cleanup-verification` 不依赖配置。运行事件和诊断写 stderr，`run`、`resume`、`demo` 的 stdout 保持单个 JSON 结果。
 
 可用 `--plan /path/to/plan.json` 提供已有计划，格式见 [examples/plan.json](examples/plan.json)。输入在创建 run、分支和 worktree 前校验任务 ID、DAG、非空验收、范围和 skill。范围从仓库根目录匹配：`src/*` 只匹配直接子项，`src/**` 匹配所有层级，`**/*.py` 也匹配根目录文件；只有独立 `**` 路径段跨越 `/`。范围应覆盖必要测试与夹具。全仓库模式允许但会警告；`.git`、`.harness`、`.codex`、`.claude` 仍受保护。
 
@@ -119,12 +121,15 @@ setup_commands = [["npm", "ci"]]
 python3 -m harness --repo /path/to/project status
 python3 -m harness --repo /path/to/project status RUN
 python3 -m harness --repo /path/to/project status RUN --full
+python3 -m harness --repo /path/to/project dashboard --port 8765
 python3 -m harness --config /path/to/harness.toml --repo /path/to/project resume RUN
 python3 -m harness --config /path/to/harness.toml --repo /path/to/project abandon RUN
 python3 -m harness --repo /path/to/project cleanup-verification RUN
 ```
 
 `status RUN` 显示任务、预算和最后错误首行，`--full` 查看完整台账。`resume` 使用保存的现场和全新 agent，不恢复供应商会话，也不清零累计预算。可增加上下文、超时、轮数、尝试／派发／再规划／最终验收上限和 `max_tasks`，或追加精确 worker argv；其余配置及共享资产必须一致。
+
+`dashboard` 在 127.0.0.1 启动只读观察网页，stdout 只打印访问地址，Ctrl-C 停止；与 `status` 一样不加载配置。它不启动、恢复或修改 run，不取锁、不写文件、不探测进程：台账记为 running 不等于进程仍在工作，Claude 的结构化输出可能在调用结束才出现。费用按供应商分列，Claude 为 CLI 报告的估算费用而非账户账单，Codex 不报告美元。页面区块、调用阶段分类与文件访问边界见[观察网页用法与限制](docs/operations.md#观察网页用法与限制)。
 
 同一快照上的已保存阶段可复用：验证中断只重跑验证，审阅调用故障只新派发 reviewer，接受 hook 失败只重试 hook。worker 返回与阶段保存之间仍有可能重复调用的中断窗口。代码变化使旧批准失效，进程未确认退出、HEAD／Git 绑定异常或证据损坏会停止；完整保存顺序见[恢复协议](docs/recovery.md)。
 
@@ -238,6 +243,7 @@ claude_max_turns_by_role = { worker = 200 }
 <project>/.harness/
   memory.sqlite3
   generated/
+  operations/<op_id>.json  # 每次 run/resume 的自动操作记录
   runs/<run_id>/
     state.json          # 台账、预算、进程和分支
     events.jsonl        # 追加事件
@@ -251,6 +257,8 @@ claude_max_turns_by_role = { worker = 200 }
     checkpoints/       # 检查点和原始证据副本
   worktrees/<run_id>/   # 隔离分支中的代码
 ```
+
+`operations/` 保存每次 `run`／`resume` 的操作记录；台账的 `created_by_operation` 与 `events.jsonl` 中的 `run_created`／`run_resumed` 事件把 run 关联到对应记录，它们只是观察信息，不参与恢复判断，字段见[操作与观察](docs/operations.md#操作记录与记录模板)。
 
 运行时只把 `/.harness/` 加入目标项目的本地 `.git/info/exclude`，不改已跟踪 `.gitignore`。`.harness/` 属于被忽略的私有运行目录，不要提交运行现场、凭据或生成 MCP 配置；日志可能包含代码与业务内容。离线开发验证产物集中到 `.harness/validation/<批次>/`，登记结果并被后续验证覆盖后可清理，当前 `.harness/refactor/` 不迁移；详见[验证记录](docs/validation.md)。
 

@@ -26,6 +26,7 @@ class CLIControlsTests(RepoCase):
         output, errors = io.StringIO(), io.StringIO()
         try:
             with patch("harness.cli.Config.load", return_value=self.config), patch("harness.cli.Engine", side_effect=factory), \
+                    patch("harness.operations.probe_cli", return_value={"path": None, "version": None}), \
                     contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
                 code = main(["--repo", str(self.repo), *args])
         finally:

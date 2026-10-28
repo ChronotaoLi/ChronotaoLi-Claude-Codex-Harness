@@ -401,3 +401,17 @@ Codex 0.163.0 的本地 `debug prompt-input` 检查确认：未提交的 AGENTS.
 新增 1 项完整 Engine 生命周期测试，在构造实际供应商命令后使用模拟响应完成规划、执行、任务审阅和整体验收。检查 Codex 输出 schema 各层对象的所有字段均为必填、计划中的 required_commands 已纳入 required，同时本地仍接受省略该字段的旧计划，Claude worker 的 checkpoints 仍为可选。另以离线 schema 检查确认计划与再规划的投影仅改变 required，不修改原始契约，且 required_commands 省略或为空数组时均通过本地计划校验。
 
 本次仅调整 Codex 的供应商 schema 投影，设计文档已说明其与本地可选字段契约的区别。没有运行真实账号的 `harness smoke`、`harness.tool_smoke` 或 `harness.permission_smoke`；离线测试不证明真实 CLI 或模型调用成功。
+
+## 跨仓库说明、只读观察网页与自动操作记录验证（2026-10-28，台账 v11）
+
+执行 `python3 -m unittest discover -s tests -v`：908 项，907 项通过、1 项因本机文件系统拒绝非 UTF-8 文件名而跳过，Python 3.15.2，905.871 秒。基线 `667079e` 为 856 项（855 通过、1 跳过，885.736 秒）；本批新增 52 项。完整日志为 `.harness/validation/observation-20261028/full-unittest-final.log`。`python3 -m compileall -q harness tests`、`git diff --check` 与 README／docs 共 67 个本地链接目标检查通过。
+
+新增 `harness/operations.py`：每次 `run`／`resume` 在加载配置之后、构造引擎之前于 `<目标项目>/.harness/operations/<operation_id>.json` 独占创建操作记录（`O_EXCL`，先于 `git.ignore_state` 与一切其他写入），可用 `--operation-id` 指定；台账新增可选信息字段 `created_by_operation`，首次保存成功后尽力追加 `run_created` 事件、输出 `[harness-json]` 通知并把 run ID 写回记录，resume 在全部恢复门禁通过后同样处理；`doctor` 回显包路径、修订、本地修改、配置摘要、共享资产摘要与共享资源路径。23 项测试经真实 CLI、真实 Engine 与模拟后端覆盖：创建前失败只有记录、创建后失败保留关联、resume 记录与事件、ID 校验与四线程同名竞争只有一个成功、`KeyboardInterrupt` 退出码 130、通知与警告输出同时失败仍正常完成且绑定不缺、记录更新失败不改变退出码、含文件型输入时错误文本省略（计划、环境更新、操作者决定三种哨兵）、旧 run 无该字段照常恢复、doctor 新字段与退出语义。六个既有 CLI 夹具改为替身 CLI 探测并使用临时仓库，不再调用真实 `claude`／`codex --version` 或写 `/tmp/repo`。
+
+新增 `harness/observe.py`、`harness/dashboard.py`、`harness/dashboard_page.py` 与 `harness dashboard --port` 子命令：只读观察层复用 `status_summary`，`status` 列表改为同一投影；HTTP 服务只绑定 127.0.0.1，Host／Origin 精确匹配，线程创建前限制 8 个连接并带 socket 超时，所有响应含统一安全头与 CSP；文件只经固定根、组件正则、深度上限与排除清单读取，从构造时固定的 `.harness` 目录描述符逐级 `O_DIRECTORY|O_NOFOLLOW` 打开，末级 `O_NOFOLLOW|O_NONBLOCK` 并要求普通文件；费用按供应商分列、无合法费用时为 null、dispatch ID 去重、协调开销按角色识别；调用阶段按矛盾检测优先的六行表分类。29 项测试覆盖：DemoBackend run 的列表与详情、重复读取后 `.harness` 目录树路径与摘要一致、四类调用分类（含本地门禁失败归已知未调用）、费用 null 规则与同名 `planning` 任务不混入协调开销、`config_snapshot` 模型映射、events 不完整尾行、损坏台账与 `status_summary` 抛 `TypeError` 的隔离、深嵌套 JSON／400 位整数／非字符串 commander 只影响对应文件或区块、旧版本不可用区块、操作记录筛选、固定根与排除清单、目录与文件符号链接、FIFO、超限截断、Host／Origin／方法／路由状态码、含 `<script>` 的日志仍为 `text/plain`、8 个慢客户端占满后第 9 个连接得到带完整安全头的 503 并在超时后恢复、后端与各 `run_process` 导入位置及 `subprocess.Popen` 在服务开始后零调用、`run.lock` 不被创建或修改、文件索引上限共享、首个事件时间取首条可解析记录、描述符在构造时固定且目录缺失时 `dashboard` 退出 1 而 `status` 列表为空、子进程运行 `dashboard --port 0` 时 stdout 仅一行 URL 且 SIGTERM 后退出码 0，以及用 node 执行页面脚本确认默认路由渲染 run 列表、详情与文件视图只用 DOM API。
+
+使用 Python 3.11.17 执行 `test_operations`、`test_observe`、`test_dashboard`：52 项全部通过，39.789 秒，日志为 `.harness/validation/observation-20261028/python311-focused.log`。未在 Python 3.11 重跑完整套件。
+
+三轮独立 `gpt-6.1-sol` 审阅均为全新 `codex exec` 进程并保存独立 ID 与原始输出：规格审阅提出 6 项阻断（合法的本地门禁失败被误分类、中间目录替换逃逸、固定文件表不覆盖 `retry-N`／`verification-N`／嵌套 hook 目录、损坏台账的非 `HarnessError` 异常、操作 ID 冲突竞争窗口、新增通知可能留下无绑定 run）与 2 项建议，全部纳入规格后再实施；实现审阅发现首页 `#/` 路由失效、深嵌套与巨大整数逃出逐 run 隔离、索引上限差一、只读替身未打在实际导入位置、503 缺安全头、首个事件时间只看首行、描述符惰性打开，以及警告输出本身可抛错改变退出码、含文件输入时错误文本回显文件字段值；修复后确认审阅无剩余阻断。审阅记录保存在 `.harness/design-proposals/2026-10-28-execution/reviews/`。
+
+台账版本、模型 ID、预算、保存顺序、命令授权与接受门禁不变；`load_run` 必需字段表未新增。本批不实现有界规划调查、进程存活探测、远端访问、多仓库汇总、跨供应商 token 汇总或按公开单价估算账单。页面未在浏览器中人工验收（本机扩展未连接），只有 HTTP、curl 与 node 执行脚本的核对；所有 Harness 流程测试使用模拟模型响应及真实本地 Git／子进程，不证明真实模型调用成功；本轮未运行 `harness smoke`、`harness.tool_smoke` 或 `harness.permission_smoke`。

@@ -1,11 +1,13 @@
 """Own run creation, loading, recovery preflight and abandonment."""
 from __future__ import annotations
 
+import json
 import sys
 from copy import deepcopy
 from pathlib import Path
 
 from . import git
+from .operations import warn
 from .path_evidence import validate_dispatch_indexes
 from .services import RuntimeService
 from .shared import asset_digest, validate_mcp
@@ -28,6 +30,7 @@ class RunLifecycle(RuntimeService):
                   + git.describe_paths(untracked), file=sys.stderr, flush=True)
         ident = uid("run")
         worktree = runtime.state / "worktrees" / ident
+        operation = runtime.operation
         runtime.run = {"schema_version": 11, "id": ident, "repo": str(runtime.repo), "goal": goal, "status": "planning", "commander": runtime.commander,
                     "branch": "harness/" + ident, "worktree": str(worktree), "tasks": [], "accepted": {}, "attempts": {},
                     "attempt_budget_policy": "work",
@@ -43,9 +46,11 @@ class RunLifecycle(RuntimeService):
                     "decision_requests": [], "operator_decisions": [], "task_checkpoints": [], "checkpoint_batches": [],
                     "worktree_binding": {}, "ignored_baseline": [],
                     "pending_format_corrections": {}, "agent_dispatches": 0,
-                    "plan_approval_required": pause_after_plan, "plan_approved": not pause_after_plan}
+                    "plan_approval_required": pause_after_plan, "plan_approved": not pause_after_plan,
+                    "created_by_operation": getattr(operation, "id", None) if operation is not None else None}
         runtime.directory.mkdir(parents=True)
         runtime.save()
+        self.announce("run_created")
         with lock(runtime.directory / "run.lock"):
             try:
                 git.git(runtime.repo, "worktree", "add", "-b", runtime.run["branch"], str(worktree), "HEAD")
@@ -59,6 +64,30 @@ class RunLifecycle(RuntimeService):
             runtime.memory.repo = runtime.worktree
             runtime.memory.binding = runtime.run["worktree_binding"]
             return runtime.execute(plan, step=step)
+
+    def announce(self, event):
+        """Observation after a successful save: event, machine-readable stderr line, operation link.
+
+        Every step is best effort. The first save precedes the worktree binding,
+        so a failure here must not leave an unbound run: it only emits a warning
+        (which itself cannot raise) and never changes the lifecycle, the save
+        order or the exit status.
+        """
+        runtime = self.runtime
+        operation = runtime.operation
+        run_id = runtime.run["id"]
+        operation_id = getattr(operation, "id", None) if operation is not None else None
+        notice = json.dumps({"event": event, "run_id": run_id, "operation_id": operation_id},
+                            ensure_ascii=True, separators=(",", ":"))
+        steps = [("event", lambda: runtime.event(event, operation_id=operation_id)),
+                 ("notify", lambda: print("[harness-json] " + notice, file=sys.stderr, flush=True))]
+        if operation is not None:
+            steps.append(("link", lambda: operation.link(run_id)))
+        for name, step in steps:
+            try:
+                step()
+            except Exception as error:
+                warn(f"{event} 的观察步骤 {name} 失败，不影响运行：{error}")
 
     def load_run(self, ident):
         runtime = self.runtime
@@ -335,4 +364,7 @@ class RunLifecycle(RuntimeService):
                 runtime.run["plan_approved"] = True
                 runtime.event("plan_approved")
                 runtime.save()
+            # Announce only once every recovery gate has passed: a rejected
+            # resume must leave the ledger and its events byte-identical.
+            self.announce("run_resumed")
             return runtime.execute(step=step)

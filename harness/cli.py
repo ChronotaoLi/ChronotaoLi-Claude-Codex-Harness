@@ -11,13 +11,14 @@ import sys
 import tempfile
 from pathlib import Path
 
-from . import git
+from . import dashboard, git, observe
 from .adapters import DemoBackend
 from .budgets import work_attempts
 from .cleanup import cleanup_verification
 from .config import Config
 from .engine import Engine
 from .memory import Memory, bind_source_files
+from .operations import RUN_ID, OperationRecord, config_identity, digest_assets, harness_identity, shared_paths
 from .shared import mcp_configs, toml_value
 from .util import HarnessError, dump, read_json, write_json
 
@@ -34,6 +35,14 @@ def doctor(config):
         result["checks"][cli] = {"installed": True, "version": version.stdout.strip(), "logged_in": auth.returncode == 0}
     if shutil.which("orca"):
         result["orca"] = subprocess.run(["orca", "--version"], capture_output=True, text=True, timeout=15).stdout.strip()
+    # Echo what this process actually loaded so a wrong package, revision or
+    # configuration copy is visible before any run.
+    result["harness"] = harness_identity()
+    result["config"] = config_identity(config)
+    result["asset_digest"], asset_error = digest_assets(config)
+    if asset_error is not None:
+        result["asset_error"] = asset_error
+    result["shared"] = shared_paths(config)
     result["note"] = "登录检查不代表指定模型有权限；实际运行不会自动换模型。"
     print(dump(result))
     return 0 if all(c.get("logged_in") for c in result["checks"].values()) else 1
@@ -199,22 +208,13 @@ def show_status(args, state):
         ledger = read_ledger(state / "runs" / args.run_id / "state.json")
         print(dump(ledger if args.full else status_summary(ledger)))
         return
-    runs = []
-    for directory in sorted((state / "runs").glob("*/")):
-        path = directory / "state.json"
-        try:
-            run = read_ledger(path)
-        except (HarnessError, OSError, ValueError) as e:
-            print(f"harness: 跳过无法读取的运行台账 {path}：{e}", file=sys.stderr)
-            continue
-        fields = ("id", "status", "goal", "branch")
-        if any(key not in run for key in fields):
-            print(f"harness: 运行台账字段不完整 {path}", file=sys.stderr)
-        item = {key: run.get(key) for key in fields}
-        item["id"] = run.get("id", path.parent.name)
-        item["status"] = run.get("status", "unknown")
-        runs.append(item)
-    print(dump(runs))
+    # The read-only observation layer owns the list; stdout fields are unchanged.
+    listing = observe.list_runs(state)
+    for item in listing["skipped"]:
+        print(f"harness: 跳过无法读取的运行台账 {state / item['path']}：{item['reason']}", file=sys.stderr)
+    for path in listing["incomplete"]:
+        print(f"harness: 运行台账字段不完整 {state / path}", file=sys.stderr)
+    print(dump([{key: item[key] for key in ("id", "status", "goal", "branch")} for item in listing["runs"]]))
 
 
 def manage_memory(args, repo, state):
@@ -254,6 +254,97 @@ def manage_memory(args, repo, state):
         print(dump(memory.export()))
 
 
+def exit_status(error):
+    """The exit code _main/main yield for an exception escaping run or resume."""
+    if isinstance(error, KeyboardInterrupt):
+        return 130
+    if isinstance(error, SystemExit):
+        return error.code if isinstance(error.code, int) else (0 if error.code is None else 1)
+    return 1
+
+
+def operation_arguments(args):
+    """Invocation arguments for the record: file options are recorded as path text only."""
+    if args.command == "run":
+        return {"goal": args.goal, "plan": str(args.plan) if args.plan is not None else None,
+                "commander": args.commander, "pause_after_plan": args.pause_after_plan, "step": args.step}
+    return {"run_id": args.run_id, "approve_plan": args.approve_plan, "step": args.step,
+            "reverify": args.reverify, "retry_stopped": args.retry_stopped,
+            "confirm_exited": list(args.confirm_exited or ()), "repair_invalid": args.repair_invalid,
+            "environment_update": str(args.environment_update) if args.environment_update is not None else None,
+            "operator_decision": [str(path) for path in args.operator_decision or ()],
+            "allow_scope": list(args.allow_scope or ())}
+
+
+def resume_options(args):
+    options = {"retry_stopped": args.retry_stopped} if args.retry_stopped is not None else {}
+    if args.confirm_exited:
+        options["confirm_exited"] = args.confirm_exited
+    if args.repair_invalid is not None:
+        options["repair_invalid"] = args.repair_invalid
+    if args.environment_update is not None:
+        options["environment_update"] = args.environment_update
+    if args.operator_decision is not None:
+        options["operator_decision"] = (args.operator_decision[0] if len(args.operator_decision) == 1
+                                        else args.operator_decision)
+    if args.allow_scope:
+        options["allow_scope"] = args.allow_scope
+    return options
+
+
+def file_inputs_present(args):
+    if args.command == "run":
+        return args.plan is not None
+    return args.environment_update is not None or bool(args.operator_decision)
+
+
+def persisted_run_id(args, engine, state):
+    """Link only a run whose ledger file exists; never guess from directory listings."""
+    if args.command == "run":
+        run = getattr(engine, "run", None)
+        ident = run.get("id") if isinstance(run, dict) else None
+    else:
+        ident = args.run_id
+    try:
+        if isinstance(ident, str) and RUN_ID.fullmatch(ident) and (state / "runs" / ident / "state.json").is_file():
+            return ident
+    except OSError:
+        pass
+    return None
+
+
+def operate(args, config, repo, state):
+    """Run or resume under an exclusive operation record; the record never alters the exit code."""
+    if args.command == "run":
+        print(f"[harness] config={config.path}", file=sys.stderr)
+        print(f"[harness] verification={dump(config.data['verification']['commands'])}", file=sys.stderr)
+    operation = OperationRecord.create(state, kind=args.command, arguments=operation_arguments(args),
+                                       config=config, repo=repo, operation_id=args.operation_id,
+                                       file_inputs=file_inputs_present(args))
+    engine = None
+    # From here every failure, including diagnostic output, finishes the record.
+    try:
+        print(f"[harness] operation_id={operation.id} record={operation.path}", file=sys.stderr)
+        if args.command == "run":
+            engine = Engine(config, repo, commander=args.commander, operation=operation)
+            result = engine.start(args.goal, read_json(args.plan) if args.plan else None,
+                                  pause_after_plan=args.pause_after_plan, step=args.step)
+            keys = ("id", "status", "branch", "worktree", "accepted")
+        else:
+            engine = Engine(config, repo, operation=operation)
+            result = engine.resume(args.run_id, approve_plan=args.approve_plan, step=args.step,
+                                   reverify=args.reverify, **resume_options(args))
+            keys = ("id", "status", "branch", "worktree")
+        print(dump({**{key: result[key] for key in keys}, "operation_id": operation.id}))
+    except BaseException as error:
+        operation.finish(exit_status=exit_status(error), error=error,
+                         run_id=persisted_run_id(args, engine, state))
+        raise
+    operation.finish(exit_status=0, result_status=result.get("status") if isinstance(result, dict) else None,
+                     run_id=persisted_run_id(args, engine, state))
+    return 0
+
+
 def _main(argv=None):
     parser = argparse.ArgumentParser(description="Personal Harness — fresh task agents, independent review")
     parser.add_argument("--config", default=str(Path(__file__).resolve().parent.parent / "harness.toml"))
@@ -269,8 +360,10 @@ def _main(argv=None):
     run.add_argument("--plan", type=Path, help="使用已编写的 JSON 任务计划")
     run.add_argument("--pause-after-plan", action="store_true", help="保存计划并等待显式批准，再开始执行")
     run.add_argument("--step", action="store_true", help="最多接受一个任务后暂停；最后一个任务仍需整体验收")
+    run.add_argument("--operation-id", metavar="ID", help="本次操作记录的 ID；默认自动生成，已存在则拒绝")
     resume = sub.add_parser("resume")
     resume.add_argument("run_id")
+    resume.add_argument("--operation-id", metavar="ID", help="本次操作记录的 ID；默认自动生成，已存在则拒绝")
     resume.add_argument("--approve-plan", action="store_true", help="批准等待确认的计划并继续")
     resume.add_argument("--step", action="store_true", help="最多接受一个任务后暂停")
     resume.add_argument("--reverify", action="store_true", help="仅在本次恢复首次整体验收时重验失败快照；不重抽审阅结论，与 --retry-stopped 互斥")
@@ -288,6 +381,8 @@ def _main(argv=None):
     status = sub.add_parser("status")
     status.add_argument("run_id", nargs="?")
     status.add_argument("--full", action="store_true", help="输出完整运行台账")
+    dash = sub.add_parser("dashboard", help="在 127.0.0.1 启动只读观察网页；不加载配置，不探测进程，不修改 run")
+    dashboard.add_arguments(dash)
     abandon = sub.add_parser("abandon", help="放弃运行并保留分支与证据")
     abandon.add_argument("run_id")
     abandon.add_argument("--remove-worktree", action="store_true", help="同时移除无未保存文件的隔离工作树；保留分支与运行证据")
@@ -324,11 +419,15 @@ def _main(argv=None):
     if args.command == "status" and args.full and not args.run_id:
         parser.error("status --full 需要 run_id")
     try:
-        if args.command in ("status", "memory", "cleanup-verification"):
+        if args.command in ("status", "dashboard", "memory", "cleanup-verification"):
             repo = git.repository(args.repo)
             state = repo / ".harness"
             if args.command == "status":
                 show_status(args, state)
+            elif args.command == "dashboard":
+                # Serves until SIGINT/SIGTERM (main() maps them to KeyboardInterrupt,
+                # which serve() absorbs) and then returns 0; stdout is only the URL.
+                return dashboard.serve(state, args.port)
             elif args.command == "cleanup-verification":
                 result = cleanup_verification(repo, args.run_id, remove=args.remove,
                                               confirm_exited=args.confirm_exited or ())
@@ -349,30 +448,9 @@ def _main(argv=None):
             return 0
         repo = git.repository(args.repo)
         state = repo / ".harness"
-        if args.command == "run":
-            print(f"[harness] config={config.path}", file=sys.stderr)
-            print(f"[harness] verification={dump(config.data['verification']['commands'])}", file=sys.stderr)
-            engine = Engine(config, repo, commander=args.commander)
-            result = engine.start(args.goal, read_json(args.plan) if args.plan else None,
-                                  pause_after_plan=args.pause_after_plan, step=args.step)
-            print(dump({k: result[k] for k in ("id", "status", "branch", "worktree", "accepted")}))
-        elif args.command == "resume":
-            options = {"retry_stopped": args.retry_stopped} if args.retry_stopped is not None else {}
-            if args.confirm_exited:
-                options["confirm_exited"] = args.confirm_exited
-            if args.repair_invalid is not None:
-                options["repair_invalid"] = args.repair_invalid
-            if args.environment_update is not None:
-                options["environment_update"] = args.environment_update
-            if args.operator_decision is not None:
-                options["operator_decision"] = (args.operator_decision[0] if len(args.operator_decision) == 1
-                                                else args.operator_decision)
-            if args.allow_scope:
-                options["allow_scope"] = args.allow_scope
-            result = Engine(config, repo).resume(args.run_id, approve_plan=args.approve_plan, step=args.step,
-                                                reverify=args.reverify, **options)
-            print(dump({k: result[k] for k in ("id", "status", "branch", "worktree")}))
-        elif args.command == "abandon":
+        if args.command in ("run", "resume"):
+            return operate(args, config, repo, state)
+        if args.command == "abandon":
             options = {"confirm_exited": args.confirm_exited} if args.confirm_exited else {}
             result = Engine(config, repo).abandon(args.run_id, remove_worktree=args.remove_worktree, **options)
             print(dump(status_summary(result)))

@@ -1,5 +1,6 @@
 import contextlib
 import io
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -9,11 +10,17 @@ from harness.util import HarnessError
 
 
 class OperatorCLITests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.repo = Path(self.temp.name)
+
     def test_explicit_decision_path_reaches_engine_and_failure_is_reported(self):
         engine = Mock()
         engine.resume.side_effect = HarnessError("decision source has changed")
         errors = io.StringIO()
-        with patch("harness.cli.Config.load"), patch("harness.cli.git.repository", return_value=Path("/tmp/repo")), \
+        with patch("harness.cli.Config.load"), patch("harness.cli.git.repository", return_value=self.repo), \
+                patch("harness.operations.probe_cli", return_value={"path": None, "version": None}), \
                 patch("harness.cli.Engine", return_value=engine), contextlib.redirect_stderr(errors):
             code = _main(["resume", "run_test", "--operator-decision", "answer.json", "--step"])
         self.assertEqual(code, 1)
@@ -24,7 +31,8 @@ class OperatorCLITests(unittest.TestCase):
     def test_repeated_decision_paths_reach_engine_as_one_batch(self):
         engine = Mock()
         engine.resume.side_effect = HarnessError("batch rejected")
-        with patch("harness.cli.Config.load"), patch("harness.cli.git.repository", return_value=Path("/tmp/repo")), \
+        with patch("harness.cli.Config.load"), patch("harness.cli.git.repository", return_value=self.repo), \
+                patch("harness.operations.probe_cli", return_value={"path": None, "version": None}), \
                 patch("harness.cli.Engine", return_value=engine), contextlib.redirect_stderr(io.StringIO()):
             code = _main(["resume", "run_test", "--operator-decision", "a.json",
                           "--operator-decision", "b.json"])

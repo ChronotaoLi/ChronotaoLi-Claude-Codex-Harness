@@ -150,6 +150,7 @@ class CLIBoundaryTests(RepoCase):
         output, errors = io.StringIO(), io.StringIO()
         with contextlib.ExitStack() as stack:
             stack.enter_context(patch("harness.cli.Config.load", return_value=self.config))
+            stack.enter_context(patch("harness.operations.probe_cli", return_value={"path": None, "version": None}))
             for name, value in patches.items():
                 stack.enter_context(patch("harness.cli." + name, value))
             stack.enter_context(contextlib.redirect_stdout(output))

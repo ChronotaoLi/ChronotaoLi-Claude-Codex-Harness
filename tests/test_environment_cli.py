@@ -1,5 +1,6 @@
 import contextlib
 import io
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -9,12 +10,18 @@ from harness.util import HarnessError
 
 
 class EnvironmentCLITests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.repo = Path(self.temp.name)
+
     def invoke(self, extra, error=None):
         engine = Mock()
         engine.resume.return_value = dict(id="run_abc", status="paused", branch="test", worktree="/tmp/test")
         engine.resume.side_effect = error
         output, errors = io.StringIO(), io.StringIO()
-        with patch("harness.cli.Config.load"), patch("harness.cli.git.repository", return_value=Path("/tmp/repo")), \
+        with patch("harness.cli.Config.load"), patch("harness.cli.git.repository", return_value=self.repo), \
+                patch("harness.operations.probe_cli", return_value={"path": None, "version": None}), \
                 patch("harness.cli.Engine", return_value=engine), contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
             code = _main(["resume", "run_abc", *extra])
         return code, engine.resume, errors.getvalue()

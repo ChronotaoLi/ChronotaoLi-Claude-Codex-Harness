@@ -36,7 +36,7 @@ from .verification import Verification
 
 
 class Engine(EnvironmentRecovery, DecisionRecovery, ProgressRecovery, InvalidOutputRecovery, AttemptAccounting):
-    def __init__(self, config, repo, state=None, backend=None, commander="astra"):
+    def __init__(self, config, repo, state=None, backend=None, commander="astra", operation=None):
         self.config = config
         self.repo = git.repository(Path(repo))
         self.state = Path(state).resolve() if state else self.repo / ".harness"
@@ -44,6 +44,9 @@ class Engine(EnvironmentRecovery, DecisionRecovery, ProgressRecovery, InvalidOut
         self.memory = Memory(self.state / "memory.sqlite3")
         self.backend = backend or CLIBackend(config, self.state)
         self.commander = commander
+        # Observation only: an object with ``id`` and ``link(run_id)``, or None.
+        # It is informed after the first ledger save and never gates the lifecycle.
+        self.operation = operation
         self.hooks = Hooks(config)
         self.run = None
         self._packets = PacketBuilder(self)
