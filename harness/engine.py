@@ -328,6 +328,9 @@ class Engine(EnvironmentRecovery, DecisionRecovery, ProgressRecovery, InvalidOut
     def apply_pending_revision(self):
         return self._planning.apply_pending_revision()
 
+    def validate_retained_candidate(self, *, before=None, worker_task=None):
+        return self._planning.validate_retained_candidate(before=before, worker_task=worker_task)
+
     def preflight_final_context(self, tasks=None, original_tasks=None):
         return self._packets.preflight_final_context(tasks, original_tasks)
 
@@ -359,6 +362,7 @@ class Engine(EnvironmentRecovery, DecisionRecovery, ProgressRecovery, InvalidOut
 
     def execute(self, supplied_plan=None, *, step=False):
         try:
+            self.validate_retained_candidate()
             self.synchronize_decision_requests()
             stopped = self.run.get("replan_stopped")
             if stopped:

@@ -91,13 +91,21 @@ class Planner(RuntimeService):
         artifact = runtime.directory / "plans" / f"revision-{revision}.json"
         record = {"revision": revision, "reason": reason, "trigger": trigger,
                   "tasks": deepcopy(tasks), "artifact": str(artifact)}
+        retained = (runtime.run.get("pending_replan", {}).get("retained_candidate")
+                    if finish_replan else None)
+        if retained:
+            record["retained_candidate"] = deepcopy(retained)
         write_json(artifact, record)
         runtime.run["plan_history"].append(record)
         runtime.run["tasks"] = deepcopy(tasks)
         if revision == 0:
             runtime.run["commander_receipts"].pop("commander:plan:planning", None)
         if finish_replan:
-            runtime.run["current_task"] = None
+            runtime.run["current_task"] = retained["task_id"] if retained else None
+            if retained:
+                runtime.run["retained_candidate"] = deepcopy(retained)
+            else:
+                runtime.run.pop("retained_candidate", None)
             runtime.run.pop("pending_replan", None)
         runtime.save()
         if broad:
@@ -105,6 +113,85 @@ class Planner(RuntimeService):
             print("[harness] 警告：任务范围覆盖全仓库，受保护路径仍禁止修改："
                   + json.dumps(broad, ensure_ascii=True), file=sys.stderr, flush=True)
         runtime.report_command_requirements()
+
+    def description_revision_task(self, previous, tasks, trigger):
+        """Recognize only an actual description change to the current task."""
+        runtime = self.runtime
+        tid = trigger.get("task_id")
+        if (not tid or tid != runtime.run.get("current_task") or tid in runtime.run["accepted"]
+                or trigger.get("final_review") or len(previous) != len(tasks)):
+            return None
+        changed = []
+        for old, new in zip(previous, tasks):
+            if old != new:
+                if (old["id"] != tid or new.get("id") != tid
+                        or {k: v for k, v in old.items() if k != "description"}
+                        != {k: v for k, v in new.items() if k != "description"}):
+                    return None
+                changed.append(new)
+        return changed[0] if len(changed) == 1 else None
+
+    def validate_retained_candidate(self, *, pending=None, before=None, worker_task=None):
+        """Keep a saved candidate bound to its task until a fresh worker starts.
+
+        In particular, an unexplained change is not permission to archive/reset.
+        Old validated revisions without the policy keep their archive behavior.
+        """
+        runtime = self.runtime
+        owner = runtime.run if pending is None else pending
+        if pending is not None and pending.get("candidate_policy") != "retain":
+            if "candidate_policy" in pending or "retained_candidate" in pending:
+                raise HarnessError("再规划候选保留策略缺失；保留现场")
+            return
+        guard = owner.get("retained_candidate")
+        if guard is None and pending is None:
+            history = runtime.run.get("plan_history", [])
+            retained = history[-1].get("retained_candidate") if history else None
+            if retained and not any(
+                    entry.get("role") == "worker" and entry.get("task_id") == retained["task_id"]
+                    and entry.get("invoked") is True
+                    and entry.get("retained_candidate_revision") == retained["plan_revision"]
+                    for entry in runtime.run["dispatches"]):
+                raise HarnessError("再规划候选保留依据缺失且未交给 worker；保留现场")
+            return
+        if (not isinstance(guard, dict)
+                or any(not isinstance(guard.get(k), str) or not guard[k] for k in
+                       ("task_id", "head", "snapshot_digest", "artifact", "artifact_digest", "dispatch_id"))
+                or type(guard.get("plan_revision")) is not int):
+            raise HarnessError("再规划候选保留依据缺失或无效；保留现场")
+        revision = guard["plan_revision"]
+        history = runtime.run["plan_history"]
+        if revision < 1 or revision != len(history) - (1 if pending is None else 0):
+            raise HarnessError("再规划候选与计划版本不符；保留现场")
+        previous = history[revision - 1]["tasks"]
+        target = pending if pending is not None else history[revision]
+        if pending is None and target.get("retained_candidate") != guard:
+            raise HarnessError("再规划候选与计划记录不符；保留现场")
+        tasks, trigger = target["tasks"], target["trigger"]
+        task = self.description_revision_task(previous, tasks, trigger)
+        if (not task or task["id"] != guard["task_id"]
+                or runtime.run["tasks"] != (previous if pending is not None else tasks)
+                or runtime.run.get("pending_task") or runtime.run.get("pending_acceptance")
+                or worker_task is not None and worker_task != guard["task_id"]):
+            raise HarnessError("再规划候选与当前任务或说明修订不符；保留现场")
+        entry = next((d for d in runtime.run["dispatches"] if d["id"] == guard["dispatch_id"]), None)
+        if (not entry or (entry["role"], entry["kind"], entry["task_id"]) !=
+                ("commander", "replan", "replanning") or not entry.get("invoked", True)
+                or entry.get("snapshot_digest") != guard["snapshot_digest"]
+                or guard["artifact"] != str(runtime.directory / "dispatches" / entry["id"] / "returned-result.json")):
+            raise HarnessError("再规划候选与原派发不符；保留现场")
+        result, _ = read_bound_result(guard, "再规划候选依据的")
+        validate(result, envelope(REPLAN, "replanning", guard["dispatch_id"]))
+        payload = {key: value for key, value in result.items() if key not in ("task_id", "dispatch_id")}
+        if (result["action"] != "revise" or apply_revision(previous, payload, runtime.run["accepted"],
+                runtime.config.data["runtime"]["max_tasks"],
+                additional_allowed_paths=runtime.run.get("approved_scope", [])) != tasks):
+            raise HarnessError("再规划候选与原计划结果不符；保留现场")
+        candidate = runtime.snapshot() if before is None else before
+        if (guard["head"] != runtime.run["expected_head"] or candidate["head"] != guard["head"]
+                or snapshot_digest(candidate) != guard["snapshot_digest"]):
+            raise HarnessError("再规划保留候选的代码或暂存区已变化；保留现场，禁止归档重置")
+        runtime.check_task_scope(task)
 
     def validate_replan_selection(self, trigger):
         """Recheck the immutable selection that routed this task to replanning."""
@@ -226,6 +313,13 @@ class Planner(RuntimeService):
             raise HarnessError(f"指挥停止重新规划：{result['reason']}")
         runtime.run["pending_replan"].update(stage="validated", tasks=tasks, reason=result["reason"],
                                           artifact=str(artifact), head=runtime.run["expected_head"])
+        if self.description_revision_task(runtime.run["tasks"], tasks, trigger):
+            receipt = runtime.run["commander_receipts"]["commander:replan:replanning"]
+            guard = {key: receipt[key] for key in
+                     ("artifact", "artifact_digest", "dispatch_id", "snapshot_digest")}
+            guard.update(task_id=trigger["task_id"], head=runtime.run["expected_head"],
+                         plan_revision=len(runtime.run["plan_history"]))
+            runtime.run["pending_replan"].update(candidate_policy="retain", retained_candidate=guard)
         runtime.run["replan_attempts"] = attempt
         runtime.run["commander_receipts"].pop("commander:replan:replanning", None)
         runtime.save()
@@ -255,8 +349,12 @@ class Planner(RuntimeService):
         if runtime.run["expected_head"] != pending["head"] or git.head(runtime.worktree, binding=runtime.run["worktree_binding"]) != pending["head"]:
             raise HarnessError("应用再规划前 HEAD 与已校验计划不符；保留现场")
         runtime.preflight_final_context(pending["tasks"], runtime.run["original_tasks"])
+        runtime.ensure_exited()
+        self.validate_retained_candidate()
+        self.validate_retained_candidate(pending=pending)
+        retain = pending.get("candidate_policy") == "retain"
         # A new prerequisite may own another scope. Never carry the blocked task's edits into it.
-        if not git.clean(runtime.worktree, binding=runtime.run["worktree_binding"]):
+        if not retain and not git.clean(runtime.worktree, binding=runtime.run["worktree_binding"]):
             folder = runtime.directory / "recovery" / f"replan-{pending['attempt']}"
             if folder.exists():
                 folder = folder.with_name(folder.name + "-" + uid("retry"))
@@ -264,7 +362,8 @@ class Planner(RuntimeService):
                                             folder, runtime.state / "worktrees", binding=runtime.run["worktree_binding"])
             runtime.event("replan_edits_archived", task_id=pending["trigger"].get("task_id"), artifact=archive)
         runtime.run["feedback"] = {"replan": pending["artifact"], "trigger": compact_feedback(pending["trigger"])}
-        runtime.run.pop("worker_recovery", None)
+        if not retain:
+            runtime.run.pop("worker_recovery", None)
         runtime.run["pending_format_corrections"].clear()
         runtime.record_plan(pending["tasks"], pending["reason"], pending["trigger"], finish_replan=True)
         runtime.checkpoint()

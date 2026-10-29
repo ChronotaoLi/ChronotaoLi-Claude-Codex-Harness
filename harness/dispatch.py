@@ -240,6 +240,7 @@ class Dispatcher(RuntimeService):
             validate_mcp(runtime.config, roles=(role,))
             before = runtime.snapshot()
             entry["snapshot_digest"] = snapshot_digest(before)
+            runtime.validate_retained_candidate(before=before, worker_task=task_id if role == "worker" else None)
             runtime.validate_attempt_accounting()
             runtime.validate_invalid_repair_source(f"{role}:{kind}:{task_id}", before)
             if role == "commander":
@@ -285,6 +286,8 @@ class Dispatcher(RuntimeService):
             entry["process_state"] = "starting"
             entry["invoked"] = True
             entry["invoked_at"] = time.time()
+            if role == "worker" and runtime.run.get("retained_candidate"):
+                entry["retained_candidate_revision"] = runtime.run.pop("retained_candidate")["plan_revision"]
             runtime.save()
             invoked = True
             result = runtime.backend.invoke(role=role, model=runtime.config.role(role, runtime.commander), cwd=runtime.worktree,

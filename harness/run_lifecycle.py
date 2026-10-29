@@ -140,7 +140,7 @@ class RunLifecycle(RuntimeService):
             return value
 
         for field in ("pending_task", "pending_acceptance", "pending_post_accept", "pending_replan",
-                      "pending_directive", "worker_recovery", "replan_stopped"):
+                      "pending_directive", "worker_recovery", "replan_stopped", "retained_candidate"):
             if field in runtime.run:
                 mapping(runtime.run[field], field)
         if "pending_task" in runtime.run and "pending_replan" in runtime.run:
@@ -221,6 +221,14 @@ class RunLifecycle(RuntimeService):
                 reference(repair["corrected_dispatch_id"], key, field)
         for tid, recovery in runtime.run.get("worker_recovery", {}).items():
             source(recovery, f"worker:implement:{tid}", "worker_recovery." + tid)
+        owners = [("retained_candidate", runtime.run)]
+        if "pending_replan" in runtime.run:
+            owners.append(("pending_replan.retained_candidate", runtime.run["pending_replan"]))
+        for field, owner in owners:
+            if "retained_candidate" in owner or owner.get("candidate_policy") == "retain":
+                guard = mapping(owner.get("retained_candidate"), field)
+                task_reference(guard.get("task_id"), field + ".task_id")
+                source(guard, "commander:replan:replanning", field)
 
     def abandon(self, ident, *, remove_worktree=False, confirm_exited=()):
         runtime = self.runtime

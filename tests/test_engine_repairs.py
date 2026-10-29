@@ -336,8 +336,10 @@ class EngineRepairsTests(RepoCase):
             if kwargs["role"] == "worker" and sum(c["role"] == "worker" for c in backend.calls) == 1:
                 result.update(status="blocked", blocker_kind="task", blockers=["Need a clearer prerequisite"], summary="Blocked")
             elif kwargs["kind"] == "replan":
-                result.update(action="revise", reason="Clarify prerequisite work", new_tasks=[], updates=[{
-                    "id": "greet", "description": "Check prerequisites and implement the greeting", "add_depends_on": []}])
+                prerequisite = copy.deepcopy(self.plan()["tasks"][0])
+                prerequisite.update(id="prerequisite", title="Resolve prerequisite")
+                result.update(action="revise", reason="Resolve prerequisite work", new_tasks=[prerequisite], updates=[{
+                    "id": "greet", "description": "Implement after prerequisite", "add_depends_on": ["prerequisite"]}])
         backend = RecordingBackend(replan)
         engine = self.engine(backend)
         def fail_archive(repo, expected_head, archive, owned_root, **kwargs):
@@ -355,7 +357,7 @@ class EngineRepairsTests(RepoCase):
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["replan_attempts"], 1)
         self.assertEqual(sum(call["kind"] == "replan" for call in backend.calls), 1)
-        self.assertEqual(result["total_attempts"], 2)
+        self.assertEqual(result["total_attempts"], 3)
         self.assertNotIn("pending_replan", result)
         self.assertEqual((engine.directory / "recovery/replan-1/partial-evidence").read_text(), "preserve this failed attempt")
         self.assertEqual(len(list((engine.directory / "recovery").glob("replan-1-*/restored.json"))), 1)
