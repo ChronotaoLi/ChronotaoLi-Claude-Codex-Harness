@@ -78,14 +78,34 @@ def claude_error_summary(value):
             or not (value.get("is_error") or value.get("subtype", "success") != "success")):
         return ""
     details = []
+    if "is_error" in value:
+        flag = value["is_error"]
+        details.append("is_error=" + (str(flag).lower() if type(flag) is bool else "invalid"))
     subtype = value.get("subtype")
-    if isinstance(subtype, str):
-        details.append(json.dumps(subtype[:128], ensure_ascii=False))
+    if "subtype" in value:
+        known = ("success", "error_max_turns", "error_during_execution", "error_max_budget_usd",
+                 "error_max_structured_output_retries")
+        label = subtype if isinstance(subtype, str) and subtype in known else "unrecognized"
+        details.append("subtype=" + json.dumps(label))
+    # These fields are CLI envelope diagnostics, not instructions or evidence
+    # from the model's result. Unknown values stay private in process.stdout.
+    for field, known in (("terminal_reason", ("api_error",)),
+                         ("api_error", ("usage_limit_reached", "rate_limit_error", "overloaded_error",
+                                        "authentication_error", "permission_error", "invalid_request_error",
+                                        "not_found_error", "request_too_large", "api_error"))):
+        if field in value:
+            item = value[field]
+            label = item if isinstance(item, str) and item in known else "unrecognized"
+            details.append(field + "=" + json.dumps(label))
+    if "api_error_status" in value:
+        status = value["api_error_status"]
+        details.append("api_error_status=" + (str(status) if type(status) is int and 400 <= status <= 599
+                                              else "invalid"))
     errors = value.get("errors")
     if isinstance(errors, list):
-        details.extend(json.dumps(message[:240], ensure_ascii=False)
+        details.extend(json.dumps(message[:240], ensure_ascii=True)
                        for message in errors[:3] if isinstance(message, str))
-    return "Claude " + "; ".join(details) if details else "Claude reported an error"
+    return "Claude reported an error" + (": " + "; ".join(details) if details else "")
 
 
 def cli_error_summary(job, provider):
