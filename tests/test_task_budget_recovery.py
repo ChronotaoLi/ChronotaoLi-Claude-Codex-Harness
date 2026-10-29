@@ -2,7 +2,7 @@ import copy
 import json
 from pathlib import Path
 
-from harness.util import HarnessError, read_json
+from harness.util import HarnessError, read_json, write_json
 from test_harness import ROOT, RepoCase
 from test_runtime_changes import ScriptedBackend
 
@@ -69,7 +69,7 @@ class TaskBudgetRecoveryTests(RepoCase):
         self.assertEqual(artifact.read_bytes(), original_result)
         self.assert_budget_audit(resumed)
 
-    def test_increase_preserves_stop_until_explicit_retry_with_fresh_dispatch(self):
+    def test_increase_preserves_stop_until_explicit_decision_with_fresh_dispatch(self):
         self.config.data["runtime"]["max_tasks"] = 1
 
         def stop_then_revise(backend, kwargs, packet, result):
@@ -96,7 +96,17 @@ class TaskBudgetRecoveryTests(RepoCase):
         self.assertEqual(resumed.run["replan_attempts"], 1)
         self.assert_budget_audit(resumed)
 
-        result = self.engine(backend).resume(engine.run["id"], retry_stopped="greet")
+        state_path = engine.directory / "state.json"
+        before_retry = read_json(state_path)
+        with self.assertRaisesRegex(HarnessError, "--operator-decision"):
+            self.engine(backend).resume(engine.run["id"], retry_stopped="greet")
+        self.assertEqual(backend.calls, calls)
+        self.assertEqual(read_json(state_path), before_retry)
+        request = before_retry["decision_requests"][-1]
+        answer = self.repo / "continue-replan.json"
+        write_json(answer, {"schema_version": 1, "request_id": request["id"], "task_id": "greet",
+                            "decision": "continue", "summary": "Retry the original planning request with the increased task budget"})
+        result = self.engine(backend).resume(engine.run["id"], operator_decision=answer)
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["replan_attempts"], 2)
         self.assertEqual(result["attempts"], {"greet": 2, "prepare": 1})

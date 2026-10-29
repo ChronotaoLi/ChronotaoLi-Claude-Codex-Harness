@@ -106,8 +106,17 @@ class CommanderReceiptTests(RepoCase):
             resumed.resume(saved["id"])
         self.assertEqual(backend.calls, calls)
         self.assertEqual(resumed.run["replan_attempts"], 1)
-        with self.assertRaisesRegex(HarnessError, "停止重新规划"):
+        with self.assertRaisesRegex(HarnessError, "等待操作者决定"):
             self.engine(backend).resume(saved["id"], retry_stopped="greet")
+        self.assertEqual(backend.calls, calls)
+        stopped = read_json(engine.directory / "state.json")
+        self.assertEqual(stopped["agent_dispatches"], resumed.run["agent_dispatches"])
+        self.assertEqual(stopped["replan_attempts"], 1)
+        answer = self.repo / "continue-replan.json"
+        write_json(answer, {"schema_version": 1, "request_id": stopped["decision_requests"][0]["id"],
+                            "task_id": "greet", "decision": "continue", "summary": "Retry the saved request"})
+        with self.assertRaisesRegex(HarnessError, "停止重新规划"):
+            self.engine(backend).resume(saved["id"], operator_decision=answer)
         final = read_json(engine.directory / "state.json")
         replans = [d for d in final["dispatches"] if d["kind"] == "replan"]
         self.assertEqual(len(replans), 2)

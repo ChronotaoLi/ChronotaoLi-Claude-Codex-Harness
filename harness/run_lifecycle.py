@@ -311,9 +311,28 @@ class RunLifecycle(RuntimeService):
                 stopped = runtime.run.get("replan_stopped")
                 if not stopped or stopped["target"] != retry_stopped:
                     raise HarnessError("--retry-stopped 必须匹配已停止的任务 ID，或 final")
-                if any(r["kind"] == "replan_stop" and r["source"]["dispatch_id"] == stopped.get("dispatch_id")
-                       and r["response"] and r["response"]["decision"] == "stop" for r in runtime.decision_context()):
-                    raise HarnessError("操作者已决定停止；请使用 --operator-decision 显式更新该决定")
+                # Recover registration if interruption followed the saved stop.
+                # Retry must not erase an unanswered, attributable decision gate.
+                source_position = next((i for i, d in enumerate(runtime.run["dispatches"])
+                                        if d.get("id") == stopped.get("dispatch_id")), None)
+                if stopped.get("source_digest") and (source_position is None or not any(
+                        d.get("invoked", True) for d in runtime.run["dispatches"][source_position + 1:])):
+                    runtime.synchronize_decision_requests()
+                for request in runtime.decision_context():
+                    if (request["kind"] != "replan_stop" or request["task_id"] != stopped["target"]
+                            or request["question"] != stopped["reason"]
+                            or request["source"]["dispatch_id"] != stopped.get("dispatch_id")
+                            or stopped.get("source_digest") not in (None, request["source"]["artifact_digest"])):
+                        continue
+                    response = request["response"]
+                    boundary = response["dispatch_count"] if response else request["dispatch_count"]
+                    if any(d.get("invoked", True) for d in runtime.run["dispatches"][boundary:]):
+                        continue
+                    if response is None:
+                        raise runtime.decision_required(request)
+                    if response["decision"] == "stop":
+                        raise HarnessError(f"操作者已决定停止：request_id={request['id']}；"
+                                           "请使用 --operator-decision 显式更新为 continue")
             if allow_scope:
                 runtime.approve_scope_extensions(allow_scope)
             if repair_invalid is not None:

@@ -49,10 +49,23 @@ class OperationalControlsTests(RepoCase):
         code, _, _ = self.invoke(["resume", engine.run["id"]], Engine=factory)
         self.assertEqual(code, 1)
         self.assertEqual(len(backend.calls), calls)
-        code, _, _ = self.invoke(["resume", engine.run["id"], "--retry-stopped", "greet"], Engine=factory)
+        state_path = engine.directory / "state.json"
+        before_retry = read_json(state_path)
+        request = before_retry["decision_requests"][-1]
+        code, _, errors = self.invoke(["resume", engine.run["id"], "--retry-stopped", "greet"], Engine=factory)
+        self.assertEqual(code, 1)
+        self.assertIn(request["id"], errors)
+        self.assertIn("--operator-decision", errors)
+        self.assertEqual(len(backend.calls), calls)
+        self.assertEqual(read_json(state_path), before_retry)
+        answer = self.repo / "continue-replan.json"
+        write_json(answer, {"schema_version": 1, "request_id": request["id"], "task_id": "greet",
+                            "decision": "continue", "summary": "Explicitly retry the saved planning request"})
+        code, _, _ = self.invoke(["resume", engine.run["id"], "--operator-decision", str(answer)], Engine=factory)
         self.assertEqual(code, 1)  # The simulated commander explicitly stops again.
         self.assertEqual(len(backend.calls), calls + 1)
         self.assertEqual(backend.calls[-1]["kind"], "replan")
+        self.assertNotEqual(read_json(state_path)["decision_requests"][-1]["id"], request["id"])
         code, _, errors = self.invoke(["abandon", engine.run["id"]], Engine=factory)
         self.assertEqual(code, 0, errors)
         self.assertEqual(read_json(engine.directory / "state.json")["status"], "abandoned")

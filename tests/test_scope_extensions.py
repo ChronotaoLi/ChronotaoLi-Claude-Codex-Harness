@@ -5,7 +5,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from harness.contracts import apply_revision, validate_revision
-from harness.util import HarnessError, read_json
+from harness.util import HarnessError, read_json, write_json
 from test_harness import ROOT, RepoCase
 from test_runtime_changes import ScriptedBackend
 
@@ -129,9 +129,20 @@ class ScopeExtensionRecoveryTests(RepoCase):
                 self.assertEqual(packet["approved_scope"], ["support.txt"])
 
         retry_backend = ScriptedBackend(inspect_authority)
-        with self.assertRaisesRegex(HarnessError, "停止重新规划"):
+        state_path = engine.directory / "state.json"
+        before_retry = read_json(state_path)
+        request = before_retry["decision_requests"][-1]
+        with self.assertRaisesRegex(HarnessError, "--operator-decision"):
             self.engine(retry_backend).resume(engine.run["id"], retry_stopped="greet")
+        self.assertEqual(retry_backend.calls, [])
+        self.assertEqual(read_json(state_path), before_retry)
+        answer = self.repo / "continue-replan.json"
+        write_json(answer, {"schema_version": 1, "request_id": request["id"], "task_id": "greet",
+                            "decision": "continue", "summary": "Retry the original planning request with approved scope"})
+        with self.assertRaisesRegex(HarnessError, "停止重新规划"):
+            self.engine(retry_backend).resume(engine.run["id"], operator_decision=answer)
         self.assertEqual([call["kind"] for call in retry_backend.calls], ["replan"])
+        self.assertNotEqual(read_json(state_path)["decision_requests"][-1]["id"], request["id"])
 
     def test_scope_approval_requires_an_unvalidated_or_stopped_replan(self):
         engine = self.engine()

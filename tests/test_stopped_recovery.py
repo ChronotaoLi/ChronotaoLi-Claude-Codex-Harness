@@ -4,7 +4,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from harness import git
-from harness.util import HarnessError, read_json, run_process
+from harness.util import HarnessError, read_json, run_process, write_json
 from test_harness import ROOT, RepoCase
 from test_runtime_changes import ScriptedBackend, finding
 
@@ -12,6 +12,13 @@ from test_runtime_changes import ScriptedBackend, finding
 class StoppedRecoveryTests(RepoCase):
     def plan(self):
         return read_json(ROOT / "examples" / "plan.json")
+
+    def answer_stop(self, engine):
+        request = read_json(engine.directory / "state.json")["decision_requests"][-1]
+        path = self.repo / "operator-choice.json"
+        write_json(path, {"schema_version": 1, "request_id": request["id"], "task_id": request["task_id"],
+                          "decision": "continue", "summary": "Explicitly reopen the original planning request"})
+        return path
 
     def stopped_backend(self):
         def change(backend, kwargs, packet, result):
@@ -23,7 +30,7 @@ class StoppedRecoveryTests(RepoCase):
                                         "add_depends_on": []}])
         return ScriptedBackend(change)
 
-    def test_stop_survives_plain_resume_and_explicit_retry_reopens_only_planning(self):
+    def test_stop_survives_plain_resume_and_explicit_answer_reopens_only_planning(self):
         backend = self.stopped_backend()
         engine = self.engine(backend)
         with self.assertRaises(HarnessError):
@@ -39,14 +46,17 @@ class StoppedRecoveryTests(RepoCase):
         with self.assertRaises(HarnessError):
             self.engine(backend).resume(engine.run["id"], retry_stopped="final")
         self.assertEqual(backend.calls, calls)
-        result = self.engine(backend).resume(engine.run["id"], retry_stopped="greet")
+        with self.assertRaisesRegex(HarnessError, "--operator-decision"):
+            self.engine(backend).resume(engine.run["id"], retry_stopped="greet")
+        self.assertEqual(backend.calls, calls)
+        result = self.engine(backend).resume(engine.run["id"], operator_decision=self.answer_stop(engine))
         self.assertEqual(backend.calls[len(calls)]["kind"], "replan")
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["attempts"], {"greet": 2})
         self.assertEqual(result["replan_attempts"], 2)
         self.assertNotIn("replan_stopped", result)
 
-    def test_explicit_retry_preserves_request_when_replan_budget_is_exhausted(self):
+    def test_explicit_answer_preserves_request_when_replan_budget_is_exhausted(self):
         self.config.data["runtime"]["max_replans"] = 1
         backend = self.stopped_backend()
         engine = self.engine(backend)
@@ -55,7 +65,7 @@ class StoppedRecoveryTests(RepoCase):
         calls = len(backend.calls)
         resumed = self.engine(backend)
         with self.assertRaises(HarnessError):
-            resumed.resume(engine.run["id"], retry_stopped="greet")
+            resumed.resume(engine.run["id"], operator_decision=self.answer_stop(engine))
         self.assertEqual(len(backend.calls), calls)
         self.assertIn("pending_replan", resumed.run)
         self.config.data["runtime"]["max_replans"] = 2
@@ -100,8 +110,12 @@ class StoppedRecoveryTests(RepoCase):
                 self.assertEqual(backend.calls, calls_before)
 
                 resumed = self.engine(backend)
-                with self.assertRaisesRegex(HarnessError, "停止重新规划"):
+                with self.assertRaisesRegex(HarnessError, "--operator-decision"):
                     resumed.resume(engine.run["id"], retry_stopped=target, confirm_exited=[dispatch["id"]])
+                self.assertEqual(backend.calls, calls_before)
+                self.assertEqual(read_json(state_path)["replan_stopped"], stop_before)
+                with self.assertRaisesRegex(HarnessError, "停止重新规划"):
+                    resumed.resume(engine.run["id"], operator_decision=self.answer_stop(engine))
                 self.assertEqual(len(backend.calls), len(calls_before) + 1)
                 self.assertEqual(backend.calls[-1]["kind"], "replan")
                 self.assertEqual(read_json(engine.directory / "plans" / "replan-2.json")["trigger"], stop_before["trigger"])
@@ -163,7 +177,7 @@ class StoppedRecoveryTests(RepoCase):
                 self.engine(backend).resume(engine.run["id"], **options)
             self.assertEqual(backend.calls, calls)
 
-    def test_final_stop_retry_replans_before_a_new_snapshot_can_be_reviewed(self):
+    def test_final_stop_answer_replans_before_a_new_snapshot_can_be_reviewed(self):
         def change(backend, kwargs, packet, result):
             if kwargs["kind"] == "final_review" and sum(c["kind"] == "final_review" for c in backend.calls) == 1:
                 result.update(verdict="request_changes", findings=[finding()])
@@ -182,7 +196,7 @@ class StoppedRecoveryTests(RepoCase):
         with self.assertRaises(HarnessError):
             self.engine(backend).resume(engine.run["id"])
         self.assertEqual(len(backend.calls), calls)
-        result = self.engine(backend).resume(engine.run["id"], retry_stopped="final")
+        result = self.engine(backend).resume(engine.run["id"], operator_decision=self.answer_stop(engine))
         self.assertEqual(backend.calls[calls]["kind"], "replan")
         self.assertEqual([r["status"] for r in result["final_history"]], ["rejected", "approved"])
         self.assertEqual(result["status"], "completed")
