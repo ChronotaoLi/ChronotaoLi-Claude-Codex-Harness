@@ -90,6 +90,8 @@ python3 -m harness --config /path/to/harness.toml --repo /path/to/project resume
 
 `RUN` 替换为实际 run ID。`--pause-after-plan` 等待显式 `--approve-plan`，普通恢复不会批准。`--step` 最多接受一个任务后暂停，最后一个任务完成后仍执行整体验收。
 
+再规划若仅细化当前未接受任务的说明，会核验并保留该任务的候选代码，继续交给同一任务的新 worker；新增任务或依赖仍先归档未接受修改。已登记的停止规划请求须通过 `resume RUN --operator-decision FILE` 明确回答，`--retry-stopped` 不能跳过未回答的决定。详见[恢复协议](docs/recovery.md)。
+
 所有更改在 `<目标项目>/.harness/worktrees/<run_id>` 的 `harness/<run_id>` 分支完成。每个通过检查和审阅的任务生成本地提交。成功输出分支和路径，便于查看 diff、merge 或 cherry-pick；最终集成由你操作。
 
 ## 验收与隔离
@@ -139,7 +141,7 @@ python3 -m harness --repo /path/to/project cleanup-verification RUN
 | 精确命令未授权 | 追加配置后普通 `resume RUN` |
 | 已保存 worker 环境阻断 | 修复条件后 `resume RUN --environment-update FILE` |
 | 等待用户决定 | 从 status 取 request ID，`resume RUN --operator-decision FILE`；可重复参数一次回答多项 |
-| 指挥明确停止 | `resume RUN --retry-stopped TASK_ID`，整体阶段用 `final` |
+| 指挥明确停止 | 已登记的有效请求用 `resume RUN --operator-decision FILE` 回答；无可用请求的历史停止用 `--retry-stopped TASK_ID`，整体阶段用 `final` |
 | 再规划需要额外范围 | `resume RUN --allow-scope 'config/**'`；停止状态另需显式重试 |
 | 最终验证普通非零退出 | 正常修正规划；确认环境已修复时可显式 `resume RUN --reverify` |
 | 可受控修正的非法结果 | `resume RUN --repair-invalid DISPATCH_ID` |

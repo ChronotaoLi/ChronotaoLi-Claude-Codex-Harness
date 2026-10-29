@@ -24,7 +24,7 @@ from .packets import PacketBuilder
 from .planning import Planner
 from .progress import ProgressRecovery
 from .receipts import ResultReceipts
-from .recovery import InvalidOutputRecovery, snapshot_digest
+from .recovery import InvalidOutputRecovery, invalidate_acceptance_review, snapshot_digest
 from .run_lifecycle import RunLifecycle
 from .shared import Hooks
 from .task_lifecycle import TaskLifecycle
@@ -363,6 +363,8 @@ class Engine(EnvironmentRecovery, DecisionRecovery, ProgressRecovery, InvalidOut
     def execute(self, supplied_plan=None, *, step=False):
         try:
             self.validate_retained_candidate()
+            if invalidate_acceptance_review(self.run):
+                self.save()
             self.synchronize_decision_requests()
             stopped = self.run.get("replan_stopped")
             if stopped:

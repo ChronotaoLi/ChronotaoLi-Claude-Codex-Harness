@@ -16,7 +16,7 @@ from .contracts import (
 from .memory import validate_proposals
 from .path_evidence import validate_dispatch_indexes
 from .progress import CheckpointDeclarationError
-from .recovery import snapshot_digest
+from .recovery import invalidate_acceptance_review, snapshot_digest, worker_recovery_context
 from .services import RuntimeService
 from .shared import HookError
 from .util import dump, HarnessError, read_json, write_json
@@ -108,7 +108,7 @@ class TaskLifecycle(RuntimeService):
                         {"goal": runtime.run["goal"], "ready": ready, "accepted": runtime.accepted_context(),
                          "feedback": compact_feedback(runtime.run.get("feedback")), "attempts": runtime.run["attempts"],
                          "work_attempts": work_attempts(runtime.run),
-                         "recovery": deepcopy(runtime.run.get("worker_recovery", {}).get(current)) if current in {t["id"] for t in ready} else None,
+                         "recovery": worker_recovery_context(runtime.run, runtime.directory, current) if current in {t["id"] for t in ready} else None,
                          "tool_constraints": runtime.tool_constraints(),
                          "instruction": "Select one ready task and return action=implement for a feasible implementation or repair. Return action=replan when feedback exposes missing prerequisites or acceptance that cannot be met within current scope and decisions; explain the unmet requirement in instruction. Replanning can stop without another worker. Retain the original acceptance: completing a report of unresolved failures is not completing the task."}, task=ready[0])
         task = next(t for t in ready if t["id"] == directive["selected_task"])
@@ -142,7 +142,7 @@ class TaskLifecycle(RuntimeService):
         result = runtime.dispatch("worker", "implement", tid, WORK,
                  {"goal": runtime.run["goal"], "task": task, "instruction": directive["instruction"],
                   "feedback": compact_feedback(runtime.run.get("feedback"), prior_reviews), "prior_reviews": prior_reviews,
-                  "recovery": deepcopy(runtime.run.get("worker_recovery", {}).get(tid)),
+                  "recovery": worker_recovery_context(runtime.run, runtime.directory, tid),
                   "dependencies": {d: runtime.accepted_context()[d] for d in task["depends_on"]},
                   "handoff_targets": runtime.handoff_targets(tid),
                   "verification_commands": runtime.config.data["verification"]["commands"],
@@ -334,7 +334,7 @@ class TaskLifecycle(RuntimeService):
                   "diff_artifact": str(evidence), "verification": compact_checks(checks),
                   "ignored_paths": deepcopy(runtime.run.get("ignored_diagnostics")),
                   "prior_reviews": prior_reviews,
-                  "recovery": deepcopy(runtime.run.get("worker_recovery", {}).get(tid)),
+                  "recovery": worker_recovery_context(runtime.run, runtime.directory, tid),
                   "proposed_memories": proposals,
                   "decision_requests": deepcopy(pending["worker_result"].get("decision_requests", [])),
                   "tool_constraints": runtime.tool_constraints(),
@@ -419,10 +419,13 @@ class TaskLifecycle(RuntimeService):
         task = next(task for task in runtime.run["tasks"] if task["id"] == tid)
         runtime.ensure_exited()
         if snapshot_digest(runtime.snapshot()) != pending["snapshot_digest"]:
-            runtime.run.pop("pending_acceptance")
-            runtime.run["feedback"] = {"task_id": tid, "acceptance": {
+            feedback = {"task_id": tid, "acceptance": {
                 "error": "待接受文件已变化，旧审阅失效；需要重新验证和独立审阅",
                 "review_artifact": pending["review_artifact"]}}
+            invalidate_acceptance_review(runtime.run, feedback, attempt=attempt,
+                                         candidate_digest=pending["snapshot_digest"])
+            runtime.run.pop("pending_acceptance")
+            runtime.run["feedback"] = feedback
             runtime.save()
             runtime.event("pending_acceptance_invalidated", task_id=tid)
             return False

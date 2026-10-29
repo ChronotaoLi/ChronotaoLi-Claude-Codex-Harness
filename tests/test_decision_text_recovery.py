@@ -97,12 +97,21 @@ class DecisionTextRecoveryTests(RepoCase):
                 self.assertEqual(state['dispatches'][-1]['status'], 'failed')
                 self.assertFalse(any(d['role'] == 'verification' for d in state['dispatches']))
                 calls = len(backend.calls)
+                original_change = backend.change
+
+                def inspect_recovery(backend, kwargs, packet, returned):
+                    original_change(backend, kwargs, packet, returned)
+                    if packet.get('recovery'):
+                        self.assertEqual(self.saved(engine)['worker_recovery']['greet'], recovery)
+
+                backend.change = inspect_recovery
                 result = self.engine(backend).resume(engine.run['id'])
                 self.assertEqual(result['status'], 'completed')
                 resumed = backend.calls[calls:]
                 for role in ('commander', 'worker'):
                     call = next(c for c in resumed if c['role'] == role)
-                    self.assertEqual(call['packet']['recovery'], recovery)
+                    projected = call['packet']['recovery']
+                    self.assertEqual({key: projected[key] for key in recovery}, recovery)
 
     def test_legacy_accepted_handoff_registers_gate_without_reaccepting(self):
         backend = self.backend(handoff='Proceed\0?')
