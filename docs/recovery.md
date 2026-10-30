@@ -97,7 +97,7 @@ python3 -m harness --config /path/to/harness.toml --repo /path/to/project resume
 
 对长时间中断后 pgid 被复用的情况，采用显式确认而非根据组长身份自动推断整个进程组已退出。`resume` 与 `abandon` 的 `--confirm-exited <dispatch_id>` 在运行锁内校验全部 ID，先追加操作事件，再只更新指定记录的退出确认。事件记录当时的组存活探测及组长 PID、PPID、PGID、启动时间和命令名（或探测错误）；组长缺失不构成自动退出证明，不发送终止信号。确认不放宽其他恢复或工作树移除检查。
 
-运行与验证清理共用进程退出判定。派发在准备阶段保存 `process_state=prepared`，真正调用后端前与预算一起保存 `starting`，启动回调记录 pgid 后转为 `running`；受控结束记录退出。只有明确的准备状态可以证明尚未尝试启动，`starting` 或旧台账中无 pgid 且未确认退出的条目均停止恢复与清理，覆盖子进程已启动但 pgid 尚未落盘的中断窗口。`cleanup-verification --confirm-exited ID` 提供无需运行配置的同一审计确认入口，兼容 v7/v8/v9/v10/v11，也支持 completed/abandoned，不恢复执行或改写终态。
+运行、运行工作树清理与验证清理共用进程退出判定。派发在准备阶段保存 `process_state=prepared`，真正调用后端前与预算一起保存 `starting`，启动回调记录 pgid 后转为 `running`；受控结束记录退出。只有明确的准备状态可以证明尚未尝试启动，`starting` 或旧台账中无 pgid 且未确认退出的条目均停止恢复与清理，覆盖子进程已启动但 pgid 尚未落盘的中断窗口。`cleanup-verification RUN --confirm-exited ID` 与终态的 `cleanup-run RUN --confirm-exited ID` 提供无需运行配置的同一审计确认入口，兼容 v7/v8/v9/v10/v11，不恢复执行或改写终态。
 
 worker 完成且结果通过检查后，持久化 `pending_task` 的 verifying 阶段及完整快照摘要；验证成功后持久化 reviewing 阶段、diff、验证产物路径、记忆提案和历轮审阅。恢复时先检查范围、HEAD 和快照；一致则继续未完成阶段，不再派发 worker 或消耗 worker 额度。验证重跑使用新的日志目录。候选变化使后续证据失效，回到新的工作尝试；越界残留先停止并提示人工核对清理，不自动删文件，不派发模型或消耗 worker 额度。
 
@@ -123,7 +123,7 @@ worker 的格式修正一旦返回结果，就结束该待修正状态，即使�
 
 worker 的失败反馈共享 9,000 字符的序列化摘录额度，保留状态、blocker 类型、各数组数量、记忆提案 key、完整结果路径及 SHA-256；后续使用前核验原始结果，缺失或改变则停止。完整执行证据和待审阅记忆提案不裁剪；必要标识和引用仍超过输入总预算时停止。身份和语义合法、但存在格式错误的 `blocked/task` 结果仍保存再规划意图，停止后 resume 直接进入有界再规划，不先重复 worker；环境 blocker 仍由操作者处理。
 
-配置采用封闭键集合，拒绝未知顶层节和各节、角色字段，错误给出完整键路径。`status`、`memory` 与 `cleanup-verification` 不加载运行配置；源码外安装执行任务需显式提供配置和共享资源。运行事件、预检提示与 demo 横幅写 stderr，结果 JSON 保持 stdout 可独立解析。
+配置采用封闭键集合，拒绝未知顶层节和各节、角色字段，错误给出完整键路径。`status`、`watch`、`dashboard`、`memory`、`cleanup-run` 与 `cleanup-verification` 不加载运行配置；源码外安装执行任务需显式提供配置和共享资源。运行事件、预检提示与 demo 横幅写 stderr，结果 JSON 保持 stdout 可独立解析。
 
 计划确认和单步执行为显式选项：默认连续执行；选择暂停确认后必须显式批准。任何无回复或重复恢复都不能代替批准。step 以一个已接受任务为边界；最后一个任务之后还需要整体检查。
 
@@ -278,6 +278,8 @@ worker 独有的 `harness_commands` broker 在 dispatch 私有 `commands/` 中�
 
 新运行台账为版本 11，保存环境更新、可复用检查点、操作者决定和命令子进程证据。未完成的版本 8、9、10 在恢复预检通过后升级，原预算、证据和历史保留；共享资产摘要仍须匹配，更新本仓库规则不构成继续旧 run 的授权。版本 7 及更早台账可通过 `status` 查看，不能直接恢复执行。列出状态时，损坏或缺失的台账会产生诊断，不阻止查看其他运行。已完成 run 的普通 `resume` 直接返回保存结果，不比较执行配置或共享资产，不升级台账、不派发或记账；CLI 仍需能加载当前配置与 hooks。已完成 run 拒绝 `--confirm-exited`、`--repair-invalid`、`--allow-scope`、`--environment-update` 和 `--operator-decision`；`--reverify`、`--retry-stopped`、`--approve-plan`、`--step` 不生效。
 
+终态工作树由独立的 `cleanup-run` 预览或移除，不借助 `resume` 或改写为其他终态。该入口接受显式退出确认，清理回执保存在 `worktree-cleanup.json`，不升级台账；只有显式 `--confirm-exited` 才更新对应进程的审计与确认字段。
+
 ## 计划范围与命令前置条件
 
 可用 `--plan /path/to/plan.json` 提供已有计划，格式见 [examples/plan.json](../examples/plan.json)。计划会检查任务 ID、依赖环、非空验收条件、文件范围及引用的 skill 是否存在。`allowed_paths` 从仓库根目录匹配：`src/*` 只匹配直接子项，`src/**` 匹配所有层级，`**/*.py` 也可匹配根目录 Python 文件；只有独立的 `**` 路径段跨越 `/`。显式指向 `.git`、`.harness`、`.codex`、`.claude` 的范围在规划时拒绝，实际变更仍会独立检查这些受保护路径。唯一就绪任务在首次尝试且没有反馈时直接使用完整任务简报派发；存在选择或返工反馈时才调用指挥。
@@ -302,6 +304,8 @@ worker 独有的 `harness_commands` broker 在 dispatch 私有 `commands/` 中�
 
 所有恢复和清理入口都核对父 dispatch 及 broker 命令子进程；父进程退出不能证明子进程已退出。旧 dispatch 没有可确认的退出记录时，清理与恢复均停止；缺少 pgid 不能证明进程未启动。核实退出后可执行 `cleanup-verification RUN --confirm-exited DISPATCH_ID`，可重复指定 ID，也可与 `--remove` 合用。此确认入口支持已完成或已放弃的 run，先保存审计事件，再更新指定 dispatch 的确认，不改变 run 状态或放松文件清理门禁。未指定确认时，预览不改运行台账。
 
+`cleanup-run RUN --confirm-exited DISPATCH_ID` 使用同一退出确认规则；即使未加 `--remove`，显式确认仍会写入审计与台账。它还核验 dispatch 的路径证据索引，不把证据损坏视为可清理依据。
+
 移除前还独立核对已跟踪文件的字节与 HEAD，并拒绝 `assume-unchanged`、`skip-worktree` 标记。换行转换或 clean/smudge 过滤导致工作树字节不同，也会保守拒绝；此时可只放弃运行并保留工作树。
 
 未跟踪文件（包括忽略文件）导致清理失败时，错误列出前 10 个阻塞路径及剩余数量，长路径作有界显示；这些文件仍需人工核对，不自动删除。
@@ -313,6 +317,8 @@ worker 独有的 `harness_commands` broker 在 dispatch 私有 `commands/` 中�
 若验证中途产生未忽略的新文件，可在核对内容后，通过 `git rev-parse --git-common-dir` 定位公共 Git 目录，在其 `info/exclude` 中加入精确生成产物模式，再恢复。linked worktree 共用该文件；这会改变后续快照可见范围，不豁免已跟踪文件，不能用宽泛模式掩盖待交付代码。
 
 `abandon RUN` 保留分支、工作树和证据并禁止恢复；`--remove-worktree` 只移除该 run 的干净工作树。旧进程未确认退出、HEAD 不符或有任何未保存文件（包括忽略文件）时拒绝移除，不使用强制删除；全新验证检出由 `cleanup-verification RUN --remove` 独立清理。
+
+`cleanup-run RUN` 仅预览 completed／abandoned 运行的工作树；加 `--remove` 后移除，保留原终态、分支及全部运行证据。命令不加载配置或调用模型，在运行锁内核对台账归属、原分支与检查点、Git 双向绑定、所有进程退出和文件原始字节；忽略文件、隐藏索引标记、嵌套 `.harness` 均阻止移除。清理前先写入绑定台账字节摘要、Git 绑定及 HEAD 的 pending 回执，重复核验后移除，再将回执记为 removed。中断后若路径已不存在，必须有匹配的清理意图（或已有的放弃清理记录），且该路径的 Git 注册与管理目录也已消失，才能确认完成；不执行全仓库 prune。回执损坏、归属不符或路径重现时拒绝继续。应先清理工作树，再由操作者决定是否删除保留的分支。
 
 ## Hooks 与共享资产兼容
 

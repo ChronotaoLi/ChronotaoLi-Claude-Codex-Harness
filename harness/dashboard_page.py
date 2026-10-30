@@ -19,10 +19,11 @@ INDEX_HTML = """<!DOCTYPE html>
   <div class="controls">
     <span id="sampled" class="muted"></span>
     <button id="refresh" type="button">刷新</button>
-    <label><input id="auto" type="checkbox"> 每 10 秒自动刷新</label>
+    <label><input id="auto" type="checkbox" checked> 跟随运行变化</label>
+    <span id="connection" class="muted"></span>
   </div>
 </header>
-<p class="muted note">只读本地视图：不探测进程、不启动或恢复 run、不修改任何文件。各文件分别读取，不是原子快照。</p>
+<p class="muted note">只读本地视图：运行详情按文件事件更新；连接在线不代表模型仍在工作。各文件分别读取，不是原子快照。</p>
 <main id="main"><p class="muted">载入中…</p></main>
 <script src="/app.js"></script>
 </body>
@@ -80,7 +81,56 @@ APP_JS = r""""use strict";
   var MAX_TAIL = 1048576;
   var main = document.getElementById("main");
   var sampledLabel = document.getElementById("sampled");
-  var timer = null;
+  var stream = null;
+  var streamRun = null;
+  var refreshTimer = null;
+  var renderSequence = 0;
+  var connectionLabel = document.getElementById("connection");
+
+  function connectionText(text) {
+    if (connectionLabel) { connectionLabel.textContent = text; }
+  }
+
+  function closeStream() {
+    if (stream) { stream.close(); stream = null; }
+    streamRun = null;
+    if (refreshTimer) { clearTimeout(refreshTimer); refreshTimer = null; }
+  }
+
+  function subscription(current) {
+    if (!document.getElementById("auto").checked || current.view !== "detail") {
+      closeStream();
+      connectionText(current.view === "detail" ? "自动更新已关闭" : "列表与文件使用手动刷新");
+      return;
+    }
+    if (typeof EventSource === "undefined") {
+      connectionText("浏览器不支持事件订阅，请手动刷新");
+      return;
+    }
+    if (stream && streamRun === current.runId) { return; }
+    closeStream();
+    var source = new EventSource("/api/runs/" + encodeURIComponent(current.runId) + "/stream");
+    stream = source;
+    streamRun = current.runId;
+    connectionText("正在连接观察台…");
+    function changed() {
+      if (stream !== source) { return; }
+      connectionText("已连接，等待运行变化");
+      if (!refreshTimer) {
+        refreshTimer = setTimeout(function () { refreshTimer = null; render(); }, 100);
+      }
+    }
+    // ready arrives after registration; this reread closes the initial fetch race.
+    source.addEventListener("ready", changed);
+    source.addEventListener("change", changed);
+    function unavailable() {
+      if (stream !== source) { return; }
+      closeStream();
+      connectionText("事件订阅已断开；点击刷新重新连接");
+    }
+    source.addEventListener("unavailable", unavailable);
+    source.onerror = unavailable;
+  }
 
   function el(tag, cls, text) {
     var node = document.createElement(tag);
@@ -218,19 +268,25 @@ APP_JS = r""""use strict";
 
   function render() {
     var current = route();
+    var sequence = ++renderSequence;
+    subscription(current);
+    function currentResult(callback) {
+      return function (data) { if (sequence === renderSequence) { callback(data); } };
+    }
     var promise;
     if (current.view === "list") {
-      promise = getJSON("/api/runs").then(renderList);
+      promise = getJSON("/api/runs").then(currentResult(renderList));
     } else if (current.view === "detail") {
-      promise = getJSON("/api/runs/" + encodeURIComponent(current.runId)).then(renderDetail);
+      promise = getJSON("/api/runs/" + encodeURIComponent(current.runId)).then(currentResult(renderDetail));
     } else if (current.view === "file") {
       var url = "/api/runs/" + encodeURIComponent(current.runId) + "/files/" + current.path +
         "?format=json&tail=" + current.tail;
-      promise = getJSON(url).then(function (data) { renderFile(current, data); });
+      promise = getJSON(url).then(currentResult(function (data) { renderFile(current, data); }));
     } else {
       promise = Promise.resolve().then(function () { replaceMain([notice("未知视图", "error")]); });
     }
     promise.catch(function (error) {
+      if (sequence !== renderSequence) { return; }
       replaceMain([notice("读取失败：" + error.message, "error"),
         link("返回 run 列表", "#/")]);
     });
@@ -329,6 +385,17 @@ APP_JS = r""""use strict";
       ["计数策略", b.attempt_budget_policy]
     ]));
     nodes.push(budgets);
+
+    if (summary.convergence && summary.convergence.warnings.length) {
+      var convergence = section("返工提示（仅供判断）");
+      convergence.appendChild(notice(summary.convergence.suggestion, "warn"));
+      convergence.appendChild(table(["范围", "工作尝试", "审阅拒绝", "连续两次出现的阻断 ID"],
+        summary.convergence.warnings.map(function (item) {
+          return [item.task_id || "整体目标", item.work_attempts, item.review_rejections,
+            item.recurring_findings && item.recurring_findings.length ? item.recurring_findings.join("、") : "无"];
+        })));
+      nodes.push(convergence);
+    }
 
     var gates = section("等待与阻塞");
     if (summary.pending_decisions && summary.pending_decisions.length) {
@@ -495,8 +562,11 @@ APP_JS = r""""use strict";
 
   document.getElementById("refresh").addEventListener("click", render);
   document.getElementById("auto").addEventListener("change", function (event) {
-    if (timer) { clearInterval(timer); timer = null; }
-    if (event.target.checked) { timer = setInterval(render, 10000); }
+    subscription(route());
+  });
+  window.addEventListener("pagehide", closeStream);
+  window.addEventListener("pageshow", function (event) {
+    if (event.persisted) { render(); }
   });
   window.addEventListener("hashchange", render);
   render();

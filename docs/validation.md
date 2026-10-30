@@ -435,3 +435,13 @@ Codex 0.163.0 的本地 `debug prompt-input` 检查确认：未提交的 AGENTS.
 三轮独立 `gpt-6.1-sol` 审阅均为全新 `codex exec` 进程并保存独立 ID 与原始输出：规格审阅提出 6 项阻断（合法的本地门禁失败被误分类、中间目录替换逃逸、固定文件表不覆盖 `retry-N`／`verification-N`／嵌套 hook 目录、损坏台账的非 `HarnessError` 异常、操作 ID 冲突竞争窗口、新增通知可能留下无绑定 run）与 2 项建议，全部纳入规格后再实施；实现审阅发现首页 `#/` 路由失效、深嵌套与巨大整数逃出逐 run 隔离、索引上限差一、只读替身未打在实际导入位置、503 缺安全头、首个事件时间只看首行、描述符惰性打开，以及警告输出本身可抛错改变退出码、含文件输入时错误文本回显文件字段值；修复后确认审阅无剩余阻断。审阅记录保存在 `.harness/design-proposals/2026-10-28-execution/reviews/`。
 
 台账版本、模型 ID、预算、保存顺序、命令授权与接受门禁不变；`load_run` 必需字段表未新增。本批不实现有界规划调查、进程存活探测、远端访问、多仓库汇总、跨供应商 token 汇总或按公开单价估算账单。页面未在浏览器中人工验收（本机扩展未连接），只有 HTTP、curl 与 node 执行脚本的核对；所有 Harness 流程测试使用模拟模型响应及真实本地 Git／子进程，不证明真实模型调用成功；本轮未运行 `harness smoke`、`harness.tool_smoke` 或 `harness.permission_smoke`。
+
+## 事件观察、错误诊断与终态清理验证（2026-10-30，台账 v11）
+
+执行 `python3 -m unittest discover -s tests -v`：1009 项，1008 项通过、1 项因本机文件系统拒绝非 UTF-8 文件名而跳过，Python 3.15.2，956.306 秒。完整日志为 `.harness/field-test-operations-unittest-final.log`。使用 Python 3.11.17 执行本批新增的 8 个测试模块：55 项全部通过，27.599 秒，日志为 `.harness/field-test-operations-python311-final.log`。未在 Python 3.11 重跑完整套件。`git diff --check` 与 49 个本地文档链接目标检查通过。
+
+新增测试覆盖 Codex stdout 错误信封的有界提取、完整行与控制字符处理；macOS kqueue 的原子替换、追加、目录重建、硬链接、符号链接拒绝及描述符释放；watch CLI 的订阅先于采样、无变化不输出、等待超时不读取台账、终态与显式持续观察；真实 HTTP SSE 的访问门禁、连接限额、心跳不读状态、断连、慢客户端和关闭释放；通过 Node 执行实际页面脚本，验证事件合并、手动重连、路由切换、缓存页面恢复订阅与过期请求隔离。返工提示测试确认仅派生建议、使用已保存的有效工作尝试计数，不改写台账或接受条件。
+
+终态清理通过模拟模型响应及真实本地 Git 生命周期验证：无需配置预览和显式移除、completed／abandoned 状态与分支和证据保留、非终态拒绝、父派发与 broker 子进程退出确认、Git 绑定与 HEAD、未保存文件与隐藏索引标记、嵌套 `.harness`、回执中断恢复及管理目录重现拒绝。清理回执独立保存，不改变台账版本。新增管理目录重现用例的夹具使用 `mkdir(parents=True)`，兼容 Git 同时删除空父管理目录的行为。
+
+实现与最终结果经独立 `gpt-6.1-sol` 审阅，无未解决的阻断发现；页面缓存恢复订阅问题已修正并通过生命周期测试，清理夹具修正也经独立复核。审阅记录索引为 `.harness/field-test-operations-review.json`。Linux inotify 仅完成模拟通知与记账测试，未在 Linux 原生环境执行；页面未做浏览器人工验收。未运行真实账号的 `harness smoke`、`harness.tool_smoke` 或 `harness.permission_smoke`，离线及本机集成测试不证明真实模型调用成功。

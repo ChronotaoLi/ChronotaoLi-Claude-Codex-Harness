@@ -16,9 +16,11 @@ from .adapters import DemoBackend
 from .budgets import work_attempts
 from .cleanup import cleanup_verification
 from .config import Config
+from .convergence import convergence_summary
 from .engine import Engine
 from .memory import Memory, bind_source_files
 from .operations import RUN_ID, OperationRecord, config_identity, digest_assets, harness_identity, shared_paths
+from .run_cleanup import cleanup_run
 from .shared import mcp_configs, toml_value
 from .util import HarnessError, dump, read_json, write_json
 
@@ -125,6 +127,7 @@ def status_summary(run):
                          ("attempts", "total_attempts", "agent_dispatches", "replan_attempts", "final_attempts")}
     result["budgets"].update(work_attempts=status_work_attempts(run),
                              attempt_budget_policy=run.get("attempt_budget_policy", "all_invocations"))
+    result["convergence"] = convergence_summary(run, result["budgets"]["work_attempts"])
     dispatches = run.get("dispatches", [])
     dispatches = [entry for entry in dispatches if isinstance(entry, dict)] if isinstance(dispatches, list) else []
     outcomes = dict.fromkeys(("completed", "task_blocked", "environment_blocked", "operator_blocked", "runtime_failed", "unknown"), 0)
@@ -384,6 +387,10 @@ def _main(argv=None):
     status = sub.add_parser("status")
     status.add_argument("run_id", nargs="?")
     status.add_argument("--full", action="store_true", help="输出完整运行台账")
+    watch = sub.add_parser("watch", help="用原生文件事件观察 run，输出变化的 JSONL；不轮询台账")
+    watch.add_argument("run_id")
+    watch.add_argument("--follow", action="store_true", help="在阻塞、暂停或终态之后继续观察，直到中断")
+    watch.add_argument("--state", type=Path, help="直接观察指定 .harness 目录，可用于归档后的运行证据")
     dash = sub.add_parser("dashboard", help="在 127.0.0.1 启动只读观察网页；不加载配置，不探测进程，不修改 run")
     dashboard.add_arguments(dash)
     abandon = sub.add_parser("abandon", help="放弃运行并保留分支与证据")
@@ -396,6 +403,11 @@ def _main(argv=None):
     cleanup.add_argument("--remove", action="store_true", help="移除已退出且干净的验证检出；保留运行与验证证据")
     cleanup.add_argument("--confirm-exited", action="append", metavar="DISPATCH_ID",
                          help="确认指定旧 dispatch 已退出并记录证据；支持已完成或已放弃的 run，可重复指定")
+    retirement = sub.add_parser("cleanup-run", help="预览终态 run 的工作树清理；保留分支、台账与证据，不加载配置")
+    retirement.add_argument("run_id")
+    retirement.add_argument("--remove", action="store_true", help="显式移除通过安全检查的工作树")
+    retirement.add_argument("--confirm-exited", action="append", metavar="DISPATCH_ID",
+                            help="显式确认旧派发及其命令进程已退出；可重复指定")
     sync = sub.add_parser("sync", help="生成共用 MCP 的两种客户端配置，不覆盖个人配置")
     sync.add_argument("--role", choices=["commander", "worker", "reviewer"], default="worker")
     mem = sub.add_parser("memory")
@@ -422,7 +434,11 @@ def _main(argv=None):
     if args.command == "status" and args.full and not args.run_id:
         parser.error("status --full 需要 run_id")
     try:
-        if args.command in ("status", "dashboard", "memory", "cleanup-verification"):
+        if args.command == "watch":
+            from .watch_cli import watch_run
+            state = args.state if args.state is not None else git.repository(args.repo) / ".harness"
+            return watch_run(state, args.run_id, follow=args.follow)
+        if args.command in ("status", "dashboard", "memory", "cleanup-verification", "cleanup-run"):
             repo = git.repository(args.repo)
             state = repo / ".harness"
             if args.command == "status":
@@ -436,6 +452,9 @@ def _main(argv=None):
                                               confirm_exited=args.confirm_exited or ())
                 print(dump(result))
                 return 1 if any(item["status"] == "blocked" for item in result["checkouts"]) else 0
+            elif args.command == "cleanup-run":
+                print(dump(cleanup_run(repo, args.run_id, remove=args.remove,
+                                       confirm_exited=args.confirm_exited or ())))
             else:
                 manage_memory(args, repo, state)
             return 0

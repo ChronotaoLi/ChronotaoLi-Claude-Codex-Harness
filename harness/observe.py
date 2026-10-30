@@ -28,7 +28,7 @@ COMPONENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,95}$")
 COMMAND_ID = re.compile(r"^[0-9a-f]{32}$")
 MAX_DEPTH = 8
 TOP_LEVEL_FILES = frozenset(("state.json", "events.jsonl", "handoff.json", "handoff.md",
-                             "ignored-baseline.json", "ignored-paths.json"))
+                             "ignored-baseline.json", "ignored-paths.json", "worktree-cleanup.json"))
 ROOT_DIRECTORIES = frozenset(("plans", "dispatches", "verification", "hooks", "recovery", "decisions",
                               "environment", "checkpoints", "path-indexes", "indexes", "batches"))
 EXCLUDED_NAMES = frozenset(("mcp.json", "run.lock"))

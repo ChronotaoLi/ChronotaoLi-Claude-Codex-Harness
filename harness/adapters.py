@@ -15,6 +15,49 @@ from .util import HarnessError, read_json, run_process, tail, write_json
 
 _USAGE_MAX_BYTES = 16 * 1024 * 1024
 _USAGE_MAX_COUNT = 2**63 - 1
+_CODEX_ERROR_TAIL_BYTES = 64 * 1024
+
+
+def codex_error_summary(path):
+    """Read only error envelopes from a bounded JSONL tail, not agent/tool text."""
+    try:
+        with path.open("rb") as stream:
+            size = stream.seek(0, os.SEEK_END)
+            start = max(0, size - _CODEX_ERROR_TAIL_BYTES)
+            stream.seek(start)
+            raw = stream.read(_CODEX_ERROR_TAIL_BYTES)
+        # A tail can start inside a UTF-8 character or a large JSON record.
+        # Never parse the partial first record, even if its suffix looks valid.
+        if start:
+            raw = raw.partition(b"\n")[2]
+        details = []
+        for line in reversed(raw.split(b"\n")):
+            try:
+                event = json.loads(line)
+            except (ValueError, UnicodeError, RecursionError):
+                continue
+            if not isinstance(event, dict):
+                continue
+            if event.get("type") == "error":
+                message = event.get("message")
+            elif event.get("type") == "turn.failed" and isinstance(event.get("error"), dict):
+                message = event["error"].get("message")
+            else:
+                continue
+            if not isinstance(message, str) or not message.strip():
+                continue
+            # ASCII JSON escaping makes terminal controls, newlines and bidi
+            # characters inert. Truncate before escaping to bound expansion.
+            excerpt = json.dumps(message[:240], ensure_ascii=True)
+            if len(message) > 240:
+                excerpt += " [truncated]"
+            if excerpt not in details:
+                details.append(excerpt)
+            if len(details) == 3:
+                break
+        return "Codex reported an error: " + "; ".join(reversed(details)) if details else ""
+    except OSError:
+        return ""
 
 
 def _usage_counts(value, fields):
@@ -109,6 +152,8 @@ def claude_error_summary(value):
 
 
 def cli_error_summary(job, provider):
+    if provider == "codex":
+        return codex_error_summary(job / "process.stdout")
     if provider != "claude":
         return ""
     try:

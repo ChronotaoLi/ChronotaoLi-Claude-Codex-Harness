@@ -71,7 +71,7 @@ python3 -m harness --config /absolute/path/harness.toml --repo /absolute/path/to
 
 从 Harness 源码目录对任意项目执行时，`--config`、`--repo` 等全局参数必须写在子命令之前，路径使用绝对路径。先运行 `doctor` 核对回显的 `harness.package`、`harness.revision`、`config.sha256` 与 `shared` 路径，确认加载的是预期的包和配置，而不是同名模块或另一份安装。每次 `run`／`resume` 自动在目标项目 `.harness/operations/` 写一份操作记录，可用 `--operation-id ID` 指定 ID，同名记录已存在时拒绝。统一入口、外层 agent 的操作边界、记录与报告模板见[操作与观察](docs/operations.md)。
 
-配置拒绝未知节和键，并指出完整路径。非 editable 安装不附带默认 `harness.toml` 与 `shared/`，执行任务需显式提供配置；`status`、`dashboard`、`memory` 和 `cleanup-verification` 不依赖配置。运行事件和诊断写 stderr，`run`、`resume`、`demo` 的 stdout 保持单个 JSON 结果。
+配置拒绝未知节和键，并指出完整路径。非 editable 安装不附带默认 `harness.toml` 与 `shared/`，执行任务需显式提供配置；`status`、`watch`、`dashboard`、`memory`、`cleanup-run` 和 `cleanup-verification` 不依赖配置。运行事件和诊断写 stderr，`run`、`resume`、`demo` 的 stdout 保持单个 JSON 结果。
 
 可用 `--plan /path/to/plan.json` 提供已有计划，格式见 [examples/plan.json](examples/plan.json)。输入在创建 run、分支和 worktree 前校验任务 ID、DAG、非空验收、范围和 skill。范围从仓库根目录匹配：`src/*` 只匹配直接子项，`src/**` 匹配所有层级，`**/*.py` 也匹配根目录文件；只有独立 `**` 路径段跨越 `/`。范围应覆盖必要测试与夹具。全仓库模式允许但会警告；`.git`、`.harness`、`.codex`、`.claude` 仍受保护。
 
@@ -123,15 +123,24 @@ setup_commands = [["npm", "ci"]]
 python3 -m harness --repo /path/to/project status
 python3 -m harness --repo /path/to/project status RUN
 python3 -m harness --repo /path/to/project status RUN --full
+python3 -m harness --repo /path/to/project watch RUN
 python3 -m harness --repo /path/to/project dashboard --port 8765
 python3 -m harness --config /path/to/harness.toml --repo /path/to/project resume RUN
 python3 -m harness --config /path/to/harness.toml --repo /path/to/project abandon RUN
 python3 -m harness --repo /path/to/project cleanup-verification RUN
+python3 -m harness --repo /path/to/project cleanup-run RUN
+python3 -m harness --repo /path/to/project cleanup-run RUN --remove
 ```
 
 `status RUN` 显示任务、预算和最后错误首行，`--full` 查看完整台账。`resume` 使用保存的现场和全新 agent，不恢复供应商会话，也不清零累计预算。可增加上下文、超时、轮数、尝试／派发／再规划／最终验收上限和 `max_tasks`，或追加精确 worker argv；其余配置及共享资产必须一致。
 
+`watch RUN` 用 macOS kqueue 或 Linux inotify 等待文件变化，只在观察结果改变时输出简短 JSONL；等待超时不重读台账。默认到阻塞、暂停、等待批准或终态后退出，`--follow` 可继续等待后续恢复。`watch RUN --state /path/to/.harness` 可以直接观察保留下来的运行证据，不要求该目录仍是 Git 工作树。不支持原生通知的平台会明确报错。观察值来自台账，不证明模型进程仍在工作。
+
+状态和网页增加只读返工提示：未接受任务达到三次工作尝试，或连续两次审阅出现同一阻断 ID 时提示；整体拒绝两次也会提示。任务接受或 run 结束后不再把历史问题显示为当前提示。这些信息用于判断范围和方案复杂度，不增加预算、不启动恢复、不改变验收。
+
 `dashboard` 在 127.0.0.1 启动只读观察网页，stdout 只打印访问地址，Ctrl-C 停止；与 `status` 一样不加载配置。它不启动、恢复或修改 run，不取锁、不写文件、不探测进程：台账记为 running 不等于进程仍在工作，Claude 的结构化输出可能在调用结束才出现。费用按供应商分列，Claude 为 CLI 报告的估算费用而非账户账单，Codex 不报告美元。页面区块、调用阶段分类与文件访问边界见[观察网页用法与限制](docs/operations.md#观察网页用法与限制)。
+
+运行详情默认通过事件订阅更新，列表和文件页使用手动刷新。连接心跳仅表示观察服务可用；订阅断开后显示断开提示，由刷新按钮重新连接，不退回定时轮询。
 
 同一快照上的已保存阶段可复用：验证中断只重跑验证，审阅调用故障只新派发 reviewer，接受 hook 失败只重试 hook。worker 返回与阶段保存之间仍有可能重复调用的中断窗口。代码变化使旧批准失效，进程未确认退出、HEAD／Git 绑定异常或证据损坏会停止；完整保存顺序见[恢复协议](docs/recovery.md)。
 
@@ -152,6 +161,8 @@ python3 -m harness --repo /path/to/project cleanup-verification RUN
 `abandon RUN` 保留分支、工作树和证据并禁止恢复。可追加 `--remove-worktree` 移除干净工作树；任何未保存文件（含忽略文件）、隐藏索引标记、字节与 HEAD 不符或进程退出未知均阻止移除，不强制删除。清理错误列出阻塞路径，需先人工核对。
 
 `cleanup-verification RUN` 默认预览，`--remove` 才移除符合门禁的验证检出，保留台账和证据。父 dispatch 退出不能证明 broker 命令子进程退出；核实后可用 `cleanup-verification RUN --confirm-exited DISPATCH_ID`，也支持已完成或放弃的 run。完整规则见[清理协议](docs/recovery.md#git-现场与验证检出清理)。
+
+`cleanup-run RUN` 预览已完成或已放弃 run 的工作树清理，`--remove` 才执行。它保留终态、分支和运行证据，要求原分支仍指向检查点、所有派发与命令子进程已确认退出、工作树无任何未保存文件。清理意图和完成记录保存在 `worktree-cleanup.json`，支持删除后记账中断的重试。显式 `--confirm-exited DISPATCH_ID` 会记录退出确认；普通预览不生成清理记录。需要删除分支时，先完成工作树清理，再由操作者核对集成结果并处理分支。
 
 新台账版本为 11；未完成的 8／9／10 经预检后升级并保留预算与证据，7 及更早只能查看、不能直接恢复执行。已完成 run 的普通恢复返回保存结果；终态选项限制见[终态与版本兼容](docs/recovery.md#终态与版本兼容)。
 

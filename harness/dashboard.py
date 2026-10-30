@@ -10,19 +10,26 @@ from __future__ import annotations
 import argparse
 import json
 import signal
+import socket
+import select
 import socketserver
+import time
 import sys
 import threading
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from . import observe
+from .watch import RunWatcher, WatchError
 from .dashboard_page import APP_CSS, APP_JS, INDEX_HTML
 from .util import HarnessError
 
 HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 MAX_CONNECTIONS = 8
+MAX_STREAMS = 2
+STREAM_HEARTBEAT = 15.0
+STREAM_WAIT = 0.25
 SOCKET_TIMEOUT = 10.0
 MAX_PATH_BYTES = 2048
 SECURITY_HEADERS = (
@@ -115,7 +122,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if not self._origin_allowed():
                 self._send(403, b"403 forbidden: Host or Origin does not match this server\n", TEXT)
                 return
-            status, body, content_type, extra = self._route()
+            result = self._route()
+            if result is None:
+                return
+            status, body, content_type, extra = result
         except observe.ObserveError as error:
             status = next((code for kind, code in _STATUS_CODES.items() if isinstance(error, kind)), 400)
             body, content_type, extra = _json_bytes({"error": str(error), "status": status}), JSON, ()
@@ -123,6 +133,80 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.log_error("internal error: %s: %s", type(error).__name__, error)
             status, body, content_type, extra = 500, b"500 internal error\n", TEXT, ()
         self._send(status, body, content_type, extra)
+
+    def _stream_frame(self, event, data):
+        payload = json.dumps(data, ensure_ascii=True, separators=(",", ":"))
+        self.wfile.write(f"event: {event}\ndata: {payload}\n\n".encode("utf-8"))
+        self.wfile.flush()
+
+    def _stream(self, run_id):
+        observe.validate_run_id(run_id)
+        if self.command == "HEAD":
+            self._send(405, b"405 stream requires GET\n", TEXT, (("Allow", "GET"),))
+            return
+        server = self.server
+        if not server.acquire_stream(self.connection):
+            self._send(503, b"503 stream capacity reached\n", TEXT, (("Retry-After", "1"),))
+            return
+        started = False
+        try:
+            # Hold the server read gate while registering against its shared root.
+            # server_close marks stopping before waiting for this gate.
+            with server._read_gate:
+                if server._stopping.is_set():
+                    return
+                watcher = RunWatcher(server.observer.reader, run_id)
+            with watcher:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                for name, value in SECURITY_HEADERS:
+                    self.send_header(name, value)
+                self.send_header("Connection", "close")
+                self.end_headers()
+                started = True
+                def metadata():
+                    return {"id": run_id, "backend": watcher.backend,
+                            "sampled_at_utc": observe.utc(time.time())}
+                self._stream_frame("ready", metadata())
+                heartbeat = time.monotonic() + server.stream_heartbeat
+                while not server._stopping.is_set():
+                    # EOF detection releases idle disconnected subscribers promptly.
+                    readable, _, _ = select.select([self.connection], [], [], 0)
+                    if readable and not self.connection.recv(1, socket.MSG_PEEK):
+                        break
+                    with server._read_gate:
+                        if server._stopping.is_set():
+                            break
+                        changed = watcher.wait(min(server.stream_wait,
+                                                   max(0, heartbeat - time.monotonic())))
+                    if server._stopping.is_set():
+                        break
+                    if changed:
+                        self._stream_frame("change", metadata())
+                    if time.monotonic() >= heartbeat:
+                        self.wfile.write(b": heartbeat\n\n")
+                        self.wfile.flush()
+                        heartbeat = time.monotonic() + server.stream_heartbeat
+        except (BrokenPipeError, ConnectionError, TimeoutError):
+            pass
+        except observe.ObserveError as error:
+            if not started and not isinstance(error, WatchError):
+                raise
+            if not started:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                for name, value in SECURITY_HEADERS:
+                    self.send_header(name, value)
+                self.send_header("Connection", "close")
+                self.end_headers()
+            try:
+                self._stream_frame("unavailable", {"id": run_id, "error": str(error)})
+            except OSError:
+                pass
+        except OSError:
+            pass
+        finally:
+            server.release_stream(self.connection)
 
     @staticmethod
     def _tail(query):
@@ -163,6 +247,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
             raise observe.NotFound("未知路由")
         if remainder == "":
             return 200, _json_bytes(observer.run_detail(run_id)), JSON, ()
+        if remainder == "stream":
+            self._stream(run_id)
+            return None
         if remainder == "events":
             return 200, _json_bytes(observer.events(run_id, self._tail(query))), JSON, ()
         if remainder == "files":
@@ -185,7 +272,8 @@ class DashboardServer(ThreadingHTTPServer):
     request_queue_size = 16
 
     def __init__(self, state, port=DEFAULT_PORT, *, max_connections=MAX_CONNECTIONS,
-                 socket_timeout=SOCKET_TIMEOUT, log=None):
+                 socket_timeout=SOCKET_TIMEOUT, log=None, max_streams=MAX_STREAMS,
+                 stream_heartbeat=STREAM_HEARTBEAT, stream_wait=STREAM_WAIT):
         # The `.harness` descriptor is fixed here, before the socket exists.
         self.observer = observe.Observer(state, required=True)
         self.max_connections = max_connections
@@ -193,7 +281,31 @@ class DashboardServer(ThreadingHTTPServer):
         self.log = log if log is not None else sys.stderr
         self._lock = threading.Lock()
         self._active = 0
+        self.max_streams = min(max_streams, max(0, max_connections - 1))
+        if stream_heartbeat <= 0 or stream_wait <= 0:
+            self.observer.close()
+            raise ValueError("stream intervals must be positive")
+        self.stream_heartbeat = stream_heartbeat
+        self.stream_wait = min(stream_wait, 0.25)
+        self._streams = set()
+        self._stopping = threading.Event()
+        self._read_gate = threading.Lock()
         super().__init__((HOST, port), DashboardHandler)
+
+    def acquire_stream(self, connection):
+        with self._lock:
+            if self._stopping.is_set() or len(self._streams) >= self.max_streams:
+                return False
+            self._streams.add(connection)
+            return True
+
+    def release_stream(self, connection):
+        with self._lock:
+            self._streams.discard(connection)
+
+    def active_streams(self):
+        with self._lock:
+            return len(self._streams)
 
     def server_bind(self):
         # Skip HTTPServer's getfqdn(): no DNS lookups for a loopback service.
@@ -246,10 +358,19 @@ class DashboardServer(ThreadingHTTPServer):
                        f"{type(error).__name__}: {error}\n")
 
     def server_close(self):
+        self._stopping.set()
+        with self._lock:
+            streams = list(self._streams)
+        for connection in streams:
+            try:
+                connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
         try:
             super().server_close()
         finally:
-            self.observer.close()
+            with self._read_gate:
+                self.observer.close()
 
 
 def create_server(state, port=DEFAULT_PORT, **options):

@@ -19,6 +19,7 @@ python3 -m harness --config /abs/harness.toml doctor
 python3 -m harness --config /abs/harness.toml --repo /abs/project run "目标描述"
 python3 -m harness --config /abs/harness.toml --repo /abs/project resume RUN
 python3 -m harness --repo /abs/project status
+python3 -m harness --repo /abs/project watch RUN
 python3 -m harness --repo /abs/project dashboard --port 8765
 ```
 
@@ -36,7 +37,7 @@ python3 -m harness --repo /abs/project dashboard --port 8765
 外层 agent 指替操作者调用上述入口的自动化会话（例如另一个 Claude Code 或 Codex 会话）。它在已有授权内可以：
 
 - 启动 `run`，并为每次调用指定可追溯的 `--operation-id`；
-- 用 `status`、`status RUN`、`status RUN --full` 和 `dashboard` 观察，读取目标项目 `.harness/` 下的台账、事件、dispatch 产物与操作记录；
+- 用 `status`、`status RUN`、`status RUN --full`、`watch RUN` 和 `dashboard` 观察，读取目标项目 `.harness/` 下的台账、事件、dispatch 产物与操作记录；
 - 使用 README“状态、恢复与清理”表中明确适用于当前状态的恢复出口，例如 `--approve-plan`、追加精确命令授权后的普通 `resume`、`--environment-update`、`--operator-decision`、`--retry-stopped`。
 
 遇到真正的新增权限（新的命令授权、范围扩展、预算或轮数提高）或需求选择（操作者决定、是否接受风险、是否放弃）时向用户请求，不自行代答。
@@ -151,9 +152,15 @@ python3 -m harness.dashboard --state /abs/project/.harness --port 8765
 
 ### 页面
 
-run 列表 → run 详情 → 文件查看。详情包含：目标、台账状态、分支、工作树（仅显示路径）、指挥、当前任务、已接受任务、台账版本、创建该 run 的操作记录、首／末事件时间；预算；等待操作者决定、环境阻塞、缺失命令授权、worker 结果计数；任务表；费用与调用分类；dispatch 表（含产物文件链接）；关联本 run 的操作记录；事件尾部；文件索引。文件查看显示文本尾部，默认 64 KiB，最大 1 MiB，可调整。页面有刷新按钮和每 10 秒自动刷新选项，界面为中文；`status`（无 run ID）的列表与网页读同一份投影，stdout 字段不变。
+run 列表 → run 详情 → 文件查看。详情包含：目标、台账状态、分支、工作树（仅显示路径）、指挥、当前任务、已接受任务、台账版本、创建该 run 的操作记录、首／末事件时间；预算；等待操作者决定、环境阻塞、缺失命令授权、worker 结果计数与返工提示；任务表；费用与调用分类；dispatch 表（含产物文件链接）；关联本 run 的操作记录；事件尾部；文件索引。文件查看显示文本尾部，默认 64 KiB，最大 1 MiB，可调整。详情默认开启“跟随运行变化”，收到原生文件通知后刷新；列表与文件查看使用刷新按钮，不定时轮询。连接断开会显示提示，手动刷新可重新订阅。界面为中文；`status`（无 run ID）的列表与网页读同一份投影，stdout 字段不变。
+
+返工提示来自已有台账：未接受任务的有效工作尝试达到 3 次，或最近两次连续拒绝审阅出现相同 blocking finding ID 时提示；整体验收累计拒绝至少 2 次且最新结果尚未批准时也提示。`status RUN`、`watch RUN` 与详情中的 `convergence` 都是建议，不自动改变预算、范围、派发或接受条件；completed／abandoned 不显示返工警告。
 
 脚本可直接读 JSON 接口：`/api/runs`、`/api/runs/<run_id>`、`/api/runs/<run_id>/events?tail=`、`/api/runs/<run_id>/files`、`/api/runs/<run_id>/files/<相对路径>?tail=&format=json`。无效 ID 或参数 400，拒绝的路径与 Host 不匹配 403，不存在的 run 或文件 404，GET／HEAD 以外的方法 405；台账可读但摘要失败的 run 仍返回 200 并带 `summary_error`。
+
+`GET /api/runs/<run_id>/stream` 提供 SSE，HEAD 返回 405。`ready` 与 `change` 只发送 run ID、原生后端和采样时间，页面随后读取当前投影；`unavailable` 表示订阅不可用并关闭连接。每 15 秒的注释心跳仅用于连接维护，不读取台账，也不证明模型进程存活。默认最多 2 个订阅，占用总计 8 个连接额度；断连、写入超时和服务关闭都会释放订阅。
+
+命令行 `watch RUN` 先订阅，再输出简短 JSONL 状态；后续仅在投影变化时输出。到达 completed、abandoned、blocked、interrupted、paused 或 awaiting_approval 后退出；`--follow` 可跨越这些状态继续等待，Ctrl-C 结束。`watch RUN --state /abs/archive/.harness` 可观察归档状态，不要求 Git 仓库或配置。macOS 使用 kqueue，Linux 使用 inotify 与 `/proc/self/fd`；平台不支持或订阅失败时明确报错，不回退到轮询。输出的 `process_observation=ledger_only` 表示只读台账，未探测模型进程。
 
 ### 调用阶段分类
 
@@ -181,12 +188,12 @@ run 列表 → run 详情 → 文件查看。详情包含：目标、台账状�
 
 ### 文件访问
 
-只能通过固定根读取 run 目录内的普通文件：顶层 `state.json`、`events.jsonl`、`handoff.json`、`handoff.md`、`ignored-baseline.json`、`ignored-paths.json`；目录 `plans/`、`dispatches/<uuid>/`（含 `commands/<32 位十六进制>/`）、`verification/`、`hooks/`、`recovery/`、`decisions/`、`environment/`、`checkpoints/`、`path-indexes/`、`indexes/`、`batches/`。`mcp.json`、`run.lock`、`*.tmp` 与 `memory.sqlite3*` 被排除；符号链接与非普通文件一律拒绝，中间目录在检查后被替换为符号链接也无法逃出根目录；路径深度不超过 8。台账中的绝对路径只显示不打开。文件内容永远以 `text/plain`（或 `format=json`）返回，日志不会作为 HTML 执行。
+只能通过固定根读取 run 目录内的普通文件：顶层 `state.json`、`events.jsonl`、`handoff.json`、`handoff.md`、`ignored-baseline.json`、`ignored-paths.json`、`worktree-cleanup.json`；目录 `plans/`、`dispatches/<uuid>/`（含 `commands/<32 位十六进制>/`）、`verification/`、`hooks/`、`recovery/`、`decisions/`、`environment/`、`checkpoints/`、`path-indexes/`、`indexes/`、`batches/`。`mcp.json`、`run.lock`、`*.tmp` 与 `memory.sqlite3*` 被排除；符号链接与非普通文件一律拒绝，中间目录在检查后被替换为符号链接也无法逃出根目录；路径深度不超过 8。台账中的绝对路径只显示不打开。文件内容永远以 `text/plain`（或 `format=json`）返回，日志不会作为 HTML 执行。
 
 ### 限制
 
-- 只绑定 127.0.0.1，不开放远端访问；只接受 GET／HEAD；同时连接最多 8 个，超出返回 503；慢客户端约 10 秒后断开。
+- 只绑定 127.0.0.1，不开放远端访问；只接受 GET／HEAD（事件流仅 GET）；同时连接最多 8 个，超出返回 503；写入阻塞的慢客户端约 10 秒后断开。
 - 服务在启动时固定持有 `.harness` 目录的描述符；目录被删除重建后需重启服务。目标项目还没有 `.harness` 目录时 `dashboard` 直接报错退出 1，而 `status` 列表为空。`.harness/runs` 本身是符号链接或不可读时，`status` 列表输出包含目录路径的诊断并退出 1；`status RUN` 保留既有的直接台账读取方式，不使用列表的符号链接拒绝规则，但仍须能读取该文件。
 - 首／末事件时间只在 `events.jsonl` 头／尾 64 KiB 内查找；dispatch 结束时间只取尾部 64 KiB 中的事件，较早调用可能显示不可用；`state.json` 超过 64 MiB 不解析；操作记录最多扫描 1000 个文件、每个 256 KiB；文件索引最多 2000 项。
 - 损坏的台账在列表中跳过并给诊断；详情仍尽量显示并标出 `ledger_error`／`summary_error`；旧 `schema_version` 没有的区块标“不可用”。
-- 不汇总多个项目，不按公开单价估算账单，观察结果不改变任何预算。页面尚未做过浏览器人工验收，当前验证只覆盖 HTTP 接口。
+- 不汇总多个项目，不按公开单价估算账单，观察结果不改变任何预算。自动验证覆盖 HTTP、macOS 原生通知和页面脚本行为；Linux 原生通知及浏览器人工验收尚未执行，验证范围见[验证记录](validation.md)。
