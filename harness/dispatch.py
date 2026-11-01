@@ -234,8 +234,11 @@ class Dispatcher(RuntimeService):
 
         invoked = False
         startup_interrupted = False
+        invocation_error = None
         try:
             runtime.emit_hook("pre_agent", entry, job)
+            from .workspace_inputs import validate_inputs
+            validate_inputs(runtime.run, runtime.directory)
             validate_indexes(runtime.directory, path_evidence)
             validate_mcp(runtime.config, roles=(role,))
             before = runtime.snapshot()
@@ -265,6 +268,7 @@ class Dispatcher(RuntimeService):
             if repair:
                 entry["invalid_repair_source"] = repair["source"]["dispatch_id"]
             if "format_correction" in packet:
+                entry["format_correction"] = True
                 key = f"{role}:{kind}:{task_id}"
                 runtime.run.setdefault("format_repairs", {})[key] = 1
                 if key in runtime.run["pending_format_corrections"]:
@@ -329,6 +333,7 @@ class Dispatcher(RuntimeService):
         except InvalidReviewRejection:
             raise
         except BaseException as error:
+            invocation_error = error
             startup_interrupted = (isinstance(error, (KeyboardInterrupt, SystemExit))
                                    and entry["process_state"] == "starting" and entry["pgid"] is None)
             entry["status"] = "failed"
@@ -348,6 +353,8 @@ class Dispatcher(RuntimeService):
                 # Observe the provider envelope even on CLI/protocol failures.
                 # Telemetry is best effort and cannot change acceptance/recovery.
                 try:
+                    from .diagnostics import invocation_diagnostics
+                    entry["diagnostics"] = invocation_diagnostics(job, runtime.config.role(role, runtime.commander)["cli"], invocation_error)
                     usage = provider_usage(job, runtime.config.role(role, runtime.commander)["cli"])
                     if usage is not None:
                         entry["provider_usage"] = usage

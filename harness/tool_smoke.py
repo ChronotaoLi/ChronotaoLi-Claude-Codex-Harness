@@ -175,6 +175,8 @@ def tool_smoke(config, repo, *, timeout=180, max_turns=20, max_budget_usd=1.0):
     model = config.role('worker')
     if model['cli'] != 'claude':
         raise HarnessError('Tool smoke requires the configured Claude worker; no model substitution')
+    from .private_state import ensure_private_state
+    ensure_private_state(Path(repo))
     directory = Path(repo).resolve() / '.harness' / 'tool-smoke' / uuid.uuid4().hex
     fixture = prepare_fixture(directory)
     job = directory / str(uuid.uuid4())

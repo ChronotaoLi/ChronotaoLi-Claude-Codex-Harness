@@ -39,8 +39,8 @@ class Engine(EnvironmentRecovery, DecisionRecovery, ProgressRecovery, InvalidOut
     def __init__(self, config, repo, state=None, backend=None, commander="astra", operation=None):
         self.config = config
         self.repo = git.repository(Path(repo))
-        self.state = Path(state).resolve() if state else self.repo / ".harness"
-        git.ignore_state(self.repo)
+        from .private_state import ensure_private_state
+        self.state = ensure_private_state(self.repo, state)
         self.memory = Memory(self.state / "memory.sqlite3")
         self.backend = backend or CLIBackend(config, self.state)
         self.commander = commander

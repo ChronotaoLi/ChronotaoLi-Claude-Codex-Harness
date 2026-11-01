@@ -150,15 +150,9 @@ def head(repo: Path, *, binding=None):
 
 
 def ignore_state(repo: Path):
-    """Local Git exclude avoids requiring changes to a target project's tracked files."""
-    common = Path(git(repo, "rev-parse", "--git-common-dir").removesuffix("\n"))
-    if not common.is_absolute():
-        common = repo / common
-    path = common / "info" / "exclude"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    previous = path.read_text(encoding="utf-8") if path.exists() else ""
-    if "/.harness/" not in previous.splitlines():
-        path.write_text(previous.rstrip() + "\n/.harness/\n", encoding="utf-8")
+    """Install and verify private-root and common-Git ignore protection."""
+    from .private_state import ensure_private_state
+    ensure_private_state(repo)
 
 
 def clean(repo: Path, *, binding=None):

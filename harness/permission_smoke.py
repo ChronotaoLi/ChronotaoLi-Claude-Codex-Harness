@@ -166,6 +166,8 @@ def permission_smoke(config, repo, *, timeout=180, max_turns=16, max_budget_usd=
     model = config.role("worker")
     if model["cli"] != "claude":
         raise HarnessError("权限 smoke 需要配置 Claude worker，不会替换模型")
+    from .private_state import ensure_private_state
+    ensure_private_state(Path(repo))
     directory = Path(repo).resolve() / ".harness" / "permission-smoke" / uuid.uuid4().hex
     fixture = prepare_fixture(directory)
     job = directory / str(uuid.uuid4())

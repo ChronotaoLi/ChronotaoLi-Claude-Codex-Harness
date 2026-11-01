@@ -273,7 +273,7 @@ claude_max_turns_by_role = { worker = 200 }
 
 `operations/` 保存每次 `run`／`resume` 的操作记录；台账的 `created_by_operation` 与 `events.jsonl` 中的 `run_created`／`run_resumed` 事件把 run 关联到对应记录，它们只是观察信息，不参与恢复判断，字段见[操作与观察](docs/operations.md#操作记录与记录模板)。
 
-运行时只把 `/.harness/` 加入目标项目的本地 `.git/info/exclude`，不改已跟踪 `.gitignore`。`.harness/` 属于被忽略的私有运行目录，不要提交运行现场、凭据或生成 MCP 配置；日志可能包含代码与业务内容。离线开发验证产物集中到 `.harness/validation/<批次>/`，登记结果并被后续验证覆盖后可清理，当前 `.harness/refactor/` 不迁移；详见[验证记录](docs/validation.md)。
+首次私有写入前，运行时保留 Git 公共目录 `info/exclude` 原字节并补充 `/.harness/`，同时建立私有根 `.harness/.gitignore` 的 `*` 保护；不改项目已跟踪 `.gitignore`。已有冲突控制文件、符号链接或被跟踪的私有状态会拒绝，不覆盖现场。`.harness/` 属于被忽略的私有运行目录，不要提交运行现场、凭据或生成 MCP 配置；日志可能包含代码与业务内容。离线开发验证产物集中到 `.harness/validation/<批次>/`，登记结果并被后续验证覆盖后可清理，当前 `.harness/refactor/` 不迁移；详见[验证记录](docs/validation.md)。
 
 `status RUN --full` 的 `provider_usage` 及 `dispatch_finished` 事件记录供应商实际返回的用量，缺失用量不当作零，报告成本不等于实际账单。长进程每 60 秒提示仍在运行，实际超时独立生效。错误、中断、Git 提交与检查点之间的窗口见[恢复协议](docs/recovery.md)。
 
@@ -282,3 +282,25 @@ claude_max_turns_by_role = { worker = 200 }
 [设计取舍与参考来源](docs/design.md)记录 Orca、ECC、OpenWiki 的借鉴及厂商接口依据；实现是独立的小型编排核心，未复制这些项目源码或运行其安装脚本。当前没有接管 Orca、安装全部 ECC 插件或部署 OpenWiki 图数据库。
 
 [验证记录](docs/validation.md)区分已执行的离线测试与真实模型联调；[恢复协议](docs/recovery.md)集中保存详细状态与兼容契约。后续并行需要每任务 worktree、依赖集成与冲突处理；当前先保证完整串行闭环和新会话边界。
+
+### 计划审阅、依赖准备与本地通知
+
+复杂任务可先 `run "目标" --pause-after-plan`，然后生成与目标及计划摘要绑定的审阅材料：
+
+```bash
+python3 -m harness --repo /abs/project plan-readiness --run RUN --coverage /abs/coverage.json
+python3 -m harness --repo /abs/project prepare-run RUN --manifest /abs/inputs.json
+python3 -m harness --repo /abs/project notify RUN
+python3 -m harness --repo /abs/project inbox --run RUN --unacknowledged
+python3 -m harness --repo /abs/project ack NOTIFICATION_ID --run RUN
+python3 -m harness --config /abs/config.toml --repo /abs/project supervise -- run "目标" --pause-after-plan
+python3 -m harness --repo /abs/project cleanup-run RUN --remove --remove-input-copies
+```
+
+`examples/plan-readiness.json` 与 `examples/plan.json` 配套，也可用 `plan-readiness --plan FILE --goal "原始目标" --coverage FILE` 在启动前生成报告。报告是人工/独立审阅材料；缺项和未知前提明确列出，不修改 PLAN、权限或接受门禁。最终负责验收的任务必须直接或传递依赖全部证据任务。全局验证命令仍在各任务执行，不能依赖尚未生成的脚本或静默跳过失败。
+
+`prepare-run` 仅在暂停/等待批准且无未消费阶段的边界准备清单指定的不可变依赖。它不导入需要修改的源代码。`cleanup-run --remove-input-copies` 仍为预览，必须同时 `--remove` 才删除登记且未修改的副本；源文件和其他忽略文件保留。清单与恢复规则见 [操作说明](docs/operations.md#依赖副本清单)。
+
+`notify` 使用原生文件事件维护私有 SQLite 收件箱及投递重试；`inbox` 只读，`ack` 仅表示看过。通知只引导查询当前状态，不能当作恢复授权。`supervise` 只启动一次指定的 Harness `run`/`resume`，保留子进程 stdout，监督回执输出到 stderr；不会重启或自动恢复。父进程退出仍不证明 broker 子进程退出。
+
+可选 `runtime.claude_output_mode = "stream_metadata_v1"` 只适用于新运行，默认仍为 `legacy_json`。新模式将唯一终态与白名单工具元数据分别保存；过程文本、thinking、工具参数及正文不进入元数据。错误、缺失/重复/损坏终态及非零退出均不能接受。旧运行不能在恢复时切换格式；观察不到的读取范围或拒绝原因保持未知。只读 `permission-diagnostics RUN DISPATCH --argv-json '["python3", "-m", "unittest"]'` 对比供应商拒绝证据和当前配置中的精确命令能力，不执行命令或扩大权限。`status` 和 dashboard 同时显示预算的已用/上限/剩余与调用、审阅候选、失败、格式修正等独立维度。

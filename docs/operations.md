@@ -54,7 +54,7 @@ python3 -m harness --repo /abs/project dashboard --port 8765
 
 ## 操作记录与记录模板
 
-每次 `run`／`resume` 在加载配置之后、构造引擎之前，于 `<目标项目>/.harness/operations/<operation_id>.json` 独占创建一份记录。ID 默认自动生成（`op_` 加 16 位十六进制），也可用 `--operation-id ID` 指定：以字母或数字开头，只含 `A-Za-z0-9_.-`，最长 64 字符。同名记录已存在时拒绝并退出 1，不覆盖已有记录，也不写台账、不创建 run、不改 `.git/info/exclude`（只会确保 `operations/` 目录存在）。stderr 输出 `[harness] operation_id=<id> record=<路径>`；stdout 仍是单个 JSON，新增 `operation_id` 键。
+每次 `run`／`resume` 在加载配置之后、构造引擎之前，于 `<目标项目>/.harness/operations/<operation_id>.json` 独占创建一份记录。ID 默认自动生成（`op_` 加 16 位十六进制），也可用 `--operation-id ID` 指定：以字母或数字开头，只含 `A-Za-z0-9_.-`，最长 64 字符。同名记录已存在时拒绝并退出 1，不覆盖已有记录，也不写台账、不创建 run、不改 `.git/info/exclude`；重复 ID 检查在公共 Git 锁内、保护规则变更前完成。stderr 输出 `[harness] operation_id=<id> record=<路径>`；stdout 仍是单个 JSON，新增 `operation_id` 键。
 
 记录不是第二套执行真相：它不取 `run.lock`、不写 run 台账，也不参与任何恢复判断。记录更新失败只在 stderr 打印 `[harness] 警告：...`，不改变运行、保存顺序或退出码。
 
@@ -197,3 +197,25 @@ run 列表 → run 详情 → 文件查看。详情包含：目标、台账状�
 - 首／末事件时间只在 `events.jsonl` 头／尾 64 KiB 内查找；dispatch 结束时间只取尾部 64 KiB 中的事件，较早调用可能显示不可用；`state.json` 超过 64 MiB 不解析；操作记录最多扫描 1000 个文件、每个 256 KiB；文件索引最多 2000 项。
 - 损坏的台账在列表中跳过并给诊断；详情仍尽量显示并标出 `ledger_error`／`summary_error`；旧 `schema_version` 没有的区块标“不可用”。
 - 不汇总多个项目，不按公开单价估算账单，观察结果不改变任何预算。自动验证覆盖 HTTP、macOS 原生通知和页面脚本行为；Linux 原生通知及浏览器人工验收尚未执行，验证范围见[验证记录](validation.md)。
+
+## 依赖副本清单
+
+`prepare-run RUN --manifest FILE` 在 run 锁内预检主检出源文件、当前 HEAD、worktree Git 绑定、所有已登记派发和命令进程。仅接受 `paused` / `awaiting_approval`，没有待消费候选、审阅、再规划等阶段。已接受任务和预算不改变。旧 11 台账在首次准备时升级为 12；更旧台账先走正常恢复迁移。
+
+清单示例（HEAD 和 SHA256 必须替换为实际值，mode 是十进制 POSIX 权限）：
+
+```json
+{"schema_version":1,"run_id":"run_0123456789abcdef","head":"<current expected HEAD>","source_root":".","max_files":1,"max_bytes":1048576,"files":[{"source":"deps/input.dat","destination":"vendor/input.dat","sha256":"<64 lowercase hex>","mode":420,"type":"file","ownership":"input_copy"}]}
+```
+
+源为主检出中的普通独立文件；目标必须在隔离 worktree 中、被 Git 忽略且未跟踪。拒绝符号链接、硬链接、保留路径、隐式凭据路径、源目标重叠和未知已有目标。复制前冻结清单摘要与台账绑定，再记录意图、独占临时文件身份、发布及回执；源和副本不共享 inode。中断后仅用登记的文件身份恢复，不能凭内容相同接管文件。resume 与派发前均核验登记副本；前置核验失败不新增 worker 次数。
+
+清理默认只读预览。`cleanup-run RUN --remove --remove-input-copies` 在终态与进程退出、HEAD/Git 绑定门禁通过后，整批预检源和副本未改变，再逐项记录删除意图和结果。未知或改动的文件保留；其他遗留文件仍会阻止整个 worktree 删除。中断可能留下已删/未删回执，重复执行仅恢复同一意图。此机制不认领构建产物、不运行任意 setup，也不将忽略的可编辑源码导入任务。
+
+## 持久本地通知与单次监督
+
+`notify RUN [RUN ...]` 在首次读取前注册原生文件通知，再重放事件；`--once` 只处理当前积压和到期投递。游标、稳定事件身份与收件箱在同一 SQLite 事务中提交。未完成尾行等待追加；完整破损行保存位置、摘要与有界异常证据后继续消费。日志替换/截断显式登记异常。`watch`、`status`、dashboard 和 `inbox` 不写 ACK；只读收件箱拒绝外部改成 WAL 的数据库，避免 SQLite 创建侧文件或忽略未合并 WAL。
+
+投递目前只有本地终端，attempting/sent/failed 和退避时间独立保存；重试时钟不轮询 run 台账。崩溃在发送后、登记前可能重复投递，同一通知 ID 供接收方去重。sent 不表示人已看过。`ack ID --run RUN` 或 `ack ID --operation OP` 确认指定关联，不批准任务或恢复。历史或尚未登记到权威台账的请求不能作为当前动作；详情只提供 `status RUN`，实际恢复资格仍由既有门禁判断。
+
+`supervise -- run ...` / `supervise -- resume RUN ...` 固定启动一次 Harness CLI，独占 operation ID，记录启动失败或 wait() 的真实退出码，随后写入同一收件箱；不伪造 Engine 事件。账本进展、被监督进程退出、观察连接与通知投递各自独立。监督进程本身被强杀时仍可能没有及时退出通知；本版本不安装后台服务，不自动重启/恢复，也不将父进程退出当作全部模型/broker 子进程退出证据。

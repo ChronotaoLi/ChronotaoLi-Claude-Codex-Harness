@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 
 from . import git
+from .util import readonly_lock
 from .util import (HarnessError, append_event, confirm_dispatches_exited,
                    ensure_dispatches_exited, group_alive, lock, read_json, validate_command_directories, write_json)
 
@@ -148,10 +149,13 @@ def cleanup_verification(repo: Path, ident: str, *, remove=False, confirm_exited
     if not directory.is_dir():
         raise HarnessError(f"运行不存在：{ident}")
     _canonical(directory / "run.lock")
-    with lock(directory / "run.lock"):
+    if remove or confirm_exited:
+        from .private_state import ensure_private_state
+        ensure_private_state(repo)
+    with (lock if remove or confirm_exited else readonly_lock)(directory / "run.lock"):
         _regular_bytes(directory / "state.json")
         run = read_json(directory / "state.json")
-        if (not isinstance(run, dict) or run.get("schema_version") not in (7, 8, 9, 10, 11) or run.get("id") != ident
+        if (not isinstance(run, dict) or run.get("schema_version") not in (7, 8, 9, 10, 11, 12) or run.get("id") != ident
                 or run.get("repo") != str(repo) or not isinstance(run.get("dispatches"), list)
                 or not isinstance(run.get("final_history"), list)
                 or not isinstance(run.get("worktree_binding"), dict)

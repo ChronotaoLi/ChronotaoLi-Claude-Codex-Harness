@@ -4,6 +4,7 @@ import contextlib
 import io
 import json
 import tempfile
+import subprocess
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -144,6 +145,7 @@ class PermissionSmokeTests(unittest.TestCase):
                 "type": "result", "subtype": "success", "permission_denials": []}), encoding="utf-8")
             return 0
 
+        subprocess.run(["git", "init", "-q", str(self.root)], check=True)
         with patch("harness.permission_smoke.run_process", side_effect=process), contextlib.redirect_stderr(io.StringIO()):
             report = permission_smoke(config, self.root)
         self.assertEqual(len(seen), 1)

@@ -1,5 +1,20 @@
 # 验证记录
 
+## 计划准备与运行可靠性验证（2026-11-01，台账 v12）
+
+全量按模块隔离复跑 **125 个模块、1089 项测试：1088 项通过，1 项跳过**，Python 3.15.2，4 个并发进程，321.635 秒。跳过原因是本机文件系统拒绝非 UTF-8 文件名。每个模块运行 `python3 -m unittest discover -s tests -p test_MODULE.py -v`，覆盖与标准全量发现相同的 1089 项；逐模块日志及结果在 `.harness/validation/design-v3-implementation-20261101/module-suite/`，汇总为 `summary.json`。
+
+此前已执行仓库要求的 `python3 -m unittest discover -s tests -v`，发现五处旧测试夹具不满足新增的真实 Git 初始化、独占 dispatch 目录和私有目录已创建前提。修正只涉及夹具，运行时代码保持复审版本；原错误、转发、保护、轮数和证据断言保留，50 项相关复验通过，测试改动经另一名独立 `gpt-6.1-sol` 审阅批准后进行上述全量复跑。
+
+Python 3.11 定向行为验证 86 项全部通过，20.627 秒，覆盖私有状态写入保护、计划证据映射、输入复制/恢复/删除、派发前门禁、通知游标/坏行/ACK/投递恢复、监督退出回执、流式 EOF/终态/容量/进程退出、权限诊断和预算计数。日志为 `.harness/validation/design-v3-implementation-20261101/python311-final-behavior.log`。Python 3.11 compileall、dashboard JavaScript 语法检查、文档本地路径检查和 `git diff --check` 通过；示例 `plan-readiness` CLI 生成 advisory_only 报告，无警告。
+
+独立 `gpt-6.1-sol` 使用两个新的只读 CLI 进程审阅和复审。首次提出四项阻断：FIFO 输入阻塞、极大时间戳阻断通知消费、监督回执到收件箱的持久交接缺口、终态 JSON 序列化后超出字节上限。修复及行为回归完成后，复审为 approve，四项全部关闭。另有组件交叉审阅，并修复只读预览写锁、SQLite WAL 侧文件、完整深嵌套坏行、监督写入失败后进程回收、准备锁符号链接与未知硬链接临时文件保留等边界。原始记录位于同批次 `reviews/final/`、`reviews/final-rereview/` 及组件审阅日志；不提交私有审阅正文。
+
+真实账号验证使用 Claude Code **2.1.316**、配置原样的 **claude-opus-5-5 / high**，每次新进程与 dispatch。正式 JSON Schema 与 `stream_metadata_v1` 联合验证成功，核对原生 Read、唯一终态、用量及回执；窄规则拒绝夹具实际匹配到同一 Bash tool ID 的 start、error result 与 terminal permission_denials，随后正常读取并返回结构化结果。共四次隔离调用，其中前两种尝试制造拒绝的方式未出现拒绝，保留原记录且不算拒绝证据。最终成功和拒绝证据分别位于 `stream-success/` 与 `stream-narrow-deny/`，汇总为 `stream-real-summary.json`。
+
+这些真实夹具使用只读 reviewer 能力及配置中的 worker 模型，不证明完整生产 worker/broker 流程；本批没有强制制造真实供应商/API 故障，也没有运行整套 `python3 -m harness smoke`。故障终态、非零退出、容量与背压由离线子进程回归覆盖。精确 broker 命令匹配属于离线验证。流式工具事件不证明全文读取或语义理解，未报告的拒绝原因保持 unavailable。默认仍为 legacy_json，既有运行不能切换捕获模式；模型、接受门禁与预算策略保持既有语义。
+
+
 ## 再规划候选保留与恢复诊断验证（2026-10-29，台账 v11）
 
 最终执行 `python3 -m unittest discover -s tests -v`：954 项，953 项通过、1 项因本机文件系统拒绝非 UTF-8 文件名而跳过，Python 3.15.2，925.034 秒。完整日志为 `.harness/validation/improvement-20261029/final-full-suite.log`。

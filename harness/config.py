@@ -13,7 +13,7 @@ DEFAULTS = {
         "max_attempts": 3, "max_final_attempts": 3, "max_total_attempts": 60, "max_replans": 2,
         "max_agent_dispatches": 200,
         "max_tasks": 20, "context_chars": 100000, "claude_max_turns": 50,
-        "claude_max_turns_by_role": {},
+        "claude_max_turns_by_role": {}, "claude_output_mode": "legacy_json",
     },
     "permissions": {"worker_commands": []},
     "memory": {"task_ttl_days": 180, "knowledge_ttl_days": 180},
@@ -119,6 +119,10 @@ class Config:
         if data["roles"]["worker"]["cli"] == "codex":
             raise HarnessError("当前 Codex 适配器仅支持只读角色，不能配置为 worker")
         for key in DEFAULTS["runtime"]:
+            if key == "claude_output_mode":
+                if data["runtime"][key] not in ("legacy_json", "stream_metadata_v1"):
+                    raise HarnessError("runtime.claude_output_mode must be legacy_json or stream_metadata_v1")
+                continue
             if key == "claude_max_turns_by_role":
                 continue
             value = data["runtime"][key]

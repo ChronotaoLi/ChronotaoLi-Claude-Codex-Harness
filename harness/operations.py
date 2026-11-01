@@ -164,8 +164,8 @@ class OperationRecord:
     def create(cls, state, *, kind, arguments, config, repo, operation_id=None, file_inputs=False):
         """Gather provenance read-only, then create the record exclusively.
 
-        Creation precedes git.ignore_state and every other write of the
-        invocation; an existing file means another process owns this ID.
+        Protection and exclusive creation share a common-Git short lock;
+        duplicate IDs are rejected before ignore configuration changes.
         """
         if operation_id is None:
             operation_id = uid("op")
@@ -184,15 +184,21 @@ class OperationRecord:
                   "error_omitted": None}
         directory = Path(state) / "operations"
         path = directory / f"{operation_id}.json"
-        directory.mkdir(parents=True, exist_ok=True)
-        try:
-            descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
-        except FileExistsError as error:
-            raise HarnessError(f"操作记录已存在：{path}；每个 --operation-id 只能由一个进程使用") from error
-        with os.fdopen(descriptor, "w", encoding="utf-8") as output:
-            output.write(dump(record) + "\n")
-            output.flush()
-            os.fsync(output.fileno())
+        from .private_state import private_state_lock, initialize_private_state_locked, _path
+        with private_state_lock(repo) as common:
+            _path(directory, directory=True)
+            if path.exists() or path.is_symlink():
+                raise HarnessError(f"操作记录已存在：{path}；每个 --operation-id 只能由一个进程使用")
+            initialize_private_state_locked(repo, state, common)
+            directory.mkdir(parents=True, exist_ok=True)
+            try:
+                descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+            except FileExistsError as error:
+                raise HarnessError(f"操作记录已存在：{path}；每个 --operation-id 只能由一个进程使用") from error
+            with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+                output.write(dump(record) + "\n")
+                output.flush()
+                os.fsync(output.fileno())
         return cls(path, record, file_inputs=file_inputs)
 
     def link(self, run_id):

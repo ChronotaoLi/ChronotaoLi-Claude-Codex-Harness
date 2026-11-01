@@ -10,6 +10,7 @@ from pathlib import Path
 
 from .command_server import create_manifest
 from .shared import mcp_configs, toml_value
+from .stream_capture import claude_result_path, freeze_capture, run_stream_process
 from .util import HarnessError, read_json, run_process, tail, write_json
 
 
@@ -74,7 +75,7 @@ def provider_usage(job, provider):
     not an account bill; none of these observations affect execution budgets.
     """
     try:
-        with (job / "process.stdout").open("rb") as stream:
+        with (claude_result_path(job) if provider == "claude" else job / "process.stdout").open("rb") as stream:
             raw = stream.read(_USAGE_MAX_BYTES + 1)
         if len(raw) > _USAGE_MAX_BYTES:
             return None
@@ -110,9 +111,21 @@ def provider_usage(job, provider):
             return None
         if tokens:
             metrics["tokens"] = tokens
-        return {"provider": provider, "source": "process.stdout", **metrics} if metrics else None
+        return {"provider": provider, "source": claude_result_path(job).name if provider == "claude" else "process.stdout", **metrics} if metrics else None
     except (OSError, ValueError, UnicodeError, RecursionError):
         return None
+
+
+def claude_http_status(value):
+    """Presence remains distinct even when missing and null share a label."""
+    if "api_error_status" not in value:
+        return {"state": "missing"}
+    status = value["api_error_status"]
+    if status is None:
+        return {"state": "null"}
+    if type(status) is int and 400 <= status <= 599:
+        return {"state": "valid", "value": status}
+    return {"state": "invalid"}
 
 
 def claude_error_summary(value):
@@ -140,10 +153,9 @@ def claude_error_summary(value):
             item = value[field]
             label = item if isinstance(item, str) and item in known else "unrecognized"
             details.append(field + "=" + json.dumps(label))
-    if "api_error_status" in value:
-        status = value["api_error_status"]
-        details.append("api_error_status=" + (str(status) if type(status) is int and 400 <= status <= 599
-                                              else "invalid"))
+    status = claude_http_status(value)
+    details.append("api_error_status=" + (str(status["value"]) if status["state"] == "valid"
+                   else "not_provided" if status["state"] in ("missing", "null") else "invalid"))
     errors = value.get("errors")
     if isinstance(errors, list):
         details.extend(json.dumps(message[:240], ensure_ascii=True)
@@ -157,7 +169,7 @@ def cli_error_summary(job, provider):
     if provider != "claude":
         return ""
     try:
-        with (job / "process.stdout").open("rb") as stream:
+        with (claude_result_path(job) if provider == "claude" else job / "process.stdout").open("rb") as stream:
             raw = stream.read(_USAGE_MAX_BYTES + 1)
         return claude_error_summary(json.loads(raw)) if len(raw) <= _USAGE_MAX_BYTES else ""
     except (OSError, ValueError, UnicodeError, RecursionError):
@@ -200,8 +212,9 @@ def claude_worktree_git_deny_rules(cwd):
 
 
 class CLIBackend:
-    def __init__(self, config, state):
+    def __init__(self, config, state, *, allow_stream_fixture=False):
         self.config, self.state = config, state
+        self.allow_stream_fixture = allow_stream_fixture
 
     def command(self, role, model, cwd, job, schema, run_path):
         if role == "worker" and model["cli"] == "codex":
@@ -250,19 +263,39 @@ class CLIBackend:
                 "--no-session-persistence", "--session-id", job.name,
                 "--setting-sources", "", "--settings", json.dumps(settings),
                 "--strict-mcp-config", "--mcp-config", str(job / "mcp.json"),
-                "--output-format", "json", "--json-schema", json.dumps(wire_schema),
+                "--output-format", self.output_format(), *(["--verbose"] if self.output_format() == "stream-json" else []),
+                "--json-schema", json.dumps(wire_schema),
                 "--max-turns", str(self.config.claude_max_turns(role)),
                 "--permission-mode", "dontAsk", "--disallowedTools", "Agent,Task",
                 "--tools", tools]
 
+    def output_format(self):
+        return "stream-json" if self.config.data["runtime"].get("claude_output_mode", "legacy_json") == "stream_metadata_v1" else "json"
+
     def invoke(self, *, role, model, cwd, job, schema, prompt, run_path, on_start, task=None, kind=None):
+        mode = self.config.data["runtime"].get("claude_output_mode", "legacy_json")
         write_json(job / "schema.json", schema)
         (job / "prompt.txt").write_text(prompt, encoding="utf-8")
         argv = self.command(role, model, cwd, job, schema, run_path)
         write_json(job / "command.json", argv)
         env = os.environ.copy()
         env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] = "1"
-        code = run_process(argv, cwd, job / "process", stdin=prompt,
+        runner = run_process
+        if model["cli"] == "claude":
+            version = "not_recorded"
+            if mode == "stream_metadata_v1":
+                import subprocess
+                try:
+                    version = subprocess.run([argv[0], "--version"], capture_output=True,
+                                             timeout=10, check=True).stdout.decode("utf-8").strip()
+                except (OSError, ValueError, subprocess.SubprocessError, UnicodeError) as error:
+                    raise HarnessError("Unable to identify Claude CLI version") from error
+                if not version or len(version) > 200 or any(ord(c) < 32 for c in version):
+                    raise HarnessError("Invalid Claude CLI version")
+            freeze_capture(job, mode, version)
+            if mode == "stream_metadata_v1":
+                runner = run_stream_process
+        code = runner(argv, cwd, job / "process", stdin=prompt,
                            timeout=self.config.data["runtime"]["agent_timeout_seconds"], env=env, on_start=on_start)
         if code:
             diagnostic = cli_error_summary(job, model["cli"])
@@ -272,7 +305,7 @@ class CLIBackend:
             if not (job / "response.json").exists():
                 raise HarnessError(f"Codex 未输出结构化结果：{job}")
             return self.read_result(job / "response.json", "Codex")
-        result = self.read_result(job / "process.stdout", "Claude")
+        result = self.read_result(claude_result_path(job), "Claude")
         write_json(job / "provider-result.json", result)
         if result.get("is_error") or result.get("subtype", "success") != "success":
             raise HarnessError(f"Claude 未成功完成：{claude_error_summary(result) or 'unclassified CLI error'}；日志：{job}")

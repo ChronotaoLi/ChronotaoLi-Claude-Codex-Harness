@@ -7,6 +7,7 @@ import os
 import re
 import sys
 import unittest
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 import harness.engine
@@ -117,7 +118,7 @@ class OperationRecordTests(OperationCase):
         self.assertLessEqual(record["run_linked_at"], record["finished_at"])
         self.assertRegex(record["finished_at_utc"], r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
         ledger = self.ledger(run_id)
-        self.assertEqual((ledger["schema_version"], ledger["created_by_operation"]), (11, "op-a"))
+        self.assertEqual((ledger["schema_version"], ledger["created_by_operation"]), (12, "op-a"))
         created = self.events(run_id, "run_created")
         self.assertEqual([(event["run_id"], event["operation_id"]) for event in created], [(run_id, "op-a")])
         self.assertIn(notice("run_created", run_id, "op-a"), errors.splitlines())
@@ -416,7 +417,7 @@ class OperationRecordTests(OperationCase):
         self.assertEqual(code, 0, errors)
         self.assertEqual(json.loads(output)["status"], "completed")
         self.assertNotIn("created_by_operation", read_json(path))
-        self.assertEqual(read_json(path)["schema_version"], 11)
+        self.assertEqual(read_json(path)["schema_version"], 12)
 
     def test_engine_accepts_operation_double_and_null_operation(self):
         state = self.state
@@ -445,6 +446,36 @@ class OperationRecordTests(OperationCase):
         self.assertIsNone(result["created_by_operation"])
         self.assertEqual([event["operation_id"] for event in self.events(result["id"], "run_created")], [None])
         self.assertIn(notice("run_created", result["id"], None), errors.getvalue().splitlines())
+
+    def test_duplicate_id_does_not_repair_changed_excludes(self):
+        with patch("harness.operations.probe_cli", side_effect=fake_probe):
+            first = OperationRecord.create(self.state, kind="run", arguments={"goal": "private"},
+                config=self.config, repo=self.repo, operation_id="duplicate")
+            common = Path(git.git(self.repo, "rev-parse", "--path-format=absolute", "--git-common-dir").strip())
+            exclude = common / "info/exclude"
+            exclude.write_bytes(b"# changed externally\n")
+            before = first.path.read_bytes()
+            with self.assertRaisesRegex(HarnessError, "已存在"):
+                OperationRecord.create(self.state, kind="run", arguments={}, config=self.config,
+                    repo=self.repo, operation_id="duplicate")
+            self.assertEqual(exclude.read_bytes(), b"# changed externally\n")
+            self.assertEqual(first.path.read_bytes(), before)
+
+    def test_concurrent_operation_id_has_one_owner(self):
+        from concurrent.futures import ThreadPoolExecutor
+        def create():
+            try:
+                record = OperationRecord.create(self.state, kind="run", arguments={"goal": "private"},
+                    config=self.config, repo=self.repo, operation_id="concurrent")
+                return record.path.read_bytes()
+            except HarnessError:
+                return None
+        with patch("harness.operations.probe_cli", side_effect=fake_probe):
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                results = list(executor.map(lambda _: create(), range(2)))
+        self.assertEqual(sum(result is not None for result in results), 1)
+        self.assertEqual((self.operations / "concurrent.json").read_bytes(), next(x for x in results if x))
+        self.assertEqual(git.git(self.repo, "ls-files", "--others", "--exclude-standard", "--", ".harness"), "")
 
     def test_exclusive_creation_never_overwrites_an_existing_record(self):
         arguments = {"goal": "x", "plan": None, "commander": "astra", "pause_after_plan": False, "step": False}

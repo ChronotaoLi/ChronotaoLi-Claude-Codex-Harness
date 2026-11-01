@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "requirements": [
+    {"id": "greeting", "text": "greet('Ada') 等于 'Hello, Ada!'，项目 unittest 通过", "evidence_tasks": ["greet"], "owner_task": "greet"}
+  ],
+  "tasks": {
+    "greet": {
+      "deliverables": ["hello.py 中的 greet(name) 实现与通过的行为验证"],
+      "input_refs": ["原始目标与仓库内已有测试；执行时核对版本"],
+      "verification_commands": [["python3", "-m", "unittest", "-v"]],
+      "unknown_prerequisites": [],
+      "permission_operations": ["验证命令必须在当前精确 argv 能力中获得授权"],
+      "cost_basis": "一个函数与已有测试；失败只涉及同一行为边界",
+      "not_split_reason": "实现与行为回归形成单个可独立审阅结果"
+    }
+  }
+}

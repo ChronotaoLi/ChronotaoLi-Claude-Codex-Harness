@@ -5,6 +5,7 @@ import json
 import os
 import signal
 import sys
+import uuid
 from unittest.mock import patch
 
 from harness.adapters import CLIBackend
@@ -67,8 +68,9 @@ class ErrorRepairsTests(RepoCase):
         self.assertEqual(os.fsencode(next(iter(read_json(path)))), b"file-\xff.txt")
 
     def invoke_provider(self, cli, raw):
-        job = self.repo / ("dispatch-" + cli)
-        job.mkdir(exist_ok=True)
+        job = self.repo / ("dispatch-" + cli + "-" + uuid.uuid4().hex)
+        job.mkdir()
+        self.provider_job = job
         model = {"cli": cli, "model": "exact-test-model", "effort": "high"}
         backend = CLIBackend(self.config, self.repo / ".harness")
         if cli == "codex":
@@ -86,7 +88,7 @@ class ErrorRepairsTests(RepoCase):
             for raw in ("invalid JSON", "[]", "null"):
                 with self.subTest(cli=cli, raw=raw), self.assertRaises(HarnessError):
                     self.invoke_provider(cli, raw)
-                path = self.repo / ("dispatch-" + cli) / ("process.stdout" if cli == "claude" else "response.json")
+                path = self.provider_job / ("process.stdout" if cli == "claude" else "response.json")
                 self.assertEqual(path.read_text(), raw)
 
     def test_claude_malformed_payload_cannot_escape_as_attribute_or_type_error(self):
@@ -94,7 +96,7 @@ class ErrorRepairsTests(RepoCase):
                         {"result": "broken"}, {"subtype": "error_max_turns", "result": "{}"}):
             with self.subTest(payload=payload), self.assertRaises(HarnessError):
                 self.invoke_provider("claude", json.dumps(payload))
-            self.assertEqual(read_json(self.repo / "dispatch-claude" / "provider-result.json"), payload)
+            self.assertEqual(read_json(self.provider_job / "provider-result.json"), payload)
 
     def test_provider_success_preserves_exact_ids_without_fallback(self):
         value = {"task_id": "task-exact", "dispatch_id": "dispatch-exact", "summary": "accepted"}

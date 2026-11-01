@@ -385,6 +385,18 @@ APP_JS = r""""use strict";
       ["计数策略", b.attempt_budget_policy]
     ]));
     nodes.push(budgets);
+    if (summary.budget_explanation) {
+      var explanation = section("调用与候选事实（独立计数维度）");
+      var dimensions = summary.budget_explanation.dimensions || {};
+      explanation.appendChild(kv(Object.keys(dimensions).map(function (key) {
+        return [key, typeof dimensions[key] === "object" ? JSON.stringify(dimensions[key]) : dimensions[key]];
+      })));
+      explanation.appendChild(notice("计数来自台账关联；完成调用不代表接受，来源缺失保留未知。格式修正与失败可重叠。"));
+      explanation.appendChild(kv(Object.keys(summary.budget_explanation.limits || {}).map(function (key) {
+        return [key, JSON.stringify(summary.budget_explanation.limits[key])];
+      })));
+      nodes.push(explanation);
+    }
 
     if (summary.convergence && summary.convergence.warnings.length) {
       var convergence = section("返工提示（仅供判断）");

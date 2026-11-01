@@ -44,7 +44,7 @@ class BoundaryDiagnosticsTests(unittest.TestCase):
     def test_scope_rejects_ignored_private_state_in_run_worktree(self):
         git.ignore_state(self.repo)
         private = self.repo / ".harness"
-        private.mkdir()
+        self.assertTrue(private.is_dir())
         (private / "operator-state").write_text("preserve\n", encoding="utf-8")
         before = git.snapshot(self.repo)
         worktree = private / "worktrees" / "run_test"

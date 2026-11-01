@@ -422,3 +422,11 @@ Claude 非零退出或 CLI 结果信封报告错误时，诊断从有界 JSON �
 `permission_smoke` 在 `.harness/permission-smoke/` 创建专用测试仓库与工作树，保留报告和供应商原始输出；`--repo` 仅指定私有现场的存放位置。检查包含工作树内读写、精确命令、额外参数、工作树外读写及 `.git` 修改。通过标准要求实际工具调用、工具结果、对应的 `permission_denials` 和文件内容一致，模型自称“已拒绝”不算证据。工作树外读取按当前适配器授权应当成功。检查使用专用命令并关闭外部 MCP，不运行项目验证命令；默认超时 180 秒、最多 16 轮、预算参数为 1 美元，可用 `--timeout`、`--max-turns`、`--max-budget-usd` 调整。结果只覆盖这组测试与实际 CLI 版本，不证明完整的命令白名单或操作系统隔离。
 
 只读文件工具与 broker 的工具接口、大小限制和 JSON 数值兼容规则见[设计说明](design.md#精确命令-broker-与只读文件证据版本-11)。
+
+## 输入准备、流格式与通知的恢复边界
+
+新 run 为 schema 12，`workspace_inputs: null` 明示未准备依赖。首次 `prepare-run` 在安全暂停边界冻结清单和文件身份；resume 及派发前检查副本，副本改变、未完成或清单缺失会停止，不重新复制或消耗 worker 次数。准备中断后用同一清单重入：已登记发布 inode 可恢复；尚未保存临时 inode 的中断需人工核对，不能凭相同字节接管。终态清理使用 `cleanup-run --remove --remove-input-copies`，只有选择标志仍为预览，源与未知产物保留。
+
+捕获模式是运行配置的一部分，旧快照缺字段按 legacy_json 比较；恢复不能切换为 stream_metadata_v1。终态信封、provider-result、response 和 returned-result 各保留原职责；过程元数据不能替代 response、审阅或 receipt。已有候选和拒绝仍走原恢复门禁，新增诊断不重抽、不减预算。
+
+`notify`/`inbox`/`ack` 独立于 run.lock 与接受状态。ACK不消费操作者决定、不恢复任务。事件先于权威台账保存的窗口只显示待核实，历史通知不提供过期恢复命令。日志替换/截断保留旧游标并登记异常，须核对原始证据，不自动跳过来源变化。`supervise` 只执行明确传入的一次 run/resume；退出通知没有自动恢复含义。既有 `--confirm-exited` 与所有 broker/候选/HEAD 门禁继续适用。

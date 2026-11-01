@@ -54,11 +54,16 @@ class ProviderErrorSummaryTests(unittest.TestCase):
                 self.assertNotIn("\n", summary)
                 self.assertNotIn("\x1b", summary)
                 self.assertLess(len(summary), 220)
-        for item in (True, False, 429.0, "429", 399, 600, None, {"status": 429}):
+        for item in (True, False, 429.0, "429", 399, 600, {"status": 429}):
             payload = usage_limit_envelope()
             payload["api_error_status"] = item
             with self.subTest(status=item):
                 self.assertIn("api_error_status=invalid", claude_error_summary(payload))
+        payload = usage_limit_envelope()
+        payload["api_error_status"] = None
+        self.assertIn("api_error_status=not_provided", claude_error_summary(payload))
+        del payload["api_error_status"]
+        self.assertIn("api_error_status=not_provided", claude_error_summary(payload))
         for item in (400, 429, 500, 599):
             payload = usage_limit_envelope()
             payload["api_error_status"] = item

@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+from harness import git
 from harness.cli import _main, status_summary
 from harness.util import HarnessError
 
@@ -13,7 +14,8 @@ class OperatorCLITests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.repo = Path(self.temp.name)
+        self.repo = Path(self.temp.name).resolve()
+        git.git(self.repo, "init", "-q")
 
     def test_explicit_decision_path_reaches_engine_and_failure_is_reported(self):
         engine = Mock()

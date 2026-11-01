@@ -195,7 +195,7 @@ class EnvironmentUpdateTests(RepoCase):
         calls = len(backend.calls)
         result = self.engine(backend).resume(engine.run['id'], environment_update=path)
         self.assertEqual(result['status'], 'completed')
-        self.assertEqual(result['schema_version'], 11)
+        self.assertEqual(result['schema_version'], 12)
         self.assertEqual(result['tasks'], before['tasks'])
         self.assertEqual(result['config_snapshot']['roles'], before['config_snapshot']['roles'])
         self.assertEqual(result['original_tasks'], before['original_tasks'])
@@ -320,7 +320,7 @@ class EnvironmentUpdateTests(RepoCase):
         state.pop('environment_checks', None)
         write_json(engine.directory / 'state.json', state)
         result = self.engine(backend).resume(engine.run['id'], environment_update=path)
-        self.assertEqual(result['schema_version'], 11)
+        self.assertEqual(result['schema_version'], 12)
         self.assertEqual(result['status'], 'completed')
 
     def test_check_does_not_reblock_completed_worker_pending_review(self):

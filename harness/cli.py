@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import json
 import re
 import shutil
 import signal
@@ -128,6 +129,8 @@ def status_summary(run):
     result["budgets"].update(work_attempts=status_work_attempts(run),
                              attempt_budget_policy=run.get("attempt_budget_policy", "all_invocations"))
     result["convergence"] = convergence_summary(run, result["budgets"]["work_attempts"])
+    from .diagnostics import budget_explanation
+    result["budget_explanation"] = budget_explanation(run, result["budgets"]["work_attempts"])
     dispatches = run.get("dispatches", [])
     dispatches = [entry for entry in dispatches if isinstance(entry, dict)] if isinstance(dispatches, list) else []
     outcomes = dict.fromkeys(("completed", "task_blocked", "environment_blocked", "operator_blocked", "runtime_failed", "unknown"), 0)
@@ -406,8 +409,36 @@ def _main(argv=None):
     retirement = sub.add_parser("cleanup-run", help="预览终态 run 的工作树清理；保留分支、台账与证据，不加载配置")
     retirement.add_argument("run_id")
     retirement.add_argument("--remove", action="store_true", help="显式移除通过安全检查的工作树")
+    retirement.add_argument("--remove-input-copies", action="store_true", help="显式删除登记且未修改的依赖副本；保留源文件")
     retirement.add_argument("--confirm-exited", action="append", metavar="DISPATCH_ID",
                             help="显式确认旧派发及其命令进程已退出；可重复指定")
+    prepare = sub.add_parser("prepare-run", help="在暂停边界按清单准备不可变依赖副本")
+    prepare.add_argument("run_id")
+    prepare.add_argument("--manifest", type=Path, required=True)
+    readiness = sub.add_parser("plan-readiness", help="生成私有计划覆盖审阅材料，不改变 PLAN 或批准状态")
+    source = readiness.add_mutually_exclusive_group(required=True)
+    source.add_argument("--run", dest="run_id")
+    source.add_argument("--plan", type=Path)
+    readiness.add_argument("--goal")
+    readiness.add_argument("--coverage", type=Path)
+    notify = sub.add_parser("notify", help="原生事件驱动的持久本地通知；不调用模型")
+    notify.add_argument("run_ids", nargs="+")
+    notify.add_argument("--once", action="store_true", help="重放当前事件并投递一次后退出")
+    inbox = sub.add_parser("inbox", help="只读查询通知和当前状态；不自动确认")
+    inbox.add_argument("--run", dest="run_id")
+    inbox.add_argument("--unacknowledged", action="store_true")
+    ack = sub.add_parser("ack", help="确认看过一条通知；不批准恢复或任务")
+    ack.add_argument("notification_id")
+    ack_source = ack.add_mutually_exclusive_group(required=True)
+    ack_source.add_argument("--run", dest="run_id")
+    ack_source.add_argument("--operation", dest="operation_id")
+    supervisor = sub.add_parser("supervise", help="启动一次 Harness run/resume 并记录真实进程退出；不自动重启")
+    supervisor.add_argument("--operation-id")
+    supervisor.add_argument("arguments", nargs=argparse.REMAINDER)
+    permission = sub.add_parser("permission-diagnostics", help="只读比较供应商拒绝证据与本地精确命令能力")
+    permission.add_argument("run_id")
+    permission.add_argument("dispatch_id")
+    permission.add_argument("--argv-json", help="要比较的完整 argv JSON 数组；不会执行")
     sync = sub.add_parser("sync", help="生成共用 MCP 的两种客户端配置，不覆盖个人配置")
     sync.add_argument("--role", choices=["commander", "worker", "reviewer"], default="worker")
     mem = sub.add_parser("memory")
@@ -434,6 +465,42 @@ def _main(argv=None):
     if args.command == "status" and args.full and not args.run_id:
         parser.error("status --full 需要 run_id")
     try:
+        if args.command in ("prepare-run", "plan-readiness", "notify", "inbox", "ack", "supervise"):
+            repo = git.repository(args.repo)
+            if args.command == "prepare-run":
+                from .workspace_inputs import prepare_run
+                print(dump(prepare_run(repo, args.run_id, args.manifest)))
+            elif args.command == "plan-readiness":
+                from .plan_readiness import save_readiness
+                if args.run_id:
+                    if not RUN_ID.fullmatch(args.run_id):
+                        raise HarnessError("无效 run ID")
+                    ledger = read_ledger(repo / ".harness" / "runs" / args.run_id / "state.json")
+                    plan, goal = {"tasks": ledger["tasks"]}, ledger["goal"]
+                else:
+                    plan, goal = read_json(args.plan), args.goal
+                print(dump(save_readiness(repo, plan, goal,
+                           read_json(args.coverage) if args.coverage else None, run_id=args.run_id)))
+            elif args.command == "supervise":
+                from .supervisor import supervise
+                arguments = args.arguments[1:] if args.arguments[:1] == ["--"] else args.arguments
+                receipt = supervise(repo, arguments, config_path=args.config, operation_id=args.operation_id)
+                print(dump(receipt), file=sys.stderr)
+                code = receipt.get("exit_code")
+                return (128 - code if code < 0 else code) if type(code) is int else 1
+            else:
+                from .notifications import NotificationStore, observe_notifications
+                if args.command == "notify":
+                    observe_notifications(repo, args.run_ids, once=args.once)
+                else:
+                    with NotificationStore(repo, readonly=args.command == "inbox") as store:
+                        if args.command == "inbox":
+                            print(dump(store.list_notifications(run_id=args.run_id,
+                                                               unacknowledged=args.unacknowledged)))
+                        else:
+                            print(dump(store.acknowledge(args.notification_id, run_id=args.run_id,
+                                                         operation_id=args.operation_id)))
+            return 0
         if args.command == "watch":
             from .watch_cli import watch_run
             state = args.state if args.state is not None else git.repository(args.repo) / ".harness"
@@ -454,6 +521,7 @@ def _main(argv=None):
                 return 1 if any(item["status"] == "blocked" for item in result["checkouts"]) else 0
             elif args.command == "cleanup-run":
                 print(dump(cleanup_run(repo, args.run_id, remove=args.remove,
+                                       remove_input_copies=args.remove_input_copies,
                                        confirm_exited=args.confirm_exited or ())))
             else:
                 manage_memory(args, repo, state)
@@ -465,6 +533,52 @@ def _main(argv=None):
                                "默认 harness.toml 和 shared 资源仅随源码仓库提供") from e
         if args.command == "doctor":
             return doctor(config)
+        if args.command == "permission-diagnostics":
+            from .permission_diagnostics import permission_diagnostics
+            if not RUN_ID.fullmatch(args.run_id) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,119}", args.dispatch_id):
+                raise HarnessError("无效 run/dispatch ID")
+            state = git.repository(args.repo) / ".harness"
+            try:
+                with observe.Observer(state, required=True) as observer:
+                    run, error = observer._read_ledger(args.run_id)
+                    if error or run.get("id") != args.run_id:
+                        raise HarnessError(error or "运行 ID 不符")
+                    entry = next((d for d in run.get("dispatches", []) if d.get("id") == args.dispatch_id), None)
+                    if entry is None:
+                        raise HarnessError("派发未登记")
+                    components = ["runs", args.run_id, "dispatches", args.dispatch_id]
+                    terminal = None
+                    roles = run.get("config_snapshot", {}).get("roles", {})
+                    role_key = "fable" if entry.get("role") == "commander" and run.get("commander") == "fable" else entry.get("role")
+                    provider = roles.get(role_key, {}).get("cli")
+                    if provider == "claude":
+                        try:
+                            capture = observer.reader.read(components + ["capture-manifest.json"], limit=4096)
+                            if capture["too_large"] or capture["changed_while_reading"]:
+                                raise HarnessError("捕获元数据过大或读取时改变")
+                            manifest = json.loads(capture["data"])
+                            if not isinstance(manifest, dict) or manifest.get("version") != 1:
+                                raise HarnessError("捕获元数据格式无效")
+                            mode = manifest.get("mode")
+                        except observe.NotFound:
+                            mode = "legacy_json"
+                        if mode not in ("legacy_json", "stream_metadata_v1"):
+                            raise HarnessError("未知捕获模式")
+                        name = "stream-terminal.json" if mode == "stream_metadata_v1" else "process.stdout"
+                        try:
+                            source = observer.reader.read(components + [name], limit=16*1024*1024)
+                            if not source["too_large"] and not source["changed_while_reading"]:
+                                terminal = json.loads(source["data"])
+                        except (observe.NotFound, ValueError, RecursionError):
+                            pass
+                    report = permission_diagnostics(config, terminal,
+                        argv=json.loads(args.argv_json) if args.argv_json else None)
+                    report.update(run_id=args.run_id, dispatch_id=args.dispatch_id,
+                                  local_config_basis="current_configuration_not_historical_provider_policy")
+                    print(dump(report))
+                    return 0
+            except observe.ObserveError as error:
+                raise HarnessError(str(error)) from error
         if args.command in ("demo", "smoke"):
             demo(config, live=args.command == "smoke", commander=getattr(args, "commander", "astra"))
             return 0

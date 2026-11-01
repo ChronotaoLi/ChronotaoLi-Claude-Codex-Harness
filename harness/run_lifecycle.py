@@ -31,7 +31,7 @@ class RunLifecycle(RuntimeService):
         ident = uid("run")
         worktree = runtime.state / "worktrees" / ident
         operation = runtime.operation
-        runtime.run = {"schema_version": 11, "id": ident, "repo": str(runtime.repo), "goal": goal, "status": "planning", "commander": runtime.commander,
+        runtime.run = {"schema_version": 12, "workspace_inputs": None, "id": ident, "repo": str(runtime.repo), "goal": goal, "status": "planning", "commander": runtime.commander,
                     "branch": "harness/" + ident, "worktree": str(worktree), "tasks": [], "accepted": {}, "attempts": {},
                     "attempt_budget_policy": "work",
                     "dispatches": [], "expected_head": git.head(runtime.repo), "feedback": None,
@@ -95,7 +95,7 @@ class RunLifecycle(RuntimeService):
         runtime.run = read_json(runtime.state / "runs" / ident / "state.json")
         if not isinstance(runtime.run, dict):
             raise HarnessError("运行台账必须为对象")
-        if runtime.run.get("schema_version") not in (8, 9, 10, 11):
+        if runtime.run.get("schema_version") not in (8, 9, 10, 11, 12):
             raise HarnessError("旧 run 状态格式无法安全恢复；请保留证据并使用原版本完成，或开始新 run")
         required = {"id": str, "repo": str, "worktree": str, "status": str, "commander": str,
                     "goal": str, "branch": str, "expected_head": str, "base_commit": str,
@@ -117,6 +117,9 @@ class RunLifecycle(RuntimeService):
             raise HarnessError("运行台账字段缺失或类型无效；保留原文件并核对证据")
         if runtime.run["repo"] != str(runtime.repo):
             raise HarnessError("Run 属于另一个项目")
+        if runtime.run["schema_version"] >= 12 and ("workspace_inputs" not in runtime.run
+                or runtime.run["workspace_inputs"] is not None and not isinstance(runtime.run["workspace_inputs"], dict)):
+            raise HarnessError("运行输入绑定字段缺失或无效；保留现场")
         validate_command_directories(runtime.run["dispatches"], runtime.directory)
         runtime.validate_recovery_links()
         runtime.validate_attempt_accounting()
@@ -311,6 +314,8 @@ class RunLifecycle(RuntimeService):
             validate_dispatch_indexes(runtime.directory, runtime.run["dispatches"])
             if git.head(runtime.worktree, binding=runtime.run["worktree_binding"]) != runtime.run["expected_head"]:
                 raise HarnessError("worktree HEAD 与检查点不同；请先核对提交，不自动重放")
+            from .workspace_inputs import validate_inputs
+            validate_inputs(runtime.run, runtime.directory)
             runtime.recover_replan_worker_correction()
             update = runtime.prepare_environment_update(environment_update) if environment_update is not None else None
             decision_values, decisions = (runtime.prepare_operator_decisions(operator_decision)
@@ -345,12 +350,13 @@ class RunLifecycle(RuntimeService):
                 runtime.approve_scope_extensions(allow_scope)
             if repair_invalid is not None:
                 runtime.prepare_invalid_repair(repair_invalid)
-            if runtime.run["schema_version"] < 11:
+            if runtime.run["schema_version"] < 12:
                 previous_version = runtime.run["schema_version"]
                 for field in ("decision_requests", "operator_decisions", "task_checkpoints", "environment_updates", "environment_checks"):
                     runtime.run.setdefault(field, [])
-                runtime.run["schema_version"] = 11
-                runtime.event("run_schema_upgraded", previous_version=previous_version, schema_version=11)
+                runtime.run.setdefault("workspace_inputs", None)
+                runtime.run["schema_version"] = 12
+                runtime.event("run_schema_upgraded", previous_version=previous_version, schema_version=12)
                 runtime.save()
             runtime.record_operator_decisions(decisions)
             if operator_decision is not None:

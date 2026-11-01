@@ -268,7 +268,7 @@ worker 的 handoff_targets 提供所有未接受的直接／传递下游 ID 和�
 
 只有 worker 获得 `harness_commands` MCP。`list_commands` 读取已配置命令，`run_command({command_id})` 仅执行 `verification.commands` 和 `permissions.worker_commands` 中与 ID 对应的完整 argv。工具约束 `command_execution` 中的 `worker_command_ids` 与 `permissions.worker_commands`、`verification_command_ids` 与 `verification.commands` 分别逐项对应；worker 优先使用 broker。调用不能附加参数或覆盖 cwd、env，不经 shell 插值。字面 `*` 和换行可原样作为 argv，旧 Bash grants 仍过滤它们。管道或重定向必须配置完整的 `["/bin/sh", "-c", "固定脚本"]`；不会自动拼接命令、授权 `gh`／`ssh`／`curl` 前缀，或借后台运行和权限绕过执行。
 
-每次命令的 stdout/stderr 原文、摘要绑定的 receipt 和子进程 journal 留在 dispatch 私有 `commands/` 目录。每条命令超时为 `runtime.verify_timeout_seconds`，恢复时可以调大；适配器的 MCP 超时另加 10 秒，worker 总调用仍受 `agent_timeout_seconds` 限制。所有恢复与清理均核对命令子进程，不能以父 CLI 退出代替子进程退出证据。`--confirm-exited` 使用父 dispatch ID 并审计子日志摘要；确认仍不放宽候选、HEAD、Git 绑定和接受门禁。新台账版本 11，未完成的 8／9／10 在预检通过后升级；cleanup 支持 7 至 11。
+每次命令的 stdout/stderr 原文、摘要绑定的 receipt 和子进程 journal 留在 dispatch 私有 `commands/` 目录。每条命令超时为 `runtime.verify_timeout_seconds`，恢复时可以调大；适配器的 MCP 超时另加 10 秒，worker 总调用仍受 `agent_timeout_seconds` 限制。所有恢复与清理均核对命令子进程，不能以父 CLI 退出代替子进程退出证据。`--confirm-exited` 使用父 dispatch ID 并审计子日志摘要；确认仍不放宽候选、HEAD、Git 绑定和接受门禁。此接口起始于台账版本 11；当前新台账为 12，未完成的 8／9／10／11 在预检通过后升级；cleanup 支持 7 至 12。
 
 只读 `harness` MCP 保留记忆只读连接，新增 `file_sha256({path})`、`json_check({path})` 和 `file_diff({left,right})`。相对路径锚定 run 工作树，绝对外部路径允许读取；解析符号链接后只读普通文件并检查文件变化。SHA256 流式读取上限 1 GiB；JSON 与 diff 每个源上限 8 MiB。JSON 严格拒绝重复 key 与非有限数，返回有效性、根类型、值数量、摘要和可用错误位置；非法内容是 `valid=false` 的证据。diff 使用 Python difflib，返回两边摘要、不同／二进制标志，文本输出上限 24,000 字符并报告截断。它们不写文件、不启动子进程、不运行 Git 过滤器。
 
@@ -281,3 +281,19 @@ JSON 检查对浮点数要求 Python 可表示的有限数值范围；超出该�
 观察层（`observe.py`、`dashboard.py`）与操作记录（`operations.py`）都是只读附属物，不构成第二套执行真相：它们不写 run 台账、不取 `run.lock`、不升级台账版本、不初始化记忆库、不调用模型；操作记录创建时只执行只读的 Git 查询（目标仓库 HEAD、Harness 检出修订与修改状态）和 CLI `--version` 探测，网页服务在启动前解析一次仓库根，服务开始后不调用 Git、不启动子进程；台账解释仍复用 `status_summary`，`status` 列表与网页读同一份投影。费用按供应商分列并以台账 dispatch ID 为唯一累计单位：Claude 的数字是 CLI 报告的估算而非账户账单，Codex 不报告美元，没有合法费用字段时显示不可用而不是 0，不给全 run 合计，token 不跨 dispatch 或供应商相加。网页只通过固定根目录读取 run 目录内的普通文件：从解析后的 `.harness` 目录描述符逐级以 `O_DIRECTORY|O_NOFOLLOW` 打开中间目录，末级以 `O_NOFOLLOW|O_NONBLOCK` 打开并要求是普通文件，检查后把中间目录替换为符号链接也无法逃出根；台账中的绝对路径只显示不打开，文件内容永远以 `text/plain` 返回。服务只绑定 127.0.0.1，要求 Host 精确匹配，在创建处理线程之前把同时连接限制为 8 个，超出的连接直接 503。
 
 操作记录在加载配置之后、构造引擎之前独占创建，只有取得该 ID 的进程继续。可选字段 `created_by_operation` 随 run 的首次台账保存一起落盘；保存成功后追加 `run_created` 事件、向 stderr 输出 `[harness-json]` 通知并立即把 run ID 写回记录；resume 自身预检门禁通过、进入执行阶段前同样处理。`run_resumed` 不表示已派发模型，执行阶段仍可停止并写 `run_stopped`；预检拒绝前已保存的显式审计和配置记录保留，不承诺所有拒绝均保持台账字节不变。这些观察步骤的普通异常只发出警告，警告输出本身失败也被忽略，不改变生命周期、保存顺序或退出码；进程中断仍按既有恢复限制处理，旧 run 没有该字段也照常恢复。含文件型输入的调用出错时记录只保留异常类型，不复制错误文本。本批不实现：有界规划调查、进程存活探测、远端访问、多仓库汇总、跨供应商 token 汇总与按公开单价估算账单，也不把观察结果变成运行预算。详细用法与限制见[操作与观察](operations.md)。
+
+## 计划粒度与运行可靠性（版本 12）
+
+保留平面串行 DAG 和原接受协议。`plan-readiness` 生成独立私有报告，以摘要绑定原目标、原文要求和计划；计算最终责任节点对全部证据任务的传递依赖，暴露未声明产物、输入、验证命令、成本依据与未知前置条件。它不判断语义覆盖已充分，也不新增固定模型审阅或执行授权。复杂任务沿发现、实现、生命周期验证、综合验收等独立结果拆分；原子生命周期修复与关键回归可以保持同一节点。交接复用 accepted commit、审阅、验证和绑定检查点，不保存私人推理，也不建立第二套接受真相。
+
+私有状态写入口先检查真实 Git 公共目录与工作树归属，在公共目录锁内保留并补充 exclude、建立私有根 `.gitignore` 的 `*` 规则、拒绝已跟踪私有文件与冲突/链接控制文件，再写操作记录或运行证据。项目中的负向忽略规则不再暴露私有状态；运行 worktree 内的 `.harness` 仍禁止。重复 operation ID 在忽略规则变更前拒绝。只读预览仅锁已有文件，缺锁不创建。
+
+版本 12 要求 `workspace_inputs` 字段：未准备为 null，准备后绑定不可变清单摘要。不允许删除 sidecar 后降级为无输入运行。旧 8—11 预检通过后迁移，历史接受结果不重验、不改预算。清单声明主检出源与被忽略的 worktree 目标、内容摘要/权限、数量和字节上限；复制和删除均采用意图与身份回执，未知、改变、链接和来源不符时保留现场。准备不是任意环境脚本执行或可编辑源码导入，详见[依赖副本清单](operations.md#依赖副本清单)。
+
+通知库独立于台账和接受：原生订阅先于初次采样，完整记录的游标与收件箱原子提交，坏行保留异常并继续消费，替换/截断保留旧游标并停止该来源自动消费。来源身份和游标前 4 KiB 摘要用于发现替换及附近变化，不保证检测同 inode 的任意早期历史改写。终端投递持久重试、显式 ACK 与当前资格查询分开；恢复入口始终只建议查询 status。单次监督仅记录真实启动/wait 结果，不重启，也不以父退出证明全部 broker 退出。后台常驻托管与外部通知不在本版本。
+
+Claude 新运行可选 `stream_metadata_v1`。每个 Claude CLI 派发独占冻结捕获模式；新流模式记录实际 CLI 版本，legacy 明示版本未记录，旧无清单产物按 legacy JSON 解析。stdout/stderr 同时排空；有界记录解析后仅把白名单事件交给独立有界元数据队列。工具参数/结果正文、assistant 文本和 thinking 不进入元数据，stderr只记字节计数。元数据容量不足或存储失败标记 diagnostics_incomplete 并继续排空；终态使用独立 16 MiB 上限。运输损坏、第二终态、缺终态、超长记录、EOF后非零退出或未收敛的写线程均拒绝接受。全程保留墙钟超时与进程组清理，不随事件延长、不回退调用旧模式。旧 read_result 的读取语义不改。
+
+新流模式已用正式 schema、配置的原模型和独立一次性夹具验证；这不保证未来 CLI 版本兼容。工具 start/end 仅表示供应商报告调用/返回，不能推出“全文已读”或理解正确。权限摘要不给供应商未报告的原因，精确 argv 本地匹配单独呈现，不改变能力。HTTP 状态区分 missing/null/valid/invalid，missing/null均可显示未提供；失败仍按既有 is_error/subtype 判定。
+
+状态和网页增加预算事实投影。已记账调用与已确认进程启动分别列出；候选须有 worker/source 摘要关联才能计为审阅，去重 dispatch 与 receipt，格式修正独立于失败类别。失败分类只取结构化供应商证据或本地异常类型；旧缺来源保留未知，不扫描错误正文猜原因。该投影只解释已保存事实，不重新核验产物或增加豁免、额度和重试。

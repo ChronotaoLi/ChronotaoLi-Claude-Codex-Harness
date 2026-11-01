@@ -343,6 +343,10 @@ class TaskLifecycle(RuntimeService):
         record = {"attempt": attempt, "review": review, "diff_artifact": str(evidence),
                   "verification": str(evidence.parent / "results.json"), "artifact": str(review_artifact),
                   "snapshot_digest": reviewed_digest, "snapshot_artifact": str(snapshot_artifact), **diagnostics}
+        if pending.get("worker_artifact"):
+            record["worker_source"] = {"dispatch_id": Path(pending["worker_artifact"]).parent.name,
+                                       "artifact": pending["worker_artifact"],
+                                       "artifact_digest": pending["worker_artifact_digest"]}
         write_json(review_artifact, record)
         approved_keys = [] if diagnostics else review["approved_memory_keys"]
         if not diagnostics and review_approved(review):

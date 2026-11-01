@@ -1,5 +1,6 @@
 import json
 import tempfile
+import subprocess
 import unittest
 from pathlib import Path
 
@@ -70,6 +71,7 @@ class ToolSmokeStartupTests(unittest.TestCase):
         root = Path(__file__).resolve().parents[1]
         config = Config.load(root / 'harness.toml')
         with tempfile.TemporaryDirectory() as tmp:
+            subprocess.run(["git", "init", "-q", tmp], check=True)
             def failed(argv, cwd, output, **kwargs):
                 (output.parent / 'process.stdout').write_text('')
                 (output.parent / 'process.stderr').write_text('Invalid session ID')

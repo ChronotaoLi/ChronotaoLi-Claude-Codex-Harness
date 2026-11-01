@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from harness import git
 from harness.adapters import CLIBackend
 from harness.config import Config
 from harness.permission_smoke import permission_smoke
@@ -104,6 +105,7 @@ class RoleTurnLimitTests(unittest.TestCase):
                 raise HarnessError("simulated local startup failure")
 
             with self.subTest(probe=module), tempfile.TemporaryDirectory() as tmp:
+                git.git(Path(tmp), "init", "-q")
                 with patch(module + ".run_process", side_effect=fail_locally), self.assertRaises(HarnessError):
                     probe(config, tmp, max_turns=7)
                 self.assertEqual(len(observed), 1)

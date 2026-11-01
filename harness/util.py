@@ -218,6 +218,24 @@ def append_event(path, run_id, event, **fields):
         os.fsync(output.fileno())
 
 
+@contextlib.contextmanager
+def readonly_lock(path):
+    """Lock existing evidence without creating a file during a preview."""
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        yield
+        return
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise HarnessError(f"运行正被写入，暂不能预览：{path}") from error
+        yield
+    finally:
+        os.close(descriptor)
+
+
 def run_process(argv: list[str], cwd: Path, log: Path, *, stdin: str = "",
                 timeout: int | float = 900, env=None, on_start=None) -> int:
     """No shell interpolation; terminate the owned process group on all exits."""

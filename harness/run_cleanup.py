@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 
 from . import git
+from .util import readonly_lock
 from .cleanup import _canonical, _regular_bytes, _registered
 from .path_evidence import validate_dispatch_indexes
 from .util import (HarnessError, append_event, confirm_dispatches_exited,
@@ -14,7 +15,7 @@ from .util import (HarnessError, append_event, confirm_dispatches_exited,
                    validate_command_directories, write_json)
 
 
-def cleanup_run(repo: Path, ident: str, *, remove=False, confirm_exited=()):
+def cleanup_run(repo: Path, ident: str, *, remove=False, confirm_exited=(), remove_input_copies=False):
     """Preview or remove one completed/abandoned worktree without changing status.
 
     A durable receipt records intent before removal. Missing paths are accepted
@@ -31,14 +32,17 @@ def cleanup_run(repo: Path, ident: str, *, remove=False, confirm_exited=()):
     receipt_path = directory / "worktree-cleanup.json"
     for path in (state, receipt_path, directory / "run.lock"):
         _canonical(path)
-    with lock(directory / "run.lock"):
+    if remove or confirm_exited:
+        from .private_state import ensure_private_state
+        ensure_private_state(repo)
+    with (lock if remove or confirm_exited else readonly_lock)(directory / "run.lock"):
         original = _regular_bytes(state)
         run = json.loads(original)
         checkout = repo / ".harness" / "worktrees" / ident
         _canonical(checkout)
         branch = "harness/" + ident
         common = Path(git.git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir").removesuffix("\n")).resolve()
-        if (not isinstance(run, dict) or run.get("schema_version") not in (7, 8, 9, 10, 11)
+        if (not isinstance(run, dict) or run.get("schema_version") not in (7, 8, 9, 10, 11, 12)
                 or run.get("id") != ident or run.get("repo") != str(repo)
                 or run.get("worktree") != str(checkout) or run.get("branch") != branch
                 or not isinstance(run.get("expected_head"), str)
@@ -86,6 +90,7 @@ def cleanup_run(repo: Path, ident: str, *, remove=False, confirm_exited=()):
                     or previous.get("status") not in ("pending", "removed")):
                 raise HarnessError("清理记录与运行证据不符；保留现场")
         exists = checkout.exists()
+        input_summary = {"status": "none", "files": []}
         registered = str(checkout) in _registered(repo)
         if previous and previous["status"] == "removed":
             if exists or registered or admin.exists():
@@ -100,10 +105,16 @@ def cleanup_run(repo: Path, ident: str, *, remove=False, confirm_exited=()):
             if git.head(checkout, binding=binding) != expected:
                 raise HarnessError("worktree HEAD 与检查点不同；保留工作树供核对")
             git.check_worktree_state(checkout, binding=binding)
+            from .workspace_inputs import cleanup_inputs
+            input_summary = cleanup_inputs(run, directory, remove=remove and remove_input_copies)
+            if input_summary["files"] and not remove and input_summary["status"] != "removed":
+                return {"id": ident, "remove": False, "run_status": run["status"],
+                        "branch": branch, "worktree": str(checkout), "status": "input_copies_present",
+                        "input_copies": input_summary}
             git.assert_removable_worktree(checkout, binding=binding)
             status = "eligible"
         result = {"id": ident, "remove": remove, "run_status": run["status"],
-                  "branch": branch, "worktree": str(checkout), "status": status}
+                  "branch": branch, "worktree": str(checkout), "status": status, "input_copies": input_summary}
         if not remove or status == "removed":
             return result
         write_json(receipt_path, {**identity, "status": "pending", "time": time.time()})
