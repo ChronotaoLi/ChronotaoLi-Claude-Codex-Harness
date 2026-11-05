@@ -118,7 +118,7 @@ class DecisionTextRecoveryTests(RepoCase):
         engine = self.engine(backend)
         # Reproduce the old late-registration failure without editing saved
         # evidence, accepted records, or their bound digests.
-        with patch('harness.engine.validate_handoff_question', return_value=None), \
+        with patch('harness.workflow.validate_handoff_question', return_value=None), \
                 patch('harness.decisions.decision_question', side_effect=lambda q, kind: q):
             with self.assertRaises(HarnessError):
                 engine.start('Implement source and later work', self.plan(dependent=True))
@@ -141,7 +141,7 @@ class DecisionTextRecoveryTests(RepoCase):
         self.assertEqual(result['accepted']['greet'], before['accepted']['greet'])
         self.assertEqual(result['attempts'], {'greet': 1, 'later': 1})
         self.assertEqual(Path(source['artifact']).read_bytes(), raw)
-        self.assertEqual(result['schema_version'], 12)
+        self.assertEqual(result['schema_version'], 13)
 
     def test_legacy_operator_registration_failure_recovers_to_explicit_gate(self):
         for blockers in (['Proceed\0?'], ['']):
@@ -165,8 +165,8 @@ class DecisionTextRecoveryTests(RepoCase):
             with self.subTest(stage=stage):
                 backend = self.backend(handoff='Proceed\0?')
                 engine = self.engine(backend)
-                with patch('harness.engine.validate_handoff_question', return_value=None), \
-                        patch.object(engine, method, side_effect=HarnessError('saved old lifecycle stage')):
+                with patch('harness.workflow.validate_handoff_question', return_value=None), \
+                        patch.object(engine.services.tasks, method, side_effect=HarnessError('saved old lifecycle stage')):
                     with self.assertRaises(HarnessError):
                         engine.start('Implement source and later work', self.plan(dependent=True))
                 before = self.saved(engine)
@@ -197,7 +197,7 @@ class DecisionTextRecoveryTests(RepoCase):
             engine.start('Implement greet', self.plan())
         request = self.saved(engine)['decision_requests'][0]
         with self.assertRaisesRegex(HarnessError, 'does not match operator blocker'):
-            engine._decision_source({**request, 'question': 'A different decision'})
+            engine.services.decisions._decision_source({**request, 'question': 'A different decision'})
         before = (engine.directory / 'state.json').read_bytes()
         artifact = Path(request['source']['artifact'])
         artifact.write_bytes(artifact.read_bytes() + b'\n')

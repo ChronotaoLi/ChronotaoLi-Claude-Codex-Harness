@@ -282,6 +282,7 @@ def operation_arguments(args):
             "confirm_exited": list(args.confirm_exited or ()), "repair_invalid": args.repair_invalid,
             "environment_update": str(args.environment_update) if args.environment_update is not None else None,
             "operator_decision": [str(path) for path in args.operator_decision or ()],
+            "execution_guidance": str(args.execution_guidance) if getattr(args, "execution_guidance", None) is not None else None,
             "allow_scope": list(args.allow_scope or ())}
 
 
@@ -298,13 +299,15 @@ def resume_options(args):
                                         else args.operator_decision)
     if args.allow_scope:
         options["allow_scope"] = args.allow_scope
+    if getattr(args, "execution_guidance", None) is not None:
+        options["execution_guidance"] = args.execution_guidance
     return options
 
 
 def file_inputs_present(args):
     if args.command == "run":
         return args.plan is not None
-    return args.environment_update is not None or bool(args.operator_decision)
+    return args.environment_update is not None or bool(args.operator_decision) or getattr(args, "execution_guidance", None) is not None
 
 
 def persisted_run_id(args, engine, state):
@@ -383,6 +386,8 @@ def _main(argv=None):
                         help="显式修正当前非法计划或无拒绝的非法批准元数据；保留证据和累计预算")
     resume.add_argument("--environment-update", type=Path, metavar="FILE",
                         help="提供操作者环境澄清 JSON 文件；不扩展权限、文件范围或命令授权")
+    resume.add_argument("--execution-guidance", type=Path, metavar="FILE",
+                        help="在停止边界提供绑定任务及候选的执行约束；不授权命令或放松验收")
     resume.add_argument("--operator-decision", type=Path, action="append", metavar="FILE",
                         help="回答 status 中的操作者决策请求；可重复指定，整批校验保存后继续，不跳过验收或授予命令权限")
     resume.add_argument("--allow-scope", action="append", metavar="PATTERN",

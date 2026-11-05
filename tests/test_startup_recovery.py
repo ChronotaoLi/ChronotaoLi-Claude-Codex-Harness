@@ -51,7 +51,7 @@ class StartupRecoveryTests(RepoCase):
         return read_json(engine.directory / "state.json")
 
     def interrupt_save(self, engine, predicate, plan, **kwargs):
-        save = engine.save
+        save = engine.context.save
         interrupted = False
 
         def interrupt():
@@ -61,7 +61,7 @@ class StartupRecoveryTests(RepoCase):
                 interrupted = True
                 raise KeyboardInterrupt()
 
-        with patch.object(engine, "save", side_effect=interrupt), self.assertRaises(KeyboardInterrupt):
+        with patch.object(engine.context, "save", side_effect=interrupt), self.assertRaises(KeyboardInterrupt):
             engine.start("Implement greeting, farewell, and combined message", plan, **kwargs)
         self.assertTrue(interrupted)
         return self.saved(engine)
@@ -106,7 +106,7 @@ class StartupRecoveryTests(RepoCase):
         backend = RecordingBackend()
         engine = self.engine(backend)
         plan = self.plan()
-        with patch.object(engine, "ignored_paths", side_effect=KeyboardInterrupt), self.assertRaises(KeyboardInterrupt):
+        with patch.object(engine.context, "ignored_paths", side_effect=KeyboardInterrupt), self.assertRaises(KeyboardInterrupt):
             engine.start("Implement messages", plan, pause_after_plan=True)
         saved = self.saved(engine)
         self.assertTrue(saved["worktree_binding"])

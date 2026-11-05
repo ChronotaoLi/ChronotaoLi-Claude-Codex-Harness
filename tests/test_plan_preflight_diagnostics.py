@@ -70,9 +70,9 @@ class PlanPreflightDiagnosticsTests(RepoCase):
         engine.start("Implement greet", plan, pause_after_plan=True)
         revised = copy.deepcopy(plan["tasks"])
         revised[0]["description"] += " with clarification"
-        engine.record_plan(revised, "Refine description")
+        engine.services.planning.record_plan(revised, "Refine description")
         added = {**copy.deepcopy(revised[0]), "id": "followup"}
-        engine.record_plan([*revised, added], "Add followup")
+        engine.services.planning.record_plan([*revised, added], "Add followup")
         events = [json.loads(line) for line in (engine.directory / "events.jsonl").read_text().splitlines()]
         warnings = [event for event in events if event["event"] == "broad_scope_warning"]
         self.assertEqual([event["revision"] for event in warnings], [0, 2])
@@ -84,14 +84,14 @@ class PlanPreflightDiagnosticsTests(RepoCase):
         plan["tasks"][0]["acceptance"].append("Preserve this operator supplied obligation")
         backend = ScriptedBackend()
         engine = self.engine(backend)
-        emit = engine.event
+        emit = engine.context.event
 
         def interrupt(event, **fields):
             emit(event, **fields)
             if event == "broad_scope_warning":
                 raise KeyboardInterrupt()
 
-        with patch.object(engine, "event", side_effect=interrupt), self.assertRaises(KeyboardInterrupt):
+        with patch.object(engine.context, "event", side_effect=interrupt), self.assertRaises(KeyboardInterrupt):
             engine.start("Implement greet", plan)
         saved = read_json(engine.directory / "state.json")
         self.assertEqual(saved["tasks"], plan["tasks"])

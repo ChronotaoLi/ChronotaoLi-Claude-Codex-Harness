@@ -35,25 +35,25 @@ class RecoveryBusyGateTests(RepoCase):
         if receipt:
             engine.run['commander_receipts'][key] = {'dispatch_id': 'corrected'}
         calls = len(backend.calls)
-        self.assert_preparation(engine, lambda: engine.prepare_environment_update(path), status == 'pending' or receipt)
+        self.assert_preparation(engine.context, lambda: engine.services.environment.prepare_environment_update(path), status == 'pending' or receipt)
         self.assertEqual(len(backend.calls), calls)
 
     def decision_repair(self, status, receipt):
         engine, path = self.decision()
         key = 'commander:replan:replanning'
-        engine.run['invalid_repairs'] = {key: {'status': status, 'corrected_dispatch_id': 'corrected'}}
+        engine.context.run['invalid_repairs'] = {key: {'status': status, 'corrected_dispatch_id': 'corrected'}}
         if receipt:
-            engine.run['commander_receipts'] = {key: {'dispatch_id': 'corrected'}}
+            engine.context.run['commander_receipts'] = {key: {'dispatch_id': 'corrected'}}
         saves = engine.saves
-        self.assert_preparation(engine, lambda: engine.prepare_operator_decision(path), status == 'pending' or receipt)
+        self.assert_preparation(engine.context, lambda: engine.prepare_operator_decision(path), status == 'pending' or receipt)
         self.assertEqual(engine.saves, saves)
 
     def test_environment_replan_stopped_rejects_valid_source(self):
         engine, backend, path, _ = self.environment()
         # No subsequent invocation: this must be rejected by the busy gate.
-        self.assertIsNotNone(engine.prepare_environment_update(path))
+        self.assertIsNotNone(engine.services.environment.prepare_environment_update(path))
         engine.run['replan_stopped'] = {'target': 'greet'}
-        self.assert_preparation(engine, lambda: engine.prepare_environment_update(path), True)
+        self.assert_preparation(engine.context, lambda: engine.services.environment.prepare_environment_update(path), True)
         self.assertEqual(len(backend.calls), 1)
 
     def test_environment_pending_repair_rejects_update(self):

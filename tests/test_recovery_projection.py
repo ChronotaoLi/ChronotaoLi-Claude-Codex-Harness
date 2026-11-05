@@ -154,11 +154,11 @@ class RecoveryProjectionTests(RepoCase):
         if legacy:
             # Reproduce a saved old run: acceptance invalidation had feedback
             # evidence, but the corresponding history record lacked a marker.
-            self.assertFalse(engine.accept_pending())
+            self.assertFalse(engine.services.tasks.accept_pending())
             engine.run["review_history"]["greet"][-1].pop("status")
             engine.run["pending_replan"] = {"stage": "pending", "trigger": {
                 "task_id": "greet", "feedback": deepcopy(engine.run["feedback"])}}
-            engine.save()
+            engine.context.save()
         resumed = self.engine(backend)
         with self.assertRaises(ProcessTimeout):
             resumed.resume(engine.run["id"])
@@ -191,7 +191,7 @@ class RecoveryProjectionTests(RepoCase):
     def test_legacy_invalidated_approval_is_normalized_before_pending_replan(self):
         self.assert_changed_approval_projection(replan=True, legacy=True)
 
-    def test_legacy_missing_invocation_evidence_does_not_invent_attempt_time_or_success(self):
+    def test_missing_invocation_evidence_is_rejected_without_inventing_recovery_state(self):
         engine, backend, original = self.interrupted_rework()
         legacy = deepcopy(engine.run)
         legacy["worker_recovery"]["greet"] = original
@@ -199,18 +199,15 @@ class RecoveryProjectionTests(RepoCase):
             if entry["role"] == "worker":
                 for key in ("invoked", "invoked_at", "worker_outcome"):
                     entry.pop(key, None)
-        projected = worker_recovery_context(legacy, engine.directory, "greet")
-        self.assertEqual(projected["source"]["dispatch_id"], original["dispatch_id"])
-        self.assertNotIn("attempt", projected["source"])
-        self.assertNotIn("invoked_at", projected["source"])
-        self.assertNotIn("superseded_by", projected)
-        self.assertNotIn("verification", projected["latest"])
-        self.assertNotIn("review", projected["latest"])
+        before = deepcopy(legacy)
+        with self.assertRaisesRegex(HarnessError, "invocation accounting is invalid"):
+            worker_recovery_context(legacy, engine.directory, "greet")
+        self.assertEqual(legacy, before)
         legacy["dispatches"] = []
-        projected = worker_recovery_context(legacy, engine.directory, "greet")
-        self.assertEqual(projected["relation"], "unknown")
-        self.assertEqual(projected["source"], {"status": "unknown"})
-        self.assertEqual({key: projected[key] for key in original}, original)
+        before = deepcopy(legacy)
+        with self.assertRaisesRegex(HarnessError, "invocation accounting is invalid"):
+            worker_recovery_context(legacy, engine.directory, "greet")
+        self.assertEqual(legacy, before)
 
     def test_new_invocation_without_legal_return_does_not_supersede_failure(self):
         engine, backend, original = self.interrupted_rework()

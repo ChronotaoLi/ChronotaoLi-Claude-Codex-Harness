@@ -1,4 +1,6 @@
 """Bound worker evidence for fresh dispatches; never an acceptance checkpoint."""
+
+from .services import RuntimeService
 from copy import deepcopy
 import hashlib
 import json
@@ -108,11 +110,11 @@ def _valid_time(value):
     return type(value) in (int, float) and math.isfinite(value) and value >= 0
 
 
-class ProgressRecovery:
+class ProgressRecovery(RuntimeService):
     def _checkpoint_path(self, path, *, evidence_dispatch=None):
         source = Path(path)
         try:
-            checked = source.relative_to(self.worktree) if source.is_absolute() else source
+            checked = source.relative_to(self.context.worktree) if source.is_absolute() else source
         except ValueError:
             checked = source
         if ".." in checked.parts:
@@ -122,14 +124,14 @@ class ProgressRecovery:
             # state boundary. Check symlinks before canonicalizing the path.
             if source.is_absolute() and evidence_dispatch is not None:
                 source = _regular_file(source)
-                commands = (self.directory / "dispatches" / evidence_dispatch / "commands").resolve()
+                commands = (self.context.directory / "dispatches" / evidence_dispatch / "commands").resolve()
                 if source.resolve().is_relative_to(commands):
                     return source
             raise HarnessError("checkpoint source uses reserved or unsafe path")
-        return source if source.is_absolute() else Path(self.worktree) / source
+        return source if source.is_absolute() else Path(self.context.worktree) / source
 
     def _checkpoint_source(self, task_id, dispatch_id, source, *, validate_declarations=True, _validation=None):
-        expected = self.directory / "dispatches" / dispatch_id / "returned-result.json"
+        expected = self.context.directory / "dispatches" / dispatch_id / "returned-result.json"
         if (not isinstance(source, dict) or source.get("artifact") != str(expected)
                 or not isinstance(source.get("artifact_digest"), str) or not _SHA.fullmatch(source["artifact_digest"])):
             raise HarnessError("checkpoint requires bound original result SHA256")
@@ -145,7 +147,7 @@ class ProgressRecovery:
             raise HarnessError("checkpoint original result is invalid JSON") from error
         if not isinstance(result, dict) or result.get("task_id") != task_id or result.get("dispatch_id") != dispatch_id:
             raise HarnessError("checkpoint source identity mismatch")
-        if not any(d["id"] == dispatch_id and d["role"] == "worker" and d["task_id"] == task_id for d in self.run["dispatches"]):
+        if not any(d["id"] == dispatch_id and d["role"] == "worker" and d["task_id"] == task_id for d in self.context.run["dispatches"]):
             raise HarnessError("checkpoint source is not a known worker dispatch")
         checked = result if validate_declarations else {k: v for k, v in result.items() if k != "checkpoints"}
         validate_structure(checked, envelope(WORK, task_id, dispatch_id))
@@ -179,12 +181,12 @@ class ProgressRecovery:
             raise CheckpointDeclarationError("invalid or duplicate checkpoint id")
         if not items:
             return []
-        folder = self.directory / "checkpoints" / dispatch_id
-        resolution_path = self.directory / "checkpoints" / "batches" / (dispatch_id + ".json")
+        folder = self.context.directory / "checkpoints" / dispatch_id
+        resolution_path = self.context.directory / "checkpoints" / "batches" / (dispatch_id + ".json")
         for private_folder in (folder, resolution_path.parent):
             if any(p.is_symlink() for p in (private_folder, *private_folder.parents)):
                 raise HarnessError("checkpoint private directory is a symlink")
-        batches = self.run.get("checkpoint_batches", [])
+        batches = self.context.run.get("checkpoint_batches")
         batch = next((b for b in batches if b["dispatch_id"] == dispatch_id), None)
         if batch is not None:
             resolution = self._checkpoint_resolution(batch)
@@ -198,7 +200,7 @@ class ProgressRecovery:
                 raise HarnessError("checkpoint recovery resolution conflict")
             prepared, discarded = resolution["rows"], resolution["discarded"]
             return self._register_checkpoint_batch(task_id, dispatch_id, source, prepared, discarded, resolution_path)
-        existing = [r for r in self.run.get("task_checkpoints", []) if r["dispatch_id"] == dispatch_id]
+        existing = [r for r in self.context.run.get("task_checkpoints", []) if r["dispatch_id"] == dispatch_id]
         if existing:
             if len(existing) != len(items):
                 raise HarnessError("checkpoint dispatch ledger is incomplete")
@@ -254,7 +256,7 @@ class ProgressRecovery:
                             os.fsync(stream.fileno())
                     evidence.append({**ref, "artifact": str(target), "artifact_digest": _digest(raw)})
                 recorded_at = time.time()
-                dispatch = next(d for d in self.run["dispatches"] if d["id"] == dispatch_id)
+                dispatch = next(d for d in self.context.run["dispatches"] if d["id"] == dispatch_id)
                 origin = dispatch.get("invoked_at")
                 if not _valid_time(origin) or origin > recorded_at:
                     origin = None
@@ -270,14 +272,11 @@ class ProgressRecovery:
 
     def _register_checkpoint_batch(self, task_id, dispatch_id, source, prepared, discarded, resolution_path):
         for row in prepared:
-            self.event("task_checkpoint_recorded", **row)
-        self.run.setdefault("task_checkpoints", []).extend(prepared)
-        self.run.setdefault("checkpoint_batches", []).append({"task_id": task_id, "dispatch_id": dispatch_id,
+            self.context.event("task_checkpoint_recorded", **row)
+        self.context.run["task_checkpoints"].extend(prepared)
+        self.context.run["checkpoint_batches"].append({"task_id": task_id, "dispatch_id": dispatch_id,
             "artifact": str(resolution_path), "artifact_digest": _digest(_read(resolution_path))})
-        for field in ("decision_requests", "operator_decisions", "environment_updates", "environment_checks"):
-            self.run.setdefault(field, [])
-        self.run["schema_version"] = max(10, self.run["schema_version"])
-        self.save()
+        self.context.save()
         return deepcopy(discarded)
 
     def _checkpoint_manifest(self, row, validation):
@@ -304,8 +303,8 @@ class ProgressRecovery:
                 or not all(isinstance(v, str) for v in batch.values())
                 or not _SAFE.fullmatch(batch["dispatch_id"]) or not _SHA.fullmatch(batch["artifact_digest"])):
             raise HarnessError("invalid checkpoint batch reference")
-        folder = self.directory / "checkpoints" / batch["dispatch_id"]
-        if batch["artifact"] != str(self.directory / "checkpoints" / "batches" / (batch["dispatch_id"] + ".json")):
+        folder = self.context.directory / "checkpoints" / batch["dispatch_id"]
+        if batch["artifact"] != str(self.context.directory / "checkpoints" / "batches" / (batch["dispatch_id"] + ".json")):
             raise HarnessError("invalid checkpoint batch path")
         raw = _read(batch["artifact"])
         if _digest(raw) != batch["artifact_digest"]:
@@ -363,7 +362,7 @@ class ProgressRecovery:
                                            validate_declarations=False, _validation=validation)
         origin = record.get("freshness_origin")
         if origin is not None:
-            dispatch = next(d for d in self.run["dispatches"] if d["id"] == record["dispatch_id"])
+            dispatch = next(d for d in self.context.run["dispatches"] if d["id"] == record["dispatch_id"])
             invoked_at = dispatch.get("invoked_at")
             if (not _valid_time(origin) or not _valid_time(invoked_at) or origin != invoked_at
                     or origin > record["recorded_at"]):
@@ -391,18 +390,18 @@ class ProgressRecovery:
 
     def _validated_checkpoint_links(self):
         validation = _CheckpointValidation()
-        rows = self.run.get("task_checkpoints", [])
-        if not isinstance(rows, list) or rows and self.run["schema_version"] < 10:
+        rows = self.context.run["task_checkpoints"]
+        if self.context.run["schema_version"] != 13 or not isinstance(rows, list):
             raise HarnessError("invalid checkpoint ledger schema")
         seen = set()
-        tasks = {t["id"] for t in self.run["tasks"]}
+        tasks = {t["id"] for t in self.context.run["tasks"]}
         for row in rows:
             if not isinstance(row, dict) or set(row) != {"task_id", "dispatch_id", "checkpoint_id", "artifact", "artifact_digest"}:
                 raise HarnessError("invalid checkpoint ledger row")
             if not all(isinstance(row[k], str) for k in row) or not _SAFE.fullmatch(row["dispatch_id"]) or not _SAFE.fullmatch(row["checkpoint_id"]):
                 raise HarnessError("invalid checkpoint ledger identity")
             key = row["dispatch_id"], row["checkpoint_id"]
-            folder = self.directory / "checkpoints" / row["dispatch_id"]
+            folder = self.context.directory / "checkpoints" / row["dispatch_id"]
             if key in seen or row["task_id"] not in tasks or row["artifact"] != str(folder / (row["checkpoint_id"] + ".json")):
                 raise HarnessError("checkpoint ledger reference invalid")
             seen.add(key)
@@ -410,7 +409,7 @@ class ProgressRecovery:
             if not isinstance(record, dict) or record.get("task_id") != row["task_id"] or record.get("dispatch_id") != row["dispatch_id"] or record.get("checkpoint", {}).get("id") != row["checkpoint_id"]:
                 raise HarnessError("checkpoint manifest identity mismatch")
             self._validate_checkpoint_record(record, folder, _validation=validation)
-        batches = self.run.get("checkpoint_batches", [])
+        batches = self.context.run.get("checkpoint_batches")
         if not isinstance(batches, list):
             raise HarnessError("invalid checkpoint batch ledger")
         batch_ids = set()
@@ -430,7 +429,7 @@ class ProgressRecovery:
         value = {"version": 1, "checkpoints": rows}
         raw = (dump(value) + "\n").encode("utf-8")
         digest = _digest(raw)
-        folder = self.directory / "checkpoints" / "indexes"
+        folder = self.context.directory / "checkpoints" / "indexes"
         if any(p.is_symlink() for p in (folder, *folder.parents)):
             raise HarnessError("checkpoint index directory is a symlink")
         artifact = folder / (digest + ".json")
@@ -442,7 +441,7 @@ class ProgressRecovery:
 
     def progress_packet(self, packet, *, task_id=None, role=None, kind=None):
         validation = self._validated_checkpoint_links()
-        rows = self.run.get("task_checkpoints", [])
+        rows = self.context.run["task_checkpoints"]
         if not rows:
             return packet
         task = packet.get("task", {})
@@ -458,7 +457,7 @@ class ProgressRecovery:
             # preflight must use that same index-only view, even mid-task.
             relevant = set()
         if relevant is None:
-            relevant = {t["id"] for t in self.run["tasks"] if t["id"] not in self.run.get("accepted", {})}
+            relevant = {t["id"] for t in self.context.run["tasks"] if t["id"] not in self.context.run.get("accepted", {})}
         latest = {(r["task_id"], r["checkpoint_id"]): r for r in rows}
         current, history, sources = [], [], {}
         relevant_count = sum(1 for tid, _ in latest if tid in relevant)

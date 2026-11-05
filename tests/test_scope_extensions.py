@@ -79,8 +79,8 @@ class ScopeExtensionRecoveryTests(RepoCase):
 
         operator = self.engine(backend)
         operator.load_run(engine.run["id"])
-        operator.approve_scope_extensions(["support.txt", "support.txt"])
-        operator.approve_scope_extensions(["support.txt"])
+        operator.services.planning.approve_scope_extensions(["support.txt", "support.txt"])
+        operator.services.planning.approve_scope_extensions(["support.txt"])
         self.assertEqual(operator.run["approved_scope"], ["support.txt"])
         self.assertEqual(operator.run["original_tasks"], plan["tasks"])
         self.assertEqual(operator.run["tasks"], plan["tasks"])
@@ -110,10 +110,10 @@ class ScopeExtensionRecoveryTests(RepoCase):
         for pattern in (".git/config", ".harness/**", ".codex/**", ".claude/**", "../outside",
                         "/tmp/outside", "src/../outside", "src//bad", "bad\0path", "", None):
             with self.subTest(pattern=pattern), self.assertRaises(HarnessError):
-                engine.approve_scope_extensions(["support.txt", pattern])
+                engine.services.planning.approve_scope_extensions(["support.txt", pattern])
             self.assertEqual(engine.run, before)
             self.assertEqual(self.events(engine), events_before)
-        engine.approve_scope_extensions(["support.txt"])
+        engine.services.planning.approve_scope_extensions(["support.txt"])
         self.assertEqual(engine.run["replan_stopped"], stopped)
         self.assertNotIn("pending_replan", engine.run)
         calls = copy.deepcopy(backend.calls)
@@ -148,7 +148,7 @@ class ScopeExtensionRecoveryTests(RepoCase):
         engine = self.engine()
         engine.start("Implement greeting", self.plan(), pause_after_plan=True)
         with self.assertRaisesRegex(HarnessError, "尚未校验"):
-            engine.approve_scope_extensions(["support.txt"])
+            engine.services.planning.approve_scope_extensions(["support.txt"])
 
         def revise(backend, kwargs, packet, result):
             self.block_worker(backend, kwargs, packet, result)
@@ -156,13 +156,13 @@ class ScopeExtensionRecoveryTests(RepoCase):
                 result.update(expanded_revision(packet["original_tasks"][0], "hello.py"))
 
         engine = self.engine(ScriptedBackend(revise))
-        with patch.object(engine, "apply_pending_revision", side_effect=HarnessError("paused before apply")):
+        with patch.object(engine.services.planning, "apply_pending_revision", side_effect=HarnessError("paused before apply")):
             with self.assertRaisesRegex(HarnessError, "paused before apply"):
                 engine.start("Implement greeting", self.plan())
         self.assertEqual(engine.run["pending_replan"]["stage"], "validated")
         before = copy.deepcopy(engine.run)
         with self.assertRaisesRegex(HarnessError, "尚未校验"):
-            engine.approve_scope_extensions(["support.txt"])
+            engine.services.planning.approve_scope_extensions(["support.txt"])
         self.assertEqual(engine.run, before)
 
 

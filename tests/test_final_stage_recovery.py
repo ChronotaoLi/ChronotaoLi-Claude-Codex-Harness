@@ -3,6 +3,7 @@ from copy import deepcopy
 from pathlib import Path
 from unittest.mock import patch
 
+from harness.process_runtime import ProcessOutcome
 from harness.util import HarnessError, ProcessTimeout, read_json, run_process, write_json
 from test_harness import RepoCase, ROOT
 from test_runtime_changes import ScriptedBackend, finding
@@ -98,7 +99,7 @@ class FinalStageRecoveryTests(RepoCase):
         self.config.data["runtime"]["max_final_attempts"] = 1
         backend = ScriptedBackend()
         engine = self.engine(backend)
-        verify = engine.verify
+        verify = engine.services.verification.verify
 
         def interrupt_after_checks(*args, **kwargs):
             result = verify(*args, **kwargs)
@@ -106,7 +107,7 @@ class FinalStageRecoveryTests(RepoCase):
                 raise KeyboardInterrupt()
             return result
 
-        with patch.object(engine, "verify", side_effect=interrupt_after_checks), self.assertRaises(KeyboardInterrupt):
+        with patch.object(engine.services.verification, "verify", side_effect=interrupt_after_checks), self.assertRaises(KeyboardInterrupt):
             engine.start("Implement greet", self.plan())
         record = engine.run["final_history"][-1]
         self.assertEqual(record["phase"], "verifying")
@@ -122,13 +123,28 @@ class FinalStageRecoveryTests(RepoCase):
         self.assertNotEqual(record["verification_rounds"][0]["artifact_dir"], record["verification_rounds"][1]["artifact_dir"])
         self.assertEqual(old_evidence, {path.name: path.read_bytes() for path in old_folder.iterdir() if path.is_file()})
 
+    def failed_check_outcome(self, log, callbacks, *, timed_out=False):
+        # This fixture models a started child whose exit and cleanup are known.
+        # Returning an integer alone leaves the strict process gate unresolved.
+        callbacks["on_start"](123)
+        Path(log).with_suffix(".stdout").write_text("")
+        Path(log).with_suffix(".stderr").write_text(
+            "Final check did not finish" if timed_out else "Observed failure")
+        outcome = ProcessOutcome(started=True, startup_state="started", pid=123, pgid=123,
+                                 exit_code=-15 if timed_out else 1, exit_confirmed=True,
+                                 termination_reason="timeout" if timed_out else "normal")
+        callbacks["on_outcome"](outcome)
+        return outcome
+
     def fail_final_check(self, *, timed_out):
         def fail(argv, cwd, log, **kwargs):
             if "final" in Path(log).parts:
-                Path(log).with_suffix(".stderr").write_text("Final check did not finish" if timed_out else "Observed failure")
+                outcome = self.failed_check_outcome(log, kwargs, timed_out=timed_out)
                 if timed_out:
-                    raise ProcessTimeout(kwargs["timeout"], Path(log))
-                return 1
+                    error = ProcessTimeout(kwargs["timeout"], Path(log))
+                    error.outcome = outcome
+                    raise error
+                return outcome.exit_code
             return run_process(argv, cwd, log, **kwargs)
         return fail
 
@@ -196,7 +212,7 @@ class FinalStageRecoveryTests(RepoCase):
             nonlocal failed
             if "final" in Path(log).parts and not failed:
                 failed = True
-                return 1
+                return self.failed_check_outcome(log, kwargs).exit_code
             return run_process(argv, cwd, log, **kwargs)
 
         backend = ScriptedBackend(corrective)
@@ -214,7 +230,7 @@ class FinalStageRecoveryTests(RepoCase):
         self.config.data["runtime"]["max_final_attempts"] = 1
         backend = ScriptedBackend()
         engine = self.engine(backend)
-        save = engine.save
+        save = engine.context.save
         interrupted = False
 
         def interrupt_after_approval():
@@ -224,7 +240,7 @@ class FinalStageRecoveryTests(RepoCase):
                 interrupted = True
                 raise KeyboardInterrupt()
 
-        with patch.object(engine, "save", side_effect=interrupt_after_approval), self.assertRaises(KeyboardInterrupt):
+        with patch.object(engine.context, "save", side_effect=interrupt_after_approval), self.assertRaises(KeyboardInterrupt):
             engine.start("Implement greet", self.plan())
         calls = list(backend.calls)
         checks = self.final_checks(engine.run)
@@ -248,7 +264,7 @@ class FinalStageRecoveryTests(RepoCase):
 
         backend = ScriptedBackend(corrective)
         engine = self.engine(backend)
-        save = engine.save
+        save = engine.context.save
         interrupted = False
 
         def interrupt_after_rejection():
@@ -258,7 +274,7 @@ class FinalStageRecoveryTests(RepoCase):
                 interrupted = True
                 raise KeyboardInterrupt()
 
-        with patch.object(engine, "save", side_effect=interrupt_after_rejection), self.assertRaises(KeyboardInterrupt):
+        with patch.object(engine.context, "save", side_effect=interrupt_after_rejection), self.assertRaises(KeyboardInterrupt):
             engine.start("Implement greet", self.plan())
         self.assertEqual(engine.run["pending_replan"]["stage"], "pending")
         self.assertFalse(any(call["kind"] == "replan" for call in backend.calls))

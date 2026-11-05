@@ -207,13 +207,13 @@ class ExplicitFormatRepairTests(RepoCase):
             result.update(summary="x" * 4001) if kwargs["kind"] == "review" and
             "invalid_output_correction" not in packet else None)
         engine = self.engine(backend)
-        save = engine.save
+        save = engine.context.save
         key = "reviewer:review:greet"
         def interrupt():
             if engine.run["review_corrections"].get(key, {}).get("exhausted"):
                 raise KeyboardInterrupt()
             save()
-        with patch.object(engine, "save", side_effect=interrupt), self.assertRaises(KeyboardInterrupt):
+        with patch.object(engine.context, "save", side_effect=interrupt), self.assertRaises(KeyboardInterrupt):
             engine.start("Implement greet", self.plan())
         saved = read_json(engine.directory / "state.json")
         self.assertFalse(saved["review_corrections"][key].get("exhausted"))
@@ -230,13 +230,13 @@ class ExplicitFormatRepairTests(RepoCase):
                     result["findings"] = []
         backend = ScriptedBackend(malformed)
         engine = self.engine(backend)
-        save = engine.save
+        save = engine.context.save
         key = "reviewer:review:greet"
         def interrupt():
             if engine.run["review_corrections"].get(key, {}).get("failed"):
                 raise KeyboardInterrupt()
             save()
-        with patch.object(engine, "save", side_effect=interrupt), self.assertRaises(KeyboardInterrupt):
+        with patch.object(engine.context, "save", side_effect=interrupt), self.assertRaises(KeyboardInterrupt):
             engine.start("Implement greet", self.plan())
         saved = read_json(engine.directory / "state.json")
         self.assertFalse(saved["review_corrections"][key].get("failed"))
@@ -361,7 +361,7 @@ class ExplicitFormatRepairTests(RepoCase):
         receipt = engine.run["commander_receipts"][key]
         receipt["request"]["packet"]["format_correction"].pop("source")
         receipt["request_digest"] = snapshot_digest(receipt["request"])
-        engine.save()
+        engine.context.save()
         calls = len(backend.calls)
         with self.assertRaisesRegex(HarnessError, "缺少原始结果摘要"):
             self.engine(backend).resume(engine.run["id"], repair_invalid=source["dispatch_id"])
@@ -379,7 +379,7 @@ class ExplicitFormatRepairTests(RepoCase):
                 receipt = engine.run["commander_receipts"][key]
                 receipt["request"]["packet"]["format_correction"].pop("source")
                 receipt["request_digest"] = snapshot_digest(receipt["request"])
-                engine.save()
+                engine.context.save()
                 self.assertFalse(Path(source["artifact"]).exists())
                 calls, dispatches = len(backend.calls), len(engine.run["dispatches"])
                 for _ in range(2):
@@ -411,7 +411,7 @@ class ExplicitFormatRepairTests(RepoCase):
                 receipt["artifact_digest"] = hashlib.sha256(Path(source["artifact"]).read_bytes()).hexdigest()
                 receipt["request_digest"] = snapshot_digest(receipt["request"])
                 receipt["hook_attempts"] = 1
-                engine.save()
+                engine.context.save()
                 calls, dispatches = len(backend.calls), len(engine.run["dispatches"])
                 for _ in range(2):
                     with self.assertRaisesRegex(HarnessError, "缺少原始结果摘要.*abandon"):

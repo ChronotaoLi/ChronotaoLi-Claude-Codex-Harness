@@ -92,16 +92,16 @@ class DescriptionReplanTests(RepoCase):
         backend = DescriptionBackend(self, rejected=rejected)
         engine = self.engine(backend)
         if boundary == "validated":
-            interruption = patch.object(engine, "apply_pending_revision", side_effect=KeyboardInterrupt())
+            interruption = patch.object(engine.services.planning, "apply_pending_revision", side_effect=KeyboardInterrupt())
         else:
-            original = engine.record_plan
+            original = engine.services.planning.record_plan
 
             def record(*args, **kwargs):
                 original(*args, **kwargs)
                 if kwargs.get("finish_replan"):
                     raise KeyboardInterrupt()
 
-            interruption = patch.object(engine, "record_plan", side_effect=record)
+            interruption = patch.object(engine.services.planning, "record_plan", side_effect=record)
         with interruption, self.assertRaises(KeyboardInterrupt):
             engine.start("Implement greeting", self.plan(two_ready=two_ready))
         self.assert_candidate(engine.worktree)
@@ -177,12 +177,13 @@ class DescriptionReplanTests(RepoCase):
                     (engine.worktree / "notes.txt").write_text(NOTES + "changed\n")
                 else:
                     (engine.worktree / "extra.txt").write_text("An additional in-scope untracked file\n")
-                snapshot = engine.snapshot()
+                snapshot = engine.context.snapshot()
                 calls = copy.deepcopy(backend.calls)
+                resumed = self.engine(backend)
                 with patch("harness.planning.git.archive_and_reset") as archive, self.assertRaises(HarnessError):
-                    self.engine(backend).resume(engine.run["id"])
+                    resumed.resume(engine.run["id"])
                 archive.assert_not_called()
-                self.assertEqual(engine.snapshot(), snapshot)
+                self.assertEqual(resumed.context.snapshot(), snapshot)
                 self.assertEqual(backend.calls, calls)
                 self.assert_no_archive(engine)
 
@@ -287,19 +288,24 @@ class DescriptionReplanTests(RepoCase):
         self.assertEqual(backend.retained_seen, [2])
         self.assertNotIn("retained_candidate", result)
 
-    def test_legacy_validated_revision_without_retention_policy_still_archives(self):
+    def test_validated_revision_without_candidate_policy_preserves_candidate_and_stops(self):
         engine, backend = self.interrupted()
+        snapshot = engine.context.snapshot()
         saved = read_json(engine.directory / "state.json")
         saved["pending_replan"].pop("candidate_policy")
         saved["pending_replan"].pop("retained_candidate")
         write_json(engine.directory / "state.json", saved)
-        backend.prerequisite = True  # The next worker should see a fresh archived candidate.
-        result = self.engine(backend).resume(engine.run["id"])
-        self.assertEqual(result["status"], "completed")
-        archive = engine.directory / "recovery" / "replan-1"
-        self.assertEqual((archive / "files" / "hello.py").read_text(), CANDIDATE)
-        self.assertEqual((archive / "files" / "notes.txt").read_text(), NOTES)
-        self.assertNotIn("retained_candidate", result)
+        calls = copy.deepcopy(backend.calls)
+        resumed = self.engine(backend)
+        with patch("harness.planning.git.archive_and_reset") as archive, self.assertRaisesRegex(
+                HarnessError, "候选保留策略缺失"):
+            resumed.resume(engine.run["id"])
+        archive.assert_not_called()
+        self.assertEqual(backend.calls, calls)
+        self.assertEqual(resumed.context.snapshot(), snapshot)
+        self.assert_candidate(resumed.worktree)
+        self.assert_no_archive(resumed)
+        self.assertEqual(read_json(resumed.directory / "state.json")["pending_replan"], saved["pending_replan"])
 
     def test_new_prerequisite_still_archives_candidate_before_other_task(self):
         backend = DescriptionBackend(self, prerequisite=True)

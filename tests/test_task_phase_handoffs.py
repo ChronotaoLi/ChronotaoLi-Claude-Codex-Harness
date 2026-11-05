@@ -52,7 +52,7 @@ class TaskPhaseHandoffTests(RepoCase):
 
     def test_commit_and_post_accept_work_survive_same_save_interruption(self):
         engine = self.engine()
-        save = engine.save
+        save = engine.context.save
         interrupted = False
 
         def stop_after_handoff():
@@ -62,7 +62,7 @@ class TaskPhaseHandoffTests(RepoCase):
                 interrupted = True
                 raise KeyboardInterrupt()
 
-        with patch.object(engine, "save", side_effect=stop_after_handoff):
+        with patch.object(engine.context, "save", side_effect=stop_after_handoff):
             with self.assertRaises(KeyboardInterrupt):
                 engine.start("Implement greet", read_json(ROOT / "examples/plan.json"))
         saved = read_json(engine.directory / "state.json")

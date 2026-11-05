@@ -4,6 +4,7 @@ from pathlib import Path
 import tempfile
 import time
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from harness.progress import ProgressRecovery
@@ -16,10 +17,13 @@ def sha(raw):
 
 class Runtime(ProgressRecovery):
     def __init__(self, root):
-        self.directory = root / 'run'
-        self.worktree = root / 'worktree'
-        self.worktree.mkdir()
-        self.run = {'schema_version': 10, 'tasks': [{'id': 'task'}], 'dispatches': [], 'task_checkpoints': []}
+        super().__init__(SimpleNamespace())
+        self.context.save = lambda: self.save()
+        self.context.event = lambda event, **fields: self.event(event, **fields)
+        self.context.directory = root / 'run'
+        self.context.worktree = root / 'worktree'
+        self.context.worktree.mkdir()
+        self.context.run = {'schema_version': 13, 'tasks': [{'id': 'task'}], 'dispatches': [], 'task_checkpoints': [], 'checkpoint_batches': []}
         self.events = []
         self.saved = 0
 
@@ -35,8 +39,8 @@ class ProgressTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.runtime = Runtime(Path(self.temp.name).resolve())
-        (self.runtime.worktree / 'input').write_bytes(b'input bytes')
-        (self.runtime.worktree / 'output').write_bytes(b'raw\x00output\xff\n')
+        (self.runtime.context.worktree / 'input').write_bytes(b'input bytes')
+        (self.runtime.context.worktree / 'output').write_bytes(b'raw\x00output\xff\n')
 
     def record(self, dispatch='worker1', freshness='content', age=0, invoked_at='now'):
         rt = self.runtime
@@ -45,9 +49,9 @@ class ProgressTests(unittest.TestCase):
                 'freshness': freshness, 'max_age_seconds': age}
         result = {'status': 'blocked', 'blocker_kind': 'environment', 'blockers': ['offline'],
                   'summary': 'blocked', 'evidence': [], 'proposed_memories': [], 'checkpoints': [item]}
-        path = rt.directory / 'dispatches' / dispatch / 'returned-result.json'
+        path = rt.context.directory / 'dispatches' / dispatch / 'returned-result.json'
         write_json(path, {**result, 'task_id': 'task', 'dispatch_id': dispatch})
-        rt.run['dispatches'].append({'id': dispatch, 'task_id': 'task', 'role': 'worker', 'invoked_at': time.time() if invoked_at == 'now' else invoked_at})
+        rt.context.run['dispatches'].append({'id': dispatch, 'task_id': 'task', 'role': 'worker', 'invoked_at': time.time() if invoked_at == 'now' else invoked_at})
         source = {'artifact': str(path), 'artifact_digest': sha(path.read_bytes())}
         self.last_discarded = rt.record_checkpoints('task', dispatch, result, source)
         return result, source
@@ -55,14 +59,14 @@ class ProgressTests(unittest.TestCase):
     def test_raw_copy_reuse_without_original_evidence_and_input_invalidation(self):
         self.record()
         rt = self.runtime
-        (rt.worktree / 'output').unlink()
+        (rt.context.worktree / 'output').unlink()
         packet = rt.progress_packet({'task': {'id': 'task'}})
         check = packet['task_checkpoints'][0]
         self.assertEqual(check['status'], 'reusable')
         self.assertEqual(Path(check['evidence'][0]['artifact']).read_bytes(), b'raw\x00output\xff\n')
-        (rt.worktree / 'input').write_bytes(b'changed')
+        (rt.context.worktree / 'input').write_bytes(b'changed')
         self.assertEqual(rt.progress_packet({}, task_id='task')['task_checkpoints'][0]['status'], 'stale')
-        (rt.worktree / 'input').unlink()
+        (rt.context.worktree / 'input').unlink()
         self.assertEqual(rt.progress_packet({}, task_id='task')['task_checkpoints'][0]['status'], 'stale')
 
     def test_volatile_expiry_and_zero(self):
@@ -79,7 +83,7 @@ class ProgressTests(unittest.TestCase):
         result, source = self.record()
         rt = self.runtime
         rt.record_checkpoints('task', 'worker1', result, source)
-        self.assertEqual(len(rt.run['task_checkpoints']), 1)
+        self.assertEqual(len(rt.context.run['task_checkpoints']), 1)
         self.record('worker2')
         packet = rt.progress_packet({}, task_id='task')
         self.assertEqual(len(packet['task_checkpoints']), 1)
@@ -101,13 +105,13 @@ class ProgressTests(unittest.TestCase):
     def test_artifact_before_ledger_recovery_preserves_timestamp(self):
         result, source = self.record()
         rt = self.runtime
-        row = rt.run['task_checkpoints'][0].copy()
+        row = rt.context.run['task_checkpoints'][0].copy()
         original = Path(row['artifact']).read_bytes()
-        rt.run['task_checkpoints'] = []
-        rt.run['checkpoint_batches'] = []
-        (rt.worktree / 'output').unlink()
+        rt.context.run['task_checkpoints'] = []
+        rt.context.run['checkpoint_batches'] = []
+        (rt.context.worktree / 'output').unlink()
         rt.record_checkpoints('task', 'worker1', result, source)
-        self.assertEqual(rt.run['task_checkpoints'], [row])
+        self.assertEqual(rt.context.run['task_checkpoints'], [row])
         self.assertEqual(Path(row['artifact']).read_bytes(), original)
 
     def test_source_result_tampering_fails_closed(self):
@@ -118,40 +122,40 @@ class ProgressTests(unittest.TestCase):
 
     def test_symlink_evidence_and_declared_digest_mismatch_rejected(self):
         rt = self.runtime
-        output = rt.worktree / 'output'
+        output = rt.context.worktree / 'output'
         output.unlink()
-        output.symlink_to(rt.worktree / 'input')
+        output.symlink_to(rt.context.worktree / 'input')
         self.record()
         self.assertTrue(self.last_discarded)
-        self.assertEqual(rt.run['task_checkpoints'], [])
+        self.assertEqual(rt.context.run['task_checkpoints'], [])
         output.unlink()
         output.write_bytes(b'different')
         self.record('worker2')
         self.assertTrue(self.last_discarded)
-        self.assertEqual(rt.run['task_checkpoints'], [])
+        self.assertEqual(rt.context.run['task_checkpoints'], [])
 
     def test_size_bound_rejects_before_recording(self):
-        (self.runtime.worktree / 'output').write_bytes(b'x' * (1024 * 1024 + 1))
+        (self.runtime.context.worktree / 'output').write_bytes(b'x' * (1024 * 1024 + 1))
         self.record()
         self.assertTrue(self.last_discarded)
-        self.assertEqual(self.runtime.run['task_checkpoints'], [])
+        self.assertEqual(self.runtime.context.run['task_checkpoints'], [])
 
     def test_audit_failure_does_not_register_checkpoint_and_recovers(self):
         rt = self.runtime
         with patch.object(rt, 'event', side_effect=HarnessError('audit unavailable')):
             with self.assertRaises(HarnessError):
                 self.record()
-        self.assertEqual(rt.run['task_checkpoints'], [])
-        artifact = rt.directory / 'checkpoints' / 'worker1' / 'check.json'
+        self.assertEqual(rt.context.run['task_checkpoints'], [])
+        artifact = rt.context.directory / 'checkpoints' / 'worker1' / 'check.json'
         original = artifact.read_bytes()
         # Retrying the same dispatch uses its immutable evidence despite deletion.
-        result = {key: value for key, value in json.loads((rt.directory / 'dispatches' / 'worker1' / 'returned-result.json').read_bytes()).items()
+        result = {key: value for key, value in json.loads((rt.context.directory / 'dispatches' / 'worker1' / 'returned-result.json').read_bytes()).items()
                   if key not in ('task_id', 'dispatch_id')}
-        source_path = rt.directory / 'dispatches' / 'worker1' / 'returned-result.json'
+        source_path = rt.context.directory / 'dispatches' / 'worker1' / 'returned-result.json'
         source = {'artifact': str(source_path), 'artifact_digest': sha(source_path.read_bytes())}
-        (rt.worktree / 'output').unlink()
+        (rt.context.worktree / 'output').unlink()
         rt.record_checkpoints('task', 'worker1', result, source)
-        self.assertEqual(len(rt.run['task_checkpoints']), 1)
+        self.assertEqual(len(rt.context.run['task_checkpoints']), 1)
         self.assertEqual(artifact.read_bytes(), original)
 
     def test_reserved_git_state_is_not_evidence(self):
@@ -160,10 +164,10 @@ class ProgressTests(unittest.TestCase):
         result, source = self.record()
         item = result['checkpoints'][0]
         item['evidence'][0]['path'] = '.git/config'
-        source_path = rt.directory / 'dispatches' / 'worker2' / 'returned-result.json'
+        source_path = rt.context.directory / 'dispatches' / 'worker2' / 'returned-result.json'
         write_json(source_path, {**result, 'task_id': 'task', 'dispatch_id': 'worker2'})
         source = {'artifact': str(source_path), 'artifact_digest': sha(source_path.read_bytes())}
-        rt.run['dispatches'].append({'id': 'worker2', 'task_id': 'task', 'role': 'worker'})
+        rt.context.run['dispatches'].append({'id': 'worker2', 'task_id': 'task', 'role': 'worker'})
         discarded = rt.record_checkpoints('task', 'worker2', result, source)
         self.assertIn('reserved or unsafe', discarded[0]['reason'])
 
@@ -177,10 +181,10 @@ class ProgressTests(unittest.TestCase):
                         'freshness': 'content', 'max_age_seconds': 0} for i in range(16)]
         result = {'status': 'blocked', 'blocker_kind': 'environment', 'blockers': ['offline'],
                   'summary': 'blocked', 'evidence': [], 'proposed_memories': [], 'checkpoints': checkpoints}
-        source_path = rt.directory / 'dispatches' / 'worker1' / 'returned-result.json'
+        source_path = rt.context.directory / 'dispatches' / 'worker1' / 'returned-result.json'
         write_json(source_path, {**result, 'task_id': 'task', 'dispatch_id': 'worker1'})
         source = {'artifact': str(source_path), 'artifact_digest': sha(source_path.read_bytes())}
-        rt.run['dispatches'].append({'id': 'worker1', 'task_id': 'task', 'role': 'worker'})
+        rt.context.run['dispatches'].append({'id': 'worker1', 'task_id': 'task', 'role': 'worker'})
         rt.record_checkpoints('task', 'worker1', result, source)
         packet = rt.progress_packet({}, task_id='task')
         self.assertEqual(len(packet['task_checkpoints']), 16)
@@ -194,21 +198,21 @@ class ProgressTests(unittest.TestCase):
             self.assertEqual(manifest['checkpoint']['summary'], 's' * 4000)
             self.assertEqual(manifest['checkpoint']['inputs'][0]['path'], long_input)
             self.assertEqual(sha(Path(check['artifact']).read_bytes()), check['artifact_digest'])
-        (rt.worktree / 'input').unlink()
+        (rt.context.worktree / 'input').unlink()
         stale = rt.progress_packet({}, task_id='task')['task_checkpoints']
         self.assertTrue(all(c['status'] == 'stale' and c['changed_input_indices'] == list(range(8)) for c in stale))
 
     def test_accepted_checkpoint_index_is_retrievable_and_still_checks_integrity(self):
         self.record()
         rt = self.runtime
-        rt.run['accepted'] = {'task': {}}
+        rt.context.run['accepted'] = {'task': {}}
         packet = rt.progress_packet({}, task_id='final', kind='final_review')
         self.assertEqual(packet['task_checkpoints'], [])
         self.assertEqual(packet['checkpoint_history'], [])
         index = packet['checkpoint_index']
         raw = Path(index['artifact']).read_bytes()
         self.assertEqual(sha(raw), index['artifact_digest'])
-        self.assertEqual(json.loads(raw)['checkpoints'], rt.run['task_checkpoints'])
+        self.assertEqual(json.loads(raw)['checkpoints'], rt.context.run['task_checkpoints'])
         row = json.loads(raw)['checkpoints'][0]
         self.assertEqual(sha(Path(row['artifact']).read_bytes()), row['artifact_digest'])
         manifest = json.loads(Path(row['artifact']).read_bytes())
@@ -225,16 +229,17 @@ class ProgressTests(unittest.TestCase):
             rt.progress_packet({})
         self.assertEqual(artifact.read_bytes(), b'corrupt')
 
-    def test_schema_promotion_initializes_all_version_ten_collections(self):
-        self.runtime.run['schema_version'] = 9
-        self.record()
-        self.assertEqual(self.runtime.run['schema_version'], 10)
-        for field in ('decision_requests', 'operator_decisions', 'environment_updates', 'environment_checks'):
-            self.assertEqual(self.runtime.run[field], [])
+    def test_historical_schema_cannot_register_new_checkpoint_evidence(self):
+        self.runtime.context.run['schema_version'] = 9
+        with self.assertRaisesRegex(HarnessError, 'checkpoint ledger schema'):
+            self.record()
+        self.assertEqual(self.runtime.context.run['schema_version'], 9)
+        self.assertEqual(self.runtime.context.run['task_checkpoints'], [])
+        self.assertEqual(self.runtime.context.run['checkpoint_batches'], [])
 
     def test_bound_source_invalid_work_semantics_rejected(self):
         result, source = self.record()
-        self.runtime.run['task_checkpoints'] = []
+        self.runtime.context.run['task_checkpoints'] = []
         result['blocker_kind'] = 'none'
         source_path = Path(source['artifact'])
         write_json(source_path, {**result, 'task_id': 'task', 'dispatch_id': 'worker1'})
@@ -264,10 +269,10 @@ class ProgressTests(unittest.TestCase):
     def test_legacy_manifest_without_origin_is_stale_and_cannot_extend_ttl(self):
         with patch('harness.progress.time.time', return_value=100):
             self.record(freshness='volatile', age=60)
-        row = self.runtime.run['task_checkpoints'][0]
+        row = self.runtime.context.run['task_checkpoints'][0]
         record = json.loads(Path(row['artifact']).read_bytes())
         record.pop('freshness_origin')
-        self.runtime.run.pop('checkpoint_batches')
+        self.runtime.context.run['checkpoint_batches'] = []
         write_json(Path(row['artifact']), record)
         row['artifact_digest'] = sha(Path(row['artifact']).read_bytes())
         with patch('harness.progress.time.time', return_value=101):
@@ -276,6 +281,6 @@ class ProgressTests(unittest.TestCase):
     def test_freshness_origin_stays_bound_to_original_dispatch(self):
         with patch('harness.progress.time.time', return_value=100):
             self.record(freshness='volatile', age=60)
-        self.runtime.run['dispatches'][0]['invoked_at'] = 101
+        self.runtime.context.run['dispatches'][0]['invoked_at'] = 101
         with self.assertRaisesRegex(HarnessError, 'freshness origin'):
             self.runtime.progress_packet({})

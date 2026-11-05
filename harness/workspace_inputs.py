@@ -15,6 +15,7 @@ from pathlib import Path
 from . import git
 from .cleanup import _canonical, _regular_bytes
 from .path_evidence import validate_dispatch_indexes
+from .run_store import RunStore
 from .util import (HarnessError, ensure_dispatches_exited, group_alive, lock,
                    validate_command_directories, write_json)
 
@@ -201,8 +202,10 @@ def prepare_run(repo, ident, manifest):
     ensure_private_state(repo)
     with lock(directory / 'run.lock'):
         run = _read(directory / 'state.json')
-        if run.get('id') != ident or run.get('repo') != str(repo) or run.get('schema_version') not in (11, 12):
-            _fail('run must be migrated before preparation')
+        if run.get('id') != ident or run.get('repo') != str(repo) or run.get('schema_version') != 13:
+            _fail('historical run is read-only; start a new run before preparation')
+        store = RunStore(repo / '.harness')
+        store.attach(run)
         before = _gate(run, directory)
         value = _read(Path(manifest).absolute()) if isinstance(manifest, (str, Path)) else manifest
         value = _manifest(run, value)
@@ -221,9 +224,8 @@ def prepare_run(repo, ident, manifest):
             # frozen evidence cannot silently revert to legacy dispatch behavior.
             raw = (json.dumps(value, sort_keys=True, indent=2) + '\n').encode()
             digest = hashlib.sha256(raw).hexdigest()
-            run['schema_version'] = 12
             run['workspace_inputs'] = {'schema_version': 1, 'manifest_sha256': digest}
-            write_json(directory / 'state.json', run)
+            store.commit()
             with frozen_path.open('xb') as stream:
                 stream.write(raw); stream.flush(); os.fsync(stream.fileno())
             journal = {'schema_version': 1, 'run_id': ident, 'manifest_sha256': digest,

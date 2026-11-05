@@ -1,10 +1,11 @@
 """Worker extension compatibility and hard protocol boundaries."""
 from copy import deepcopy
 import unittest
+from types import SimpleNamespace
+from harness.services import Services
 
 from harness.adapters import provider_schema
 from harness.contracts import WORK, envelope, validate, validate_work
-from harness.engine import Engine
 from harness.util import HarnessError
 
 
@@ -67,19 +68,20 @@ class ProtocolExtensionTests(unittest.TestCase):
             validate_work(dict(self.result(), checkpoints=[checkpoint]))
 
     def test_handoff_targets_require_unaccepted_transitive_dependency(self):
-        engine = Engine.__new__(Engine)
+        engine = SimpleNamespace()
         engine.run = {'tasks': [dict(id='analysis', depends_on=[]),
                                 dict(id='middle', depends_on=['analysis']),
                                 dict(id='operation', depends_on=['middle']),
                                 dict(id='unrelated', depends_on=[])], 'accepted': {}}
+        engine.services = Services(engine)
         def result(target):
             return dict(self.result(), decision_requests=[dict(id='risk', task_id=target, question='Proceed?')])
         before = deepcopy(engine.run)
-        engine.validate_handoff_requests('analysis', result('operation'))
+        engine.services.workflow.validate_handoff_requests('analysis', result('operation'))
         for target in ('analysis', 'unrelated', 'missing'):
             with self.subTest(target=target), self.assertRaises(HarnessError):
-                engine.validate_handoff_requests('analysis', result(target))
+                engine.services.workflow.validate_handoff_requests('analysis', result(target))
         self.assertEqual(engine.run, before)
         engine.run['accepted']['operation'] = {}
         with self.assertRaises(HarnessError):
-            engine.validate_handoff_requests('analysis', result('operation'))
+            engine.services.workflow.validate_handoff_requests('analysis', result('operation'))

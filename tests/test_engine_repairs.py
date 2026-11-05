@@ -1,3 +1,4 @@
+import signal
 import copy
 import json
 import sys
@@ -5,7 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from harness import git
-from harness.engine import snapshot_digest
+from harness.recovery import snapshot_digest
 from harness.shared import HookError
 from harness.util import HarnessError, read_json, write_json
 from test_harness import RepoCase, ROOT
@@ -58,7 +59,7 @@ class EngineRepairsTests(RepoCase):
         self.assertEqual(correction["previous_dispatch"], workers[0]["dispatch_id"])
         self.assertEqual(len(read_json(Path(correction["artifact"]) / "response.json")["summary"]), 4001)
         self.assertEqual(result["accepted"]["greet"]["verification"],
-                         str(engine.verification_directory("greet", 2) / "results.json"))
+                         str(engine.services.verification.verification_directory("greet", 2) / "results.json"))
 
     def test_second_format_violation_blocks_without_a_third_worker(self):
         def malformed(backend, kwargs, packet, result):
@@ -194,7 +195,7 @@ class EngineRepairsTests(RepoCase):
             self.assertGreater(Path(check["log"]).with_suffix(".stdout").stat().st_size, 8000)
             self.assertGreater(Path(check["log"]).with_suffix(".stderr").stat().st_size, 8000)
         self.assertTrue(all(len(request["prompt"]) <= 32000 for request in backend.requests))
-        self.assertEqual(len(read_json(engine.verification_directory("greet", 1) / "results.json")), 3)
+        self.assertEqual(len(read_json(engine.services.verification.verification_directory("greet", 1) / "results.json")), 3)
 
     def test_only_independently_reviewed_summary_enters_accepted_memory(self):
         worker_claim = "UNVERIFIED: a remote production deployment succeeded"
@@ -290,8 +291,10 @@ class EngineRepairsTests(RepoCase):
         self.assertEqual(result["status"], "completed")
         timeout = next(dispatch for dispatch in result["dispatches"] if dispatch["status"] == "timed_out")
         self.assertTrue(timeout["exit_confirmed"])
-        checks = read_json(engine.verification_directory("greet", 1) / "results.json")
-        self.assertEqual(checks[0]["exit_code"], 124)
+        checks = read_json(engine.services.verification.verification_directory("greet", 1) / "results.json")
+        self.assertEqual(checks[0]["exit_code"], -signal.SIGTERM)
+        self.assertEqual(checks[0]["termination_reason"], "timeout")
+        self.assertEqual(checks[0]["status"], "timed_out")
         self.assertTrue(checks[0]["timed_out"])
         workers = [call for call in backend.calls if call["role"] == "worker"]
         self.assertTrue(workers[1]["packet"]["feedback"]["verification"][0]["timed_out"])
@@ -322,7 +325,7 @@ class EngineRepairsTests(RepoCase):
             if args[:2] == ("worktree", "add"):
                 raise OSError("worktree directory unavailable")
             return original(repo, *args, **kwargs)
-        with patch("harness.engine.git.git", side_effect=fail_creation), self.assertRaises(OSError):
+        with patch("harness.git.git", side_effect=fail_creation), self.assertRaises(OSError):
             engine.start("Implement greet", self.plan())
         state = read_json(engine.directory / "state.json")
         self.assertEqual(state["status"], "blocked")
@@ -346,7 +349,7 @@ class EngineRepairsTests(RepoCase):
             archive.mkdir(parents=True)
             (archive / "partial-evidence").write_text("preserve this failed attempt")
             raise HarnessError("archive unavailable")
-        with patch("harness.engine.git.archive_and_reset", side_effect=fail_archive), self.assertRaisesRegex(HarnessError, "archive unavailable"):
+        with patch("harness.git.archive_and_reset", side_effect=fail_archive), self.assertRaisesRegex(HarnessError, "archive unavailable"):
             engine.start("Implement greet", self.plan())
         saved = read_json(engine.directory / "state.json")
         self.assertEqual(saved["pending_replan"]["stage"], "validated")

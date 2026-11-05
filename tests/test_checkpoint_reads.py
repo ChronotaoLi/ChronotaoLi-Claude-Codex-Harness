@@ -18,23 +18,23 @@ class CheckpointReadTests(unittest.TestCase):
         self.addCleanup(temp.cleanup)
         self.runtime = Runtime(Path(temp.name).resolve())
         rt = self.runtime
-        (rt.worktree / 'input').write_bytes(b'input')
-        (rt.worktree / 'output').write_bytes(b'proof')
+        (rt.context.worktree / 'input').write_bytes(b'input')
+        (rt.context.worktree / 'output').write_bytes(b'proof')
         items = [{'id': f'check-{i}', 'summary': 'observed',
                   'inputs': [{'path': 'input', 'sha256': sha(b'input')}],
                   'evidence': [{'path': 'output', 'sha256': sha(b'proof')}],
                   'freshness': 'content', 'max_age_seconds': 0} for i in range(3)]
         result = {'status': 'blocked', 'blocker_kind': 'environment', 'blockers': ['offline'],
                   'summary': 'blocked', 'evidence': [], 'proposed_memories': [], 'checkpoints': items}
-        self.source = rt.directory / 'dispatches' / 'worker' / 'returned-result.json'
+        self.source = rt.context.directory / 'dispatches' / 'worker' / 'returned-result.json'
         write_json(self.source, {**result, 'task_id': 'task', 'dispatch_id': 'worker'})
-        rt.run['dispatches'] = [{'id': 'worker', 'task_id': 'task', 'role': 'worker', 'invoked_at': 100}]
+        rt.context.run['dispatches'] = [{'id': 'worker', 'task_id': 'task', 'role': 'worker', 'invoked_at': 100}]
         rt.record_checkpoints('task', 'worker', result,
                               {'artifact': str(self.source), 'artifact_digest': sha(self.source.read_bytes())})
-        self.manifests = [Path(row['artifact']) for row in rt.run['task_checkpoints']]
+        self.manifests = [Path(row['artifact']) for row in rt.context.run['task_checkpoints']]
         self.evidence = [Path(json.loads(path.read_bytes())['evidence'][0]['artifact'])
                          for path in self.manifests]
-        self.resolution = Path(rt.run['checkpoint_batches'][0]['artifact'])
+        self.resolution = Path(rt.context.run['checkpoint_batches'][0]['artifact'])
 
     def test_validation_and_projection_read_hash_and_parse_bound_artifacts_once(self):
         artifacts = [self.source, self.resolution, *self.manifests, *self.evidence]
@@ -72,7 +72,7 @@ class CheckpointReadTests(unittest.TestCase):
     def test_next_operation_rejects_symlink_with_identical_bytes(self):
         self.runtime.progress_packet({})
         evidence = self.evidence[0]
-        copy_path = self.runtime.worktree / 'identical-proof'
+        copy_path = self.runtime.context.worktree / 'identical-proof'
         copy_path.write_bytes(evidence.read_bytes())
         evidence.unlink()
         evidence.symlink_to(copy_path)
@@ -85,23 +85,23 @@ class CheckpointReadTests(unittest.TestCase):
         resolution = json.loads(original)
         resolution['rows'][0]['artifact_digest'] = '0' * 64
         write_json(self.resolution, resolution)
-        self.runtime.run['checkpoint_batches'][0]['artifact_digest'] = sha(self.resolution.read_bytes())
+        self.runtime.context.run['checkpoint_batches'][0]['artifact_digest'] = sha(self.resolution.read_bytes())
         # The manifest has already been validated from the ledger when the
         # batch presents a different hash for that same path.
         with self.assertRaisesRegex(HarnessError, 'manifest changed'):
             self.runtime.progress_packet({})
 
         self.resolution.write_bytes(original)
-        self.runtime.run['checkpoint_batches'][0]['artifact_digest'] = sha(original)
-        row = copy.deepcopy(self.runtime.run['task_checkpoints'].pop())
+        self.runtime.context.run['checkpoint_batches'][0]['artifact_digest'] = sha(original)
+        row = copy.deepcopy(self.runtime.context.run['task_checkpoints'].pop())
         with self.assertRaisesRegex(HarnessError, 'ledger is incomplete'):
             self.runtime.progress_packet({})
-        self.runtime.run['task_checkpoints'].append(row)
+        self.runtime.context.run['task_checkpoints'].append(row)
         self.assertEqual(len(self.runtime.progress_packet({})['task_checkpoints']), 3)
 
     def test_live_inputs_are_rehashed_on_later_projection(self):
         self.assertTrue(all(row['status'] == 'reusable'
                             for row in self.runtime.progress_packet({})['task_checkpoints']))
-        (self.runtime.worktree / 'input').write_bytes(b'changed')
+        (self.runtime.context.worktree / 'input').write_bytes(b'changed')
         rows = self.runtime.progress_packet({})['task_checkpoints']
         self.assertTrue(all(row['status'] == 'stale' and row['changed_input_indices'] == [0] for row in rows))

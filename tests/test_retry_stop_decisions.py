@@ -105,7 +105,7 @@ class RetryStopDecisionTests(RepoCase):
             raise KeyboardInterrupt()
         backend = self.stopped_backend()
         engine = self.engine(backend)
-        with patch.object(engine, 'register_decision_request', side_effect=interrupt_registration):
+        with patch.object(engine.services.decisions, 'register_decision_request', side_effect=interrupt_registration):
             with self.assertRaises(KeyboardInterrupt):
                 engine.start('Implement greet', read_json(ROOT / 'examples' / 'plan.json'))
         before = self.saved(engine)
@@ -130,11 +130,11 @@ class RetryStopDecisionTests(RepoCase):
         engine, backend = self.stopped()
         before = self.saved(engine)
         resumed = self.engine(backend)
-        record = resumed.record_operator_decisions
+        record = resumed.services.decisions.record_operator_decisions
         def record_then_interrupt(records):
             record(records)
             raise KeyboardInterrupt()
-        with patch.object(resumed, 'record_operator_decisions', side_effect=record_then_interrupt):
+        with patch.object(resumed.services.decisions, 'record_operator_decisions', side_effect=record_then_interrupt):
             with self.assertRaises(KeyboardInterrupt):
                 resumed.resume(engine.run['id'], operator_decision=self.answer(before['decision_requests'][0]))
         interrupted = self.saved(engine)
@@ -149,7 +149,7 @@ class RetryStopDecisionTests(RepoCase):
         engine, backend = self.stopped()
         before = self.saved(engine)
         resumed = self.engine(backend)
-        with patch.object(resumed, 'execute', side_effect=KeyboardInterrupt()):
+        with patch.object(resumed.services.scheduler, 'execute', side_effect=KeyboardInterrupt()):
             with self.assertRaises(KeyboardInterrupt):
                 resumed.resume(engine.run['id'], operator_decision=self.answer(before['decision_requests'][0]))
         interrupted = self.saved(engine)
@@ -181,9 +181,9 @@ class RetryStopDecisionTests(RepoCase):
         request = self.saved(engine)['decision_requests'][0]
         # Reproduce an older retry that invoked another model while retaining
         # the original stop/request. Expiration follows the real dispatch ledger.
-        engine.dispatch('commander', 'plan', 'planning', PLAN, {'goal': engine.run['goal']})
+        engine.services.dispatch.dispatch('commander', 'plan', 'planning', PLAN, {'goal': engine.run['goal']})
         self.assertGreater(len(engine.run['dispatches']), request['dispatch_count'])
-        engine.save()
+        engine.context.save()
         result = self.engine(backend).resume(engine.run['id'], retry_stopped='greet')
         self.assertEqual(result['status'], 'completed')
         self.assertEqual(result['operator_decisions'], [])
@@ -196,7 +196,7 @@ class RetryStopDecisionTests(RepoCase):
         engine.load_run(engine.run['id'])
         engine.run['replan_stopped'].pop('dispatch_id')
         engine.run['replan_stopped'].pop('source_digest')
-        engine.save()
+        engine.context.save()
         result = self.engine(backend).resume(engine.run['id'], retry_stopped='greet')
         self.assertEqual(result['status'], 'completed')
         self.assertEqual([r['decision'] for r in result['operator_decisions']], ['stop'])
@@ -207,16 +207,16 @@ class RetryStopDecisionTests(RepoCase):
                 backend = self.stopped_backend()
                 engine = self.engine(backend)
                 # Legacy execution could save a stop without registering a decision.
-                with patch.object(engine, 'synchronize_decision_requests'):
+                with patch.object(engine.services.workflow, 'synchronize_decision_requests'):
                     with self.assertRaises(HarnessError):
                         engine.start('Implement greet', read_json(ROOT / 'examples' / 'plan.json'))
                 if legacy == 'stale_source':
-                    engine.dispatch('commander', 'plan', 'planning', PLAN, {'goal': engine.run['goal']})
+                    engine.services.dispatch.dispatch('commander', 'plan', 'planning', PLAN, {'goal': engine.run['goal']})
                 else:
                     engine.run['replan_stopped'].pop('source_digest')
                     if legacy == 'no_source':
                         engine.run['replan_stopped'].pop('dispatch_id')
-                engine.save()
+                engine.context.save()
                 self.assertEqual(self.saved(engine)['decision_requests'], [])
                 result = self.engine(backend).resume(engine.run['id'], retry_stopped='greet')
                 self.assertEqual(result['status'], 'completed')
@@ -226,13 +226,13 @@ class RetryStopDecisionTests(RepoCase):
         engine, backend = self.stopped()
         request = self.saved(engine)['decision_requests'][0]
         engine.run['replan_stopped'].pop('source_digest')
-        engine.save()
+        engine.context.save()
         self.assert_retry_needs_answer(engine, backend, request)
 
     def test_mismatched_stop_digest_preserves_evidence_without_dispatch(self):
         engine, backend = self.stopped()
         engine.run['replan_stopped']['source_digest'] = '0' * 64
-        engine.save()
+        engine.context.save()
         before = (engine.directory / 'state.json').read_bytes()
         calls = copy.deepcopy(backend.calls)
         with self.assertRaises(HarnessError):

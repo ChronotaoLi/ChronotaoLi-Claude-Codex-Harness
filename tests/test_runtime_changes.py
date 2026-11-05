@@ -241,8 +241,8 @@ class RuntimeChangesTests(RepoCase):
         engine = self.engine()
         result = engine.start("Implement greet", self.plan(), pause_after_plan=True)
         engine.run.pop("schema_version")
-        engine.save()
-        with self.assertRaisesRegex(HarnessError, "旧 run 状态格式"):
+        engine.context.save()
+        with self.assertRaisesRegex(HarnessError, "旧 run"):
             self.engine().resume(result["id"], approve_plan=True)
         self.assertEqual(engine.run["dispatches"], [])
 
@@ -295,12 +295,12 @@ class RuntimeChangesTests(RepoCase):
                 result.update(action="revise", reason="Add preparation", new_tasks=[prerequisite],
                               updates=[{"id": task["id"], "description": task["description"], "add_depends_on": ["prepare"]}])
         engine = self.engine(ScriptedBackend(revise))
-        save = engine.save
+        save = engine.context.save
         def interrupt_after_application():
             save()
             if len(engine.run["plan_history"]) == 2:
                 raise KeyboardInterrupt()
-        engine.save = interrupt_after_application
+        engine.context.save = interrupt_after_application
         with self.assertRaises(KeyboardInterrupt):
             engine.start("Implement greet", self.plan())
         persisted = read_json(engine.directory / "state.json")

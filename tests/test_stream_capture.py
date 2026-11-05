@@ -1,5 +1,7 @@
 import json
 import os
+import signal
+import subprocess
 import sys
 import tempfile
 import time
@@ -23,6 +25,34 @@ class StreamCaptureTests(unittest.TestCase):
     def run_cli(self, program, **options):
         return run_stream_process([sys.executable, '-c', program], self.job,
                                   self.job / 'process', timeout=3, **options)
+
+    def test_real_sigint_after_popen_creation_retains_ownership_and_cleans_child(self):
+        original = subprocess.Popen
+        children = []
+        def interrupted(*args, **kwargs):
+            child = original(*args, **kwargs)
+            children.append(child)
+            os.kill(os.getpid(), signal.SIGINT)
+            return child
+        try:
+            with patch('harness.stream_capture.subprocess.Popen', side_effect=interrupted):
+                with self.assertRaises(KeyboardInterrupt) as caught:
+                    self.run_cli('import time; time.sleep(30)')
+            facts = caught.exception.outcome
+            self.assertTrue(facts.started)
+            self.assertEqual(facts.pid, children[0].pid)
+            self.assertEqual(facts.termination_reason, 'cancelled')
+            self.assertTrue(facts.exit_confirmed)
+            self.assertIsNotNone(children[0].poll())
+            saved = read_json(self.job / 'process.outcome.json')
+            self.assertTrue(saved['started'])
+            self.assertTrue(saved['exit_confirmed'])
+            self.assertEqual(saved['termination_reason'], 'cancelled')
+        finally:
+            for child in children:
+                if child.poll() is None:
+                    os.killpg(child.pid, signal.SIGKILL)
+                child.wait()
 
     def test_tool_metadata_filters_bodies_and_preserves_terminal_and_usage(self):
         freeze_capture(self.job, 'stream_metadata_v1', 'synthetic')
@@ -106,6 +136,13 @@ class StreamCaptureTests(unittest.TestCase):
         release = threading.Event()
         timer = threading.Timer(2.2, release.set)
         self.addCleanup(timer.cancel)
+        # A rejected, deliberately blocked daemon can outlive the bounded API.
+        # Release and join the fixture before deleting its output directory.
+        def join_fixture_writer():
+            for worker in threading.enumerate():
+                if worker.name == "harness-metadata-writer":
+                    worker.join(1)
+        self.addCleanup(join_fixture_writer)
         self.addCleanup(release.set)
         def slow_open(path, *args, **kwargs):
             if path.name == 'stream-metadata.jsonl':

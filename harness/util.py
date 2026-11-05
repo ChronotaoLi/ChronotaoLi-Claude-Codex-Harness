@@ -237,31 +237,41 @@ def readonly_lock(path):
 
 
 def run_process(argv: list[str], cwd: Path, log: Path, *, stdin: str = "",
-                timeout: int | float = 900, env=None, on_start=None) -> int:
+                timeout: int | float = 900, env=None, on_start=None, on_outcome=None,
+                execution_deadline=None, cleanup_deadline=None) -> int:
     """No shell interpolation; terminate the owned process group on all exits."""
+    from .process_runtime import ProcessSupervisor, defer_cleanup_signals
+    execution_deadline = min(time.monotonic() + timeout, execution_deadline if execution_deadline is not None else float("inf"))
     log.parent.mkdir(parents=True, exist_ok=True)
-    with log.with_suffix(".stdout").open("w", encoding="utf-8") as out, \
-            log.with_suffix(".stderr").open("w", encoding="utf-8", errors="backslashreplace") as err, \
-            tempfile.TemporaryFile(dir=log.parent) as source:
-        # A regular file delivers the whole input even if startup spans several
-        # heartbeat windows. Retrying communicate(input=None) can strand a
-        # partially written pipe on Python 3.11.
-        source.write(stdin.encode("utf-8"))
-        source.seek(0)
-        p = None
-        try:
-            try:
-                p = subprocess.Popen(argv, cwd=cwd, stdin=source, stdout=out,
-                                     stderr=err, text=True, env=env, start_new_session=True)
-            except (OSError, ValueError) as e:
-                message = f"无法启动进程 {argv[0] if argv else '<empty argv>'}：{e}；日志：{log}"
-                err.write(message + "\n")
-                raise ProcessStartError(message) from e
+    supervision = ProcessSupervisor(log, on_outcome=on_outcome, cleanup_deadline=cleanup_deadline)
+    try:
+        with log.with_suffix(".stdout").open("w", encoding="utf-8") as out, \
+                log.with_suffix(".stderr").open("w", encoding="utf-8", errors="backslashreplace") as err, \
+                tempfile.TemporaryFile(dir=log.parent) as source:
+            # A regular file delivers the whole input even if startup spans several
+            # heartbeat windows. Retrying communicate(input=None) can strand a
+            # partially written pipe on Python 3.11.
+            source.write(stdin.encode("utf-8"))
+            source.seek(0)
+            if time.monotonic() >= execution_deadline:
+                raise ProcessTimeout(timeout, log)
+            # Retain cancellation until the supervisor owns the new process.
+            # Popen can have created its child before returning to this frame.
+            with defer_cleanup_signals():
+                supervision.begin_launch()
+                try:
+                    p = subprocess.Popen(argv, cwd=cwd, stdin=source, stdout=out,
+                                         stderr=err, text=True, env=env, start_new_session=True)
+                except (OSError, ValueError) as e:
+                    message = f"无法启动进程 {argv[0] if argv else '<empty argv>'}：{e}；日志：{log}"
+                    err.write(message + "\n")
+                    raise ProcessStartError(message) from e
+                supervision.started(p)
             started = time.monotonic()
             if on_start:
                 on_start(p.pid)
             while True:
-                remaining = timeout - (time.monotonic() - started)
+                remaining = execution_deadline - time.monotonic()
                 if remaining <= 0:
                     raise ProcessTimeout(timeout, log)
                 try:
@@ -269,17 +279,8 @@ def run_process(argv: list[str], cwd: Path, log: Path, *, stdin: str = "",
                     return p.returncode
                 except subprocess.TimeoutExpired:
                     print(f"[harness] {argv[0]} 仍在运行；日志 {log}", file=sys.stderr)
-        finally:
-            if p is not None:
-                with contextlib.suppress(ProcessLookupError):
-                    os.killpg(p.pid, signal.SIGTERM)
-                try:
-                    p.wait(timeout=2)
-                except subprocess.TimeoutExpired:
-                    pass
-                with contextlib.suppress(ProcessLookupError):
-                    os.killpg(p.pid, signal.SIGKILL)
-                p.wait()
+    finally:
+        supervision.finish(sys.exc_info()[1])
 
 
 def tail(path: Path, size=4000) -> str:

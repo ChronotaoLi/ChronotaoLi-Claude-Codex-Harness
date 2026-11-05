@@ -5,6 +5,7 @@ import math
 import os
 import shlex
 import sys
+import time
 from copy import deepcopy
 from pathlib import Path
 
@@ -216,12 +217,12 @@ class CLIBackend:
         self.config, self.state = config, state
         self.allow_stream_fixture = allow_stream_fixture
 
-    def command(self, role, model, cwd, job, schema, run_path):
+    def command(self, role, model, cwd, job, schema, run_path, *, parent_deadline=None):
         if role == "worker" and model["cli"] == "codex":
             raise HarnessError("当前 Codex 适配器仅支持只读角色，不能配置为 worker")
         claude, codex = mcp_configs(self.config, self.state, role, run_path)
         if role == "worker":
-            manifest = create_manifest(self.config, cwd, job.resolve(), run_path)
+            manifest = create_manifest(self.config, cwd, job.resolve(), run_path, parent_deadline=parent_deadline if parent_deadline is not None else getattr(self, "_parent_deadline", None))
             claude["mcpServers"]["harness_commands"] = {
                 "type": "stdio", "command": sys.executable,
                 "timeout": int(self.config.data["runtime"]["verify_timeout_seconds"] * 1000) + 10000,
@@ -272,11 +273,16 @@ class CLIBackend:
     def output_format(self):
         return "stream-json" if self.config.data["runtime"].get("claude_output_mode", "legacy_json") == "stream_metadata_v1" else "json"
 
-    def invoke(self, *, role, model, cwd, job, schema, prompt, run_path, on_start, task=None, kind=None):
+    def invoke(self, *, role, model, cwd, job, schema, prompt, run_path, on_start, task=None, kind=None, on_outcome=None):
+        parent_deadline = time.monotonic() + self.config.data["runtime"]["agent_timeout_seconds"]
         mode = self.config.data["runtime"].get("claude_output_mode", "legacy_json")
         write_json(job / "schema.json", schema)
         (job / "prompt.txt").write_text(prompt, encoding="utf-8")
-        argv = self.command(role, model, cwd, job, schema, run_path)
+        self._parent_deadline = parent_deadline
+        try:
+            argv = self.command(role, model, cwd, job, schema, run_path)
+        finally:
+            self._parent_deadline = None
         write_json(job / "command.json", argv)
         env = os.environ.copy()
         env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] = "1"
@@ -295,8 +301,12 @@ class CLIBackend:
             freeze_capture(job, mode, version)
             if mode == "stream_metadata_v1":
                 runner = run_stream_process
+        remaining = parent_deadline - time.monotonic()
+        if remaining <= 0:
+            raise HarnessError("Agent budget exhausted before CLI startup")
         code = runner(argv, cwd, job / "process", stdin=prompt,
-                           timeout=self.config.data["runtime"]["agent_timeout_seconds"], env=env, on_start=on_start)
+                           timeout=remaining, env=env, on_start=on_start,
+                           execution_deadline=parent_deadline, on_outcome=on_outcome)
         if code:
             diagnostic = cli_error_summary(job, model["cli"])
             detail = f"；{diagnostic}" if diagnostic else ""
@@ -333,15 +343,25 @@ class CLIBackend:
 
 class DemoBackend:
     """Explicit offline simulation, only used by the demo command and tests."""
-    def invoke(self, *, role, model, cwd, job, schema, prompt, run_path, on_start, task=None, kind=None):
+    def invoke(self, *, role, model, cwd, job, schema, prompt, run_path, on_start, task=None, kind=None, on_outcome=None):
         ids = {k: schema["properties"][k]["enum"][0] for k in ("task_id", "dispatch_id")}
+        packet = json.JSONDecoder().raw_decode(prompt)[0].get("packet", {})
         if role == "worker":
             (cwd / "hello.py").write_text('def greet(name):\n    return f"Hello, {name}!"\n', encoding="utf-8")
             result = {"status": "completed", "summary": "Implemented greet", "evidence": ["hello.py"],
                       "blockers": [], "blocker_kind": "none", "proposed_memories": []}
+            if "repair_claims" in schema["properties"]:
+                result["repair_claims"] = [{"review_dispatch_id": item["review_dispatch_id"],
+                    "finding_id": item["finding_id"], "summary": "Offline fixture reimplemented greet",
+                    "evidence_paths": ["hello.py"]} for item in packet.get("required_findings", [])]
         elif role == "reviewer":
             result = {"verdict": "approve", "summary": "Demo simulated review", "findings": [],
                       "approved_memory_keys": []}
+            if "finding_dispositions" in schema["properties"]:
+                result["finding_dispositions"] = [{"review_dispatch_id": item["review_dispatch_id"],
+                    "finding_id": item["finding_id"], "status": "resolved",
+                    "evidence": ["Offline fixture reviewed the current greet implementation"]}
+                    for item in packet.get("required_findings", [])]
         elif kind == "plan":
             result = {"tasks": [{"id": "greet", "title": "Implement greet", "description": "Implement greet(name) returning Hello, name!",
                                   "depends_on": [], "allowed_paths": ["hello.py"], "acceptance": ["test_greet passes"], "skills": []}]}

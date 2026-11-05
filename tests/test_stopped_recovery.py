@@ -4,6 +4,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from harness import git
+from harness.process_runtime import ProcessOutcome
 from harness.util import HarnessError, read_json, run_process, write_json
 from test_harness import ROOT, RepoCase
 from test_runtime_changes import ScriptedBackend, finding
@@ -81,6 +82,11 @@ class StoppedRecoveryTests(RepoCase):
 
                 def fail_final(argv, cwd, log, **kwargs):
                     if "final" in Path(log).parts:
+                        kwargs["on_start"](123)
+                        Path(log).with_suffix(".stdout").write_text("")
+                        Path(log).with_suffix(".stderr").write_text("Observed final verification failure")
+                        kwargs["on_outcome"](ProcessOutcome(started=True, startup_state="started", pid=123, pgid=123,
+                                                            exit_code=1, exit_confirmed=True))
                         return 1
                     return run_process(argv, cwd, log, **kwargs)
 
@@ -93,7 +99,7 @@ class StoppedRecoveryTests(RepoCase):
                 # combination has been validated, before auditing or saving it.
                 dispatch = engine.run["dispatches"][0]
                 dispatch["exit_confirmed"] = False
-                engine.save()
+                engine.context.save()
                 state_path = engine.directory / "state.json"
                 events_path = engine.directory / "events.jsonl"
                 state_before = state_path.read_bytes()
@@ -249,11 +255,11 @@ class StoppedRecoveryTests(RepoCase):
         engine = self.engine()
         engine.start("Implement greet", self.plan(), pause_after_plan=True)
         engine.run["dispatches"].append({"pgid": 123456, "exit_confirmed": False})
-        engine.save()
-        with patch("harness.engine.group_alive", return_value=True), self.assertRaises(HarnessError):
+        engine.context.save()
+        with patch("harness.run_context.group_alive", return_value=True), self.assertRaises(HarnessError):
             self.engine().abandon(engine.run["id"])
         engine.run["dispatches"].clear()
-        engine.save()
+        engine.context.save()
         cache = engine.worktree / "__pycache__"
         cache.mkdir()
         (cache / "unsaved").write_text("keep")
@@ -286,7 +292,7 @@ class StoppedRecoveryTests(RepoCase):
         engine.start("Implement greet", self.plan(), pause_after_plan=True)
         backend = ScriptedBackend()
         resumed = self.engine(backend)
-        load = resumed.load_run
+        load = resumed.services.lifecycle.load_run
         abandoned = False
 
         def abandon_between_load_and_lock(ident):
@@ -296,7 +302,7 @@ class StoppedRecoveryTests(RepoCase):
                 abandoned = True
                 self.engine().abandon(ident)
 
-        with patch.object(resumed, "load_run", side_effect=abandon_between_load_and_lock):
+        with patch.object(resumed.services.lifecycle, "load_run", side_effect=abandon_between_load_and_lock):
             with self.assertRaisesRegex(HarnessError, "放弃"):
                 resumed.resume(engine.run["id"], approve_plan=True)
         self.assertEqual(backend.calls, [])

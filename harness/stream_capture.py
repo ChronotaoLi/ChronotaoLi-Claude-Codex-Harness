@@ -8,7 +8,7 @@ import os
 import selectors
 import queue
 import threading
-import signal
+import sys
 import subprocess
 import tempfile
 import time
@@ -74,12 +74,16 @@ def project_event(event, dispatch_id):
 
 def run_stream_process(argv, cwd, log, *, stdin="", timeout=900, env=None, on_start=None,
                        terminal_limit=TERMINAL_LIMIT, metadata_limit=METADATA_LIMIT,
-                       record_limit=RECORD_LIMIT):
+                       record_limit=RECORD_LIMIT, on_outcome=None,
+                       execution_deadline=None, cleanup_deadline=None):
     """One selector drains both pipes; no observer queue can block the child.
 
     Parsing finishes before exit is interpreted. Oversized/malformed transport
     permanently invalidates the protocol even when a terminal was already seen.
     """
+    from .process_runtime import ProcessSupervisor, defer_cleanup_signals
+    execution_deadline = min(time.monotonic() + timeout, execution_deadline if execution_deadline is not None else float("inf"))
+    writer_deadline = None
     job = log.parent
     terminal = job / "stream-terminal.json"
     if terminal.exists():
@@ -116,8 +120,11 @@ def run_stream_process(argv, cwd, log, *, stdin="", timeout=900, env=None, on_st
     writer = threading.Thread(target=writer_main, daemon=True, name="harness-metadata-writer")
 
     def finish_writer():
+        nonlocal writer_deadline
+        if writer_deadline is None:
+            writer_deadline = min(time.monotonic() + 2, execution_deadline)
         writer_stop.set()
-        writer.join(timeout=2)
+        writer.join(timeout=max(0, (writer_deadline if writer_deadline is not None else execution_deadline) - time.monotonic()))
         return writer_failed.is_set() or writer.is_alive()
 
     def emit(record):
@@ -156,16 +163,23 @@ def run_stream_process(argv, cwd, log, *, stdin="", timeout=900, env=None, on_st
         for record in projected if isinstance(projected, list) else [projected]:
             emit(record)
 
+    supervision = ProcessSupervisor(log, on_outcome=on_outcome, cleanup_deadline=cleanup_deadline)
     try:
         writer.start()
         with tempfile.TemporaryFile(dir=job) as source:
             source.write(stdin.encode("utf-8"))
             source.seek(0)
-            try:
-                p = subprocess.Popen(argv, cwd=cwd, stdin=source, stdout=subprocess.PIPE,
-                                     stderr=subprocess.PIPE, env=env, start_new_session=True)
-            except (OSError, ValueError) as error:
-                raise ProcessStartError("Unable to start stream CLI") from error
+            if time.monotonic() >= execution_deadline:
+                raise ProcessTimeout(timeout, log)
+            # Retain cancellation until the supervisor owns the new process.
+            with defer_cleanup_signals():
+                supervision.begin_launch()
+                try:
+                    p = subprocess.Popen(argv, cwd=cwd, stdin=source, stdout=subprocess.PIPE,
+                                         stderr=subprocess.PIPE, env=env, start_new_session=True)
+                except (OSError, ValueError) as error:
+                    raise ProcessStartError("Unable to start stream CLI") from error
+                supervision.started(p)
             started = time.monotonic()
             if on_start:
                 on_start(p.pid)
@@ -173,7 +187,7 @@ def run_stream_process(argv, cwd, log, *, stdin="", timeout=900, env=None, on_st
                 os.set_blocking(stream.fileno(), False)
                 selector.register(stream, selectors.EVENT_READ)
             while selector.get_map():
-                remaining = timeout - (time.monotonic() - started)
+                remaining = execution_deadline - time.monotonic()
                 if remaining <= 0:
                     raise ProcessTimeout(timeout, log)
                 for key, _ in selector.select(min(.1, remaining)):
@@ -204,7 +218,7 @@ def run_stream_process(argv, cwd, log, *, stdin="", timeout=900, env=None, on_st
                             overflow = False
             if pending or overflow:
                 damaged = True  # A truncated final record cannot exclude lost terminal data.
-            remaining = timeout - (time.monotonic() - started)
+            remaining = execution_deadline - time.monotonic()
             if remaining <= 0:
                 raise ProcessTimeout(timeout, log)
             try:
@@ -246,21 +260,36 @@ def run_stream_process(argv, cwd, log, *, stdin="", timeout=900, env=None, on_st
                     temporary.unlink(missing_ok=True)
             return code
     finally:
-        if p is not None:
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(p.pid, signal.SIGTERM)
-            try:
-                p.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                pass
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(p.pid, signal.SIGKILL)
-            p.wait()
-            for stream in (p.stdout, p.stderr):
-                stream.close()
-        selector.close()
-        if writer.ident is not None:
-            finish_writer()
+        primary = sys.exc_info()[1]
+        try:
+            with defer_cleanup_signals(primary=primary) as deferred:
+                writer_deadline = min(writer_deadline or float("inf"), time.monotonic() + 2, cleanup_deadline if cleanup_deadline is not None else float("inf"))
+                supervision.cleanup_deadline = writer_deadline
+                cleanup_failure = None
+                actions = []
+                if p is not None:
+                    actions.extend([("close_stdout", p.stdout.close), ("close_stderr", p.stderr.close)])
+                actions.append(("close_selector", selector.close))
+                if writer.ident is not None:
+                    actions.append(("finish_writer", finish_writer))
+                for step, action in actions:
+                    try:
+                        action()
+                    except (Exception, KeyboardInterrupt, SystemExit) as error:
+                        supervision.outcome.cleanup_errors.append({"step": step,
+                            "type": type(error).__name__, "message": str(error),
+                            "errno": getattr(error, "errno", None)})
+                        cleanup_failure = cleanup_failure or error
+                supervision.finish(primary or cleanup_failure, captured=deferred)
+                if primary is None and cleanup_failure is not None:
+                    raise cleanup_failure
+        except KeyboardInterrupt as error:
+            if primary is not None:
+                raise primary
+            if getattr(error, "outcome", None) is None:
+                supervision.record_cancellation(error)
+            raise
+
 
 
 def permission_denial_projection(value):

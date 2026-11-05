@@ -3,6 +3,7 @@ import copy
 from pathlib import Path
 from unittest.mock import patch
 
+from harness import git
 from harness.budgets import work_attempts
 from harness.cli import status_summary
 from harness.util import HarnessError, read_json, write_json
@@ -92,17 +93,22 @@ class WorkAttemptBudgetTests(RepoCase):
             self.engine(backend).resume(engine.run["id"])
         self.assertEqual(len(backend.calls), 1)
 
-    def test_legacy_run_keeps_original_budget_policy(self):
+    def test_missing_budget_policy_rejects_resume_without_reset_or_calls(self):
         engine, backend = self.start_blocked()
-        state = read_json(engine.directory / "state.json")
+        snapshot = engine.context.snapshot()
+        state_path = engine.directory / "state.json"
+        state = read_json(state_path)
         state.pop("attempt_budget_policy")
-        for entry in state["dispatches"]:
-            entry.pop("attempt_exemption", None)
-        write_json(engine.directory / "state.json", state)
-        with self.assertRaisesRegex(HarnessError, "尝试次数上限"):
+        write_json(state_path, state)
+        saved_bytes = state_path.read_bytes()
+        calls = copy.deepcopy(backend.calls)
+        with self.assertRaisesRegex(HarnessError, "运行台账字段缺失或类型无效"):
             self.engine(backend).resume(engine.run["id"])
-        self.assertEqual(len(backend.calls), 1)
-        self.assertEqual(work_attempts(state), state["attempts"])
+        self.assertEqual(backend.calls, calls)
+        self.assertEqual(state_path.read_bytes(), saved_bytes)
+        self.assertEqual(git.snapshot(engine.worktree, binding=state["worktree_binding"]), snapshot)
+        self.assertEqual(state["attempts"], {"greet": 1})
+        self.assertEqual(state["total_attempts"], 1)
 
     def test_exemption_evidence_tampering_and_invalid_accounting_stop_before_dispatch(self):
         engine, backend = self.start_blocked()

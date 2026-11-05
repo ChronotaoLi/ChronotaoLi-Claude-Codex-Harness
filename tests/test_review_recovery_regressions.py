@@ -3,6 +3,7 @@ import sys
 from pathlib import Path
 from unittest.mock import patch
 
+from harness.process_runtime import ProcessOutcome
 from harness.util import HarnessError, read_json, run_process
 from test_harness import ROOT, RepoCase
 from test_runtime_changes import ScriptedBackend, finding
@@ -115,7 +116,7 @@ class ReviewRecoveryRegressionTests(RepoCase):
 
         backend = ScriptedBackend(long_summary)
         engine = self.engine(backend)
-        save = engine.save
+        save = engine.context.save
         key = "reviewer:review:greet"
 
         def crash_before_terminal_save():
@@ -123,7 +124,7 @@ class ReviewRecoveryRegressionTests(RepoCase):
                 raise KeyboardInterrupt()
             save()
 
-        with patch.object(engine, "save", side_effect=crash_before_terminal_save):
+        with patch.object(engine.context, "save", side_effect=crash_before_terminal_save):
             with self.assertRaises(KeyboardInterrupt):
                 engine.start("Implement greet", self.plan())
         saved = read_json(engine.directory / "state.json")
@@ -272,7 +273,11 @@ class ReviewRecoveryRegressionTests(RepoCase):
 
         def final_gate(argv, cwd, log, **kwargs):
             if "final" in Path(log).parts and "# integration correction" not in (cwd / "hello.py").read_text():
+                kwargs["on_start"](123)
+                Path(log).with_suffix(".stdout").write_text("")
                 Path(log).with_suffix(".stderr").write_text("Integration correction is missing")
+                kwargs["on_outcome"](ProcessOutcome(started=True, startup_state="started", pid=123, pgid=123,
+                                                    exit_code=1, exit_confirmed=True))
                 return 1
             return run_process(argv, cwd, log, **kwargs)
 

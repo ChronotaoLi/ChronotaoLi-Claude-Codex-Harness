@@ -266,7 +266,7 @@ class RuntimeTests(RepoCase):
         engine.run["status"] = "interrupted"
         engine.run["dispatches"][-1]["pgid"] = os.getpgrp()
         engine.run["dispatches"][-1]["exit_confirmed"] = False
-        engine.save()
+        engine.context.save()
         with self.assertRaisesRegex(HarnessError, "进程组仍存在"):
             self.engine().resume(engine.run["id"])
 

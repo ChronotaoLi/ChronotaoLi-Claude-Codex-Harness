@@ -10,11 +10,12 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-import harness.engine
+import harness.run_context
 from harness import git
 from harness.adapters import DemoBackend
 from harness.cli import main
 from harness.engine import Engine
+from harness.run_context import RunContext
 from harness.operations import OperationRecord
 from harness.shared import asset_digest
 from harness.util import HarnessError, read_json, write_json
@@ -55,7 +56,7 @@ class OperationCase(RepoCase):
         output, errors = io.StringIO(), io.StringIO() if errors is None else errors
         with contextlib.ExitStack() as stack:
             stack.enter_context(patch("harness.cli.Config.load", return_value=self.config))
-            stack.enter_context(patch("harness.engine.CLIBackend", return_value=backend or DemoBackend()))
+            stack.enter_context(patch("harness.run_context.CLIBackend", return_value=backend or DemoBackend()))
             stack.enter_context(patch("harness.operations.probe_cli", side_effect=fake_probe))
             for name, value in patches.items():
                 stack.enter_context(patch(name, value))
@@ -118,7 +119,7 @@ class OperationRecordTests(OperationCase):
         self.assertLessEqual(record["run_linked_at"], record["finished_at"])
         self.assertRegex(record["finished_at_utc"], r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
         ledger = self.ledger(run_id)
-        self.assertEqual((ledger["schema_version"], ledger["created_by_operation"]), (12, "op-a"))
+        self.assertEqual((ledger["schema_version"], ledger["created_by_operation"]), (13, "op-a"))
         created = self.events(run_id, "run_created")
         self.assertEqual([(event["run_id"], event["operation_id"]) for event in created], [(run_id, "op-a")])
         self.assertIn(notice("run_created", run_id, "op-a"), errors.splitlines())
@@ -168,7 +169,7 @@ class OperationRecordTests(OperationCase):
         self.assertEqual(record["arguments"], {
             "run_id": run_id, "approve_plan": True, "step": False, "reverify": False, "retry_stopped": None,
             "confirm_exited": [], "repair_invalid": None, "environment_update": None,
-            "operator_decision": [], "allow_scope": []})
+            "operator_decision": [], "execution_guidance": None, "allow_scope": []})
         self.assertIsInstance(record["run_linked_at"], float)
         self.assertEqual([event["operation_id"] for event in self.events(run_id, "run_resumed")], ["op-resume"])
         self.assertIn(notice("run_resumed", run_id, "op-resume"), errors.splitlines())
@@ -211,7 +212,7 @@ class OperationRecordTests(OperationCase):
             operation_id = f"op-stopped-{index}"
             before = self.ledger(run_id)
             events_before = events_path.read_bytes()
-            with patch.object(Engine, "emit_hook", autospec=True, side_effect=Engine.emit_hook) as hook:
+            with patch.object(RunContext, "emit_hook", autospec=True, side_effect=RunContext.emit_hook) as hook:
                 code, output, errors = self.invoke(["resume", run_id, "--operation-id", operation_id], backend)
             self.assertEqual(code, 1, errors)
             self.assertEqual(output, "")
@@ -371,7 +372,7 @@ class OperationRecordTests(OperationCase):
         self.assertEqual(self.ledger(result["id"])["created_by_operation"], "op-link")
         self.assertIn(notice("run_created", result["id"], "op-link"), errors.splitlines())
 
-        real = harness.engine.append_event
+        real = harness.run_context.append_event
 
         def failing(path, run_id, event, **fields):
             if event == "run_created":
@@ -379,7 +380,7 @@ class OperationRecordTests(OperationCase):
             return real(path, run_id, event, **fields)
 
         code, output, errors = self.invoke(["run", "Implement greet", "--pause-after-plan", "--operation-id", "op-event"],
-                                           **{"harness.engine.append_event": failing})
+                                           **{"harness.run_context.append_event": failing})
         self.assertEqual(code, 0, errors)
         result = json.loads(output)
         self.assertEqual(result["status"], "awaiting_approval")
@@ -417,7 +418,7 @@ class OperationRecordTests(OperationCase):
         self.assertEqual(code, 0, errors)
         self.assertEqual(json.loads(output)["status"], "completed")
         self.assertNotIn("created_by_operation", read_json(path))
-        self.assertEqual(read_json(path)["schema_version"], 12)
+        self.assertEqual(read_json(path)["schema_version"], 13)
 
     def test_engine_accepts_operation_double_and_null_operation(self):
         state = self.state

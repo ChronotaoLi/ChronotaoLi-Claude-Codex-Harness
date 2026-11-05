@@ -59,4 +59,4 @@ class RoleSkillContextTests(RepoCase):
         for name in ("harness-worker", "harness-commander", "harness-reviewer"):
             plan = read_json(ROOT / "examples" / "plan.json")
             plan["tasks"][0]["skills"] = [name]
-            self.assertEqual(engine.validate_tasks(plan)[0]["skills"], [name])
+            self.assertEqual(engine.services.planning.validate_tasks(plan)[0]["skills"], [name])

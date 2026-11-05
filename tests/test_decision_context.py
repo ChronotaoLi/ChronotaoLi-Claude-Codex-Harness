@@ -52,7 +52,7 @@ class DecisionContextTests(RepoCase):
         self.assertEqual(hashlib.sha256(raw).hexdigest(), index['artifact_digest'])
         archive = read_json(Path(index['artifact']))
         self.assertEqual(archive['responses'], result['operator_decisions'])
-        self.assertEqual(archive['requests'], resumed.decision_context())
+        self.assertEqual(archive['requests'], resumed.services.decisions.decision_context())
         for path, raw in originals.items():
             self.assertEqual(Path(path).read_bytes(), raw)
         reports = [read_json(p) for p in (engine.directory / 'dispatches').glob('*/context-report.json')]
@@ -92,7 +92,7 @@ class DecisionIndexTests(unittest.TestCase):
         engine = self.engine
         engine.record_operator_decision(engine.prepare_operator_decision(engine.response(self.request, 'stop')))
         engine.record_operator_decision(engine.prepare_operator_decision(engine.response(self.request)))
-        for path in (engine.source['artifact'], engine.run['operator_decisions'][0]['artifact']):
+        for path in (engine.source['artifact'], engine.context.run['operator_decisions'][0]['artifact']):
             original = Path(path).read_bytes()
             Path(path).write_text('{}')
             with self.assertRaises(HarnessError):
@@ -112,7 +112,7 @@ class DecisionIndexTests(unittest.TestCase):
         engine = self.engine
         ref = engine.decision_packet({}, task_id='one')['operator_decision_index']
         artifact = Path(ref['artifact'])
-        target = engine.directory / 'unrelated.json'
+        target = engine.context.directory / 'unrelated.json'
         target.write_bytes(artifact.read_bytes())
         artifact.unlink()
         artifact.symlink_to(target)
@@ -123,9 +123,9 @@ class DecisionIndexTests(unittest.TestCase):
 
     def test_run_directory_symlink_cannot_redirect_index_writes(self):
         engine = self.engine
-        alias = engine.directory / 'run-alias'
-        alias.symlink_to(engine.directory, target_is_directory=True)
-        engine.directory = alias
+        alias = engine.context.directory / 'run-alias'
+        alias.symlink_to(engine.context.directory, target_is_directory=True)
+        engine.context.directory = alias
         with self.assertRaisesRegex(HarnessError, 'decision index directory is a symlink'):
             engine._decision_index([])
         self.assertFalse((alias / 'decisions' / 'indexes').exists())

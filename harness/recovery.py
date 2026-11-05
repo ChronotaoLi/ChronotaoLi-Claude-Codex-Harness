@@ -1,4 +1,6 @@
 """Explicit, bounded repair of attributable non-rejecting model output."""
+
+from .services import RuntimeService
 from copy import deepcopy
 import hashlib
 import json
@@ -27,9 +29,8 @@ def snapshot_digest(snapshot):
 def invalidate_acceptance_review(run, feedback=None, *, attempt=None, candidate_digest=None):
     """Persist a known acceptance invalidation without changing its evidence.
 
-    Legacy feedback carries the exact review artifact even when its history
-    record predates the durable invalidation marker. Call before replacing that
-    feedback, so a later plan cannot make the old approval look current again.
+    Feedback binds the exact review artifact. Call before replacing it, so a
+    later plan cannot make the invalidated approval look current again.
     """
     feedback = run.get("feedback") if feedback is None else feedback
     if not isinstance(feedback, dict) or not isinstance(feedback.get("acceptance"), dict):
@@ -62,11 +63,10 @@ def worker_recovery_context(run, directory, task_id):
     workers = [entry for entry in run.get("dispatches", [])
                if entry.get("role") == "worker" and entry.get("task_id") == task_id]
     invoked = [entry for entry in workers if entry.get("invoked") is True]
-    # Do not assign ordinal attempts to legacy ledgers with missing invocation
-    # evidence, or confuse a local preparation failure with a worker attempt.
-    numbered = (all(type(entry.get("invoked")) is bool for entry in workers)
-                and len(invoked) == run.get("attempts", {}).get(task_id))
-    attempts = {entry["id"]: index for index, entry in enumerate(invoked, 1)} if numbered else {}
+    if (any(type(entry.get("invoked")) is not bool for entry in workers)
+            or len(invoked) != run.get("attempts", {}).get(task_id)):
+        raise HarnessError("worker recovery invocation accounting is invalid")
+    attempts = {entry["id"]: index for index, entry in enumerate(invoked, 1)}
 
     def source(entry):
         value = {"dispatch_id": entry["id"], "status": entry.get("status", "unknown"),
@@ -79,7 +79,7 @@ def worker_recovery_context(run, directory, task_id):
         return value
 
     original = next((entry for entry in workers if entry["id"] == recovery.get("dispatch_id")), None)
-    latest = next((entry for entry in reversed(workers) if entry.get("invoked") is not False), None)
+    latest = next((entry for entry in reversed(workers) if entry.get("invoked") is True), None)
     result["source"] = source(original) if original else {"status": "unknown"}
     result["relation"] = "unknown"
     if latest is None:
@@ -153,26 +153,26 @@ def read_bound_result(receipt, label, *, bind=None):
     return result, digest
 
 
-class InvalidOutputRecovery:
+class InvalidOutputRecovery(RuntimeService):
     def format_repair_guidance(self, key, original):
         role, kind, _ = key.split(":", 2)
-        receipts = self.run["commander_receipts"] if role == "commander" else self.run["review_receipts"]
+        receipts = self.context.run["commander_receipts"] if role == "commander" else self.context.run["review_receipts"]
         receipt = receipts.get(key)
         eligible = ((role == "reviewer" and review_approved(original)) or
                     role == "commander" and (kind == "dispatch" or kind == "replan" and original["action"] == "revise"))
         if role == "commander" and receipt:
             correction = receipt["request"]["packet"].get("format_correction")
             eligible = eligible and (correction is None or bool(correction.get("source")))
-        if eligible and receipt and key not in self.run["invalid_repairs"]:
-            return (f"；若仅需修正可变字段格式，可显式 resume {self.run['id']} "
+        if eligible and receipt and key not in self.context.run["invalid_repairs"]:
+            return (f"；若仅需修正可变字段格式，可显式 resume {self.context.run['id']} "
                     f"--repair-invalid {receipt['dispatch_id']}（此角色/调用类型/任务在整个 run 仅一次）")
         return "；请保留原始证据并 abandon"
 
     def active_invalid_repair(self, key):
-        repair = self.run["invalid_repairs"].get(key)
+        repair = self.context.run["invalid_repairs"].get(key)
         if not repair or repair["status"] == "invalidated":
             return None
-        receipts = self.run["commander_receipts"] if key.startswith("commander:") else self.run["review_receipts"]
+        receipts = self.context.run["commander_receipts"] if key.startswith("commander:") else self.context.run["review_receipts"]
         receipt = receipts.get(key)
         if repair["status"] == "pending" or receipt and receipt["dispatch_id"] == repair.get("corrected_dispatch_id"):
             return repair
@@ -207,7 +207,7 @@ class InvalidOutputRecovery:
         repair = self.active_invalid_repair(key)
         if repair:
             result, _ = read_bound_result(repair["source"], "显式修正依据的")
-            candidate = self.snapshot() if candidate is None else candidate
+            candidate = self.context.snapshot() if candidate is None else candidate
             if snapshot_digest(candidate) != repair["source"]["snapshot_digest"]:
                 raise HarnessError("显式修正依据的代码快照已变化；不能修正旧候选的结果")
             if "original" in repair:
@@ -215,14 +215,14 @@ class InvalidOutputRecovery:
             return result
 
     def read_format_source(self, key, source, candidate=None):
-        """Verify previously bound evidence; never invent a digest for old guards."""
+        """Verify previously bound evidence; never invent a missing source digest."""
         if not source.get("artifact_digest"):
-            raise HarnessError("旧格式修正缺少原始结果摘要，无法安全追加修正；请保留证据并 abandon")
+            raise HarnessError("格式修正缺少原始结果摘要，无法安全追加修正；请保留证据并 abandon")
         result, _ = read_bound_result(source, "格式修正依据的")
-        entry = next((d for d in self.run["dispatches"] if d["id"] == source["dispatch_id"]), None)
+        entry = next((d for d in self.context.run["dispatches"] if d["id"] == source["dispatch_id"]), None)
         if entry is None or key != f"{entry['role']}:{entry['kind']}:{entry['task_id']}":
             raise HarnessError("格式修正原始依据与派发身份不符")
-        candidate = self.snapshot() if candidate is None else candidate
+        candidate = self.context.snapshot() if candidate is None else candidate
         if snapshot_digest(candidate) != source["snapshot_digest"]:
             raise HarnessError("格式修正原始依据的代码快照已变化")
         return result
@@ -233,23 +233,23 @@ class InvalidOutputRecovery:
             return None
         source = correction.get("source")
         if not source:
-            raise HarnessError("旧指挥格式修正缺少原始结果摘要，无法安全恢复；请保留证据并 abandon")
+            raise HarnessError("指挥格式修正缺少原始结果摘要，无法安全恢复；请保留证据并 abandon")
         return self.read_format_source(key, source, candidate)
 
     def prepare_invalid_repair(self, dispatch_id):
         """Authorize one correction per role/kind/task without discarding evidence."""
         matches = [(key, receipt, receipts) for receipts in
-                   (self.run["commander_receipts"], self.run["review_receipts"])
+                   (self.context.run["commander_receipts"], self.context.run["review_receipts"])
                    for key, receipt in receipts.items() if receipt["dispatch_id"] == dispatch_id]
         if len(matches) != 1:
             raise HarnessError("--repair-invalid 必须匹配当前未消费的非法结果 dispatch ID")
         key, receipt, receipts = matches[0]
-        if key in self.run["invalid_repairs"]:
+        if key in self.context.run["invalid_repairs"]:
             raise HarnessError("该角色/调用类型/任务的显式输出修正额度已使用；不能再次抽取结果")
-        result, digest = read_bound_result(receipt, "待修正的", bind=self.save)
-        if snapshot_digest(self.snapshot()) != receipt["snapshot_digest"]:
+        result, digest = read_bound_result(receipt, "待修正的", bind=self.context.save)
+        if snapshot_digest(self.context.snapshot()) != receipt["snapshot_digest"]:
             raise HarnessError("待修正结果的代码快照已变化")
-        entry = next(d for d in self.run["dispatches"] if d["id"] == dispatch_id)
+        entry = next(d for d in self.context.run["dispatches"] if d["id"] == dispatch_id)
         if key != f"{entry['role']}:{entry['kind']}:{entry['task_id']}":
             raise HarnessError("待修正结果与派发身份不符")
         proposed_keys = []
@@ -262,36 +262,36 @@ class InvalidOutputRecovery:
             validate_structure(result, envelope(request["schema"], entry["task_id"], dispatch_id))
             if entry["kind"] not in ("plan", "replan", "dispatch") or entry["kind"] == "replan" and result["action"] != "revise":
                 raise HarnessError("显式输出修正不能丢弃指挥 stop")
-            if entry["kind"] == "replan" and receipt["request_id"] != self.run["pending_replan"]["request_id"]:
+            if entry["kind"] == "replan" and receipt["request_id"] != self.context.run["pending_replan"]["request_id"]:
                 raise HarnessError("指挥结果不属于当前再规划请求")
             payload = {k: v for k, v in result.items() if k not in ("task_id", "dispatch_id")}
             try:
                 if entry["kind"] == "plan":
-                    self.validate_tasks(payload)
+                    self.services.planning.validate_tasks(payload)
                 elif entry["kind"] == "replan":
-                    tasks = apply_revision(self.run["tasks"], payload, self.run["accepted"],
-                                           self.config.data["runtime"]["max_tasks"],
-                                           additional_allowed_paths=self.run["approved_scope"])
-                    self.validate_tasks({"tasks": tasks})
+                    tasks = apply_revision(self.context.run["tasks"], payload, self.context.run["accepted"],
+                                           self.context.config.data["runtime"]["max_tasks"],
+                                           additional_allowed_paths=self.context.run["approved_scope"])
+                    self.services.planning.validate_tasks({"tasks": tasks})
                 validate(result, envelope(request["schema"], entry["task_id"], dispatch_id))
             except RepairableFormatError as error:
-                if entry["kind"] not in ("dispatch", "replan") or not self.run["format_repairs"].get(key):
+                if entry["kind"] not in ("dispatch", "replan") or not self.context.run["format_repairs"].get(key):
                     raise HarnessError("格式修正自动额度尚未耗尽，或原计划包含不可变格式错误") from error
                 if entry["kind"] == "replan":
-                    tasks = apply_revision(self.run["tasks"], {**payload, "reason": "Format correction"},
-                                           self.run["accepted"], self.config.data["runtime"]["max_tasks"],
-                                           additional_allowed_paths=self.run["approved_scope"])
-                    self.validate_tasks({"tasks": tasks})
+                    tasks = apply_revision(self.context.run["tasks"], {**payload, "reason": "Format correction"},
+                                           self.context.run["accepted"], self.context.config.data["runtime"]["max_tasks"],
+                                           additional_allowed_paths=self.context.run["approved_scope"])
+                    self.services.planning.validate_tasks({"tasks": tasks})
                 correction = request["packet"].get("format_correction")
                 if correction is not None and not correction.get("source"):
-                    raise HarnessError("旧指挥格式修正缺少原始结果摘要，无法安全追加修正；请保留证据并 abandon") from error
+                    raise HarnessError("指挥格式修正缺少原始结果摘要，无法安全追加修正；请保留证据并 abandon") from error
                 original = deepcopy(correction["source"] if correction else receipt)
                 previous = self.read_format_source(key, original)
                 validate_structure(previous, envelope(request["schema"], entry["task_id"], original["dispatch_id"]))
                 validate_commander_format_correction(entry["kind"], previous, result)
                 mode, validation_error = "format", str(error)
             except HarnessError as error:
-                if (entry["kind"] == "dispatch" or key in self.run["pending_format_corrections"]
+                if (entry["kind"] == "dispatch" or key in self.context.run["pending_format_corrections"]
                         or "format_correction" in request["packet"]):
                     raise HarnessError("格式修正结果存在非格式错误；不能丢弃原指挥决定") from error
                 validation_error = str(error)
@@ -302,14 +302,14 @@ class InvalidOutputRecovery:
             if not review_approved(result):
                 raise HarnessError("拒绝或包含 blocking finding 的审阅不能通过 --repair-invalid 重抽")
             if entry["kind"] == "review":
-                pending = self.run.get("pending_task", {})
+                pending = self.context.run.get("pending_task", {})
                 if pending.get("task_id") != entry["task_id"]:
                     raise HarnessError("待修正审阅不属于当前任务")
                 proposed_keys = [p["key"] for p in pending["proposals"]]
             elif entry["kind"] != "final_review":
                 raise HarnessError("不支持此类审阅修正")
             validate_immutable_findings(result["findings"])
-            guard = self.run["review_corrections"].get(key)
+            guard = self.context.run["review_corrections"].get(key)
             if guard:
                 if guard.get("failed") or guard.get("unrepairable"):
                     raise HarnessError("原审阅修正已违反结论或包含不可修正字段；不能追加修正")
@@ -323,7 +323,7 @@ class InvalidOutputRecovery:
                 validate_review_semantics(result, proposed_keys)
                 # Recheck even when a crash prevented failed/exhausted from being saved.
                 validate_review_correction(previous, result)
-                if not self.run["format_repairs"].get(key):
+                if not self.context.run["format_repairs"].get(key):
                     raise HarnessError("格式修正自动额度尚未耗尽；请普通 resume")
                 try:
                     validate(result, envelope(REVIEW, entry["task_id"], dispatch_id))
@@ -332,7 +332,7 @@ class InvalidOutputRecovery:
                 else:
                     raise HarnessError("原审阅修正结果合法；不能丢弃结果或绕过 hook 门禁")
             else:
-                if key in self.run["pending_format_corrections"]:
+                if key in self.context.run["pending_format_corrections"]:
                     raise HarnessError("格式修正缺少原审阅守卫；不能丢弃原始依据")
                 try:
                     validate_review_semantics(result, proposed_keys)
@@ -341,11 +341,11 @@ class InvalidOutputRecovery:
                 else:
                     raise HarnessError("审阅没有可修正的批准元数据错误；不能绕过格式额度或 hook 门禁")
         source = {**deepcopy(receipt), "artifact_digest": digest}
-        self.run["invalid_repairs"][key] = {"status": "pending", "source": source,
+        self.context.run["invalid_repairs"][key] = {"status": "pending", "source": source,
             "error": validation_error, "proposed_keys": proposed_keys, "mode": mode,
             **({"original": original} if original else {})}
         receipts.pop(key)
         # Original evidence and replacement intent are durable in the same write.
-        self.save()
-        self.event("invalid_output_repair_requested", dispatch_id=dispatch_id, key=key,
+        self.context.save()
+        self.context.event("invalid_output_repair_requested", dispatch_id=dispatch_id, key=key,
                    error=validation_error, artifact=source["artifact"], artifact_digest=digest)

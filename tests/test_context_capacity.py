@@ -5,7 +5,7 @@ import json
 import unittest
 from pathlib import Path
 
-from harness.context import compact_plan
+from harness.context import compact_plan, prompt_json
 from harness.contracts import apply_revision
 from harness.util import HarnessError, dump, read_json
 from test_harness import RepoCase, ROOT
@@ -90,7 +90,7 @@ class FinalContextCapacityTests(RepoCase):
         backend = ScriptedBackend()
         engine = self.engine(backend)
         engine.start("Implement greeting throughout the project", {"tasks": tasks}, pause_after_plan=True)
-        report = engine.final_context_capacity()
+        report = engine.services.packets.final_context_capacity()
         self.assertEqual(report["status"], "projected_overflow")
         self.assertLess(report["required_chars"], report["budget_chars"])
         self.assertGreater(report["projected_chars"], report["budget_chars"])
@@ -98,7 +98,7 @@ class FinalContextCapacityTests(RepoCase):
         self.assertEqual(engine.run["total_attempts"], 0)
         self.assertEqual(engine.run["accepted"], {})
         self.config.data["runtime"]["context_chars"] = report["projected_chars"]
-        self.assertEqual(engine.final_context_capacity()["status"], "fits")
+        self.assertEqual(engine.services.packets.final_context_capacity()["status"], "fits")
 
     def test_required_overflow_saves_plan_before_workers_and_resumes_with_larger_budget(self):
         plan = self.plan()
@@ -153,19 +153,19 @@ class FinalContextCapacityTests(RepoCase):
         engine.start("Implement greeting", self.plan(), pause_after_plan=True)
         tasks = copy.deepcopy(engine.run["tasks"])
         engine.run.update(tasks=[], original_tasks=[])
-        report = engine.final_context_capacity(tasks)
-        explicit = engine.final_context_capacity(tasks, tasks)
+        report = engine.services.packets.final_context_capacity(tasks)
+        explicit = engine.services.packets.final_context_capacity(tasks, tasks)
         self.assertEqual(report, explicit)
         self.config.data["runtime"]["context_chars"] = report["required_chars"] - 1
-        self.assertEqual(engine.final_context_capacity(tasks)["status"], "required_overflow")
+        self.assertEqual(engine.services.packets.final_context_capacity(tasks)["status"], "required_overflow")
         self.assertEqual(engine.run["dispatches"], [])
 
     def test_projection_includes_verification_commands_and_bounded_output(self):
         engine = self.engine()
         engine.start("Implement greeting", self.plan(), pause_after_plan=True)
-        first = engine.final_context_capacity()
+        first = engine.services.packets.final_context_capacity()
         self.config.data["verification"]["commands"].append(["python3", "check.py", "x" * 1000])
-        second = engine.final_context_capacity()
+        second = engine.services.packets.final_context_capacity()
         self.assertGreater(second["required_chars"], first["required_chars"] + 1000)
         self.assertGreater(second["projected_chars"] - first["projected_chars"],
                            second["required_chars"] - first["required_chars"] + 500)
@@ -214,12 +214,12 @@ class FinalContextCapacityTests(RepoCase):
         self.assertEqual(packet["tasks_delta"]["updates"], [])
         self.assertEqual(packet["original_tasks"], plan["tasks"])
         final = final_inputs[-1]
-        self.assertLessEqual(len(dump(final)), self.config.data["runtime"]["context_chars"])
+        self.assertLessEqual(len(prompt_json(final)), self.config.data["runtime"]["context_chars"])
         duplicated = copy.deepcopy(final)
         duplicated["packet"]["tasks"] = reconstruct(packet)
         for key in ("tasks_base_ref", "tasks_delta", "tasks_reconstruction"):
             duplicated["packet"].pop(key)
-        self.assertGreater(len(dump(duplicated)), self.config.data["runtime"]["context_chars"])
+        self.assertGreater(len(prompt_json(duplicated)), self.config.data["runtime"]["context_chars"])
 
 
 if __name__ == "__main__":

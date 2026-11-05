@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from types import SimpleNamespace
 
 from harness.environment import EnvironmentRecovery
 from harness.recovery import snapshot_digest
@@ -19,26 +20,26 @@ class EnvironmentProjectionTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.env = Projection()
-        self.env.directory = Path(self.temp.name).resolve()
-        self.env.run = {'id': 'run', 'schema_version': 10, 'environment_updates': [], 'environment_checks': []}
+        self.env = Projection(SimpleNamespace())
+        self.env.context.directory = Path(self.temp.name).resolve()
+        self.env.context.run = {'id': 'run', 'schema_version': 13, 'environment_updates': [], 'environment_checks': []}
 
     def add(self, task, summary, checks=None, passed=True):
         checks = checks or []
         update = dict(schema_version=1, task_id=task, blocker_dispatch_id='dispatch', summary=summary, checks=checks)
         digest = snapshot_digest({'run_id': 'run', 'update': update})
-        record = dict(update, id='env_' + digest, sequence=len(self.env.run['environment_updates']) + 1,
+        record = dict(update, id='env_' + digest, sequence=len(self.env.context.run['environment_updates']) + 1,
                       source={}, update_digest=digest)
-        artifact = self.env.directory / (record['id'] + '.json')
+        artifact = self.env.context.directory / (record['id'] + '.json')
         write_json(artifact, record)
         row = dict(record, artifact=str(artifact), artifact_digest=hashlib.sha256(artifact.read_bytes()).hexdigest())
-        self.env.run['environment_updates'].append(row)
+        self.env.context.run['environment_updates'].append(row)
         if checks:
             report = dict(update_id=record['id'], task_id=task, observed_at=1, passed=passed,
                           results=[dict(check=check, passed=passed) for check in checks], limitation='read only')
-            path = self.env.directory / ('checks-' + str(record['sequence']) + '.json')
+            path = self.env.context.directory / ('checks-' + str(record['sequence']) + '.json')
             write_json(path, report)
-            self.env.run['environment_checks'].append(dict(update_id=record['id'], task_id=task, passed=passed,
+            self.env.context.run['environment_checks'].append(dict(update_id=record['id'], task_id=task, passed=passed,
                 artifact=str(path), artifact_digest=hashlib.sha256(path.read_bytes()).hexdigest()))
         return row
 
@@ -81,7 +82,7 @@ class EnvironmentProjectionTests(unittest.TestCase):
     def test_omitted_update_and_old_report_tampering_fail_closed(self):
         first = self.add('a', 'Old facts', [dict(kind='executable', name='python3')])
         self.add('a', 'New facts')
-        for row in (first, self.env.run['environment_checks'][0]):
+        for row in (first, self.env.context.run['environment_checks'][0]):
             path = Path(row['artifact'])
             original = path.read_bytes()
             path.write_bytes(original + b' ')
@@ -95,12 +96,12 @@ class EnvironmentProjectionTests(unittest.TestCase):
         first = self.env.environment_packet({}, task_id='a')
         old_index = first['environment_index']
         old_raw = Path(old_index['artifact']).read_bytes()
-        original = dict(self.env.run['environment_checks'][0])
+        original = dict(self.env.context.run['environment_checks'][0])
         report = json.loads(Path(original['artifact']).read_bytes())
         for i in range(100):
-            path = self.env.directory / f'repeated-{i}.json'
+            path = self.env.context.directory / f'repeated-{i}.json'
             write_json(path, dict(report, observed_at=i + 2))
-            self.env.run['environment_checks'].append(dict(original, artifact=str(path),
+            self.env.context.run['environment_checks'].append(dict(original, artifact=str(path),
                 artifact_digest=hashlib.sha256(path.read_bytes()).hexdigest()))
         packet = self.env.environment_packet({}, task_id='a')
         self.assertEqual(len(packet['environment_check_history']), 1)
@@ -112,7 +113,7 @@ class EnvironmentProjectionTests(unittest.TestCase):
         self.assertEqual(len(index['checks']), 102)
         self.assertEqual(Path(old_index['artifact']).read_bytes(), old_raw)
         # Recovery validates reports absent from the current task and latest view.
-        for row in (original, self.env.run['environment_checks'][1]):
+        for row in (original, self.env.context.run['environment_checks'][1]):
             path = Path(row['artifact'])
             raw = path.read_bytes()
             path.write_bytes(raw + b' ')

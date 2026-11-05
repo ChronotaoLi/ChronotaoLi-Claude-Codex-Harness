@@ -104,7 +104,7 @@ engine.start("Implement greet", read_json(root / "examples/plan.json"))
                     # different fixture command from this test's configuration.
                     resumed.load_run(run["id"])
                     with self.assertRaisesRegex(HarnessError, "无法确认"):
-                        resumed.ensure_exited()
+                        resumed.context.ensure_exited()
                     with self.assertRaisesRegex(HarnessError, "无法确认"):
                         cleanup_verification(self.repo, run["id"], remove=True)
                 finally:
@@ -143,6 +143,10 @@ engine.start("Implement greet", read_json(root / "examples/plan.json"))
                     self.assertEqual(entry["process_state"], "starting")
                     self.assertIsNone(entry["pgid"])
                     self.assertFalse(entry["exit_confirmed"])
+                    self.assertEqual(entry["process_outcome"]["startup_state"], "starting")
+                    self.assertFalse(entry["process_outcome"]["started"])
+                    self.assertFalse(entry["process_outcome"]["exit_confirmed"])
+                    self.assertFalse(entry["process_outcome"]["evidence_complete"])
                     with self.assertRaisesRegex(HarnessError, "无法确认"):
                         self.engine().resume(run["id"])
                     with self.assertRaisesRegex(HarnessError, "无法确认"):

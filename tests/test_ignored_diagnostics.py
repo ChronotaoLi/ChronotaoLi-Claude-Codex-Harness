@@ -21,7 +21,7 @@ class IgnoredDiagnosticRecoveryTests(RepoCase):
 
         backend = ScriptedBackend(create_ignored_helper)
         engine = self.engine(backend)
-        with patch.object(engine, "record_ignored_paths", side_effect=KeyboardInterrupt()):
+        with patch.object(engine.context, "record_ignored_paths", side_effect=KeyboardInterrupt()):
             with self.assertRaises(KeyboardInterrupt):
                 engine.start("Implement greet")
         saved = read_json(engine.directory / "state.json")
@@ -50,7 +50,7 @@ class IgnoredDiagnosticRecoveryTests(RepoCase):
                 raise OSError("baseline artifact unavailable")
             return write_json(path, value)
 
-        with patch("harness.engine.write_json", side_effect=fail_baseline):
+        with patch("harness.run_context.write_json", side_effect=fail_baseline):
             with self.assertRaisesRegex(OSError, "baseline artifact unavailable"):
                 engine.start("Implement greet")
         saved = read_json(engine.directory / "state.json")

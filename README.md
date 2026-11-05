@@ -79,6 +79,10 @@ python3 -m harness --config /absolute/path/harness.toml --repo /absolute/path/to
 
 模型计划的重复／超限声明保留结果并停止，普通恢复不重抽计划。显式修正与旧版兼容边界见[计划范围与命令前置条件](docs/recovery.md#计划范围与命令前置条件)及[阻塞出口](docs/recovery.md#阻塞状态与操作者出口)。
 
+任务可另声明 `self_checks`（最多 32 条精确 argv）与 `evidence_requirements`（`id`、从 0 起的 `acceptance_index`、`kind`、仓库相对 `path`）。证据类型为 `static`、`simulation`、`host_integration` 或 `device`。角色收到 `verification_plan`，区分 worker 聚焦自检、全部正式任务门禁与最终门禁；自检不授权，也不替代正式验证。worker 无需默认重复全套门禁，仅在有明确诊断理由时重复。必需文件和修复声明先作来源／候选绑定预检，内容正确性仍由独立审阅核验。
+
+worker 可用结构化续作请求正常交还控制权，等待精确命令授权或单次派发超时调整；满足条件后以全新派发继续原候选，累计调用和任务预算保留。`resume RUN --execution-guidance FILE` 可在安全待处理任务边界登记绑定来源与候选的操作约束；指导不授予命令权限。格式与适用边界见[续作与操作指导](docs/recovery.md#续作与操作指导)。
+
 默认连续执行。需要先检查计划或分步执行时：
 
 ```bash
@@ -164,7 +168,7 @@ python3 -m harness --repo /path/to/project cleanup-run RUN --remove
 
 `cleanup-run RUN` 预览已完成或已放弃 run 的工作树清理，`--remove` 才执行。它保留终态、分支和运行证据，要求原分支仍指向检查点、所有派发与命令子进程已确认退出、工作树无任何未保存文件。清理意图和完成记录保存在 `worktree-cleanup.json`，支持删除后记账中断的重试。显式 `--confirm-exited DISPATCH_ID` 会记录退出确认；普通预览不生成清理记录。需要删除分支时，先完成工作树清理，再由操作者核对集成结果并处理分支。
 
-新台账版本为 11；未完成的 8／9／10 经预检后升级并保留预算与证据，7 及更早只能查看、不能直接恢复执行。已完成 run 的普通恢复返回保存结果；终态选项限制见[终态与版本兼容](docs/recovery.md#终态与版本兼容)。
+新台账版本为 13；旧版本只保留历史查看与受门禁保护的清理，不升级、不恢复执行。版本 13 已完成 run 的普通恢复返回保存结果；终态选项限制见[终态与版本兼容](docs/recovery.md#终态与版本兼容)。
 
 ## 共用 skills / MCP / hooks
 

@@ -3,7 +3,6 @@ import copy
 import hashlib
 from pathlib import Path
 
-from harness.engine import Engine
 from harness.util import HarnessError
 import test_decision_lifecycle
 from test_harness import RepoCase
@@ -16,25 +15,25 @@ class HandoffProjectionTests(RepoCase):
     response = test_decision_lifecycle.DecisionLifecycleTests.response
 
     def test_targets_are_exact_and_validation_uses_same_projection(self):
-        engine = Engine.__new__(Engine)
-        engine.run = {'tasks': [dict(id='source', title='Source', depends_on=[]),
+        engine = self.engine()
+        engine.run = {'id': 'run_targets', 'tasks': [dict(id='source', title='Source', depends_on=[]),
                                 dict(id='middle', title='Middle', depends_on=['source']),
                                 dict(id='last', title='Last', depends_on=['middle']),
                                 dict(id='other', title='Other', depends_on=[])], 'accepted': {}}
-        self.assertEqual(engine.handoff_targets('source'),
+        self.assertEqual(engine.services.workflow.handoff_targets('source'),
                          [{'id': 'middle', 'title': 'Middle'}, {'id': 'last', 'title': 'Last'}])
         for target in ('middle', 'last'):
-            engine.validate_handoff_requests('source', {'decision_requests': [
+            engine.services.workflow.validate_handoff_requests('source', {'decision_requests': [
                 {'task_id': target, 'question': 'Proceed?'}]})
         engine.run['accepted']['middle'] = {}
-        self.assertEqual(engine.handoff_targets('source'), [{'id': 'last', 'title': 'Last'}])
+        self.assertEqual(engine.services.workflow.handoff_targets('source'), [{'id': 'last', 'title': 'Last'}])
         for target in ('source', 'other', 'missing', 'middle'):
             with self.subTest(target=target), self.assertRaises(HarnessError):
-                engine.validate_handoff_requests('source', {'decision_requests': [
+                engine.services.workflow.validate_handoff_requests('source', {'decision_requests': [
                     {'task_id': target, 'question': 'Proceed?'}]})
-        self.assertEqual(engine.handoff_targets('last'), [])
+        self.assertEqual(engine.services.workflow.handoff_targets('last'), [])
         with self.assertRaises(HarnessError):
-            engine.validate_handoff_requests('last', {'decision_requests': [
+            engine.services.workflow.validate_handoff_requests('last', {'decision_requests': [
                 {'task_id': 'last', 'question': 'Proceed?'}]})
 
     def test_packet_selected_transitive_target_survives_resume_and_blocks_dispatch(self):

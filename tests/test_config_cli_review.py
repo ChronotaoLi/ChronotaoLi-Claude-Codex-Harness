@@ -138,7 +138,7 @@ class ExitConfirmationRecoveryTests(RepoCase):
                     "status": "interrupted", "pgid": 2_000_000_000 + index, "exit_confirmed": False}
                    for index in range(1, count + 1)]
         engine.run["dispatches"].extend(entries)
-        engine.save()
+        engine.context.save()
         return engine, entries
 
     def confirmation_events(self, engine):
@@ -149,7 +149,7 @@ class ExitConfirmationRecoveryTests(RepoCase):
         engine, entries = self.paused_run(count=2)
         selected, other = entries
         backend = ScriptedBackend()
-        with patch("harness.engine.group_alive", return_value=True), \
+        with patch("harness.run_context.group_alive", return_value=True), \
                 patch("harness.util.os.killpg", side_effect=AssertionError("must not signal old groups")), \
                 self.assertRaisesRegex(HarnessError, other["id"]):
             self.engine(backend).resume(engine.run["id"], approve_plan=True,
@@ -174,7 +174,7 @@ class ExitConfirmationRecoveryTests(RepoCase):
         before = state_path.read_bytes(), event_path.read_bytes()
         for action in ("resume", "abandon"):
             backend = ScriptedBackend()
-            with self.subTest(action=action), patch("harness.engine.group_alive") as observe, \
+            with self.subTest(action=action), patch("harness.run_context.group_alive") as observe, \
                     self.assertRaisesRegex(HarnessError, "dispatch_unknown"):
                 getattr(self.engine(backend), action)(engine.run["id"],
                     confirm_exited=[entries[0]["id"], "dispatch_unknown"])
@@ -186,7 +186,7 @@ class ExitConfirmationRecoveryTests(RepoCase):
         engine, entries = self.paused_run()
         old = entries[0]
         backend = ScriptedBackend()
-        with patch("harness.engine.group_alive", side_effect=lambda pgid: pgid == old["pgid"]):
+        with patch("harness.run_context.group_alive", side_effect=lambda pgid: pgid == old["pgid"]):
             with self.assertRaisesRegex(HarnessError, old["id"]):
                 self.engine(backend).resume(engine.run["id"], approve_plan=True)
             with patch("harness.util.os.killpg", wraps=os.killpg) as signal_group:
@@ -204,7 +204,7 @@ class ExitConfirmationRecoveryTests(RepoCase):
 
     def test_abandon_accepts_confirmation_without_signalling_reused_process_group(self):
         engine, entries = self.paused_run()
-        with patch("harness.engine.group_alive", return_value=True), \
+        with patch("harness.run_context.group_alive", return_value=True), \
                 patch("harness.util.os.killpg", side_effect=AssertionError("must not signal old group")):
             result = self.engine().abandon(engine.run["id"], confirm_exited=[entries[0]["id"]])
         self.assertEqual(result["status"], "abandoned")
@@ -220,7 +220,7 @@ class ExitConfirmationRecoveryTests(RepoCase):
         git.git(engine.worktree, "-c", "user.name=Test", "-c", "user.email=test@localhost",
                 "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "Unexpected HEAD")
         backend = ScriptedBackend()
-        with patch("harness.engine.group_alive", return_value=True):
+        with patch("harness.run_context.group_alive", return_value=True):
             with self.assertRaisesRegex(HarnessError, "HEAD"):
                 self.engine(backend).resume(engine.run["id"], approve_plan=True,
                                             confirm_exited=[entries[0]["id"]])
@@ -236,7 +236,7 @@ class ExitConfirmationRecoveryTests(RepoCase):
         unsaved = engine.worktree / "__pycache__" / "uncommitted.bin"
         unsaved.parent.mkdir()
         unsaved.write_bytes(b"unsaved ignored file")
-        with patch("harness.engine.group_alive", return_value=True), \
+        with patch("harness.run_context.group_alive", return_value=True), \
                 self.assertRaises(HarnessError):
             self.engine().abandon(engine.run["id"], remove_worktree=True,
                                   confirm_exited=[entries[0]["id"]])

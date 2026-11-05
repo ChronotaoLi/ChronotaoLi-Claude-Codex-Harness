@@ -73,7 +73,7 @@ class DispatchAccountingTests(RepoCase):
                 raise HarnessError("candidate snapshot unavailable")
             return original_snapshot(path, **kwargs)
 
-        with patch("harness.engine.git.snapshot", side_effect=unreadable_candidate):
+        with patch("harness.git.snapshot", side_effect=unreadable_candidate):
             with self.assertRaisesRegex(HarnessError, "snapshot unavailable"):
                 engine.start("Implement greet", self.plan())
         saved = read_json(engine.directory / "state.json")

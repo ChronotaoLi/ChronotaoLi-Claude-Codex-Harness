@@ -32,31 +32,29 @@ class InvalidReviewRejection(HarnessError):
 
 class ResultReceipts(RuntimeService):
     def record_receipt_error(self, receipt, error):
-        runtime = self.runtime
         if receipt is None:
             return
-        entry = next(d for d in runtime.run["dispatches"] if d["id"] == receipt["dispatch_id"])
+        entry = next(d for d in self.context.run["dispatches"] if d["id"] == receipt["dispatch_id"])
         entry.update(status="failed", error=str(error))
-        runtime.run["last_runtime_error"] = {"role": entry["role"], "kind": entry["kind"],
+        self.context.run["last_runtime_error"] = {"role": entry["role"], "kind": entry["kind"],
             "task_id": entry["task_id"], "error": str(error), "artifact": str(Path(receipt["artifact"]).parent)}
-        runtime.save()
+        self.context.save()
 
     def finish_commander_receipt(self, key):
         """Replay the original request's result through validation and hook gates."""
-        runtime = self.runtime
-        runtime.validate_invalid_repair_source(key)
-        receipt = runtime.run["commander_receipts"][key]
-        entry = next(d for d in runtime.run["dispatches"] if d["id"] == receipt["dispatch_id"])
+        self.services.recovery.validate_invalid_repair_source(key)
+        receipt = self.context.run["commander_receipts"][key]
+        entry = next(d for d in self.context.run["dispatches"] if d["id"] == receipt["dispatch_id"])
         if key != f"{entry['role']}:{entry['kind']}:{entry['task_id']}" or entry["role"] != "commander":
             raise HarnessError("指挥结果的派发身份与接收记录不符")
         if snapshot_digest(receipt["request"]) != receipt["request_digest"]:
             raise HarnessError("指挥原始请求已改变；保留证据，禁止重新抽取结论")
-        if entry["kind"] == "replan" and receipt["request_id"] != runtime.run["pending_replan"]["request_id"]:
+        if entry["kind"] == "replan" and receipt["request_id"] != self.context.run["pending_replan"]["request_id"]:
             raise HarnessError("指挥结果不属于当前再规划请求")
         artifact = Path(receipt["artifact"])
-        raw, _ = read_bound_bytes(receipt, "指挥", bind=runtime.save)
-        if (git.head(runtime.worktree, binding=runtime.run["worktree_binding"]) != runtime.run["expected_head"]
-                or snapshot_digest(runtime.snapshot()) != receipt["snapshot_digest"]):
+        raw, _ = read_bound_bytes(receipt, "指挥", bind=self.context.save)
+        if (git.head(self.context.worktree, binding=self.context.run["worktree_binding"]) != self.context.run["expected_head"]
+                or snapshot_digest(self.context.snapshot()) != receipt["snapshot_digest"]):
             raise HarnessError("指挥或 hook 修改了代码/HEAD；原指挥结果不能用于当前快照")
         try:
             result = json.loads(raw)
@@ -64,35 +62,35 @@ class ResultReceipts(RuntimeService):
             raise HarnessError("指挥原始结果不是有效 JSON；保留证据，禁止重新抽取结论") from error
         contract = envelope(receipt["request"]["schema"], entry["task_id"], entry["id"])
         validate_structure(result, contract)
-        previous = runtime.commander_format_source(key, receipt["request"]["packet"])
-        repair = runtime.active_invalid_repair(key)
+        previous = self.services.recovery.commander_format_source(key, receipt["request"]["packet"])
+        repair = self.services.recovery.active_invalid_repair(key)
         if repair and repair.get("mode") == "format":
-            previous = runtime.validate_invalid_repair_source(key)
+            previous = self.services.recovery.validate_invalid_repair_source(key)
         if previous is not None:
             validate_commander_format_correction(entry["kind"], previous, result)
         payload = {k: v for k, v in result.items() if k not in ("task_id", "dispatch_id")}
         if entry["kind"] == "plan":
-            runtime.validate_tasks(payload)
+            self.services.planning.validate_tasks(payload)
         elif entry["kind"] == "replan":
-            tasks = apply_revision(runtime.run["tasks"], payload, runtime.run["accepted"],
-                                   runtime.config.data["runtime"]["max_tasks"],
-                                   additional_allowed_paths=runtime.run.get("approved_scope", []))
-            runtime.validate_tasks({"tasks": tasks})
+            tasks = apply_revision(self.context.run["tasks"], payload, self.context.run["accepted"],
+                                   self.context.config.data["runtime"]["max_tasks"],
+                                   additional_allowed_paths=self.context.run.get("approved_scope", []))
+            self.services.planning.validate_tasks({"tasks": tasks})
         validate(result, contract)
         if not receipt.get("hook_completed"):
             receipt["hook_attempts"] = receipt.get("hook_attempts", 0) + 1
-            runtime.save()
-            runtime.emit_hook("post_agent", {**entry, "status": "completed", "result": result},
+            self.context.save()
+            self.context.emit_hook("post_agent", {**entry, "status": "completed", "result": result},
                             artifact.parent / f"post-agent-{receipt['hook_attempts']}")
-            if (git.head(runtime.worktree, binding=runtime.run["worktree_binding"]) != runtime.run["expected_head"]
-                    or snapshot_digest(runtime.snapshot()) != receipt["snapshot_digest"]):
+            if (git.head(self.context.worktree, binding=self.context.run["worktree_binding"]) != self.context.run["expected_head"]
+                    or snapshot_digest(self.context.snapshot()) != receipt["snapshot_digest"]):
                 raise HarnessError("commander hook 修改了代码/HEAD；已停止，保留现场")
             receipt["hook_completed"] = True
-        runtime.validate_invalid_repair_source(key)
-        runtime.commander_format_source(key, receipt["request"]["packet"])
+        self.services.recovery.validate_invalid_repair_source(key)
+        self.services.recovery.commander_format_source(key, receipt["request"]["packet"])
         entry["status"] = "completed"
         entry.pop("error", None)
-        runtime.save()
+        self.context.save()
         return payload
 
     @staticmethod
@@ -115,24 +113,23 @@ class ResultReceipts(RuntimeService):
 
     def finish_review_receipt(self, key, schema, packet, previous_review=None):
         """Finish a returned review without treating unvalidated JSON as approval."""
-        runtime = self.runtime
-        receipt = runtime.run["review_receipts"][key]
-        entry = next(d for d in runtime.run["dispatches"] if d["id"] == receipt["dispatch_id"])
+        receipt = self.context.run["review_receipts"][key]
+        entry = next(d for d in self.context.run["dispatches"] if d["id"] == receipt["dispatch_id"])
         artifact = Path(receipt["artifact"])
-        result, digest = read_bound_result(receipt, "审阅", bind=runtime.save)
+        result, digest = read_bound_result(receipt, "审阅", bind=self.context.save)
         if "artifact_digest" not in receipt:
             receipt["artifact_digest"] = digest
-            runtime.save()
+            self.context.save()
         if digest != receipt["artifact_digest"]:
             raise HarnessError("审阅原始结果已改变；保留证据，禁止重新抽取结论")
-        if (git.head(runtime.worktree, binding=runtime.run["worktree_binding"]) != runtime.run["expected_head"]
-                or snapshot_digest(runtime.snapshot()) != receipt["snapshot_digest"]):
+        if (git.head(self.context.worktree, binding=self.context.run["worktree_binding"]) != self.context.run["expected_head"]
+                or snapshot_digest(self.context.snapshot()) != receipt["snapshot_digest"]):
             raise HarnessError("审阅或 hook 修改了代码/HEAD；原审阅结果不能用于当前快照")
         contract = envelope(schema, entry["task_id"], entry["id"])
         validate_structure(result, contract)
-        repair = runtime.active_invalid_repair(key)
+        repair = self.services.recovery.active_invalid_repair(key)
         if repair:
-            original = runtime.validate_invalid_repair_source(key)
+            original = self.services.recovery.validate_invalid_repair_source(key)
             validate_approval_repair(original, result, repair["proposed_keys"])
         rejection = None
         try:
@@ -147,8 +144,8 @@ class ResultReceipts(RuntimeService):
             try:
                 validate_review_correction(previous_review, result)
             except HarnessError:
-                runtime.run["review_corrections"][key]["failed"] = True
-                runtime.save()
+                self.context.run["review_corrections"][key]["failed"] = True
+                self.context.save()
                 raise
         if rejection is None:
             try:
@@ -164,38 +161,37 @@ class ResultReceipts(RuntimeService):
                 except RepairableFormatError as error:
                     rejection = InvalidReviewRejection(result, receipt, error)
                 else:
-                    if not runtime.run["format_repairs"].get(key):
+                    if not self.context.run["format_repairs"].get(key):
                         raise
                     # A prior candidate may have spent the correction budget.
                     # Keep this candidate's original rejection and rework it.
                     rejection = InvalidReviewRejection(result, receipt, format_error)
         if not receipt.get("hook_completed"):
             receipt["hook_attempts"] = receipt.get("hook_attempts", 0) + 1
-            runtime.save()
+            self.context.save()
             logs = artifact.parent / f"post-agent-{receipt['hook_attempts']}"
-            runtime.emit_hook("post_agent", {**entry, "status": "invalid_rejected" if rejection else "completed",
+            self.context.emit_hook("post_agent", {**entry, "status": "invalid_rejected" if rejection else "completed",
                                            "result": result,
                                            **({"validation_error": str(rejection)} if rejection else {})}, logs)
-            if (git.head(runtime.worktree, binding=runtime.run["worktree_binding"]) != runtime.run["expected_head"]
-                    or snapshot_digest(runtime.snapshot()) != receipt["snapshot_digest"]):
+            if (git.head(self.context.worktree, binding=self.context.run["worktree_binding"]) != self.context.run["expected_head"]
+                    or snapshot_digest(self.context.snapshot()) != receipt["snapshot_digest"]):
                 raise HarnessError("reviewer hook 修改了代码；已停止，保留现场")
             receipt["hook_completed"] = True
-        runtime.validate_invalid_repair_source(key)
+        self.services.recovery.validate_invalid_repair_source(key)
         entry["status"] = "invalid_rejected" if rejection else "completed"
         if rejection:
             entry["error"] = str(rejection)
         else:
             entry.pop("error", None)
-        runtime.save()
+        self.context.save()
         if rejection:
-            runtime.ensure_exited()
+            self.context.ensure_exited()
             raise rejection
         return {k: v for k, v in result.items() if k not in ("task_id", "dispatch_id")}
 
     def dispatch_review(self, kind, task_id, packet, task=None):
-        runtime = self.runtime
         try:
-            review = runtime.dispatch("reviewer", kind, task_id, REVIEW, packet, task)
+            review = self.services.dispatch.dispatch("reviewer", kind, task_id, REVIEW, packet, task)
         except InvalidReviewRejection as rejection:
             return rejection.review, rejection.diagnostics
         validate_review(review, [p["key"] for p in packet.get("proposed_memories", [])])

@@ -1,4 +1,6 @@
 """Invocation accounting and evidence-bound exclusions from task work budgets."""
+
+from .services import RuntimeService
 import re
 
 from .contracts import WORK, envelope, validate, validate_work_semantics
@@ -17,19 +19,19 @@ def work_attempts(run):
     return attempts
 
 
-class AttemptAccounting:
+class AttemptAccounting(RuntimeService):
     def task_budget_used(self, task_id):
-        return work_attempts(self.run).get(task_id, 0)
+        return work_attempts(self.context.run).get(task_id, 0)
 
     def validate_attempt_accounting(self):
-        policy = self.run.get("attempt_budget_policy", "all_invocations")
+        policy = self.context.run["attempt_budget_policy"]
         if policy not in ("all_invocations", "work"):
             raise HarnessError("未知任务尝试计数策略；保留台账")
-        attempts = self.run["attempts"]
+        attempts = self.context.run["attempts"]
         if any(not isinstance(k, str) or type(v) is not int or v < 0 for k, v in attempts.items()):
             raise HarnessError("任务调用计数无效；保留台账")
-        tasks = {task["id"] for task in self.run["tasks"]}
-        for entry in self.run["dispatches"]:
+        tasks = {task["id"] for task in self.context.run["tasks"]}
+        for entry in self.context.run["dispatches"]:
             if "attempt_exemption" not in entry:
                 continue
             exemption = entry["attempt_exemption"]
@@ -42,7 +44,7 @@ class AttemptAccounting:
                     or exemption.get("blocker_kind") not in ("environment", "operator")
                     or not isinstance(exemption.get("artifact_digest"), str)
                     or not re.fullmatch(r"[0-9a-f]{64}", exemption["artifact_digest"])
-                    or exemption.get("artifact") != str(self.directory / "dispatches" / dispatch_id / "returned-result.json")):
+                    or exemption.get("artifact") != str(self.context.directory / "dispatches" / dispatch_id / "returned-result.json")):
                 raise HarnessError("任务尝试豁免来源无效；保留台账")
             result, _ = read_bound_result(exemption, "任务尝试豁免")
             validate(result, envelope(WORK, task_id, dispatch_id))
@@ -50,17 +52,17 @@ class AttemptAccounting:
             if (result["status"] != "blocked" or result["blocker_kind"] != exemption["blocker_kind"]
                     or entry.get("worker_outcome") != exemption["blocker_kind"] + "_blocked"):
                 raise HarnessError("任务尝试豁免与原始阻断结果不符；保留台账")
-        if any(value < 0 for value in work_attempts(self.run).values()):
+        if any(value < 0 for value in work_attempts(self.context.run).values()):
             raise HarnessError("任务尝试豁免超过实际调用次数；保留台账")
 
     def record_attempt_exemption(self, entry, result, source):
         """Only a fully validated, durably retained wait may spare the task budget.
 
         Caller saves this with the blocked feedback. Crashes before that boundary
-        conservatively retain the invocation's charge. Historical runs keep their
-        original policy and no old counters or results are retroactively rewritten.
+        conservatively retain the invocation's charge. Neither counters nor
+        previous results are retroactively rewritten.
         """
-        if (self.run.get("attempt_budget_policy") != "work" or result["status"] != "blocked"
+        if (self.context.run.get("attempt_budget_policy") != "work" or result["status"] != "blocked"
                 or result["blocker_kind"] not in ("environment", "operator")):
             return
         entry["attempt_exemption"] = {

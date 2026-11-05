@@ -27,28 +27,28 @@ class DecisionCapacityTests(RepoCase):
         engine = self.engine(backend)
         with self.assertRaises(HarnessError):
             engine.start('Implement greet', read_json(ROOT / 'examples' / 'plan.json'))
-        before = engine.final_context_capacity()
+        before = engine.services.packets.final_context_capacity()
         path = self.answer(engine)
-        engine.record_operator_decision(engine.prepare_operator_decision(path))
-        after = engine.final_context_capacity()
+        engine.services.decisions.record_operator_decision(engine.services.decisions.prepare_operator_decision(path))
+        after = engine.services.packets.final_context_capacity()
         self.assertEqual(after['required_chars'], before['required_chars'])
         self.assertGreater(after['projected_chars'], before['projected_chars'])
         original_budget = self.config.data['runtime']['context_chars']
         self.config.data['runtime']['context_chars'] = after['required_chars'] + 1
         output = io.StringIO()
         with redirect_stderr(output):
-            engine.preflight_final_context()
+            engine.services.packets.preflight_final_context()
         self.assertEqual(engine.run['context_capacity']['status'], 'projected_overflow')
         self.assertEqual(len(backend.calls), 1)
         self.assertEqual(engine.run['accepted'], {})
         self.config.data['runtime']['context_chars'] = original_budget
         resumed = self.engine(backend)
         counts = []
-        preflight = resumed.preflight_final_context
+        preflight = resumed.services.packets.preflight_final_context
         def observe(*args, **kwargs):
             counts.append(len(backend.calls))
             return preflight(*args, **kwargs)
-        with patch.object(resumed, 'preflight_final_context', side_effect=observe):
+        with patch.object(resumed.services.packets, 'preflight_final_context', side_effect=observe):
             result = resumed.resume(engine.run['id'], operator_decision=path)
         self.assertEqual(counts, [1])
         self.assertEqual(result['status'], 'completed')
@@ -84,9 +84,9 @@ class DecisionCapacityTests(RepoCase):
             pending.resume(engine.run['id'], operator_decision=self.answer(engine))
         accepted = copy.deepcopy(pending.run['accepted'])
         self.assertEqual(set(accepted), {'greet'})
-        report = pending.final_context_capacity()
+        report = pending.services.packets.final_context_capacity()
         self.assertNotEqual(report['status'], 'required_overflow')
-        projected = pending.progress_packet({}, kind='final_review', task_id='final')
+        projected = pending.services.progress.progress_packet({}, kind='final_review', task_id='final')
         self.assertEqual(projected['task_checkpoints'], [])
         self.assertEqual(projected['checkpoint_index']['count'], 14)
         self.assertEqual(pending.run['accepted'], accepted)

@@ -221,7 +221,7 @@ class CommandRequirementsTests(RepoCase):
             if event == 'pre_agent' and payload.get('role') == 'worker':
                 raise HarnessError('worker preparation failed')
 
-        with patch.object(engine, 'emit_hook', side_effect=fail_worker), self.assertRaises(HarnessError):
+        with patch.object(engine.context, 'emit_hook', side_effect=fail_worker), self.assertRaises(HarnessError):
             engine.start('Implement greet', plan)
         saved = self.saved(engine)
         directive = saved['pending_directive']['directive']
@@ -258,7 +258,7 @@ class CommandRequirementsTests(RepoCase):
             if event == 'pre_agent':
                 raise HarnessError('prepare failed')
 
-        with patch.object(engine, 'emit_hook', side_effect=fail_preparation):
+        with patch.object(engine.context, 'emit_hook', side_effect=fail_preparation):
             with self.assertRaises(HarnessError):
                 engine.start('Implement greet', self.plan([self.command]))
         self.assertEqual(backend.calls, [])
@@ -267,7 +267,7 @@ class CommandRequirementsTests(RepoCase):
         # authorize a worker if its current execution grants are absent.
         self.config.data['permissions']['worker_commands'] = []
         with self.assertRaises(HarnessError):
-            engine.dispatch_once('worker', 'implement', 'greet', WORK, {}, task=engine.run['tasks'][0])
+            engine.services.dispatch.dispatch_once('worker', 'implement', 'greet', WORK, {}, task=engine.run['tasks'][0])
         for key in ('attempts', 'total_attempts', 'agent_dispatches'):
             self.assertEqual(engine.run[key], before[key])
         self.assertEqual(backend.calls, [])

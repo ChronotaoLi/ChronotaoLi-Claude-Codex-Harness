@@ -210,7 +210,7 @@ class ReviewCorrectionRecoveryTests(RepoCase):
         guard = {field: receipt[field] for field in ("artifact", "artifact_digest", "snapshot_digest")}
         guard.update(error="response.summary: string length exceeds permitted bounds", exhausted=True)
         engine.run["review_corrections"][key] = guard
-        engine.save()
+        engine.context.save()
         calls = copy.deepcopy(backend.calls)
         for options in ({}, {"repair_invalid": receipt["dispatch_id"]}):
             resumed = self.engine(backend)

@@ -218,7 +218,7 @@ class InvalidReviewRecoveryTests(RepoCase):
         engine = self.engine(backend)
         engine.start("Implement greet", self.plan(), pause_after_plan=True)
         engine.run["schema_version"] = 5
-        engine.save()
+        engine.context.save()
         with self.assertRaisesRegex(HarnessError, "旧 run"):
             self.engine(backend).resume(engine.run["id"], approve_plan=True)
         self.assertEqual(backend.calls, [])

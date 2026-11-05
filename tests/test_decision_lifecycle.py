@@ -93,10 +93,10 @@ class DecisionLifecycleTests(RepoCase):
 
     def test_batch_save_failure_rolls_back_memory_and_restart_recovers(self):
         engine, backend, paths = self.batch_handoff()
-        values, records = engine.prepare_operator_decisions(paths)
-        with patch.object(engine, 'save', side_effect=OSError('disk unavailable')):
+        values, records = engine.services.decisions.prepare_operator_decisions(paths)
+        with patch.object(engine.context, 'save', side_effect=OSError('disk unavailable')):
             with self.assertRaises(OSError):
-                engine.record_operator_decisions(records)
+                engine.services.decisions.record_operator_decisions(records)
         self.assertEqual(engine.run['operator_decisions'], [])
         self.assertEqual(self.saved(engine)['operator_decisions'], [])
         result = self.engine(backend).resume(engine.run['id'], operator_decision=paths)
@@ -106,7 +106,7 @@ class DecisionLifecycleTests(RepoCase):
     def test_batch_interrupted_prewrite_has_no_partial_ledger_and_recovers(self):
         engine, backend, paths = self.batch_handoff()
         resumed = self.engine(backend)
-        original = resumed._decision_artifact
+        original = resumed.services.decisions._decision_artifact
         count = 0
         def interrupt(record, category):
             nonlocal count
@@ -115,7 +115,7 @@ class DecisionLifecycleTests(RepoCase):
                 raise KeyboardInterrupt()
             return original(record, category)
         calls = len(backend.calls)
-        with patch.object(resumed, '_decision_artifact', side_effect=interrupt):
+        with patch.object(resumed.services.decisions, '_decision_artifact', side_effect=interrupt):
             with self.assertRaises(KeyboardInterrupt):
                 resumed.resume(engine.run['id'], operator_decision=paths)
         self.assertEqual(self.saved(engine)['operator_decisions'], [])
@@ -290,7 +290,7 @@ class DecisionLifecycleTests(RepoCase):
     def test_decision_cannot_bypass_pending_review(self):
         engine, backend = self.blocked()
         resumed = self.engine(backend)
-        with patch.object(resumed, 'dispatch_review', side_effect=HarnessError('review offline')):
+        with patch.object(resumed.services.receipts, 'dispatch_review', side_effect=HarnessError('review offline')):
             with self.assertRaises(HarnessError):
                 resumed.resume(engine.run['id'], operator_decision=self.response(engine))
         saved = self.saved(engine)
@@ -322,14 +322,14 @@ class DecisionLifecycleTests(RepoCase):
 
     def test_handoff_registration_waits_for_post_accept_completion(self):
         engine, backend, plan = self.handoff()
-        finish = engine.finish_post_accept
+        finish = engine.services.tasks.finish_post_accept
 
         def unavailable_after_accept():
             if engine.run.get('pending_post_accept'):
                 raise HarnessError('post accept unavailable')
             return finish()
 
-        with patch.object(engine, 'finish_post_accept', side_effect=unavailable_after_accept):
+        with patch.object(engine.services.tasks, 'finish_post_accept', side_effect=unavailable_after_accept):
             with self.assertRaises(HarnessError):
                 engine.start('Implement source and dependent', plan)
         state = self.saved(engine)

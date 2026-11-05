@@ -292,7 +292,7 @@ class CommanderReceiptTests(RepoCase):
     def test_reverify_cannot_cancel_returned_commander_stop(self):
         backend = ScriptedBackend()
         engine = self.engine(backend)
-        verify = engine.verify
+        verify = engine.services.verification.verify
         emit = engine.hooks.emit
 
         def failed_final(*args, **kwargs):
@@ -306,7 +306,7 @@ class CommanderReceiptTests(RepoCase):
                 raise HarnessError("stop hook unavailable")
             return emit(event, payload, logs)
 
-        with patch.object(engine, "verify", side_effect=failed_final), patch.object(engine.hooks, "emit", side_effect=fail_replan):
+        with patch.object(engine.services.verification, "verify", side_effect=failed_final), patch.object(engine.hooks, "emit", side_effect=fail_replan):
             with self.assertRaisesRegex(HarnessError, "stop hook unavailable"):
                 engine.start("Implement greet", self.plan())
         calls = copy.deepcopy(backend.calls)

@@ -34,6 +34,12 @@ TASK = obj(id=TASK_ID, title=NONBLANK, description=NONBLANK, depends_on=DEPENDEN
 REQUIRED_COMMANDS = {"type": "array", "items": {"type": "array", "items": TEXT, "minItems": 1},
                      "maxItems": 32, "uniqueItems": True}
 TASK["properties"]["required_commands"] = REQUIRED_COMMANDS
+TASK["properties"]["self_checks"] = REQUIRED_COMMANDS
+EVIDENCE_KIND = {"type": "string", "enum": ["static", "simulation", "host_integration", "device"]}
+TASK["properties"]["evidence_requirements"] = {
+    "type": "array", "maxItems": 32, "items": obj(
+        id=SAFE_ID, acceptance_index={"type": "integer", "minimum": 0},
+        kind=EVIDENCE_KIND, path={"type": "string", "minLength": 1, "maxLength": 4096})}
 PLAN = obj(tasks={"type": "array", "items": TASK, "minItems": 1})
 TASK_UPDATE = obj(id=TASK_ID, description=NONBLANK, add_depends_on=DEPENDENCIES)
 REPLAN = obj(action={"type": "string", "enum": ["revise", "stop"]},
@@ -41,7 +47,7 @@ REPLAN = obj(action={"type": "string", "enum": ["revise", "stop"]},
              updates={"type": "array", "items": TASK_UPDATE})
 WORK = obj(status={"type": "string", "enum": ["completed", "blocked"]},
            summary=DETAIL, evidence=EVIDENCE, blockers=EVIDENCE,
-           blocker_kind={"type": "string", "enum": ["none", "task", "environment", "operator"]},
+           blocker_kind={"type": "string", "enum": ["none", "task", "environment", "operator", "continuation"]},
            proposed_memories=PROPOSALS)
 FILE_EVIDENCE = obj(path={"type": "string", "minLength": 1, "maxLength": 4096},
                     sha256={"type": "string", "pattern": r"^[0-9a-f]{64}$"})
@@ -54,7 +60,16 @@ CHECKPOINT = obj(id=SAFE_ID, summary=DETAIL,
 # A handoff question gates another task; it is not a blocker of this deliverable.
 WORK["properties"].update(
     checkpoints={"type": "array", "items": CHECKPOINT, "maxItems": 16},
-    decision_requests={"type": "array", "items": obj(id=SAFE_ID, task_id=TASK_ID, question=DETAIL), "maxItems": 16})
+    decision_requests={"type": "array", "items": obj(id=SAFE_ID, task_id=TASK_ID, question=DETAIL), "maxItems": 16},
+    continuation_request=obj(kind={"type": "string", "enum": ["commands", "budget"]},
+        commands=REQUIRED_COMMANDS,
+        minimum_timeout_seconds={"type": "integer", "minimum": 0, "maximum": 86400}, reason=DETAIL),
+    evidence_files={"type": "array", "maxItems": 32, "items": obj(
+        requirement_id=SAFE_ID, path=FILE_EVIDENCE["properties"]["path"],
+        sha256=FILE_EVIDENCE["properties"]["sha256"], kind=EVIDENCE_KIND)},
+    repair_claims={"type": "array", "maxItems": 60, "items": obj(
+        review_dispatch_id=NONBLANK, finding_id=SAFE_ID, summary=DETAIL,
+        evidence_paths={"type": "array", "items": NONBLANK, "maxItems": 20})})
 FINDING = obj(id=SAFE_ID,
               severity={"type": "string", "enum": ["blocking", "advisory"]},
               category={"type": "string", "enum": ["defect", "evidence", "scope", "preference"]},
@@ -62,6 +77,10 @@ FINDING = obj(id=SAFE_ID,
 REVIEW = obj(verdict={"type": "string", "enum": ["approve", "request_changes"]},
              summary=DETAIL, findings={"type": "array", "items": FINDING, "maxItems": 30},
              approved_memory_keys={"type": "array", "items": SAFE_ID, "maxItems": 8, "uniqueItems": True})
+REVIEW["properties"]["finding_dispositions"] = {
+    "type": "array", "maxItems": 60, "items": obj(
+        review_dispatch_id=NONBLANK, finding_id=SAFE_ID,
+        status={"type": "string", "enum": ["resolved", "open", "not_checked"]}, evidence=EVIDENCE)}
 
 
 def envelope(schema, task_id, dispatch_id):
@@ -172,6 +191,21 @@ def validate_work_semantics(result):
     completed = result["status"] == "completed"
     if completed != (result["blocker_kind"] == "none") or completed != (not result["blockers"]):
         raise HarnessError("worker 状态、blocker_kind 与 blockers 不一致")
+    continuation = result.get("continuation_request")
+    if (result["blocker_kind"] == "continuation") != (continuation is not None):
+        raise HarnessError("续作请求必须使用 blocked/continuation，且必须提供结构化请求")
+    if continuation is not None:
+        validate_commands(continuation["commands"], "continuation_request.commands")
+        if ((continuation["kind"] == "commands" and (not continuation["commands"] or continuation["minimum_timeout_seconds"] != 0))
+                or (continuation["kind"] == "budget" and (continuation["commands"] or continuation["minimum_timeout_seconds"] <= 0))):
+            raise HarnessError("续作请求必须明确缺少的精确命令或所需的派发时间预算")
+    for field in ("repair_claims",):
+        references = [(r["review_dispatch_id"], r["finding_id"]) for r in result.get(field, [])]
+        if len(set(references)) != len(references):
+            raise HarnessError("修复声明不能重复引用同一来源问题")
+    evidence_ids = [item["requirement_id"] for item in result.get("evidence_files", [])]
+    if len(set(evidence_ids)) != len(evidence_ids):
+        raise HarnessError("任务证据声明 ID 不得重复")
     keys = [proposal["key"] for proposal in result["proposed_memories"]]
     if len(keys) != len(set(keys)):
         raise HarnessError("记忆提案 key 必须唯一")
@@ -204,6 +238,11 @@ def validate_review_semantics(result, proposed_keys=()):
                 raise HarnessError("阻断 finding 必须有证据，且不能仅为偏好")
     if not set(result["approved_memory_keys"]) <= set(proposed_keys):
         raise HarnessError("审阅批准了不存在的记忆提案")
+    refs = [(r["review_dispatch_id"], r["finding_id"]) for r in result.get("finding_dispositions", [])]
+    if len(set(refs)) != len(refs):
+        raise HarnessError("审阅处置不能重复引用同一来源问题")
+    if any(r["status"] == "resolved" and not r["evidence"] for r in result.get("finding_dispositions", [])):
+        raise HarnessError("解决问题的审阅处置必须包含核验依据")
 
 
 def validate_review(result, proposed_keys=()):
@@ -229,7 +268,8 @@ def validate_review_correction(previous, current):
     """
     if (current["verdict"] != previous["verdict"]
             or set(current["approved_memory_keys"]) != set(previous["approved_memory_keys"])
-            or len(current["findings"]) != len(previous["findings"])):
+            or len(current["findings"]) != len(previous["findings"])
+            or current.get("finding_dispositions", []) != previous.get("finding_dispositions", [])):
         raise HarnessError("审阅格式修复不得改变结论、记忆批准或 findings 数量")
     fields = ("severity", "category", "location", "message", "evidence")
     for old, new in zip(previous["findings"], current["findings"]):
@@ -250,7 +290,8 @@ def validate_approval_repair(previous, current, proposed_keys):
     permitted = set(previous["approved_memory_keys"]) & set(proposed_keys)
     if (not review_approved(previous) or not review_approved(current)
             or set(current["approved_memory_keys"]) != permitted
-            or len(previous["findings"]) != len(current["findings"])):
+            or len(previous["findings"]) != len(current["findings"])
+            or current.get("finding_dispositions", []) != previous.get("finding_dispositions", [])):
         raise HarnessError("显式审阅修正必须保留批准结论、有效记忆批准和全部 findings")
     ids = [finding["id"] for finding in previous["findings"]]
     for old, new in zip(previous["findings"], current["findings"]):
@@ -277,11 +318,14 @@ def task_directive(task_ids):
 
 
 def validate_required_commands(task):
-    commands = task.get("required_commands", [])
-    validate_structure(commands, REQUIRED_COMMANDS, "task.required_commands")
-    validate_commands(commands, "task.required_commands")
-    _validate_format(commands, REQUIRED_COMMANDS, "task.required_commands")
-    return commands
+    result = []
+    for field in ("required_commands", "self_checks"):
+        commands = task.get(field, [])
+        validate_structure(commands, REQUIRED_COMMANDS, "task." + field)
+        validate_commands(commands, "task." + field)
+        _validate_format(commands, REQUIRED_COMMANDS, "task." + field)
+        result.extend(argv for argv in commands if argv not in result)
+    return result
 
 
 def validate_plan(plan, max_tasks=20):
@@ -298,6 +342,18 @@ def validate_plan(plan, max_tasks=20):
             raise HarnessError(f"任务 {task['id']} 的 required_commands 最多 {REQUIRED_COMMANDS['maxItems']} 条")
         if len({tuple(argv) for argv in commands}) != len(commands):
             raise HarnessError(f"任务 {task['id']} 的 required_commands 不得重复")
+        validate_required_commands(task)
+        requirement_ids = set()
+        for requirement in task.get("evidence_requirements", []):
+            path = requirement["path"]
+            parts = PurePosixPath(path).parts
+            if (requirement["id"] in requirement_ids
+                    or not 0 <= requirement["acceptance_index"] < len(task["acceptance"])
+                    or not parts or PurePosixPath(path).is_absolute() or ".." in parts
+                    or path != str(PurePosixPath(path)) or "\\" in path
+                    or any(p in (".git", ".harness", ".codex", ".claude") for p in parts)):
+                raise HarnessError("任务证据要求必须有唯一 ID、有效验收索引和普通相对文件路径")
+            requirement_ids.add(requirement["id"])
         if not re.fullmatch(TASK_ID["pattern"], task["id"]):
             raise HarnessError("任务 ID 只能含字母、数字、下划线和连字符")
         if not task["description"].strip() or not task["title"].strip():
@@ -379,6 +435,9 @@ def validate_revision(current_tasks, proposed_tasks, accepted_ids, max_tasks=20,
             raise HarnessError("再规划不得改变既有验收条件或文件范围")
         if old.get("required_commands", []) != new.get("required_commands", []):
             raise HarnessError("再规划不得改变既有任务的 required_commands")
+        for field in ("self_checks", "evidence_requirements"):
+            if old.get(field, []) != new.get(field, []):
+                raise HarnessError(f"再规划不得改变既有任务的 {field}")
         if not set(old["depends_on"]) <= set(new["depends_on"]):
             raise HarnessError("再规划不得移除既有依赖")
     for ident in proposed.keys() - current.keys():

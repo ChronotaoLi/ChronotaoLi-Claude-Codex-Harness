@@ -1,10 +1,11 @@
 import tempfile
 import unittest
+import json
 from pathlib import Path
 
 from harness.config import Config
-from harness.context import compose
-from harness.util import HarnessError, dump
+from harness.context import compose, prompt_json, compact_checks
+from harness.util import HarnessError
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -49,11 +50,29 @@ class RuntimeBudgetDefaultsTests(unittest.TestCase):
 
 
 class ContextBudgetAccountingTests(unittest.TestCase):
+    def test_compact_verification_keeps_failed_gate_and_retrievable_lifecycle(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            check = {"argv": ["check"], "exit_code": 0, "status": "failed",
+                     "termination_reason": "normal", "exit_confirmed": False,
+                     "evidence_complete": False, "log": str(root / "check-0"),
+                     "process_outcome": {"pid": 42, "cleanup_errors": [{"step": "wait"}],
+                                         "errors": [{"step": "persist"}]}}
+            (root / "results.json").write_text(json.dumps([check]))
+            projected = compact_checks([check])[0]
+            for key in ("exit_code", "status", "termination_reason", "exit_confirmed", "evidence_complete"):
+                self.assertEqual(projected[key], check[key])
+            self.assertEqual(projected["cleanup_errors"], [{"step": "wait"}])
+            self.assertEqual(projected["errors"], [{"step": "persist"}])
+            self.assertEqual(json.loads(Path(projected["details"]).read_text()), [check])
+
     def test_required_packet_at_budget_is_lossless_and_omits_optional_memory(self):
-        required = {"goal": "Preserve full acceptance obligations", "acceptance": ["完整内容"]}
-        core = dump(required)
+        required = {"goal": "Preserve full acceptance obligations", "acceptance": ["完整内容"],
+                    "path": "raw-\udcff", "nested": {"empty": [], "enabled": False}}
+        core = prompt_json(required)
         packet, report = compose(required, [{"id": "optional", "body": "reference"}], len(core))
         self.assertEqual(packet, core)
+        self.assertEqual(json.loads(packet), required)
         self.assertEqual(report["required_chars"], len(core))
         self.assertEqual(report["memory_chars"], 0)
         self.assertEqual(report["used_chars"], len(packet))
@@ -67,16 +86,16 @@ class ContextBudgetAccountingTests(unittest.TestCase):
         full, _ = compose(required, [small], 10000)
         packet, report = compose(required, [large, small], len(full))
         self.assertEqual(packet, full)
-        self.assertIn(dump(small), packet)
-        self.assertNotIn(dump(large), packet)
+        self.assertIn(prompt_json(small), packet)
+        self.assertNotIn(prompt_json(large), packet)
         self.assertEqual(report["memory_ids"], ["small"])
         self.assertEqual(report["omitted_memories"], 1)
-        self.assertEqual(report["required_chars"], len(dump(required)))
-        self.assertEqual(report["memory_chars"], len(packet) - len(dump(required)))
-        self.assertGreater(report["memory_chars"], len(dump(small)))
+        self.assertEqual(report["required_chars"], len(prompt_json(required)))
+        self.assertEqual(report["memory_chars"], len(packet) - len(prompt_json(required)))
+        self.assertGreater(report["memory_chars"], len(prompt_json(small)))
         self.assertEqual(report["used_chars"], report["required_chars"] + report["memory_chars"])
 
     def test_required_overflow_still_fails_even_without_optional_memory(self):
         required = {"acceptance": ["x" * 200]}
         with self.assertRaises(HarnessError):
-            compose(required, [], len(dump(required)) - 1)
+            compose(required, [], len(prompt_json(required)) - 1)

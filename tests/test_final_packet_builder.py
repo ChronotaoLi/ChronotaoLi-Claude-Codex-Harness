@@ -37,7 +37,7 @@ class FinalPacketBuilderTests(RepoCase):
                     return capacity_report(required, projected, budget)
 
                 with patch("harness.packets.capacity_report", side_effect=capture):
-                    engine.final_context_capacity()
+                    engine.services.packets.final_context_capacity()
                 actual = json.loads(kwargs["prompt"].split("\n\nREFERENCE MEMORY")[0])
                 observed.append((actual, *captured[0]))
                 if len(observed) == 1:
@@ -79,7 +79,7 @@ class FinalPacketBuilderTests(RepoCase):
     def test_builder_reads_replaced_run_and_does_not_reuse_plan_or_history(self):
         engine = self.engine()
         engine.start("Initial goal", read_json(ROOT / "examples" / "plan.json"), pause_after_plan=True)
-        builder = engine._packets
+        builder = engine.services.packets
         first = builder.final_review_packet(checks=[], diff_artifact="first.diff", changed_paths=[])
         replacement = copy.deepcopy(engine.run)
         replacement["goal"] = "Replacement goal"
@@ -88,7 +88,9 @@ class FinalPacketBuilderTests(RepoCase):
             {"status": "verification_failed", "artifact": "old-final.json", "verification_failures": []},
             {"status": "running", "artifact": "active-final.json"},
         ]
-        engine.run = replacement
+        engine.run.update(replacement)
+        engine.context.save()
+        engine.run = copy.deepcopy(engine.run)
         second = builder.final_review_packet(checks=[], diff_artifact="second.diff", changed_paths=["AGENTS.md"])
         self.assertEqual(first["goal"], "Initial goal")
         self.assertEqual(first["prior_reviews"], [])

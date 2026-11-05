@@ -8,6 +8,7 @@ from pathlib import Path
 
 from . import git
 from .util import readonly_lock
+from .run_store import RunStore
 from .cleanup import _canonical, _regular_bytes, _registered
 from .path_evidence import validate_dispatch_indexes
 from .util import (HarnessError, append_event, confirm_dispatches_exited,
@@ -42,7 +43,7 @@ def cleanup_run(repo: Path, ident: str, *, remove=False, confirm_exited=(), remo
         _canonical(checkout)
         branch = "harness/" + ident
         common = Path(git.git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir").removesuffix("\n")).resolve()
-        if (not isinstance(run, dict) or run.get("schema_version") not in (7, 8, 9, 10, 11, 12)
+        if (not isinstance(run, dict) or run.get("schema_version") not in (7, 8, 9, 10, 11, 12, 13)
                 or run.get("id") != ident or run.get("repo") != str(repo)
                 or run.get("worktree") != str(checkout) or run.get("branch") != branch
                 or not isinstance(run.get("expected_head"), str)
@@ -63,13 +64,15 @@ def cleanup_run(repo: Path, ident: str, *, remove=False, confirm_exited=(), remo
         validate_command_directories(run["dispatches"], directory)
         validate_dispatch_indexes(directory, run["dispatches"])
         if confirm_exited:
+            store = RunStore(repo / ".harness")
+            store.attach(run)
             events = directory / "events.jsonl"
             _canonical(events)
             if events.exists():
                 _regular_bytes(events)
             confirm_dispatches_exited(run["dispatches"], confirm_exited,
                 audit=lambda event, **fields: append_event(events, ident, event, **fields),
-                save=lambda: write_json(state, run), observe=group_alive)
+                save=store.commit, observe=group_alive)
         if confirm_exited:
             original = _regular_bytes(state)
         elif _regular_bytes(state) != original:

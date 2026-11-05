@@ -37,7 +37,7 @@ class ProcessStdinTests(unittest.TestCase):
             self.assertGreaterEqual(len(progress.getvalue().splitlines()), 2)
             self.assertEqual(len(pgids), 1)
             self.assertFalse(group_alive(pgids[0]))
-            self.assertEqual({path.name for path in root.iterdir()}, {"delayed.stdout", "delayed.stderr"})
+            self.assertEqual({path.name for path in root.iterdir()}, {"delayed.stdout", "delayed.stderr", "delayed.outcome.json"})
 
     def test_empty_input_reaches_eof_and_preserves_exit_code(self):
         script = "import sys; data=sys.stdin.buffer.read(); print(len(data)); sys.exit(7)"
@@ -64,7 +64,7 @@ class ProcessStdinTests(unittest.TestCase):
             self.assertEqual(len(pgids), 1)
             self.assertFalse(group_alive(pgids[0]))
             self.assertEqual({path.name for path in root.iterdir()}, {
-                "interrupted.stdout", "interrupted.stderr",
+                "interrupted.stdout", "interrupted.stderr", "interrupted.outcome.json",
             })
 
 

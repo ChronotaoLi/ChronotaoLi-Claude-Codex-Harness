@@ -1,4 +1,6 @@
 """Durable, task-scoped operator choices, independent of facts and acceptance."""
+
+from .services import RuntimeService
 from copy import deepcopy
 import hashlib
 import json
@@ -32,8 +34,8 @@ def validate_handoff_question(question):
 def decision_question(question, kind):
     """Keep an attributable decision gate even when its question is malformed.
 
-    Valid questions keep their identities. Invalid operator questions and legacy
-    accepted handoffs get a bounded notice; the source remains byte-for-byte
+    Valid questions keep their identities. Invalid operator questions get a
+    bounded notice; the source remains byte-for-byte
     intact and its digest, not the excerpt, binds the operator's answer.
     """
     limit = 80019 if kind == 'worker' else 4000
@@ -85,19 +87,19 @@ def read_decision(path):
         raise HarnessError(f'cannot read operator decision JSON: {error}') from error
 
 
-class DecisionRecovery:
+class DecisionRecovery(RuntimeService):
     def _decision_source(self, request):
         source = request['source']
         if not isinstance(source, dict) or set(source) != {'artifact', 'artifact_digest', 'dispatch_id'}:
             raise HarnessError('decision source fields invalid')
         dispatch_id = source.get('dispatch_id')
-        entries = [d for d in self.run['dispatches'] if d.get('id') == dispatch_id]
+        entries = [d for d in self.context.run['dispatches'] if d.get('id') == dispatch_id]
         if len(entries) != 1:
             raise HarnessError('decision source dispatch unknown')
         entry = entries[0]
         if entry.get('invoked', True) is not True:
             raise HarnessError('decision source model was not invoked')
-        expected = self.directory / 'dispatches' / dispatch_id / 'returned-result.json'
+        expected = self.context.directory / 'dispatches' / dispatch_id / 'returned-result.json'
         if source.get('artifact') != str(expected) or not source.get('artifact_digest'):
             raise HarnessError('decision source reference invalid')
         result, _ = read_bound_result(source, 'decision source ')
@@ -113,13 +115,13 @@ class DecisionRecovery:
                     raise HarnessError('decision request does not match operator blocker')
             else:
                 matches = [r for r in result.get('decision_requests', []) if r.get('id') == request['request_key']]
-                if (result['status'] != 'completed' or request['source_task_id'] not in self.run['accepted']
-                        or self.run['accepted'][request['source_task_id']].get('worker_source') != source
-                        or self.run['accepted'][request['source_task_id']].get('decision_requests') != result.get('decision_requests', [])
+                if (result['status'] != 'completed' or request['source_task_id'] not in self.context.run['accepted']
+                        or self.context.run['accepted'][request['source_task_id']].get('worker_source') != source
+                        or self.context.run['accepted'][request['source_task_id']].get('decision_requests') != result.get('decision_requests', [])
                         or len(matches) != 1 or matches[0].get('task_id') != request['task_id']
                         or decision_question(matches[0].get('question'), 'handoff') != request['question']):
                     raise HarnessError('handoff decision is not bound to accepted worker request')
-                tasks = {t['id']: t for t in self.run['tasks']}
+                tasks = {t['id']: t for t in self.context.run['tasks']}
                 seen, pending = set(), list(tasks[request['task_id']]['depends_on'])
                 while pending:
                     ident = pending.pop()
@@ -143,7 +145,7 @@ class DecisionRecovery:
             ('run_id', 'task_id', 'source_task_id', 'kind', 'source', 'question', 'request_key')})
 
     def _decision_artifact(self, record, category):
-        artifact = self.directory / 'decisions' / (record['id'] + '.json')
+        artifact = self.context.directory / 'decisions' / (record['id'] + '.json')
         if artifact.exists():
             try:
                 old = json.loads(artifact.read_bytes())
@@ -156,7 +158,7 @@ class DecisionRecovery:
             write_json(artifact, record)
         row = {**deepcopy(record), 'artifact': str(artifact),
                'artifact_digest': hashlib.sha256(artifact.read_bytes()).hexdigest()}
-        self.event(category, **{k: v for k, v in row.items() if k != 'run_id'})
+        self.context.event(category, **{k: v for k, v in row.items() if k != 'run_id'})
         return row
 
     def register_decision_request(self, task_id, source_task_id, kind, source, question, request_key=''):
@@ -165,43 +167,40 @@ class DecisionRecovery:
         _text(question, 'question', 80019 if kind == 'worker' else 4000)
         if not isinstance(request_key, str) or len(request_key) > 96 or '\0' in request_key:
             raise HarnessError('decision request key invalid')
-        tasks = {t['id'] for t in self.run['tasks']}
+        tasks = {t['id'] for t in self.context.run['tasks']}
         if task_id not in tasks | {'final'}:
             raise HarnessError('decision target must be an unaccepted task or final')
-        record = dict(run_id=self.run['id'], task_id=task_id, source_task_id=source_task_id,
+        record = dict(run_id=self.context.run['id'], task_id=task_id, source_task_id=source_task_id,
                       kind=kind, source=deepcopy(source), question=question, request_key=request_key)
         self._decision_source(record)
         record['id'] = self._decision_identity(record)
-        for old in self.run.get('decision_requests', []):
+        for old in self.context.run.get('decision_requests', []):
             if old['id'] == record['id']:
                 return deepcopy(old)
-        if task_id in self.run['accepted']:
+        if task_id in self.context.run['accepted']:
             raise HarnessError('decision target already accepted')
         if kind == 'worker':
-            feedback = self.run.get('feedback') or {}
-            if (self.run.get('current_task') != task_id or feedback.get('task_id') != task_id
+            feedback = self.context.run.get('feedback') or {}
+            if (self.context.run.get('current_task') != task_id or feedback.get('task_id') != task_id
                     or feedback.get('worker_artifact') != source['artifact']
                     or feedback.get('worker_artifact_digest') != source['artifact_digest']):
                 raise HarnessError('operator request does not match current worker feedback')
         if kind == 'replan_stop':
-            stopped = self.run.get('replan_stopped') or {}
+            stopped = self.context.run.get('replan_stopped') or {}
             if (stopped.get('target') != task_id or stopped.get('reason') != question
                     or stopped.get('dispatch_id') != source['dispatch_id']):
                 raise HarnessError('operator request does not match stopped replan')
         if kind in ('worker', 'replan_stop'):
-            position = next(i for i, d in enumerate(self.run['dispatches']) if d['id'] == source['dispatch_id'])
-            if any(d.get('invoked', True) for d in self.run['dispatches'][position + 1:]):
+            position = next(i for i, d in enumerate(self.context.run['dispatches']) if d['id'] == source['dispatch_id'])
+            if any(d.get('invoked', True) for d in self.context.run['dispatches'][position + 1:]):
                 raise HarnessError('cannot register stale decision source after model invocation')
-        if self.run.get('status') in ('completed', 'abandoned'):
+        if self.context.run.get('status') in ('completed', 'abandoned'):
             raise HarnessError('terminal run cannot request decisions')
-        record.update(sequence=len(self.run.get('decision_requests', [])) + 1,
-                      dispatch_count=len(self.run['dispatches']), recorded_at=time.time())
+        record.update(sequence=len(self.context.run.get('decision_requests', [])) + 1,
+                      dispatch_count=len(self.context.run['dispatches']), recorded_at=time.time())
         row = self._decision_artifact(record, 'operator_decision_requested')
-        self.run.setdefault('decision_requests', []).append(row)
-        self.run.setdefault('operator_decisions', [])
-        self.run.setdefault('task_checkpoints', [])
-        self.run['schema_version'] = max(self.run['schema_version'], 10)
-        self.save()
+        self.context.run['decision_requests'].append(row)
+        self.context.save()
         return deepcopy(row)
 
     def decision_context(self):
@@ -211,30 +210,30 @@ class DecisionRecovery:
             raise HarnessError('malformed operator decision ledger; preserve evidence') from error
 
     def _decision_context(self):
-        requests, responses = self.run.get('decision_requests', []), self.run.get('operator_decisions', [])
+        requests, responses = self.context.run.get('decision_requests', []), self.context.run.get('operator_decisions', [])
         if not isinstance(requests, list) or not isinstance(responses, list):
             raise HarnessError('decision ledger must contain arrays')
-        if (requests or responses) and self.run['schema_version'] < 10:
-            raise HarnessError('decision ledger requires schema 10')
+        if self.context.run['schema_version'] != 13:
+            raise HarnessError('decision ledger requires schema 13')
         records, ids = [], set()
         for category, rows in (('request', requests), ('response', responses)):
             for sequence, row in enumerate(rows, 1):
                 if not isinstance(row, dict) or not isinstance(row.get('id'), str) or row['id'] in ids:
                     raise HarnessError('decision ledger identity invalid')
                 ids.add(row['id'])
-                if row.get('artifact') != str(self.directory / 'decisions' / (row['id'] + '.json')) or not row.get('artifact_digest'):
+                if row.get('artifact') != str(self.context.directory / 'decisions' / (row['id'] + '.json')) or not row.get('artifact_digest'):
                     raise HarnessError('decision artifact reference invalid')
                 record, _ = read_bound_result(row, 'operator decision ')
                 expected = {k: v for k, v in row.items() if k not in ('artifact', 'artifact_digest')}
                 if record != expected or type(record.get('sequence')) is not int or record.get('sequence') != sequence:
                     raise HarnessError('decision artifact disagrees with ledger')
                 if category == 'request':
-                    if record.get('run_id') != self.run['id'] or record['id'] != self._decision_identity(record):
+                    if record.get('run_id') != self.context.run['id'] or record['id'] != self._decision_identity(record):
                         raise HarnessError('decision request identity invalid')
-                    if record['task_id'] not in {t['id'] for t in self.run['tasks']} | {'final'}:
+                    if record['task_id'] not in {t['id'] for t in self.context.run['tasks']} | {'final'}:
                         raise HarnessError('decision target unknown')
                     count = record.get('dispatch_count')
-                    if type(count) is not int or not 0 <= count <= len(self.run['dispatches']):
+                    if type(count) is not int or not 0 <= count <= len(self.context.run['dispatches']):
                         raise HarnessError('decision dispatch boundary invalid')
                     if not isinstance(record['request_key'], str) or len(record['request_key']) > 96:
                         raise HarnessError('decision request key invalid')
@@ -246,7 +245,7 @@ class DecisionRecovery:
                     request = next((r for r in records if r['id'] == value['request_id']), None)
                     if (request is None or request['task_id'] != value['task_id'] or record['id'] != self._response_id(value)
                             or type(record.get('dispatch_count')) is not int
-                            or not request['dispatch_count'] <= record['dispatch_count'] <= len(self.run['dispatches'])):
+                            or not request['dispatch_count'] <= record['dispatch_count'] <= len(self.context.run['dispatches'])):
                         raise HarnessError('operator response request linkage invalid')
         latest = {r['request_id']: r for r in responses}
         return [{**r, 'response': deepcopy(latest.get(r['id']))} for r in records]
@@ -259,21 +258,21 @@ class DecisionRecovery:
                      and (r['response'] is None or r['response']['decision'] == 'stop')), None)
 
     def _response_id(self, value):
-        return 'decision_' + snapshot_digest({'run_id': self.run['id'], 'response': value})
+        return 'decision_' + snapshot_digest({'run_id': self.context.run['id'], 'response': value})
 
     def _prepare_decision(self, value):
         records = self.decision_context()
-        if self.run.get('status') in ('completed', 'abandoned'):
+        if self.context.run.get('status') in ('completed', 'abandoned'):
             raise HarnessError('terminal run rejects operator decisions')
         request = next((r for r in records if r['id'] == value['request_id']), None)
-        if request is None or request['task_id'] != value['task_id'] or value['task_id'] in self.run['accepted']:
+        if request is None or request['task_id'] != value['task_id'] or value['task_id'] in self.context.run['accepted']:
             raise HarnessError('operator decision request unknown or task accepted')
-        active = [key for key in RECOVERY_BUSY_KEYS if self.run.get(key)]
-        if any(r.get('status') == 'pending' for r in self.run.get('invalid_repairs', {}).values()):
+        active = [key for key in RECOVERY_BUSY_KEYS if self.context.run.get(key)]
+        if any(r.get('status') == 'pending' for r in self.context.run.get('invalid_repairs', {}).values()):
             active.append('invalid_repairs')
         if active:
             raise HarnessError('pending lifecycle gates reject operator decisions: ' + ', '.join(active))
-        stopped = self.run.get('replan_stopped')
+        stopped = self.context.run.get('replan_stopped')
         if stopped and (request['kind'] != 'replan_stop' or stopped.get('target') != request['task_id']
                         or stopped.get('reason') != request['question']
                         or stopped.get('dispatch_id') != request['source']['dispatch_id']):
@@ -281,15 +280,15 @@ class DecisionRecovery:
         boundary = request['response']['dispatch_count'] if request['response'] else request['dispatch_count']
         if any(d.get('invoked', True) and (request['kind'] != 'handoff'
                    or d.get('task_id') == request['task_id'])
-               for d in self.run['dispatches'][boundary:]):
+               for d in self.context.run['dispatches'][boundary:]):
             raise HarnessError('operator decision request stale after subsequent model invocation')
         ident = self._response_id(value)
-        if any(r['id'] == ident for r in self.run.get('operator_decisions', [])):
+        if any(r['id'] == ident for r in self.context.run.get('operator_decisions', [])):
             if request['response'] and request['response']['id'] == ident:
                 return None
             raise HarnessError('operator decision was superseded; provide a new explicit summary')
-        return {**value, 'id': ident, 'sequence': len(self.run.get('operator_decisions', [])) + 1,
-                'dispatch_count': len(self.run['dispatches']), 'recorded_at': time.time()}
+        return {**value, 'id': ident, 'sequence': len(self.context.run.get('operator_decisions', [])) + 1,
+                'dispatch_count': len(self.context.run['dispatches']), 'recorded_at': time.time()}
 
     def prepare_operator_decision(self, path):
         return self._prepare_decision(read_decision(path))
@@ -339,22 +338,22 @@ class DecisionRecovery:
             return
         rows = [self._decision_artifact(record, 'operator_decision_recorded')
                 for record in prepared_records]
-        old = self.run.get('operator_decisions', [])
-        self.run['operator_decisions'] = [*old, *rows]
+        old = self.context.run.get('operator_decisions', [])
+        self.context.run['operator_decisions'] = [*old, *rows]
         try:
-            self.save()
+            self.context.save()
         except BaseException:
-            self.run['operator_decisions'] = old
+            self.context.run['operator_decisions'] = old
             raise
 
     def _decision_index(self, records):
         # Navigation only: validation of every ledger/source precedes projection.
         # Content addressing preserves references from earlier dispatches.
         value = {'version': 1, 'requests': records,
-                 'responses': self.run.get('operator_decisions', [])}
+                 'responses': self.context.run.get('operator_decisions', [])}
         raw = (dump(value) + '\n').encode('utf-8')
         digest = hashlib.sha256(raw).hexdigest()
-        folder = self.directory / 'decisions' / 'indexes'
+        folder = self.context.directory / 'decisions' / 'indexes'
         if any(p.is_symlink() for p in (folder, *folder.parents)):
             raise HarnessError('decision index directory is a symlink')
         artifact = folder / (digest + '.json')

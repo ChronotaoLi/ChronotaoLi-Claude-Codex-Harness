@@ -460,3 +460,15 @@ Codex 0.163.0 的本地 `debug prompt-input` 检查确认：未提交的 AGENTS.
 终态清理通过模拟模型响应及真实本地 Git 生命周期验证：无需配置预览和显式移除、completed／abandoned 状态与分支和证据保留、非终态拒绝、父派发与 broker 子进程退出确认、Git 绑定与 HEAD、未保存文件与隐藏索引标记、嵌套 `.harness`、回执中断恢复及管理目录重现拒绝。清理回执独立保存，不改变台账版本。新增管理目录重现用例的夹具使用 `mkdir(parents=True)`，兼容 Git 同时删除空父管理目录的行为。
 
 实现与最终结果经独立 `gpt-6.1-sol` 审阅，无未解决的阻断发现；页面缓存恢复订阅问题已修正并通过生命周期测试，清理夹具修正也经独立复核。审阅记录索引为 `.harness/field-test-operations-review.json`。Linux inotify 仅完成模拟通知与记账测试，未在 Linux 原生环境执行；页面未做浏览器人工验收。未运行真实账号的 `harness smoke`、`harness.tool_smoke` 或 `harness.permission_smoke`，离线及本机集成测试不证明真实模型调用成功。
+
+## 单一执行内核与证据闭环验证（2026-11-05，台账 v13）
+
+执行 `python3 -m unittest discover -s tests -v`：1,188 项，1,187 项通过、1 项因本机文件系统拒绝非 UTF-8 文件名而跳过，Python 3.15.2，1233.020 秒。完整日志为 `.harness/redesign-final-unittest.log`。运行时、共享资产与测试的最终来源清单为 `.harness/redesign-final-test-source.json`；完整回归期间无行为变更。
+
+Python 3.11.17 的关键生命周期组共 86 项全部通过，34.295 秒，日志为 `.harness/redesign-final-python311.log`；覆盖进程监督、命令准入、派发结果传播、RunStore、调度内核、续作、预检、任务与最终审阅历史处置、验证事实和问题进度检索。本轮未在 Python 3.11 执行完整套件。两个 Python 版本的 compileall、`git diff --cached --check` 与 README/docs 的 54 个本地链接目标检查通过。
+
+行为回归保留全部正式任务与最终验证门禁，覆盖过期写入权、累计预算、授权前无派发、候选变更失效、缺失或篡改原始审阅凭证、重复／非法 finding ID、遗漏处置不得批准，以及 SIGINT 在启动、收尾、持久化和信号处理器交接窗口发生时的进程事实。真实本地子进程测试核对清理及退出；模拟后端仍明确属于离线测试。最大审阅结果、返工和格式修正保持原 32,000 字符输入预算，通过完整原文索引及可还原引用保留必需身份。正常单任务生命周期维持不超过 15 次完整快照，hook 后仍独立重检。
+
+执行真实账号 `python3 -m harness smoke`，运行 `run_3bea6b440c044eac` 达到 completed，日志为 `.harness/redesign-live-smoke-final.log`。四次模型调用分别为 `gpt-6-astra` 规划、`claude-opus-5-5` 执行及两个全新 `gpt-6.1-sol` 任务／整体审阅派发；均保存 exit_code=0、normal、退出确认与完整证据。另有两次正式验证，以及 worker 实际通过命令 broker 执行的一次授权命令，回执成功且完整。模型 ID 原样使用，所有 dispatch ID 独立。这是最小工作流的真实联调，不代表所有模型错误、工具权限组合或长任务已获实测覆盖。
+
+独立 `gpt-6.1-sol` 分别审阅执行内核、进程监督、来源与恢复门禁，发现的问题均已修复并经针对性复验；审阅验证日志保留在 `.harness/review-validation/`。旧 Engine 执行实现及旧台账自动恢复兼容已移除；版本 13 为唯一执行内核。上述验证证明所覆盖的行为边界，尚未量化大型真实任务的端到端性能或返工率变化。

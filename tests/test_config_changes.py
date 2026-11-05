@@ -212,10 +212,13 @@ class ConfigChangesTests(unittest.TestCase):
 
         def check_core(local, wire):
             self.assertLessEqual(set(wire), core)
-            for key in ("type", "required", "additionalProperties", "enum"):
+            for key in ("type", "additionalProperties", "enum"):
                 if key in local:
                     self.assertEqual(wire[key], local[key])
             if "properties" in local:
+                expected_required = (list(local["properties"]) if cli == "codex"
+                                     else local.get("required", []))
+                self.assertEqual(wire.get("required", []), expected_required)
                 self.assertEqual(set(wire["properties"]), set(local["properties"]))
                 for key in local["properties"]:
                     check_core(local["properties"][key], wire["properties"][key])

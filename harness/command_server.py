@@ -11,11 +11,14 @@ import os
 import re
 import signal
 import sys
+import time
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
+from .process_runtime import defer_cleanup_signals
 from . import git
-from .util import HarnessError, ProcessStartError, ProcessTimeout, group_alive, read_json, run_process, tail, write_json
+from .util import HarnessError, ProcessStartError, ProcessTimeout, group_alive, lock, read_json, run_process, tail, write_json
 
 
 def _file_digest(path):
@@ -42,7 +45,7 @@ def _argv(value):
             and bool(value[0].strip()))
 
 
-def create_manifest(config, cwd, job, run_path=None):
+def create_manifest(config, cwd, job, run_path=None, *, parent_deadline=None):
     data = config.data if hasattr(config, "data") else config
     cwd, job = _safe(Path(cwd).resolve()), _safe(job)
     job.mkdir(parents=True, exist_ok=True)
@@ -55,12 +58,15 @@ def create_manifest(config, cwd, job, run_path=None):
     timeout = data["runtime"]["verify_timeout_seconds"]
     if type(timeout) not in (int, float) or not math.isfinite(timeout) or not 0 < timeout:
         raise HarnessError("Command timeout must be finite and positive")
+    if parent_deadline is None:
+        parent_deadline = time.monotonic() + data["runtime"].get("agent_timeout_seconds", timeout + 5)
     run_path = _safe(run_path).resolve() if run_path is not None else None
     state = read_json(run_path) if run_path else {}
     manifest = {"version": 1, "role": "worker", "dispatch_id": job.name, "cwd": str(cwd),
                 "job": str(job.resolve()), "run_path": str(run_path) if run_path else None,
                 "binding": state.get("worktree_binding"), "expected_head": state.get("expected_head"),
-                "timeout": timeout, "commands": list(commands.values())}
+                "timeout": timeout, "parent_deadline": parent_deadline, "cleanup_margin": 2.0,
+                "commands": list(commands.values())}
     path = _safe(job / "commands.json")
     if path.exists():
         raise HarnessError("Command manifest already exists")
@@ -122,12 +128,14 @@ class Broker:
         if hashlib.sha256(raw).hexdigest() != self.digest:
             raise HarnessError("Command manifest digest mismatch")
         m = json.loads(raw)
-        fields = {"version", "role", "dispatch_id", "cwd", "job", "run_path", "binding", "expected_head", "timeout", "commands"}
+        fields = {"version", "role", "dispatch_id", "cwd", "job", "run_path", "binding", "expected_head", "timeout", "parent_deadline", "cleanup_margin", "commands"}
         if (not isinstance(m, dict) or set(m) != fields or m["version"] != 1 or m["role"] != "worker"
                 or str(self.path) != str(_safe(Path(m["job"]) / "commands.json"))
                 or Path(m["job"]).name != m["dispatch_id"]
                 or type(m["timeout"]) not in (int, float) or not math.isfinite(m["timeout"])
-                or not 0 < m["timeout"] or not isinstance(m["commands"], list)):
+                or not 0 < m["timeout"] or not isinstance(m["commands"], list)
+                or any(type(m[k]) not in (int, float) or not math.isfinite(m[k]) or m[k] <= 0
+                       for k in ("parent_deadline", "cleanup_margin"))):
             raise HarnessError("Invalid closed command manifest")
         ids = set()
         for c in m["commands"]:
@@ -164,52 +172,139 @@ class Broker:
     def list_commands(self):
         return self._load()["commands"]
 
-    def run_command(self, arguments):
+    def _admit(self, arguments):
+        # Reload authority, inspect every prior child, and durably register intent
+        # under one dispatch lock. The active parent delegates this resource.
         m = self._load()
         if not isinstance(arguments, dict) or set(arguments) != {"command_id"} or not isinstance(arguments["command_id"], str):
             raise HarnessError("run_command accepts only command_id")
         command = next((c for c in m["commands"] if c["command_id"] == arguments["command_id"]), None)
         if command is None:
             raise HarnessError("Unknown command_id")
+        ensure_command_processes_exited(m["job"])
+        for prior in command_processes(m["job"]):
+            if prior["process_state"] == "prepared":
+                continue  # No start intent was ever committed.
+            receipt_path = Path(prior["journal"]).with_name("receipt.json")
+            try:
+                receipt = read_json(_safe(receipt_path))
+                if (receipt["call_id"] != prior["id"] or receipt["command_id"] != prior["command_id"]
+                        or receipt.get("evidence_complete") is not True
+                        or receipt.get("manifest_sha256") != self.digest
+                        or receipt.get("journal_sha256") != prior["journal_digest"]
+                        or receipt.get("exit_confirmed") != prior["exit_confirmed"]):
+                    raise ValueError("receipt identity or completeness")
+                for stream in ("stdout", "stderr"):
+                    expected = receipt_path.with_name("output." + stream)
+                    if receipt[stream + "_path"] != str(expected) or _file_digest(_safe(expected)) != receipt[stream + "_sha256"]:
+                        raise ValueError("capture digest")
+            except (OSError, ValueError, KeyError, TypeError) as error:
+                raise HarnessError("Command evidence incomplete: " + prior["id"]) from error
+        remaining = m["parent_deadline"] - time.monotonic()
+        timeout = min(m["timeout"], remaining - m["cleanup_margin"])
+        if timeout <= 0:
+            raise HarnessError(f"Command budget exhausted: remaining={remaining:.3f}s cleanup_margin={m['cleanup_margin']:.3f}s; not started")
         folder = _safe(Path(m["job"]) / "commands" / uuid.uuid4().hex)
         folder.mkdir(mode=0o700)
-        journal = folder / "process.json"
         entry = {"id": m["dispatch_id"] + ":command:" + folder.name, "command_id": command["command_id"],
-                 "pgid": None, "process_state": "prepared", "exit_confirmed": False}
-        write_json(journal, entry)
-        result = {"call_id": entry["id"], "command_id": command["command_id"], "exit_code": None, "error": None}
+                 "pgid": None, "process_state": "starting", "exit_confirmed": False}
+        write_json(folder / "process.json", entry)
+        return m, command, timeout, folder, entry
+
+    def run_command(self, arguments):
+        with lock(_safe(Path(self.manifest["job"]) / "command-admission.lock")):
+            m, command, timeout, folder, entry = self._admit(arguments)
+        journal = folder / "process.json"
+        result = {"call_id": entry["id"], "command_id": command["command_id"], "exit_code": None,
+                  "error": None, "evidence_complete": False, "effective_timeout": timeout}
         def started(pgid):
             entry.update(pgid=pgid, process_state="running")
             write_json(journal, entry)
+        def outcome(value):
+            facts = value.to_dict()
+            result.update(lifecycle=facts, exit_code=facts["exit_code"],
+                          termination_reason=facts["termination_reason"],
+                          evidence_complete=facts["evidence_complete"])
+            entry.update(exit_confirmed=facts["exit_confirmed"])
+            if facts["exit_confirmed"]:
+                entry["process_state"] = "exited"
+        started_clock = time.monotonic()
+        result["started_at"] = datetime.now(timezone.utc).isoformat()
         old = {}
+        fatal_error = None
         def interrupted(signum, frame):
             raise KeyboardInterrupt(f"Command broker signal {signum}")
         try:
             for signum in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
                 old[signum] = signal.signal(signum, interrupted)
-            entry["process_state"] = "starting"
-            write_json(journal, entry)
-            result["exit_code"] = run_process(command["argv"], Path(m["cwd"]), folder / "output", timeout=m["timeout"], on_start=started)
+            result["exit_code"] = run_process(command["argv"], Path(m["cwd"]), folder / "output",
+                                               timeout=timeout, on_start=started, on_outcome=outcome,
+                                               execution_deadline=m["parent_deadline"] - m["cleanup_margin"],
+                                               cleanup_deadline=m["parent_deadline"])
         except BaseException as error:
+            if not isinstance(error, (Exception, KeyboardInterrupt, SystemExit)):
+                fatal_error = error
+            if getattr(error, "outcome", None) is not None:
+                outcome(error.outcome)
             result["error"] = str(error) or type(error).__name__
             result["timed_out"] = isinstance(error, ProcessTimeout)
             if isinstance(error, ProcessStartError):
                 entry.update(process_state="exited", exit_confirmed=True)
         finally:
-            for signum, handler in old.items():
-                signal.signal(signum, handler)
-            if entry["pgid"] is not None and not group_alive(entry["pgid"]):
-                entry.update(process_state="exited", exit_confirmed=True)
-            write_json(journal, entry)
-            for stream in ("stdout", "stderr"):
-                path = folder / ("output." + stream)
-                if not path.exists():
-                    path.write_bytes(b"")
-                result[stream] = tail(path, 4000)
-                result[stream + "_path"] = str(path)
-                result[stream + "_sha256"] = _file_digest(path)
-            result["exit_confirmed"] = entry["exit_confirmed"]
-            write_json(folder / "receipt.json", result)
+            try:
+                with defer_cleanup_signals(primary=fatal_error or result["error"]) as deferred:
+                    result["finished_at"] = datetime.now(timezone.utc).isoformat()
+                    result["duration_seconds"] = max(0.0, time.monotonic() - started_clock)
+                    result["timing_scope"] = "worker_command_nested_in_dispatch"
+                    # Never replace known wait/timeout facts with a teardown observation.
+                    try:
+                        write_json(journal, entry)
+                        for stream in ("stdout", "stderr"):
+                            path = folder / ("output." + stream)
+                            if not path.exists():
+                                raise HarnessError("Missing command capture: " + stream)
+                            result[stream] = tail(path, 4000)
+                            result[stream + "_path"] = str(path)
+                            result[stream + "_sha256"] = _file_digest(path)
+                        result["exit_confirmed"] = entry["exit_confirmed"]
+                        result["journal_sha256"] = _file_digest(journal)
+                        result["manifest_sha256"] = self.digest
+                        write_json(folder / "receipt.json", result)
+                    except (Exception, KeyboardInterrupt, SystemExit) as error:
+                        result.update(evidence_complete=False, persistence_error="Command evidence persistence failed: " + str(error))
+                        result["exit_confirmed"] = entry["exit_confirmed"]
+                    if deferred and result["error"] is None and fatal_error is None:
+                        deferred.handled = True
+                        result.update(error=f"Command broker signal {deferred[0]}",
+                                      termination_reason="cancelled", timed_out=False)
+                        if "lifecycle" in result:
+                            result["lifecycle"]["termination_reason"] = "cancelled"
+                            result["lifecycle"]["errors"].append({
+                                "step": "execution", "type": "KeyboardInterrupt",
+                                "message": result["error"], "errno": None})
+                        try:
+                            if "lifecycle" in result:
+                                write_json(folder / "output.outcome.json", result["lifecycle"])
+                            write_json(folder / "receipt.json", result)
+                        except (Exception, KeyboardInterrupt, SystemExit) as error:
+                            result.update(evidence_complete=False, persistence_error="Command evidence persistence failed: " + str(error))
+            except KeyboardInterrupt as error:
+                # The command receipt may already be committed. Record a broker
+                # cancellation without rewriting its completed lifecycle facts.
+                if fatal_error is None and result["error"] is None:
+                    result.update(error=str(error) or "Command broker cancelled",
+                                  response_cancelled=True)
+                    with defer_cleanup_signals(primary=error):
+                        try:
+                            write_json(folder / "receipt.json", result)
+                        except (Exception, KeyboardInterrupt, SystemExit) as persistence_error:
+                            result.update(evidence_complete=False,
+                                          persistence_error=str(persistence_error))
+            finally:
+                for signum, handler in old.items():
+                    signal.signal(signum, handler)
+        if fatal_error is not None:
+            raise fatal_error
         return result
 
 
@@ -250,7 +345,7 @@ def handle(request, broker):
             raise HarnessError("Unknown tool")
         return {"content": [{"type": "text", "text": json.dumps(value, ensure_ascii=True)}], "isError": False}
     except (HarnessError, ValueError, OSError, TypeError) as error:
-        return {"content": [{"type": "text", "text": str(error)}], "isError": True}
+        return {"content": [{"type": "text", "text": json.dumps({"status": "blocked", "started": False, "error": str(error)}, ensure_ascii=True)}], "isError": True}
 
 
 def main():

@@ -92,7 +92,7 @@ class CheckpointDeclarationFailureTests(RepoCase):
 
     def test_discard_reason_is_bounded_without_changing_operator_gate(self):
         engine = self.engine(self.backend(blocked=True))
-        with patch.object(engine, 'record_checkpoints', side_effect=CheckpointDeclarationError('x' * 10000)):
+        with patch.object(engine.services.progress, 'record_checkpoints', side_effect=CheckpointDeclarationError('x' * 10000)):
             with self.assertRaises(HarnessError):
                 engine.start('Implement greet', read_json(ROOT / 'examples' / 'plan.json'))
         self.assertEqual(len(engine.run['feedback']['checkpoints_discarded']['reason']), 2000)
@@ -144,18 +144,18 @@ class CheckpointDeclarationFailureTests(RepoCase):
         write_json(artifact, bound)
         result = {k: v for k, v in bound.items() if k not in ('task_id', 'dispatch_id')}
         source = {'artifact': str(artifact), 'artifact_digest': digest(artifact)}
-        discarded = engine.record_checkpoints('greet', dispatch['id'], result, source)
+        discarded = engine.services.progress.record_checkpoints('greet', dispatch['id'], result, source)
         self.assertTrue(discarded)
 
     def test_changed_bound_result_is_fatal_even_with_malformed_declaration(self):
         backend = self.backend()
         engine = self.engine(backend)
-        original_record = engine.record_checkpoints
+        original_record = engine.services.progress.record_checkpoints
         def tamper(task_id, dispatch_id, result, source):
             result['checkpoints'][0]['summary'] = 'invalid\0summary'
             Path(source['artifact']).write_bytes(b'changed original')
             return original_record(task_id, dispatch_id, result, source)
-        with patch.object(engine, 'record_checkpoints', side_effect=tamper):
+        with patch.object(engine.services.progress, 'record_checkpoints', side_effect=tamper):
             with self.assertRaisesRegex(HarnessError, 'original result changed') as error:
                 engine.start('Implement greet', read_json(ROOT / 'examples' / 'plan.json'))
         self.assertNotIsInstance(error.exception, CheckpointDeclarationError)
@@ -175,7 +175,7 @@ class CheckpointDeclarationFailureTests(RepoCase):
         result['checkpoints'] = 'malformed'
         calls = len(backend.calls)
         with self.assertRaisesRegex(HarnessError, 'cached evidence changed') as error:
-            engine.record_checkpoints('greet', dispatch['id'], result, source)
+            engine.services.progress.record_checkpoints('greet', dispatch['id'], result, source)
         self.assertNotIsInstance(error.exception, CheckpointDeclarationError)
         with self.assertRaisesRegex(HarnessError, 'cached evidence changed'):
             self.engine(backend).resume(engine.run['id'])

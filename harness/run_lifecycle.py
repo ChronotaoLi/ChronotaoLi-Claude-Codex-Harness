@@ -10,33 +10,34 @@ from . import git
 from .operations import warn
 from .path_evidence import validate_dispatch_indexes
 from .services import RuntimeService
+from .continuation import packet as continuation_packet, record_execution_guidance
 from .shared import asset_digest, validate_mcp
 from .util import HarnessError, lock, read_json, uid, validate_command_directories
 
 
 class RunLifecycle(RuntimeService):
     def start(self, goal, plan=None, *, pause_after_plan=False, step=False):
-        runtime = self.runtime
+        runtime = self.context
         if not goal.strip():
             raise HarnessError("目标不能为空")
-        untracked = git.check_starting_checkout(runtime.repo)
-        if not runtime.config.data["verification"]["commands"]:
+        untracked = git.check_starting_checkout(self.context.repo)
+        if not self.context.config.data["verification"]["commands"]:
             raise HarnessError("请先配置目标项目的 verification.commands")
-        git.reject_submodules(runtime.repo)
-        supplied_tasks = runtime.validate_tasks(plan) if plan is not None else []
-        validate_mcp(runtime.config)
+        git.reject_submodules(self.context.repo)
+        supplied_tasks = self.services.planning.validate_tasks(plan) if plan is not None else []
+        validate_mcp(self.context.config)
         if untracked:
             print("[harness] 主检出存在未跟踪文件；保留原处，不进入隔离 worktree："
                   + git.describe_paths(untracked), file=sys.stderr, flush=True)
         ident = uid("run")
-        worktree = runtime.state / "worktrees" / ident
-        operation = runtime.operation
-        runtime.run = {"schema_version": 12, "workspace_inputs": None, "id": ident, "repo": str(runtime.repo), "goal": goal, "status": "planning", "commander": runtime.commander,
+        worktree = self.context.state / "worktrees" / ident
+        operation = self.context.operation
+        self.context.run = {"schema_version": 13, "workspace_inputs": None, "id": ident, "repo": str(self.context.repo), "goal": goal, "status": "planning", "commander": self.context.commander,
                     "branch": "harness/" + ident, "worktree": str(worktree), "tasks": [], "accepted": {}, "attempts": {},
                     "attempt_budget_policy": "work",
-                    "dispatches": [], "expected_head": git.head(runtime.repo), "feedback": None,
-                    "config_path": str(runtime.config.path), "config_snapshot": deepcopy(runtime.config.data),
-                    "asset_digest": asset_digest(runtime.config), "base_commit": git.head(runtime.repo),
+                    "dispatches": [], "expected_head": git.head(self.context.repo), "feedback": None,
+                    "config_path": str(self.context.config.path), "config_snapshot": deepcopy(self.context.config.data),
+                    "asset_digest": asset_digest(self.context.config), "base_commit": git.head(self.context.repo),
                     "original_tasks": deepcopy(supplied_tasks),
                     "total_attempts": 0, "replan_attempts": 0, "final_attempts": 0,
                     "review_history": {}, "final_history": [], "plan_history": [], "format_repairs": {},
@@ -44,26 +45,27 @@ class RunLifecycle(RuntimeService):
                     "invalid_repairs": {}, "approved_scope": [],
                     "environment_updates": [], "environment_checks": [],
                     "decision_requests": [], "operator_decisions": [], "task_checkpoints": [], "checkpoint_batches": [],
+                    "continuation_history": [], "execution_guidance": [],
                     "worktree_binding": {}, "ignored_baseline": [],
                     "pending_format_corrections": {}, "agent_dispatches": 0,
                     "plan_approval_required": pause_after_plan, "plan_approved": not pause_after_plan,
                     "created_by_operation": getattr(operation, "id", None) if operation is not None else None}
-        runtime.directory.mkdir(parents=True)
-        runtime.save()
+        self.context.directory.mkdir(parents=True, exist_ok=True)
+        self.context.save()
         self.announce("run_created")
-        with lock(runtime.directory / "run.lock"):
+        with lock(self.context.directory / "run.lock"):
             try:
-                git.git(runtime.repo, "worktree", "add", "-b", runtime.run["branch"], str(worktree), "HEAD")
-                runtime.run["worktree_binding"] = git.capture_worktree_binding(worktree, runtime.run["branch"])
-                runtime.run["ignored_baseline"] = runtime.ignored_paths()
-                runtime.save()
-                runtime.record_ignored_paths("initial", runtime.directory)
+                git.git(self.context.repo, "worktree", "add", "-b", self.context.run["branch"], str(worktree), "HEAD")
+                self.context.run["worktree_binding"] = git.capture_worktree_binding(worktree, self.context.run["branch"])
+                self.context.run["ignored_baseline"] = self.context.ignored_paths()
+                self.context.save()
+                self.context.record_ignored_paths("initial", self.context.directory)
             except BaseException as error:
-                runtime.stop(error)
+                self.services.workflow.stop(error)
                 raise
-            runtime.memory.repo = runtime.worktree
-            runtime.memory.binding = runtime.run["worktree_binding"]
-            return runtime.execute(plan, step=step)
+            self.context.memory.repo = self.context.worktree
+            self.context.memory.binding = self.context.run["worktree_binding"]
+            return self.services.scheduler.execute(plan, step=step)
 
     def announce(self, event):
         """Observation after a successful save: event, machine-readable stderr line, operation link.
@@ -72,13 +74,13 @@ class RunLifecycle(RuntimeService):
         lifecycle, save order or exit status. Process interrupts still follow
         the existing recovery limits; the first save precedes worktree binding.
         """
-        runtime = self.runtime
-        operation = runtime.operation
-        run_id = runtime.run["id"]
+        runtime = self.context
+        operation = self.context.operation
+        run_id = self.context.run["id"]
         operation_id = getattr(operation, "id", None) if operation is not None else None
         notice = json.dumps({"event": event, "run_id": run_id, "operation_id": operation_id},
                             ensure_ascii=True, separators=(",", ":"))
-        steps = [("event", lambda: runtime.event(event, operation_id=operation_id)),
+        steps = [("event", lambda: self.context.event(event, operation_id=operation_id)),
                  ("notify", lambda: print("[harness-json] " + notice, file=sys.stderr, flush=True))]
         if operation is not None:
             steps.append(("link", lambda: operation.link(run_id)))
@@ -89,14 +91,14 @@ class RunLifecycle(RuntimeService):
                 warn(f"{event} 的观察步骤 {name} 失败，不影响运行：{error}")
 
     def load_run(self, ident):
-        runtime = self.runtime
+        runtime = self.context
         if not ident.startswith("run_") or not ident[4:].isalnum():
             raise HarnessError("无效 run ID")
-        runtime.run = read_json(runtime.state / "runs" / ident / "state.json")
-        if not isinstance(runtime.run, dict):
+        self.context.run = read_json(self.context.state / "runs" / ident / "state.json")
+        if not isinstance(self.context.run, dict):
             raise HarnessError("运行台账必须为对象")
-        if runtime.run.get("schema_version") not in (8, 9, 10, 11, 12):
-            raise HarnessError("旧 run 状态格式无法安全恢复；请保留证据并使用原版本完成，或开始新 run")
+        if self.context.run.get("schema_version") != 13:
+            raise HarnessError("旧 run 仅保留为历史证据；新内核不恢复旧执行状态，请开始新 run")
         required = {"id": str, "repo": str, "worktree": str, "status": str, "commander": str,
                     "goal": str, "branch": str, "expected_head": str, "base_commit": str,
                     "config_snapshot": dict, "tasks": list, "original_tasks": list,
@@ -107,25 +109,25 @@ class RunLifecycle(RuntimeService):
                     "pending_format_corrections": dict,
                     "final_history": list, "plan_history": list, "format_repairs": dict,
                     "total_attempts": int, "agent_dispatches": int, "final_attempts": int,
-                    "replan_attempts": int, "plan_approval_required": bool, "plan_approved": bool}
-        if runtime.run["schema_version"] >= 9:
-            required.update(environment_updates=list, environment_checks=list)
-        if runtime.run["schema_version"] >= 10:
-            required.update(decision_requests=list, operator_decisions=list, task_checkpoints=list)
-        if (runtime.run.get("id") != ident or any(type(runtime.run.get(k)) is not t for k, t in required.items())
-                or any(not isinstance(d, dict) for d in runtime.run["dispatches"])):
+                    "replan_attempts": int, "plan_approval_required": bool, "plan_approved": bool,
+                    "environment_updates": list, "environment_checks": list,
+                    "decision_requests": list, "operator_decisions": list, "task_checkpoints": list, "checkpoint_batches": list, "attempt_budget_policy": str,
+                    "continuation_history": list, "execution_guidance": list, "store_revision": int}
+        if (self.context.run.get("id") != ident or any(type(self.context.run.get(k)) is not t for k, t in required.items())
+                or any(not isinstance(d, dict) for d in self.context.run["dispatches"])):
             raise HarnessError("运行台账字段缺失或类型无效；保留原文件并核对证据")
-        if runtime.run["repo"] != str(runtime.repo):
+        if self.context.run["repo"] != str(self.context.repo):
             raise HarnessError("Run 属于另一个项目")
-        if runtime.run["schema_version"] >= 12 and ("workspace_inputs" not in runtime.run
-                or runtime.run["workspace_inputs"] is not None and not isinstance(runtime.run["workspace_inputs"], dict)):
+        if ("workspace_inputs" not in self.context.run
+                or self.context.run["workspace_inputs"] is not None and not isinstance(self.context.run["workspace_inputs"], dict)):
             raise HarnessError("运行输入绑定字段缺失或无效；保留现场")
-        validate_command_directories(runtime.run["dispatches"], runtime.directory)
-        runtime.validate_recovery_links()
-        runtime.validate_attempt_accounting()
-        runtime.validate_environment_links()
-        runtime.validate_decision_links()
-        runtime.validate_checkpoint_links()
+        validate_command_directories(self.context.run["dispatches"], self.context.directory)
+        self.validate_recovery_links()
+        self.services.budgets.validate_attempt_accounting()
+        self.services.environment.validate_environment_links()
+        self.services.decisions.validate_decision_links()
+        self.services.progress.validate_checkpoint_links()
+        continuation_packet(runtime)
 
     def validate_recovery_links(self):
         """Reject inconsistent recovery links before any resumed side effects.
@@ -133,7 +135,7 @@ class RunLifecycle(RuntimeService):
         This checks ledger structure, not artifact integrity or candidate validity;
         the existing phase-specific gates still validate those when consumed.
         """
-        runtime = self.runtime
+        runtime = self.context
         def fail(field):
             raise HarnessError(f"运行台账恢复状态无效：{field}；保留原文件并核对证据")
 
@@ -144,13 +146,13 @@ class RunLifecycle(RuntimeService):
 
         for field in ("pending_task", "pending_acceptance", "pending_post_accept", "pending_replan",
                       "pending_directive", "worker_recovery", "replan_stopped", "retained_candidate"):
-            if field in runtime.run:
-                mapping(runtime.run[field], field)
-        if "pending_task" in runtime.run and "pending_replan" in runtime.run:
+            if field in self.context.run:
+                mapping(self.context.run[field], field)
+        if "pending_task" in self.context.run and "pending_replan" in self.context.run:
             fail("pending_task 与 pending_replan 不能同时存在")
 
         task_ids = set()
-        for index, task in enumerate(runtime.run["tasks"]):
+        for index, task in enumerate(self.context.run["tasks"]):
             field = f"tasks[{index}]"
             ident = mapping(task, field).get("id")
             if not isinstance(ident, str) or not ident or ident in task_ids:
@@ -162,17 +164,17 @@ class RunLifecycle(RuntimeService):
                 fail(field + " 必须引用现有任务的字符串 ID")
 
         for field in ("pending_task", "pending_acceptance"):
-            if field in runtime.run:
-                task_reference(runtime.run[field].get("task_id"), field + ".task_id")
-        if "pending_post_accept" in runtime.run:
+            if field in self.context.run:
+                task_reference(self.context.run[field].get("task_id"), field + ".task_id")
+        if "pending_post_accept" in self.context.run:
             field = "pending_post_accept.payload"
-            payload = mapping(runtime.run["pending_post_accept"].get("payload"), field)
+            payload = mapping(self.context.run["pending_post_accept"].get("payload"), field)
             task_reference(payload.get("task_id"), field + ".task_id")
-        if runtime.run.get("current_task") is not None:
-            task_reference(runtime.run["current_task"], "current_task")
+        if self.context.run.get("current_task") is not None:
+            task_reference(self.context.run["current_task"], "current_task")
 
         dispatches = {}
-        for entry in runtime.run["dispatches"]:
+        for entry in self.context.run["dispatches"]:
             if "invoked" in entry and type(entry["invoked"]) is not bool:
                 fail("dispatches.invoked 必须是布尔值")
             ident = entry.get("id")
@@ -193,18 +195,18 @@ class RunLifecycle(RuntimeService):
             reference(value.get("dispatch_id"), key, field)
 
         for field, role in (("review_receipts", "reviewer"), ("commander_receipts", "commander")):
-            for key, receipt in runtime.run[field].items():
+            for key, receipt in self.context.run[field].items():
                 if not key.startswith(role + ":"):
                     fail(field + "." + key)
                 source(receipt, key, field + "." + key)
-        for key, guard in runtime.run["review_corrections"].items():
+        for key, guard in self.context.run["review_corrections"].items():
             field = "review_corrections." + key
             artifact = mapping(guard, field).get("artifact")
             if not key.startswith("reviewer:") or not isinstance(artifact, str):
                 fail(field)
             # Existing v8 guards identify the original dispatch by its artifact path.
             reference(Path(artifact).parent.name, key, field)
-        for key, pending in runtime.run["pending_format_corrections"].items():
+        for key, pending in self.context.run["pending_format_corrections"].items():
             field = "pending_format_corrections." + key
             pending = mapping(pending, field)
             if "dispatch_id" in pending:
@@ -214,7 +216,7 @@ class RunLifecycle(RuntimeService):
                 reference(correction["previous_dispatch"], key, field + ".correction")
             if "source" in correction:
                 source(correction["source"], key, field + ".correction.source")
-        for key, repair in runtime.run["invalid_repairs"].items():
+        for key, repair in self.context.run["invalid_repairs"].items():
             field = "invalid_repairs." + key
             repair = mapping(repair, field)
             source(repair.get("source"), key, field + ".source")
@@ -222,11 +224,11 @@ class RunLifecycle(RuntimeService):
                 source(repair["original"], key, field + ".original")
             if "corrected_dispatch_id" in repair:
                 reference(repair["corrected_dispatch_id"], key, field)
-        for tid, recovery in runtime.run.get("worker_recovery", {}).items():
+        for tid, recovery in self.context.run.get("worker_recovery", {}).items():
             source(recovery, f"worker:implement:{tid}", "worker_recovery." + tid)
-        owners = [("retained_candidate", runtime.run)]
-        if "pending_replan" in runtime.run:
-            owners.append(("pending_replan.retained_candidate", runtime.run["pending_replan"]))
+        owners = [("retained_candidate", self.context.run)]
+        if "pending_replan" in self.context.run:
+            owners.append(("pending_replan.retained_candidate", self.context.run["pending_replan"]))
         for field, owner in owners:
             if "retained_candidate" in owner or owner.get("candidate_policy") == "retain":
                 guard = mapping(owner.get("retained_candidate"), field)
@@ -234,63 +236,67 @@ class RunLifecycle(RuntimeService):
                 source(guard, "commander:replan:replanning", field)
 
     def abandon(self, ident, *, remove_worktree=False, confirm_exited=()):
-        runtime = self.runtime
-        runtime.load_run(ident)
-        with lock(runtime.directory / "run.lock"):
+        runtime = self.context
+        self.load_run(ident)
+        with lock(self.context.directory / "run.lock"):
             # Reload under the lock so a concurrent completion cannot be lost.
-            runtime.load_run(ident)
-            if runtime.run["status"] == "completed":
+            self.load_run(ident)
+            if self.context.run["status"] == "completed":
                 raise HarnessError("已完成的 run 不能标记为放弃")
-            runtime.confirm_exited(confirm_exited)
-            runtime.ensure_exited()
+            self.context.confirm_exited(confirm_exited)
+            self.context.ensure_exited()
             removal_finished = False
-            if remove_worktree and not runtime.run.get("worktree_removed"):
-                expected = (runtime.state / "worktrees" / ident).resolve()
-                if runtime.worktree.resolve() != expected or runtime.worktree.is_symlink():
+            if remove_worktree and not self.context.run.get("worktree_removed"):
+                expected = (self.context.state / "worktrees" / ident).resolve()
+                if self.context.worktree.resolve() != expected or self.context.worktree.is_symlink():
                     raise HarnessError("只能移除该 run 所有的隔离 worktree")
-                if not runtime.worktree.exists() and runtime.run.get("pending_worktree_removal"):
+                if not self.context.worktree.exists() and self.context.run.get("pending_worktree_removal"):
                     registered = {field.removeprefix("worktree ") for field in
-                                  git.git(runtime.repo, "worktree", "list", "--porcelain", "-z").split("\0")
+                                  git.git(self.context.repo, "worktree", "list", "--porcelain", "-z").split("\0")
                                   if field.startswith("worktree ")}
-                    if str(runtime.worktree) in registered:
+                    if str(self.context.worktree) in registered:
                         raise HarnessError("工作树路径缺失但 Git 注册仍存在；请核对后再清理")
                     removal_finished = True
                 else:
-                    if not (runtime.worktree / ".git").is_file():
+                    if not (self.context.worktree / ".git").is_file():
                         raise HarnessError("只能移除该 run 所有的隔离 worktree")
-                    if git.head(runtime.worktree, binding=runtime.run["worktree_binding"]) != runtime.run["expected_head"]:
+                    if git.head(self.context.worktree, binding=self.context.run["worktree_binding"]) != self.context.run["expected_head"]:
                         raise HarnessError("worktree HEAD 与检查点不同；保留工作树供核对")
-                    git.assert_removable_worktree(runtime.worktree, binding=runtime.run["worktree_binding"])
-            if runtime.run["status"] != "abandoned":
-                runtime.run["status"] = "abandoned"
-                runtime.save()
-                runtime.checkpoint()
-                runtime.event("run_abandoned")
-            if remove_worktree and not runtime.run.get("worktree_removed"):
+                    git.assert_removable_worktree(self.context.worktree, binding=self.context.run["worktree_binding"])
+            if self.context.run["status"] != "abandoned":
+                self.context.run["status"] = "abandoned"
+                self.context.save()
+                self.context.checkpoint()
+                self.context.event("run_abandoned")
+            if remove_worktree and not self.context.run.get("worktree_removed"):
                 if not removal_finished:
-                    runtime.run["pending_worktree_removal"] = True
-                    runtime.save()
-                    git.check_worktree_binding(runtime.worktree, runtime.run["worktree_binding"])
-                    git.git(runtime.repo, "worktree", "remove", str(runtime.worktree))
-                runtime.run["worktree_removed"] = True
-                runtime.run.pop("pending_worktree_removal", None)
-                runtime.save()
-                runtime.event("worktree_removed")
-            return runtime.run
+                    self.context.run["pending_worktree_removal"] = True
+                    self.context.save()
+                    git.check_worktree_binding(self.context.worktree, self.context.run["worktree_binding"])
+                    git.git(self.context.repo, "worktree", "remove", str(self.context.worktree))
+                self.context.run["worktree_removed"] = True
+                self.context.run.pop("pending_worktree_removal", None)
+                self.context.save()
+                self.context.event("worktree_removed")
+            return self.context.run
 
     def resume(self, ident, *, step=False, approve_plan=False, reverify=False, retry_stopped=None, confirm_exited=(),
-               repair_invalid=None, allow_scope=(), environment_update=None, operator_decision=None):
-        runtime = self.runtime
-        runtime.load_run(ident)
-        with lock(runtime.directory / "run.lock"):
-            runtime.load_run(ident)
-            if runtime.run["status"] == "abandoned":
+               repair_invalid=None, allow_scope=(), environment_update=None, operator_decision=None,
+               execution_guidance=None):
+        runtime = self.context
+        self.load_run(ident)
+        with lock(self.context.directory / "run.lock"):
+            self.load_run(ident)
+            if self.context.run["status"] == "abandoned":
                 raise HarnessError("该 run 已放弃；保留分支、工作树与证据，不能继续派发")
-            runtime.commander = runtime.run["commander"]
-            if runtime.run["status"] == "completed":
-                if confirm_exited or repair_invalid is not None or allow_scope or environment_update is not None or operator_decision is not None:
+            self.context.commander = self.context.run["commander"]
+            if self.context.run["status"] == "completed":
+                if confirm_exited or repair_invalid is not None or allow_scope or environment_update is not None or operator_decision is not None or execution_guidance is not None:
                     raise HarnessError("--confirm-exited、--repair-invalid、--allow-scope、--environment-update 与 --operator-decision 仅用于未完成的 run")
-                return runtime.run
+                return self.context.run
+            if execution_guidance is not None and (operator_decision is not None or environment_update is not None
+                    or reverify or retry_stopped is not None or repair_invalid is not None or allow_scope):
+                raise HarnessError("--execution-guidance 不能与决定、环境更新、重验、重规划或修正合用")
             if operator_decision is not None and (environment_update is not None or reverify or retry_stopped is not None
                                                    or repair_invalid is not None or allow_scope):
                 raise HarnessError("--operator-decision 不能与环境更新、重验、重试停止、修正或扩展范围合用")
@@ -300,38 +306,38 @@ class RunLifecycle(RuntimeService):
                 raise HarnessError("--repair-invalid 不能与 --reverify、--retry-stopped 或 --allow-scope 合用")
             if reverify and retry_stopped is not None:
                 raise HarnessError("--reverify 不能与 --retry-stopped 合用")
-            runtime.reverify_requested = reverify
-            changes = runtime.config.resume_changes(runtime.run["config_snapshot"])
-            if runtime.run.get("asset_digest") != asset_digest(runtime.config):
+            self.context.reverify_requested = reverify
+            changes = self.context.config.resume_changes(self.context.run["config_snapshot"])
+            if self.context.run.get("asset_digest") != asset_digest(self.context.config):
                 raise HarnessError("共享规则、skills、MCP 或 hooks 已改变；请恢复原版本后继续")
-            runtime.environment_context()
-            runtime.confirm_exited(confirm_exited)
-            runtime.ensure_exited()
-            if not runtime.run["worktree_binding"]:
+            self.services.environment.environment_context()
+            self.context.confirm_exited(confirm_exited)
+            self.context.ensure_exited()
+            if not self.context.run["worktree_binding"]:
                 raise HarnessError("缺少已保存的 worktree Git 绑定，无法安全恢复；"
                                    f"使用 abandon {ident} 保留证据后重新运行；"
                                    "若工作树或分支已创建，请核对后手工清理")
-            validate_dispatch_indexes(runtime.directory, runtime.run["dispatches"])
-            if git.head(runtime.worktree, binding=runtime.run["worktree_binding"]) != runtime.run["expected_head"]:
+            validate_dispatch_indexes(self.context.directory, self.context.run["dispatches"])
+            if git.head(self.context.worktree, binding=self.context.run["worktree_binding"]) != self.context.run["expected_head"]:
                 raise HarnessError("worktree HEAD 与检查点不同；请先核对提交，不自动重放")
             from .workspace_inputs import validate_inputs
-            validate_inputs(runtime.run, runtime.directory)
-            runtime.recover_replan_worker_correction()
-            update = runtime.prepare_environment_update(environment_update) if environment_update is not None else None
-            decision_values, decisions = (runtime.prepare_operator_decisions(operator_decision)
+            validate_inputs(self.context.run, self.context.directory)
+            self.services.planning.recover_replan_worker_correction()
+            update = self.services.environment.prepare_environment_update(environment_update) if environment_update is not None else None
+            decision_values, decisions = (self.services.decisions.prepare_operator_decisions(operator_decision)
                                           if operator_decision is not None else ([], []))
             if retry_stopped is not None:
-                stopped = runtime.run.get("replan_stopped")
+                stopped = self.context.run.get("replan_stopped")
                 if not stopped or stopped["target"] != retry_stopped:
                     raise HarnessError("--retry-stopped 必须匹配已停止的任务 ID，或 final")
                 # Recover registration if interruption followed the saved stop.
                 # Retry must not erase an unanswered, attributable decision gate.
-                source_position = next((i for i, d in enumerate(runtime.run["dispatches"])
+                source_position = next((i for i, d in enumerate(self.context.run["dispatches"])
                                         if d.get("id") == stopped.get("dispatch_id")), None)
                 if stopped.get("source_digest") and (source_position is None or not any(
-                        d.get("invoked", True) for d in runtime.run["dispatches"][source_position + 1:])):
-                    runtime.synchronize_decision_requests()
-                for request in runtime.decision_context():
+                        d.get("invoked", True) for d in self.context.run["dispatches"][source_position + 1:])):
+                    self.services.workflow.synchronize_decision_requests()
+                for request in self.services.decisions.decision_context():
                     if (request["kind"] != "replan_stop" or request["task_id"] != stopped["target"]
                             or request["question"] != stopped["reason"]
                             or request["source"]["dispatch_id"] != stopped.get("dispatch_id")
@@ -339,64 +345,58 @@ class RunLifecycle(RuntimeService):
                         continue
                     response = request["response"]
                     boundary = response["dispatch_count"] if response else request["dispatch_count"]
-                    if any(d.get("invoked", True) for d in runtime.run["dispatches"][boundary:]):
+                    if any(d.get("invoked", True) for d in self.context.run["dispatches"][boundary:]):
                         continue
                     if response is None:
-                        raise runtime.decision_required(request)
+                        raise self.services.workflow.decision_required(request)
                     if response["decision"] == "stop":
                         raise HarnessError(f"操作者已决定停止：request_id={request['id']}；"
                                            "请使用 --operator-decision 显式更新为 continue")
             if allow_scope:
-                runtime.approve_scope_extensions(allow_scope)
+                self.services.planning.approve_scope_extensions(allow_scope)
             if repair_invalid is not None:
-                runtime.prepare_invalid_repair(repair_invalid)
-            if runtime.run["schema_version"] < 12:
-                previous_version = runtime.run["schema_version"]
-                for field in ("decision_requests", "operator_decisions", "task_checkpoints", "environment_updates", "environment_checks"):
-                    runtime.run.setdefault(field, [])
-                runtime.run.setdefault("workspace_inputs", None)
-                runtime.run["schema_version"] = 12
-                runtime.event("run_schema_upgraded", previous_version=previous_version, schema_version=12)
-                runtime.save()
-            runtime.record_operator_decisions(decisions)
+                self.services.recovery.prepare_invalid_repair(repair_invalid)
+            self.services.decisions.record_operator_decisions(decisions)
             if operator_decision is not None:
                 if any(value["decision"] == "stop" for value in decision_values):
                     error = HarnessError("操作者决定停止；决定与原证据已保存，未派发模型")
-                    runtime.stop(error)
+                    self.services.workflow.stop(error)
                     raise error
                 answered_ids = {value["request_id"] for value in decision_values}
-                request = next((r for r in runtime.decision_context()
+                request = next((r for r in self.services.decisions.decision_context()
                                 if r["id"] in answered_ids and r["kind"] == "replan_stop"), None)
-                if request is not None and runtime.run.get("replan_stopped"):
-                    if runtime.run["replan_stopped"].get("dispatch_id") != request["source"]["dispatch_id"]:
+                if request is not None and self.context.run.get("replan_stopped"):
+                    if self.context.run["replan_stopped"].get("dispatch_id") != request["source"]["dispatch_id"]:
                         raise HarnessError("操作者决定不能重开另一次指挥停止；请回答当前请求")
-                    stopped = runtime.run.pop("replan_stopped")
-                    runtime.run["pending_replan"] = {"stage": "request", "trigger": deepcopy(stopped["trigger"])}
-                    runtime.save()
-                    runtime.event("stopped_replan_decision_applied", request_id=request["id"], artifact=stopped["artifact"])
+                    stopped = self.context.run.pop("replan_stopped")
+                    self.context.run["pending_replan"] = {"stage": "request", "trigger": deepcopy(stopped["trigger"])}
+                    self.context.save()
+                    self.context.event("stopped_replan_decision_applied", request_id=request["id"], artifact=stopped["artifact"])
             if retry_stopped is not None:
-                stopped = runtime.run.get("replan_stopped")
+                stopped = self.context.run.get("replan_stopped")
                 # Reopen the saved planning request, not another attempt by the
                 # already blocked worker. Preserve the original stop as evidence.
-                runtime.run["pending_replan"] = {"stage": "request", "trigger": deepcopy(stopped["trigger"])}
-                runtime.run.pop("replan_stopped")
-                runtime.save()
-                runtime.event("stopped_replan_retry_requested", target=retry_stopped, artifact=stopped["artifact"])
-            runtime.memory.repo = runtime.worktree
-            runtime.memory.binding = runtime.run["worktree_binding"]
+                self.context.run["pending_replan"] = {"stage": "request", "trigger": deepcopy(stopped["trigger"])}
+                self.context.run.pop("replan_stopped")
+                self.context.save()
+                self.context.event("stopped_replan_retry_requested", target=retry_stopped, artifact=stopped["artifact"])
+            self.context.memory.repo = self.context.worktree
+            self.context.memory.binding = self.context.run["worktree_binding"]
             if changes:
-                runtime.run["config_snapshot"] = deepcopy(runtime.config.data)
-                runtime.event("resume_config_relaxed", changes=changes)
-                runtime.save()
-            runtime.record_environment_update(update)
-            runtime.report_command_requirements()
-            if runtime.run["tasks"] and runtime.run["plan_approval_required"] and not runtime.run["plan_approved"]:
+                self.context.run["config_snapshot"] = deepcopy(self.context.config.data)
+                self.context.event("resume_config_relaxed", changes=changes)
+                self.context.save()
+            self.services.environment.record_environment_update(update)
+            if execution_guidance is not None:
+                record_execution_guidance(runtime, execution_guidance)
+            self.services.planning.report_command_requirements()
+            if self.context.run["tasks"] and self.context.run["plan_approval_required"] and not self.context.run["plan_approved"]:
                 if not approve_plan:
                     raise HarnessError("计划等待明确批准；使用 resume --approve-plan 继续")
-                runtime.run["plan_approved"] = True
-                runtime.event("plan_approved")
-                runtime.save()
+                self.context.run["plan_approved"] = True
+                self.context.event("plan_approved")
+                self.context.save()
             # Announce after resume() gates pass; earlier explicit audit writes
             # survive rejection. Stops inside execute() still emit run_stopped.
             self.announce("run_resumed")
-            return runtime.execute(step=step)
+            return self.services.scheduler.execute(step=step)

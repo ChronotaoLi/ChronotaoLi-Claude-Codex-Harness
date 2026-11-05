@@ -230,7 +230,7 @@ class ExplicitOutputRepairTests(RepoCase):
     def test_version_seven_cannot_ignore_new_repair_guards(self):
         engine, backend, key, source = self.blocked_approval()
         engine.run["schema_version"] = 7
-        engine.save()
+        engine.context.save()
         with self.assertRaisesRegex(HarnessError, "旧 run"):
             self.engine(backend).resume(engine.run["id"], repair_invalid=source["dispatch_id"])
 

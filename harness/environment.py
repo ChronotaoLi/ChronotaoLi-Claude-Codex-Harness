@@ -3,6 +3,8 @@
 These records clarify task assumptions. They do not grant capabilities, amend
 task obligations, or turn a worker's evidence into an accepted result.
 """
+
+from .services import RuntimeService
 from copy import deepcopy
 import hashlib
 import json
@@ -88,16 +90,16 @@ def read_update(path):
         raise HarnessError(f"无法读取环境更新 JSON：{error}") from error
 
 
-class EnvironmentRecovery:
+class EnvironmentRecovery(RuntimeService):
     def validate_environment_links(self):
-        updates = self.run.get("environment_updates", [])
-        checks = self.run.get("environment_checks", [])
+        updates = self.context.run.get("environment_updates", [])
+        checks = self.context.run.get("environment_checks", [])
         if not isinstance(updates, list) or not isinstance(checks, list):
             raise HarnessError("环境恢复台账字段无效")
-        if self.run["schema_version"] == 8 and (updates or checks):
-            raise HarnessError("含环境更新的台账必须使用版本 9")
+        if self.context.run["schema_version"] != 13:
+            raise HarnessError("环境恢复台账必须使用版本 13")
         ids = set()
-        tasks = {task["id"] for task in self.run["tasks"]}
+        tasks = {task["id"] for task in self.context.run["tasks"]}
         for sequence, row in enumerate(updates, 1):
             if (not isinstance(row, dict) or type(row.get("sequence")) is not int
                     or row["sequence"] != sequence or not isinstance(row.get("task_id"), str)
@@ -107,11 +109,11 @@ class EnvironmentRecovery:
                     or len(row["id"]) != 68
                     or any(c not in "0123456789abcdef" for c in row["id"][4:])
                     or not isinstance(row.get("artifact_digest"), str)
-                    or row.get("artifact") != str(self.directory / "environment" / (row["id"] + ".json"))):
+                    or row.get("artifact") != str(self.context.directory / "environment" / (row["id"] + ".json"))):
                 raise HarnessError("环境更新台账引用无效；保留现场")
             ids.add(row["id"])
             if not any(d["id"] == row.get("blocker_dispatch_id") and d["role"] == "worker"
-                       and d["task_id"] == row["task_id"] for d in self.run["dispatches"]):
+                       and d["task_id"] == row["task_id"] for d in self.context.run["dispatches"]):
                 raise HarnessError("环境更新引用未知 worker dispatch")
         update_tasks = {row["id"]: row["task_id"] for row in updates}
         for row in checks:
@@ -124,18 +126,18 @@ class EnvironmentRecovery:
             name = Path(row["artifact"]).name
             if (not name.startswith("checks-") or not name.endswith(".json")
                     or not name[7:-5].isdigit()
-                    or row["artifact"] != str(self.directory / "environment" / name)):
+                    or row["artifact"] != str(self.context.directory / "environment" / name)):
                 raise HarnessError("环境检查产物路径无效")
 
     def environment_context(self, *, include_reports=False):
         records = []
-        for row in self.run.get("environment_updates", []):
+        for row in self.context.run.get("environment_updates", []):
             record, _ = read_bound_result(row, "环境更新")
             if not isinstance(record, dict):
                 raise HarnessError("环境更新产物必须为对象")
             update = validate_update({key: record[key] for key in
                 ("schema_version", "task_id", "blocker_dispatch_id", "summary", "checks") if key in record})
-            digest = snapshot_digest({"run_id": self.run["id"], "update": update})
+            digest = snapshot_digest({"run_id": self.context.run["id"], "update": update})
             if (digest != row["update_digest"] or record.get("sequence") != row["sequence"]
                     or record.get("id") != row["id"] or record.get("task_id") != row["task_id"]
                     or record.get("blocker_dispatch_id") != row["blocker_dispatch_id"]):
@@ -144,7 +146,7 @@ class EnvironmentRecovery:
             records.append({**record, "artifact": row["artifact"], "artifact_digest": row["artifact_digest"]})
         by_id = {record["id"]: record for record in records}
         reports = []
-        for row in self.run.get("environment_checks", []):
+        for row in self.context.run.get("environment_checks", []):
             report, _ = read_bound_result(row, "环境检查")
             record = by_id.get(row.get("update_id"))
             if (not isinstance(report, dict) or record is None
@@ -164,11 +166,11 @@ class EnvironmentRecovery:
 
     def _environment_index(self):
         # Complete navigation remains immutable as later observations arrive.
-        value = {"version": 1, "updates": self.run.get("environment_updates", []),
-                 "checks": self.run.get("environment_checks", [])}
+        value = {"version": 1, "updates": self.context.run.get("environment_updates", []),
+                 "checks": self.context.run.get("environment_checks", [])}
         raw = (dump(value) + "\n").encode("utf-8")
         digest = hashlib.sha256(raw).hexdigest()
-        folder = self.directory / "environment" / "indexes"
+        folder = self.context.directory / "environment" / "indexes"
         if any(p.is_symlink() for p in (folder, *folder.parents)):
             raise HarnessError("environment index directory is a symlink")
         artifact = folder / (digest + ".json")
@@ -205,7 +207,7 @@ class EnvironmentRecovery:
         elif isinstance(trigger, dict) and trigger.get("task_id"):
             relevant = {trigger["task_id"]}
         else:
-            # Final review/capacity and legacy callers without a task receive
+            # Final review/capacity and callers without a task receive
             # latest facts for all tasks, each explicitly names its scope.
             relevant = {record["task_id"] for record in records}
         latest = {record["task_id"]: record for record in records}
@@ -259,7 +261,7 @@ class EnvironmentRecovery:
                     "check list only for its named task; local observations remain time-sensitive.")}
 
     def environment_source(self, task_id, dispatch_id, source):
-        expected = self.directory / "dispatches" / dispatch_id / "returned-result.json"
+        expected = self.context.directory / "dispatches" / dispatch_id / "returned-result.json"
         if (not isinstance(source, dict) or source.get("artifact") != str(expected)
                 or not isinstance(source.get("artifact_digest"), str)):
             raise HarnessError("环境阻断原始证据引用无效")
@@ -274,23 +276,23 @@ class EnvironmentRecovery:
         update = read_update(path)
         self.environment_context()
         task_id, dispatch_id = update["task_id"], update["blocker_dispatch_id"]
-        feedback = self.run.get("feedback")
+        feedback = self.context.run.get("feedback")
         if not isinstance(feedback, dict) or not isinstance(feedback.get("worker"), dict):
             raise HarnessError("环境更新缺少当前 worker 环境阻断反馈")
         # A pre-invocation interruption can leave interrupted/running status
         # without invalidating the saved blocker. Resume guards terminal runs;
         # the evidence and pending-state checks below guard this update boundary.
-        if (self.run.get("current_task") != task_id
-                or task_id in self.run["accepted"] or feedback.get("task_id") != task_id):
+        if (self.context.run.get("current_task") != task_id
+                or task_id in self.context.run["accepted"] or feedback.get("task_id") != task_id):
             raise HarnessError("--environment-update 仅用于当前未接受任务的环境阻断")
         busy = (*RECOVERY_BUSY_KEYS, "replan_stopped")
-        if any(self.run.get(key) for key in busy) or any(
-                self.active_invalid_repair(key) for key in self.run["invalid_repairs"]):
+        if any(self.context.run.get(key) for key in busy) or any(
+                self.services.recovery.active_invalid_repair(key) for key in self.context.run["invalid_repairs"]):
             raise HarnessError("已有待处理阶段、指令、receipt 或修正；不能用环境更新替换原请求")
-        matches = [i for i, d in enumerate(self.run["dispatches"])
+        matches = [i for i, d in enumerate(self.context.run["dispatches"])
                    if d["id"] == dispatch_id and d["role"] == "worker" and d["task_id"] == task_id]
         if not matches or any(d.get("role") in ("worker", "commander", "reviewer")
-                              and d.get("invoked", True) for d in self.run["dispatches"][matches[0] + 1:]):
+                              and d.get("invoked", True) for d in self.context.run["dispatches"][matches[0] + 1:]):
             raise HarnessError("环境阻断来源已过期；后续模型调用已开始，保留原恢复路径")
         source = {"artifact": feedback.get("worker_artifact"), "artifact_digest": feedback.get("worker_artifact_digest")}
         result = self.environment_source(task_id, dispatch_id, source)
@@ -298,21 +300,21 @@ class EnvironmentRecovery:
         supplied = {k: v for k, v in feedback["worker"].items() if k not in ("task_id", "dispatch_id")}
         if stored != supplied:
             raise HarnessError("当前环境反馈与原始 worker 证据不一致")
-        task = next(t for t in self.run["tasks"] if t["id"] == task_id)
-        self.check_task_scope(task)
-        digest = snapshot_digest({"run_id": self.run["id"], "update": update})
+        task = next(t for t in self.context.run["tasks"] if t["id"] == task_id)
+        self.services.tasks.check_task_scope(task)
+        digest = snapshot_digest({"run_id": self.context.run["id"], "update": update})
         ident = "env_" + digest
-        if any(row["id"] == ident for row in self.run.get("environment_updates", [])):
+        if any(row["id"] == ident for row in self.context.run.get("environment_updates", [])):
             return None
-        if len(self.run.get("environment_updates", [])) >= 32:
+        if len(self.context.run.get("environment_updates", [])) >= 32:
             raise HarnessError("环境更新最多 32 条；保留全部历史，不静默裁剪")
-        return {**update, "id": ident, "sequence": len(self.run.get("environment_updates", [])) + 1,
+        return {**update, "id": ident, "sequence": len(self.context.run.get("environment_updates", [])) + 1,
                 "source": source, "recorded_at": time.time(), "update_digest": digest}
 
     def record_environment_update(self, record):
         if record is None:
             return
-        artifact = self.directory / "environment" / (record["id"] + ".json")
+        artifact = self.context.directory / "environment" / (record["id"] + ".json")
         if artifact.exists():
             # Recover artifact-before-ledger interruption without replacing evidence.
             try:
@@ -329,11 +331,9 @@ class EnvironmentRecovery:
         row.update(artifact=str(artifact), artifact_digest=hashlib.sha256(artifact.read_bytes()).hexdigest())
         # Audit before use. A crash can repeat the event with the same stable ID;
         # only the single ledger entry authorizes injection into model context.
-        self.event("environment_update_recorded", **row)
-        self.run["schema_version"] = max(self.run["schema_version"], 9)
-        self.run.setdefault("environment_updates", []).append(row)
-        self.run.setdefault("environment_checks", [])
-        self.save()
+        self.context.event("environment_update_recorded", **row)
+        self.context.run["environment_updates"].append(row)
+        self.context.save()
 
     def check_environment(self, task_id):
         records = [record for record in self.environment_context() if record["task_id"] == task_id]
@@ -349,13 +349,13 @@ class EnvironmentRecovery:
                 elif check["kind"] == "executable":
                     passed = shutil.which(check["name"]) is not None
                 else:
-                    allowed = self.config.data["permissions"]["worker_commands"] + self.config.data["verification"]["commands"]
+                    allowed = self.context.config.data["permissions"]["worker_commands"] + self.context.config.data["verification"]["commands"]
                     passed = check["argv"] in allowed
                 results.append({"check": check, "passed": passed})
             except OSError as error:
                 results.append({"check": check, "passed": False, "error": str(error)})
-        ident = len(self.run.setdefault("environment_checks", [])) + 1
-        artifact = self.directory / "environment" / f"checks-{ident}.json"
+        ident = len(self.context.run["environment_checks"]) + 1
+        artifact = self.context.directory / "environment" / f"checks-{ident}.json"
         report = {"update_id": record["id"], "task_id": task_id, "observed_at": time.time(),
                   "results": results, "passed": all(item["passed"] for item in results),
                   "limitation": "Local observations only; no commands executed, permissions granted, or acceptance proven."}
@@ -364,11 +364,11 @@ class EnvironmentRecovery:
             ident += 1
             artifact = artifact.with_name(f"checks-{ident}.json")
         write_json(artifact, report)
-        self.run["environment_checks"].append({"update_id": record["id"], "task_id": task_id,
+        self.context.run["environment_checks"].append({"update_id": record["id"], "task_id": task_id,
             "passed": report["passed"], "artifact": str(artifact),
             "artifact_digest": hashlib.sha256(artifact.read_bytes()).hexdigest()})
-        self.save()
-        self.event("environment_checked", task_id=task_id, passed=report["passed"], artifact=str(artifact))
+        self.context.save()
+        self.context.event("environment_checked", task_id=task_id, passed=report["passed"], artifact=str(artifact))
         if not report["passed"]:
             raise HarnessError(f"环境前置检查未通过；未派发本次 worker、未消耗本次 worker 尝试；"
                                f"已发生的指挥调用仍计入派发预算。检查日志：{artifact}")

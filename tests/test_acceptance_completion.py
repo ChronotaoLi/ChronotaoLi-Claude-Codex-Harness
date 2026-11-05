@@ -198,14 +198,14 @@ class AcceptanceCompletionTests(RepoCase):
 
     def test_acceptance_event_is_not_repeated_after_append_interruption(self):
         engine = self.engine(ProposedKnowledge())
-        event = engine.event
+        event = engine.context.event
 
         def interrupt_after_event(name, **fields):
             event(name, **fields)
             if name == "task_accepted":
                 raise KeyboardInterrupt()
 
-        engine.event = interrupt_after_event
+        engine.context.event = interrupt_after_event
         with self.assertRaises(KeyboardInterrupt):
             engine.start("Implement greet")
         commit = engine.run["accepted"]["greet"]["commit"]

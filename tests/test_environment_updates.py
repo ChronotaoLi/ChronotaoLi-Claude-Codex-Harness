@@ -62,14 +62,14 @@ class EnvironmentUpdateTests(RepoCase):
 
         backend.change = add_ready_work
         resumed = self.engine(backend)
-        task_attempt = resumed.task_attempt
+        task_attempt = resumed.services.tasks.task_attempt
 
         def interrupt_after_replan(ready):
             if len(ready) > 1:
                 raise KeyboardInterrupt()
             return task_attempt(ready)
 
-        with patch.object(resumed, 'task_attempt', side_effect=interrupt_after_replan):
+        with patch.object(resumed.services.tasks, 'task_attempt', side_effect=interrupt_after_replan):
             with self.assertRaises(KeyboardInterrupt):
                 resumed.resume(engine.run['id'], environment_update=path)
         saved = self.saved(engine)
@@ -130,9 +130,9 @@ class EnvironmentUpdateTests(RepoCase):
                 resumed = self.engine(backend)
                 # This boundary follows the durable running status but precedes
                 # any subsequent model call. Suppress stop to model a hard crash.
-                stop = (lambda error: None) if abrupt else resumed.stop
-                with patch.object(resumed, 'finish_post_accept', side_effect=KeyboardInterrupt()), \
-                        patch.object(resumed, 'stop', side_effect=stop):
+                stop = (lambda error: None) if abrupt else resumed.services.workflow.stop
+                with patch.object(resumed.services.tasks, 'finish_post_accept', side_effect=KeyboardInterrupt()), \
+                        patch.object(resumed.services.workflow, 'stop', side_effect=stop):
                     with self.assertRaises(KeyboardInterrupt):
                         resumed.resume(engine.run['id'])
                 saved = self.saved(engine)
@@ -151,7 +151,7 @@ class EnvironmentUpdateTests(RepoCase):
     def test_interrupted_commander_receipt_still_rejects_environment_update(self):
         engine, backend, path, _ = self.blocked()
         resumed = self.engine(backend)
-        with patch.object(resumed, 'finish_commander_receipt', side_effect=KeyboardInterrupt()):
+        with patch.object(resumed.services.receipts, 'finish_commander_receipt', side_effect=KeyboardInterrupt()):
             with self.assertRaises(KeyboardInterrupt):
                 resumed.resume(engine.run['id'])
         before = self.saved(engine)
@@ -195,7 +195,7 @@ class EnvironmentUpdateTests(RepoCase):
         calls = len(backend.calls)
         result = self.engine(backend).resume(engine.run['id'], environment_update=path)
         self.assertEqual(result['status'], 'completed')
-        self.assertEqual(result['schema_version'], 12)
+        self.assertEqual(result['schema_version'], 13)
         self.assertEqual(result['tasks'], before['tasks'])
         self.assertEqual(result['config_snapshot']['roles'], before['config_snapshot']['roles'])
         self.assertEqual(result['original_tasks'], before['original_tasks'])
@@ -312,16 +312,19 @@ class EnvironmentUpdateTests(RepoCase):
             self.engine(backend).resume(engine.run['id'], environment_update=path)
         self.assertEqual(len(backend.calls), calls)
 
-    def test_version_eight_ordinary_resume_and_update_promotion(self):
+    def test_version_eight_update_rejected_before_dispatch(self):
         engine, backend, path, _ = self.blocked()
         state = self.saved(engine)
         state['schema_version'] = 8
         state.pop('environment_updates', None)
         state.pop('environment_checks', None)
         write_json(engine.directory / 'state.json', state)
-        result = self.engine(backend).resume(engine.run['id'], environment_update=path)
-        self.assertEqual(result['schema_version'], 12)
-        self.assertEqual(result['status'], 'completed')
+        calls = len(backend.calls)
+        before = (engine.directory / 'state.json').read_bytes()
+        with self.assertRaisesRegex(HarnessError, '旧 run'):
+            self.engine(backend).resume(engine.run['id'], environment_update=path)
+        self.assertEqual(len(backend.calls), calls)
+        self.assertEqual((engine.directory / 'state.json').read_bytes(), before)
 
     def test_check_does_not_reblock_completed_worker_pending_review(self):
         engine, backend, path, value = self.blocked()
@@ -330,7 +333,7 @@ class EnvironmentUpdateTests(RepoCase):
         value['checks'] = [{'kind': 'path', 'path': str(marker), 'path_type': 'file'}]
         write_json(path, value)
         resumed = self.engine(backend)
-        with patch.object(resumed, 'dispatch_review', side_effect=HarnessError('Review unavailable')):
+        with patch.object(resumed.services.receipts, 'dispatch_review', side_effect=HarnessError('Review unavailable')):
             with self.assertRaises(HarnessError):
                 resumed.resume(engine.run['id'], environment_update=path)
         self.assertEqual(self.saved(engine)['pending_task']['stage'], 'reviewing')
@@ -340,16 +343,19 @@ class EnvironmentUpdateTests(RepoCase):
         self.assertEqual(result['status'], 'completed')
         self.assertFalse(any(c['role'] == 'worker' for c in backend.calls[calls:]))
 
-    def test_version_eight_ordinary_resume_remains_supported(self):
+    def test_version_eight_ordinary_resume_rejected_before_dispatch(self):
         engine, backend, _, _ = self.blocked()
         state = self.saved(engine)
         state['schema_version'] = 8
         state.pop('environment_updates', None)
         state.pop('environment_checks', None)
         write_json(engine.directory / 'state.json', state)
-        result = self.engine(backend).resume(engine.run['id'])
-        self.assertEqual(result['status'], 'completed')
-        self.assertEqual(result['attempts'], {'greet': 2})
+        calls = len(backend.calls)
+        before = (engine.directory / 'state.json').read_bytes()
+        with self.assertRaisesRegex(HarnessError, '旧 run'):
+            self.engine(backend).resume(engine.run['id'])
+        self.assertEqual(len(backend.calls), calls)
+        self.assertEqual((engine.directory / 'state.json').read_bytes(), before)
 
     def test_unauthorized_command_is_a_saved_failing_gate(self):
         engine, backend, path, value = self.blocked()
@@ -365,7 +371,7 @@ class EnvironmentUpdateTests(RepoCase):
     def test_pending_commander_receipt_cannot_be_replaced_by_update(self):
         engine, backend, path, _ = self.blocked()
         resumed = self.engine(backend)
-        with patch.object(resumed, 'finish_commander_receipt', side_effect=HarnessError('Receipt gate unavailable')):
+        with patch.object(resumed.services.receipts, 'finish_commander_receipt', side_effect=HarnessError('Receipt gate unavailable')):
             with self.assertRaises(HarnessError):
                 resumed.resume(engine.run['id'])
         before = self.saved(engine)
@@ -380,14 +386,14 @@ class EnvironmentUpdateTests(RepoCase):
     def test_pending_directive_cannot_be_replaced_by_update(self):
         engine, backend, path, _ = self.blocked()
         resumed = self.engine(backend)
-        dispatch = resumed.dispatch
+        dispatch = resumed.services.dispatch.dispatch
 
         def stop_before_worker(role, *args, **kwargs):
             if role == 'worker':
                 raise HarnessError('Worker preparation unavailable')
             return dispatch(role, *args, **kwargs)
 
-        with patch.object(resumed, 'dispatch', side_effect=stop_before_worker):
+        with patch.object(resumed.services.dispatch, 'dispatch', side_effect=stop_before_worker):
             with self.assertRaises(HarnessError):
                 resumed.resume(engine.run['id'])
         before = self.saved(engine)
@@ -485,7 +491,7 @@ class EnvironmentUpdateTests(RepoCase):
                 value['checks'] = [{'kind': 'path', 'path': str(marker), 'path_type': 'file'}]
                 write_json(path, value)
                 resumed = self.engine(backend)
-                original_event, original_save = resumed.event, resumed.save
+                original_event, original_save = resumed.context.event, resumed.context.save
 
                 def interrupt_event(name, **fields):
                     if name == 'environment_update_recorded':
@@ -498,7 +504,7 @@ class EnvironmentUpdateTests(RepoCase):
                     return original_save()
 
                 target, replacement = ('event', interrupt_event) if boundary == 'event' else ('save', interrupt_save)
-                with patch.object(resumed, target, side_effect=replacement):
+                with patch.object(resumed.context, target, side_effect=replacement):
                     with self.assertRaises(KeyboardInterrupt):
                         resumed.resume(engine.run['id'], environment_update=path)
                 self.assertFalse(self.saved(engine).get('environment_updates'))

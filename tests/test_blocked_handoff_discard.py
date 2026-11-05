@@ -37,7 +37,7 @@ class BlockedHandoffDiscardTests(RepoCase):
         self.assertEqual(run['feedback']['worker']['decision_requests'], requests)
         self.assertEqual(run['feedback']['worker_artifact_digest'], source_digest)
         self.assertEqual(worker['attempt_exemption']['artifact_digest'], source_digest)
-        self.assertEqual(engine.task_budget_used('greet'), 0)
+        self.assertEqual(engine.services.budgets.task_budget_used('greet'), 0)
         self.assertEqual(len(run['task_checkpoints']), 1)
         self.assertEqual(run['accepted'], {})
         self.assertFalse(any(d['role'] in ('verification', 'reviewer') for d in run['dispatches']))
@@ -45,7 +45,7 @@ class BlockedHandoffDiscardTests(RepoCase):
         discarded = [e for e in events if e.get('event') == 'decision_requests_discarded']
         self.assertEqual(len(discarded), 1)
         self.assertEqual(discarded[0]['worker_artifact_digest'], source_digest)
-        engine.validate_attempt_accounting()
+        engine.services.budgets.validate_attempt_accounting()
         return artifact, raw
 
     def test_environment_block_keeps_duplicate_invalid_target_requests_as_raw_evidence(self):

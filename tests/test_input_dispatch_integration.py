@@ -31,12 +31,12 @@ class InputDispatchIntegrationTests(RepoCase):
     def test_pre_agent_copy_mutation_blocks_before_worker_charge_and_invocation(self):
         engine, backend = self.prepared()
         resumed = self.engine(backend)
-        original = resumed.emit_hook
+        original = resumed.context.emit_hook
         def mutate(event, entry, job):
             original(event, entry, job)
             if event == 'pre_agent' and entry['role'] == 'worker':
                 (resumed.worktree / 'vendor/input.txt').write_text('modified by hook')
-        with patch.object(resumed, 'emit_hook', side_effect=mutate):
+        with patch.object(resumed.context, 'emit_hook', side_effect=mutate):
             with self.assertRaises(HarnessError):
                 resumed.resume(engine.run['id'], approve_plan=True)
         state = read_json(engine.directory / 'state.json')
@@ -49,7 +49,7 @@ class InputDispatchIntegrationTests(RepoCase):
     def test_schema12_missing_input_binding_refuses_resume_without_calls(self):
         engine, backend = self.prepared()
         state = read_json(engine.directory / 'state.json')
-        self.assertEqual(state['schema_version'], 12)
+        self.assertEqual(state['schema_version'], 13)
         del state['workspace_inputs']
         write_json(engine.directory / 'state.json', state)
         before = (engine.directory / 'state.json').read_bytes()

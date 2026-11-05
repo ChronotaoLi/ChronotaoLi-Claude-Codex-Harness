@@ -301,7 +301,7 @@ class PathEvidenceLifecycleTests(RepoCase):
 
         backend = ScriptedBackend(delete)
         engine = self.engine(backend)
-        emit = engine.emit_hook
+        emit = engine.context.emit_hook
 
         def corrupt(event, payload, logs):
             emit(event, payload, logs)
@@ -311,7 +311,7 @@ class PathEvidenceLifecycleTests(RepoCase):
                 saved.update(path=path, raw=path.read_bytes())
                 path.write_bytes(b'{}')
 
-        with patch.object(engine, 'emit_hook', side_effect=corrupt):
+        with patch.object(engine.context, 'emit_hook', side_effect=corrupt):
             with self.assertRaisesRegex(HarnessError, 'path evidence index changed'):
                 engine.start('Replace legacy docs', plan)
         self.assertEqual(engine.run['accepted'], {})

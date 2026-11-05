@@ -33,7 +33,7 @@ class ReplanFormatRecoveryTests(RepoCase):
 
         backend = ScriptedBackend(fail_repair)
         engine = self.engine(backend)
-        emit = engine.emit_hook
+        emit = engine.context.emit_hook
 
         def local_failure(event, payload, logs):
             if (failure == "pre_agent" and event == "pre_agent" and payload.get("role") == "worker"
@@ -41,7 +41,7 @@ class ReplanFormatRecoveryTests(RepoCase):
                 raise HarnessError("local pre_agent preparation failed")
             return emit(event, payload, logs)
 
-        with patch.object(engine, "emit_hook", side_effect=local_failure):
+        with patch.object(engine.context, "emit_hook", side_effect=local_failure):
             with self.assertRaisesRegex(HarnessError, "pre_agent preparation|provider failed"):
                 engine.start("Implement greet", self.plan())
         state = self.saved(engine)
@@ -179,7 +179,7 @@ class ReplanFormatRecoveryTests(RepoCase):
             with self.subTest(persist=persist):
                 engine, backend, unused = self.interrupted_correction()
                 resumed = self.engine(backend)
-                save = resumed.save
+                save = resumed.context.save
                 interrupted = False
 
                 def interrupt_transition():
@@ -197,7 +197,7 @@ class ReplanFormatRecoveryTests(RepoCase):
 
                 # A process crash cannot run execute's stop/save handler. Keep
                 # that handler from making the interrupted transition durable.
-                with patch.object(resumed, "save", side_effect=interrupt_transition), patch.object(resumed, "stop"):
+                with patch.object(resumed.context, "save", side_effect=interrupt_transition), patch.object(resumed.services.workflow, "stop"):
                     with self.assertRaises(KeyboardInterrupt):
                         resumed.resume(engine.run["id"])
                 self.assertTrue(interrupted)
@@ -256,7 +256,7 @@ class ReplanFormatRecoveryTests(RepoCase):
         before = self.saved(engine)
         calls = len(backend.calls)
         resumed = self.engine(backend)
-        with patch.object(resumed, "ensure_exited", side_effect=HarnessError("exit not confirmed")):
+        with patch.object(resumed.context, "ensure_exited", side_effect=HarnessError("exit not confirmed")):
             with self.assertRaisesRegex(HarnessError, "exit not confirmed"):
                 resumed.resume(engine.run["id"], operator_decision=self.answer(engine))
         self.assertEqual(self.saved(engine), before)
@@ -274,7 +274,7 @@ class ReplanFormatRecoveryTests(RepoCase):
 
         backend.change = correct_selection
         resumed = self.engine(backend)
-        save = resumed.save
+        save = resumed.context.save
         captured = {}
 
         def capture_real_gates():
@@ -286,7 +286,7 @@ class ReplanFormatRecoveryTests(RepoCase):
                 captured["receipt"] = copy.deepcopy(receipt)
             save()
 
-        with patch.object(resumed, "save", side_effect=capture_real_gates):
+        with patch.object(resumed.context, "save", side_effect=capture_real_gates):
             with self.assertRaisesRegex(HarnessError, "停止重新规划"):
                 resumed.resume(engine.run["id"])
         self.assertEqual(set(captured), {"correction", "receipt"})

@@ -108,8 +108,8 @@ class BrokerCheckpointBoundaryTests(unittest.TestCase):
         self.addCleanup(temp.cleanup)
         self.root = Path(temp.name).resolve()
         self.runtime = Runtime(self.root)
-        self.runtime.directory = self.root / '.harness' / 'runs' / 'run'
-        self.commands = self.runtime.directory / 'dispatches' / 'worker' / 'commands'
+        self.runtime.context.directory = self.root / '.harness' / 'runs' / 'run'
+        self.commands = self.runtime.context.directory / 'dispatches' / 'worker' / 'commands'
         self.output = self.commands / ('a' * 32) / 'output.stdout'
         self.output.parent.mkdir(parents=True)
         self.output.write_bytes(b'output')
@@ -118,9 +118,9 @@ class BrokerCheckpointBoundaryTests(unittest.TestCase):
         rt = self.runtime
         self.assertEqual(rt._declared_checkpoint_file(str(self.output), evidence_dispatch='worker'), b'output')
         other_run = self.root / '.harness' / 'runs' / 'other' / 'dispatches' / 'worker' / 'commands' / 'output'
-        other_dispatch = self.runtime.directory / 'dispatches' / 'other' / 'commands' / 'output'
+        other_dispatch = self.runtime.context.directory / 'dispatches' / 'other' / 'commands' / 'output'
         sibling = self.commands.with_name('commands-extra') / 'output'
-        private = self.runtime.directory / 'state.json'
+        private = self.runtime.context.directory / 'state.json'
         for path in (other_run, other_dispatch, sibling, private):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(b'output')

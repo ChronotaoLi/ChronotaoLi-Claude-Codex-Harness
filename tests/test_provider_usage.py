@@ -213,7 +213,7 @@ class ProviderUsageTests(RepoCase):
         self.assertNotIn("provider_usage", engine.run["dispatches"][-1])
         backend = self.backend()
         engine = self.engine(backend)
-        original = engine.event
+        original = engine.context.event
 
         def unavailable_event(event, **fields):
             if event == "dispatch_finished":
@@ -221,7 +221,7 @@ class ProviderUsageTests(RepoCase):
             return original(event, **fields)
 
         with patch("harness.dispatch.provider_usage", side_effect=OSError("telemetry read unavailable")), \
-                patch.object(engine, "event", side_effect=unavailable_event):
+                patch.object(engine.context, "event", side_effect=unavailable_event):
             result = engine.start("Implement greet", self.plan())
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["total_attempts"], 1)

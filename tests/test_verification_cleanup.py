@@ -264,7 +264,7 @@ class VerificationCleanupTests(RepoCase):
             cleanup_verification(self.repo, self.run["id"], confirm_exited=[selected["id"]])
         self.assertEqual((self.directory / "state.json").read_bytes(), before)
         self.assertEqual(self.confirmation_events(), [])
-        with patch("harness.cleanup.write_json", side_effect=OSError("state unavailable")), \
+        with patch("harness.run_store.write_json", side_effect=OSError("state unavailable")), \
                 self.assertRaisesRegex(OSError, "state unavailable"):
             cleanup_verification(self.repo, self.run["id"], confirm_exited=[selected["id"]])
         self.assertEqual((self.directory / "state.json").read_bytes(), before)
