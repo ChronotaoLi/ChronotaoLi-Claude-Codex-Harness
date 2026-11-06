@@ -261,6 +261,17 @@ def run_stream_process(argv, cwd, log, *, stdin="", timeout=900, env=None, on_st
             return code
     finally:
         primary = sys.exc_info()[1]
+        if primary is not None and candidate is not None and not terminal.exists():
+            # Preserve a received whole terminal as refusal evidence even when
+            # later timeout/cancellation prevents transport completion. This is
+            # never the authoritative stream terminal or successful protocol.
+            try:
+                write_json(job / "stream-incomplete-terminal.json", {
+                    "terminal": candidate, "terminal_count": terminals,
+                    "protocol_complete": False, "damaged": damaged})
+            except (Exception, KeyboardInterrupt, SystemExit) as error:
+                supervision.outcome.cleanup_errors.append({"step": "preserve_incomplete_terminal",
+                    "type": type(error).__name__, "message": str(error), "errno": getattr(error, "errno", None)})
         try:
             with defer_cleanup_signals(primary=primary) as deferred:
                 writer_deadline = min(writer_deadline or float("inf"), time.monotonic() + 2, cleanup_deadline if cleanup_deadline is not None else float("inf"))

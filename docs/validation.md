@@ -472,3 +472,15 @@ Python 3.11.17 的关键生命周期组共 86 项全部通过，34.295 秒，日
 执行真实账号 `python3 -m harness smoke`，运行 `run_3bea6b440c044eac` 达到 completed，日志为 `.harness/redesign-live-smoke-final.log`。四次模型调用分别为 `gpt-6-astra` 规划、`claude-opus-5-5` 执行及两个全新 `gpt-6.1-sol` 任务／整体审阅派发；均保存 exit_code=0、normal、退出确认与完整证据。另有两次正式验证，以及 worker 实际通过命令 broker 执行的一次授权命令，回执成功且完整。模型 ID 原样使用，所有 dispatch ID 独立。这是最小工作流的真实联调，不代表所有模型错误、工具权限组合或长任务已获实测覆盖。
 
 独立 `gpt-6.1-sol` 分别审阅执行内核、进程监督、来源与恢复门禁，发现的问题均已修复并经针对性复验；审阅验证日志保留在 `.harness/review-validation/`。旧 Engine 执行实现及旧台账自动恢复兼容已移除；版本 13 为唯一执行内核。上述验证证明所覆盖的行为边界，尚未量化大型真实任务的端到端性能或返工率变化。
+
+## 修复义务与终态证据恢复验证（2026-11-05，台账 v13）
+
+执行 `python3 -m unittest discover -s tests -v`：1,213 项，1,212 项通过、1 项因本机文件系统拒绝非 UTF-8 文件名而跳过，Python 3.15.2，1392.482 秒。完整日志为 `.harness/v27-fixes/full-unittest.log`，运行时、共享资产与测试来源清单为 `.harness/v27-fixes/final-test-source.json`；测试完成后逐文件核对摘要一致，期间没有源码变更。提交检查仅移除一个新增测试文件末尾的多余空行，AST 对比一致，前后摘要记录在同一来源清单。
+
+Python 3.11.17 执行 7 个焦点模块：`test_worker_repair_obligations`、`test_terminal_capture_recovery`、`test_explicit_output_repair`、`test_process_runtime`、`test_command_admission`、`test_environment_cli`、`test_redesign_integration`，88 项全部通过，168.170 秒。日志为 `.harness/v27-fixes/python311-final.log`；未在 Python 3.11 重跑完整套件。
+
+新增生命周期验证覆盖默认三次预算内的部分解决与新问题、全部问题解决但仍拒绝、候选未变、pre_agent 改动、压缩来源、输入清单缺失或篡改，以及 reviewer 对新候选仍需完整独立处置。真实本地子进程与 stub CLI 覆盖短寿命后代排空、清理截止时间、worker／验证／hook／broker 的退出事实、长寿命后代退出后消费原拒绝、原指挥计划和 stop 的保留、终态之后超时或非零退出禁止重抽、取消与证据损坏阻断，以及没有完整终态的超时保留原重试边界。显式修正测试覆盖处置语义及格式错误同时伴随非法记忆批准或重复 finding ID 时，不登记修正、不追加派发、不消耗其唯一额度；续作分类仍不改变预算、权限或接受条件。
+
+独立 `gpt-6.1-sol` 审阅发现的终态后超时／普通非零退出重抽，以及不可变处置格式错误被其他元数据错误遮蔽的问题，均已修复并复验；最终审阅无未解决问题，记录为 `.harness/v27-fixes/independent-review.txt`。审阅者另以 Python 3.11 执行 4 个针对性测试方法及其子场景，全部通过，日志为 `.harness/v27-fixes/independent-regressions.log`。`git diff --check` 通过。
+
+全部流程测试使用模拟响应、stub CLI 与真实本地 Git／子进程，不证明真实模型调用成功；未运行 `harness smoke`、`harness.tool_smoke` 或 `harness.permission_smoke`。有界等待不保证所有后代都在窗口内退出，窗口外仍保留退出未知门禁；更新前缺少实际输入绑定的待预检 worker 不补造证据，恢复边界见[恢复协议](recovery.md#进程退出与阶段恢复)。

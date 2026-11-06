@@ -168,8 +168,16 @@ class ProcessSupervisor:
                 out.errors.append(failure("persist_cancellation", persistence_error))
 
     def _finish_deferred(self, primary=None, captured=None):
-        with defer_cleanup_signals(captured, primary=primary):
-            self._finish(primary)
+        from .util import HarnessError
+        with defer_cleanup_signals(captured, primary=primary) as deferred:
+            try:
+                self._finish(primary)
+            except HarnessError:
+                if deferred and primary is None and not self.outcome.cleanup_errors and not self.outcome.errors:
+                    error = KeyboardInterrupt(f"Process cleanup signal {deferred[0]}")
+                    self.record_cancellation(error)
+                    raise error
+                raise
 
     def _finish(self, primary=None):
         from .util import HarnessError, ProcessStartError, ProcessTimeout, write_json
@@ -194,7 +202,17 @@ class ProcessSupervisor:
             code = self._attempt("poll_leader", p.poll)
             if code is not None:
                 out.exit_code = code
-            self._observe()
+            group_present = self._observe()
+            if code is not None and primary is None and group_present is True:
+                # A normal CLI may close its MCP pipes just before its children
+                # exit. Observe their drain, but never signal after reaping the
+                # leader: ownership of the numeric group is no longer assured.
+                drain_end = min(time.monotonic() + 2, self.cleanup_deadline
+                                if self.cleanup_deadline is not None else float("inf"))
+                def drain():
+                    while self._observe() is True and time.monotonic() < drain_end:
+                        time.sleep(min(.01, max(0, drain_end - time.monotonic())))
+                self._attempt("drain_descendants", drain)
             if code is None:
                 cleanup_end = min(time.monotonic() + 2, self.cleanup_deadline if self.cleanup_deadline is not None else float("inf"))
                 self._attempt("sigterm", lambda: os.killpg(p.pid, signal.SIGTERM))

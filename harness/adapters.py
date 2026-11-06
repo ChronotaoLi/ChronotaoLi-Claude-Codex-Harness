@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 import os
 import shlex
@@ -12,7 +13,7 @@ from pathlib import Path
 from .command_server import create_manifest
 from .shared import mcp_configs, toml_value
 from .stream_capture import claude_result_path, freeze_capture, run_stream_process
-from .util import HarnessError, read_json, run_process, tail, write_json
+from .util import HarnessError, dump, read_json, run_process, tail, write_json
 
 
 _USAGE_MAX_BYTES = 16 * 1024 * 1024
@@ -304,14 +305,81 @@ class CLIBackend:
         remaining = parent_deadline - time.monotonic()
         if remaining <= 0:
             raise HarnessError("Agent budget exhausted before CLI startup")
-        code = runner(argv, cwd, job / "process", stdin=prompt,
-                           timeout=remaining, env=env, on_start=on_start,
-                           execution_deadline=parent_deadline, on_outcome=on_outcome)
+        observed_outcome = None
+        def record_outcome(value):
+            nonlocal observed_outcome
+            observed_outcome = value
+            if on_outcome:
+                on_outcome(value)
+        try:
+            code = runner(argv, cwd, job / "process", stdin=prompt,
+                               timeout=remaining, env=env, on_start=on_start,
+                               execution_deadline=parent_deadline, on_outcome=record_outcome)
+        except (Exception, KeyboardInterrupt, SystemExit) as error:
+            outcome = getattr(error, "outcome", None)
+            if (role in ("commander", "reviewer") and outcome is not None
+                    and outcome.started):
+                try:
+                    self.preserve_terminal(job, model["cli"], outcome.to_dict())
+                except (Exception, KeyboardInterrupt, SystemExit) as capture_error:
+                    error.add_note(f"Terminal evidence preservation failed: {type(capture_error).__name__}: {capture_error}")
+            raise
         if code:
+            if role in ("commander", "reviewer") and observed_outcome is not None:
+                self.preserve_terminal(job, model["cli"], observed_outcome.to_dict(), terminal_only=True)
             diagnostic = cli_error_summary(job, model["cli"])
             detail = f"；{diagnostic}" if diagnostic else ""
             raise HarnessError(f"{role} CLI exit={code}{detail}；{job}\n{tail(job / 'process.stderr')}")
-        if model["cli"] == "codex":
+        return self.completed_result(job, model["cli"])
+
+    def preserve_terminal(self, job, provider, outcome, *, terminal_only=False):
+        """Save designated terminal evidence separately from process success."""
+        source = job / "response.json" if provider == "codex" else claude_result_path(job)
+        incomplete_stream = job / "stream-incomplete-terminal.json"
+        if provider == "claude" and not source.exists() and incomplete_stream.exists():
+            source = incomplete_stream
+        known_completion = (outcome.get("exit_code") is not None
+                            and (outcome.get("termination_reason") == "normal" or outcome["exit_code"] == 0))
+        value = None
+        if terminal_only or not known_completion:
+            # A timeout before any terminal remains retryable. A whole provider
+            # terminal followed by timeout/cancellation is retained, never used
+            # as success. Partial JSON and ordinary event output are insufficient.
+            try:
+                if source.is_symlink() or not source.is_file():
+                    return False
+                terminal = self.read_result(source, provider)
+                if provider == "claude" and terminal.get("type") != "result" and source != incomplete_stream:
+                    return False
+                if source != incomplete_stream:
+                    value = self.completed_result(job, provider)
+            except HarnessError:
+                return False
+        support = (("capture-manifest.json", "stream-capture.json")
+                   if source.name == "stream-terminal.json" else
+                   ("capture-manifest.json",) if provider == "claude" else ())
+        for path in (source, job / "process.outcome.json", *(job / name for name in support)):
+            if path.is_symlink() or not path.is_file():
+                raise HarnessError("Terminal evidence must be a regular file")
+        capture = {"version": 1, "provider": provider, "source": source.name,
+                   "source_digest": hashlib.sha256(source.read_bytes()).hexdigest(),
+                   "outcome_digest": hashlib.sha256((job / "process.outcome.json").read_bytes()).hexdigest(),
+                   "support_digests": {name: hashlib.sha256((job / name).read_bytes()).hexdigest() for name in support}}
+        # Publish intent before parsing or result publication. Incomplete intent
+        # is a permanent evidence blocker, never permission to redraw a decision.
+        write_json(job / "terminal-capture.json", capture)
+        if source == incomplete_stream:
+            return True
+        if value is not None or outcome.get("exit_code") == 0:
+            value = value if value is not None else self.completed_result(job, provider)
+            capture["result_digest"] = hashlib.sha256((dump(value) + "\n").encode("utf-8")).hexdigest()
+            write_json(job / "terminal-capture.json", capture)
+            write_json(job / "returned-result.json", value)
+        return True
+
+    def completed_result(self, job, provider):
+        """Parse only the provider's designated, complete terminal artifact."""
+        if provider == "codex":
             if not (job / "response.json").exists():
                 raise HarnessError(f"Codex 未输出结构化结果：{job}")
             return self.read_result(job / "response.json", "Codex")

@@ -8,7 +8,7 @@ from pathlib import Path
 
 from .contracts import (REVIEW, RepairableFormatError, apply_revision, envelope,
                         review_approved, validate, validate_commander_format_correction,
-                        validate_immutable_findings, validate_review_correction,
+                        validate_finding_dispositions, validate_immutable_findings, validate_review_correction,
                         validate_review_semantics, validate_structure)
 from .util import HarnessError
 
@@ -334,6 +334,15 @@ class InvalidOutputRecovery(RuntimeService):
             else:
                 if key in self.context.run["pending_format_corrections"]:
                     raise HarnessError("格式修正缺少原审阅守卫；不能丢弃原始依据")
+                # Dispositions are immutable during approval repair. Check them
+                # separately so another semantic error cannot hide an impossible
+                # repair and consume its single authorization/dispatch budget.
+                try:
+                    validate_finding_dispositions(result)
+                    validate(result.get("finding_dispositions", []), REVIEW["properties"]["finding_dispositions"],
+                             "response.finding_dispositions")
+                except HarnessError as error:
+                    raise HarnessError("审阅处置错误不能通过 --repair-invalid 修正；请保留证据并 abandon") from error
                 try:
                     validate_review_semantics(result, proposed_keys)
                 except HarnessError as error:

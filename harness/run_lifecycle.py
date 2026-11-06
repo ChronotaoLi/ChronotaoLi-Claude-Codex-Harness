@@ -322,6 +322,7 @@ class RunLifecycle(RuntimeService):
                 raise HarnessError("worktree HEAD 与检查点不同；请先核对提交，不自动重放")
             from .workspace_inputs import validate_inputs
             validate_inputs(self.context.run, self.context.directory)
+            self.services.receipts.validate_pending_terminal_captures()
             self.services.planning.recover_replan_worker_correction()
             update = self.services.environment.prepare_environment_update(environment_update) if environment_update is not None else None
             decision_values, decisions = (self.services.decisions.prepare_operator_decisions(operator_decision)

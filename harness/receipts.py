@@ -14,7 +14,7 @@ from .contracts import (
 )
 from .recovery import read_bound_bytes, read_bound_result, snapshot_digest
 from .services import RuntimeService
-from .util import HarnessError
+from .util import HarnessError, read_json
 
 
 class InvalidReviewRejection(HarnessError):
@@ -31,6 +31,92 @@ class InvalidReviewRejection(HarnessError):
 
 
 class ResultReceipts(RuntimeService):
+    @staticmethod
+    def terminal_capture_required(outcome):
+        return (outcome and not outcome.get("evidence_complete")
+                and outcome.get("started") is True
+                and type(outcome.get("exit_code")) is int
+                and (outcome.get("termination_reason") == "normal" or outcome["exit_code"] == 0))
+
+    def validate_pending_terminal_captures(self):
+        for field in ("review_receipts", "commander_receipts"):
+            for receipt in self.context.run[field].values():
+                entry = next(d for d in self.context.run["dispatches"] if d["id"] == receipt["dispatch_id"])
+                marker = self.context.directory / "dispatches" / entry["id"] / "terminal-capture.json"
+                outcome = entry.get("process_outcome")
+                if (marker.exists() or receipt.get("terminal_capture_digest")
+                        or outcome):
+                    self.validate_terminal_capture(receipt)
+                    if ((marker.exists() or receipt.get("terminal_capture_digest") or self.terminal_capture_required(outcome))
+                            and snapshot_digest(self.context.snapshot()) != receipt["snapshot_digest"]):
+                        raise HarnessError("终端结果的代码快照已变化；保留证据，禁止重新抽取结论")
+
+    def validate_terminal_capture(self, receipt):
+        """Keep failed cleanup distinct from the captured terminal decision.
+
+        Exit confirmation permits revalidation; it does not erase original
+        timeout, nonzero exit, protocol or persistence failures.
+        """
+        entry = next(d for d in self.context.run["dispatches"] if d["id"] == receipt["dispatch_id"])
+        job = self.context.directory / "dispatches" / entry["id"]
+        marker = job / "terminal-capture.json"
+        outcome = entry.get("process_outcome")
+        if (not marker.exists() and outcome and outcome.get("started") is True
+                and (outcome.get("termination_reason") != "normal" or outcome.get("exit_code") not in (None, 0))):
+            from .adapters import CLIBackend
+            CLIBackend(self.context.config, self.context.directory).preserve_terminal(
+                job, self.context.config.role(entry["role"], self.context.commander)["cli"], outcome, terminal_only=True)
+        if not marker.exists():
+            if receipt.get("terminal_capture_digest") or self.terminal_capture_required(outcome):
+                raise HarnessError("终端结果的进程证据不完整；保留证据，禁止重新抽取结论")
+            return
+        self.context.ensure_exited()
+        try:
+            if marker.is_symlink() or not marker.is_file() or marker.parent.resolve() != marker.parent:
+                raise ValueError("unsafe terminal capture path")
+            raw = marker.read_bytes()
+            digest = hashlib.sha256(raw).hexdigest()
+            if receipt.get("terminal_capture_digest", digest) != digest:
+                raise ValueError("terminal capture changed")
+            capture = json.loads(raw)
+            if (not isinstance(capture, dict) or capture.get("version") != 1
+                    or capture.get("provider") not in ("claude", "codex")
+                    or capture["provider"] != self.context.config.role(entry["role"], self.context.commander)["cli"]
+                    or capture.get("source") not in (("response.json",) if capture["provider"] == "codex"
+                                                     else ("process.stdout", "stream-terminal.json", "stream-incomplete-terminal.json"))):
+                raise ValueError("invalid terminal capture")
+            for name, field in ((capture["source"], "source_digest"),
+                                ("process.outcome.json", "outcome_digest"),
+                                ("returned-result.json", "result_digest")):
+                path = job / name
+                if path.is_symlink() or not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != capture[field]:
+                    raise ValueError("terminal evidence changed")
+            support = capture.get("support_digests")
+            expected_support = ({"capture-manifest.json", "stream-capture.json"}
+                                if capture["source"] == "stream-terminal.json" else
+                                {"capture-manifest.json"} if capture["provider"] == "claude" else set())
+            if not isinstance(support, dict) or set(support) != expected_support:
+                raise ValueError("missing terminal protocol evidence")
+            for name, expected in support.items():
+                path = job / name
+                if path.is_symlink() or not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != expected:
+                    raise ValueError("terminal protocol evidence changed")
+            original = read_json(job / "process.outcome.json")
+            if (original != outcome or original.get("started") is not True
+                    or type(original.get("exit_code")) is not int or original["exit_code"] != 0
+                    or original.get("termination_reason") != "normal"
+                    or original.get("errors") or original.get("cleanup_errors")):
+                raise ValueError("terminal process did not complete normally")
+            if capture["source"] == "stream-terminal.json":
+                protocol = read_json(job / "stream-capture.json")
+                if protocol.get("protocol_complete") is not True or protocol.get("terminal_count") != 1 or protocol.get("exit_code") != 0:
+                    raise ValueError("terminal stream incomplete")
+        except (OSError, ValueError, TypeError, KeyError) as error:
+            raise HarnessError("终端结果证据缺失、改变或进程未正常完成；保留证据，禁止重新抽取结论") from error
+        if "terminal_capture_digest" not in receipt:
+            receipt["terminal_capture_digest"] = digest
+            self.context.save()
+
     def record_receipt_error(self, receipt, error):
         if receipt is None:
             return
@@ -44,6 +130,7 @@ class ResultReceipts(RuntimeService):
         """Replay the original request's result through validation and hook gates."""
         self.services.recovery.validate_invalid_repair_source(key)
         receipt = self.context.run["commander_receipts"][key]
+        self.validate_terminal_capture(receipt)
         entry = next(d for d in self.context.run["dispatches"] if d["id"] == receipt["dispatch_id"])
         if key != f"{entry['role']}:{entry['kind']}:{entry['task_id']}" or entry["role"] != "commander":
             raise HarnessError("指挥结果的派发身份与接收记录不符")
@@ -114,6 +201,7 @@ class ResultReceipts(RuntimeService):
     def finish_review_receipt(self, key, schema, packet, previous_review=None):
         """Finish a returned review without treating unvalidated JSON as approval."""
         receipt = self.context.run["review_receipts"][key]
+        self.validate_terminal_capture(receipt)
         entry = next(d for d in self.context.run["dispatches"] if d["id"] == receipt["dispatch_id"])
         artifact = Path(receipt["artifact"])
         result, digest = read_bound_result(receipt, "审阅", bind=self.context.save)

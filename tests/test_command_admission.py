@@ -54,6 +54,20 @@ class CommandAdmissionTests(unittest.TestCase):
         result = self.broker.run_command({'command_id': command_id(self.argv)})
         self.assertEqual(result['exit_code'], 0)
 
+    def test_short_lived_descendant_drain_allows_following_commands(self):
+        argv = [sys.executable, '-c', 'import subprocess,sys; '
+                'subprocess.Popen([sys.executable,"-c","import time;time.sleep(.1)"],'
+                'stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL);print("done")']
+        config = {'verification': {'commands': [argv]}, 'permissions': {'worker_commands': []},
+                  'runtime': {'verify_timeout_seconds': 2, 'agent_timeout_seconds': 10}}
+        meta = create_manifest(config, self.root, self.root / 'short-child-worker')
+        broker = Broker(meta['artifact'], meta['artifact_digest'])
+        for _ in range(3):
+            result = broker.run_command({'command_id': command_id(argv)})
+            self.assertEqual(result['exit_code'], 0)
+            self.assertTrue(result['exit_confirmed'])
+            self.assertTrue(result['evidence_complete'])
+
     def test_parent_budget_rejects_without_intent(self):
         with patch('harness.command_server.time.monotonic', return_value=self.broker.manifest['parent_deadline']):
             with self.assertRaisesRegex(HarnessError, 'budget exhausted'):

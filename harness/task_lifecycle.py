@@ -19,7 +19,10 @@ from .progress import CheckpointDeclarationError
 from .recovery import invalidate_acceptance_review, snapshot_digest, worker_recovery_context
 from .services import RuntimeService
 from .continuation import record_continuation
-from .review_progress import bind_review_source, validate_review_source, claim_gaps, disposition_gaps, required_findings
+from .review_progress import (
+    bind_review_source, validate_review_source, claim_gaps, disposition_gaps,
+    required_findings, delivered_worker_findings,
+)
 from .verification_plan import candidate_preflight
 from .verification import checks_passed
 from .shared import HookError
@@ -318,13 +321,14 @@ class TaskLifecycle(RuntimeService):
             worker_id = Path(pending["worker_artifact"]).parent.name
             full_result = {"task_id": tid, "dispatch_id": worker_id, **pending["worker_result"]}
             required = required_findings(self.context.run, tid, pending["snapshot_digest"])
+            delivered = delivered_worker_findings(self.context, tid, worker_id)
             # Only source reads occurred since this snapshot; verification will
             # independently rehash after its hooks and commands have run.
             preflight = candidate_preflight(task, full_result, worktree=self.context.worktree,
                 candidate_snapshot=snapshot, current_snapshot=snapshot,
                 worker_artifact=pending["worker_artifact"],
                 worker_artifact_digest=pending["worker_artifact_digest"], worker_dispatch_id=worker_id)
-            preflight["failures"].extend(claim_gaps(full_result, required, snapshot))
+            preflight["failures"].extend(claim_gaps(full_result, delivered, snapshot, known=required))
             preflight["passed"] = not preflight["failures"]
             preflight_path = self.context.directory / "preflight" / tid / str(attempt) / "result.json"
             write_json(preflight_path, preflight)

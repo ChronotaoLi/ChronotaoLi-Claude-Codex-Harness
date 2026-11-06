@@ -1,5 +1,6 @@
 """Source-addressed repair claims and independent dispositions, never inferred closure."""
 from pathlib import PurePosixPath
+import hashlib
 import re
 
 from .util import HarnessError
@@ -23,6 +24,15 @@ def dispositions_usable(record):
             and not record.get("validation_error") and not record.get("disposition_errors"))
 
 
+def _blocking_requirements(record):
+    references = finding_references(record["review"])
+    aliases = any(finding["id"] != reference["finding_id"] for finding, reference in references)
+    return [{"review_dispatch_id": record["review_source"]["dispatch_id"],
+             **(reference if aliases else {"finding_id": reference["finding_id"]}),
+             "artifact": record["review_source"]["artifact"], "status": "open"}
+            for finding, reference in references if finding.get("severity") == "blocking"]
+
+
 def required_findings(run, task_id, candidate_digest, *, whole_run=False, records=None):
     issues = {}
     if records is None:
@@ -34,15 +44,8 @@ def required_findings(run, task_id, candidate_digest, *, whole_run=False, record
             continue
         validate_review_source(run, task_id, record, kind="final_review" if whole_run else "review")
         review = record["review"]
-        source = record["review_source"]["dispatch_id"]
-        references = finding_references(review)
-        aliases = any(finding["id"] != reference["finding_id"] for finding, reference in references)
-        for finding, reference in references:
-            if finding.get("severity") == "blocking":
-                identity = reference if aliases else {"finding_id": reference["finding_id"]}
-                issues[(source, reference["finding_id"])] = {
-                    "review_dispatch_id": source, **identity,
-                    "artifact": record["review_source"]["artifact"], "status": "open"}
+        for row in _blocking_requirements(record):
+            issues[(row["review_dispatch_id"], row["finding_id"])] = row
         for disposition in review.get("finding_dispositions", []):
             key = (disposition["review_dispatch_id"], disposition["finding_id"])
             if (key in issues and disposition["status"] == "resolved"
@@ -54,14 +57,77 @@ def required_findings(run, task_id, candidate_digest, *, whole_run=False, record
     return list(issues.values())
 
 
-def claim_gaps(result, required, snapshot):
+def bind_worker_findings(context, entry, packet):
+    """Save the exact delivered obligations, before hooks can change the candidate."""
+    from copy import deepcopy
+    from .util import write_json
+    rows = deepcopy(packet.get("required_findings", []))
+    if len(rows) > 60:
+        raise HarnessError("worker 必需问题超过单次审阅容量；保留来源并调整计划")
+    sources = packet.get("required_finding_sources", {})
+    for row in rows:
+        if "artifact" not in row:
+            source = sources.get(row["review_dispatch_id"], {})
+            if not source.get("artifact"):
+                raise HarnessError("worker 必需问题缺少原始来源")
+            row["artifact"] = source["artifact"]
+    artifact = context.directory / "dispatches" / entry["id"] / "worker-findings.json"
+    value = {"dispatch_id": entry["id"], "task_id": entry["task_id"], "required_findings": rows}
+    write_json(artifact, value)
+    entry["worker_findings"] = {"artifact": str(artifact),
+        "artifact_digest": hashlib.sha256(artifact.read_bytes()).hexdigest()}
+
+
+def delivered_worker_findings(context, task_id, dispatch_id):
+    """Authenticate delivered requirements independently of the post-hook snapshot."""
+    from .recovery import read_bound_result
+    entries = [d for d in context.run.get("dispatches", []) if d.get("id") == dispatch_id]
+    if (len(entries) != 1 or entries[0].get("role") != "worker"
+            or entries[0].get("task_id") != task_id):
+        raise HarnessError("worker 必需问题的派发身份无效；保留证据")
+    binding = entries[0].get("worker_findings")
+    expected = context.directory / "dispatches" / dispatch_id / "worker-findings.json"
+    if (not isinstance(binding, dict) or binding.get("artifact") != str(expected)
+            or not binding.get("artifact_digest")):
+        raise HarnessError("worker 缺少实际交付的必需问题绑定；禁止推断清单，请保留证据后 abandon")
+    try:
+        if any(p.is_symlink() for p in (expected, *expected.parents)):
+            raise ValueError("symbolic link")
+        value, _ = read_bound_result(binding, "worker 必需问题")
+        if (not isinstance(value, dict) or value.get("dispatch_id") != dispatch_id or value.get("task_id") != task_id):
+            raise ValueError("dispatch or task binding changed")
+        rows = value["required_findings"]
+        if not isinstance(rows, list) or len(rows) > 60:
+            raise ValueError("required findings capacity invalid")
+        references = set()
+        canonical_sources = {}
+        records = context.run.get("review_history", {}).get(task_id, [])
+        for row in rows:
+            source = row["review_dispatch_id"]
+            if source not in canonical_sources:
+                matches = [r for r in records if (r.get("review_source") or {}).get("dispatch_id") == source]
+                if len(matches) != 1:
+                    raise ValueError("review source missing or ambiguous")
+                validate_review_source(context.run, task_id, matches[0])
+                canonical_sources[source] = _blocking_requirements(matches[0])
+            key = (source, row["finding_id"])
+            if row not in canonical_sources[source] or key in references:
+                raise ValueError("required finding differs from original source")
+            references.add(key)
+        return rows
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        raise HarnessError("worker 实际交付的必需问题证据损坏；保留证据，禁止推断清单") from error
+
+
+def claim_gaps(result, required, snapshot, *, known=()):
     claims = {(item["review_dispatch_id"], item["finding_id"]): item
               for item in result.get("repair_claims", [])}
     references = {(item["review_dispatch_id"], item["finding_id"]) for item in required}
+    known_references = references | {(item["review_dispatch_id"], item["finding_id"]) for item in known}
     failures = [{"code": "repair_claim_missing", "review_dispatch_id": source, "finding_id": finding}
                 for source, finding in sorted(references - claims.keys())]
     for key, claim in claims.items():
-        if key not in references:
+        if key not in known_references:
             failures.append({"code": "repair_claim_unknown_source", "reference": list(key)})
         for path in claim["evidence_paths"]:
             parts = PurePosixPath(path).parts

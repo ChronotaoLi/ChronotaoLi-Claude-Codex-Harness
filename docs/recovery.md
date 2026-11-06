@@ -92,7 +92,7 @@ python3 -m harness --config /path/to/harness.toml --repo /path/to/project resume
 
 同一任务最新更新的 checks 替代先前检查列表；`environment_history` 仅内联相关任务的更新引用，`environment_check_history` 仅保留每个相关 update 的最新报告引用。`environment_index` 提供内容寻址的不可变 JSON 路径、SHA256、update_count 与 check_count，索引的 updates/checks 保存完整台账引用。旧报告和其他任务历史按索引检索；已有索引损坏时拒绝覆盖，新增观测不会改变旧索引。选择前只预检已有的 current_task，不检查全部 ready 任务；选中任务在后续每次 worker 尝试（含格式修正）前仍重检，所有报告保留。已有当前任务的一次普通尝试可能在选择前与派发前分别记录报告，输入使用最近一份。检查失败不启动本次 worker，不消耗其尝试或派发预算。current_task 为空时，指挥选择可能已消耗派发预算；其选定指令保存到 pending_directive，后续恢复复用，修复条件后启动 worker 才消费该指令。worker 已返回并进入验证／审阅后不重跑这些前置检查；正常验证、独立审阅、快照和接受门禁仍全部执行，检查成功或操作者声明本身不是完成证据。
 
-状态摘要的 worker_outcomes 仅分类 worker 自报完成、任务／环境／操作者阻断、运行故障与未知结果，不替代 accepted 或 completed 门禁。last_environment_blocker 是最近环境阻断的历史诊断；后续模型调用开始后标为 stale。stale=false 也不代表具备环境更新资格：更新仍需通过进程退出、来源摘要、任务范围和待处理阶段等检查。
+状态摘要的 worker_outcomes 仅分类 worker 自报完成、任务／环境／操作者／续作阻断、运行故障与未知结果，不替代 accepted 或 completed 门禁。`continuation_blocked` 表示 worker 已结构化交还控制权等待续作条件，不计入 unknown，也不改变预算或授权。last_environment_blocker 是最近环境阻断的历史诊断；后续模型调用开始后标为 stale。stale=false 也不代表具备环境更新资格：更新仍需通过进程退出、来源摘要、任务范围和待处理阶段等检查。
 
 ## 进程退出与阶段恢复
 
@@ -102,11 +102,15 @@ python3 -m harness --config /path/to/harness.toml --repo /path/to/project resume
 
 worker 完成且结果通过检查后，持久化 `pending_task` 的 verifying 阶段及完整快照摘要；验证成功后持久化 reviewing 阶段、diff、验证产物路径、记忆提案和历轮审阅。恢复时先检查范围、HEAD 和快照；一致则继续未完成阶段，不再派发 worker 或消耗 worker 额度。验证重跑使用新的日志目录。候选变化使后续证据失效，回到新的工作尝试；越界残留先停止并提示人工核对清理，不自动删文件，不派发模型或消耗 worker 额度。
 
+worker 返回后的修复声明预检读取派发前已绑定的实际输入清单；缺失、改变、符号链接或原审阅来源不符均停止，不能重算一份清单替代。更新前已返回但尚待预检的 worker 若没有该绑定，也不补造来源，需保留证据后 abandon；已完成候选预检的后续阶段仍沿用其已保存门禁。
+
 已知窗口：worker 结果落盘、dispatch 返回之后，到 `pending_task` 或 blocker 反馈持久化之前，还会进行结果核对、忽略文件记录及候选快照。如果这时中断，普通恢复会重新调度并启动新的 worker，保留现场编辑但再次消耗尝试和派发预算。此窗口不属于 `dispatch_once` 的异常处理，可能没有 `worker_recovery` 来源；已返回的普通 worker 结果不按 reviewer／commander receipt 复用。当前不提供直接消费该旧结果的恢复协议。
 
-候选变化时，先将已返回的审阅及格式修正原始依据保存到历史，保留 dispatch、原快照、产物路径、摘要和校验错误，再清除待审阅状态。结构与身份可确认的 findings 传给后续实例复核，其余产物只作为带诊断的原始证据引用。已绑定产物缺失或篡改仍阻止恢复；失效批准不构成新候选的接受依据。
+候选变化时，先将已返回的审阅及格式修正原始依据保存到历史，保留 dispatch、原快照、产物路径、摘要和校验错误，再清除待审阅状态。结构与身份可确认的 findings 传给后续实例复核，其余产物只作为带诊断的原始证据引用。结构非法的审阅即使候选变化也继续阻止后续派发，需保留证据后 abandon，不能通过修改候选跳过其中可能存在的拒绝。已绑定产物缺失或篡改仍阻止恢复；失效批准不构成新候选的接受依据。
 
 审阅派发在调用模型之前保存 `review_receipts` 接收意图，绑定原 dispatch ID、候选快照和结果文件位置。返回结果原子落盘后即使还没完成检查就中断，恢复也读取该结果，完成原契约身份、结构、语义、格式、文件一致性和 post_agent hook 检查。结果绑定哈希后，文件缺失或改变必须停止；hook 重试使用独立日志并具有至少一次执行语义。没有返回结果的调用可在人工 resume 后重新派发，仍消耗派发预算。协议错误不能通过重抽结果消失。
+
+CLI 领导进程正常退出后，对同组后代仅作最多 2 秒有界观察。超出窗口时，已捕获的指挥／审阅终态及原输出、进程事实保持绑定，run 停止。后代退出后普通 resume 先验证捕获证据和原候选，再处理原结论；不会把收尾失败当作“供应商没有返回”而重新派发。只有原进程正常零退出、无其他执行或收尾错误、终态与运输证据完整时可继续；超时、取消、非零退出、捕获中断、证据改变或候选改变均不能借此重抽或接受。退出确认只满足退出门禁，不补造成功证据；无法核验时保留现场后 abandon。
 
 首次审阅的身份、结构和快照正确，但 finding ID 重复、blocking 缺少证据／属于偏好或记忆批准越界时，若 verdict 为 request_changes 或包含任意 blocking finding，则保留为 `invalid_rejected`。首次拒绝若语义合法、但 finding 数量、位置、说明或证据等不可变字段违反格式限制，也使用该路径。仅可变字段格式错误时，该角色／调用类型／任务的自动额度未用则走现有一次自动格式修正；额度已用的首次拒绝直接保存为 `invalid_rejected`，不追加格式修正派发。该状态保存完整原文、产物摘要和校验诊断，不修造一份合法结果，也不批准记忆；post_agent hook 仍须通过，hook 中断后恢复继续核验同一原始结果。任务级保存历史后返工，整体级保存完成的失败记录与 pending_replan，再按原预算请求修正。相同整体快照包括空 diff 修正均不可重抽审阅；不含拒绝的非法批准默认停止，仅下述显式元数据修正可继续。身份／结构错误及自动或显式修正中的非法结果继续停止。无效语义结果可能同时超过格式大小限制；历史通过原始产物引用和有界摘录传递，必要元数据仍超预算时明确停止。
 
@@ -132,7 +136,7 @@ worker 的失败反馈共享 9,000 字符的序列化摘录额度，保留状态
 
 指挥 plan、replan 和 dispatch 同样采用派发前 receipt：保存原 schema、输入包及摘要、dispatch、候选摘要、返回位置；结果原子落盘后继续原身份、结构、任务语义和格式校验。replan 另绑定持久请求 ID，合法新修订不能误用前次结果。结果摘要确定后缺失或篡改停止。post_agent 使用独立日志，保留至少一次语义；receipt 与计划、停止或已校验修订在同一次台账保存中消费。模型生成的 implement 任务选择先保存为 pending_directive，worker 本地准备失败保留它，调用后端前与尝试预算一起消费；replan 选择直接登记 pending_replan。已返回的指挥结果不再由普通恢复重新抽取；未返回结果的故障仍可显式恢复，格式修正保持原有一次额度。
 
-`resume --repair-invalid DISPATCH_ID` 提供独立、显式且有界的输出修正入口。仅匹配当前未消费的 receipt，先验证原字节摘要、派发身份、结构、当前快照，以及指挥请求摘要和 replan 请求归属。语义修正适用对象为非法 plan/revise，或 verdict 为 approve、没有 blocking finding，但重复 finding ID／批准未知记忆 key 的审阅。自动格式修正额度耗尽后，仅可变字段格式非法的指挥任务选择、revise 和无阻断 approve 也可使用同一显式额度；不得在自动修正尚未耗尽时取得额外派发。
+`resume --repair-invalid DISPATCH_ID` 提供独立、显式且有界的输出修正入口。仅匹配当前未消费的 receipt，先验证原字节摘要、派发身份、结构、当前快照，以及指挥请求摘要和 replan 请求归属。语义修正适用对象为非法 plan/revise，或 verdict 为 approve、没有 blocking finding，但重复 finding ID／批准未知记忆 key 的审阅。`finding_dispositions` 在修正中不可变；重复处置、resolved 缺少核验依据，或处置字段的长度／数量／标识符格式非法时，修正准入独立拒绝，即使同时存在可修正的 finding ID 或记忆 key 错误也不登记修正、不消耗派发，需保留证据后 abandon。自动格式修正额度耗尽后，仅可变字段格式非法的指挥任务选择、revise 和无阻断 approve 也可使用同一显式额度；不得在自动修正尚未耗尽时取得额外派发。
 
 格式耗尽的显式修正保留最初结果和最新失败修正结果的路径、派发、快照与内容摘要。review 以最初 review_corrections 守卫为约束，不能用后一次返回的内容替代最初结论；指挥的自动和显式格式修正固定最初 selected_task 或 action/new_tasks/updates，仅修正 instruction 或 reason。旧 v8 指挥格式修正没有最初结果的已绑定摘要时，普通恢复与显式修正均停止：既不派发未返回的修正，也不接受已有修正结果，不从现有文件补造可信依据；操作者可保留证据后 abandon。旧 reviewer 守卫已有原始摘要，可按同一条件恢复。合法结果及其 hook 失败、stop、拒绝或 blocking 审阅、身份／结构错误、改变原结论的 failed 守卫均不适用；非阻断批准的 finding 数量、位置、内容或证据等不可变字段超限仍属于 unrepairable，不派发无解修正。符合前述条件的首次拒绝按 invalid_rejected 路径处理；已保存的拒绝型 exhausted 或 unrepairable 守卫不自动转换，同一快照仍停止。任务候选真实变化时仅按证据归档与完整重做路径恢复。
 

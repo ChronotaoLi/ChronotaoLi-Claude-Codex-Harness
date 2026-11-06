@@ -2,6 +2,7 @@ import hashlib
 import json
 import sys
 
+from harness.cli import status_summary
 from harness.util import HarnessError, read_json, write_json
 from test_harness import RepoCase, ROOT
 from test_runtime_changes import ScriptedBackend, finding
@@ -29,6 +30,9 @@ class RedesignIntegrationTests(RepoCase):
             engine.start("Implement greet", self.plan())
         self.assertEqual(engine.run["attempts"]["greet"], 1)
         self.assertEqual(engine.run["accepted"], {})
+        outcomes = status_summary(engine.run)["worker_outcomes"]
+        self.assertEqual(outcomes["continuation_blocked"], 1)
+        self.assertEqual(outcomes["unknown"], 0)
         initial = len(backend.calls)
         with self.assertRaises(HarnessError):
             self.engine(backend).resume(engine.run["id"])
@@ -44,6 +48,10 @@ class RedesignIntegrationTests(RepoCase):
         self.assertFalse(any(row.get("attempt_exemption") for row in workers))
         self.assertEqual(len(result["continuation_history"]), 1)
         self.assertIsNone(result["pending_continuation"])
+        outcomes = status_summary(result)["worker_outcomes"]
+        self.assertEqual(outcomes["continuation_blocked"], 1)
+        self.assertEqual(outcomes["completed"], 1)
+        self.assertEqual(outcomes["unknown"], 0)
 
     def test_budget_request_requires_explicit_increase(self):
         before = self.config.data["runtime"]["agent_timeout_seconds"]

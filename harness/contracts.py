@@ -238,6 +238,11 @@ def validate_review_semantics(result, proposed_keys=()):
                 raise HarnessError("阻断 finding 必须有证据，且不能仅为偏好")
     if not set(result["approved_memory_keys"]) <= set(proposed_keys):
         raise HarnessError("审阅批准了不存在的记忆提案")
+    validate_finding_dispositions(result)
+
+
+def validate_finding_dispositions(result):
+    """Check immutable dispositions independently of repairable approval metadata."""
     refs = [(r["review_dispatch_id"], r["finding_id"]) for r in result.get("finding_dispositions", [])]
     if len(set(refs)) != len(refs):
         raise HarnessError("审阅处置不能重复引用同一来源问题")

@@ -133,7 +133,8 @@ def status_summary(run):
     result["budget_explanation"] = budget_explanation(run, result["budgets"]["work_attempts"])
     dispatches = run.get("dispatches", [])
     dispatches = [entry for entry in dispatches if isinstance(entry, dict)] if isinstance(dispatches, list) else []
-    outcomes = dict.fromkeys(("completed", "task_blocked", "environment_blocked", "operator_blocked", "runtime_failed", "unknown"), 0)
+    outcomes = dict.fromkeys(("completed", "task_blocked", "environment_blocked", "operator_blocked",
+                              "continuation_blocked", "runtime_failed", "unknown"), 0)
     for entry in dispatches:
         if entry.get("role") == "worker":
             outcome = entry.get("worker_outcome")

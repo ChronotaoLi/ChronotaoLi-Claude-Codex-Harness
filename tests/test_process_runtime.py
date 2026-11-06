@@ -6,6 +6,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -177,6 +178,28 @@ class ProcessRuntimeTests(unittest.TestCase):
             for pgid in pgids:
                 with contextlib.suppress(ProcessLookupError):
                     os.killpg(pgid, signal.SIGKILL)
+
+    def test_descendant_drain_respects_shared_cleanup_deadline(self):
+        child_file = self.root / "child"
+        script = ('import subprocess,sys; p=subprocess.Popen([sys.executable,"-c",'
+                  '"import time; time.sleep(30)"],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL); '
+                  f'open({str(child_file)!r},"w").write(str(p.pid))')
+        started = time.monotonic()
+        try:
+            with self.assertRaises(HarnessError) as caught:
+                self.invoke(script, cleanup_deadline=started + .2)
+            self.assertLess(time.monotonic() - started, .6)
+            outcome = caught.exception.outcome
+            self.assertEqual(outcome.cleanup_actions.count("drain_descendants"), 1)
+            self.assertLess(len(outcome.cleanup_actions), 5)
+            self.assertEqual(outcome.exit_code, 0)
+            self.assertFalse(outcome.exit_confirmed)
+            self.assertNotIn("sigterm", outcome.cleanup_actions)
+            os.kill(int(child_file.read_text()), 0)
+        finally:
+            if child_file.exists():
+                with contextlib.suppress(ProcessLookupError):
+                    os.kill(int(child_file.read_text()), signal.SIGKILL)
 
     def test_intent_failure_prevents_start(self):
         with patch('harness.util.write_json', side_effect=OSError('intent fault')), \

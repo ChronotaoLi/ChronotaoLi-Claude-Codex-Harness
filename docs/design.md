@@ -303,7 +303,11 @@ Claude 新运行可选 `stream_metadata_v1`。每个 Claude CLI 派发独占冻�
 
 任务可声明 `self_checks` 和 `evidence_requirements`；WORK 用 `evidence_files` 返回 requirement_id/path/sha256/kind。预检核对源结果、候选、必需材料身份及摘要，再执行昂贵门禁。kind 与义务映射不能证明语义覆盖。已知阻断问题按 review_dispatch_id/finding_id 绑定，worker 的 `repair_claims` 必须完整回应所需问题并引用候选内路径；reviewer 独立给出 `finding_dispositions`，approve 要求全部所需问题 resolved 且有证据。遗漏旧 finding 或 worker 自称修好均不关闭问题；解决结论只适用于其已绑定候选。 任务审阅历史与 `final_history` 均生成 required_findings；整体批准也须逐项独立处置旧整体阻断。历史 finding ID 非法或重复时，按原审阅 dispatch 与原列表位置生成 `finding-N` 别名，并保留 original_finding_id/finding_index 与原始结果；别名用于协议关联，不改写原文。无效拒绝中的问题仍须处理，其 dispositions 不能关闭问题。
 
+worker 的必需修复声明以本次实际发送的 `required_findings` 为准：调用前将完整来源身份清单绑定到 task、dispatch 和内容摘要，候选预检核验该清单及原审阅来源，不按 worker 改动后或 pre_agent hook 后的快照重算其已收到的要求。worker 可以额外回应当前候选重新打开的历史问题，未知来源仍拒绝。reviewer 独立按新候选计算全部待处置问题；输入清单绑定不延长旧解决结论的有效期，不减少正式验证或独立审阅。
+
 共享进程结果分别保留真实 exit_code、termination_reason、退出确认、cleanup 失败与证据完整性，收尾失败不覆盖已知退出码或超时原因。成功门禁不能仅看 code=0。命令准入在资源锁内检查全部未解决 journal 并持久化 starting 意图；未知退出或启动状态阻止下一命令。worker 父派发与其委托命令保留所有权区别，正式验证不得与活动候选修改竞争。子命令有效绝对截止不超过自身上限及父派发截止减 2 秒收尾余量，无剩余时间不启动。退出确认不补造退出码、输出或成功证据；进程组监督不等于完整 OS 进程树隔离。
+
+领导进程正常退出后，同组后代最多有 2 秒只观察的退出窗口，且不超过 cleanup_deadline；回收领导后不向身份连续性未知的进程组发送终止信号。窗口结束仍未确认退出时停止消费结果。指挥与审阅的已捕获终态另行绑定原输出、进程事实和结果摘要，恢复须先确认退出、核验原始证据与候选，再继续同一结果的契约和 hook 门禁，不重新抽取结论。该恢复仅允许正常零退出且唯一缺口为后代退出确认的结果；超时、取消、非零退出、协议损坏或证据不完整不因后代退出而成为成功。保留的原始 process outcome 不改写为成功，捕获未完成或证据损坏时持续阻断并保留现场。
 
 续作和执行约束的输入、来源及恢复门禁见[恢复协议](recovery.md#续作与操作指导)。这些行为边界不构成模型效果、提速或返工下降的测量结论。
 

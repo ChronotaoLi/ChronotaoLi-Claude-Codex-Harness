@@ -90,6 +90,53 @@ class ExplicitOutputRepairTests(RepoCase):
         self.assertEqual([f["message"] for f in repaired["findings"]], [f["message"] for f in advice])
         self.assertTrue(self.engine().memory.search("greet"))
 
+    def test_invalid_dispositions_reject_repair_before_spending_even_with_other_errors(self):
+        for kind in ("review", "final_review"):
+            for defect in ("duplicate", "missing_evidence", "overlong_evidence", "overfull_evidence"):
+                metadata_cases = (("unknown_memory", "duplicate_findings") if defect.startswith("over")
+                                  else ("valid", "unknown_memory", "duplicate_findings"))
+                for metadata in metadata_cases:
+                    with self.subTest(kind=kind, defect=defect, metadata=metadata):
+                        def change(backend, kwargs, packet, result):
+                            if kwargs["kind"] != kind:
+                                return
+                            disposition = {"review_dispatch_id": "prior-review", "finding_id": "edge-case",
+                                           "status": "resolved", "evidence": ["hello.py"]}
+                            if defect == "missing_evidence":
+                                disposition["evidence"] = []
+                            elif defect == "overlong_evidence":
+                                disposition["evidence"] = ["x" * 4001]
+                            elif defect == "overfull_evidence":
+                                disposition["evidence"] = ["hello.py"] * 21
+                            result["finding_dispositions"] = [disposition] * (2 if defect == "duplicate" else 1)
+                            if metadata == "unknown_memory":
+                                result["approved_memory_keys"] = ["nonexistent"]
+                            elif metadata == "duplicate_findings":
+                                result["findings"] = [finding("advisory", "preference")] * 2
+
+                        backend = ScriptedBackend(change)
+                        engine = self.engine(backend)
+                        with self.assertRaises(HarnessError):
+                            engine.start("Implement greet", self.plan())
+                        key = f"reviewer:{kind}:{'greet' if kind == 'review' else 'final'}"
+                        source = copy.deepcopy(engine.run["review_receipts"][key])
+                        original = Path(source["artifact"]).read_bytes()
+                        calls = copy.deepcopy(backend.calls)
+                        budgets = {name: engine.run[name] for name in ("agent_dispatches", "total_attempts", "final_attempts")}
+                        for options in ({"repair_invalid": source["dispatch_id"]}, {}):
+                            with self.assertRaises(HarnessError) as caught:
+                                self.engine(backend).resume(engine.run["id"], **options)
+                            if options:
+                                self.assertIn("abandon", str(caught.exception))
+                            saved = read_json(engine.directory / "state.json")
+                            self.assertEqual(backend.calls, calls)
+                            self.assertEqual({name: saved[name] for name in budgets}, budgets)
+                            self.assertEqual(saved["invalid_repairs"], {})
+                            self.assertEqual(saved["review_receipts"][key]["dispatch_id"], source["dispatch_id"])
+                            self.assertEqual(Path(source["artifact"]).read_bytes(), original)
+                        self.engine(backend).abandon(engine.run["id"])
+                        self.assertEqual(read_json(engine.directory / "state.json")["status"], "abandoned")
+
     def test_invalid_correction_cannot_reroll_or_get_an_extra_format_attempt(self):
         for correction in (lambda r: r.update(summary="x" * 4001),
                            lambda r: r.update(verdict="request_changes"),

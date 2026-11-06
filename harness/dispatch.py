@@ -17,6 +17,7 @@ from .contracts import (
 from .receipts import InvalidReviewRejection
 from .path_evidence import validate_dispatch_indexes, validate_indexes
 from .recovery import snapshot_digest
+from .review_progress import bind_worker_findings
 from .services import RuntimeService
 from .shared import validate_mcp
 from .util import group_alive, HarnessError, read_json, write_json
@@ -77,6 +78,7 @@ class Dispatcher(RuntimeService):
             receipts = self.context.run["commander_receipts"] if role == "commander" else self.context.run["review_receipts"]
             receipt = receipts.get(key)
             if receipt and "artifact_digest" not in receipt and not Path(receipt["artifact"]).exists():
+                self.services.receipts.validate_terminal_capture(receipt)
                 # Intent was saved before invoke; the provider never returned a
                 # usable result. Retrying still consumes a fresh dispatch budget.
                 receipts.pop(key)
@@ -224,6 +226,7 @@ class Dispatcher(RuntimeService):
         if role == "worker":
             (job / "commands").mkdir()
             entry["command_directory"] = str(job / "commands")
+            bind_worker_findings(self.context, entry, required["packet"])
         self.context.save()
         self.context.event("dispatch_started", task_id=task_id, dispatch_id=dispatch_id, role=role)
         def on_start(pgid):
@@ -368,6 +371,15 @@ class Dispatcher(RuntimeService):
                                    and entry["process_state"] == "starting" and entry["pgid"] is None)
             entry["status"] = "failed"
             entry["error"] = str(error)
+            if role in ("reviewer", "commander"):
+                receipt = self.context.run["review_receipts" if role == "reviewer" else "commander_receipts"].get(f"{role}:{kind}:{task_id}")
+                capture = job / "terminal-capture.json"
+                if receipt and capture.exists():
+                    if capture.is_file() and not capture.is_symlink():
+                        receipt["terminal_capture_digest"] = hashlib.sha256(capture.read_bytes()).hexdigest()
+                    artifact = job / "returned-result.json"
+                    if artifact.is_file() and not artifact.is_symlink():
+                        receipt["artifact_digest"] = hashlib.sha256(artifact.read_bytes()).hexdigest()
             if not isinstance(error, (KeyboardInterrupt, SystemExit)):
                 self.context.run["last_runtime_error"] = {"role": role, "kind": kind, "task_id": task_id,
                                                  "error": str(error), "artifact": str(job)}
