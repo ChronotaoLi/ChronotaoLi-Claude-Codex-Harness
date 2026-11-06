@@ -83,6 +83,8 @@ python3 -m harness --config /absolute/path/harness.toml --repo /absolute/path/to
 
 worker 可用结构化续作请求正常交还控制权，等待精确命令授权或单次派发超时调整；满足条件后以全新派发继续原候选，累计调用和任务预算保留。`resume RUN --execution-guidance FILE` 可在安全待处理任务边界登记绑定来源与候选的操作约束；指导不授予命令权限。格式与适用边界见[续作与操作指导](docs/recovery.md#续作与操作指导)。
 
+续作请求中的命令或方案需要先修正时，使用 `resume RUN --reject-continuation FILE` 显式拒绝当前请求，保留候选交给同一任务的全新 worker。无需先授权旧命令或增加请求的超时；拒绝记录绑定原请求和候选，累计预算继续计算，新命令仍须独立授权。`status RUN` 提供请求绑定字段，输入格式与中断恢复规则见[续作与操作指导](docs/recovery.md#续作与操作指导)。
+
 默认连续执行。需要先检查计划或分步执行时：
 
 ```bash
@@ -152,6 +154,7 @@ python3 -m harness --repo /path/to/project cleanup-run RUN --remove
 | --- | --- |
 | 等待计划批准 | `resume RUN --approve-plan` |
 | 精确命令未授权 | 追加配置后普通 `resume RUN` |
+| 续作请求需要先修正 | `resume RUN --reject-continuation FILE` |
 | 已保存 worker 环境阻断 | 修复条件后 `resume RUN --environment-update FILE` |
 | 等待用户决定 | 从 status 取 request ID，`resume RUN --operator-decision FILE`；可重复参数一次回答多项 |
 | 指挥明确停止 | 已登记的有效请求用 `resume RUN --operator-decision FILE` 回答；无可用请求的历史停止用 `--retry-stopped TASK_ID`，整体阶段用 `final` |

@@ -65,7 +65,7 @@ python3 -m harness --repo /abs/project dashboard --port 8765
 | `operation_id`、`kind` | 记录 ID；`run` 或 `resume` |
 | `status` | `prepared`（已创建）→ `running`（已关联 run）→ `finished`（CLI 结束） |
 | `started_at`、`started_at_utc`、`finished_at`、`finished_at_utc` | epoch 秒与 ISO 8601 UTC |
-| `arguments` | `run`：`goal`、`plan`（路径或 null）、`commander`、`pause_after_plan`、`step`；`resume`：`run_id`、`approve_plan`、`step`、`reverify`、`retry_stopped`、`confirm_exited`、`repair_invalid`、`environment_update`（路径或 null）、`operator_decision`（路径列表）、`allow_scope`。文件型选项只记路径 |
+| `arguments` | `run`：`goal`、`plan`（路径或 null）、`commander`、`pause_after_plan`、`step`；`resume`：`run_id`、`approve_plan`、`step`、`reverify`、`retry_stopped`、`confirm_exited`、`repair_invalid`、`environment_update`、`execution_guidance`、`reject_continuation`（后三项为路径或 null）、`operator_decision`（路径列表）、`allow_scope`。文件型选项只记路径 |
 | `repo`、`repo_head` | 目标项目绝对路径与当时 HEAD；取不到为 null |
 | `harness` | `package`、`revision`、`runtime_modified`、`python`、`executable`，与 `doctor` 回显相同 |
 | `config` | `path`、`sha256`（配置文件字节摘要） |
@@ -73,9 +73,9 @@ python3 -m harness --repo /abs/project dashboard --port 8765
 | `models` | 配置中 commander／fable／worker／reviewer 的 `cli`、`model`、`effort` 原样 |
 | `cli` | `claude`、`codex` 的 `path`（PATH 查找结果）与 `version`（`--version` 首个非空行，5 秒超时，失败为 null） |
 | `run_id`、`run_linked_at` | run 持久登记后立即写入；创建 run 前失败时为 null |
-| `exit_status`、`result_status`、`error`、`error_type`、`error_omitted` | CLI 退出码（0／1／130）、最终 JSON 的 `status`、错误首行与异常类型名。本次调用含文件型输入（`--plan`、`--environment-update`、`--operator-decision`）且出错时，`error` 为 null 并写 `error_omitted: "file inputs present; see stderr"`，只保留 `error_type`，因为校验错误可能引用文件中的字段值；错误全文仍输出到 stderr。无文件输入时 `error_omitted` 为 null |
+| `exit_status`、`result_status`、`error`、`error_type`、`error_omitted` | CLI 退出码（0／1／130）、最终 JSON 的 `status`、错误首行与异常类型名。本次调用含文件型输入（计划或恢复 JSON，包括执行指导与续作拒绝）且出错时，`error` 为 null 并写 `error_omitted: "file inputs present; see stderr"`，只保留 `error_type`，因为校验错误可能引用文件中的字段值；错误全文仍输出到 stderr。无文件输入时 `error_omitted` 为 null |
 
-记录不保存环境变量值、凭据、`--plan`／`--environment-update`／`--operator-decision` 的文件内容或生成的 MCP 配置。
+记录不保存环境变量值、凭据、计划或恢复 JSON 的文件内容或生成的 MCP 配置。
 
 run 身份的关联：`run` 的首次台账保存随同写入可选字段 `created_by_operation`（不是额外一次保存），保存成功后追加 `run_created` 事件（带 `operation_id`）、在 stderr 输出一行 `[harness-json] {"event":"run_created","run_id":"...","operation_id":"..."}`，并立即把 `run_id` 写进记录，长时间运行或被强制终止时也能关联。`resume` 在自身预检门禁（含计划批准）通过后、进入 `execute()` 前同样追加 `run_resumed` 事件与通知。
 

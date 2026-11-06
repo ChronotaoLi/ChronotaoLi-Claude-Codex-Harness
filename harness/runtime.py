@@ -72,11 +72,12 @@ class Runtime:
         return self.services.lifecycle.abandon(ident, remove_worktree=remove_worktree, confirm_exited=confirm_exited)
 
     def resume(self, ident, *, step=False, approve_plan=False, reverify=False, retry_stopped=None, confirm_exited=(),
-               repair_invalid=None, allow_scope=(), environment_update=None, operator_decision=None, execution_guidance=None):
+               repair_invalid=None, allow_scope=(), environment_update=None, operator_decision=None,
+               execution_guidance=None, reject_continuation=None):
         return self.services.lifecycle.resume(ident, step=step, approve_plan=approve_plan, reverify=reverify,
             retry_stopped=retry_stopped, confirm_exited=confirm_exited, repair_invalid=repair_invalid,
             allow_scope=allow_scope, environment_update=environment_update, operator_decision=operator_decision,
-            execution_guidance=execution_guidance)
+            execution_guidance=execution_guidance, reject_continuation=reject_continuation)
 
     def execute(self, supplied_plan=None, *, step=False):
         return self.services.scheduler.execute(supplied_plan, step=step)

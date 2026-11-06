@@ -10,7 +10,7 @@ from . import git
 from .operations import warn
 from .path_evidence import validate_dispatch_indexes
 from .services import RuntimeService
-from .continuation import packet as continuation_packet, record_execution_guidance
+from .continuation import packet as continuation_packet, record_execution_guidance, record_continuation_rejection
 from .shared import asset_digest, validate_mcp
 from .util import HarnessError, lock, read_json, uid, validate_command_directories
 
@@ -282,7 +282,7 @@ class RunLifecycle(RuntimeService):
 
     def resume(self, ident, *, step=False, approve_plan=False, reverify=False, retry_stopped=None, confirm_exited=(),
                repair_invalid=None, allow_scope=(), environment_update=None, operator_decision=None,
-               execution_guidance=None):
+               execution_guidance=None, reject_continuation=None):
         runtime = self.context
         self.load_run(ident)
         with lock(self.context.directory / "run.lock"):
@@ -291,9 +291,13 @@ class RunLifecycle(RuntimeService):
                 raise HarnessError("该 run 已放弃；保留分支、工作树与证据，不能继续派发")
             self.context.commander = self.context.run["commander"]
             if self.context.run["status"] == "completed":
-                if confirm_exited or repair_invalid is not None or allow_scope or environment_update is not None or operator_decision is not None or execution_guidance is not None:
-                    raise HarnessError("--confirm-exited、--repair-invalid、--allow-scope、--environment-update 与 --operator-decision 仅用于未完成的 run")
+                if confirm_exited or repair_invalid is not None or allow_scope or environment_update is not None or operator_decision is not None or execution_guidance is not None or reject_continuation is not None:
+                    raise HarnessError("恢复修改选项仅用于未完成的 run（含 --reject-continuation 与 --execution-guidance）")
                 return self.context.run
+            if reject_continuation is not None and (operator_decision is not None or environment_update is not None
+                    or execution_guidance is not None or reverify or retry_stopped is not None
+                    or repair_invalid is not None or allow_scope):
+                raise HarnessError("--reject-continuation 不能与决定、环境更新、执行指导、重验、重规划或修正合用")
             if execution_guidance is not None and (operator_decision is not None or environment_update is not None
                     or reverify or retry_stopped is not None or repair_invalid is not None or allow_scope):
                 raise HarnessError("--execution-guidance 不能与决定、环境更新、重验、重规划或修正合用")
@@ -390,6 +394,8 @@ class RunLifecycle(RuntimeService):
             self.services.environment.record_environment_update(update)
             if execution_guidance is not None:
                 record_execution_guidance(runtime, execution_guidance)
+            if reject_continuation is not None:
+                record_continuation_rejection(runtime, reject_continuation)
             self.services.planning.report_command_requirements()
             if self.context.run["tasks"] and self.context.run["plan_approval_required"] and not self.context.run["plan_approved"]:
                 if not approve_plan:

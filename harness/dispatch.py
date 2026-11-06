@@ -10,6 +10,7 @@ from pathlib import Path
 from . import git
 from .adapters import provider_usage
 from .context import compose
+from .continuation import validate_continuation_rejection
 from .contracts import (
     RepairableFormatError, validate, validate_immutable_findings, validate_structure,
     validate_work_semantics,
@@ -276,6 +277,10 @@ class Dispatcher(RuntimeService):
             validate_mcp(self.context.config, roles=(role,))
             before = self.context.snapshot()
             entry["snapshot_digest"] = snapshot_digest(before)
+            rejection = validate_continuation_rejection(self.context, before,
+                                                       worker_task=task_id if role == "worker" else None)
+            if rejection and role != "worker":
+                raise HarnessError("continuation revision requires a fresh worker before other model calls")
             self.services.planning.validate_retained_candidate(before=before, worker_task=task_id if role == "worker" else None)
             self.services.budgets.validate_attempt_accounting()
             self.services.recovery.validate_invalid_repair_source(f"{role}:{kind}:{task_id}", before)
@@ -323,6 +328,8 @@ class Dispatcher(RuntimeService):
             entry["process_state"] = "starting"
             entry["invoked"] = True
             entry["invoked_at"] = time.time()
+            if rejection:
+                entry["continuation_rejection_id"] = rejection["id"]
             if role == "worker" and self.context.run.get("retained_candidate"):
                 entry["retained_candidate_revision"] = self.context.run.pop("retained_candidate")["plan_revision"]
             self.context.save()

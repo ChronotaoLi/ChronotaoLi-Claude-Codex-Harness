@@ -84,7 +84,7 @@ python3 -m harness --config /path/to/harness.toml --repo /path/to/project resume
 
 `resume RUN --environment-update FILE` 接受最多 64 KiB 的严格 JSON，每个 run 最多 32 条更新：必填 `schema_version: 1`、`task_id`、`blocker_dispatch_id` 和非空、至多 4,000 字符的 `summary`；可选 `checks` 默认 `[]`，最多 16 项。未知字段拒绝。检查只允许 `{kind: "path", path: 绝对路径, path_type: "file"|"directory"|"any"}`、`{kind: "executable", name: 可执行文件名或绝对路径}`、`{kind: "worker_command", argv: 精确命令数组}`。命令检查以是否已在当前 worker_commands 或 verification.commands 中声明判定通过；未声明时仍保留更新及失败检查报告，追加精确配置授权后普通 resume 可重检。检查不执行命令、不启动子进程、不新增授权，也不保证真实 CLI、账号或服务成功。只需表达操作者事实时可省略 checks。
 
-接受更新前在 run 锁内核对进程退出、Git 绑定、HEAD、当前任务与范围，以及保存的环境 blocker 来源身份和原结果摘要。只接受当前未接受任务的 worker 环境阻断边界；首次后续模型调用前中断，即使状态为 interrupted 或遗留 running，仍按这些证据判断资格。后续模型调用使旧来源失效，包括已开始但失败的指挥调用；需在新的 worker 环境阻断后再提交更新。存在待处理任务／最终验证或审阅、接受及接受后待办、再规划／指挥 stop、pending_directive、commander/reviewer receipt、待格式修正或活动非法结果修正时拒绝。完成或放弃状态拒绝更新；与 reverify、retry-stopped、allow-scope、repair-invalid 互斥，step 可合用。不得通过更新清除任何 receipt、修正守卫、已保存拒绝或批准快照。
+接受更新前在 run 锁内核对进程退出、Git 绑定、HEAD、当前任务与范围，以及保存的环境 blocker 来源身份和原结果摘要。只接受当前未接受任务的 worker 环境阻断边界；首次后续模型调用前中断，即使状态为 interrupted 或遗留 running，仍按这些证据判断资格。后续模型调用使旧来源失效，包括已开始但失败的指挥调用；需在新的 worker 环境阻断后再提交更新。存在待处理任务／最终验证或审阅、接受及接受后待办、再规划／指挥 stop、pending_directive、commander/reviewer receipt、待格式修正或活动非法结果修正时拒绝。完成或放弃状态拒绝更新；与 reverify、retry-stopped、allow-scope、repair-invalid、operator-decision、execution-guidance、reject-continuation 互斥，step 可合用。不得通过更新清除任何 receipt、修正守卫、已保存拒绝或批准快照。
 
 更新输入复制到私有产物并绑定摘要，原输入文件不再是恢复依赖。所有历史更新、来源及检查报告在恢复及投影前核验；缺失或篡改时停止。有效来源的重复相同更新幂等，审计事件可因中断重复但台账只有一条引用。上下文只包含相关任务的最新摘要及紧凑检查结果：worker／任务 reviewer 看当前任务，dispatch 看 ready 任务，replan 看触发任务，final reviewer 看各任务。完整历史、checks、argv 和报告保留路径与 SHA256 引用；依赖省略的细节前须读取并核验产物，失败检查先查看详情。原目标、验收、范围、实际权限及未解决 blocker 始终保留，任务环境断言不得推广到其他任务。整体容量预估采用相同投影。
 
@@ -146,7 +146,7 @@ worker 的失败反馈共享 9,000 字符的序列化摘录额度，保留状态
 
 语义修正与格式耗尽修正共用这一次显式额度；格式修正不允许改变已批准 key 集合。显式修正再次格式非法也不取得自动修正额度，普通恢复继续校验同一个已返回结果。
 
-原始依据在准备、派发和接收修正时继续核验。已返回的修正结果由新 receipt 完成同一校验与 hook，不因再次非法、格式错误或中断自动增加派发；未返回结果的 CLI 故障可普通 resume 继续，保留授权并计入预算。完成、失败或待处理的修正记录均不清零，任务候选变化仍走原审阅证据归档路径。`--repair-invalid` 与 `--reverify`、`--retry-stopped`、`--allow-scope` 互斥，不能组合成丢弃结果或扩大权限的捷径。
+原始依据在准备、派发和接收修正时继续核验。已返回的修正结果由新 receipt 完成同一校验与 hook，不因再次非法、格式错误或中断自动增加派发；未返回结果的 CLI 故障可普通 resume 继续，保留授权并计入预算。完成、失败或待处理的修正记录均不清零，任务候选变化仍走原审阅证据归档路径。`--repair-invalid` 与 `--reverify`、`--retry-stopped`、`--allow-scope`、`--environment-update`、`--operator-decision`、`--execution-guidance`、`--reject-continuation` 互斥，不能组合成丢弃结果或扩大权限的捷径。
 
 结构与语义正确但格式超限的 blocked/task worker 结果先保存完整证据和 pending_replan，再停止；resume 直接请求有界再规划。环境 blocker 仍停止，不将权限或服务故障变成工程再规划。恢复中校验 receipt 的错误同步更新 dispatch 及 last_runtime_error，避免仅 run 状态反映故障。
 
@@ -257,7 +257,7 @@ python3 -m harness --config /path/to/harness.toml --repo /path/to/project resume
 
 `--operator-decision` 可重复指定多个文件。整批先验证，重复 request ID 或任一非法／过期答复使整批拒绝且不登记答复；通过后预写不可变证据并一次保存全部答复，再进入调度。任一 stop 使本次恢复保存整批后停止，不派发模型。预写中断后按原文件和原顺序重试，已落盘但未登记的产物会复用；改变顺序可能因 sequence 冲突而停止。每个任务仍需全部相关问题答复才可派发，无关任务沿用原调度规则。
 
-`--operator-decision` 与 `--environment-update`、`--retry-stopped`、`--reverify`、`--repair-invalid`、`--allow-scope` 互斥，可与 `--confirm-exited`、`--step` 合用。操作者已回答 stop 时，必须向同一请求提交新的 continue；单独 `--retry-stopped` 不能覆盖该决定。完成或放弃的 run 拒绝回答。操作者决定是任务范围内的选择，不是其他任务的环境事实、记忆指令或权限授予。
+`--operator-decision` 与 `--environment-update`、`--execution-guidance`、`--reject-continuation`、`--retry-stopped`、`--reverify`、`--repair-invalid`、`--allow-scope` 互斥，可与 `--confirm-exited`、`--step` 合用。操作者已回答 stop 时，必须向同一请求提交新的 continue；单独 `--retry-stopped` 不能覆盖该决定。完成或放弃的 run 拒绝回答。操作者决定是任务范围内的选择，不是其他任务的环境事实、记忆指令或权限授予。
 
 工作上下文按任务筛选决定，整体审阅和再规划包含全部请求的紧凑投影。问题与答复摘录共享 4,000 字符额度，每段最多 500 字符；ID、来源和最新 continue/stop 保留，未答复为 response=null。`operator_decision_index` 的路径与 SHA256 绑定完整请求、当前答复及全部历史答复，含原产物路径和摘要；依赖截断信息前须读取全文。被省略的来源仍须通过完整性校验，原文和台账不被截断或替换。
 
@@ -446,12 +446,24 @@ worker 需要新精确命令或更长单次派发时间时，返回 status=block
 
 预算请求用 kind=budget、commands=[] 和正的 minimum_timeout_seconds。请求不授权、不执行命令，也不表示任务完成。运行时保存来源结果及候选绑定；普通恢复仅在请求命令已独立进入 verification.commands/permissions.worker_commands，或 agent_timeout_seconds 已达到请求下限时继续。仍须确认旧派发及所有命令退出、来源与候选完整，再以全新进程、dispatch 和能力清单续作。每次真实调用计入累计预算，续作不重置任务尝试或其他上限。
 
+操作者判定当前命令或方案需要先修正时，可用 `resume RUN --reject-continuation FILE` 拒绝当前续作请求并返回同一任务的修正 worker。输入为最多 64 KiB 的严格 JSON，恰有以下五个字段；前四项从 `status RUN` 的 `continuation` 取值：
+
+```json
+{"continuation_id":"continuations_<sha256>","task_id":"task_id_from_status","source_dispatch_id":"worker_dispatch_id","source_snapshot_digest":"64_lowercase_hex_characters","reason":"旧命令绑定的脚本需要先修正；修改脚本与清单后重新申请新 SHA 的精确命令。"}
+```
+
+reason 非空、最多 4,000 字符；其余字段非空、最多 120 字符，摘要必须为 64 位小写十六进制，禁止重复字段和 NUL。入口仅用于 blocked／interrupted／paused 的当前未接受任务，要求源结果、请求、候选、Git 绑定及 HEAD 一致，旧派发和 broker 命令均已退出，且没有后续模型调用或其他待处理阶段。它同时支持 commands 和 budget 请求，不改变配置权限、原目标、任务范围、required_commands、验收及累计预算；已授权的命令不会因此被撤销。该选项与执行指导、操作者决定、环境更新、重验、停止重试、非法结果修正、扩展范围互斥，仍可结合退出确认与分步执行。
+
+拒绝证据私有保存在 `continuation-rejections/`，保留完整原请求和来源引用；拒绝记录、旧请求解除及候选绑定的待执行指令在同一次台账保存中发布。下一步直接派发同一任务的全新 worker，不先调用指挥或归档候选。角色输入明确标记历史请求已被拒绝，并提供拒绝原因。worker 可以在原权限内修改候选、采用其他可行方案或重新请求条件；新的命令／超时请求仍经过普通门禁，拒绝不豁免任何工作尝试。
+
+候选绑定保留到修正 worker 的实际调用，与其 dispatch ID 和预算在同一次保存中消费。启动前再次检查 pre_agent 之后的候选和证据，准备失败、预算耗尽或中断不会清除绑定。拒绝已保存但 worker 尚未调用时，普通 `resume RUN` 继续同一修正；相同拒绝文件可幂等重试，修改原因、重放已消费拒绝或指向其他请求均拒绝。候选或证据改变时停止并保留现场，不自动丢弃绑定。修正完成仍须通过正式任务验证、独立任务审阅和最终验收。
+
 `resume RUN --execution-guidance FILE` 接受最多 64 KiB 的严格 JSON，仅有以下四个字段：
 
 ```json
 {"task_id":"task_id_from_status","source_dispatch_id":"worker_dispatch_id","source_snapshot_digest":"64_lowercase_hex_characters","summary":"必须遵守的具体执行约束"}
 ```
 
-summary 非空且最多 4,000 字符，其余字段非空且最多 120 字符，摘要必须为 64 位小写十六进制。入口要求当前未接受任务的安全暂停边界，来源必须已有权威 worker 结果／候选绑定，且没有后续模型调用取代该来源；当前候选必须仍匹配。内容私有保存并按任务进入角色视图，视图标明当前适用性；候选改变时旧指导不能冒充当前约束。指导不得授予命令权限、改变目标、放宽验收或增加预算；与计划冲突应调整或明确阻塞。该选项不能与决定、环境更新、重验、停止重试、非法结果修正或扩展范围合用。
+summary 非空且最多 4,000 字符，其余字段非空且最多 120 字符，摘要必须为 64 位小写十六进制。入口要求当前未接受任务的安全暂停边界，来源必须已有权威 worker 结果／候选绑定，且没有后续模型调用取代该来源；当前候选必须仍匹配。内容私有保存并按任务进入角色视图，视图标明当前适用性；候选改变时旧指导不能冒充当前约束。指导不得授予命令权限、改变目标、放宽验收或增加预算；与计划冲突应调整或明确阻塞。该选项不能与决定、环境更新、续作拒绝、重验、停止重试、非法结果修正或扩展范围合用。
 
 必需证据和已知阻断修复的机械预检在正式任务验证前执行。证据缺失、路径／摘要／来源或候选不符，不能靠自报完成进入接受。worker 的 repair_claims 与 reviewer 的 finding_dispositions 都用原审阅 dispatch ID 加 finding ID 关联；声明不会自行关闭问题，approve 必须独立解决全部要求的问题。任务与最终审阅均要求对 required_findings 完整给出 dispositions，整体审阅从 final_history 保留旧阻断。历史 finding ID 非法或重复时，关联采用原 dispatch 与列表位置的 finding-N 别名，同时保留原 ID、位置和源结果；不要按非法原 ID 猜测或合并问题。无效拒绝的处置声明不能关闭旧问题。版本 13 保留完整正式任务和最终门禁，不缓存跨候选成功。

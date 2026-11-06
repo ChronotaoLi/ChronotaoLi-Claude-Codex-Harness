@@ -484,3 +484,13 @@ Python 3.11.17 执行 7 个焦点模块：`test_worker_repair_obligations`、`te
 独立 `gpt-6.1-sol` 审阅发现的终态后超时／普通非零退出重抽，以及不可变处置格式错误被其他元数据错误遮蔽的问题，均已修复并复验；最终审阅无未解决问题，记录为 `.harness/v27-fixes/independent-review.txt`。审阅者另以 Python 3.11 执行 4 个针对性测试方法及其子场景，全部通过，日志为 `.harness/v27-fixes/independent-regressions.log`。`git diff --check` 通过。
 
 全部流程测试使用模拟响应、stub CLI 与真实本地 Git／子进程，不证明真实模型调用成功；未运行 `harness smoke`、`harness.tool_smoke` 或 `harness.permission_smoke`。有界等待不保证所有后代都在窗口内退出，窗口外仍保留退出未知门禁；更新前缺少实际输入绑定的待预检 worker 不补造证据，恢复边界见[恢复协议](recovery.md#进程退出与阶段恢复)。
+
+## 续作拒绝与候选修正验证（2026-11-05，台账 v13）
+
+执行 `python3 -m unittest discover -s tests -v`：1,233 项，1,232 项通过、1 项因本机文件系统拒绝非 UTF-8 文件名而跳过，Python 3.15.2，1379.555 秒。完整日志为 `.harness/continuation-rejection/full-unittest.log`；运行时、共享资产和测试的来源清单为 `.harness/continuation-rejection/full-test-sources.json`，完成后逐文件核对摘要与文件集合一致。
+
+Python 3.11.17 执行 `test_continuation*.py`：30 项全部通过，21.019 秒，日志为 `.harness/continuation-rejection/python311-focused.log`；未在 Python 3.11 重跑完整套件。两个 Python 版本的编译检查、`git diff --check` 及本地文档链接检查通过。
+
+新增 20 项行为测试覆盖：拒绝未授权命令后直接进入同任务的全新 worker、新命令仍需精确授权、拒绝超时请求不增加原时限、正式任务及最终验证和审阅保留、任务命令前置条件继续生效、预算耗尽、准备失败和 pre_agent 候选变更、拒绝保存后中断与普通恢复、相同输入幂等、冲突和已消费拒绝禁止重放、缺失或篡改证据、伪造消费身份、状态投影、CLI 互斥及操作记录的文件输入隐私。拒绝指令与证据一起保存，后续恢复不依赖当前运行时生成的提示措辞。
+
+独立 `gpt-6.1-sol` 完成设计与实现审阅，最终无未解决的正确性或结构问题；实现审阅同时运行新增 20 项测试。审阅记录为 `.harness/continuation-rejection/independent-review.json`，审阅测试日志为同目录的 `independent-review-tests.log`。全部运行验证使用模拟模型响应及真实本地 Git／子进程；未调用真实设备或运行真实账号 smoke，不将离线结果作为模型调用成功证明。

@@ -142,6 +142,22 @@ def status_summary(run):
                 "runtime_failed" if entry.get("status") == "failed" else "unknown")
             outcomes[key] += 1
     result["worker_outcomes"] = outcomes
+    # Read-only bindings for the explicit recovery input; this projection does
+    # not assert evidence integrity or substitute for resume's source checks.
+    continuation_history = run.get("continuation_history", [])
+    pending = run.get("pending_continuation")
+    if isinstance(continuation_history, list) and pending is not None:
+        source = next((row for row in continuation_history if isinstance(row, dict) and row.get("id") == pending), None)
+        if source and isinstance(source.get("source"), dict):
+            result["continuation"] = {
+                "continuation_id": source["id"], "task_id": source.get("task_id"),
+                "source_dispatch_id": source["source"].get("dispatch_id"),
+                "source_snapshot_digest": source.get("snapshot_digest"),
+                "request": source.get("request"), "state": "awaiting_requirements"}
+    directive = run.get("pending_directive")
+    if isinstance(directive, dict) and directive.get("continuation_rejection_id"):
+        result["continuation"] = {"state": "revision_pending", "task_id": run.get("current_task"),
+                                  "rejection_id": directive["continuation_rejection_id"]}
     command_report = run.get("command_requirements", {})
     if not isinstance(command_report, dict) or not isinstance(command_report.get("missing", {}), dict):
         raise HarnessError("运行台账 command_requirements 诊断无效；使用 status --full 查看原始内容")
@@ -284,6 +300,7 @@ def operation_arguments(args):
             "environment_update": str(args.environment_update) if args.environment_update is not None else None,
             "operator_decision": [str(path) for path in args.operator_decision or ()],
             "execution_guidance": str(args.execution_guidance) if getattr(args, "execution_guidance", None) is not None else None,
+            "reject_continuation": str(args.reject_continuation) if getattr(args, "reject_continuation", None) is not None else None,
             "allow_scope": list(args.allow_scope or ())}
 
 
@@ -302,13 +319,17 @@ def resume_options(args):
         options["allow_scope"] = args.allow_scope
     if getattr(args, "execution_guidance", None) is not None:
         options["execution_guidance"] = args.execution_guidance
+    if getattr(args, "reject_continuation", None) is not None:
+        options["reject_continuation"] = args.reject_continuation
     return options
 
 
 def file_inputs_present(args):
     if args.command == "run":
         return args.plan is not None
-    return args.environment_update is not None or bool(args.operator_decision) or getattr(args, "execution_guidance", None) is not None
+    return (args.environment_update is not None or bool(args.operator_decision)
+            or getattr(args, "execution_guidance", None) is not None
+            or getattr(args, "reject_continuation", None) is not None)
 
 
 def persisted_run_id(args, engine, state):
@@ -389,6 +410,8 @@ def _main(argv=None):
                         help="提供操作者环境澄清 JSON 文件；不扩展权限、文件范围或命令授权")
     resume.add_argument("--execution-guidance", type=Path, metavar="FILE",
                         help="在停止边界提供绑定任务及候选的执行约束；不授权命令或放松验收")
+    resume.add_argument("--reject-continuation", type=Path, metavar="FILE",
+                        help="显式拒绝当前续作请求并保留候选交给新 worker 修正；不授权命令、不重置预算")
     resume.add_argument("--operator-decision", type=Path, action="append", metavar="FILE",
                         help="回答 status 中的操作者决策请求；可重复指定，整批校验保存后继续，不跳过验收或授予命令权限")
     resume.add_argument("--allow-scope", action="append", metavar="PATTERN",

@@ -3,7 +3,7 @@ from __future__ import annotations
 from copy import deepcopy
 from pathlib import Path
 from .contracts import PLAN
-from .continuation import continuation_gate, resolve_continuation
+from .continuation import continuation_gate, resolve_continuation, validate_continuation_rejection
 from .recovery import invalidate_acceptance_review, snapshot_digest
 from .util import HarnessError
 from .services import RuntimeService
@@ -11,6 +11,7 @@ from .services import RuntimeService
 class Scheduler(RuntimeService):
     def admission(self):
         self.context.ensure_exited()
+        validate_continuation_rejection(self.context)
         if self.context.run.get("pending_continuation"):
             blocker = continuation_gate(self.context)
             if blocker is not None:
