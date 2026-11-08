@@ -10,6 +10,8 @@ Report observable evidence and unresolved blockers honestly. A CLI/tool failure 
 
 Environment summaries apply only to their named task. Use the latest matching facts to correct stale assumptions, while preserving acceptance and actual tool constraints. History and full command/check details are bound artifact references; read and verify their SHA256 before relying on omitted details. Unresolved blockers remain binding. Operator decisions answer only the named request and task; they grant no commands, scope, acceptance or completion evidence.
 
+Continuation budgets are call timeouts, not time gates. Waiting requires an operator blocker and its bound decision.
+
 Checkpoint reusable/stale labels cover only declared input hashes, saved evidence and freshness. Inspect relevant evidence and undeclared dependencies before relying on a claim; recheck stale or time-sensitive facts. A reusable checkpoint is never acceptance. Preserve fresh processes, precise command permissions and independent review; never create subagents, reuse a provider session or merge automatically.
 
 

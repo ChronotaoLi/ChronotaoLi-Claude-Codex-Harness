@@ -15,16 +15,20 @@ class RecoveryProjectionTests(RepoCase):
     def interrupted_rework(self):
         self.config.data["runtime"]["max_attempts"] = 4
 
-        def change(backend, kwargs, packet, result):
+        def interrupt(backend, kwargs, packet):
             if kwargs["role"] == "worker":
                 number = sum(call["role"] == "worker" for call in backend.calls)
                 if number in (1, 3):
                     (kwargs["job"] / "failure.log").write_text(f"timeout evidence {number}\n")
+                    self.assertFalse((kwargs["job"] / "response.json").exists())
                     raise ProcessTimeout(number, kwargs["job"] / "cli")
-            elif kwargs["kind"] == "review" and sum(call["kind"] == "review" for call in backend.calls) == 1:
+
+        def change(backend, kwargs, packet, result):
+            if kwargs["kind"] == "review" and sum(call["kind"] == "review" for call in backend.calls) == 1:
                 result.update(verdict="request_changes", findings=[finding()])
 
         backend = RecordingBackend(change)
+        backend.before_result = interrupt
         engine = self.engine(backend)
         with self.assertRaises(ProcessTimeout):
             engine.start("Implement greet", self.plan())
@@ -97,13 +101,16 @@ class RecoveryProjectionTests(RepoCase):
             self.assertEqual(call["packet"]["recovery"]["source"]["dispatch_id"], failed["dispatch_id"])
 
     def test_pending_review_uses_saved_worker_and_formal_verification(self):
-        def change(backend, kwargs, packet, result):
+        def interrupt(backend, kwargs, packet):
             if kwargs["role"] == "worker" and sum(call["role"] == "worker" for call in backend.calls) == 1:
+                self.assertFalse((kwargs["job"] / "response.json").exists())
                 raise ProcessTimeout(1, kwargs["job"] / "cli")
             if kwargs["kind"] == "review":
+                self.assertFalse((kwargs["job"] / "response.json").exists())
                 raise HarnessError("review service unavailable")
 
-        backend = RecordingBackend(change)
+        backend = RecordingBackend()
+        backend.before_result = interrupt
         engine = self.engine(backend)
         with self.assertRaises(ProcessTimeout):
             engine.start("Implement greet", self.plan())
@@ -119,9 +126,12 @@ class RecoveryProjectionTests(RepoCase):
         self.assertEqual(resumed.run["accepted"], {})
 
     def assert_changed_approval_projection(self, *, replan=False, legacy=False):
-        def change(backend, kwargs, packet, result):
+        def interrupt(backend, kwargs, packet):
             if kwargs["role"] == "worker" and sum(call["role"] == "worker" for call in backend.calls) in (1, 3):
+                self.assertFalse((kwargs["job"] / "response.json").exists())
                 raise ProcessTimeout(1, kwargs["job"] / "cli")
+
+        def change(backend, kwargs, packet, result):
             if replan and kwargs["kind"] == "dispatch" and (packet.get("feedback") or {}).get("acceptance"):
                 result.update(action="replan", instruction="Clarify implementation details before retrying")
             elif kwargs["kind"] == "replan":
@@ -130,6 +140,7 @@ class RecoveryProjectionTests(RepoCase):
                                         "add_depends_on": []}])
 
         backend = RecordingBackend(change)
+        backend.before_result = interrupt
         engine = self.engine(backend)
         with self.assertRaises(ProcessTimeout):
             engine.start("Implement greet", self.plan())

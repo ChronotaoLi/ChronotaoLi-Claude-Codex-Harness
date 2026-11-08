@@ -23,15 +23,19 @@ class ReplanFormatRecoveryTests(RepoCase):
             if kwargs["role"] == "worker":
                 if "format_correction" not in packet:
                     result["summary"] = "x" * 4001
-                elif failure == "provider":
-                    # A failed mutating invocation can leave a newer candidate.
-                    with (kwargs["cwd"] / "hello.py").open("a") as stream:
-                        stream.write("# partial format correction\n")
-                    raise HarnessError("provider failed before returning a result")
             elif kwargs["kind"] == "dispatch":
                 result.update(action="replan", instruction="Resolve the unmet requirement through planning")
 
+        def fail_before_result(backend, kwargs, packet):
+            if kwargs["role"] == "worker" and "format_correction" in packet and failure == "provider":
+                # A failed mutating invocation can leave a newer candidate.
+                with (kwargs["cwd"] / "hello.py").open("a") as stream:
+                    stream.write("# partial format correction\n")
+                self.assertFalse((kwargs["job"] / "response.json").exists())
+                raise HarnessError("provider failed before returning a result")
+
         backend = ScriptedBackend(fail_repair)
+        backend.before_result = fail_before_result
         engine = self.engine(backend)
         emit = engine.context.emit_hook
 
@@ -81,7 +85,12 @@ class ReplanFormatRecoveryTests(RepoCase):
             self.assertEqual(after.get(field), before.get(field), field)
         self.assertEqual(after["replan_attempts"], before["replan_attempts"] + replan_delta)
         self.assertEqual(after["agent_dispatches"], before["agent_dispatches"] + dispatch_delta)
-        self.assertEqual(after["dispatches"][:len(before["dispatches"])], before["dispatches"])
+        prior_dispatches = copy.deepcopy(before["dispatches"])
+        for prior, current in zip(prior_dispatches, after["dispatches"]):
+            if prior.get("worker_no_result") is True and not prior.get("worker_receipt_consumed"):
+                self.assertEqual(current.get("worker_receipt_consumed"), "provider_failure")
+                prior["worker_receipt_consumed"] = "provider_failure"
+        self.assertEqual(after["dispatches"][:len(prior_dispatches)], prior_dispatches)
 
     def test_replan_selection_retires_only_worker_correction_for_both_failure_boundaries(self):
         for failure in ("pre_agent", "provider"):

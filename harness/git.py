@@ -345,6 +345,10 @@ def path_matches(name: str, pattern: str) -> bool:
     return len(names) in positions
 
 
+class ScopeViolation(HarnessError):
+    """A validated Git candidate contains paths outside its task authority."""
+
+
 def check_scope(repo: Path, allowed: list[str], *, binding=None):
     for pattern in allowed:
         validate_scope_pattern(pattern)
@@ -352,9 +356,9 @@ def check_scope(repo: Path, allowed: list[str], *, binding=None):
     paths = changed(repo, binding=binding)
     for path in paths:
         if path.split("/", 1)[0] in PROTECTED_ROOTS:
-            raise HarnessError(f"任务修改了受保护路径：{path}")
+            raise ScopeViolation(f"任务修改了受保护路径：{path}")
         if not any(path_matches(path, pattern) for pattern in allowed):
-            raise HarnessError(f"任务越界修改：{path}；允许范围：{allowed}")
+            raise ScopeViolation(f"任务越界修改：{path}；允许范围：{allowed}")
     return paths
 
 

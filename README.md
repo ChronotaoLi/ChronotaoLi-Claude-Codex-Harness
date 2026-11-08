@@ -79,7 +79,7 @@ python3 -m harness --config /absolute/path/harness.toml --repo /absolute/path/to
 
 模型计划的重复／超限声明保留结果并停止，普通恢复不重抽计划。显式修正与旧版兼容边界见[计划范围与命令前置条件](docs/recovery.md#计划范围与命令前置条件)及[阻塞出口](docs/recovery.md#阻塞状态与操作者出口)。
 
-任务可另声明 `self_checks`（最多 32 条精确 argv）与 `evidence_requirements`（`id`、从 0 起的 `acceptance_index`、`kind`、仓库相对 `path`）。证据类型为 `static`、`simulation`、`host_integration` 或 `device`。角色收到 `verification_plan`，区分 worker 聚焦自检、全部正式任务门禁与最终门禁；自检不授权，也不替代正式验证。worker 无需默认重复全套门禁，仅在有明确诊断理由时重复。必需文件和修复声明先作来源／候选绑定预检，内容正确性仍由独立审阅核验。
+任务可另声明 `self_checks`（最多 32 条精确 argv）与 `evidence_requirements`（`id`、从 0 起的 `acceptance_index`、`kind`、仓库相对 `path`）。证据类型为 `static`、`simulation`、`host_integration` 或 `device`。角色收到 `verification_plan`，区分 worker 聚焦自检、全部正式任务门禁与最终门禁；自检不授权，也不替代正式验证。worker 无需默认重复全套门禁，仅在有明确诊断理由时重复。必需文件和修复声明先作来源／候选绑定预检，内容正确性仍由独立审阅核验。返工输入提供与本次实际问题清单绑定的声明草稿引用；空字段不是修复证明，候选路径与普通 evidence 中的外部日志引用保持分开。
 
 worker 可用结构化续作请求正常交还控制权，等待精确命令授权或单次派发超时调整；满足条件后以全新派发继续原候选，累计调用和任务预算保留。`resume RUN --execution-guidance FILE` 可在安全待处理任务边界登记绑定来源与候选的操作约束；指导不授予命令权限。格式与适用边界见[续作与操作指导](docs/recovery.md#续作与操作指导)。
 
@@ -148,7 +148,7 @@ python3 -m harness --repo /path/to/project cleanup-run RUN --remove
 
 运行详情默认通过事件订阅更新，列表和文件页使用手动刷新。连接心跳仅表示观察服务可用；订阅断开后显示断开提示，由刷新按钮重新连接，不退回定时轮询。
 
-同一快照上的已保存阶段可复用：验证中断只重跑验证，审阅调用故障只新派发 reviewer，接受 hook 失败只重试 hook。worker 返回与阶段保存之间仍有可能重复调用的中断窗口。代码变化使旧批准失效，进程未确认退出、HEAD／Git 绑定异常或证据损坏会停止；完整保存顺序见[恢复协议](docs/recovery.md)。
+同一快照上的已保存阶段可复用：验证中断只重跑验证，审阅调用故障只新派发 reviewer，接受 hook 失败只重试 hook。worker 的完整接收记录绑定结果与返回后候选，恢复继续原校验及交接，复用封存结果本身不重新派发或扣除调用额度。仅有原始输出、尚未封存候选时中断则停止，不能把恢复时的文件补认原候选。代码变化使旧批准失效，进程未确认退出、HEAD／Git 绑定异常或证据损坏会停止；完整保存顺序见[恢复协议](docs/recovery.md)。
 
 | 情况 | 常用出口 |
 | --- | --- |
@@ -171,7 +171,7 @@ python3 -m harness --repo /path/to/project cleanup-run RUN --remove
 
 `cleanup-run RUN` 预览已完成或已放弃 run 的工作树清理，`--remove` 才执行。它保留终态、分支和运行证据，要求原分支仍指向检查点、所有派发与命令子进程已确认退出、工作树无任何未保存文件。清理意图和完成记录保存在 `worktree-cleanup.json`，支持删除后记账中断的重试。显式 `--confirm-exited DISPATCH_ID` 会记录退出确认；普通预览不生成清理记录。需要删除分支时，先完成工作树清理，再由操作者核对集成结果并处理分支。
 
-新台账版本为 13；旧版本只保留历史查看与受门禁保护的清理，不升级、不恢复执行。版本 13 已完成 run 的普通恢复返回保存结果；终态选项限制见[终态与版本兼容](docs/recovery.md#终态与版本兼容)。
+新台账版本为 14，要求完整的 worker 接收状态；版本 13 及更早只保留历史查看与受门禁保护的清理，不升级、不恢复执行。共享规则变更也受资产摘要门禁约束。版本 14 已完成 run 的普通恢复返回保存结果；终态选项限制见[终态与版本兼容](docs/recovery.md#终态与版本兼容)。
 
 ## 共用 skills / MCP / hooks
 
@@ -240,6 +240,8 @@ python3 -m harness --repo /path/to/project memory export > memory-backup.json
 自动任务历史与知识默认 TTL 为 180 天，可通过 `[memory]` 的 `task_ttl_days`／`knowledge_ttl_days` 调整，0 表示不过期；操作者事实默认不过期。检索先排列优先参考，再排列来源变化、不可用、非法或原因未知的需复核记录，组内保留相关性、时间、类型和原有过时降权。未绑定／未核验记录不额外降组，放弃或来源无效的任务历史不自动召回。默认六条仍不能保证某条声明必然进入上下文；必要要求应写入任务验收。没有 embedding 或自动语义冲突合并。完整限制见[记忆兼容参考](docs/recovery.md#记忆作用域与来源兼容)。
 
 上下文采用结构化检查点、有界检索和原始证据引用，在任务边界写 `handoff.json`／`handoff.md`；每次指挥调用重新构建输入。默认 `context_chars = 100000` 是编排输入字符上限，不是 token 数；必要约束超限就停止，可选记忆按整条移除。CLI 内部上下文不在该预算内。
+
+实际派发的 `context-report.json` 记录角色、阶段、必要字符数及字段尺寸，容器开销包含 JSON 键、引号与分隔符；必要输入超限也保存报告，不启动模型或扣调用预算。较长的续作历史、操作指导与重复命令通过 `input-indexes/` 中的不可变摘要索引检索；当前等待条件及指导义务仍保留，索引不授予命令权限。
 
 dispatch 私有 `context-report.json` 中的 `memory_retrieval` 记录候选、匹配、作用域、数量上限与容量筛选计数。最多四十条明细，依次优先保留返回项、数量上限排除项、作用域排除项和未匹配项，并按实际 ID 标记装入情况；计数完整，明细不保证涵盖全部排除项。报告也随既有 `context_prepared` hook 传递，不加入模型提示词。
 

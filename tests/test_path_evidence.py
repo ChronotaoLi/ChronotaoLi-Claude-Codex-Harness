@@ -200,9 +200,16 @@ class PathEvidenceLifecycleTests(RepoCase):
                     self.assertTrue(all(name.encode() in diff for name in self.names))
 
         backend = ScriptedBackend(exercise)
+        def before_result(backend, kwargs, packet):
+            if kwargs['role'] == 'worker' and sum(c['role'] == 'worker' for c in backend.calls) == 1:
+                (kwargs['cwd'] / 'hello.py').write_text('# interrupted implementation\n')
+                exercise(backend, kwargs, packet, {})
+        backend.before_result = before_result
         engine = self.engine(backend)
         with self.assertRaisesRegex(HarnessError, 'provider interruption'):
             engine.start('Replace legacy docs and implement greet', plan)
+        worker = next(d for d in engine.run['dispatches'] if d['role'] == 'worker')
+        self.assertFalse((engine.directory / 'dispatches' / worker['id'] / 'response.json').exists())
         ident = engine.run['id']
         engine = self.engine(backend)
         result = engine.resume(ident)

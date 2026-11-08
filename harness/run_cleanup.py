@@ -11,6 +11,8 @@ from .util import readonly_lock
 from .run_store import RunStore
 from .cleanup import _canonical, _regular_bytes, _registered
 from .path_evidence import validate_dispatch_indexes
+from .input_projection import validate_dispatch_indexes as validate_input_dispatch_indexes
+from .worker_receipts import validate_worker_receipt_links
 from .util import (HarnessError, append_event, confirm_dispatches_exited,
                    ensure_dispatches_exited, group_alive, lock,
                    validate_command_directories, write_json)
@@ -43,7 +45,7 @@ def cleanup_run(repo: Path, ident: str, *, remove=False, confirm_exited=(), remo
         _canonical(checkout)
         branch = "harness/" + ident
         common = Path(git.git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir").removesuffix("\n")).resolve()
-        if (not isinstance(run, dict) or run.get("schema_version") not in (7, 8, 9, 10, 11, 12, 13)
+        if (not isinstance(run, dict) or run.get("schema_version") not in (7, 8, 9, 10, 11, 12, 13, 14)
                 or run.get("id") != ident or run.get("repo") != str(repo)
                 or run.get("worktree") != str(checkout) or run.get("branch") != branch
                 or not isinstance(run.get("expected_head"), str)
@@ -63,6 +65,9 @@ def cleanup_run(repo: Path, ident: str, *, remove=False, confirm_exited=(), remo
             raise HarnessError("运行 worktree Git 管理目录不属于该仓库")
         validate_command_directories(run["dispatches"], directory)
         validate_dispatch_indexes(directory, run["dispatches"])
+        validate_input_dispatch_indexes(directory, run["dispatches"])
+        if run["schema_version"] == 14:
+            validate_worker_receipt_links(run, directory)
         if confirm_exited:
             store = RunStore(repo / ".harness")
             store.attach(run)

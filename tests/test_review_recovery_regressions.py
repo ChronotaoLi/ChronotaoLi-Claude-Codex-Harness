@@ -177,14 +177,16 @@ class ReviewRecoveryRegressionTests(RepoCase):
         self.assertEqual(Path(stopped["artifact"]).read_bytes(), evidence)
 
     def test_failed_worker_recovery_reaches_same_task_without_leaking_to_next_task(self):
-        def interrupted_edit(backend, kwargs, packet, result):
+        def interrupted_edit(backend, kwargs, packet):
             if kwargs["role"] == "worker" and sum(c["role"] == "worker" for c in backend.calls) == 1:
                 (kwargs["cwd"] / "hello.py").write_text("def greet(name:\n    # unfinished edit\n")
+                self.assertFalse((kwargs["job"] / "response.json").exists())
                 raise HarnessError("Claude 未成功完成：error_max_turns")
 
         plan = self.plan()
         plan["tasks"].append({**copy.deepcopy(plan["tasks"][0]), "id": "confirm", "depends_on": ["greet"]})
-        backend = ScriptedBackend(interrupted_edit)
+        backend = ScriptedBackend()
+        backend.before_result = interrupted_edit
         engine = self.engine(backend)
         with self.assertRaises(HarnessError):
             engine.start("Implement and confirm greet", plan)
@@ -238,11 +240,13 @@ class ReviewRecoveryRegressionTests(RepoCase):
         self.assertEqual(sum(call["role"] == "worker" for call in backend.calls), 1)
 
     def test_repeated_errors_retain_each_on_error_hook_output(self):
-        def fail_worker(backend, kwargs, packet, result):
+        def fail_worker(backend, kwargs, packet):
             if kwargs["role"] == "worker":
+                self.assertFalse((kwargs["job"] / "response.json").exists())
                 raise HarnessError("worker service unavailable")
 
-        backend = ScriptedBackend(fail_worker)
+        backend = ScriptedBackend()
+        backend.before_result = fail_worker
         engine = self.engine(backend)
         spec = self.hook_spec("on_error", engine.state / "on-error-count")
         engine.hooks.spec = spec

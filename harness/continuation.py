@@ -105,7 +105,7 @@ def _records(context, category, key):
     return deepcopy(records)
 
 
-def record_continuation(context, task_id, result, worker_source, snapshot):
+def record_continuation(context, task_id, result, worker_source, snapshot, *, save=True):
     history = _records(context, 'continuations', 'continuation_history')
     rejections, _ = _rejections(context, history)
     stored = _source(context, task_id, worker_source)
@@ -129,7 +129,8 @@ def record_continuation(context, task_id, result, worker_source, snapshot):
     row = _write(context, 'continuations', record)
     context.run['continuation_history'] = [*history, row]
     context.run['pending_continuation'] = row['id']
-    context.save()
+    if save:
+        context.save()
     return deepcopy(row)
 
 

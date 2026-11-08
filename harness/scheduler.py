@@ -21,6 +21,7 @@ class Scheduler(RuntimeService):
     def execute(self, supplied_plan=None, *, step=False):
         try:
             self.admission()
+            replayed = self.services.tasks.replay_worker()
             self.services.planning.validate_retained_candidate()
             if invalidate_acceptance_review(self.context.run):
                 self.context.save()
@@ -56,7 +57,7 @@ class Scheduler(RuntimeService):
             self.context.run.pop("error", None)
             self.context.run.pop("error_type", None)
             self.context.save()
-            accepted_this_call = int(self.services.tasks.finish_post_accept())
+            accepted_this_call = int(bool(replayed)) + int(self.services.tasks.finish_post_accept())
             if self.context.run.get("pending_acceptance"):
                 if self.services.tasks.accept_pending():
                     accepted_this_call += 1

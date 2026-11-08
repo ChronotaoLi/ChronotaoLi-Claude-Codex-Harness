@@ -11,12 +11,13 @@ from .context import (
 )
 from .contracts import envelope, output_constraints, REVIEW, review_output_constraints
 from .path_evidence import project_paths
+from .input_projection import project_history, project_commands
 from .services import RuntimeService
 from .shared import read_skill, skills_catalog
 from .util import HarnessError
 from .verification_plan import build_verification_plan, finding_progress_packet, project_finding_sources, verification_role_view, recent_costs
 from .continuation import packet as continuation_packet
-from .review_progress import required_findings, validate_review_source
+from .review_progress import required_findings, validate_review_source, worker_claim_template_reference
 from .recovery import snapshot_digest
 
 
@@ -60,6 +61,7 @@ class PacketBuilder(RuntimeService):
     def role_input(self, *, role, kind, task_id, schema, dispatch_id, packet, task=None):
         """Construct the same mandatory role envelope for dispatch and estimates."""
         packet = project_paths(packet, self.context.directory)
+        packet = project_commands(packet, self.context.directory)
         schema = deepcopy(schema)
         if role == "worker":
             for field, needed in (("evidence_files", bool((task or {}).get("evidence_requirements"))),
@@ -71,6 +73,10 @@ class PacketBuilder(RuntimeService):
         elif role == "reviewer":
             if not packet.get("required_findings"):
                 schema["properties"].pop("finding_dispositions", None)
+        if role == "worker":
+            template = worker_claim_template_reference(self.context, task_id, dispatch_id, packet)
+            if template is not None:
+                packet["repair_claims_template"] = template
         contract = envelope(schema, task_id, dispatch_id)
         required = {
             "role": role, "kind": kind, "task_id": task_id, "dispatch_id": dispatch_id,
@@ -189,6 +195,7 @@ class PacketBuilder(RuntimeService):
                     "current_candidate_matches": digest == row["snapshot_digest"],
                     "superseded_by_worker_dispatches": [item["id"] for item in successors],
                     "active": digest == row["snapshot_digest"] and not successors}
+        continuation = project_history(continuation, self.context.directory)
         # Validate every historical body used by progress, including run-wide views.
         for tid, records in self.context.run.get("review_history", {}).items():
             if scope is None or tid == scope:

@@ -23,7 +23,7 @@ class Runtime(ProgressRecovery):
         self.context.directory = root / 'run'
         self.context.worktree = root / 'worktree'
         self.context.worktree.mkdir()
-        self.context.run = {'schema_version': 13, 'tasks': [{'id': 'task'}], 'dispatches': [], 'task_checkpoints': [], 'checkpoint_batches': []}
+        self.context.run = {'schema_version': 14, 'tasks': [{'id': 'task'}], 'dispatches': [], 'task_checkpoints': [], 'checkpoint_batches': []}
         self.events = []
         self.saved = 0
 

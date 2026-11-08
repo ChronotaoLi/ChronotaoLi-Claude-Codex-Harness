@@ -325,11 +325,46 @@ def compact_feedback(feedback, prior_reviews=()):
     return compact(feedback)
 
 
+class ContextCapacityError(HarnessError):
+    """A failed preparation with a content-free, exact size diagnostic."""
+    def __init__(self, report):
+        self.report = report
+        super().__init__(f"任务必要上下文 {report['required_chars']} 字符超过预算 {report['budget_chars']}；请拆小任务或增加 context_chars")
+
+
+def field_size_report(value):
+    """Recursive, additive JSON accounting, including keys/commas/brackets.
+
+    Leaf sizes include JSON quotes/escaping. Containers' own overhead plus their
+    immediate children's serialized sizes equals their serialized size exactly.
+    Only field paths and lengths are exposed, never prompt values.
+    """
+    rows = []
+    def visit(item, path):
+        size = len(prompt_json(item))
+        children = list(item.items()) if isinstance(item, dict) else list(enumerate(item)) if isinstance(item, list) else []
+        child_size = sum(len(prompt_json(v)) for _, v in children)
+        rows.append({'path': path, 'chars': size, 'overhead_chars': size - child_size,
+                     'container': isinstance(item, (dict, list))})
+        for key, child in children:
+            visit(child, path + [key])
+    visit(value, [])
+    return rows
+
+
+def actual_capacity_report(required, budget):
+    return {'budget_chars': budget, 'required_chars': len(prompt_json(required)),
+            'role': required.get('role'), 'kind': required.get('kind'),
+            'task_id': required.get('task_id'), 'dispatch_id': required.get('dispatch_id'),
+            'field_sizes': field_size_report(required),
+            'method': 'exact prompt_json character count; not tokenizer count'}
+
+
 def compose(required: dict, memories: list[dict], budget: int, *, memory_diagnostics=None):
     """Lossless required packet, whole optional records, references to full evidence."""
     core = prompt_json(required)
     if len(core) > budget:
-        raise HarnessError(f"任务必要上下文 {len(core)} 字符超过预算 {budget}；请拆小任务或增加 context_chars")
+        raise ContextCapacityError({**actual_capacity_report(required, budget), "status": "required_overflow"})
     packet = core
     kept = []
     for memory in memories:
@@ -337,7 +372,7 @@ def compose(required: dict, memories: list[dict], budget: int, *, memory_diagnos
         if len(packet) + len(candidate) <= budget:
             packet += candidate
             kept.append(memory["id"])
-    report = {"budget_chars": budget, "required_chars": len(core),
+    report = {**actual_capacity_report(required, budget),
               "memory_chars": len(packet) - len(core), "used_chars": len(packet),
               "memory_ids": kept, "omitted_memories": len(memories) - len(kept),
               "method": "structured checkpoint + bounded retrieval; not tokenizer count"}

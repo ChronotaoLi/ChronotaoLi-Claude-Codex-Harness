@@ -26,6 +26,7 @@ class Services:
         from .task_lifecycle import TaskLifecycle
         from .verification import Verification
         from .workflow import Workflow
+        from .worker_receipts import WorkerReceipts
         self.budgets = AttemptAccounting(context, self)
         self.decisions = DecisionRecovery(context, self)
         self.dispatch = Dispatcher(context, self)
@@ -35,6 +36,7 @@ class Services:
         self.planning = Planner(context, self)
         self.progress = ProgressRecovery(context, self)
         self.receipts = ResultReceipts(context, self)
+        self.worker_receipts = WorkerReceipts(context, self)
         self.recovery = InvalidOutputRecovery(context, self)
         self.lifecycle = RunLifecycle(context, self)
         self.tasks = TaskLifecycle(context, self)

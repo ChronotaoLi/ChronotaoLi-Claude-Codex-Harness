@@ -391,7 +391,7 @@ class ProgressRecovery(RuntimeService):
     def _validated_checkpoint_links(self):
         validation = _CheckpointValidation()
         rows = self.context.run["task_checkpoints"]
-        if self.context.run["schema_version"] != 13 or not isinstance(rows, list):
+        if self.context.run["schema_version"] != 14 or not isinstance(rows, list):
             raise HarnessError("invalid checkpoint ledger schema")
         seen = set()
         tasks = {t["id"] for t in self.context.run["tasks"]}

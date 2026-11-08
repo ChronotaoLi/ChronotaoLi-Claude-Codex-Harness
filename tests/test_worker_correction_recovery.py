@@ -114,10 +114,13 @@ class WorkerCorrectionRecoveryTests(RepoCase):
             attempt = len(self.workers(backend))
             if attempt == 1:
                 result["summary"] = "x" * 4001
-            elif attempt == 2:
-                raise HarnessError("worker correction service unavailable")
+
 
         backend = RecordingBackend(unavailable_correction)
+        def fail_before_result(backend, kwargs, packet):
+            if kwargs["role"] == "worker" and len(self.workers(backend)) == 2:
+                raise HarnessError("worker correction service unavailable")
+        backend.before_result = fail_before_result
         engine = self.engine(backend)
         with self.assertRaisesRegex(HarnessError, "correction service unavailable"):
             engine.start("Implement greet", self.plan())
@@ -153,7 +156,7 @@ class WorkerCorrectionRecoveryTests(RepoCase):
                 interrupted_artifact = Path(path)
                 raise KeyboardInterrupt()
 
-        with patch("harness.dispatch.write_json", side_effect=write_then_interrupt):
+        with patch("harness.worker_receipts.write_json", side_effect=write_then_interrupt):
             with self.assertRaises(KeyboardInterrupt):
                 engine.start("Implement greet", self.plan())
         self.assertIsNotNone(interrupted_artifact)
@@ -166,6 +169,17 @@ class WorkerCorrectionRecoveryTests(RepoCase):
         self.assertEqual(saved["pending_format_corrections"][self.correction_key]["dispatch_id"],
                          failed["dispatch_id"])
 
+        # Schema 14 adjudicates the sealed invalid correction before allowing
+        # the existing ordinary-attempt exit on a subsequent explicit resume.
+        with self.assertRaisesRegex(HarnessError, "格式修复额度已用"):
+            self.engine(backend).resume(saved["id"])
+        rejected = read_json(engine.directory / "state.json")
+        self.assert_accounting(backend, rejected, 2)
+        self.assertEqual(rejected["pending_format_corrections"], {})
+        self.assertEqual(rejected["worker_receipts"], {})
+        self.assertEqual(rejected["dispatches"][-1]["worker_receipt_consumed"], "format_exhausted")
+        self.assertEqual(rejected["worker_recovery"]["greet"]["dispatch_id"], failed["dispatch_id"])
+        self.assertEqual(interrupted_artifact.read_bytes(), evidence)
         result = self.engine(backend).resume(saved["id"])
         self.assertEqual(result["status"], "completed")
         self.assert_accounting(backend, result, 3)

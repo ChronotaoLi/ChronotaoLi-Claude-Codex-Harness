@@ -7,15 +7,14 @@ import uuid
 from copy import deepcopy
 from pathlib import Path
 
-from . import git
 from .adapters import provider_usage
 from .context import compose
 from .continuation import validate_continuation_rejection
 from .contracts import (
-    RepairableFormatError, validate, validate_immutable_findings, validate_structure,
-    validate_work_semantics,
+    RepairableFormatError, validate_immutable_findings,
 )
 from .receipts import InvalidReviewRejection
+from .input_projection import validate_dispatch_indexes as validate_input_dispatch_indexes
 from .path_evidence import validate_dispatch_indexes, validate_indexes
 from .recovery import snapshot_digest
 from .review_progress import bind_worker_findings
@@ -28,7 +27,16 @@ class Dispatcher(RuntimeService):
     def dispatch(self, role, kind, task_id, schema, packet, task=None):
         # A format correction is a new process, never a provider-session resume.
         validate_dispatch_indexes(self.context.directory, self.context.run["dispatches"])
+        validate_input_dispatch_indexes(self.context.directory, self.context.run["dispatches"])
         key = f"{role}:{kind}:{task_id}"
+        if role == "worker" and key in self.context.run["worker_receipts"]:
+            try:
+                result = self.services.worker_receipts.finish(key, task)
+                if self.context.run["pending_format_corrections"].pop(key, None) is not None:
+                    self.context.save()
+                return result
+            except RepairableFormatError:
+                packet = deepcopy(self.context.run["worker_receipts"][key]["packet"])
         packet = self.services.packets.runtime_packet(packet, role=role, kind=kind, task_id=task_id)
         packet = self.services.recovery.invalid_repair_packet(key, packet)
         previous_review = None
@@ -76,16 +84,18 @@ class Dispatcher(RuntimeService):
             self.services.recovery.commander_format_source(key, packet)
         while True:
             self.context.ensure_exited()
-            receipts = self.context.run["commander_receipts"] if role == "commander" else self.context.run["review_receipts"]
+            receipts = self.context.run[{"commander": "commander_receipts", "worker": "worker_receipts"}.get(role, "review_receipts")]
             receipt = receipts.get(key)
-            if receipt and "artifact_digest" not in receipt and not Path(receipt["artifact"]).exists():
+            if role != "worker" and receipt and "artifact_digest" not in receipt and not Path(receipt["artifact"]).exists():
                 self.services.receipts.validate_terminal_capture(receipt)
                 # Intent was saved before invoke; the provider never returned a
                 # usable result. Retrying still consumes a fresh dispatch budget.
                 receipts.pop(key)
                 self.context.save()
             try:
-                if role == "reviewer" and key in self.context.run["review_receipts"]:
+                if role == "worker" and key in receipts:
+                    result = self.services.worker_receipts.finish(key, task)
+                elif role == "reviewer" and key in self.context.run["review_receipts"]:
                     result = self.services.receipts.finish_review_receipt(key, schema, packet, previous_review)
                 elif role == "commander" and key in receipts:
                     result = self.services.receipts.finish_commander_receipt(key)
@@ -93,6 +103,7 @@ class Dispatcher(RuntimeService):
                     result = self.dispatch_once(role, kind, task_id, schema, packet, task, previous_review)
                 self.context.ensure_exited()
                 validate_dispatch_indexes(self.context.directory, self.context.run["dispatches"])
+                validate_input_dispatch_indexes(self.context.directory, self.context.run["dispatches"])
                 repair = self.services.recovery.active_invalid_repair(key)
                 if repair:
                     repair.update(status="completed", corrected_dispatch_id=receipts[key]["dispatch_id"])
@@ -119,6 +130,7 @@ class Dispatcher(RuntimeService):
                     if returned["blocker_kind"] == "task":
                         self.context.run["pending_replan"] = {"stage": "pending",
                             "trigger": deepcopy(self.context.run["feedback"])}
+                    self.services.worker_receipts.consume(key, "invalid_blocker")
                     self.context.save()
                     if returned["blocker_kind"] == "operator":
                         self.services.workflow.synchronize_decision_requests()
@@ -153,9 +165,10 @@ class Dispatcher(RuntimeService):
                     if role == "reviewer":
                         guard.update(exhausted=True, error=str(error))
                     pending.pop(key, None)
-                    self.context.save()
                     if role == "worker":
+                        self.services.worker_receipts.reject(key, error, "format_exhausted")
                         raise HarnessError(f"{error}；格式修复额度已用，resume 将执行新的普通 worker 尝试并消耗任务、总尝试及派发预算") from error
+                    self.context.save()
                     raise HarnessError(str(error) + self.services.recovery.format_repair_guidance(key, previous_review or returned)) from error
                 # Keep a returned invalid correction attached until the terminal
                 # guard is durable; an interruption must not turn it into a retry.
@@ -185,7 +198,10 @@ class Dispatcher(RuntimeService):
                 pending[key] = {"correction": correction,
                                 "snapshot_digest": snapshot_digest(self.context.snapshot())}
                 if receipt:
-                    receipts.pop(key)
+                    if role == "worker":
+                        self.services.worker_receipts.consume(key, "format_correction")
+                    else:
+                        receipts.pop(key)
                 self.context.save()
                 self.context.event("output_format_repair", task_id=task_id, role=role, previous_dispatch=previous["id"])
             except InvalidReviewRejection:
@@ -214,8 +230,18 @@ class Dispatcher(RuntimeService):
         memory_diagnostics = {}
         memories = self.context.memory.search(query, level=1, run_id=self.context.run["id"],
                                          diagnostics=memory_diagnostics)
-        prompt, report = compose(required, memories, self.context.config.data["runtime"]["context_chars"],
-                                 memory_diagnostics=memory_diagnostics)
+        from .context import ContextCapacityError
+        try:
+            prompt, report = compose(required, memories, self.context.config.data["runtime"]["context_chars"],
+                                     memory_diagnostics=memory_diagnostics)
+        except ContextCapacityError as error:
+            report = {**error.report, "request_id": self.context.run.get("pending_replan", {}).get("request_id")}
+            write_json(job / "context-report.json", report)
+            self.context.run["last_runtime_error"] = {"role": role, "kind": kind, "task_id": task_id,
+                "error": str(error), "artifact": str(job), "context_report": str(job / "context-report.json"),
+                "request_id": report["request_id"]}
+            self.context.save()
+            raise
         write_json(job / "context-report.json", report)
         self.context.emit_hook("context_prepared", {"report": report}, job)
         self.context.run["dispatches"].append({"id": dispatch_id, "role": role, "kind": kind, "task_id": task_id,
@@ -224,6 +250,9 @@ class Dispatcher(RuntimeService):
         path_evidence = list(required["packet"].get("path_evidence_indexes", {}).values())
         if path_evidence:
             entry["path_evidence"] = path_evidence
+        input_evidence = list(required["packet"].get("input_evidence_indexes", {}).values())
+        if input_evidence:
+            entry["input_evidence"] = input_evidence
         if role == "worker":
             (job / "commands").mkdir()
             entry["command_directory"] = str(job / "commands")
@@ -269,6 +298,7 @@ class Dispatcher(RuntimeService):
         invoked = False
         startup_interrupted = False
         invocation_error = None
+        backend_returned = False
         try:
             self.context.emit_hook("pre_agent", entry, job)
             from .workspace_inputs import validate_inputs
@@ -311,6 +341,8 @@ class Dispatcher(RuntimeService):
                 self.context.run.setdefault("format_repairs", {})[key] = 1
                 if key in self.context.run["pending_format_corrections"]:
                     self.context.run["pending_format_corrections"][key]["dispatch_id"] = dispatch_id
+            if role == "worker":
+                self.services.worker_receipts.intent(entry, contract, required["packet"])
             if role == "reviewer":
                 # Persist the identity and expected path before calling the model:
                 # a crash immediately after the atomic result write must not reroll.
@@ -337,14 +369,15 @@ class Dispatcher(RuntimeService):
             result = self.context.backend.invoke(role=role, model=self.context.config.role(role, self.context.commander), cwd=self.context.worktree,
                                          job=job, schema=contract, prompt=prompt, run_path=self.context.directory / "state.json",
                                          on_start=on_start, task=task, kind=kind, on_outcome=on_outcome)
+            backend_returned = True
             # The synchronous backend has returned through run_process cleanup.
             # Receipt validation may itself check that all processes exited.
             if process_outcome is None:
                 observe_fallback()
+            if role == "worker":
+                self.services.worker_receipts.seal(entry, result)
+                return self.services.worker_receipts.finish(f"worker:{kind}:{task_id}", task)
             write_json(job / "returned-result.json", result)
-            if role == "worker" and "format_correction" in packet:
-                self.context.run["pending_format_corrections"].pop(f"{role}:{kind}:{task_id}", None)
-                self.context.save()
             if role == "reviewer":
                 artifact = job / "returned-result.json"
                 key = f"{role}:{kind}:{task_id}"
@@ -355,21 +388,6 @@ class Dispatcher(RuntimeService):
                 return self.services.receipts.finish_review_receipt(key, schema, packet, previous_review)
             if role == "commander":
                 return self.services.receipts.finish_commander_receipt(f"{role}:{kind}:{task_id}")
-            if git.head(self.context.worktree, binding=self.context.run["worktree_binding"]) != self.context.run["expected_head"]:
-                raise HarnessError("agent 修改了 Git HEAD；已停止，保留现场")
-            # Commander/reviewer receipts own their read-only gates above.
-            # Only the mutating worker result reaches this acceptance boundary.
-            git.check_scope(self.context.worktree, task["allowed_paths"], binding=self.context.run["worktree_binding"])
-            validate_structure(result, contract)
-            validate_work_semantics(result)
-            entry["worker_outcome"] = ("completed" if result["status"] == "completed"
-                                       else result["blocker_kind"] + "_blocked")
-            validate(result, contract)
-            entry["status"] = "completed"
-            self.context.emit_hook("post_agent", {**entry, "result": result}, job)
-            if git.head(self.context.worktree, binding=self.context.run["worktree_binding"]) != self.context.run["expected_head"]:
-                raise HarnessError("agent hook 修改了 Git HEAD；已停止，保留现场")
-            return {k: v for k, v in result.items() if k not in ("task_id", "dispatch_id")}
         except InvalidReviewRejection:
             raise
         except BaseException as error:
@@ -400,6 +418,10 @@ class Dispatcher(RuntimeService):
                 # Supervision can add callback/persistence failures after the
                 # callback returns. Preserve those final facts as well.
                 apply_outcome(process_outcome)
+            if (role == "worker" and invoked and not backend_returned and invocation_error is not None
+                    and entry.get("exit_confirmed") is True and not startup_interrupted):
+                entry["worker_no_result"] = self.services.worker_receipts.failed_without_result(
+                    job, self.context.config.role(role, self.context.commander)["cli"])
             if invoked:
                 # Observe the provider envelope even on CLI/protocol failures.
                 # Telemetry is best effort and cannot change acceptance/recovery.

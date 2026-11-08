@@ -8,6 +8,7 @@ from pathlib import Path
 
 from . import git
 from .operations import warn
+from .input_projection import validate_dispatch_indexes as validate_input_dispatch_indexes
 from .path_evidence import validate_dispatch_indexes
 from .services import RuntimeService
 from .continuation import packet as continuation_packet, record_execution_guidance, record_continuation_rejection
@@ -32,7 +33,7 @@ class RunLifecycle(RuntimeService):
         ident = uid("run")
         worktree = self.context.state / "worktrees" / ident
         operation = self.context.operation
-        self.context.run = {"schema_version": 13, "workspace_inputs": None, "id": ident, "repo": str(self.context.repo), "goal": goal, "status": "planning", "commander": self.context.commander,
+        self.context.run = {"schema_version": 14, "workspace_inputs": None, "id": ident, "repo": str(self.context.repo), "goal": goal, "status": "planning", "commander": self.context.commander,
                     "branch": "harness/" + ident, "worktree": str(worktree), "tasks": [], "accepted": {}, "attempts": {},
                     "attempt_budget_policy": "work",
                     "dispatches": [], "expected_head": git.head(self.context.repo), "feedback": None,
@@ -41,7 +42,7 @@ class RunLifecycle(RuntimeService):
                     "original_tasks": deepcopy(supplied_tasks),
                     "total_attempts": 0, "replan_attempts": 0, "final_attempts": 0,
                     "review_history": {}, "final_history": [], "plan_history": [], "format_repairs": {},
-                    "review_corrections": {}, "review_receipts": {}, "commander_receipts": {},
+                    "worker_receipts": {}, "review_corrections": {}, "review_receipts": {}, "commander_receipts": {},
                     "invalid_repairs": {}, "approved_scope": [],
                     "environment_updates": [], "environment_checks": [],
                     "decision_requests": [], "operator_decisions": [], "task_checkpoints": [], "checkpoint_batches": [],
@@ -97,14 +98,14 @@ class RunLifecycle(RuntimeService):
         self.context.run = read_json(self.context.state / "runs" / ident / "state.json")
         if not isinstance(self.context.run, dict):
             raise HarnessError("运行台账必须为对象")
-        if self.context.run.get("schema_version") != 13:
+        if self.context.run.get("schema_version") != 14:
             raise HarnessError("旧 run 仅保留为历史证据；新内核不恢复旧执行状态，请开始新 run")
         required = {"id": str, "repo": str, "worktree": str, "status": str, "commander": str,
                     "goal": str, "branch": str, "expected_head": str, "base_commit": str,
                     "config_snapshot": dict, "tasks": list, "original_tasks": list,
                     "accepted": dict, "attempts": dict, "dispatches": list,
                     "review_history": dict, "review_corrections": dict, "review_receipts": dict,
-                    "commander_receipts": dict, "worktree_binding": dict, "ignored_baseline": list,
+                    "worker_receipts": dict, "commander_receipts": dict, "worktree_binding": dict, "ignored_baseline": list,
                     "invalid_repairs": dict, "approved_scope": list,
                     "pending_format_corrections": dict,
                     "final_history": list, "plan_history": list, "format_repairs": dict,
@@ -123,6 +124,7 @@ class RunLifecycle(RuntimeService):
             raise HarnessError("运行输入绑定字段缺失或无效；保留现场")
         validate_command_directories(self.context.run["dispatches"], self.context.directory)
         self.validate_recovery_links()
+        self.services.worker_receipts.validate_links()
         self.services.budgets.validate_attempt_accounting()
         self.services.environment.validate_environment_links()
         self.services.decisions.validate_decision_links()
@@ -194,7 +196,7 @@ class RunLifecycle(RuntimeService):
             value = mapping(value, field)
             reference(value.get("dispatch_id"), key, field)
 
-        for field, role in (("review_receipts", "reviewer"), ("commander_receipts", "commander")):
+        for field, role in (("worker_receipts", "worker"), ("review_receipts", "reviewer"), ("commander_receipts", "commander")):
             for key, receipt in self.context.run[field].items():
                 if not key.startswith(role + ":"):
                     fail(field + "." + key)
@@ -322,10 +324,12 @@ class RunLifecycle(RuntimeService):
                                    f"使用 abandon {ident} 保留证据后重新运行；"
                                    "若工作树或分支已创建，请核对后手工清理")
             validate_dispatch_indexes(self.context.directory, self.context.run["dispatches"])
+            validate_input_dispatch_indexes(self.context.directory, self.context.run["dispatches"])
             if git.head(self.context.worktree, binding=self.context.run["worktree_binding"]) != self.context.run["expected_head"]:
                 raise HarnessError("worktree HEAD 与检查点不同；请先核对提交，不自动重放")
             from .workspace_inputs import validate_inputs
             validate_inputs(self.context.run, self.context.directory)
+            self.services.worker_receipts.validate_links()
             self.services.receipts.validate_pending_terminal_captures()
             self.services.planning.recover_replan_worker_correction()
             update = self.services.environment.prepare_environment_update(environment_update) if environment_update is not None else None

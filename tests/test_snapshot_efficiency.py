@@ -14,7 +14,9 @@ class SnapshotEfficiencyTests(RepoCase):
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["total_attempts"], 1)
         self.assertEqual(result["final_attempts"], 1)
-        self.assertLessEqual(snapshots.call_count, 15)
+        # Durable worker return, replay, hook and publication guards add four
+        # net reads; none may reuse a snapshot across those boundaries.
+        self.assertLessEqual(snapshots.call_count, 19)
 
     def test_reused_verification_snapshot_still_detects_hook_changes(self):
         engine = self.engine()

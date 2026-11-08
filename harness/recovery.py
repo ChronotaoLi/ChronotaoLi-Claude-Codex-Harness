@@ -17,7 +17,7 @@ from .util import HarnessError
 RECOVERY_BUSY_KEYS = (
     "pending_task", "pending_acceptance", "pending_post_accept",
     "pending_replan", "pending_directive", "review_receipts",
-    "commander_receipts", "pending_format_corrections", "review_corrections",
+    "worker_receipts", "commander_receipts", "pending_format_corrections", "review_corrections",
 )
 
 

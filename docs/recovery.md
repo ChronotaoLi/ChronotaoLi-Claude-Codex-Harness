@@ -98,13 +98,17 @@ python3 -m harness --config /path/to/harness.toml --repo /path/to/project resume
 
 对长时间中断后 pgid 被复用的情况，采用显式确认而非根据组长身份自动推断整个进程组已退出。`resume` 与 `abandon` 的 `--confirm-exited <dispatch_id>` 在运行锁内校验全部 ID，先追加操作事件，再只更新指定记录的退出确认。事件记录当时的组存活探测及组长 PID、PPID、PGID、启动时间和命令名（或探测错误）；组长缺失不构成自动退出证明，不发送终止信号。确认不放宽其他恢复或工作树移除检查。
 
-运行、运行工作树清理与验证清理共用进程退出判定。派发在准备阶段保存 `process_state=prepared`，真正调用后端前与预算一起保存 `starting`，启动回调记录 pgid 后转为 `running`；受控结束记录退出。只有明确的准备状态可以证明尚未尝试启动，`starting` 或旧台账中无 pgid 且未确认退出的条目均停止恢复与清理，覆盖子进程已启动但 pgid 尚未落盘的中断窗口。`cleanup-verification RUN --confirm-exited ID` 与终态的 `cleanup-run RUN --confirm-exited ID` 提供无需运行配置的同一审计确认入口，兼容版本 7 至 13，不恢复执行或改写终态。
+运行、运行工作树清理与验证清理共用进程退出判定。派发在准备阶段保存 `process_state=prepared`，真正调用后端前与预算一起保存 `starting`，启动回调记录 pgid 后转为 `running`；受控结束记录退出。只有明确的准备状态可以证明尚未尝试启动，`starting` 或旧台账中无 pgid 且未确认退出的条目均停止恢复与清理，覆盖子进程已启动但 pgid 尚未落盘的中断窗口。`cleanup-verification RUN --confirm-exited ID` 与终态的 `cleanup-run RUN --confirm-exited ID` 提供无需运行配置的同一审计确认入口，兼容版本 7 至 14，不恢复执行或改写终态。
 
 worker 完成且结果通过检查后，持久化 `pending_task` 的 verifying 阶段及完整快照摘要；验证成功后持久化 reviewing 阶段、diff、验证产物路径、记忆提案和历轮审阅。恢复时先检查范围、HEAD 和快照；一致则继续未完成阶段，不再派发 worker 或消耗 worker 额度。验证重跑使用新的日志目录。候选变化使后续证据失效，回到新的工作尝试；越界残留先停止并提示人工核对清理，不自动删文件，不派发模型或消耗 worker 额度。
 
 worker 返回后的修复声明预检读取派发前已绑定的实际输入清单；缺失、改变、符号链接或原审阅来源不符均停止，不能重算一份清单替代。更新前已返回但尚待预检的 worker 若没有该绑定，也不补造来源，需保留证据后 abandon；已完成候选预检的后续阶段仍沿用其已保存门禁。
 
-已知窗口：worker 结果落盘、dispatch 返回之后，到 `pending_task` 或 blocker 反馈持久化之前，还会进行结果核对、忽略文件记录及候选快照。如果这时中断，普通恢复会重新调度并启动新的 worker，保留现场编辑但再次消耗尝试和派发预算。此窗口不属于 `dispatch_once` 的异常处理，可能没有 `worker_recovery` 来源；已返回的普通 worker 结果不按 reviewer／commander receipt 复用。当前不提供直接消费该旧结果的恢复协议。
+版本 14 在 worker 调用身份与预算同次保存接收意图。正常返回并确认 worker 及 broker 子进程退出后，将结果全文、来源摘要、返回后候选摘要、HEAD、Git 绑定和进程事实封存为内容寻址的 `worker-seal.<SHA256>.json`，再发布 `returned-result.json`。恢复先核验封存记录与当前候选，再继续原契约、范围及 hook 门禁；接收原结果不启动模型、不增加尝试，也不因新调用额度耗尽而丢弃结果。任务阶段或原 blocker 的发布与活动回执消费同次保存，检查点沿用原 dispatch 的幂等登记及有效期。
+
+worker 的 post_agent 正常修改可以形成独立的 hook 后候选绑定，仍检查 HEAD 和范围；hook 未完成或完成标记尚未保存时，候选已变化就停止，不能推断成功。候选未变可用新日志目录重试 hook，保持至少一次语义。仅有供应商原始输出、尚无完整封存记录的中断不允许重启后补绑当前工作树或自动重派；原始证据保留，没有人工接受未绑定结果或旧台账迁移入口。调用故障或正常中断在进程退出后保存了“无返回结果”的确定事实时，仍按已有预算允许新的调用；重启后仅发现结果文件不存在，不足以补造这一事实。这里保证的是受门禁保护的进程中断恢复，不承诺断电一致性或外部副作用恰好一次。
+
+明确拒绝的交接另有原有出口：非法下游决定、post_agent 前已校验的路径范围违规，以及自动格式修正返回后的结构／语义拒绝或修正额度耗尽，原子保存拒绝来源与回执消费，后续普通恢复走新的计费尝试。若中断时结果尚未校验，首次恢复先完成原拒绝门禁并停止，再次恢复才开始新尝试。范围违规仍须先核对并清理越界文件。这里不复用被拒绝结果，也不消费来源、候选、Git 绑定、未知进程退出或 hook 失败的回执。后续 worker 成功返回后，较早失败的来源仍保留到正式接受；回执自身恢复成功的临时错误与历史失败分别处理。
 
 候选变化时，先将已返回的审阅及格式修正原始依据保存到历史，保留 dispatch、原快照、产物路径、摘要和校验错误，再清除待审阅状态。结构与身份可确认的 findings 传给后续实例复核，其余产物只作为带诊断的原始证据引用。结构非法的审阅即使候选变化也继续阻止后续派发，需保留证据后 abandon，不能通过修改候选跳过其中可能存在的拒绝。已绑定产物缺失或篡改仍阻止恢复；失效批准不构成新候选的接受依据。
 
@@ -152,7 +156,7 @@ worker 的失败反馈共享 9,000 字符的序列化摘录额度，保留状态
 
 ### 恢复子状态的维护约束
 
-加载台账时先检查下列可选对象的类型、任务阶段与再规划互斥，以及 receipt、修正守卫和 worker 故障来源引用的 dispatch 是否存在并匹配角色／调用类型／任务；重复 dispatch ID 同样停止。`pending_task.task_id`、`pending_acceptance.task_id`、`pending_post_accept.payload.task_id` 和非 `None` 的 `current_task` 必须是指向现有任务的字符串；检查引用前先核对任务条目、嵌套 payload 和 ID 的类型。检查失败给出 `HarnessError`，不重写台账、不派发、不写入记忆，也不先归档候选。此检查不替代消费证据时的内容摘要、候选快照、身份和 hook 门禁，不自动修复损坏状态；当前执行仅接受版本 13；环境更新、检查点及决定另校验各自归属和证据引用。
+加载台账时先检查下列可选对象的类型、任务阶段与再规划互斥，以及 receipt、修正守卫和 worker 故障来源引用的 dispatch 是否存在并匹配角色／调用类型／任务；重复 dispatch ID 同样停止。`pending_task.task_id`、`pending_acceptance.task_id`、`pending_post_accept.payload.task_id` 和非 `None` 的 `current_task` 必须是指向现有任务的字符串；检查引用前先核对任务条目、嵌套 payload 和 ID 的类型。检查失败给出 `HarnessError`，不重写台账、不派发、不写入记忆，也不先归档候选。此检查不替代消费证据时的内容摘要、候选快照、身份和 hook 门禁，不自动修复损坏状态；当前执行仅接受版本 14；环境更新、检查点及决定另校验各自归属和证据引用。
 
 恢复链接校验失败同样阻止 `abandon`，应保留台账与证据供核对。`status` 和 `cleanup-verification` 不经过此链接检查；后者仍须通过独立的台账、进程退出和 Git 绑定检查，不保证损坏台账可以清理。
 
@@ -166,6 +170,7 @@ worker 的失败反馈共享 9,000 字符的序列化摘录额度，保留状态
 | `pending_post_accept` | 接受提交及台账保存 | 记忆、事件和 post_accept 均完成后清除 |
 | `pending_replan` | task blocker、整体失败、指挥任务选择 `action=replan`（同一次保存消费选择 receipt），或显式重开 stop | 修订登记、stop 或允许的 reverify 取消时清除 |
 | `pending_directive` | 已校验的 implement 任务选择；replan 选择不进入 | worker 调用前与预算一起消费；本地准备失败保留 |
+| `worker_receipts` | 调用身份与预算同次保存接收意图，返回后封存结果、实际输出契约及候选 | 原阶段或 blocker 与消费同次保存；未封存返回不能自动重派 |
 | `review_receipts` / `commander_receipts` | 调用前保存接收意图 | 结果被阶段状态消费、转入修正或允许的候选失效时清除 |
 | `pending_format_corrections` | 格式错误后准备修正 | 成功、额度耗尽或候选失效时清除；worker 返回或同任务指挥选择 replan 时清除。旧再规划残留只经来源校验后兼容清理；尚未启动时允许没有新 dispatch ID |
 | `review_corrections` | 首次需要格式修正的审阅 | 审阅被消费或候选失效时清除；可与 receipt、待修正状态并存 |
@@ -211,7 +216,7 @@ worker 的失败反馈共享 9,000 字符的序列化摘录额度，保留状态
 | 启动中断且 `worktree_binding` 仍为空 | `abandon RUN` 保留证据后重新 `run` | 没有已保存的可信绑定，不能 resume 或自动推断；若工作树或 `harness/<run>` 分支已创建，核对后手工执行 `git worktree remove` 并删除该分支 |
 | 移除工作树被未保存文件阻止 | 核对诊断路径、归档或清理后重试移除 | 忽略文件也不得未经核对删除 |
 
-环境更新与操作者决定共用九个待处理阶段键：`pending_task`、`pending_acceptance`、`pending_post_accept`、`pending_replan`、`pending_directive`、`review_receipts`、`commander_receipts`、`pending_format_corrections`、`review_corrections`。环境更新另将 `replan_stopped` 视为忙碌；决定答复则单独核对停止请求的目标、原因及来源。两入口保留各自的 invalid repair 判断：pending 修正阻断，completed 修正的匹配 receipt 未消费时仍阻断，消费后不会仅因历史修正完成而永久阻断。准备门禁不写入更新或答复，也不消耗模型预算；原台账版本与证据保存顺序不变。
+环境更新与操作者决定共用十个待处理阶段键：`pending_task`、`pending_acceptance`、`pending_post_accept`、`pending_replan`、`pending_directive`、`worker_receipts`、`review_receipts`、`commander_receipts`、`pending_format_corrections`、`review_corrections`。环境更新另将 `replan_stopped` 视为忙碌；决定答复则单独核对停止请求的目标、原因及来源。两入口保留各自的 invalid repair 判断：pending 修正阻断，completed 修正的匹配 receipt 未消费时仍阻断，消费后不会仅因历史修正完成而永久阻断。准备门禁不写入更新或答复，也不消耗模型预算；原台账版本与证据保存顺序不变。
 
 来源过期判断仍有意保留入口差异：环境更新只计来源之后 worker／commander／reviewer 的后续模型调用；worker／replan_stop 决定登记计来源之后的全部 dispatch；决定答复或修订从保存的 `dispatch_count` 起算，handoff 只计目标任务。后两处以 `.get("invoked", True)` 判断，因此没有 invoked 字段的 verification 也会被表达式计入；目前未发现该差异在正常可达流程中造成错误过期，不将状态注入测试视为实际生命周期缺陷证明。status 对三种模型角色按 `invoked is not False` 保守诊断原始坏台账。
 
@@ -269,7 +274,7 @@ worker 独有的 `harness_commands` broker 在 dispatch 私有 `commands/` 中�
 
 每条 broker 命令的超时取 `runtime.verify_timeout_seconds`，可在恢复时调大；适配器配置的 MCP 超时另加 10 秒，整个 worker 仍受 `agent_timeout_seconds` 限制。
 
-操作者核实后仍以父 dispatch ID 提交 `--confirm-exited`，审计记录绑定命令子日志摘要，再保存该精确 dispatch 的确认；不终止无关进程，也不跳过 HEAD、快照、Git 绑定或文件清理检查。新运行写版本 13；旧版本不得恢复执行。`cleanup-verification` 可检查版本 7 至 13，包括终态 run。
+操作者核实后仍以父 dispatch ID 提交 `--confirm-exited`，审计记录绑定命令子日志摘要，再保存该精确 dispatch 的确认；不终止无关进程，也不跳过 HEAD、快照、Git 绑定或文件清理检查。新运行写版本 14；旧版本不得恢复执行。`cleanup-verification` 可检查版本 7 至 14，包括终态 run。
 
 ## 操作记录与观察事件
 
@@ -281,7 +286,7 @@ worker 独有的 `harness_commands` broker 在 dispatch 私有 `commands/` 中�
 
 ## 终态与版本兼容
 
-新运行台账为版本 13。执行入口拒绝所有旧 schema，包括旧终态 run 的 resume；不升级或推广旧执行状态。旧台账仍可由 status／观察工具读取，并可通过专用清理入口在退出、Git 和文件门禁通过后清理。列出状态时，损坏或缺失台账产生诊断，不阻止查看其他运行。版本 13 已完成 run 的普通 resume 返回保存结果，不派发；修改执行状态的选项仍受终态限制。当前配置或历史产物的读取兼容不表示旧 run 可以继续执行。
+新运行台账为版本 14。执行入口拒绝所有旧 schema，包括旧终态 run 的 resume；不升级或推广旧执行状态。旧台账仍可由 status／观察工具读取，并可通过专用清理入口在退出、Git 和文件门禁通过后清理。列出状态时，损坏或缺失台账产生诊断，不阻止查看其他运行。版本 14 已完成 run 的普通 resume 返回保存结果，不派发；修改执行状态的选项仍受终态限制。当前配置或历史产物的读取兼容不表示旧 run 可以继续执行。
 
 终态工作树由独立的 `cleanup-run` 预览或移除，不借助 `resume` 或改写为其他终态。该入口接受显式退出确认，清理回执保存在 `worktree-cleanup.json`，不升级台账；只有显式 `--confirm-exited` 才更新对应进程的审计与确认字段。
 
@@ -305,7 +310,7 @@ worker 独有的 `harness_commands` broker 在 dispatch 私有 `commands/` 中�
 
 准备失败或中断保留日志，普通 resume 在另一个全新检出重试当前最终尝试，不重复 worker；已经完成验证而仅审阅失败时复用原验证证据。新检出位于系统临时目录的私有 `harness-verify-*/.harness/checkout`，路径、绑定和准备结果记入验证目录的 `checkout.json`，保留供检查，不由 `abandon --remove-worktree` 自动清理。临时目录若位于目标仓库内则拒绝使用。此模式隔离工作树遗留文件及主仓库父目录依赖，仍使用当前进程环境、Git 配置和操作者声明的准备命令，不承诺容器级可复现性。
 
-`cleanup-verification RUN` 默认只返回各检出的可清理状态；`--remove` 在运行锁内确认旧进程退出、路径归属、Git 绑定及原验证提交后逐项移除，保留运行台账、diff、日志和 `checkout.json`，另写清理记录。已跟踪修改、未跟踪或忽略文件均阻止清理，需要先人工核对。目录已缺失时，仅在原绑定仍可核验的情况下注销该精确路径，不执行全仓库 prune。该命令兼容版本 7 至 13 的台账，不加载配置或调用模型。
+`cleanup-verification RUN` 默认只返回各检出的可清理状态；`--remove` 在运行锁内确认旧进程退出、路径归属、Git 绑定及原验证提交后逐项移除，保留运行台账、diff、日志和 `checkout.json`，另写清理记录。已跟踪修改、未跟踪或忽略文件均阻止清理，需要先人工核对。目录已缺失时，仅在原绑定仍可核验的情况下注销该精确路径，不执行全仓库 prune。该命令兼容版本 7 至 14 的台账，不加载配置或调用模型。
 
 所有恢复和清理入口都核对父 dispatch 及 broker 命令子进程；父进程退出不能证明子进程已退出。旧 dispatch 没有可确认的退出记录时，清理与恢复均停止；缺少 pgid 不能证明进程未启动。核实退出后可执行 `cleanup-verification RUN --confirm-exited DISPATCH_ID`，可重复指定 ID，也可与 `--remove` 合用。此确认入口支持已完成或已放弃的 run，先保存审计事件，再更新指定 dispatch 的确认，不改变 run 状态或放松文件清理门禁。未指定确认时，预览不改运行台账。
 
@@ -404,13 +409,13 @@ SQLite 存在目标项目 `.harness/memory.sqlite3`，项目之间独立。每�
 
 首次执行、应用再规划前，以及已有环境更新或操作者答复的恢复中，预检整体审阅容量。确定的必要内容下界超限时保存计划并停止，允许增加 `context_chars` 后恢复；预计摘要和验证输出可能超限时提前警告。决定摘录会随答复修订或条数变化而缩减，因此仅计入预警估计；检查点按最终全部任务已接受的场景只提供索引，不把当前未接受任务的展开内容计入最终容量。预计容量不是保证，后续历史和实际输出仍可能使输入超限，所有正式派发继续执行完整输入的实际预算检查。
 
-所有输入包与预算报告落在 dispatch 目录。默认 `context_chars = 100000` 是编排输入的字符上限，不是 token 数或固定输入长度。`context-report.json` 分别记录必要输入 `required_chars`、已加入的可选记忆及其分隔文本 `memory_chars`，两者之和为 `used_chars`；必要输入超限才触发硬门禁，可选记忆按剩余预算整条加入。
+所有输入包与预算报告落在 dispatch 目录。默认 `context_chars = 100000` 是编排输入的字符上限，不是 token 数或固定输入长度。准备成功时，`context-report.json` 分别记录必要输入 `required_chars`、已加入的可选记忆及其分隔文本 `memory_chars`，两者之和为 `used_chars`；必要输入超限才触发硬门禁，可选记忆按剩余预算整条加入。超限报告保留实际角色、阶段、必要字符数、预算、逐字段尺寸及容器开销，不包含尚未装入的 `memory_chars` 或 `used_chars`；再规划报告另绑定原 request ID，不启动模型或扣调用额度。
 
 报告的 `memory_retrieval.counts` 区分 active_candidates、matched、scope_excluded、applicable、returned、limit_excluded、included、capacity_excluded。八条适用、六条返回、三条装入时，数量上限排除为二、容量排除为三；排第一的大记录可能被跳过而后续小记录进入，明细按实际 ID 标记。查询摘录最多 1,024 字符，附完整 SHA256；最多四十条明细、每条最多十个命中词、长文本最多 256 字符并标注截断，阶段计数仍完整。未执行的来源核验或评分为 null，不为报告重扫来源。报告随 context_prepared（或既有 context_compacted 别名）hook 传递，不放入提示词，也不解释 SQL 已排除的每条历史记录。
 
 默认 `agent_timeout_seconds = 3600`，全局 `claude_max_turns = 50`。可选 `runtime.claude_max_turns_by_role = { worker = 200 }` 按 commander、worker、reviewer 设置正整数覆盖；Fable 指挥使用 commander，Codex 不使用此限制。仓库示例显式设置 worker 200，旧配置省略覆盖仍沿用原全局值。恢复允许添加、提高或移除覆盖，但各角色实际生效值不得减少；例如原 worker 200、全局 50 时，直接删除 worker 覆盖会拒绝恢复，将全局提高到至少 200 后才可删除。全局值自身仍不可降低，合法变更沿用配置变更审计，不清零累计预算。
 
-Claude 的轮数上限针对单次派发的工具使用循环，一轮可以包含多个工具调用，不是任务累计工具次数；供应商报告的 `num_turns` 仅用于观测，不能直接与该上限比较。墙钟时限独立生效，持续输出或工具运行不会自动延长。轮数耗尽或超时 worker 均计入工作尝试，文件改动和原始错误保留；增加限额后正常恢复使用新进程和新 dispatch，继续核验原目标、范围、验证及独立审阅。当前不会自动延长、续接供应商会话或豁免预算。200 只是长任务起始值，需按到限率、最终验收和恢复重复工作校准；提高容量不保证任意任务完成。
+Claude 的轮数上限针对单次派发的工具使用循环，一轮可以包含多个工具调用，不是任务累计工具次数；供应商报告的 `num_turns` 仅用于观测，不能直接与该上限比较。墙钟时限独立生效，持续输出或工具运行不会自动延长。轮数耗尽或超时 worker 均计入工作尝试，文件改动和原始错误保留；已确认无返回结果时，增加限额后正常恢复使用新进程和新 dispatch，继续核验原目标、范围、验证及独立审阅。当前不会自动延长、续接供应商会话或豁免预算。200 只是长任务起始值，需按到限率、最终验收和恢复重复工作校准；提高容量不保证任意任务完成。
 
 Claude 非零退出或 CLI 结果信封报告错误时，诊断从有界 JSON 读取错误标志、类型和最多三条短错误说明，同时保留退出码及原始日志。`subtype=success` 与 `is_error=true` 并存时明确报告错误；白名单内的 `terminal_reason`、`api_error` 和严格整数 HTTP 错误状态可显示额度／限流等原因，未知值只显示固定标记。错误说明转义控制字符，不读取模型正文或任意额外字段作为诊断；读取失败仍保留原退出错误。诊断不增加重试、不换模型、不豁免预算，也不根据 `num_turns` 推断成功或失败。
 

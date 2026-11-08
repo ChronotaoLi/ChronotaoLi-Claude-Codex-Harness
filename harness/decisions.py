@@ -213,7 +213,7 @@ class DecisionRecovery(RuntimeService):
         requests, responses = self.context.run.get('decision_requests', []), self.context.run.get('operator_decisions', [])
         if not isinstance(requests, list) or not isinstance(responses, list):
             raise HarnessError('decision ledger must contain arrays')
-        if self.context.run['schema_version'] != 13:
+        if self.context.run['schema_version'] != 14:
             raise HarnessError('decision ledger requires schema 13')
         records, ids = [], set()
         for category, rows in (('request', requests), ('response', responses)):

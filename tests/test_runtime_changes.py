@@ -18,12 +18,16 @@ def finding(severity="blocking", category="defect"):
 class ScriptedBackend(DemoBackend):
     def __init__(self, change=None):
         self.change = change
+        # Simulate failures/partial edits before any designated result exists.
+        self.before_result = None
         self.calls = []
 
     def invoke(self, **kwargs):
         packet = json.loads(kwargs["prompt"].split("\n\nREFERENCE MEMORY")[0])["packet"]
         self.calls.append({"role": kwargs["role"], "kind": kwargs["kind"],
                            "packet": copy.deepcopy(packet), "task_id": kwargs["schema"]["properties"]["task_id"]["enum"][0]})
+        if self.before_result:
+            self.before_result(self, kwargs, packet)
         result = super().invoke(**kwargs)
         if self.change:
             self.change(self, kwargs, packet, result)
@@ -211,10 +215,12 @@ class RuntimeChangesTests(RepoCase):
         self.assertEqual(engine.run["replan_attempts"], 0)
 
     def test_resume_budget_increase_preserves_attempts_and_logs_change(self):
-        def interrupt(backend, kwargs, packet, result):
+        def interrupt(backend, kwargs, packet):
             if kwargs["role"] == "worker":
                 interrupt_started_agent(kwargs)
-        engine = self.engine(ScriptedBackend(interrupt))
+        backend = ScriptedBackend()
+        backend.before_result = interrupt
+        engine = self.engine(backend)
         with self.assertRaises(KeyboardInterrupt):
             engine.start("Implement greet", self.plan())
         old_budget = engine.run["config_snapshot"]["runtime"]["context_chars"]

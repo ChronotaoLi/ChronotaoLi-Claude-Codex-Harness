@@ -14,6 +14,7 @@ from .contracts import (
     WORK,
 )
 from .memory import validate_proposals
+from .input_projection import validate_dispatch_indexes as validate_input_dispatch_indexes
 from .path_evidence import validate_dispatch_indexes
 from .progress import CheckpointDeclarationError
 from .recovery import invalidate_acceptance_review, snapshot_digest, worker_recovery_context
@@ -155,10 +156,31 @@ class TaskLifecycle(RuntimeService):
                   "handoff_targets": self.services.workflow.handoff_targets(tid),
                   "verification_commands": self.context.config.data["verification"]["commands"],
                   "tool_constraints": self.services.packets.tool_constraints()}, task=task)
+        return self.publish_worker_result(task, result, prior_reviews)
+
+    def replay_worker(self):
+        key = self.services.worker_receipts.pending()
+        if key is None:
+            return None
+        receipt = self.context.run["worker_receipts"][key]
+        entry = self.services.worker_receipts.entry(receipt)
+        task = next(t for t in self.context.run["tasks"] if t["id"] == entry["task_id"])
+        result = self.services.dispatch.dispatch("worker", "implement", task["id"], WORK, {}, task=task)
+        prior_reviews = compact_reviews(self.context.run["review_history"].get(task["id"], []))
+        return self.publish_worker_result(task, result, prior_reviews)
+
+    def publish_worker_result(self, task, result, prior_reviews):
+        runtime = self.context
+        tid = task["id"]
+        key = f"worker:implement:{tid}"
+        receipt = self.context.run["worker_receipts"][key]
+        candidate_digest = receipt.get("post_hook_digest")
+        if not candidate_digest or snapshot_digest(self.context.snapshot()) != candidate_digest:
+            raise HarnessError("worker candidate changed before handoff publication")
         validate_work(result)
-        attempt = self.context.run["attempts"][tid]
+        attempt = self.context.run["worker_receipts"][key]["attempt"]
         paths = git.check_scope(self.context.worktree, task["allowed_paths"], binding=self.context.run["worktree_binding"])
-        worker_dispatch = self.context.run["dispatches"][-1]
+        worker_dispatch = self.services.worker_receipts.entry(self.context.run["worker_receipts"][key])
         worker_artifact = self.context.directory / "dispatches" / worker_dispatch["id"] / "returned-result.json"
         raw_worker = worker_artifact.read_bytes()
         stored_worker = json.loads(raw_worker)
@@ -195,23 +217,32 @@ class TaskLifecycle(RuntimeService):
             self.context.run["last_runtime_error"] = {"role": "worker", "kind": "implement", "task_id": tid,
                                              "error": str(error), "artifact": str(worker_artifact.parent)}
             self.services.workflow.record_worker_recovery(tid, worker_dispatch["id"], worker_artifact.parent, error)
+            self.services.worker_receipts.consume(key, "handoff_rejected")
             self.context.save()
             self.context.event("worker_result_rejected", task_id=tid, dispatch_id=worker_dispatch["id"], reason=str(error))
             raise
         self.context.record_ignored_paths("worker", worker_artifact.parent)
+        if snapshot_digest(self.context.snapshot()) != candidate_digest:
+            raise HarnessError("worker candidate changed during handoff preparation")
         if result["status"] == "blocked":
             snapshot = self.context.snapshot()
+            if snapshot_digest(snapshot) != candidate_digest:
+                raise HarnessError("worker candidate changed before blocker publication")
             self.context.run["feedback"] = {"task_id": tid, "worker": result, "attempt": attempt,
                                        "snapshot_digest": snapshot_digest(snapshot), **worker_source}
             if result["blocker_kind"] == "continuation":
                 record_continuation(runtime, tid, result,
                     {"dispatch_id": worker_dispatch["id"], "artifact": str(worker_artifact),
-                     "artifact_digest": worker_source["worker_artifact_digest"]}, snapshot)
+                     "artifact_digest": worker_source["worker_artifact_digest"]}, snapshot, save=False)
+                self.services.worker_receipts.consume(key, "continuation")
                 self.context.save()
                 return False
             self.services.budgets.record_attempt_exemption(worker_dispatch, result, worker_source)
             if checkpoints_discarded is not None:
                 self.context.run["feedback"]["checkpoints_discarded"] = checkpoints_discarded
+            if result["blocker_kind"] == "task":
+                self.context.run["pending_replan"] = {"stage": "pending", "trigger": deepcopy(self.context.run["feedback"])}
+            self.services.worker_receipts.consume(key, result["blocker_kind"] + "_blocked")
             self.context.save()
             if result["blocker_kind"] == "operator":
                 self.services.workflow.synchronize_decision_requests()
@@ -221,12 +252,11 @@ class TaskLifecycle(RuntimeService):
                                    "若必要命令被拒绝，可在 permissions.worker_commands 追加精确 argv 后 resume；"
                                    "环境事实有变化可使用 --environment-update FILE 记录补充说明与本地检查；"
                                    "原尝试和派发预算仍保留。")
-            self.context.run["pending_replan"] = {"stage": "pending", "trigger": deepcopy(self.context.run["feedback"])}
-            self.context.save()
             return False
         self.context.run["pending_task"] = {"task_id": tid, "attempt": attempt, "stage": "verifying",
-            "snapshot_digest": snapshot_digest(self.context.snapshot()),
+            "snapshot_digest": candidate_digest,
             "worker_result": result, **worker_source, "prior_reviews": prior_reviews, "verification_rounds": 0}
+        self.services.worker_receipts.consume(key, "pending_task")
         self.context.save()
         return self.continue_task()
 
@@ -501,6 +531,7 @@ class TaskLifecycle(RuntimeService):
         if snapshot_digest(self.context.snapshot()) != pending["snapshot_digest"]:
             raise HarnessError("审阅后文件发生变化；禁止接受旧审阅结果")
         validate_dispatch_indexes(self.context.directory, self.context.run["dispatches"])
+        validate_input_dispatch_indexes(self.context.directory, self.context.run["dispatches"])
         paths = git.check_scope(self.context.worktree, task["allowed_paths"], binding=self.context.run["worktree_binding"])
         validate_review_source(self.context.run, tid, pending, candidate_digest=pending["snapshot_digest"])
         commit = git.accept(self.context.worktree, paths, self.context.run["id"], tid, binding=self.context.run["worktree_binding"])

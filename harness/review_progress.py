@@ -57,10 +57,9 @@ def required_findings(run, task_id, candidate_digest, *, whole_run=False, record
     return list(issues.values())
 
 
-def bind_worker_findings(context, entry, packet):
-    """Save the exact delivered obligations, before hooks can change the candidate."""
+def worker_findings_payload(task_id, dispatch_id, packet):
+    """Build the delivered identities and a draft that makes no repair claim."""
     from copy import deepcopy
-    from .util import write_json
     rows = deepcopy(packet.get("required_findings", []))
     if len(rows) > 60:
         raise HarnessError("worker 必需问题超过单次审阅容量；保留来源并调整计划")
@@ -71,8 +70,34 @@ def bind_worker_findings(context, entry, packet):
             if not source.get("artifact"):
                 raise HarnessError("worker 必需问题缺少原始来源")
             row["artifact"] = source["artifact"]
+    value = {"dispatch_id": dispatch_id, "task_id": task_id, "required_findings": rows}
+    if rows:
+        value["repair_claims_template"] = [
+            {"review_dispatch_id": row["review_dispatch_id"], "finding_id": row["finding_id"],
+             "summary": "", "evidence_paths": []} for row in rows]
+    return value
+
+
+def worker_claim_template_reference(context, task_id, dispatch_id, packet):
+    """Reference the exact sidecar that bind_worker_findings publishes before invoke."""
+    from .util import dump
+    value = worker_findings_payload(task_id, dispatch_id, packet)
+    if not value["required_findings"]:
+        return None
+    artifact = context.directory / "dispatches" / dispatch_id / "worker-findings.json"
+    return {"artifact": str(artifact),
+            "artifact_digest": hashlib.sha256((dump(value) + "\n").encode("utf-8")).hexdigest(),
+            "field": "repair_claims_template", "required_count": len(value["required_findings"]),
+            "policy": "Read the bound draft; complete every identity once within output_constraints. "
+                      "Empty fields prove no repair. evidence_paths name candidate-relative files; "
+                      "external logs belong in evidence. Independent review decides resolution."}
+
+
+def bind_worker_findings(context, entry, packet):
+    """Save the exact delivered obligations, before hooks can change the candidate."""
+    from .util import write_json
     artifact = context.directory / "dispatches" / entry["id"] / "worker-findings.json"
-    value = {"dispatch_id": entry["id"], "task_id": entry["task_id"], "required_findings": rows}
+    value = worker_findings_payload(entry["task_id"], entry["id"], packet)
     write_json(artifact, value)
     entry["worker_findings"] = {"artifact": str(artifact),
         "artifact_digest": hashlib.sha256(artifact.read_bytes()).hexdigest()}

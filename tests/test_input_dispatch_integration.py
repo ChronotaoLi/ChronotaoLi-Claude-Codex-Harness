@@ -49,7 +49,7 @@ class InputDispatchIntegrationTests(RepoCase):
     def test_schema12_missing_input_binding_refuses_resume_without_calls(self):
         engine, backend = self.prepared()
         state = read_json(engine.directory / 'state.json')
-        self.assertEqual(state['schema_version'], 13)
+        self.assertEqual(state['schema_version'], 14)
         del state['workspace_inputs']
         write_json(engine.directory / 'state.json', state)
         before = (engine.directory / 'state.json').read_bytes()

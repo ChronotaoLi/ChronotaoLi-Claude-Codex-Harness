@@ -62,6 +62,18 @@ class ContinuationTests(unittest.TestCase):
         self.context.config['runtime']['agent_timeout_seconds'] = 90
         self.assertIsNone(continuation_gate(self.context))
 
+    def test_satisfied_budget_does_not_interpret_reason_as_a_clock_gate(self):
+        self.result['continuation_request'] = {
+            'kind': 'budget', 'commands': [], 'minimum_timeout_seconds': 30,
+            'reason': 'Do not start before 2999-01-01T00:00:00Z; observation interval incomplete'}
+        self.record()
+        before = deepcopy(self.context.run)
+        self.assertIsNone(continuation_gate(self.context))
+        resolve_continuation(self.context)
+        self.assertIsNone(self.context.run['pending_continuation'])
+        self.assertEqual(self.context.run['attempts'], before['attempts'])
+        self.assertEqual(self.context.run['continuation_history'], before['continuation_history'])
+
     def test_changed_candidate_and_changed_original_source_fail_closed(self):
         self.record()
         self.candidate['files']['code'] = 'edited'

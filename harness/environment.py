@@ -96,8 +96,8 @@ class EnvironmentRecovery(RuntimeService):
         checks = self.context.run.get("environment_checks", [])
         if not isinstance(updates, list) or not isinstance(checks, list):
             raise HarnessError("环境恢复台账字段无效")
-        if self.context.run["schema_version"] != 13:
-            raise HarnessError("环境恢复台账必须使用版本 13")
+        if self.context.run["schema_version"] != 14:
+            raise HarnessError("环境恢复台账必须使用版本 14")
         ids = set()
         tasks = {task["id"] for task in self.context.run["tasks"]}
         for sequence, row in enumerate(updates, 1):

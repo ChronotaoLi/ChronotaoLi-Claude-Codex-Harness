@@ -195,7 +195,7 @@ class EnvironmentUpdateTests(RepoCase):
         calls = len(backend.calls)
         result = self.engine(backend).resume(engine.run['id'], environment_update=path)
         self.assertEqual(result['status'], 'completed')
-        self.assertEqual(result['schema_version'], 13)
+        self.assertEqual(result['schema_version'], 14)
         self.assertEqual(result['tasks'], before['tasks'])
         self.assertEqual(result['config_snapshot']['roles'], before['config_snapshot']['roles'])
         self.assertEqual(result['original_tasks'], before['original_tasks'])

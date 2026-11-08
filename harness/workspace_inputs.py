@@ -15,6 +15,8 @@ from pathlib import Path
 from . import git
 from .cleanup import _canonical, _regular_bytes
 from .path_evidence import validate_dispatch_indexes
+from .input_projection import validate_dispatch_indexes as validate_input_dispatch_indexes
+from .worker_receipts import validate_worker_receipt_links
 from .run_store import RunStore
 from .util import (HarnessError, ensure_dispatches_exited, group_alive, lock,
                    validate_command_directories, write_json)
@@ -22,7 +24,7 @@ from .util import (HarnessError, ensure_dispatches_exited, group_alive, lock,
 _RESERVED = {'.git', '.harness', '.codex', '.claude', 'agents.md', 'claude.md'}
 _PENDING = ('pending_task', 'pending_acceptance', 'pending_post_accept',
             'pending_replan', 'pending_directive', 'worker_recovery',
-            'retained_candidate', 'replan_stopped', 'pending_format_corrections')
+            'retained_candidate', 'replan_stopped', 'pending_format_corrections', 'worker_receipts')
 
 def _fail(message):
     raise HarnessError('workspace inputs: ' + message)
@@ -101,6 +103,9 @@ def _gate(run, directory, *, terminal=False):
         _fail('prepare requires paused/awaiting_approval with no pending stage')
     validate_command_directories(run['dispatches'], directory)
     validate_dispatch_indexes(directory, run['dispatches'])
+    validate_input_dispatch_indexes(directory, run['dispatches'])
+    if run['schema_version'] == 14:
+        validate_worker_receipt_links(run, directory)
     ensure_dispatches_exited(run['dispatches'], observe=group_alive)
     git.check_worktree_binding(checkout, run['worktree_binding'])
     if git.head(checkout, binding=run['worktree_binding']) != run['expected_head']:
@@ -202,7 +207,7 @@ def prepare_run(repo, ident, manifest):
     ensure_private_state(repo)
     with lock(directory / 'run.lock'):
         run = _read(directory / 'state.json')
-        if run.get('id') != ident or run.get('repo') != str(repo) or run.get('schema_version') != 13:
+        if run.get('id') != ident or run.get('repo') != str(repo) or run.get('schema_version') != 14:
             _fail('historical run is read-only; start a new run before preparation')
         store = RunStore(repo / '.harness')
         store.attach(run)

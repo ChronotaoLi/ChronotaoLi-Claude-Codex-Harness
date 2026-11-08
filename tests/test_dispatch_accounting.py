@@ -103,7 +103,7 @@ class DispatchAccountingTests(RepoCase):
         self.assertEqual(saved["dispatches"][-1]["status"], "failed")
 
     def test_backend_failure_keeps_worker_and_dispatch_counts_persisted_together(self):
-        def unavailable(backend, kwargs, packet, result):
+        def unavailable(backend, kwargs, packet):
             if kwargs["role"] == "worker":
                 saved = read_json(kwargs["run_path"])
                 self.assertEqual(saved["attempts"], {"greet": 1})
@@ -112,7 +112,8 @@ class DispatchAccountingTests(RepoCase):
                 raise HarnessError("worker provider unavailable")
 
         self.config.data["runtime"]["max_attempts"] = 1
-        backend = RecordingBackend(unavailable)
+        backend = RecordingBackend()
+        backend.before_result = unavailable
         engine = self.engine(backend)
         with self.assertRaisesRegex(HarnessError, "provider unavailable"):
             engine.start("Implement greet", self.plan())
@@ -120,6 +121,7 @@ class DispatchAccountingTests(RepoCase):
         self.assertEqual(saved["attempts"], {"greet": 1})
         self.assertEqual(saved["total_attempts"], 1)
         self.assertEqual(saved["agent_dispatches"], 1)
+        self.assertFalse((backend.requests[0]["job"] / "response.json").exists())
         with self.assertRaisesRegex(HarnessError, "尝试次数上限"):
             self.engine(backend).resume(saved["id"])
         self.assertEqual(len(backend.requests), 1)
