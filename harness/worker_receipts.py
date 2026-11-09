@@ -8,45 +8,11 @@ from .contracts import RepairableFormatError, validate, validate_structure, vali
 from .recovery import snapshot_digest
 from .services import RuntimeService
 from .util import HarnessError, read_json, write_json
+from .worker_returns import inspect_return, validate_return_evidence
+from .versions import RUN_SCHEMA_VERSION
 
 
 class WorkerReceipts(RuntimeService):
-    def failed_without_result(self, job, provider):
-        """Only absence or a complete explicit provider error permits fresh retry.
-
-        A captured success, unreadable terminal or ambiguous terminal remains an
-        unsealed return, even when a backend subsequently raises an exception.
-        """
-        from .stream_capture import claude_result_path
-        for name in ('returned-result.json', 'response.json', 'terminal-capture.json', 'stream-incomplete-terminal.json'):
-            path = job / name
-            if path.exists() or path.is_symlink():
-                return False
-        if (job / 'capture-manifest.json').is_symlink():
-            return False
-        if provider != 'claude':
-            return True
-        try:
-            source = claude_result_path(job)
-            if source.is_symlink():
-                return False
-            if not source.exists():
-                return True
-            if not source.is_file():
-                return False
-            # Legacy stdout can exist without a terminal (ordinary progress or
-            # a CLI error). Distinguish that from a complete result envelope.
-            raw = source.read_bytes()
-            if not raw.strip():
-                return True
-            import json
-            value = json.loads(raw)
-        except (OSError, ValueError, HarnessError):
-            return False
-        return (isinstance(value, dict) and value.get('type') == 'result'
-                and (value.get('is_error') is True or
-                     isinstance(value.get('subtype'), str) and value['subtype'].startswith('error_')))
-
     def intent(self, entry, schema, packet):
         key = f"worker:{entry['kind']}:{entry['task_id']}"
         if key in self.context.run['worker_receipts']:
@@ -55,6 +21,8 @@ class WorkerReceipts(RuntimeService):
         receipt = {'dispatch_id': entry['id'], 'artifact': str(job / 'returned-result.json'),
                    'seal': str(job / 'worker-seal.json'), 'schema': deepcopy(schema),
                    'packet': deepcopy(packet), 'packet_digest': snapshot_digest(packet),
+                   'capture': {'provider': self.context.config.role('worker', self.context.commander)['cli'],
+                               'mode': self.context.config.data['runtime']['claude_output_mode']},
                    'snapshot_digest': entry['snapshot_digest'],
                    'attempt': self.context.run['attempts'][entry['task_id']], 'phase': 'invoking'}
         entry['worker_receipt'] = deepcopy(receipt)
@@ -69,7 +37,7 @@ class WorkerReceipts(RuntimeService):
         receipt = self.context.run['worker_receipts'][key]
         job = Path(receipt['artifact']).parent
         sources = {}
-        names = ['response.json', 'process.stdout', 'process.stderr', 'provider-result.json', 'result.json', 'stream-terminal.json', 'terminal-capture.json', 'process.outcome.json', 'capture-manifest.json', 'stream-capture.json']
+        names = ['response.json', 'process.stdout', 'process.stderr', 'provider-result.json', 'result.json', 'stream-terminal.json', 'stream-received-terminal.json', 'terminal-capture.json', 'process.outcome.json', 'capture-manifest.json', 'stream-capture.json']
         command_dir = job / 'commands'
         if command_dir.exists():
             if command_dir.is_symlink():
@@ -129,6 +97,23 @@ class WorkerReceipts(RuntimeService):
                     or intent.get('packet_digest') != snapshot_digest(intent['packet'])):
                 raise HarnessError('missing mandatory worker receipt linkage')
             job = self.context.directory / 'dispatches' / entry['id']
+            if self.context.run['schema_version'] == RUN_SCHEMA_VERSION:
+                capture = intent.get('capture')
+                if (not isinstance(capture, dict) or set(capture) != {'provider', 'mode'}
+                        or capture['provider'] != 'claude'
+                        or capture['mode'] not in ('legacy_json', 'stream_metadata_v1')
+                        or 'worker_no_result' in entry):
+                    raise HarnessError('missing/invalid mandatory worker capture contract')
+                snapshot = self.context.run.get('config_snapshot', {})
+                if (capture['provider'] != snapshot.get('roles', {}).get('worker', {}).get('cli')
+                        or capture['mode'] != snapshot.get('runtime', {}).get('claude_output_mode')):
+                    raise HarnessError('worker capture contract differs from run configuration')
+                evidence = entry.get('worker_return_evidence')
+                if evidence is not None:
+                    validate_return_evidence(job, evidence, capture)
+                if entry.get('worker_receipt_consumed') == 'provider_failure' and (
+                        evidence is None or evidence['state'] != 'retryable'):
+                    raise HarnessError('worker provider failure lacks retry evidence')
             if intent.get('artifact') != str(job / 'returned-result.json') or intent.get('seal') != str(job / 'worker-seal.json'):
                 raise HarnessError('worker intent paths invalid')
             properties = intent['schema'].get('properties', {})
@@ -155,21 +140,50 @@ class WorkerReceipts(RuntimeService):
                 raise HarnessError('invalid worker receipt identity')
 
     def pending(self):
+        try:
+            return self._pending()
+        except HarnessError as error:
+            receipts = self.context.run['worker_receipts']
+            if isinstance(receipts, dict) and len(receipts) == 1:
+                receipt = next(iter(receipts.values()))
+                self.services.receipts.record_receipt_error(receipt, error)
+            raise
+
+    def _pending(self):
+        self.context.ensure_exited()
         self.validate_links()
         if not self.context.run['worker_receipts']:
             return None
         key, receipt = next(iter(self.context.run['worker_receipts'].items()))
         entry = self.entry(receipt)
         if self.seal_path(receipt) is None:
-            if (entry.get('worker_no_result') is True and not Path(receipt['artifact']).exists()
-                    and self.failed_without_result(Path(receipt['artifact']).parent, self.context.config.role('worker', self.context.commander)['cli'])):
-                self.consume(key, 'provider_failure')
-                self.context.save()
+            job = Path(receipt['artifact']).parent
+            evidence = entry.get('worker_return_evidence')
+            if evidence is None:
+                evidence = inspect_return(job, receipt['capture'])
+                entry['worker_return_evidence'] = evidence
+            else:
+                validate_return_evidence(job, evidence, receipt['capture'])
+            if evidence['state'] == 'retryable':
+                error = HarnessError(entry.get('error') or 'Worker invocation requires a fresh attempt: ' + evidence['reason'])
+                # Classification, failure provenance and receipt retirement share
+                # one commit, including when a crash skipped dispatch.finally.
+                self.reject(key, error, 'provider_failure')
                 return None
-            raise HarnessError('worker return interrupted before immutable seal; preserve evidence; automatic retry forbidden')
+            raise HarnessError('worker return interrupted before immutable seal; ' + evidence['reason'] +
+                               '; preserve evidence; automatic retry forbidden')
         return key
 
     def finish(self, key, task):
+        try:
+            return self._finish(key, task)
+        except RepairableFormatError:
+            raise
+        except HarnessError as error:
+            self.services.receipts.record_receipt_error(self.context.run['worker_receipts'].get(key), error)
+            raise
+
+    def _finish(self, key, task):
         self.context.ensure_exited()
         receipt = self.context.run['worker_receipts'][key]
         entry = self.entry(receipt)
@@ -245,7 +259,7 @@ class WorkerReceipts(RuntimeService):
         except HarnessError as error:
             if entry.get('format_correction') is True:
                 self.context.run['pending_format_corrections'].pop(key, None)
-                self.reject(key, error, 'correction_rejected')
+            self.reject(key, error, 'correction_rejected' if entry.get('format_correction') is True else 'result_rejected')
             raise
         entry['worker_outcome'] = ('completed' if result['status'] == 'completed' else result['blocker_kind'] + '_blocked')
         validate(result, contract)
@@ -269,7 +283,11 @@ class WorkerReceipts(RuntimeService):
         job = Path(receipt['artifact']).parent
         self.context.run['last_runtime_error'] = {'role': 'worker', 'kind': entry['kind'],
             'task_id': entry['task_id'], 'error': str(error), 'artifact': str(job)}
-        self.services.workflow.record_worker_recovery(entry['task_id'], entry['id'], job, error)
+        previous = self.context.run.get('worker_recovery', {}).get(entry['task_id'])
+        if reason != 'provider_failure' or not previous or previous.get('dispatch_id') != entry['id']:
+            # A later classification must not replace an observed timeout or
+            # cancellation with the generic recovery error used to retire it.
+            self.services.workflow.record_worker_recovery(entry['task_id'], entry['id'], job, error)
         self.consume(key, reason)
         self.context.save()
 
@@ -279,7 +297,7 @@ class WorkerReceipts(RuntimeService):
         task_id = self.entry(receipt)['task_id']
         recovery = self.context.run.get('worker_recovery', {}).get(task_id)
         rejection = reason in ('provider_failure', 'handoff_rejected', 'scope_rejected',
-                               'format_exhausted', 'correction_rejected', 'invalid_blocker')
+                               'format_exhausted', 'correction_rejected', 'result_rejected', 'invalid_blocker')
         if not rejection and recovery and recovery.get('dispatch_id') == receipt['dispatch_id']:
             self.context.run['worker_recovery'].pop(task_id)
 

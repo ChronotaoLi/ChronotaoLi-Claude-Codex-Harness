@@ -8,6 +8,7 @@ import stat
 import time
 from pathlib import Path
 
+from .versions import HISTORICAL_CLEANUP_VERSIONS
 from . import git
 from .util import readonly_lock
 from .run_store import RunStore
@@ -156,7 +157,7 @@ def cleanup_verification(repo: Path, ident: str, *, remove=False, confirm_exited
     with (lock if remove or confirm_exited else readonly_lock)(directory / "run.lock"):
         _regular_bytes(directory / "state.json")
         run = read_json(directory / "state.json")
-        if (not isinstance(run, dict) or run.get("schema_version") not in (7, 8, 9, 10, 11, 12, 13, 14) or run.get("id") != ident
+        if (not isinstance(run, dict) or run.get("schema_version") not in HISTORICAL_CLEANUP_VERSIONS or run.get("id") != ident
                 or run.get("repo") != str(repo) or not isinstance(run.get("dispatches"), list)
                 or not isinstance(run.get("final_history"), list)
                 or not isinstance(run.get("worktree_binding"), dict)
@@ -166,7 +167,7 @@ def cleanup_verification(repo: Path, ident: str, *, remove=False, confirm_exited
         from .input_projection import validate_dispatch_indexes as validate_input_dispatch_indexes
         from .worker_receipts import validate_worker_receipt_links
         validate_input_dispatch_indexes(directory, run['dispatches'])
-        if run['schema_version'] == 14:
+        if run['schema_version'] >= 14:
             validate_worker_receipt_links(run, directory)
         common = Path(git.git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir").removesuffix("\n")).resolve()
         if run["worktree_binding"].get("common_dir") != str(common):

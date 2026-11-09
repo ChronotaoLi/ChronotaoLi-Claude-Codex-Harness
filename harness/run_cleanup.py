@@ -6,6 +6,7 @@ import json
 import time
 from pathlib import Path
 
+from .versions import HISTORICAL_CLEANUP_VERSIONS
 from . import git
 from .util import readonly_lock
 from .run_store import RunStore
@@ -45,7 +46,7 @@ def cleanup_run(repo: Path, ident: str, *, remove=False, confirm_exited=(), remo
         _canonical(checkout)
         branch = "harness/" + ident
         common = Path(git.git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir").removesuffix("\n")).resolve()
-        if (not isinstance(run, dict) or run.get("schema_version") not in (7, 8, 9, 10, 11, 12, 13, 14)
+        if (not isinstance(run, dict) or run.get("schema_version") not in HISTORICAL_CLEANUP_VERSIONS
                 or run.get("id") != ident or run.get("repo") != str(repo)
                 or run.get("worktree") != str(checkout) or run.get("branch") != branch
                 or not isinstance(run.get("expected_head"), str)
@@ -66,7 +67,7 @@ def cleanup_run(repo: Path, ident: str, *, remove=False, confirm_exited=(), remo
         validate_command_directories(run["dispatches"], directory)
         validate_dispatch_indexes(directory, run["dispatches"])
         validate_input_dispatch_indexes(directory, run["dispatches"])
-        if run["schema_version"] == 14:
+        if run["schema_version"] >= 14:
             validate_worker_receipt_links(run, directory)
         if confirm_exited:
             store = RunStore(repo / ".harness")

@@ -119,7 +119,7 @@ class OperationRecordTests(OperationCase):
         self.assertLessEqual(record["run_linked_at"], record["finished_at"])
         self.assertRegex(record["finished_at_utc"], r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
         ledger = self.ledger(run_id)
-        self.assertEqual((ledger["schema_version"], ledger["created_by_operation"]), (14, "op-a"))
+        self.assertEqual((ledger["schema_version"], ledger["created_by_operation"]), (15, "op-a"))
         created = self.events(run_id, "run_created")
         self.assertEqual([(event["run_id"], event["operation_id"]) for event in created], [(run_id, "op-a")])
         self.assertIn(notice("run_created", run_id, "op-a"), errors.splitlines())
@@ -418,7 +418,7 @@ class OperationRecordTests(OperationCase):
         self.assertEqual(code, 0, errors)
         self.assertEqual(json.loads(output)["status"], "completed")
         self.assertNotIn("created_by_operation", read_json(path))
-        self.assertEqual(read_json(path)["schema_version"], 14)
+        self.assertEqual(read_json(path)["schema_version"], 15)
 
     def test_engine_accepts_operation_double_and_null_operation(self):
         state = self.state

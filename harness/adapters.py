@@ -114,7 +114,7 @@ def provider_usage(job, provider):
         if tokens:
             metrics["tokens"] = tokens
         return {"provider": provider, "source": claude_result_path(job).name if provider == "claude" else "process.stdout", **metrics} if metrics else None
-    except (OSError, ValueError, UnicodeError, RecursionError):
+    except (OSError, ValueError, UnicodeError, RecursionError, HarnessError):
         return None
 
 
@@ -174,7 +174,7 @@ def cli_error_summary(job, provider):
         with (claude_result_path(job) if provider == "claude" else job / "process.stdout").open("rb") as stream:
             raw = stream.read(_USAGE_MAX_BYTES + 1)
         return claude_error_summary(json.loads(raw)) if len(raw) <= _USAGE_MAX_BYTES else ""
-    except (OSError, ValueError, UnicodeError, RecursionError):
+    except (OSError, ValueError, UnicodeError, RecursionError, HarnessError):
         return ""
 
 
@@ -335,7 +335,7 @@ class CLIBackend:
     def preserve_terminal(self, job, provider, outcome, *, terminal_only=False):
         """Save designated terminal evidence separately from process success."""
         source = job / "response.json" if provider == "codex" else claude_result_path(job)
-        incomplete_stream = job / "stream-incomplete-terminal.json"
+        incomplete_stream = job / "stream-received-terminal.json"
         if provider == "claude" and not source.exists() and incomplete_stream.exists():
             source = incomplete_stream
         known_completion = (outcome.get("exit_code") is not None

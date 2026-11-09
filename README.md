@@ -77,7 +77,7 @@ python3 -m harness --config /absolute/path/harness.toml --repo /absolute/path/to
 
 任务的 `required_commands` 最多声明 32 条不同的完整 argv，表示执行前置条件，不授予权限。派发前与 `verification.commands`、`permissions.worker_commands` 精确比较；不接受前缀，`verification.setup_commands` 不授予 worker 能力。缺少授权时不启动 worker 或消耗其尝试，其他满足条件的就绪任务仍可继续；已有任务选择保持绑定。`status RUN` 显示 `missing_command_requirements`，追加精确授权后普通 `resume` 即可重检，无需环境更新。计划批准不增加权限，检查不证明命令存在、执行成功或验收通过。
 
-模型计划的重复／超限声明保留结果并停止，普通恢复不重抽计划。显式修正与旧版兼容边界见[计划范围与命令前置条件](docs/recovery.md#计划范围与命令前置条件)及[阻塞出口](docs/recovery.md#阻塞状态与操作者出口)。
+模型计划的重复／超限声明保留结果并停止，普通恢复不重抽计划。显式修正与恢复边界见[计划范围与命令前置条件](docs/recovery.md#计划范围与命令前置条件)及[阻塞出口](docs/recovery.md#阻塞状态与操作者出口)。
 
 任务可另声明 `self_checks`（最多 32 条精确 argv）与 `evidence_requirements`（`id`、从 0 起的 `acceptance_index`、`kind`、仓库相对 `path`）。证据类型为 `static`、`simulation`、`host_integration` 或 `device`。角色收到 `verification_plan`，区分 worker 聚焦自检、全部正式任务门禁与最终门禁；自检不授权，也不替代正式验证。worker 无需默认重复全套门禁，仅在有明确诊断理由时重复。必需文件和修复声明先作来源／候选绑定预检，内容正确性仍由独立审阅核验。返工输入提供与本次实际问题清单绑定的声明草稿引用；空字段不是修复证明，候选路径与普通 evidence 中的外部日志引用保持分开。
 
@@ -148,7 +148,7 @@ python3 -m harness --repo /path/to/project cleanup-run RUN --remove
 
 运行详情默认通过事件订阅更新，列表和文件页使用手动刷新。连接心跳仅表示观察服务可用；订阅断开后显示断开提示，由刷新按钮重新连接，不退回定时轮询。
 
-同一快照上的已保存阶段可复用：验证中断只重跑验证，审阅调用故障只新派发 reviewer，接受 hook 失败只重试 hook。worker 的完整接收记录绑定结果与返回后候选，恢复继续原校验及交接，复用封存结果本身不重新派发或扣除调用额度。仅有原始输出、尚未封存候选时中断则停止，不能把恢复时的文件补认原候选。代码变化使旧批准失效，进程未确认退出、HEAD／Git 绑定异常或证据损坏会停止；完整保存顺序见[恢复协议](docs/recovery.md)。
+同一快照上的已保存阶段可复用：验证中断只重跑验证，审阅调用故障只新派发 reviewer，接受 hook 失败只重试 hook。worker 的完整接收记录绑定结果与返回后候选，恢复继续原校验及交接，复用封存结果本身不重新派发或扣除调用额度。仅有原始输出、尚未封存候选时中断则停止，不能把恢复时的文件补认原候选。调用失败且退出得到确认后，只有原始传输证据证明可以重试时才启动新尝试；流式捕获不完整仍阻塞。首次结构／语义拒绝保留证据并消费回执，后续普通恢复走新的计费尝试。代码变化使旧批准失效，进程未确认退出、HEAD／Git 绑定异常或证据损坏会停止；完整保存顺序见[恢复协议](docs/recovery.md)。
 
 | 情况 | 常用出口 |
 | --- | --- |
@@ -171,7 +171,7 @@ python3 -m harness --repo /path/to/project cleanup-run RUN --remove
 
 `cleanup-run RUN` 预览已完成或已放弃 run 的工作树清理，`--remove` 才执行。它保留终态、分支和运行证据，要求原分支仍指向检查点、所有派发与命令子进程已确认退出、工作树无任何未保存文件。清理意图和完成记录保存在 `worktree-cleanup.json`，支持删除后记账中断的重试。显式 `--confirm-exited DISPATCH_ID` 会记录退出确认；普通预览不生成清理记录。需要删除分支时，先完成工作树清理，再由操作者核对集成结果并处理分支。
 
-新台账版本为 14，要求完整的 worker 接收状态；版本 13 及更早只保留历史查看与受门禁保护的清理，不升级、不恢复执行。共享规则变更也受资产摘要门禁约束。版本 14 已完成 run 的普通恢复返回保存结果；终态选项限制见[终态与版本兼容](docs/recovery.md#终态与版本兼容)。
+新台账版本为 15，要求完整的 worker 接收状态、输出模式与配置快照，缺失时不补造旧默认值；版本 14 及更早只保留历史查看与受门禁保护的清理，不升级、不恢复执行。共享规则变更也受资产摘要门禁约束。版本 15 已完成 run 的普通恢复返回保存结果；终态选项限制见[终态与版本兼容](docs/recovery.md#终态与版本兼容)。
 
 ## 共用 skills / MCP / hooks
 

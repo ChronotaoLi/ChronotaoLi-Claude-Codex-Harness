@@ -76,7 +76,7 @@ class DemoRunObservationTests(RepoCase):
         item = listing["runs"][0]
         self.assertEqual({key: item[key] for key in ("id", "status", "goal", "branch")},
                          {key: ledger_value[key] for key in ("id", "status", "goal", "branch")})
-        self.assertEqual(item["schema_version"], 14)
+        self.assertEqual(item["schema_version"], 15)
         self.assertEqual(item["last_event_time"], events[-1]["time"])
 
         detail = observe.run_detail(state, result["id"])

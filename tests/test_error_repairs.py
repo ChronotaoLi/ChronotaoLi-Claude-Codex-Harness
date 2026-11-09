@@ -152,6 +152,10 @@ class ErrorRepairsTests(RepoCase):
     def test_final_attempt_budget_is_independent_and_can_increase_on_resume(self):
         snapshot = copy.deepcopy(self.config.data)
         del snapshot["runtime"]["max_final_attempts"]
+        with self.assertRaisesRegex(HarnessError, '配置快照字段缺失'):
+            self.config.resume_changes(snapshot)
+        self.assertNotIn('max_final_attempts', snapshot['runtime'])
+        snapshot = copy.deepcopy(self.config.data)
         self.assertEqual(self.config.resume_changes(snapshot), {})
         self.config.data["runtime"]["max_final_attempts"] = 4
         self.assertEqual(self.config.resume_changes(snapshot), {"max_final_attempts": {"old": 3, "new": 4}})

@@ -87,9 +87,11 @@ class ReplanFormatRecoveryTests(RepoCase):
         self.assertEqual(after["agent_dispatches"], before["agent_dispatches"] + dispatch_delta)
         prior_dispatches = copy.deepcopy(before["dispatches"])
         for prior, current in zip(prior_dispatches, after["dispatches"]):
-            if prior.get("worker_no_result") is True and not prior.get("worker_receipt_consumed"):
+            if not prior.get("worker_receipt_consumed") and current.get("worker_receipt_consumed") == "provider_failure":
                 self.assertEqual(current.get("worker_receipt_consumed"), "provider_failure")
                 prior["worker_receipt_consumed"] = "provider_failure"
+                self.assertEqual(current["worker_return_evidence"]["state"], "retryable")
+                prior["worker_return_evidence"] = copy.deepcopy(current["worker_return_evidence"])
         self.assertEqual(after["dispatches"][:len(prior_dispatches)], prior_dispatches)
 
     def test_replan_selection_retires_only_worker_correction_for_both_failure_boundaries(self):
@@ -130,58 +132,8 @@ class ReplanFormatRecoveryTests(RepoCase):
         self.assert_preserved(before, state, replan_delta=1, dispatch_delta=1)
         self.assertEqual(state["replan_stopped"]["trigger"], before["replan_stopped"]["trigger"])
 
-    def test_legacy_stopped_cleanup_preserves_stop_and_budgets_without_invoking(self):
-        for failure in ("pre_agent", "provider"):
-            with self.subTest(failure=failure):
-                engine, backend, correction = self.stopped(failure, legacy=True)
-                before = self.saved(engine)
-                calls = len(backend.calls)
-                with self.assertRaisesRegex(HarnessError, "停止重新规划"):
-                    self.engine(backend).resume(engine.run["id"])
-                state = self.saved(engine)
-                self.assertNotIn(self.key, state["pending_format_corrections"])
-                self.assertEqual(state["replan_stopped"], before["replan_stopped"])
-                self.assertEqual(state["decision_requests"], before["decision_requests"])
-                self.assertEqual(state["operator_decisions"], [])
-                self.assertEqual(len(backend.calls), calls)
-                self.assert_preserved(before, state)
 
-    def test_legacy_stopped_correction_does_not_block_explicit_decisions(self):
-        engine, backend, unused = self.stopped("provider", legacy=True)
-        before = self.saved(engine)
-        calls = len(backend.calls)
-        with self.assertRaisesRegex(HarnessError, "操作者决定停止"):
-            self.engine(backend).resume(engine.run["id"], operator_decision=self.answer(engine, "stop"))
-        self.assertEqual(len(backend.calls), calls)
-        self.assertNotIn(self.key, self.saved(engine)["pending_format_corrections"])
-        with self.assertRaisesRegex(HarnessError, "停止重新规划"):
-            self.engine(backend).resume(engine.run["id"], operator_decision=self.answer(engine))
-        self.assertEqual([c["kind"] for c in backend.calls[calls:]], ["replan"])
-        self.assert_preserved(before, self.saved(engine), replan_delta=1, dispatch_delta=1)
 
-    def test_legacy_pending_replan_recovers_without_reselecting_or_worker(self):
-        self.config.data["runtime"]["max_replans"] = 0
-        engine, backend, correction = self.interrupted_correction("provider")
-        with self.assertRaisesRegex(HarnessError, "重新规划次数上限"):
-            self.engine(backend).resume(engine.run["id"])
-        state = self.saved(engine)
-        self.assertEqual(state["pending_replan"]["stage"], "pending")
-        state["pending_format_corrections"][self.key] = correction
-        write_json(engine.directory / "state.json", state)
-        calls = len(backend.calls)
-        # Normalization must not reset the exhausted replan budget.
-        with self.assertRaisesRegex(HarnessError, "重新规划次数上限"):
-            self.engine(backend).resume(engine.run["id"])
-        normalized = self.saved(engine)
-        self.assertNotIn(self.key, normalized["pending_format_corrections"])
-        self.assertEqual(normalized["pending_replan"], state["pending_replan"])
-        self.assertEqual(len(backend.calls), calls)
-        self.assert_preserved(state, normalized)
-        self.config.data["runtime"]["max_replans"] = 1
-        with self.assertRaisesRegex(HarnessError, "停止重新规划"):
-            self.engine(backend).resume(engine.run["id"])
-        self.assertEqual([c["kind"] for c in backend.calls[calls:]], ["replan"])
-        self.assert_preserved(state, self.saved(engine), replan_delta=1, dispatch_delta=1)
 
     def test_transition_save_is_atomic_across_interruptions(self):
         for persist in (False, True):
@@ -224,132 +176,40 @@ class ReplanFormatRecoveryTests(RepoCase):
                 self.assertNotIn(self.key, self.saved(engine)["pending_format_corrections"])
                 self.assertEqual([c["kind"] for c in backend.calls], ["implement", "dispatch", "replan"])
 
-    def test_legacy_cleanup_rejects_changed_selection_or_candidate_without_mutation(self):
-        engine, backend, unused = self.stopped("provider", legacy=True)
-        original = self.saved(engine)
-        source = original["replan_stopped"]["trigger"]["coordination"]
-        artifact = Path(source["artifact"])
-        artifact_bytes = artifact.read_bytes()
-        hello = engine.worktree / "hello.py"
-        hello_bytes = hello.read_bytes()
-        calls = len(backend.calls)
-        for mutation in ("artifact", "digest", "source", "selection", "snapshot", "current_task"):
-            with self.subTest(mutation=mutation):
-                state = copy.deepcopy(original)
-                trigger = state["replan_stopped"]["trigger"]
-                if mutation == "artifact":
-                    artifact.write_bytes(artifact_bytes + b"\n")
-                elif mutation == "digest":
-                    trigger["coordination"].pop("artifact_digest")
-                elif mutation == "source":
-                    trigger["coordination"]["dispatch_id"] = state["dispatches"][0]["id"]
-                elif mutation == "selection":
-                    trigger["coordination"]["instruction"] = "Altered selection"
-                elif mutation == "snapshot":
-                    hello.write_bytes(hello_bytes + b"# changed after selection\n")
-                else:
-                    state["current_task"] = None
-                write_json(engine.directory / "state.json", state)
-                with self.assertRaises(HarnessError):
-                    self.engine(backend).resume(engine.run["id"], operator_decision=self.answer(engine))
-                saved = self.saved(engine)
-                self.assertEqual(saved, state)
-                self.assertEqual(saved["pending_format_corrections"][self.key], original["pending_format_corrections"][self.key])
-                self.assertEqual(len(backend.calls), calls)
-                artifact.write_bytes(artifact_bytes)
-                hello.write_bytes(hello_bytes)
-        write_json(engine.directory / "state.json", original)
+    def test_superseded_correction_is_rejected_without_migrating_stopped_run(self):
+        for failure in ('pre_agent', 'provider'):
+            with self.subTest(failure=failure):
+                engine, backend, correction = self.stopped(failure, legacy=True)
+                before = self.saved(engine)
+                calls = len(backend.calls)
+                for answer in (None, self.answer(engine, 'continue')):
+                    with self.assertRaisesRegex(HarnessError, 'does not repair legacy state'):
+                        self.engine(backend).resume(engine.run['id'], operator_decision=answer)
+                    self.assertEqual(self.saved(engine), before)
+                    self.assertEqual(len(backend.calls), calls)
 
-    def test_existing_exit_gate_precedes_legacy_cleanup(self):
-        engine, backend, unused = self.stopped("provider", legacy=True)
+    def test_superseded_correction_is_rejected_at_pending_replan_without_spending_budget(self):
+        self.config.data['runtime']['max_replans'] = 0
+        engine, backend, correction = self.interrupted_correction('provider')
+        with self.assertRaisesRegex(HarnessError, '重新规划次数上限'):
+            self.engine(backend).resume(engine.run['id'])
+        state = self.saved(engine)
+        state['pending_format_corrections'][self.key] = correction
+        write_json(engine.directory / 'state.json', state)
+        calls = len(backend.calls)
+        self.config.data['runtime']['max_replans'] = 1
+        with self.assertRaisesRegex(HarnessError, 'does not repair legacy state'):
+            self.engine(backend).resume(engine.run['id'])
+        self.assertEqual(self.saved(engine), state)
+        self.assertEqual(len(backend.calls), calls)
+
+    def test_exit_gate_precedes_rejection_of_superseded_correction(self):
+        engine, backend, unused = self.stopped('provider', legacy=True)
         before = self.saved(engine)
         calls = len(backend.calls)
         resumed = self.engine(backend)
-        with patch.object(resumed.context, "ensure_exited", side_effect=HarnessError("exit not confirmed")):
-            with self.assertRaisesRegex(HarnessError, "exit not confirmed"):
-                resumed.resume(engine.run["id"], operator_decision=self.answer(engine))
+        with patch.object(resumed.context, 'ensure_exited', side_effect=HarnessError('exit not confirmed')):
+            with self.assertRaisesRegex(HarnessError, 'exit not confirmed'):
+                resumed.resume(engine.run['id'], operator_decision=self.answer(engine))
         self.assertEqual(self.saved(engine), before)
-        self.assertEqual(len(backend.calls), calls)
-
-    def test_legacy_cleanup_preserves_unrelated_correction_and_receipt_gates(self):
-        engine, backend, worker_correction = self.interrupted_correction()
-        change = backend.change
-        commander_key = "commander:dispatch:dispatching"
-
-        def correct_selection(backend, kwargs, packet, result):
-            change(backend, kwargs, packet, result)
-            if kwargs["kind"] == "dispatch" and "format_correction" not in packet:
-                result["instruction"] = " "
-
-        backend.change = correct_selection
-        resumed = self.engine(backend)
-        save = resumed.context.save
-        captured = {}
-
-        def capture_real_gates():
-            pending = resumed.run["pending_format_corrections"].get(commander_key)
-            receipt = resumed.run["commander_receipts"].get(commander_key)
-            if pending:
-                captured["correction"] = copy.deepcopy(pending)
-            if receipt and receipt.get("hook_completed"):
-                captured["receipt"] = copy.deepcopy(receipt)
-            save()
-
-        with patch.object(resumed.context, "save", side_effect=capture_real_gates):
-            with self.assertRaisesRegex(HarnessError, "停止重新规划"):
-                resumed.resume(engine.run["id"])
-        self.assertEqual(set(captured), {"correction", "receipt"})
-        original = self.saved(engine)
-        calls = len(backend.calls)
-        # Each restored gate was produced by this run's actual selection repair.
-        # Neither is authority to waive operator-decision busy checks.
-        for gate in ("correction", "receipt"):
-            with self.subTest(gate=gate):
-                state = copy.deepcopy(original)
-                state["pending_format_corrections"][self.key] = worker_correction
-                field = "pending_format_corrections" if gate == "correction" else "commander_receipts"
-                state[field][commander_key] = copy.deepcopy(captured[gate])
-                write_json(engine.directory / "state.json", state)
-                with self.assertRaisesRegex(HarnessError, "pending lifecycle gates"):
-                    self.engine(backend).resume(engine.run["id"], operator_decision=self.answer(engine))
-                after = self.saved(engine)
-                self.assertNotIn(self.key, after["pending_format_corrections"])
-                self.assertEqual(after[field][commander_key], captured[gate])
-                self.assertEqual(after["operator_decisions"], [])
-                self.assertEqual(after["replan_stopped"], original["replan_stopped"])
-                self.assert_preserved(state, after)
-                self.assertEqual(len(backend.calls), calls)
-
-    def test_legacy_cleanup_rejects_worker_origins_after_selection(self):
-        engine, backend, unused = self.stopped("provider", legacy=True)
-        original = self.saved(engine)
-        calls = len(backend.calls)
-        for origin in ("previous", "correction", "subsequent_worker"):
-            with self.subTest(origin=origin):
-                state = copy.deepcopy(original)
-                pending = state["pending_format_corrections"][self.key]
-                ident = pending["correction"]["previous_dispatch"] if origin == "previous" else pending["dispatch_id"]
-                row = next(d for d in state["dispatches"] if d["id"] == ident)
-                state["dispatches"].remove(row)
-                state["dispatches"].append(row)
-                if origin == "subsequent_worker":
-                    # Isolate the no-later-worker guard from origin chronology:
-                    # the old origin stays before selection, but another invoked
-                    # worker now appears after it in the tampered ledger.
-                    pending.pop("dispatch_id")
-                write_json(engine.directory / "state.json", state)
-                with self.assertRaises(HarnessError):
-                    self.engine(backend).resume(engine.run["id"], operator_decision=self.answer(engine))
-                self.assertEqual(self.saved(engine), state)
-                self.assertEqual(len(backend.calls), calls)
-
-    def test_legacy_cleanup_requires_a_saved_coordination_selection(self):
-        engine, backend, unused = self.stopped(legacy=True)
-        state = self.saved(engine)
-        state["replan_stopped"]["trigger"].pop("coordination")
-        write_json(engine.directory / "state.json", state)
-        calls = len(backend.calls)
-        with self.assertRaisesRegex(HarnessError, "pending lifecycle gates"):
-            self.engine(backend).resume(engine.run["id"], operator_decision=self.answer(engine))
-        self.assertEqual(self.saved(engine), state)
         self.assertEqual(len(backend.calls), calls)

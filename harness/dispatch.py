@@ -207,6 +207,8 @@ class Dispatcher(RuntimeService):
             except InvalidReviewRejection:
                 raise
             except HarnessError as error:
+                # Also covers post-receipt process/index checks. Worker receipt
+                # entry points record their own errors before this outer boundary.
                 self.services.receipts.record_receipt_error(receipts.get(key), error)
                 raise
 
@@ -298,7 +300,6 @@ class Dispatcher(RuntimeService):
         invoked = False
         startup_interrupted = False
         invocation_error = None
-        backend_returned = False
         try:
             self.context.emit_hook("pre_agent", entry, job)
             from .workspace_inputs import validate_inputs
@@ -369,7 +370,6 @@ class Dispatcher(RuntimeService):
             result = self.context.backend.invoke(role=role, model=self.context.config.role(role, self.context.commander), cwd=self.context.worktree,
                                          job=job, schema=contract, prompt=prompt, run_path=self.context.directory / "state.json",
                                          on_start=on_start, task=task, kind=kind, on_outcome=on_outcome)
-            backend_returned = True
             # The synchronous backend has returned through run_process cleanup.
             # Receipt validation may itself check that all processes exited.
             if process_outcome is None:
@@ -418,10 +418,6 @@ class Dispatcher(RuntimeService):
                 # Supervision can add callback/persistence failures after the
                 # callback returns. Preserve those final facts as well.
                 apply_outcome(process_outcome)
-            if (role == "worker" and invoked and not backend_returned and invocation_error is not None
-                    and entry.get("exit_confirmed") is True and not startup_interrupted):
-                entry["worker_no_result"] = self.services.worker_receipts.failed_without_result(
-                    job, self.context.config.role(role, self.context.commander)["cli"])
             if invoked:
                 # Observe the provider envelope even on CLI/protocol failures.
                 # Telemetry is best effort and cannot change acceptance/recovery.

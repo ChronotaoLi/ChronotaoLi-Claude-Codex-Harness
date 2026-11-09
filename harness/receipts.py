@@ -83,7 +83,7 @@ class ResultReceipts(RuntimeService):
                     or capture.get("provider") not in ("claude", "codex")
                     or capture["provider"] != self.context.config.role(entry["role"], self.context.commander)["cli"]
                     or capture.get("source") not in (("response.json",) if capture["provider"] == "codex"
-                                                     else ("process.stdout", "stream-terminal.json", "stream-incomplete-terminal.json"))):
+                                                     else ("process.stdout", "stream-terminal.json", "stream-received-terminal.json"))):
                 raise ValueError("invalid terminal capture")
             for name, field in ((capture["source"], "source_digest"),
                                 ("process.outcome.json", "outcome_digest"),

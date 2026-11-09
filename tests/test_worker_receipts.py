@@ -346,7 +346,7 @@ class WorkerReceiptTests(RepoCase):
             engine.resume(engine.run['id'])
         self.assertEqual(engine.run['attempts']['greet'], 1)
 
-    def test_exact_delivered_contract_rejects_nonapplicable_field_on_first_return_and_replay(self):
+    def test_exact_delivered_contract_rejects_each_fresh_attempt_without_acceptance(self):
         class ExtraField(DemoBackend):
             workers = 0
             def invoke(self, **kwargs):
@@ -363,14 +363,16 @@ class WorkerReceiptTests(RepoCase):
         with self.assertRaises(HarnessError):
             engine.start('Implement greeting', self.plan())
         self.assertNotIn('evidence_files', backend.asserted_contract['properties'])
-        receipt = next(iter(engine.run['worker_receipts'].values()))
+        receipt = engine.run['dispatches'][-1]['worker_receipt']
         self.assertEqual(receipt['schema'], backend.asserted_contract)
         self.assertNotIn('pending_task', engine.run)
         self.assertFalse(engine.run['accepted'])
         with self.assertRaises(HarnessError):
             engine.resume(engine.run['id'])
-        self.assertEqual(backend.workers, 1)
-        self.assertEqual(engine.run['attempts']['greet'], 1)
+        self.assertEqual(backend.workers, 2)
+        self.assertEqual(engine.run['attempts']['greet'], 2)
+        self.assertFalse(engine.run['worker_receipts'])
+        self.assertEqual(engine.run['dispatches'][-1]['worker_receipt_consumed'], 'result_rejected')
         self.assertNotIn('pending_task', engine.run)
         self.assertFalse(engine.run['accepted'])
 
@@ -390,8 +392,9 @@ class WorkerReceiptTests(RepoCase):
             engine.start('Implement greeting', self.plan())
         failed = next(e for e in engine.run['dispatches'] if e['role'] == 'worker')
         self.assertTrue(failed['exit_confirmed'])
-        self.assertTrue(failed['worker_no_result'])
         run = engine.resume(engine.run['id'])
+        failed = next(e for e in run['dispatches'] if e['role'] == 'worker')
+        self.assertEqual(failed['worker_return_evidence']['state'], 'retryable')
         self.assertEqual(run['status'], 'completed')
         self.assertEqual(run['attempts']['greet'], 2)
         self.assertEqual(backend.workers, 2)

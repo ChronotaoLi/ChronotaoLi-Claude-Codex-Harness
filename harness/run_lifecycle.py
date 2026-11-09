@@ -6,6 +6,8 @@ import sys
 from copy import deepcopy
 from pathlib import Path
 
+from .versions import RUN_SCHEMA_VERSION
+from .config import normalized
 from . import git
 from .operations import warn
 from .input_projection import validate_dispatch_indexes as validate_input_dispatch_indexes
@@ -33,7 +35,7 @@ class RunLifecycle(RuntimeService):
         ident = uid("run")
         worktree = self.context.state / "worktrees" / ident
         operation = self.context.operation
-        self.context.run = {"schema_version": 14, "workspace_inputs": None, "id": ident, "repo": str(self.context.repo), "goal": goal, "status": "planning", "commander": self.context.commander,
+        self.context.run = {"schema_version": RUN_SCHEMA_VERSION, "workspace_inputs": None, "id": ident, "repo": str(self.context.repo), "goal": goal, "status": "planning", "commander": self.context.commander,
                     "branch": "harness/" + ident, "worktree": str(worktree), "tasks": [], "accepted": {}, "attempts": {},
                     "attempt_budget_policy": "work",
                     "dispatches": [], "expected_head": git.head(self.context.repo), "feedback": None,
@@ -98,7 +100,7 @@ class RunLifecycle(RuntimeService):
         self.context.run = read_json(self.context.state / "runs" / ident / "state.json")
         if not isinstance(self.context.run, dict):
             raise HarnessError("运行台账必须为对象")
-        if self.context.run.get("schema_version") != 14:
+        if self.context.run.get("schema_version") != RUN_SCHEMA_VERSION:
             raise HarnessError("旧 run 仅保留为历史证据；新内核不恢复旧执行状态，请开始新 run")
         required = {"id": str, "repo": str, "worktree": str, "status": str, "commander": str,
                     "goal": str, "branch": str, "expected_head": str, "base_commit": str,
@@ -119,6 +121,8 @@ class RunLifecycle(RuntimeService):
             raise HarnessError("运行台账字段缺失或类型无效；保留原文件并核对证据")
         if self.context.run["repo"] != str(self.context.repo):
             raise HarnessError("Run 属于另一个项目")
+        if self.context.run['config_snapshot'] != normalized(self.context.run['config_snapshot']):
+            raise HarnessError('运行配置快照字段缺失；当前协议不补写旧版本默认值')
         if ("workspace_inputs" not in self.context.run
                 or self.context.run["workspace_inputs"] is not None and not isinstance(self.context.run["workspace_inputs"], dict)):
             raise HarnessError("运行输入绑定字段缺失或无效；保留现场")
@@ -177,7 +181,7 @@ class RunLifecycle(RuntimeService):
 
         dispatches = {}
         for entry in self.context.run["dispatches"]:
-            if "invoked" in entry and type(entry["invoked"]) is not bool:
+            if (entry.get('role') in ('worker', 'commander', 'reviewer') or 'invoked' in entry) and type(entry.get("invoked")) is not bool:
                 fail("dispatches.invoked 必须是布尔值")
             ident = entry.get("id")
             if isinstance(ident, str):
@@ -206,7 +210,7 @@ class RunLifecycle(RuntimeService):
             artifact = mapping(guard, field).get("artifact")
             if not key.startswith("reviewer:") or not isinstance(artifact, str):
                 fail(field)
-            # Existing v8 guards identify the original dispatch by its artifact path.
+            # The guard identifies its original dispatch by the bound artifact path.
             reference(Path(artifact).parent.name, key, field)
         for key, pending in self.context.run["pending_format_corrections"].items():
             field = "pending_format_corrections." + key
@@ -331,7 +335,7 @@ class RunLifecycle(RuntimeService):
             validate_inputs(self.context.run, self.context.directory)
             self.services.worker_receipts.validate_links()
             self.services.receipts.validate_pending_terminal_captures()
-            self.services.planning.recover_replan_worker_correction()
+            self.services.planning.validate_replan_worker_correction()
             update = self.services.environment.prepare_environment_update(environment_update) if environment_update is not None else None
             decision_values, decisions = (self.services.decisions.prepare_operator_decisions(operator_decision)
                                           if operator_decision is not None else ([], []))

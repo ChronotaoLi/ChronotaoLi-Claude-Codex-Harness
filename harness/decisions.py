@@ -1,5 +1,6 @@
 """Durable, task-scoped operator choices, independent of facts and acceptance."""
 
+from .versions import RUN_SCHEMA_VERSION
 from .services import RuntimeService
 from copy import deepcopy
 import hashlib
@@ -213,8 +214,8 @@ class DecisionRecovery(RuntimeService):
         requests, responses = self.context.run.get('decision_requests', []), self.context.run.get('operator_decisions', [])
         if not isinstance(requests, list) or not isinstance(responses, list):
             raise HarnessError('decision ledger must contain arrays')
-        if self.context.run['schema_version'] != 14:
-            raise HarnessError('decision ledger requires schema 13')
+        if self.context.run['schema_version'] != RUN_SCHEMA_VERSION:
+            raise HarnessError(f'decision ledger requires schema {RUN_SCHEMA_VERSION}')
         records, ids = [], set()
         for category, rows in (('request', requests), ('response', responses)):
             for sequence, row in enumerate(rows, 1):

@@ -155,7 +155,9 @@ class Config:
 
     def resume_changes(self, snapshot):
         """Return budget increases and exact command grants without mutating inputs."""
-        previous, current = normalized(snapshot), normalized(self.data)
+        previous, current = copy.deepcopy(snapshot), normalized(self.data)
+        if previous != normalized(previous):
+            raise HarnessError('运行配置快照字段缺失；不补写旧版本默认值，请开始新 run')
         self.validate(previous)
         self.validate(current)
         changes = {}

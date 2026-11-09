@@ -23,12 +23,36 @@ RECORD_LIMIT = TERMINAL_LIMIT
 
 def claude_result_path(job):
     manifest = job / "capture-manifest.json"
-    if not manifest.exists():
-        return job / "process.stdout"
+    if manifest.is_symlink() or not manifest.is_file():
+        raise HarnessError('Missing or unsafe capture manifest; output mode cannot be inferred')
     value = read_json(manifest)
     if not isinstance(value, dict) or value.get("version") != 1 or value.get("mode") not in ("legacy_json", "stream_metadata_v1"):
         raise HarnessError("Invalid capture manifest")
     return job / ("stream-terminal.json" if value["mode"] == "stream_metadata_v1" else "process.stdout")
+
+
+def _publish_terminal(path, value, limit):
+    """Publish exact bounded bytes once, without replacing existing evidence."""
+    try:
+        artifact = (json.dumps(value, ensure_ascii=True, separators=(',', ':')) + '\n').encode('utf-8')
+    except (ValueError, UnicodeError, RecursionError) as error:
+        raise HarnessError('Unable to serialize Claude terminal safely') from error
+    if len(artifact) > limit:
+        raise HarnessError('Claude terminal exceeds capture limit')
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode='wb', dir=path.parent,
+                                         prefix='.stream-terminal-', delete=False) as output:
+            temporary = Path(output.name)
+            output.write(artifact)
+            output.flush()
+            os.fsync(output.fileno())
+        os.link(temporary, path)
+    except OSError as error:
+        raise HarnessError('Unable to publish Claude terminal safely') from error
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def freeze_capture(job, mode, cli_version):
@@ -86,7 +110,8 @@ def run_stream_process(argv, cwd, log, *, stdin="", timeout=900, env=None, on_st
     writer_deadline = None
     job = log.parent
     terminal = job / "stream-terminal.json"
-    if terminal.exists():
+    received = job / 'stream-received-terminal.json'
+    if any(path.exists() or path.is_symlink() for path in (terminal, received, job / 'stream-capture.json')):
         raise HarnessError("Stream terminal already exists")
     selector = selectors.DefaultSelector()
     pending = bytearray()
@@ -159,6 +184,9 @@ def run_stream_process(argv, cwd, log, *, stdin="", timeout=900, env=None, on_st
                 damaged = True
             elif terminals == 1:
                 candidate = event
+                # Refusal evidence survives controller SIGKILL before EOF or
+                # authoritative terminal publication. It never proves success.
+                _publish_terminal(received, {'version': 1, 'terminal': event}, terminal_limit + 64)
         projected = project_event(event, job.name)
         for record in projected if isinstance(projected, list) else [projected]:
             emit(record)
@@ -229,49 +257,18 @@ def run_stream_process(argv, cwd, log, *, stdin="", timeout=900, env=None, on_st
             if writer.is_alive():
                 raise HarnessError("Metadata writer did not converge; stream capture incomplete")
             write_json(job / "stream-capture.json", {
-                "version": 1, "stdout_sha256": digest.hexdigest(), "terminal_count": terminals,
+                "version": 2, "transport_complete": True, "damaged": damaged,
+                "stdout_sha256": digest.hexdigest(), "terminal_count": terminals,
                 "protocol_complete": not damaged and terminals == 1,
                 "diagnostics_incomplete": diagnostics_incomplete,
                 "dropped_events": dropped + writer_counts["enqueued"] - writer_counts["written"],
                 "stderr_bytes": min(stderr_bytes, metadata_limit), "exit_code": code})
             if damaged or terminals != 1:
                 raise HarnessError("Incomplete or ambiguous Claude stream protocol")
-            try:
-                artifact = (json.dumps(candidate, ensure_ascii=True, separators=(",", ":")) + "\n").encode("utf-8")
-            except (ValueError, UnicodeError, RecursionError) as error:
-                raise HarnessError("Unable to serialize Claude terminal safely") from error
-            if len(artifact) > terminal_limit:
-                raise HarnessError("Claude terminal exceeds capture limit")
-            temporary = None
-            try:
-                # Bound these exact bytes, then atomically publish without replacing
-                # any existing authority, including a concurrently created symlink.
-                with tempfile.NamedTemporaryFile(mode="wb", dir=job,
-                                                 prefix=".stream-terminal-", delete=False) as output:
-                    temporary = Path(output.name)
-                    output.write(artifact)
-                    output.flush()
-                    os.fsync(output.fileno())
-                os.link(temporary, terminal)
-            except OSError as error:
-                raise HarnessError("Unable to publish Claude terminal safely") from error
-            finally:
-                if temporary is not None:
-                    temporary.unlink(missing_ok=True)
+            _publish_terminal(terminal, candidate, terminal_limit)
             return code
     finally:
         primary = sys.exc_info()[1]
-        if primary is not None and candidate is not None and not terminal.exists():
-            # Preserve a received whole terminal as refusal evidence even when
-            # later timeout/cancellation prevents transport completion. This is
-            # never the authoritative stream terminal or successful protocol.
-            try:
-                write_json(job / "stream-incomplete-terminal.json", {
-                    "terminal": candidate, "terminal_count": terminals,
-                    "protocol_complete": False, "damaged": damaged})
-            except (Exception, KeyboardInterrupt, SystemExit) as error:
-                supervision.outcome.cleanup_errors.append({"step": "preserve_incomplete_terminal",
-                    "type": type(error).__name__, "message": str(error), "errno": getattr(error, "errno", None)})
         try:
             with defer_cleanup_signals(primary=primary) as deferred:
                 writer_deadline = min(writer_deadline or float("inf"), time.monotonic() + 2, cleanup_deadline if cleanup_deadline is not None else float("inf"))
@@ -319,9 +316,3 @@ def permission_denial_projection(value):
                 item[target] = ident
         projected.append(item)
     return projected
-
-
-def command_capability_projection(config, argv):
-    # Compatibility import for callers of the initial stream projection API.
-    from .permission_diagnostics import command_capability_projection as project
-    return project(config, argv)

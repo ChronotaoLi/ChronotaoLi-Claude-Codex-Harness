@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 from harness.adapters import claude_error_summary, cli_error_summary
 from harness.budgets import work_attempts
+from harness.stream_capture import freeze_capture
 from harness.util import HarnessError, read_json
 from test_harness import ROOT, RepoCase
 from test_provider_usage import FIXTURE_PROCESS, FixtureCLIBackend
@@ -98,6 +99,8 @@ class ProviderErrorSummaryTests(unittest.TestCase):
             job = Path(temporary)
             output = job / "process.stdout"
             output.write_text(json.dumps(usage_limit_envelope()))
+            self.assertEqual(cli_error_summary(job, 'claude'), '')
+            freeze_capture(job, 'legacy_json', 'offline-fixture')
             self.assertIn("usage_limit_reached", cli_error_summary(job, "claude"))
             self.assertEqual(cli_error_summary(job, "codex"), "")
             with patch("harness.adapters._USAGE_MAX_BYTES", 32):

@@ -78,6 +78,7 @@ class StreamCaptureTests(unittest.TestCase):
     def test_protocol_tail_cannot_be_hidden_by_metadata_limit(self):
         for tail in ('{bad}\n', '{"type":"result"}\n', '{"type":"result"}'):
             with self.subTest(tail=tail):
+                self.setUp()
                 with self.assertRaises(HarnessError):
                     self.run_cli('import sys; sys.stdout.write(' + repr(
                         '{"type":"result"}\n' + tail) + ')', metadata_limit=0)
@@ -126,7 +127,7 @@ class StreamCaptureTests(unittest.TestCase):
         with patch.object(Path, 'open', failing_open):
             self.assertEqual(self.run_cli('print("{\\"type\\":\\"result\\"}")'), 0)
         self.assertTrue(read_json(self.job / 'stream-capture.json')['diagnostics_incomplete'])
-        (self.job / 'stream-terminal.json').unlink()
+        self.setUp()
         with patch.object(Path, 'open', failing_open):
             with self.assertRaises(HarnessError):
                 self.run_cli('print("{\\"type\\":\\"result\\"}"); print("{bad}")')
@@ -194,8 +195,9 @@ class StreamCaptureTests(unittest.TestCase):
         self.assertEqual(terminal.read_bytes(), b'{"existing":true}\n')
         self.assertEqual(list(self.job.glob('.stream-terminal-*')), [])
 
-    def test_manifest_is_immutable_and_absent_is_legacy(self):
-        self.assertEqual(claude_result_path(self.job).name, 'process.stdout')
+    def test_manifest_is_immutable_and_missing_cannot_infer_output_mode(self):
+        with self.assertRaisesRegex(HarnessError, 'capture manifest'):
+            claude_result_path(self.job)
         freeze_capture(self.job, 'stream_metadata_v1', 'fixture')
         with self.assertRaises(FileExistsError):
             freeze_capture(self.job, 'legacy_json', 'fixture')

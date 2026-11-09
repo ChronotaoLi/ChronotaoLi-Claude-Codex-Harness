@@ -30,7 +30,7 @@ class ConfigChangesTests(unittest.TestCase):
         path.write_text("\n".join(f"{key} = {toml_value(value)}" for key, value in data.items()))
         return Config.load(path)
 
-    def test_existing_configuration_gets_bounded_defaults(self):
+    def test_new_configuration_gets_defaults_but_incomplete_saved_snapshot_is_rejected(self):
         del self.data["permissions"]
         del self.data["memory"]
         del self.data["runtime"]["max_total_attempts"]
@@ -40,7 +40,11 @@ class ConfigChangesTests(unittest.TestCase):
         self.assertEqual(config.data["runtime"]["max_replans"], 2)
         self.assertEqual(config.data["permissions"]["worker_commands"], [])
         self.assertEqual(config.data["memory"], {"task_ttl_days": 180, "knowledge_ttl_days": 180})
-        self.assertEqual(config.resume_changes(self.data), {})
+        before = copy.deepcopy(self.data)
+        with self.assertRaisesRegex(HarnessError, '配置快照字段缺失'):
+            config.resume_changes(self.data)
+        self.assertEqual(self.data, before)
+        self.assertEqual(config.resume_changes(config.data), {})
 
     def test_rejects_unsupported_codex_worker_before_dispatch(self):
         self.data["roles"]["worker"]["cli"] = "codex"

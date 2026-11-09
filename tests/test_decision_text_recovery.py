@@ -141,7 +141,7 @@ class DecisionTextRecoveryTests(RepoCase):
         self.assertEqual(result['accepted']['greet'], before['accepted']['greet'])
         self.assertEqual(result['attempts'], {'greet': 1, 'later': 1})
         self.assertEqual(Path(source['artifact']).read_bytes(), raw)
-        self.assertEqual(result['schema_version'], 14)
+        self.assertEqual(result['schema_version'], 15)
 
     def test_legacy_operator_registration_failure_recovers_to_explicit_gate(self):
         for blockers in (['Proceed\0?'], ['']):

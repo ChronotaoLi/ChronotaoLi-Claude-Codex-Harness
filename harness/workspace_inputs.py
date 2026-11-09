@@ -12,6 +12,7 @@ import stat
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
+from .versions import RUN_SCHEMA_VERSION
 from . import git
 from .cleanup import _canonical, _regular_bytes
 from .path_evidence import validate_dispatch_indexes
@@ -104,7 +105,7 @@ def _gate(run, directory, *, terminal=False):
     validate_command_directories(run['dispatches'], directory)
     validate_dispatch_indexes(directory, run['dispatches'])
     validate_input_dispatch_indexes(directory, run['dispatches'])
-    if run['schema_version'] == 14:
+    if run['schema_version'] >= 14:
         validate_worker_receipt_links(run, directory)
     ensure_dispatches_exited(run['dispatches'], observe=group_alive)
     git.check_worktree_binding(checkout, run['worktree_binding'])
@@ -207,7 +208,7 @@ def prepare_run(repo, ident, manifest):
     ensure_private_state(repo)
     with lock(directory / 'run.lock'):
         run = _read(directory / 'state.json')
-        if run.get('id') != ident or run.get('repo') != str(repo) or run.get('schema_version') != 14:
+        if run.get('id') != ident or run.get('repo') != str(repo) or run.get('schema_version') != RUN_SCHEMA_VERSION:
             _fail('historical run is read-only; start a new run before preparation')
         store = RunStore(repo / '.harness')
         store.attach(run)

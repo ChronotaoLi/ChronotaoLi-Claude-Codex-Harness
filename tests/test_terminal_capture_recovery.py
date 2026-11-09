@@ -284,7 +284,7 @@ class TerminalCaptureRecoveryTests(RepoCase):
                         # Deleting all captured bytes cannot turn an observed
                         # terminal into a retryable call with no terminal.
                         (backend.jobs[0] / "terminal-capture.json").unlink()
-                        source = "stream-incomplete-terminal.json" if mode == "stream_metadata_v1" else "process.stdout"
+                        source = "stream-received-terminal.json" if mode == "stream_metadata_v1" else "process.stdout"
                         (backend.jobs[0] / source).unlink()
                     with self.assertRaisesRegex(HarnessError, "终端结果"):
                         self.engine(backend).resume(engine.run["id"])

@@ -6,7 +6,7 @@ from pathlib import Path
 
 from harness.adapters import CLIBackend
 from harness.config import Config
-from harness.stream_capture import command_capability_projection
+from harness.permission_diagnostics import command_capability_projection
 from harness.util import HarnessError, read_json
 from test_harness import RepoCase, ROOT
 from test_provider_usage import FixtureCLIBackend
@@ -55,7 +55,8 @@ class StreamAdapterTests(RepoCase):
         self.assertEqual(self.config.data['runtime']['claude_output_mode'], 'legacy_json')
         snapshot = copy.deepcopy(self.config.data)
         snapshot['runtime'].pop('claude_output_mode')
-        self.assertEqual(self.config.resume_changes(snapshot), {})
+        with self.assertRaisesRegex(HarnessError, '快照字段缺失'):
+            self.config.resume_changes(snapshot)
         self.config.data['runtime']['claude_output_mode'] = 'stream_metadata_v1'
         with self.assertRaises(HarnessError):
             self.config.resume_changes(snapshot)

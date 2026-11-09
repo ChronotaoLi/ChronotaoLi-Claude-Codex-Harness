@@ -25,8 +25,8 @@ class AttemptAccounting(RuntimeService):
 
     def validate_attempt_accounting(self):
         policy = self.context.run["attempt_budget_policy"]
-        if policy not in ("all_invocations", "work"):
-            raise HarnessError("未知任务尝试计数策略；保留台账")
+        if policy != 'work':
+            raise HarnessError("任务尝试计数策略必须为 work；不恢复旧计数协议")
         attempts = self.context.run["attempts"]
         if any(not isinstance(k, str) or type(v) is not int or v < 0 for k, v in attempts.items()):
             raise HarnessError("任务调用计数无效；保留台账")

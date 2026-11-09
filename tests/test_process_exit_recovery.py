@@ -16,7 +16,8 @@ class ProcessExitRecoveryTests(RepoCase):
     def test_unknown_startup_blocks_both_resume_and_cleanup_without_dispatch(self):
         engine = self.engine()
         run = engine.start("Implement greet", read_json(ROOT / "examples/plan.json"), pause_after_plan=True)
-        entry = {"id": "unknown", "role": "worker", "status": "running", "pgid": None}
+        entry = {"id": "unknown", "role": "commander", "invoked": True,
+                 "status": "running", "pgid": None}
         run["dispatches"].append(entry)
         backend = ScriptedBackend()
         for process_state in (None, "starting", "running", "exited"):

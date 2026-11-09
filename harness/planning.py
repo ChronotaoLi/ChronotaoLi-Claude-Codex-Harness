@@ -205,47 +205,18 @@ class Planner(RuntimeService):
             if result.get("action") != "replan" or result["instruction"] != source["instruction"]:
                 raise HarnessError("再规划选择与原指挥结果不符；保留原选择和证据")
 
-    def recover_replan_worker_correction(self):
-        """Retire only a worker correction superseded by a saved replan selection.
-
-        Older runs could retain it at a pending or stopped replan boundary. This
-        is recovery bookkeeping, not approval to restart a stopped request.
-        """
-        pending = self.context.run.get("pending_replan")
-        stopped = self.context.run.get("replan_stopped")
-        if pending and pending.get("stage") not in ("pending", "request"):
-            return  # A validated revision owns its existing archive/reset recovery.
-        boundary = pending or stopped
-        if not boundary:
-            return
-        trigger = boundary.get("trigger", {})
-        if not isinstance(trigger, dict) or not trigger.get("coordination"):
-            return
-        tid = trigger.get("task_id")
-        key = f"worker:implement:{tid}"
-        correction = self.context.run["pending_format_corrections"].get(key)
-        if correction is None:
-            return
-        if (pending and stopped or self.context.run.get("current_task") != tid
-                or tid in self.context.run["accepted"] or stopped and stopped.get("target") != tid):
-            raise HarnessError("待修正 worker 与再规划任务边界不符；保留原状态")
-        self.validate_replan_selection(trigger)
-        selection_id = trigger["coordination"]["dispatch_id"]
-        entries = self.context.run["dispatches"]
-        positions = {entry["id"]: i for i, entry in enumerate(entries)}
-        selection_position = positions[selection_id]
-        origins = [correction["correction"].get("previous_dispatch")]
-        if correction.get("dispatch_id"):
-            origins.append(correction["dispatch_id"])
-        if (any(origin not in positions or positions[origin] >= selection_position for origin in origins)
-                or any(entry["role"] == "worker" and entry["task_id"] == tid and entry.get("invoked", True)
-                       for entry in entries[selection_position + 1:])):
-            raise HarnessError("待修正 worker 未被原再规划选择取代；保留原状态")
-        # Audit before mutation; an interrupted save can safely repeat cleanup.
-        self.context.event("replan_worker_correction_retired", task_id=tid, selection_dispatch_id=selection_id,
-                      correction=deepcopy(correction))
-        self.context.run["pending_format_corrections"].pop(key)
-        self.context.save()
+    def validate_replan_worker_correction(self):
+        """Current transitions atomically retire superseded worker corrections."""
+        for field in ('pending_replan', 'replan_stopped'):
+            boundary = self.context.run.get(field)
+            if not boundary:
+                continue
+            trigger = boundary.get('trigger', {})
+            if isinstance(trigger, dict) and trigger.get('coordination'):
+                key = f"worker:implement:{trigger.get('task_id')}"
+                if key in self.context.run['pending_format_corrections']:
+                    raise HarnessError('superseded worker correction conflicts with replan; '
+                                       'current protocol does not repair legacy state')
 
     def replan(self, trigger):
         pending = self.context.run.get("pending_replan")

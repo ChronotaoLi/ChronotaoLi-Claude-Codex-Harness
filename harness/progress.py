@@ -1,5 +1,6 @@
 """Bound worker evidence for fresh dispatches; never an acceptance checkpoint."""
 
+from .versions import RUN_SCHEMA_VERSION
 from .services import RuntimeService
 from copy import deepcopy
 import hashlib
@@ -391,7 +392,7 @@ class ProgressRecovery(RuntimeService):
     def _validated_checkpoint_links(self):
         validation = _CheckpointValidation()
         rows = self.context.run["task_checkpoints"]
-        if self.context.run["schema_version"] != 14 or not isinstance(rows, list):
+        if self.context.run["schema_version"] != RUN_SCHEMA_VERSION or not isinstance(rows, list):
             raise HarnessError("invalid checkpoint ledger schema")
         seen = set()
         tasks = {t["id"] for t in self.context.run["tasks"]}

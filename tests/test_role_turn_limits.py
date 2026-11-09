@@ -20,7 +20,7 @@ from test_provider_usage import FIXTURE_PROCESS, FixtureCLIBackend
 class RoleTurnLimitTests(unittest.TestCase):
     def config(self):
         config = Config.load(ROOT / "harness.toml")
-        config.data["runtime"].pop("claude_max_turns_by_role", None)
+        config.data["runtime"]["claude_max_turns_by_role"] = {}
         return config
 
     def test_legacy_fallback_and_actual_role_routing_keep_exact_models(self):
@@ -83,13 +83,15 @@ class RoleTurnLimitTests(unittest.TestCase):
                         config.resume_changes(snapshot)
                 self.assertEqual((snapshot, config.data), before)
 
-    def test_old_snapshot_without_overrides_preserves_fallback(self):
+    def test_snapshot_without_role_table_is_rejected_without_default_inference(self):
         config = self.config()
         snapshot = copy.deepcopy(config.data)
-        self.assertEqual(config.resume_changes(snapshot), {})
+        snapshot['runtime'].pop('claude_max_turns_by_role')
+        with self.assertRaisesRegex(HarnessError, '快照字段缺失'):
+            config.resume_changes(snapshot)
         config.data["runtime"]["claude_max_turns_by_role"] = {"worker": 200}
-        self.assertEqual(config.resume_changes(snapshot), {
-            "claude_max_turns_by_role": {"old": {}, "new": {"worker": 200}}})
+        with self.assertRaisesRegex(HarnessError, '快照字段缺失'):
+            config.resume_changes(snapshot)
         self.assertNotIn("claude_max_turns_by_role", snapshot["runtime"])
 
     def test_smoke_explicit_limit_overrides_project_profile_without_calling_provider(self):
@@ -131,8 +133,8 @@ class BudgetFixtureBackend(FixtureCLIBackend):
 
 class RoleTurnLimitRecoveryTests(RepoCase):
     def test_exhaustion_then_role_increase_keeps_counts_evidence_and_fresh_dispatch(self):
-        # An old run has no role table. Its existing scalar still applies.
-        self.config.data["runtime"].pop("claude_max_turns_by_role", None)
+        # An empty current role table uses the configured global limit.
+        self.config.data["runtime"]["claude_max_turns_by_role"] = {}
         self.config.data["runtime"]["claude_max_turns"] = 100
         backend = BudgetFixtureBackend(self.config, self.repo / ".harness", {
             "worker": {"exit_code": 1, "envelope": {"subtype": "error_max_turns", "is_error": True,
