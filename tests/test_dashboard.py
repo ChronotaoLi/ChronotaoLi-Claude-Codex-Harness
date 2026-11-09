@@ -40,19 +40,24 @@ const vm = require("vm");
 const fixture = JSON.parse(fs.readFileSync(process.argv[3], "utf8"));
 const requested = [];
 class Node {
-  constructor(tag) { this.tagName = tag; this.childNodes = []; this.className = ""; this.ownText = ""; this.listeners = {}; }
+  constructor(tag) { this.tagName = tag; this.childNodes = []; this.className = ""; this.ownText = ""; this.listeners = {};
+    this.attributes = {}; this.parentNode = null; }
   get firstChild() { return this.childNodes.length ? this.childNodes[0] : null; }
-  appendChild(child) { this.childNodes.push(child); return child; }
-  removeChild(child) { const i = this.childNodes.indexOf(child); if (i >= 0) { this.childNodes.splice(i, 1); } return child; }
+  appendChild(child) { this.childNodes.push(child); child.parentNode = this; return child; }
+  removeChild(child) { const i = this.childNodes.indexOf(child); if (i >= 0) { this.childNodes.splice(i, 1); child.parentNode = null; } return child; }
   get textContent() { return this.ownText + this.childNodes.map(function (c) { return c.textContent; }).join(""); }
   set textContent(value) { this.ownText = String(value); this.childNodes = []; }
   addEventListener(name, fn) { (this.listeners[name] = this.listeners[name] || []).push(fn); }
+  setAttribute(name, value) { this.attributes[name] = String(value); }
+  getAttribute(name) { return Object.prototype.hasOwnProperty.call(this.attributes, name) ? this.attributes[name] : null; }
+  focus() { globalThis.document.activeElement = this; }
 }
 const byId = {};
 ["main", "sampled", "refresh", "auto"].forEach(function (id) { byId[id] = new Node("div"); byId[id].id = id; });
 const windowListeners = {};
 globalThis.Node = Node;
 globalThis.document = {
+  activeElement: null,
   createElement: function (tag) { return new Node(tag); },
   createTextNode: function (text) { const n = new Node("#text"); n.ownText = String(text); return n; },
   getElementById: function (id) { return byId[id] || null; }
@@ -639,22 +644,25 @@ class PageScriptTests(RepoCase):
         home = report["phases"][0]
         self.assertEqual(home["hash"], "")
         self.assertEqual(home["requested"], ["/api/runs"])
-        self.assertIn("run 列表（1）", home["text"])
+        self.assertIn(run_id, home["text"])
         self.assertIn("Implement greet", home["text"])
         self.assertIn(f"#/runs/{run_id}", home["anchors"])
         for forbidden in ("未知视图", "读取失败"):
             self.assertNotIn(forbidden, home["text"])
         for hash_value in ("#/", "#"):
             self.assertEqual(phases[hash_value]["requested"], ["/api/runs"])
-            self.assertIn("run 列表（1）", phases[hash_value]["text"])
+            self.assertEqual(phases[hash_value]["text"], home["text"])
 
         shown = phases[f"#/runs/{run_id}"]
         self.assertEqual(shown["requested"], [f"/api/runs/{run_id}", f"/api/runs/{run_id}/files"])
-        for expected in (f"run {run_id}", "费用与调用分类", "CLI 报告的估算费用，非账户账单", worker, "dispatch（",
-                         "文件索引", "state.json", "不探测进程", "Implement greet"):
+        # Values from the real projection stay reachable (some inside closed tabs/disclosures).
+        for expected in (run_id, detail["cost"]["by_provider"]["claude"]["label"], worker, "Implement greet",
+                         detail["notes"]["invoked"]):
             self.assertIn(expected, shown["text"])
         self.assertNotIn("读取失败", shown["text"])
         self.assertIn(f"#/runs/{run_id}/files/dispatches/{worker}/prompt.txt", shown["anchors"])
+        self.assertIn(f"#/runs/{run_id}/files/state.json", shown["anchors"])
+        self.assertIn(f"#/runs/{run_id}/files/events.jsonl", shown["anchors"])
 
         viewer = phases[f"#/runs/{run_id}/files/state.json?tail=200"]
         self.assertEqual(viewer["requested"], [f"/api/runs/{run_id}/files/state.json?format=json&tail=200"])
