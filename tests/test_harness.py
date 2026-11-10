@@ -108,7 +108,7 @@ class ContextMemoryTests(unittest.TestCase):
 
     def test_supersession_retains_history_and_retrieves_current(self):
         old = self.remember()
-        new = self.remember(text="Use claude-fable-5-1")
+        new = self.remember(text="Use claude-fable-5-2")
         self.assertFalse(self.memory.read(old)["active"])
         self.assertEqual(self.memory.read(new)["supersedes"], old)
         self.assertEqual(self.memory.search("模型选择")[0]["id"], new)

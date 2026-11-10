@@ -18,7 +18,7 @@ from harness.util import read_json, write_json
 from test_harness import RepoCase
 
 ROLES = {"commander": {"cli": "codex", "model": "gpt-6-astra", "effort": "high"},
-         "fable": {"cli": "claude", "model": "claude-fable-5-1", "effort": "high"},
+         "fable": {"cli": "claude", "model": "claude-fable-5-2", "effort": "high"},
          "worker": {"cli": "claude", "model": "claude-opus-5-5", "effort": "high"},
          "reviewer": {"cli": "codex", "model": "gpt-6.1-sol", "effort": "high"}}
 
@@ -233,7 +233,7 @@ class ProviderModelTests(StateCase):
         rows = [dispatch(role="commander", kind="plan", task_id="planning"),
                 dispatch(), dispatch(role="reviewer", kind="review"),
                 dispatch(provider_usage={"provider": "codex", "completed_turns": 1})]
-        for commander, expected in (("astra", ("codex", "gpt-6-astra")), ("fable", ("claude", "claude-fable-5-1"))):
+        for commander, expected in (("astra", ("codex", "gpt-6-astra")), ("fable", ("claude", "claude-fable-5-2"))):
             with self.subTest(commander=commander):
                 detail, by_id = self.rows(ledger("run_" + commander, commander=commander, dispatches=rows))
                 self.assertEqual((by_id[rows[0]["id"]]["provider"], by_id[rows[0]["id"]]["model_id"]), expected)

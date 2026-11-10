@@ -5,7 +5,7 @@ effort = "high"
 
 [roles.fable]
 cli = "claude"
-model = "claude-fable-5-1"
+model = "claude-fable-5-2"
 effort = "high"
 
 [roles.worker]
