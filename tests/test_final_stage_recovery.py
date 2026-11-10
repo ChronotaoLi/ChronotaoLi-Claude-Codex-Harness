@@ -29,7 +29,6 @@ class FinalStageRecoveryTests(RepoCase):
     def test_snapshot_write_interruption_resumes_allocated_final_attempt(self):
         self.config.data["runtime"]["max_final_attempts"] = 1
         self.config.data["runtime"]["max_attempts"] = 1
-        self.config.data["runtime"]["max_total_attempts"] = 1
         for error in (KeyboardInterrupt(), OSError("Storage temporarily unavailable")):
             with self.subTest(error=type(error).__name__):
                 backend = ScriptedBackend()
@@ -46,7 +45,7 @@ class FinalStageRecoveryTests(RepoCase):
                 result = self.engine(backend).resume(engine.run["id"])
                 self.assertEqual(result["status"], "completed")
                 self.assertEqual(result["final_attempts"], 1)
-                self.assertEqual(result["total_attempts"], 1)
+                self.assertEqual(sum(result["attempts"].values()), 1)
                 self.assertEqual(len(result["final_history"]), 1)
                 self.assertEqual(len(self.final_checks(result)), 1)
                 self.assertTrue(Path(record["snapshot_artifact"]).exists())
@@ -87,7 +86,7 @@ class FinalStageRecoveryTests(RepoCase):
         result = self.engine(backend).resume(engine.run["id"])
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["final_attempts"], 1)
-        self.assertEqual(result["total_attempts"], 1)
+        self.assertEqual(sum(result["attempts"].values()), 1)
         self.assertEqual(self.final_checks(result), checks)
         reviews = [entry["id"] for entry in result["dispatches"] if entry.get("kind") == "final_review"]
         self.assertEqual(len(reviews), 2)
@@ -116,7 +115,7 @@ class FinalStageRecoveryTests(RepoCase):
         result = self.engine(backend).resume(engine.run["id"])
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["final_attempts"], 1)
-        self.assertEqual(result["total_attempts"], 1)
+        self.assertEqual(sum(result["attempts"].values()), 1)
         self.assertEqual(len(self.final_checks(result)), 2)
         record = result["final_history"][-1]
         self.assertEqual(len(record["verification_rounds"]), 2)
@@ -325,7 +324,7 @@ class FinalStageRecoveryTests(RepoCase):
                 after = read_json(engine.directory / "state.json")
                 self.assertIn("pending_replan", after)
                 for field in ("pending_replan", "commander_receipts", "final_history", "dispatches",
-                              "final_attempts", "agent_dispatches", "total_attempts", "replan_attempts"):
+                              "final_attempts", "agent_dispatches", "attempts", "replan_attempts"):
                     self.assertEqual(after[field], before[field], field)
                 self.assertEqual(after["final_attempts"], 1)
                 self.assertEqual(backend.calls, calls)
@@ -376,7 +375,7 @@ class FinalStageRecoveryTests(RepoCase):
         with self.assertRaisesRegex(HarnessError, "整体审阅已达尝试次数"):
             self.engine(backend).resume(before["id"], reverify=True)
         after = read_json(state_path)
-        for field in ("final_history", "dispatches", "final_attempts", "agent_dispatches", "total_attempts"):
+        for field in ("final_history", "dispatches", "final_attempts", "agent_dispatches", "attempts"):
             self.assertEqual(after[field], before[field], field)
         self.assertEqual(backend.calls, calls)
         self.assertEqual(failed_artifact.read_bytes(), failed_bytes)

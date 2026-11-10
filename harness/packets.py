@@ -131,7 +131,9 @@ class PacketBuilder(RuntimeService):
         packet = projected["packet"]
         limits = self.context.config.data["runtime"]
         # Include a UUID-sized suffix as a reserve for distinct recovery artifacts.
-        suffix = f"{max(limits['max_attempts'], limits['max_total_attempts'])}-{dispatch_id}"
+        # A task's raw invocation count may pass max_attempts through exempt waits,
+        # but every invocation is also a model dispatch.
+        suffix = f"{max(limits['max_attempts'], limits['max_agent_dispatches'])}-{dispatch_id}"
         for task in tasks:
             if task["id"] not in packet["accepted"]:
                 folder = self.context.directory / "verification" / "tasks" / task["id"] / suffix
@@ -162,10 +164,11 @@ class PacketBuilder(RuntimeService):
                 "verification_commands": self.context.config.data["verification"]["commands"],
                 "command_execution": {"worker_only": True, "tool": "mcp__harness_commands__run_command",
                                       "list_tool": "mcp__harness_commands__list_commands",
+                                      "delete_tool": "mcp__harness_commands__delete_path",
                                       "worker_command_ids": [command_id(c) for c in self.context.config.data["permissions"]["worker_commands"]],
                                       "verification_command_ids": [command_id(c) for c in self.context.config.data["verification"]["commands"]]},
                 "file_tools": ["mcp__harness__json_check", "mcp__harness__file_sha256", "mcp__harness__file_diff"],
-                "permission_guidance": "Workers: use aligned command IDs, with no argument overrides. Each call executes anew and saves stdout/stderr. Shell syntax requires its own authorized argv. Use file tools for JSON, hashes and differences. Append readonly Bash paths after --. A denied command does not prove a path unreadable; use Read/Glob/Grep. Command grants do not expand task scope."}
+                "permission_guidance": "Workers: use aligned command IDs, with no argument overrides. Each call executes anew and saves stdout/stderr. Shell syntax requires its own authorized argv. Use file tools for JSON, hashes and differences. Append readonly Bash paths after --. A denied command does not prove a path unreadable; use Read/Glob/Grep. Command grants do not expand task scope. Delete a tracked in-scope file with delete_path instead of rm; it removes no directories and moves nothing."}
 
     def runtime_packet(self, packet, *, role, kind, task_id):
         if role != "worker" and "tool_constraints" in packet:

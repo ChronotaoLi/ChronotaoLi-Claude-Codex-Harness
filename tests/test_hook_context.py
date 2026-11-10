@@ -51,8 +51,8 @@ class HookContextTests(RepoCase):
         self.engines = []
         self.addCleanup(self.cleanup_checkouts)
 
-    def configure_hooks(self, *, legacy_context=False):
-        events = Hooks.EVENTS - {'context_compacted' if not legacy_context else 'context_prepared'}
+    def configure_hooks(self):
+        events = Hooks.EVENTS
         argv = [sys.executable, '-c', HOOK_SCRIPT, str(self.events_path), str(self.block),
                 str(self.repo.resolve())]
         write_json(self.hooks_path, {event: [{'argv': argv}] for event in events})
@@ -85,7 +85,7 @@ class HookContextTests(RepoCase):
         return [record['payload'] for record in records]
 
     def test_all_lifecycle_hooks_locate_run_across_tasks_recovery_and_fresh_verification(self):
-        self.configure_hooks(legacy_context=True)
+        self.configure_hooks()
         self.config.data['verification']['fresh_checkout'] = True
         write_json(self.block, {'event': 'pre_accept', 'task_id': 'greet'})
 
@@ -113,8 +113,8 @@ class HookContextTests(RepoCase):
         self.assertEqual(failed.read_bytes(), failed_log)
         self.assertTrue((engine.directory / 'hooks/greet-1/pre_accept-2/hook-pre_accept-0.stdout').is_file())
         events = self.events(resumed)
-        self.assertEqual({event['event'] for event in events}, Hooks.EVENTS - {'context_prepared'})
-        self.assertEqual(sum(event['event'] == 'context_compacted' for event in events), len(backend.calls))
+        self.assertEqual({event['event'] for event in events}, Hooks.EVENTS)
+        self.assertEqual(sum(event['event'] == 'context_prepared' for event in events), len(backend.calls))
         self.assertEqual([event['task_id'] for event in events if event['event'] == 'pre_accept'],
                          ['greet', 'greet', 'document'])
         self.assertEqual({event['role'] for event in events if event['event'] == 'post_agent'},

@@ -44,7 +44,7 @@ class RedesignIntegrationTests(RepoCase):
         workers = [row for row in result["dispatches"] if row["role"] == "worker"]
         self.assertEqual(len(workers), 2)
         self.assertEqual(len({row["id"] for row in workers}), 2)
-        self.assertEqual(result["total_attempts"], 2)
+        self.assertEqual(sum(result["attempts"].values()), 2)
         self.assertFalse(any(row.get("attempt_exemption") for row in workers))
         self.assertEqual(len(result["continuation_history"]), 1)
         self.assertIsNone(result["pending_continuation"])

@@ -77,5 +77,5 @@ class TaskPhaseHandoffTests(RepoCase):
         result = engine.resume(saved["id"])
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["accepted"]["greet"]["commit"], accepted["commit"])
-        self.assertEqual(result["total_attempts"], 1)
+        self.assertEqual(sum(result["attempts"].values()), 1)
         self.assertEqual(len(engine.memory.export()), 1)

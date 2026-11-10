@@ -77,7 +77,7 @@ class ToolSmokeStartupTests(unittest.TestCase):
                 (output.parent / 'process.stderr').write_text('Invalid session ID')
                 return 1
             argv = ['claude', '--json-schema', '{}', '--output-format', 'json']
-            def command(role, model, cwd, job, schema, run_path):
+            def command(role, model, cwd, job, schema, run_path, **kwargs):
                 # Like the real adapter, publish the per-dispatch MCP config.
                 (job / 'mcp.json').write_text(json.dumps({'mcpServers': {'harness': {'args': []}}}))
                 return list(argv)

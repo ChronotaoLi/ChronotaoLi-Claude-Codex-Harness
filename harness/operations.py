@@ -143,7 +143,7 @@ def _repo_head(repo):
 
 
 class OperationRecord:
-    """One run/resume invocation's record file: the CLI owns it, the Engine only links a run."""
+    """One run/resume invocation's record file: the CLI owns it, the Runtime only links a run."""
 
     def __init__(self, path, record, *, file_inputs=False):
         self.path = path

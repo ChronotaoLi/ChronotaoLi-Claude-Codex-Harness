@@ -160,7 +160,7 @@ class ProviderErrorRecoveryTests(RepoCase):
         self.config.data["runtime"]["max_attempts"] = 2
         result = self.engine(backend).resume(engine.run["id"])
         self.assertEqual(result["status"], "completed")
-        self.assertEqual(result["total_attempts"], 2)
+        self.assertEqual(sum(result["attempts"].values()), 2)
         self.assertEqual(work_attempts(result), {"greet": 2})
         self.assertEqual(result["agent_dispatches"], 5)
         workers = [call for call in backend.calls if call["role"] == "worker"]

@@ -20,6 +20,10 @@ class PermissionDiagnosticsTests(unittest.TestCase):
         self.assertNotIn('PRIVATE', repr(result))
         self.assertIn('Read', result['native_read_tools'])
         self.assertIn('harness.file_sha256', result['readonly_file_tools'])
+        # Every broker tool a worker can be given is named, deletion included.
+        from harness.command_server import DELETE_TOOL, TOOLS
+        for tool in TOOLS + [DELETE_TOOL]:
+            self.assertIn('harness_commands.' + tool['name'], result['command_broker'])
         self.assertEqual(config.data, original)
         for argv in (['python3'], ['python3', '-m', 'unittest', '-v'],
                      ['sh', '-c', 'python3 -m unittest']):

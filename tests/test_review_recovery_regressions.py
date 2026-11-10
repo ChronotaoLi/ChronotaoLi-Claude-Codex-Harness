@@ -30,7 +30,7 @@ class ReviewRecoveryRegressionTests(RepoCase):
         self.assertEqual(trigger["task_id"], "greet")
         self.assertEqual(trigger["worker"]["blocker_kind"], "task")
         self.assertEqual(saved["attempts"], {"greet": 1})
-        self.assertEqual(saved["total_attempts"], 1)
+        self.assertEqual(sum(saved["attempts"].values()), 1)
         calls = copy.deepcopy(backend.calls)
         with self.assertRaises(HarnessError):
             self.engine(backend).resume(saved["id"])
@@ -44,15 +44,15 @@ class ReviewRecoveryRegressionTests(RepoCase):
         self.assertEqual([(call["role"], call["kind"]) for call in backend.calls[len(calls):]],
                          [("commander", "replan")])
         self.assertEqual(resumed.run["attempts"], saved["attempts"])
-        self.assertEqual(resumed.run["total_attempts"], saved["total_attempts"])
+        self.assertEqual(sum(resumed.run["attempts"].values()), sum(saved["attempts"].values()))
         self.assertEqual(resumed.run["replan_attempts"], 1)
         self.assertEqual(resumed.run["replan_stopped"]["trigger"], trigger)
 
     def test_last_task_attempt_preserves_replanning_intent(self):
         self.assert_blocker_replans_after_budget_increase("max_attempts", 1)
 
-    def test_exhausted_total_attempts_preserve_replanning_intent(self):
-        self.assert_blocker_replans_after_budget_increase("max_total_attempts", 1)
+    def test_exhausted_dispatches_preserve_replanning_intent(self):
+        self.assert_blocker_replans_after_budget_increase("max_agent_dispatches", 1)
 
     def test_exhausted_replans_preserve_task_blocker_intent(self):
         self.assert_blocker_replans_after_budget_increase("max_replans", 0)

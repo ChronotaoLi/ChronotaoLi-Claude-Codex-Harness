@@ -71,7 +71,7 @@ class ReceiptVersionBoundaryTests(RepoCase):
         backend = RecordingBackend()
         runtime = self.engine(backend)
         state = runtime.start("Implement greet", read_json(ROOT / "examples/plan.json"))
-        self.assertEqual(state["schema_version"], 15)
+        self.assertEqual(state["schema_version"], 16)
         shutil.rmtree(runtime.worktree / "__pycache__", ignore_errors=True)
         state.pop("worker_receipts")
         path = runtime.directory / "state.json"

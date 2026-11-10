@@ -83,7 +83,7 @@ class RecoveryProjectionTests(RepoCase):
         result = self.engine(backend).resume(engine.run["id"])
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["attempts"], {"greet": 4})
-        self.assertEqual(result["total_attempts"], 4)
+        self.assertEqual(sum(result["attempts"].values()), 4)
         self.assertEqual(result["agent_dispatches"], len(backend.requests))
         self.assertEqual(len({request["dispatch_id"] for request in backend.requests}), len(backend.requests))
         self.assertNotIn("greet", result["worker_recovery"])

@@ -34,7 +34,8 @@ class OperationalControlsTests(RepoCase):
                 self.assertEqual(state, read_json(engine.directory / "state.json"))
             else:
                 self.assertNotIn("dispatches", state)
-                self.assertEqual(state["budgets"]["total_attempts"], 0)
+                self.assertEqual(state["budgets"]["attempts_total"], 0)
+                self.assertFalse({"total_attempts", "attempt_budget_policy"} & set(state["budgets"]))
 
     def test_cli_explicit_stop_retry_and_abandon_preserve_engine_behavior(self):
         def blocker(backend, kwargs, packet, result):
@@ -46,13 +47,13 @@ class OperationalControlsTests(RepoCase):
             engine.start("Implement greet", read_json(ROOT / "examples/plan.json"))
         factory = lambda *args, **kwargs: self.engine(backend)
         calls = len(backend.calls)
-        code, _, _ = self.invoke(["resume", engine.run["id"]], Engine=factory)
+        code, _, _ = self.invoke(["resume", engine.run["id"]], Runtime=factory)
         self.assertEqual(code, 1)
         self.assertEqual(len(backend.calls), calls)
         state_path = engine.directory / "state.json"
         before_retry = read_json(state_path)
         request = before_retry["decision_requests"][-1]
-        code, _, errors = self.invoke(["resume", engine.run["id"], "--retry-stopped", "greet"], Engine=factory)
+        code, _, errors = self.invoke(["resume", engine.run["id"], "--retry-stopped", "greet"], Runtime=factory)
         self.assertEqual(code, 1)
         self.assertIn(request["id"], errors)
         self.assertIn("--operator-decision", errors)
@@ -61,12 +62,12 @@ class OperationalControlsTests(RepoCase):
         answer = self.repo / "continue-replan.json"
         write_json(answer, {"schema_version": 1, "request_id": request["id"], "task_id": "greet",
                             "decision": "continue", "summary": "Explicitly retry the saved planning request"})
-        code, _, _ = self.invoke(["resume", engine.run["id"], "--operator-decision", str(answer)], Engine=factory)
+        code, _, _ = self.invoke(["resume", engine.run["id"], "--operator-decision", str(answer)], Runtime=factory)
         self.assertEqual(code, 1)  # The simulated commander explicitly stops again.
         self.assertEqual(len(backend.calls), calls + 1)
         self.assertEqual(backend.calls[-1]["kind"], "replan")
         self.assertNotEqual(read_json(state_path)["decision_requests"][-1]["id"], request["id"])
-        code, _, errors = self.invoke(["abandon", engine.run["id"]], Engine=factory)
+        code, _, errors = self.invoke(["abandon", engine.run["id"]], Runtime=factory)
         self.assertEqual(code, 0, errors)
         self.assertEqual(read_json(engine.directory / "state.json")["status"], "abandoned")
 
@@ -100,14 +101,14 @@ class OperationalControlsTests(RepoCase):
 
     def test_damaged_attempt_accounting_keeps_status_readable_and_ledger_unchanged(self):
         path = self.repo / ".harness" / "runs" / "run_damaged" / "state.json"
-        base = {"id": "run_damaged", "attempts": {"task": 1},
-                "attempt_budget_policy": "work", "dispatches": []}
+        base = {"id": "run_damaged", "schema_version": 16, "attempts": {"task": 1}, "dispatches": []}
         exemption = {"task_id": "task", "attempt_exemption": {"blocker_kind": "operator"}}
         variants = [{"attempts": value} for value in
                     (None, 5, ["a"], [["task", 1]], {"task": "1"}, {"task": True}, {"task": -1})]
         variants += [{"dispatches": value} for value in (None, 5, {})]
         variants += [
-            {"attempt_budget_policy": "unknown"},
+            # Historical display branch: a schema-15 ledger's saved policy is still validated.
+            {"schema_version": 15, "attempt_budget_policy": "unknown"},
             {"dispatches": [dict(exemption, task_id=[])]},
             {"dispatches": [dict(exemption, task_id="missing")]},
             {"dispatches": [dict(exemption, attempt_exemption=True)]},

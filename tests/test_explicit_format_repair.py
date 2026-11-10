@@ -47,7 +47,7 @@ class ExplicitFormatRepairTests(RepoCase):
                 self.assertEqual(len(backend.calls), calls)
                 result = self.engine(backend).resume(engine.run["id"], repair_invalid=source["dispatch_id"])
                 self.assertEqual(result["status"], "completed")
-                self.assertEqual(result["total_attempts"], 1)
+                self.assertEqual(sum(result["attempts"].values()), 1)
                 self.assertEqual(result["final_attempts"], 1)
                 self.assertEqual(result["format_repairs"][key], 1)
                 repair = result["invalid_repairs"][key]
@@ -182,7 +182,7 @@ class ExplicitFormatRepairTests(RepoCase):
         result = self.engine(backend).resume(engine.run["id"])
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["agent_dispatches"], saved["agent_dispatches"] + 1)
-        self.assertEqual(result["total_attempts"], 1)
+        self.assertEqual(sum(result["attempts"].values()), 1)
         self.assertNotEqual(result["invalid_repairs"][key]["corrected_dispatch_id"], saved["dispatches"][-1]["id"])
 
     def test_explicit_correction_result_write_crash_replays_without_new_dispatch(self):

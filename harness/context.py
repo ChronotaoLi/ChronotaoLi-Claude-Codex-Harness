@@ -352,6 +352,21 @@ def field_size_report(value):
     return rows
 
 
+FIELD_SIZE_DETAILS = 30
+
+
+def bounded_field_sizes(rows, limit=FIELD_SIZE_DETAILS):
+    """Keep the root and top-level rows plus the largest nested rows, in order.
+
+    Omitted rows make the kept rows non-additive; omitted counts what is missing.
+    """
+    nested = sorted((i for i, row in enumerate(rows) if len(row['path']) > 1),
+                    key=lambda i: (-rows[i]['chars'], i))
+    kept = set(nested[:limit])
+    return ([row for i, row in enumerate(rows) if len(row['path']) <= 1 or i in kept],
+            len(nested) - len(kept))
+
+
 def actual_capacity_report(required, budget):
     return {'budget_chars': budget, 'required_chars': len(prompt_json(required)),
             'role': required.get('role'), 'kind': required.get('kind'),
@@ -372,7 +387,10 @@ def compose(required: dict, memories: list[dict], budget: int, *, memory_diagnos
         if len(packet) + len(candidate) <= budget:
             packet += candidate
             kept.append(memory["id"])
-    report = {**actual_capacity_report(required, budget),
+    report = actual_capacity_report(required, budget)
+    # Successful dispatches keep a bounded breakdown; overflow reports keep all rows.
+    report["field_sizes"], omitted = bounded_field_sizes(report["field_sizes"])
+    report = {**report, "field_sizes_omitted": omitted,
               "memory_chars": len(packet) - len(core), "used_chars": len(packet),
               "memory_ids": kept, "omitted_memories": len(memories) - len(kept),
               "method": "structured checkpoint + bounded retrieval; not tokenizer count"}

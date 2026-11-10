@@ -97,7 +97,7 @@ class RuntimeChangesTests(RepoCase):
         self.assertEqual(result["replan_attempts"], 1)
         self.assertEqual(result["final_attempts"], 2)
         self.assertEqual([item["status"] for item in result["final_history"]], ["rejected", "approved"])
-        self.assertEqual(result["total_attempts"], 2)
+        self.assertEqual(sum(result["attempts"].values()), 2)
         self.assertNotEqual(result["final_history"][0]["head"], result["final_history"][1]["head"])
 
     def test_noop_corrective_task_does_not_get_fresh_final_verdict(self):
@@ -176,7 +176,7 @@ class RuntimeChangesTests(RepoCase):
         engine = self.engine(ScriptedBackend(prerequisite))
         result = engine.start("Implement greet", self.plan())
         self.assertEqual(result["attempts"], {"greet": 2, "prepare": 1})
-        self.assertEqual(result["total_attempts"], 3)
+        self.assertEqual(sum(result["attempts"].values()), 3)
         archive = engine.directory / "recovery" / "replan-1"
         self.assertEqual((archive / "files" / "hello.py").read_text(), "partial blocked implementation\n")
         self.assertEqual(read_json(archive / "restored.json")["head"], result["base_commit"])
@@ -197,7 +197,7 @@ class RuntimeChangesTests(RepoCase):
             self.assertEqual(engine.run["replan_attempts"], 0)
             self.assertFalse(any(call["kind"] == "replan" for call in backend.calls))
 
-    def test_exhausted_attempt_and_total_budgets_stop_before_replan(self):
+    def test_exhausted_attempt_and_dispatch_budgets_stop_before_replan(self):
         def blocked(backend, kwargs, packet, result):
             if kwargs["role"] == "worker":
                 result.update(status="blocked", blocker_kind="task", blockers=["Need prerequisite"], summary="Blocked")
@@ -206,13 +206,17 @@ class RuntimeChangesTests(RepoCase):
         with self.assertRaisesRegex(HarnessError, "重新命名任务"):
             engine.start("Implement greet", self.plan())
         self.assertEqual(engine.run["replan_attempts"], 0)
+        # The run-wide limit is the model dispatch budget; it still precedes replanning.
         self.config.data["runtime"]["max_attempts"] = 3
-        self.config.data["runtime"]["max_total_attempts"] = 1
-        engine = self.engine(ScriptedBackend(blocked))
-        with self.assertRaisesRegex(HarnessError, "总尝试次数"):
+        self.config.data["runtime"]["max_agent_dispatches"] = 1
+        backend = ScriptedBackend(blocked)
+        engine = self.engine(backend)
+        with self.assertRaisesRegex(HarnessError, "模型派发次数上限"):
             engine.start("Implement greet", self.plan())
-        self.assertEqual(engine.run["total_attempts"], 1)
+        self.assertEqual(sum(engine.run["attempts"].values()), 1)
         self.assertEqual(engine.run["replan_attempts"], 0)
+        self.assertEqual(engine.run["pending_replan"]["stage"], "request")
+        self.assertFalse(any(call["kind"] == "replan" for call in backend.calls))
 
     def test_resume_budget_increase_preserves_attempts_and_logs_change(self):
         def interrupt(backend, kwargs, packet):
@@ -228,7 +232,7 @@ class RuntimeChangesTests(RepoCase):
         self.assertEqual(engine.run["config_snapshot"]["runtime"]["context_chars"], old_budget)
         result = self.engine().resume(engine.run["id"])
         self.assertEqual(result["attempts"]["greet"], 2)
-        self.assertEqual(result["total_attempts"], 2)
+        self.assertEqual(sum(result["attempts"].values()), 2)
         events = [json.loads(line) for line in (engine.directory / "events.jsonl").read_text().splitlines()]
         change = next(event for event in events if event["event"] == "resume_config_relaxed")
         self.assertEqual(change["changes"]["context_chars"], {"old": old_budget, "new": old_budget + 100})

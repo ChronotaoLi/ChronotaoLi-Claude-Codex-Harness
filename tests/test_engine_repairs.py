@@ -54,7 +54,7 @@ class EngineRepairsTests(RepoCase):
         self.assertNotEqual(workers[0]["job"], workers[1]["job"])
         self.assertEqual([request["model"] for request in workers], [self.config.role("worker")] * 2)
         self.assertEqual(result["attempts"], {"greet": 2})
-        self.assertEqual(result["total_attempts"], 2)
+        self.assertEqual(sum(result["attempts"].values()), 2)
         correction = [call for call in backend.calls if call["role"] == "worker"][1]["packet"]["format_correction"]
         self.assertEqual(correction["previous_dispatch"], workers[0]["dispatch_id"])
         self.assertEqual(len(read_json(Path(correction["artifact"]) / "response.json")["summary"]), 32001)
@@ -75,20 +75,20 @@ class EngineRepairsTests(RepoCase):
         self.assertEqual(sum(call["role"] == "worker" for call in backend.calls), 2)
         self.assertEqual(sum(engine.run["format_repairs"].values()), 1)
 
-    def test_format_repair_cannot_exceed_task_or_total_worker_budget(self):
+    def test_format_repair_cannot_exceed_task_or_dispatch_budget(self):
         def malformed(backend, kwargs, packet, result):
             if kwargs["role"] == "worker":
                 result["summary"] = "x" * 32001
-        for limit in ("max_attempts", "max_total_attempts"):
+        for limit in ("max_attempts", "max_agent_dispatches"):
             with self.subTest(limit=limit):
                 self.config.data["runtime"]["max_attempts"] = 3
-                self.config.data["runtime"]["max_total_attempts"] = 60
+                self.config.data["runtime"]["max_agent_dispatches"] = 200
                 self.config.data["runtime"][limit] = 1
                 backend = RecordingBackend(malformed)
                 engine = self.engine(backend)
                 with self.assertRaises(HarnessError):
                     engine.start("Implement greet", self.plan())
-                self.assertEqual(engine.run["total_attempts"], 1)
+                self.assertEqual(sum(engine.run["attempts"].values()), 1)
                 self.assertEqual(sum(call["role"] == "worker" for call in backend.calls), 1)
                 self.assertEqual(engine.run["format_repairs"], {})
 
@@ -166,7 +166,7 @@ class EngineRepairsTests(RepoCase):
                 with self.assertRaises(HarnessError):
                     engine.start("Implement greet", self.plan())
                 self.assertEqual(engine.run["format_repairs"], {})
-                self.assertEqual(engine.run["total_attempts"], 1)
+                self.assertEqual(sum(engine.run["attempts"].values()), 1)
                 self.assertEqual(engine.run["replan_attempts"], 0)
                 self.assertEqual(sum(call["role"] == "worker" for call in backend.calls), 1)
 
@@ -238,7 +238,7 @@ class EngineRepairsTests(RepoCase):
         self.assertEqual(result["status"], "completed")
         self.assertEqual(sum(call["role"] == "worker" for call in backend.calls), 1)
         self.assertEqual(sum(call["kind"] == "review" for call in backend.calls), 1)
-        self.assertEqual(result["total_attempts"], 1)
+        self.assertEqual(sum(result["attempts"].values()), 1)
         self.assertEqual(sum(d["role"] == "verification" and d["task_id"] == "greet" for d in result["dispatches"]), 1)
         self.assertNotIn("pending_acceptance", result)
         self.assertTrue((engine.directory / "hooks/greet-1/pre_accept-2/hook-pre_accept-0.stdout").exists())
@@ -354,13 +354,13 @@ class EngineRepairsTests(RepoCase):
         saved = read_json(engine.directory / "state.json")
         self.assertEqual(saved["pending_replan"]["stage"], "validated")
         self.assertEqual(saved["replan_attempts"], 1)
-        self.assertEqual(saved["total_attempts"], 1)
+        self.assertEqual(sum(saved["attempts"].values()), 1)
         self.assertTrue((engine.worktree / "hello.py").exists())
         result = self.engine(backend).resume(engine.run["id"])
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["replan_attempts"], 1)
         self.assertEqual(sum(call["kind"] == "replan" for call in backend.calls), 1)
-        self.assertEqual(result["total_attempts"], 3)
+        self.assertEqual(sum(result["attempts"].values()), 3)
         self.assertNotIn("pending_replan", result)
         self.assertEqual((engine.directory / "recovery/replan-1/partial-evidence").read_text(), "preserve this failed attempt")
         self.assertEqual(len(list((engine.directory / "recovery").glob("replan-1-*/restored.json"))), 1)

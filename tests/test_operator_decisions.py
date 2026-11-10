@@ -18,7 +18,7 @@ class Fixture(DecisionRecovery):
         self.context.directory = Path(directory).resolve()
         self.events = []
         self.saves = 0
-        self.context.run = {'id': 'run_test', 'schema_version': 15, 'status': 'blocked',
+        self.context.run = {'id': 'run_test', 'schema_version': 16, 'status': 'blocked',
                     'tasks': [{'id': 'one', 'depends_on': []}, {'id': 'two', 'depends_on': ['one']}],
                     'accepted': {}, 'dispatches': [{'id': 'dispatch_one', 'role': 'commander',
                     'kind': 'replan', 'task_id': 'replanning', 'invoked': True}],

@@ -35,7 +35,7 @@ class WorkAttemptBudgetTests(RepoCase):
         result = self.engine(backend).resume(engine.run["id"])
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["attempts"], {"greet": 2})
-        self.assertEqual(result["total_attempts"], 2)
+        self.assertEqual(sum(result["attempts"].values()), 2)
         self.assertEqual(work_attempts(result), {"greet": 1})
         self.assertEqual(result["agent_dispatches"], len(backend.calls))
         workers = [d for d in result["dispatches"] if d["role"] == "worker"]
@@ -57,18 +57,21 @@ class WorkAttemptBudgetTests(RepoCase):
                             "decision": "continue", "summary": "Continue with the original task"})
         result = self.engine(backend).resume(engine.run["id"], operator_decision=answer)
         self.assertEqual(result["status"], "completed")
-        self.assertEqual(result["total_attempts"], 2)
+        self.assertEqual(sum(result["attempts"].values()), 2)
         self.assertEqual(work_attempts(result), {"greet": 1})
 
-    def test_wait_does_not_exempt_global_invocation_limit(self):
-        self.config.data["runtime"]["max_total_attempts"] = 1
+    def test_wait_does_not_exempt_dispatch_limit(self):
+        self.config.data["runtime"]["max_agent_dispatches"] = 1
         engine, backend = self.start_blocked()
-        with self.assertRaisesRegex(HarnessError, "run 总尝试次数上限"):
+        before = read_json(engine.directory / "state.json")
+        self.assertEqual((before["agent_dispatches"], work_attempts(before)), (1, {"greet": 0}))
+        with self.assertRaisesRegex(HarnessError, "模型派发次数上限"):
             self.engine(backend).resume(engine.run["id"])
         self.assertEqual(len(backend.calls), 1)
-        self.config.data["runtime"]["max_total_attempts"] = 2
+        self.config.data["runtime"]["max_agent_dispatches"] = 200
         result = self.engine(backend).resume(engine.run["id"])
         self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["agent_dispatches"], len(backend.calls))
 
     def test_real_rework_still_exhausts_task_budget_after_environment_wait(self):
         engine, backend = self.start_blocked()
@@ -93,12 +96,13 @@ class WorkAttemptBudgetTests(RepoCase):
             self.engine(backend).resume(engine.run["id"])
         self.assertEqual(len(backend.calls), 1)
 
-    def test_missing_budget_policy_rejects_resume_without_reset_or_calls(self):
+    def test_missing_attempt_counters_reject_resume_without_reset_or_calls(self):
         engine, backend = self.start_blocked()
         snapshot = engine.context.snapshot()
         state_path = engine.directory / "state.json"
         state = read_json(state_path)
-        state.pop("attempt_budget_policy")
+        self.assertNotIn("attempt_budget_policy", state)
+        attempts = state.pop("attempts")
         write_json(state_path, state)
         saved_bytes = state_path.read_bytes()
         calls = copy.deepcopy(backend.calls)
@@ -107,13 +111,12 @@ class WorkAttemptBudgetTests(RepoCase):
         self.assertEqual(backend.calls, calls)
         self.assertEqual(state_path.read_bytes(), saved_bytes)
         self.assertEqual(git.snapshot(engine.worktree, binding=state["worktree_binding"]), snapshot)
-        self.assertEqual(state["attempts"], {"greet": 1})
-        self.assertEqual(state["total_attempts"], 1)
+        self.assertEqual(attempts, {"greet": 1})
 
     def test_exemption_evidence_tampering_and_invalid_accounting_stop_before_dispatch(self):
         engine, backend = self.start_blocked()
         original = read_json(engine.directory / "state.json")
-        for change in ("digest", "identity", "count", "policy", "task_type"):
+        for change in ("digest", "identity", "count", "task_type"):
             state = copy.deepcopy(original)
             exemption = state["dispatches"][0]["attempt_exemption"]
             if change == "digest":
@@ -122,8 +125,6 @@ class WorkAttemptBudgetTests(RepoCase):
                 exemption["blocker_kind"] = "operator"
             elif change == "count":
                 state["attempts"]["greet"] = 0
-            elif change == "policy":
-                state["attempt_budget_policy"] = "invalid"
             else:
                 state["dispatches"][0]["task_id"] = []
             write_json(engine.directory / "state.json", state)
@@ -152,5 +153,5 @@ class WorkAttemptBudgetTests(RepoCase):
                 resumed.resume(engine.run["id"])
         self.assertEqual(len(backend.calls), 1)
         after = read_json(engine.directory / "state.json")
-        for key in ("attempts", "total_attempts", "agent_dispatches"):
+        for key in ("attempts", "agent_dispatches"):
             self.assertEqual(after[key], before[key])

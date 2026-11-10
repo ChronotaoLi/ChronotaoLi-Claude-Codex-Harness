@@ -31,7 +31,7 @@ class ConvergenceTests(unittest.TestCase):
             self.assertEqual(convergence_summary({**run, "status": status}, {"old": 10})["warnings"], [])
 
     def test_signal_uses_work_attempts_and_only_consecutive_rejections(self):
-        run = {"status": "running", "attempts": {"task": 3}, "attempt_budget_policy": "work",
+        run = {"schema_version": 16, "status": "running", "attempts": {"task": 3},
                "dispatches": [{"role": "worker", "task_id": "task", "attempt_exemption": {
                    "blocker_kind": "environment", "artifact": "/evidence/returned-result.json",
                    "artifact_digest": "0" * 64}}],
@@ -39,8 +39,10 @@ class ConvergenceTests(unittest.TestCase):
         # Observation uses saved accounting, not an extra interpretation of retries.
         self.assertEqual(status_summary(run)["budgets"]["work_attempts"], {"task": 2})
         self.assertEqual(status_summary(run)["convergence"]["warnings"], [])
-        run["attempt_budget_policy"] = "all_invocations"
-        self.assertEqual(status_summary(run)["convergence"]["warnings"][0]["recurring_findings"], [])
+        # Historical display branch: a schema-15 ledger is read under its saved policy.
+        historical = {**run, "schema_version": 15, "attempt_budget_policy": "all_invocations"}
+        self.assertEqual(status_summary(historical)["budgets"]["work_attempts"], {"task": 3})
+        self.assertEqual(status_summary(historical)["convergence"]["warnings"][0]["recurring_findings"], [])
 
     def test_damaged_history_and_large_warning_sets_remain_bounded(self):
         run = {"status": "running", "accepted": {}, "review_history": {"bad": None}, "final_history": None}

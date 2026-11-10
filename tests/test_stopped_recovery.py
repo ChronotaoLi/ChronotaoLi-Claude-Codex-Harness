@@ -37,13 +37,13 @@ class StoppedRecoveryTests(RepoCase):
         with self.assertRaises(HarnessError):
             engine.start("Implement greet", self.plan())
         calls = copy.deepcopy(backend.calls)
-        budget = (engine.run["total_attempts"], engine.run["agent_dispatches"], engine.run["replan_attempts"])
+        budget = (sum(engine.run["attempts"].values()), engine.run["agent_dispatches"], engine.run["replan_attempts"])
         for _ in range(2):
             resumed = self.engine(backend)
             with self.assertRaisesRegex(HarnessError, "retry-stopped"):
                 resumed.resume(engine.run["id"])
             self.assertEqual(backend.calls, calls)
-            self.assertEqual((resumed.run["total_attempts"], resumed.run["agent_dispatches"], resumed.run["replan_attempts"]), budget)
+            self.assertEqual((sum(resumed.run["attempts"].values()), resumed.run["agent_dispatches"], resumed.run["replan_attempts"]), budget)
         with self.assertRaises(HarnessError):
             self.engine(backend).resume(engine.run["id"], retry_stopped="final")
         self.assertEqual(backend.calls, calls)
@@ -222,7 +222,7 @@ class StoppedRecoveryTests(RepoCase):
             output.write("\n/report.tmp\n")
         result = self.engine(backend).resume(engine.run["id"])
         self.assertEqual(result["status"], "completed")
-        self.assertEqual(result["total_attempts"], 1)
+        self.assertEqual(sum(result["attempts"].values()), 1)
         self.assertEqual(result["final_attempts"], 1)
         self.assertEqual(len(result["final_history"][0]["verification_rounds"]), 2)
 

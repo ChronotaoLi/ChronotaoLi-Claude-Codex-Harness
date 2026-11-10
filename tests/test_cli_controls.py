@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 from harness.adapters import DemoBackend
 from harness.cli import main
-from harness.engine import Engine
+from harness.runtime import Runtime
 from harness.shared import Hooks
 from harness.util import HarnessError, read_json, write_json
 from test_harness import ROOT, RepoCase
@@ -18,14 +18,14 @@ class CLIControlsTests(RepoCase):
         engines = []
 
         def factory(config, repo, **kwargs):
-            engine = Engine(config, repo, backend=backend or DemoBackend(), **kwargs)
+            engine = Runtime(config, repo, backend=backend or DemoBackend(), **kwargs)
             engines.append(engine)
             return engine
 
         previous = signal.getsignal(signal.SIGTERM)
         output, errors = io.StringIO(), io.StringIO()
         try:
-            with patch("harness.cli.Config.load", return_value=self.config), patch("harness.cli.Engine", side_effect=factory), \
+            with patch("harness.cli.Config.load", return_value=self.config), patch("harness.cli.Runtime", side_effect=factory), \
                     patch("harness.operations.probe_cli", return_value={"path": None, "version": None}), \
                     contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
                 code = main(["--repo", str(self.repo), *args])
@@ -75,18 +75,30 @@ class CLIControlsTests(RepoCase):
         self.assertEqual(resumed[0].run["status"], "completed")
         self.assertEqual(set(resumed[0].run["accepted"]), {"greet", "document"})
 
-    def test_legacy_context_hook_receives_legacy_event_once(self):
+    def test_context_hook_receives_prepared_event_once(self):
         output = self.repo / "hook-event.json"
         hooks = Hooks(self.config)
         script = "import json,sys; from pathlib import Path; Path(sys.argv[1]).write_text(json.dumps(json.load(sys.stdin)))"
-        hooks.spec = {"context_compacted": [{"argv": [sys.executable, "-c", script, str(output)]}]}
+        hooks.spec = {"context_prepared": [{"argv": [sys.executable, "-c", script, str(output)]}]}
         hooks.emit("context_prepared", {"report": {"used_chars": 10}}, self.repo / "logs")
-        self.assertEqual(json.loads(output.read_text()), {"event": "context_compacted", "report": {"used_chars": 10}})
+        self.assertEqual(json.loads(output.read_text()), {"event": "context_prepared", "report": {"used_chars": 10}})
 
-    def test_duplicate_context_hook_aliases_are_rejected(self):
-        hook = {"argv": [sys.executable, "-c", "pass"]}
+    def test_removed_context_hook_alias_is_an_unknown_event_naming_its_replacement(self):
+        hook = {"argv": [sys.executable, "-c", "raise SystemExit(9)"]}
         path = self.repo / "hooks.json"
-        write_json(path, {"context_prepared": [hook], "context_compacted": [hook]})
-        self.config.data["shared"]["hooks"] = str(path)
-        with self.assertRaises(HarnessError):
-            Hooks(self.config)
+        for spec in ({"context_compacted": [hook]}, {"context_prepared": [], "context_compacted": [hook]}):
+            with self.subTest(events=sorted(spec)):
+                write_json(path, spec)
+                self.config.data["shared"]["hooks"] = str(path)
+                with self.assertRaises(HarnessError) as raised:
+                    Hooks(self.config)
+                self.assertIn("未知事件", str(raised.exception))
+                self.assertIn("context_compacted", str(raised.exception))
+                self.assertIn("请改用 context_prepared", str(raised.exception))
+        # An in-process override is rejected before any hook script runs.
+        write_json(path, {})
+        hooks = Hooks(self.config)
+        hooks.spec = {"context_compacted": [hook]}
+        with self.assertRaisesRegex(HarnessError, "请改用 context_prepared"):
+            hooks.emit("context_prepared", {"report": {}}, self.repo / "logs")
+        self.assertFalse((self.repo / "logs").exists())

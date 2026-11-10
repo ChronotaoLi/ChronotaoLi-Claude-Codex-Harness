@@ -1,32 +1,122 @@
 """Durable worker handoff: immutable returned candidates, replayable local gates."""
 from copy import deepcopy
 import hashlib
+import json
+import os
 from pathlib import Path
+import stat
 
 from . import git
 from .contracts import RepairableFormatError, validate, validate_structure, validate_work_semantics
 from .recovery import snapshot_digest
 from .services import RuntimeService
-from .util import HarnessError, read_json, write_json
+from .util import HarnessError, dump, read_json, write_json
 from .worker_returns import inspect_return, validate_return_evidence
-from .versions import RUN_SCHEMA_VERSION
+
+# Worker inputs live beside the dispatch as immutable files; the ledger keeps
+# their paths and SHA256 (schema 16). Schema 14 and 15 ledgers embed the same
+# inputs; only read-only history checks accept that shape.
+INPUTS = {'packet': 'packet.json', 'schema': 'schema.json'}
+REFERENCED, EMBEDDED = 'referenced', 'embedded'
+# The capture contract has been mandatory since schema 15; it stays checked for
+# every later version, including historical schema 15 ledgers.
+CAPTURE_CONTRACT_SCHEMA = 15
+
+
+def receipt_shape(run):
+    """The worker intent shape fixed by the ledger's version; never guessed from content."""
+    version = run.get('schema_version')
+    if type(version) is not int or version < 14:
+        raise HarnessError('worker receipts require ledger schema 14 or later')
+    return EMBEDDED if version < 16 else REFERENCED
+
+
+def read_worker_input(directory, entry, intent, field):
+    """Read one referenced input after checking its path, file type and SHA256."""
+    job = Path(directory) / 'dispatches' / entry['id']
+    path = job / INPUTS[field]
+    digest = intent.get(field + '_artifact_digest')
+    if intent.get(field + '_artifact') != str(path) or not isinstance(digest, str):
+        raise HarnessError(f'worker {field} reference invalid; preserve evidence')
+    if any(item.is_symlink() for item in (job, job.parent)):
+        raise HarnessError(f'worker {field} directory is a symlink; preserve evidence')
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError as error:
+        raise HarnessError(f'worker {field} artifact missing or a symlink; preserve evidence: {path}') from error
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise HarnessError(f'worker {field} artifact must be a regular file; preserve evidence: {path}')
+        with os.fdopen(descriptor, 'rb') as stream:
+            descriptor = None
+            raw = stream.read()
+    except OSError as error:
+        raise HarnessError(f'cannot read worker {field} artifact; preserve evidence: {path}') from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    if hashlib.sha256(raw).hexdigest() != digest:
+        raise HarnessError(f'worker {field} artifact changed; preserve evidence: {path}')
+    try:
+        value = json.loads(raw)
+    except (ValueError, UnicodeError) as error:
+        raise HarnessError(f'worker {field} artifact is not valid JSON; preserve evidence') from error
+    if not isinstance(value, dict):
+        raise HarnessError(f'worker {field} artifact must be an object; preserve evidence')
+    return value
 
 
 class WorkerReceipts(RuntimeService):
-    def intent(self, entry, schema, packet):
+    def publish_inputs(self, entry, schema, packet):
+        """Write and verify the immutable worker inputs before any accounting.
+
+        The caller mutates budgets, the receipt intent and invoked only after this
+        returns, then saves them together. A failed write therefore charges nothing;
+        an unreferenced file left by an interruption is ignored by later dispatches.
+        """
         key = f"worker:{entry['kind']}:{entry['task_id']}"
         if key in self.context.run['worker_receipts']:
             raise HarnessError('worker receipt already active')
         job = self.context.directory / 'dispatches' / entry['id']
+        inputs = {}
+        for field, value in (('packet', packet), ('schema', schema)):
+            path = job / INPUTS[field]
+            raw = (dump(value) + '\n').encode('utf-8')
+            try:
+                if any(item.is_symlink() for item in (path, job, job.parent)):
+                    raise HarnessError(f'worker {field} path is a symlink')
+                if not path.exists():
+                    write_json(path, value)
+                if path.is_symlink() or not path.is_file() or path.read_bytes() != raw:
+                    raise HarnessError(f'worker {field} artifact conflict; preserve evidence')
+            except OSError as error:
+                raise HarnessError(f'cannot publish worker {field} before invocation; no budget was charged: {error}') from error
+            inputs[field + '_artifact'] = str(path)
+            inputs[field + '_artifact_digest'] = hashlib.sha256(raw).hexdigest()
+        return inputs
+
+    def intent(self, entry, inputs):
+        """Stage the receipt intent; the dispatcher saves it with budgets and invoked."""
+        key = f"worker:{entry['kind']}:{entry['task_id']}"
+        job = self.context.directory / 'dispatches' / entry['id']
         receipt = {'dispatch_id': entry['id'], 'artifact': str(job / 'returned-result.json'),
-                   'seal': str(job / 'worker-seal.json'), 'schema': deepcopy(schema),
-                   'packet': deepcopy(packet), 'packet_digest': snapshot_digest(packet),
+                   'seal': str(job / 'worker-seal.json'), **deepcopy(inputs),
                    'capture': {'provider': self.context.config.role('worker', self.context.commander)['cli'],
                                'mode': self.context.config.data['runtime']['claude_output_mode']},
                    'snapshot_digest': entry['snapshot_digest'],
                    'attempt': self.context.run['attempts'][entry['task_id']], 'phase': 'invoking'}
         entry['worker_receipt'] = deepcopy(receipt)
         self.context.run['worker_receipts'][key] = receipt
+
+    def original_packet(self, key):
+        """The sealed worker's exact input packet, for its automatic format correction."""
+        receipt = self.context.run['worker_receipts'][key]
+        try:
+            entry = self.entry(receipt)
+            return read_worker_input(self.context.directory, entry, entry['worker_receipt'], 'packet')
+        except HarnessError as error:
+            self.services.receipts.record_receipt_error(receipt, error)
+            raise
 
     def seal(self, entry, result):
         self.context.ensure_exited()
@@ -77,7 +167,25 @@ class WorkerReceipts(RuntimeService):
             raise HarnessError('worker receipt dispatch identity missing or ambiguous')
         return matches[0]
 
-    def validate_links(self):
+    def delivered_contract(self, entry, intent, shape=REFERENCED):
+        """Return the exact contract delivered to a worker, verifying its inputs.
+
+        The referenced shape reads both immutable files and checks their SHA256;
+        the embedded shape exists only in completed historical ledgers.
+        """
+        if shape == EMBEDDED:
+            if (any(field + '_artifact' in intent for field in INPUTS)
+                    or not isinstance(intent.get('schema'), dict) or not isinstance(intent.get('packet'), dict)
+                    or intent.get('packet_digest') != snapshot_digest(intent['packet'])):
+                raise HarnessError('missing mandatory worker receipt linkage')
+            return intent['schema']
+        if shape != REFERENCED or any(field in intent for field in ('packet', 'schema', 'packet_digest')):
+            raise HarnessError('missing mandatory worker receipt linkage')
+        read_worker_input(self.context.directory, entry, intent, 'packet')
+        return read_worker_input(self.context.directory, entry, intent, 'schema')
+
+    def validate_links(self, shape=REFERENCED):
+        """Execution accepts only referenced inputs; history passes its own shape."""
         receipts = self.context.run['worker_receipts']
         if not isinstance(receipts, dict) or len(receipts) > 1:
             raise HarnessError('invalid/conflicting worker receipts')
@@ -90,14 +198,12 @@ class WorkerReceipts(RuntimeService):
                 continue
             intent = entry.get('worker_receipt')
             if (not isinstance(intent, dict) or intent.get('dispatch_id') != entry['id']
-                    or not isinstance(intent.get('schema'), dict)
-                    or not isinstance(intent.get('packet'), dict)
                     or type(intent.get('attempt')) is not int or intent['attempt'] < 1
-                    or intent.get('phase') != 'invoking'
-                    or intent.get('packet_digest') != snapshot_digest(intent['packet'])):
+                    or intent.get('phase') != 'invoking'):
                 raise HarnessError('missing mandatory worker receipt linkage')
+            contract = self.delivered_contract(entry, intent, shape)
             job = self.context.directory / 'dispatches' / entry['id']
-            if self.context.run['schema_version'] == RUN_SCHEMA_VERSION:
+            if self.context.run['schema_version'] >= CAPTURE_CONTRACT_SCHEMA:
                 capture = intent.get('capture')
                 if (not isinstance(capture, dict) or set(capture) != {'provider', 'mode'}
                         or capture['provider'] != 'claude'
@@ -116,7 +222,7 @@ class WorkerReceipts(RuntimeService):
                     raise HarnessError('worker provider failure lacks retry evidence')
             if intent.get('artifact') != str(job / 'returned-result.json') or intent.get('seal') != str(job / 'worker-seal.json'):
                 raise HarnessError('worker intent paths invalid')
-            properties = intent['schema'].get('properties', {})
+            properties = contract.get('properties', {})
             if (not isinstance(properties, dict)
                     or properties.get('task_id') != {'type': 'string', 'enum': [entry['task_id']]}
                     or properties.get('dispatch_id') != {'type': 'string', 'enum': [entry['id']]}):
@@ -250,7 +356,8 @@ class WorkerReceipts(RuntimeService):
         except git.ScopeViolation as error:
             self.reject(key, error, 'scope_rejected')
             raise
-        contract = receipt['schema']
+        # The delivered contract is read back from its immutable file and digest.
+        contract = self.delivered_contract(entry, entry['worker_receipt'])
         try:
             validate_structure(result, contract)
             validate_work_semantics(result)
@@ -302,9 +409,15 @@ class WorkerReceipts(RuntimeService):
             self.context.run['worker_recovery'].pop(task_id)
 
 
-def validate_worker_receipt_links(run, directory):
-    """Read-only structural check for execution and guarded historical cleanup."""
+def validate_worker_receipt_links(run, directory, shape=None):
+    """Read-only structural check for input preparation and guarded historical cleanup.
+
+    Without an explicit shape the ledger's version selects it: schema 14 and 15
+    use their embedded inputs, schema 16 the referenced files. Old ledgers are
+    checked in their own shape; no default is filled in.
+    """
     from types import SimpleNamespace
     if not isinstance(run.get('worker_receipts'), dict):
         raise HarnessError('missing mandatory worker receipts')
-    WorkerReceipts(SimpleNamespace(run=run, directory=Path(directory))).validate_links()
+    WorkerReceipts(SimpleNamespace(run=run, directory=Path(directory))).validate_links(
+        receipt_shape(run) if shape is None else shape)

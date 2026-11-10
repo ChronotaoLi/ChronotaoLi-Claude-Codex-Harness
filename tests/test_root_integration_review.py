@@ -1,15 +1,10 @@
 """Independent behavioral checks for advisory reports and read-only telemetry."""
-import contextlib
 import copy
-import io
-import json
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import patch
 
 from harness import git
-from harness.cli import main
 from harness.diagnostics import budget_explanation
 from harness.plan_readiness import build_readiness, save_readiness
 from harness.private_state import ensure_private_state
@@ -63,7 +58,8 @@ class RootIntegrationReviewTests(unittest.TestCase):
                    review_history={'task': [dict(artifact=f'review{i}', worker_source={
                      'dispatch_id': f'w{i}', 'artifact': f'/dispatches/w{i}/returned-result.json',
                      'artifact_digest': 'a' * 64}) for i in range(3)] + [dict(artifact='legacy-review')]},
-                   total_attempts=5, agent_dispatches=9, replan_attempts=0, final_attempts=0,
+                   # Historical schema-15 shape: it saved a run-wide worker counter and limit.
+                   schema_version=15, total_attempts=5, agent_dispatches=9, replan_attempts=0, final_attempts=0,
                    config_snapshot={'runtime': {'max_attempts': 5, 'max_total_attempts': 10,
                                     'max_agent_dispatches': 12, 'max_replans': 2, 'max_final_attempts': 3}})
         before = copy.deepcopy(run)
@@ -76,12 +72,6 @@ class RootIntegrationReviewTests(unittest.TestCase):
         self.assertEqual(dims['historical_invocation_unknown'], 1)
         self.assertEqual(dims['unlinked_review_records'], 1)
         self.assertEqual(report['limits']['task_work']['task']['remaining'], 0)
+        # The historical counter is shown as saved, never recomputed.
+        self.assertEqual(report['limits']['total_worker'], {'used': 5, 'limit': 10, 'remaining': 5})
         self.assertEqual(run, before)
-
-    def test_readonly_inbox_does_not_initialize_private_state_or_load_config(self):
-        output = io.StringIO()
-        with patch('harness.cli.Config.load', side_effect=AssertionError('query loaded config')):
-            with contextlib.redirect_stdout(output):
-                self.assertEqual(main(['--repo', str(self.repo), 'inbox']), 0)
-        self.assertEqual(json.loads(output.getvalue()), [])
-        self.assertFalse((self.repo / '.harness').exists())

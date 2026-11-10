@@ -33,8 +33,23 @@ def _config(context):
     return getattr(context.config, 'data', context.config)
 
 
+def _identity(category, record):
+    """Content identity of a complete artifact without its own ID (algorithm unchanged)."""
+    return category + '_' + snapshot_digest(record)
+
+
+def _projection(artifact):
+    """Ledger projection of a complete artifact: everything except the whole snapshot.
+
+    The row keeps snapshot_digest; artifact and artifact_digest reference the file
+    that alone holds the snapshot.
+    """
+    return {key: deepcopy(value) for key, value in artifact.items() if key != 'snapshot'}
+
+
 def _write(context, category, record):
-    ident = category + '_' + snapshot_digest(record)
+    """Publish the complete immutable artifact, then return its ledger projection."""
+    ident = _identity(category, record)
     value = {**deepcopy(record), 'id': ident}
     path = Path(context.directory) / category / (ident + '.json')
     if any(p.is_symlink() for p in (path, *path.parents)):
@@ -44,7 +59,28 @@ def _write(context, category, record):
         write_json(path, value)
     if path.read_bytes() != raw:
         raise HarnessError('immutable evidence artifact conflict')
-    return {**value, 'artifact': str(path), 'artifact_digest': hashlib.sha256(raw).hexdigest()}
+    return {**_projection(value), 'artifact': str(path), 'artifact_digest': hashlib.sha256(raw).hexdigest()}
+
+
+def _complete(context, category, row):
+    """Validate a ledger projection together with its referenced complete artifact."""
+    if not isinstance(row, dict) or not isinstance(row.get('id'), str):
+        raise HarnessError('invalid evidence identity')
+    suffix = row['id'].removeprefix(category + '_')
+    if row['id'] != category + '_' + suffix or len(suffix) != 64 or any(c not in '0123456789abcdef' for c in suffix):
+        raise HarnessError('invalid evidence identity')
+    path = Path(context.directory) / category / (row['id'] + '.json')
+    if row.get('artifact') != str(path) or not row.get('artifact_digest') or any(p.is_symlink() for p in (path, *path.parents)):
+        raise HarnessError('invalid evidence reference')
+    record, _ = read_bound_result(row, category)
+    projection = {k: v for k, v in row.items() if k not in ('artifact', 'artifact_digest')}
+    if (not isinstance(record, dict) or 'snapshot' in projection or 'snapshot' not in record
+            or _projection(record) != projection
+            or row['id'] != _identity(category, {k: v for k, v in record.items() if k != 'id'})):
+        raise HarnessError('evidence artifact disagrees with ledger')
+    if snapshot_digest(record['snapshot']) != record.get('snapshot_digest'):
+        raise HarnessError('evidence candidate digest invalid')
+    return record
 
 
 def _source(context, task_id, source):
@@ -73,24 +109,13 @@ def _records(context, category, key):
     for sequence, row in enumerate(records, 1):
         if not isinstance(row, dict) or not isinstance(row.get('id'), str) or row['id'] in seen:
             raise HarnessError('invalid evidence identity')
-        suffix = row['id'].removeprefix(category + '_')
-        if row['id'] != category + '_' + suffix or len(suffix) != 64 or any(c not in '0123456789abcdef' for c in suffix):
-            raise HarnessError('invalid evidence identity')
+        _complete(context, category, row)
         seen.add(row['id'])
-        path = Path(context.directory) / category / (row['id'] + '.json')
-        if row.get('artifact') != str(path) or not row.get('artifact_digest') or any(p.is_symlink() for p in (path, *path.parents)):
-            raise HarnessError('invalid evidence reference')
-        record, _ = read_bound_result(row, category)
-        expected = {k: v for k, v in row.items() if k not in ('artifact', 'artifact_digest')}
-        content = {k: v for k, v in expected.items() if k != 'id'}
-        if (record != expected or row['id'] != category + '_' + snapshot_digest(content)
-                or row.get('run_id') != context.run['id'] or row.get('sequence') != sequence):
+        if row.get('run_id') != context.run['id'] or row.get('sequence') != sequence:
             raise HarnessError('evidence artifact disagrees with ledger')
         if row.get('task_id') not in {t['id'] for t in context.run['tasks']}:
             raise HarnessError('evidence target task unknown')
         result = _source(context, row['task_id'], row['source'])
-        if snapshot_digest(row['snapshot']) != row.get('snapshot_digest'):
-            raise HarnessError('evidence candidate digest invalid')
         if category == 'execution-guidance':
             value = row.get('input')
             if (not isinstance(value, dict) or set(value) != {'task_id', 'source_dispatch_id', 'source_snapshot_digest', 'summary'}
@@ -119,7 +144,7 @@ def record_continuation(context, task_id, result, worker_source, snapshot, *, sa
         if old['source'] == worker_source:
             if any(row['continuation_id'] == old['id'] for row in rejections):
                 raise HarnessError('rejected continuation source cannot be replayed')
-            if old['snapshot'] != snapshot:
+            if old['snapshot_digest'] != snapshot_digest(snapshot):
                 raise HarnessError('continuation candidate changed')
             return old
     if context.run.get('pending_continuation'):
@@ -148,7 +173,7 @@ def continuation_gate(context, current_snapshot=None):
     if any(r['continuation_id'] == pending for r in rejections):
         raise HarnessError('rejected continuation cannot become pending again')
     if (context.run.get('current_task') != row['task_id'] or row['task_id'] in context.run['accepted']
-            or row['snapshot'] != (current_snapshot if current_snapshot is not None else _snapshot(context))):
+            or row['snapshot_digest'] != snapshot_digest(current_snapshot if current_snapshot is not None else _snapshot(context))):
         raise HarnessError('pending continuation candidate or task changed')
     source_index = next(i for i, d in enumerate(context.run['dispatches']) if d['id'] == row['source']['dispatch_id'])
     if any(d.get('invoked', True) for d in context.run['dispatches'][source_index + 1:]):
@@ -225,8 +250,9 @@ def _rejections(context, history=None):
         original = originals.get(row.get('continuation_id'))
         value = row.get('input')
         directive = row.get('directive')
+        # Both complete artifacts were checked against their snapshot digests.
         if (original is None or original['id'] in seen
-                or any(row.get(key) != original[key] for key in ('task_id', 'source', 'snapshot', 'snapshot_digest'))
+                or any(row.get(key) != original[key] for key in ('task_id', 'source', 'snapshot_digest'))
                 or not isinstance(value, dict)
                 or set(value) != {'continuation_id', 'task_id', 'source_dispatch_id', 'source_snapshot_digest', 'reason'}
                 or value.get('continuation_id') != original['id'] or value.get('task_id') != row['task_id']
@@ -279,7 +305,7 @@ def validate_continuation_rejection(context, current_snapshot=None, worker_task=
     _, active = _rejections(context)
     if active:
         snapshot = current_snapshot if current_snapshot is not None else _snapshot(context)
-        if active['snapshot'] != snapshot:
+        if active['snapshot_digest'] != snapshot_digest(snapshot):
             raise HarnessError('continuation revision candidate changed')
         if worker_task is not None and worker_task != active['task_id']:
             raise HarnessError('continuation revision requires its named worker')
@@ -309,9 +335,11 @@ def record_continuation_rejection(context, path, current_snapshot=None):
         raise HarnessError('continuation rejection must bind the current request and candidate')
     # Check identity, source, candidate and dispatch order, without granting its requirements.
     continuation_gate(context, current_snapshot)
+    # The complete rejection artifact keeps the original's whole snapshot.
+    original = _complete(context, 'continuations', row)
     record = dict(run_id=context.run['id'], sequence=len(records) + 1,
                   continuation_id=pending, input=value,
-                  **{key: deepcopy(row[key]) for key in ('task_id', 'source', 'snapshot', 'snapshot_digest')})
+                  **{key: deepcopy(original[key]) for key in ('task_id', 'source', 'snapshot', 'snapshot_digest')})
     # Freeze the actual instruction with the evidence. Recovery must not depend
     # on the current runtime's prompt wording when the instruction was issued.
     record['directive'] = {'selected_task': row['task_id'], 'action': 'implement',
@@ -384,7 +412,7 @@ def packet(context, task_id=None):
         raise HarnessError('pending continuation pointer invalid')
     relevant = lambda row: task_id is None or row['task_id'] == task_id
     def reference(row):
-        return {k: deepcopy(v) for k, v in row.items() if k not in ('snapshot', 'directive')}
+        return {k: deepcopy(v) for k, v in row.items() if k != 'directive'}
     relevant_guidance = [reference(r) for r in guidance if relevant(r)]
     resolutions = {r['continuation_id']: {'status': 'rejected', 'rejection_id': r['id']} for r in rejections}
     return {'continuation_history': [{**reference(r), **({'resolution': resolutions[r['id']]} if r['id'] in resolutions else {})}

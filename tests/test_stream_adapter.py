@@ -45,7 +45,7 @@ class StreamAdapterTests(RepoCase):
                 with self.assertRaises(HarnessError):
                     engine.start('Implement greet', read_json(ROOT / 'examples/plan.json'))
                 self.assertEqual(engine.run['accepted'], {})
-                self.assertEqual(engine.run['total_attempts'], 1)
+                self.assertEqual(sum(engine.run['attempts'].values()), 1)
                 self.assertEqual(len(backend.calls), 1)
                 worker = engine.run['dispatches'][-1]
                 job = engine.directory / 'dispatches' / worker['id']

@@ -218,12 +218,15 @@ class CLIBackend:
         self.config, self.state = config, state
         self.allow_stream_fixture = allow_stream_fixture
 
-    def command(self, role, model, cwd, job, schema, run_path, *, parent_deadline=None):
+    def command(self, role, model, cwd, job, schema, run_path, *, parent_deadline=None, delete_scope=None):
         if role == "worker" and model["cli"] == "codex":
             raise HarnessError("当前 Codex 适配器仅支持只读角色，不能配置为 worker")
         claude, codex = mcp_configs(self.config, self.state, role, run_path)
         if role == "worker":
-            manifest = create_manifest(self.config, cwd, job.resolve(), run_path, parent_deadline=parent_deadline if parent_deadline is not None else getattr(self, "_parent_deadline", None))
+            # Run dispatches take delete_path's task scope from the ledger; only a
+            # ledger-less probe passes an explicit delete_scope.
+            manifest = create_manifest(self.config, cwd, job.resolve(), run_path, parent_deadline=parent_deadline if parent_deadline is not None else getattr(self, "_parent_deadline", None),
+                                       delete_scope=delete_scope)
             claude["mcpServers"]["harness_commands"] = {
                 "type": "stdio", "command": sys.executable,
                 "timeout": int(self.config.data["runtime"]["verify_timeout_seconds"] * 1000) + 10000,
@@ -277,7 +280,15 @@ class CLIBackend:
     def invoke(self, *, role, model, cwd, job, schema, prompt, run_path, on_start, task=None, kind=None, on_outcome=None):
         parent_deadline = time.monotonic() + self.config.data["runtime"]["agent_timeout_seconds"]
         mode = self.config.data["runtime"].get("claude_output_mode", "legacy_json")
-        write_json(job / "schema.json", schema)
+        contract = job / "schema.json"
+        if role == "worker":
+            # The runtime published this immutable contract before charging the
+            # invocation. Only use it unchanged; never write or replace it here.
+            if (contract.is_symlink() or not contract.is_file()
+                    or contract.read_bytes() != (dump(schema) + "\n").encode("utf-8")):
+                raise HarnessError(f"worker 契约文件缺失或与本次调用不符；保留现场：{contract}")
+        else:
+            write_json(contract, schema)
         (job / "prompt.txt").write_text(prompt, encoding="utf-8")
         self._parent_deadline = parent_deadline
         try:
@@ -436,7 +447,8 @@ class DemoBackend:
         elif kind == "replan":
             result = {"action": "stop", "reason": "Demo cannot replan a failed task automatically", "new_tasks": [], "updates": []}
         else:
-            result = {"selected_task": task["id"], "instruction": "Complete this one task and satisfy its acceptance criteria."}
+            result = {"selected_task": task["id"], "action": "implement",
+                      "instruction": "Complete this one task and satisfy its acceptance criteria."}
         value = {**ids, **result}
         write_json(job / "response.json", value)
         (job / "prompt.txt").write_text(prompt, encoding="utf-8")

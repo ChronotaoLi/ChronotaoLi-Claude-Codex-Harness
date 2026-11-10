@@ -76,7 +76,7 @@ class CommanderReceiptTests(RepoCase):
                 resumed.resume(saved["id"])
             self.assertEqual(backend.calls, calls)
             self.assertEqual(resumed.run["replan_attempts"], 1)
-            self.assertEqual(resumed.run["total_attempts"], 1)
+            self.assertEqual(sum(resumed.run["attempts"].values()), 1)
         self.assertEqual(resumed.run["commander_receipts"], {})
 
     def test_plan_post_agent_recovery_keeps_original_result_and_separate_logs(self):
@@ -245,7 +245,7 @@ class CommanderReceiptTests(RepoCase):
             resumed.resume(engine.run["id"])
         self.assertEqual([c["kind"] for c in backend.calls], ["implement", "replan"])
         self.assertEqual(resumed.run["replan_stopped"]["trigger"], trigger)
-        self.assertEqual(resumed.run["total_attempts"], 1)
+        self.assertEqual(sum(resumed.run["attempts"].values()), 1)
 
     def test_semantically_invalid_worker_is_not_routed_as_task_blocker(self):
         def invalid(backend, kwargs, packet, result):

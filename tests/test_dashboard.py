@@ -381,6 +381,11 @@ class ReadOnlyTests(DashboardCase):
 
     def test_observation_never_invokes_backend_or_processes_and_leaves_lock_free(self):
         run_id, run_dir = self.demo_run()
+        # Only handoff.json is written now; a run directory from an earlier
+        # version may still hold handoff.md, which stays viewable.
+        self.assertTrue((run_dir / "handoff.json").is_file())
+        self.assertFalse((run_dir / "handoff.md").exists())
+        (run_dir / "handoff.md").write_text("# Run handoff\n\nhistorical\n", encoding="utf-8")
         lock_path = run_dir / "run.lock"
         lock_before = os.stat(lock_path)
         with contextlib.ExitStack() as stack:
@@ -389,9 +394,12 @@ class ReadOnlyTests(DashboardCase):
             doubles["subprocess.Popen"] = stack.enter_context(patch("subprocess.Popen"))
             server = self.start_server()
             for path in ("/api/runs", f"/api/runs/{run_id}", f"/api/runs/{run_id}/events", f"/api/runs/{run_id}/files",
-                         f"/api/runs/{run_id}/files/state.json", f"/api/runs/{run_id}/files/handoff.md"):
-                status, _, _ = self.request(server, path)
+                         f"/api/runs/{run_id}/files/state.json", f"/api/runs/{run_id}/files/handoff.json",
+                         f"/api/runs/{run_id}/files/handoff.md"):
+                status, _, body = self.request(server, path)
                 self.assertEqual(status, 200, path)
+                if path.endswith("handoff.md"):
+                    self.assertIn(b"historical", body)
             for site, double in doubles.items():
                 self.assertEqual(double.call_count, 0, site)
             lock_after = os.stat(lock_path)

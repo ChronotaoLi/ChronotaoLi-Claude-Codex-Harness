@@ -15,7 +15,7 @@ class RetryStopDecisionTests(RepoCase):
     @staticmethod
     def budgets(state):
         return {key: copy.deepcopy(state[key]) for key in
-                ('attempts', 'total_attempts', 'agent_dispatches', 'replan_attempts', 'final_attempts')}
+                ('attempts', 'agent_dispatches', 'replan_attempts', 'final_attempts')}
 
     def answer(self, request, decision='continue'):
         path = self.repo / 'choice.json'

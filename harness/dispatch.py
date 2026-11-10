@@ -36,7 +36,8 @@ class Dispatcher(RuntimeService):
                     self.context.save()
                 return result
             except RepairableFormatError:
-                packet = deepcopy(self.context.run["worker_receipts"][key]["packet"])
+                # Read back the referenced immutable input and verify its digest.
+                packet = self.services.worker_receipts.original_packet(key)
         packet = self.services.packets.runtime_packet(packet, role=role, kind=kind, task_id=task_id)
         packet = self.services.recovery.invalid_repair_packet(key, packet)
         previous_review = None
@@ -167,7 +168,7 @@ class Dispatcher(RuntimeService):
                     pending.pop(key, None)
                     if role == "worker":
                         self.services.worker_receipts.reject(key, error, "format_exhausted")
-                        raise HarnessError(f"{error}；格式修复额度已用，resume 将执行新的普通 worker 尝试并消耗任务、总尝试及派发预算") from error
+                        raise HarnessError(f"{error}；格式修复额度已用，resume 将执行新的普通 worker 尝试并消耗任务及派发预算") from error
                     self.context.save()
                     raise HarnessError(str(error) + self.services.recovery.format_repair_guidance(key, previous_review or returned)) from error
                 # Keep a returned invalid correction attached until the terminal
@@ -175,8 +176,6 @@ class Dispatcher(RuntimeService):
                 if role == "worker":
                     if self.services.budgets.task_budget_used(task_id) >= self.context.config.data["runtime"]["max_attempts"]:
                         raise HarnessError(f"{task_id} 已达尝试次数上限；格式修复也计入预算") from error
-                    if self.context.run["total_attempts"] >= self.context.config.data["runtime"]["max_total_attempts"]:
-                        raise HarnessError("已达 run 总尝试次数上限；格式修复也计入预算") from error
                 correction = {"error": str(error), "previous_dispatch": previous["id"],
                               "artifact": str(self.context.directory / "dispatches" / previous["id"]),
                               "instruction": "Correct the reported output format using the current task and files. Recheck the evidence. Return only this dispatch's IDs; do not relax acceptance or discard blocking findings."}
@@ -192,7 +191,7 @@ class Dispatcher(RuntimeService):
                                             ("artifact", "artifact_digest", "dispatch_id", "snapshot_digest")}
                     correction["instruction"] = (
                         "Correct only the reported text format using this dispatch's IDs. Read source.artifact. "
-                        "Preserve the original selected_task and action (omitted action means implement), or action, new_tasks and updates exactly. "
+                        "Preserve the original selected_task and action, or action, new_tasks and updates exactly. "
                         "Do not change scope, acceptance or the selected revision operations.")
                 packet = {**packet, "format_correction": correction}
                 pending[key] = {"correction": correction,
@@ -332,10 +331,10 @@ class Dispatcher(RuntimeService):
                 attempts = self.context.run["attempts"].get(task_id, 0)
                 if self.services.budgets.task_budget_used(task_id) >= self.context.config.data["runtime"]["max_attempts"]:
                     raise HarnessError(f"{task_id} 已达尝试次数上限；格式修复也计入预算")
-                if self.context.run["total_attempts"] >= self.context.config.data["runtime"]["max_total_attempts"]:
-                    raise HarnessError("已达 run 总尝试次数上限；格式修复也计入预算")
+                # Publish and verify the immutable packet and contract before any
+                # budget, receipt or invoked mutation; a failed write charges nothing.
+                inputs = self.services.worker_receipts.publish_inputs(entry, contract, required["packet"])
                 self.context.run["attempts"][task_id] = attempts + 1
-                self.context.run["total_attempts"] += 1
                 # The saved selection belongs to this worker attempt. Retrying
                 # local preparation keeps it; starting a process consumes it.
                 self.context.run.pop("pending_directive", None)
@@ -350,7 +349,7 @@ class Dispatcher(RuntimeService):
                 if key in self.context.run["pending_format_corrections"]:
                     self.context.run["pending_format_corrections"][key]["dispatch_id"] = dispatch_id
             if role == "worker":
-                self.services.worker_receipts.intent(entry, contract, required["packet"])
+                self.services.worker_receipts.intent(entry, inputs)
             if role == "reviewer":
                 # Persist the identity and expected path before calling the model:
                 # a crash immediately after the atomic result write must not reroll.

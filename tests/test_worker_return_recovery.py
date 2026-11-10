@@ -152,7 +152,7 @@ import json, os, signal, sys
 from pathlib import Path
 from harness.adapters import CLIBackend, DemoBackend
 from harness.config import Config
-from harness.engine import Engine
+from harness.runtime import Runtime
 from harness.util import HarnessError, read_json
 import harness.stream_capture as capture
 from harness.process_runtime import ProcessSupervisor
@@ -195,7 +195,7 @@ class Stub(DemoBackend):
             if boundary == 'no_output':
                 os.kill(os.getpid(), signal.SIGKILL)
             raise
-Engine(config, repo, backend=Stub()).start('Implement greet', read_json(root / 'examples/plan.json'))
+Runtime(config, repo, backend=Stub()).start('Implement greet', read_json(root / 'examples/plan.json'))
 '''
         process = subprocess.run([sys.executable, '-c', script, str(ROOT), str(self.repo), mode, boundary],
                                  env={**os.environ, 'PYTHONPATH': str(ROOT)}, capture_output=True, timeout=20)

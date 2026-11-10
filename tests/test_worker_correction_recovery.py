@@ -22,7 +22,7 @@ class WorkerCorrectionRecoveryTests(RepoCase):
 
     def assert_accounting(self, backend, state, attempts):
         self.assertEqual(state["attempts"], {"greet": attempts})
-        self.assertEqual(state["total_attempts"], attempts)
+        self.assertEqual(sum(state["attempts"].values()), attempts)
         self.assertEqual(state["agent_dispatches"], len(backend.requests))
         self.assertEqual(state["format_repairs"], {self.correction_key: 1})
         requests = self.worker_requests(backend)
@@ -32,7 +32,7 @@ class WorkerCorrectionRecoveryTests(RepoCase):
         self.assertTrue(all(request["model"] == self.config.role("worker") for request in requests))
 
     def test_exhausted_correction_resumes_as_ordinary_attempts_with_latest_failure(self):
-        self.config.data["runtime"].update(max_attempts=4, max_total_attempts=4)
+        self.config.data["runtime"].update(max_attempts=4)
 
         def malformed(backend, kwargs, packet, result):
             if kwargs["role"] == "worker":

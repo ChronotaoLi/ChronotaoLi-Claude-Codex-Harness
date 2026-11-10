@@ -157,7 +157,7 @@ class MCPPreflightLifecycleTests(RepoCase):
         self.assertIn("servers.worker_service.url", str(raised.exception))
         invoke.assert_not_called()
         saved = read_json(engine.directory / "state.json")
-        self.assertEqual(saved["total_attempts"], 0)
+        self.assertEqual(sum(saved["attempts"].values()), 0)
         self.assertEqual(saved["attempts"], {})
         self.assertEqual(saved["agent_dispatches"], 0)
         self.assertEqual(len(saved["dispatches"]), 1)

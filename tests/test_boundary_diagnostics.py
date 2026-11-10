@@ -11,7 +11,7 @@ from unittest.mock import patch
 from harness import git, mcp_server
 from harness.adapters import DemoBackend
 from harness.config import Config
-from harness.engine import Engine
+from harness.runtime import Runtime
 from harness.util import HarnessError
 
 
@@ -190,7 +190,7 @@ class BoundaryDiagnosticsTests(unittest.TestCase):
                     (hidden / "output").write_text("hidden\n", encoding="utf-8")
                 return result
 
-        engine = Engine(self.config, self.repo, backend=HiddenStateBackend())
+        engine = Runtime(self.config, self.repo, backend=HiddenStateBackend())
         with self.assertRaisesRegex(HarnessError, "受保护"):
             engine.start("Implement greet", self.plan())
         self.assertEqual(engine.run["accepted"], {})
@@ -205,7 +205,7 @@ class BoundaryDiagnosticsTests(unittest.TestCase):
         self.assertNotEqual(engine.run["status"], "completed")
         self.assertIn("reviewer:final_review:final", engine.run["review_receipts"])
         dispatch_count = len(engine.run["dispatches"])
-        resumed = Engine(self.config, self.repo, backend=DemoBackend())
+        resumed = Runtime(self.config, self.repo, backend=DemoBackend())
         with self.assertRaisesRegex(HarnessError, "受保护"):
             resumed.resume(engine.run["id"])
         self.assertEqual(len(resumed.run["dispatches"]), dispatch_count)
@@ -219,10 +219,10 @@ class BoundaryDiagnosticsTests(unittest.TestCase):
                     (kwargs["cwd"] / ".harness").mkdir()
                 return result
 
-        self.assert_final_private_state_blocked(Engine(self.config, self.repo, backend=HiddenFinalBackend()))
+        self.assert_final_private_state_blocked(Runtime(self.config, self.repo, backend=HiddenFinalBackend()))
 
     def test_final_review_hook_private_state_cannot_complete_or_reroll(self):
-        engine = Engine(self.config, self.repo, backend=DemoBackend())
+        engine = Runtime(self.config, self.repo, backend=DemoBackend())
         original = engine.hooks.emit
 
         def emit(event, payload, logs):
@@ -244,7 +244,7 @@ class BoundaryDiagnosticsTests(unittest.TestCase):
         # clean, uninitialized submodule and reaches the start preflight gate.
         (self.repo / "vendor/lib").mkdir(parents=True)
         self.assertTrue(git.clean(self.repo))
-        engine = Engine(self.config, self.repo, backend=DemoBackend())
+        engine = Runtime(self.config, self.repo, backend=DemoBackend())
         with self.assertRaisesRegex(HarnessError, "submodule.*vendor/lib"):
             engine.start("Implement greet", self.plan())
         self.assertIsNone(engine.run)
@@ -256,7 +256,7 @@ class BoundaryDiagnosticsTests(unittest.TestCase):
         (self.repo / ".gitmodules").write_text("# Historical configuration only\n", encoding="utf-8")
         git.git(self.repo, "add", ".gitmodules")
         self.commit("retain old submodule configuration")
-        engine = Engine(self.config, self.repo, backend=DemoBackend())
+        engine = Runtime(self.config, self.repo, backend=DemoBackend())
         result = engine.start("Implement greet", self.plan(), pause_after_plan=True)
         self.assertEqual(result["status"], "awaiting_approval")
         self.assertEqual(result["dispatches"], [])

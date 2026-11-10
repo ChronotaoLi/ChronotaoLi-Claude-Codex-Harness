@@ -54,7 +54,7 @@ class ReplanFormatRecoveryTests(RepoCase):
         self.assertEqual(len(workers), 2)
         self.assertEqual([d["invoked"] for d in workers], [True, failure == "provider"])
         self.assertFalse((engine.directory / "dispatches" / workers[-1]["id"] / "returned-result.json").exists())
-        self.assertEqual(state["total_attempts"], 2 if failure == "provider" else 1)
+        self.assertEqual(sum(state["attempts"].values()), 2 if failure == "provider" else 1)
         self.assertEqual(state["format_repairs"], {self.key: 1} if failure == "provider" else {})
         source = Path(correction["correction"]["artifact"]) / "returned-result.json"
         self.assertEqual(read_json(source)["dispatch_id"], workers[0]["id"])
@@ -80,7 +80,7 @@ class ReplanFormatRecoveryTests(RepoCase):
         return path
 
     def assert_preserved(self, before, after, *, replan_delta=0, dispatch_delta=0):
-        for field in ("attempts", "total_attempts", "format_repairs", "accepted", "tasks", "original_tasks",
+        for field in ("attempts", "format_repairs", "accepted", "tasks", "original_tasks",
                       "review_history", "final_attempts", "final_history", "worker_recovery"):
             self.assertEqual(after.get(field), before.get(field), field)
         self.assertEqual(after["replan_attempts"], before["replan_attempts"] + replan_delta)

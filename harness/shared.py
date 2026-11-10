@@ -158,7 +158,7 @@ class HookError(HarnessError):
 
 class Hooks:
     EVENTS = {"pre_agent", "post_agent", "pre_verify", "post_verify", "pre_accept", "post_accept", "on_error",
-              "context_prepared", "context_compacted"}
+              "context_prepared"}
 
     def __init__(self, config):
         self.config = config
@@ -172,8 +172,11 @@ class Hooks:
     def validate(self):
         if not isinstance(self.spec, dict):
             raise HarnessError("hooks.json 必须为事件对象")
-        if set(self.spec) - self.EVENTS:
-            raise HarnessError("hooks.json 含未知事件")
+        unknown = sorted(str(event) for event in set(self.spec) - self.EVENTS)
+        if unknown:
+            # The removed alias gets a pointer to its replacement in the error text only.
+            hint = "；context_compacted 已删除，请改用 context_prepared" if "context_compacted" in unknown else ""
+            raise HarnessError("hooks.json 含未知事件：" + "、".join(name[:80] for name in unknown[:10]) + hint)
         for event, hooks in self.spec.items():
             if not isinstance(hooks, list):
                 raise HarnessError(f"hook {event} 必须为数组")
@@ -189,15 +192,11 @@ class Hooks:
                     valid_timeout = False
                 if not valid_timeout:
                     raise HarnessError(f"{field}.timeout_seconds 必须为正有限数值")
-        if self.spec.get("context_prepared") and self.spec.get("context_compacted"):
-            raise HarnessError("context_prepared 与旧名 context_compacted 只能配置一个，避免重复执行")
 
     def emit(self, event, payload, logs: Path):
         # Validate the entire configuration before any script, including hooks
         # on later events, can run. Keep this guard for in-process overrides.
         self.validate()
-        if event == "context_prepared" and not self.spec.get(event) and self.spec.get("context_compacted"):
-            event = "context_compacted"
         for i, hook in enumerate(self.spec.get(event, [])):
             argv = hook["argv"]
             log = logs / f"hook-{event}-{i}"

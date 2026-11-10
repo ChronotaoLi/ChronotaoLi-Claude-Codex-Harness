@@ -1239,7 +1239,17 @@ APP_JS = r""""use strict";
     var attempts = summary.budgets && summary.budgets.work_attempts ? summary.budgets.work_attempts : b.attempts;
     panel.appendChild(el("h3", null, "预算"));
     var meters = el("div", "grid-cards");
-    meters.appendChild(budgetMeter("总尝试", b.total_attempts, limits.max_total_attempts));
+    // Schema 16 has no run-wide worker limit: show the sum of task attempts. The
+    // saved total_attempts / max_total_attempts pair exists only in older ledgers.
+    if (typeof b.total_attempts === "number") {
+      meters.appendChild(budgetMeter("总尝试（历史台账）", b.total_attempts, limits.max_total_attempts));
+    } else {
+      var total = el("div", "mini");
+      total.appendChild(el("h3", null, "worker 尝试总数"));
+      total.appendChild(el("div", "metric-value", show(b.attempts_total)));
+      total.appendChild(el("p", "metric-note", "各任务 attempts 之和；全 run 上限由模型派发数约束"));
+      meters.appendChild(total);
+    }
     meters.appendChild(budgetMeter("模型派发", b.agent_dispatches, limits.max_agent_dispatches));
     meters.appendChild(budgetMeter("再规划", b.replan_attempts, limits.max_replans));
     meters.appendChild(budgetMeter("整体验收", b.final_attempts, limits.max_final_attempts));
@@ -1253,7 +1263,10 @@ APP_JS = r""""use strict";
     panel.appendChild(kv([
       ["任务尝试（work_attempts）", attempts && Object.keys(attempts).length ? Object.keys(attempts).map(function (key) {
         return key + "=" + attempts[key] + "/" + show(limits.max_attempts); }).join("，") : UNAVAILABLE],
-      ["计数策略", b.attempt_budget_policy], ["单次调用超时（秒）", limits.agent_timeout_seconds]
+      ["计数策略", typeof b.attempt_budget_policy === "string" ? b.attempt_budget_policy + "（历史台账保存）"
+        : typeof data.schema_version === "number" && data.schema_version >= 16 ? "work（台账 16 固定）"
+        : b.attempt_budget_policy],
+      ["单次调用超时（秒）", limits.agent_timeout_seconds]
     ]));
 
     var cost = data.cost;

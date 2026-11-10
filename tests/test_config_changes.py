@@ -33,10 +33,10 @@ class ConfigChangesTests(unittest.TestCase):
     def test_new_configuration_gets_defaults_but_incomplete_saved_snapshot_is_rejected(self):
         del self.data["permissions"]
         del self.data["memory"]
-        del self.data["runtime"]["max_total_attempts"]
+        del self.data["runtime"]["max_final_attempts"]
         del self.data["runtime"]["max_replans"]
         config = self.load()
-        self.assertEqual(config.data["runtime"]["max_total_attempts"], 60)
+        self.assertEqual(config.data["runtime"]["max_final_attempts"], 3)
         self.assertEqual(config.data["runtime"]["max_replans"], 2)
         self.assertEqual(config.data["permissions"]["worker_commands"], [])
         self.assertEqual(config.data["memory"], {"task_ttl_days": 180, "knowledge_ttl_days": 180})
@@ -45,6 +45,41 @@ class ConfigChangesTests(unittest.TestCase):
             config.resume_changes(self.data)
         self.assertEqual(self.data, before)
         self.assertEqual(config.resume_changes(config.data), {})
+
+    def test_removed_run_wide_attempt_limit_is_rejected_with_its_replacements(self):
+        self.data["runtime"]["max_total_attempts"] = 60
+        with self.assertRaises(HarnessError) as raised:
+            self.load()
+        message = str(raised.exception)
+        self.assertIn("未知配置键：runtime.max_total_attempts", message)
+        self.assertIn("请删除 runtime.max_total_attempts", message)
+        self.assertIn("runtime.max_attempts", message)
+        self.assertIn("runtime.max_agent_dispatches", message)
+        # A saved snapshot carrying the key is equally unknown, never silently dropped.
+        current = copy.deepcopy(self.data)
+        del current["runtime"]["max_total_attempts"]
+        config = self.load(current)
+        self.assertNotIn("max_total_attempts", config.data["runtime"])
+        with self.assertRaisesRegex(HarnessError, "未知配置键：runtime.max_total_attempts"):
+            config.resume_changes(self.data)
+
+    def test_cli_startup_reports_the_removed_key_before_any_run(self):
+        import contextlib
+        import io
+        import subprocess
+        from harness.cli import main
+        repo = self.root / "repo"
+        repo.mkdir()
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        self.data["runtime"]["max_total_attempts"] = 60
+        path = self.root / "harness.toml"
+        path.write_text("\n".join(f"{key} = {toml_value(value)}" for key, value in self.data.items()))
+        errors = io.StringIO()
+        with contextlib.redirect_stderr(errors), contextlib.redirect_stdout(io.StringIO()):
+            code = main(["--config", str(path), "--repo", str(repo), "resume", "run_missing"])
+        self.assertEqual(code, 1)
+        self.assertIn("请删除 runtime.max_total_attempts", errors.getvalue())
+        self.assertFalse((repo / ".harness").exists())
 
     def test_rejects_unsupported_codex_worker_before_dispatch(self):
         self.data["roles"]["worker"]["cli"] = "codex"

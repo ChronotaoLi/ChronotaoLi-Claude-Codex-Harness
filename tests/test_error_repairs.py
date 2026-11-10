@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 from harness.adapters import CLIBackend
 from harness.cli import main
-from harness.engine import Engine
+from harness.runtime import Runtime
 from harness.shared import HookError, Hooks
 from harness.util import HarnessError, ProcessTimeout, dump, group_alive, read_json, run_process, write_json
 from test_harness import RepoCase, ROOT
@@ -41,7 +41,7 @@ class ErrorRepairsTests(RepoCase):
 
     def test_missing_cli_blocks_run_instead_of_classifying_it_as_interrupted(self):
         backend = CLIBackend(self.config, self.repo / ".harness")
-        engine = Engine(self.config, self.repo, backend=backend)
+        engine = Runtime(self.config, self.repo, backend=backend)
         with patch.object(backend, "command", return_value=[str(self.repo / "not-installed-cli")]):
             with self.assertRaises(HarnessError):
                 engine.start("Implement greet", read_json(ROOT / "examples" / "plan.json"))

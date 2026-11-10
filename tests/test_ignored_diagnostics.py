@@ -30,7 +30,7 @@ class IgnoredDiagnosticRecoveryTests(RepoCase):
         self.assertTrue(saved["worktree_binding"])
         self.assertFalse((engine.directory / "ignored-baseline.json").exists())
         self.assertEqual(backend.calls, [])
-        self.assertEqual(saved["total_attempts"], 0)
+        self.assertEqual(sum(saved["attempts"].values()), 0)
 
         result = self.engine(backend).resume(saved["id"])
         self.assertEqual(result["status"], "completed")
@@ -39,7 +39,7 @@ class IgnoredDiagnosticRecoveryTests(RepoCase):
         inventory = read_json(Path(result["ignored_diagnostics"]["artifact"]))
         self.assertIn("ignored-helper", inventory["added"])
         self.assertEqual(sum(call["kind"] == "plan" for call in backend.calls), 1)
-        self.assertEqual(result["total_attempts"], 1)
+        self.assertEqual(sum(result["attempts"].values()), 1)
 
     def test_initial_inventory_artifact_write_failure_keeps_durable_baseline(self):
         backend = ScriptedBackend()

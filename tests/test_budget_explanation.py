@@ -12,9 +12,9 @@ class BudgetExplanationTests(unittest.TestCase):
         records = [{'artifact': 'review'+str(i), 'worker_source': {'dispatch_id': 'd'+str(i),
                     'artifact_digest': 'a'*64}} for i in range(3)]
         run = {'id': 'run_a', 'dispatches': workers + [workers[-1]],
-               'review_history': {'x': records + [records[-1]]}, 'total_attempts': 5,
+               'review_history': {'x': records + [records[-1]]}, 'schema_version': 16,
                'agent_dispatches': 8, 'final_attempts': 0, 'replan_attempts': 0,
-               'config_snapshot': {'runtime': {'max_attempts': 5, 'max_total_attempts': 20}}}
+               'config_snapshot': {'runtime': {'max_attempts': 5, 'max_agent_dispatches': 20}}}
         original = copy.deepcopy(run)
         report = budget_explanation(run, {'x': 5})
         dimensions = report['dimensions']
@@ -23,6 +23,9 @@ class BudgetExplanationTests(unittest.TestCase):
         self.assertEqual(dimensions['failed_worker_invocations']['provider_reported'], 2)
         self.assertEqual(dimensions['worker_format_corrections'], 1)
         self.assertEqual(report['limits']['task_work']['x']['remaining'], 0)
+        # Schema 16 has no run-wide worker counter or limit to explain.
+        self.assertNotIn('total_worker', report['limits'])
+        self.assertEqual(report['limits']['agent_dispatches'], {'used': 8, 'limit': 20, 'remaining': 12})
         self.assertEqual(run, original)
 
     def test_unlinked_history_and_legacy_invocation_remain_unknown(self):

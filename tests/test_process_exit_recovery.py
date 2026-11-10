@@ -36,7 +36,7 @@ class ProcessExitRecoveryTests(RepoCase):
                 self.assertEqual(backend.calls, [])
         result = self.engine(backend).resume(run["id"], approve_plan=True, confirm_exited=[entry["id"]])
         self.assertEqual(result["status"], "completed")
-        self.assertEqual(result["total_attempts"], 1)
+        self.assertEqual(sum(result["attempts"].values()), 1)
         self.assertTrue(result["dispatches"][0]["exit_confirmed"])
 
     def test_pre_agent_hook_can_check_exit_gate_before_process_start(self):
@@ -62,7 +62,7 @@ import json, os, subprocess, sys
 from pathlib import Path
 from harness.adapters import CLIBackend, DemoBackend
 from harness.config import Config
-from harness.engine import Engine
+from harness.runtime import Runtime
 from harness.util import read_json
 root, repo, mode, witness = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3], Path(sys.argv[4])
 config = Config.load(root / "harness.toml")
@@ -72,7 +72,7 @@ config.data["verification"]["commands"] = ([command] if mode == "verification" e
 backend = CLIBackend(config, repo / ".harness") if mode == "worker" else DemoBackend()
 if mode == "worker":
     backend.command = lambda *args: command
-engine = Engine(config, repo, backend=backend)
+engine = Runtime(config, repo, backend=backend)
 original_popen = subprocess.Popen
 def die_after_start(argv, *args, **kwargs):
     process = original_popen(argv, *args, **kwargs)

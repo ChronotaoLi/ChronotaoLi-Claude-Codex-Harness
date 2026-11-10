@@ -14,7 +14,7 @@ from unittest.mock import Mock, patch
 from harness.adapters import DemoBackend
 from harness.cli import main
 from harness.config import Config, normalized
-from harness.engine import Engine
+from harness.runtime import Runtime
 from harness.shared import asset_digest
 from harness.util import HarnessError, group_alive, read_json, run_process, write_json
 from test_harness import ROOT, RepoCase
@@ -140,7 +140,7 @@ class ResumeConfigurationIntegrationTests(RepoCase):
         relocated = self.repo / ".harness" / "relocated-installation"
         shutil.copytree(ROOT / "shared", relocated / "shared")
         config = Config(relocated / "harness.toml", copy.deepcopy(self.config.data))
-        result = Engine(config, self.repo, backend=DemoBackend()).resume(engine.run["id"], approve_plan=True)
+        result = Runtime(config, self.repo, backend=DemoBackend()).resume(engine.run["id"], approve_plan=True)
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["asset_digest"], asset_digest(config))
 
@@ -198,7 +198,7 @@ class CLIBoundaryTests(RepoCase):
     def test_explicit_reverification_is_forwarded(self):
         engine = Mock()
         engine.resume.return_value = {"id": "run_test", "status": "completed", "branch": "branch", "worktree": "tree"}
-        code, output, errors = self.invoke(["resume", "run_test", "--reverify"], Engine=Mock(return_value=engine))
+        code, output, errors = self.invoke(["resume", "run_test", "--reverify"], Runtime=Mock(return_value=engine))
         self.assertEqual(code, 0, errors)
         self.assertEqual(json.loads(output)["status"], "completed")
         engine.resume.assert_called_once_with("run_test", approve_plan=False, step=False, reverify=True)
@@ -213,10 +213,10 @@ class CLIBoundaryTests(RepoCase):
                                 kwargs["cwd"], kwargs["job"] / "signal-child", on_start=kwargs["on_start"])
                 return super().invoke(**kwargs)
 
-        engine = Engine(self.config, self.repo, backend=HangupBackend())
+        engine = Runtime(self.config, self.repo, backend=HangupBackend())
         previous = {sig: signal.getsignal(sig) for sig in (signal.SIGTERM, signal.SIGHUP)}
         code, _, errors = self.invoke(["run", "Implement greet", "--plan", str(ROOT / "examples" / "plan.json")],
-                                      Engine=Mock(return_value=engine))
+                                      Runtime=Mock(return_value=engine))
         self.assertEqual(code, 130, errors)
         saved = read_json(engine.directory / "state.json")
         self.assertEqual(saved["status"], "interrupted")

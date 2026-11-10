@@ -22,7 +22,7 @@ class EnvironmentProjectionTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.env = Projection(SimpleNamespace())
         self.env.context.directory = Path(self.temp.name).resolve()
-        self.env.context.run = {'id': 'run', 'schema_version': 15, 'environment_updates': [], 'environment_checks': []}
+        self.env.context.run = {'id': 'run', 'schema_version': 16, 'environment_updates': [], 'environment_checks': []}
 
     def add(self, task, summary, checks=None, passed=True):
         checks = checks or []

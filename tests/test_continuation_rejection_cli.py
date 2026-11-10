@@ -25,7 +25,7 @@ class RejectionCLITests(unittest.TestCase):
         stdout, stderr = io.StringIO(), io.StringIO()
         with patch('harness.cli.Config.load'), patch('harness.cli.git.repository', return_value=self.repo), \
                 patch('harness.operations.probe_cli', return_value={'path': None, 'version': None}), \
-                patch('harness.cli.Engine', return_value=engine), \
+                patch('harness.cli.Runtime', return_value=engine), \
                 contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
             code = _main(['resume', 'run_fixture', *arguments])
         return code, engine, stdout.getvalue(), stderr.getvalue()

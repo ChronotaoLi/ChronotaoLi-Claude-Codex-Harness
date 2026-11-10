@@ -12,7 +12,7 @@ class SnapshotEfficiencyTests(RepoCase):
         with patch("harness.git.snapshot", wraps=git.snapshot) as snapshots:
             result = engine.start("Implement greet", read_json(ROOT / "examples" / "plan.json"))
         self.assertEqual(result["status"], "completed")
-        self.assertEqual(result["total_attempts"], 1)
+        self.assertEqual(sum(result["attempts"].values()), 1)
         self.assertEqual(result["final_attempts"], 1)
         # Durable worker return, replay, hook and publication guards add four
         # net reads; none may reuse a snapshot across those boundaries.

@@ -32,7 +32,7 @@ class DescriptionBackend(ScriptedBackend):
                 entry = next(d for d in state["dispatches"] if d["id"] == kwargs["job"].name)
                 self.case.assertIs(entry["invoked"], True)
                 self.case.assertEqual(entry["retained_candidate_revision"], len(state["plan_history"]) - 1)
-                self.retained_seen.append(state["total_attempts"])
+                self.retained_seen.append(sum(state["attempts"].values()))
             if self.worker_ids and self.prerequisite and kwargs["task"]["id"] == "prepare":
                 self.case.assertFalse((kwargs["cwd"] / "hello.py").exists())
                 self.case.assertFalse((kwargs["cwd"] / "notes.txt").exists())
@@ -128,7 +128,7 @@ class DescriptionReplanTests(RepoCase):
         engine = self.engine(backend)
         result = engine.start("Implement greeting", self.plan())
         self.assertEqual(result["status"], "completed")
-        self.assertEqual(result["total_attempts"], 2)
+        self.assertEqual(sum(result["attempts"].values()), 2)
         self.assertEqual(result["replan_attempts"], 1)
         reviews = result["review_history"]["greet"]
         self.assertEqual([item["review"]["verdict"] for item in reviews], ["request_changes", "approve"])
@@ -161,7 +161,7 @@ class DescriptionReplanTests(RepoCase):
         self.assertEqual(saved["retained_candidate"], saved["plan_history"][-1]["retained_candidate"])
         result = self.engine(backend).resume(engine.run["id"], step=True)
         self.assertEqual(set(result["accepted"]), {"greet"})
-        self.assertEqual(result["total_attempts"], 2)
+        self.assertEqual(sum(result["attempts"].values()), 2)
         self.assertEqual(sum(call["kind"] == "replan" for call in backend.calls), 1)
         self.assert_no_archive(engine)
 
@@ -274,7 +274,7 @@ class DescriptionReplanTests(RepoCase):
             resumed.resume(engine.run["id"])
         after = read_json(engine.directory / "state.json")
         self.assertEqual(after["retained_candidate"], saved["retained_candidate"])
-        for key in ("attempts", "total_attempts"):
+        for key in ("attempts",):
             self.assertEqual(after[key], saved[key])
         self.assertEqual(after["agent_dispatches"], saved["agent_dispatches"] + 1)
         self.assertEqual(backend.calls[-1]["role"], "commander")

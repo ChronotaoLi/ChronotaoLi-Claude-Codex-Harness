@@ -27,7 +27,7 @@ class RejectionEvidenceTests(unittest.TestCase):
         self.context = SimpleNamespace(directory=self.root / 'run',
             run={'id': 'run', 'tasks': [{'id': 'task'}], 'accepted': {}, 'dispatches': [],
                  'current_task': 'task', 'status': 'blocked', 'attempts': {'task': 1},
-                 'total_attempts': 1, 'agent_dispatches': 1, 'rounds': 3},
+                 'agent_dispatches': 1, 'rounds': 3},
             config={'runtime': {'agent_timeout_seconds': 30}, 'permissions': {'worker_commands': []},
                     'verification': {'commands': [['python3', '-m', 'unittest']]}},
             snapshot=lambda: deepcopy(self.candidate), save=lambda: self.saved.append(deepcopy(self.context.run)))
@@ -59,7 +59,7 @@ class RejectionEvidenceTests(unittest.TestCase):
         self.assertIsNone(self.saved[-1]['pending_continuation'])
         self.assertTrue(self.saved[-1]['pending_directive'])
         self.assertEqual(self.context.config, config)
-        for key in ('attempts', 'total_attempts', 'agent_dispatches', 'rounds', 'accepted', 'continuation_history'):
+        for key in ('attempts', 'agent_dispatches', 'rounds', 'accepted', 'continuation_history'):
             self.assertEqual(self.context.run[key], before[key])
         self.assertEqual(self.reject()['id'], rejection['id'])
         self.assertEqual(len(self.context.run['continuation_rejections']), 1)
@@ -222,7 +222,7 @@ class RejectionLifecycleTests(RepoCase):
         self.config.data['permissions']['worker_commands'].append(new_command)
         result = self.engine(backend).resume(engine.run['id'])
         self.assertEqual(result['status'], 'completed')
-        self.assertEqual(result['total_attempts'], 3)
+        self.assertEqual(sum(result['attempts'].values()), 3)
         workers = [d for d in result['dispatches'] if d['role'] == 'worker' and d.get('invoked')]
         self.assertEqual(len({d['id'] for d in workers}), 3)
         self.assertEqual(workers[1]['continuation_rejection_id'], result['continuation_rejections'][0]['id'])
@@ -243,12 +243,12 @@ class RejectionLifecycleTests(RepoCase):
         saved = read_json(engine.directory / 'state.json')
         self.assertIsNone(saved['pending_continuation'])
         self.assertEqual(len(saved['continuation_rejections']), 1)
-        for key in ('attempts', 'total_attempts', 'agent_dispatches'):
+        for key in ('attempts', 'agent_dispatches'):
             self.assertEqual(saved[key], before[key])
         self.assertEqual(len(backend.calls), 1)
         result = self.engine(backend).resume(engine.run['id'])
         self.assertEqual(result['status'], 'completed')
-        self.assertEqual(result['total_attempts'], 2)
+        self.assertEqual(sum(result['attempts'].values()), 2)
         self.assertEqual(self.config.data['runtime']['agent_timeout_seconds'], timeout)
 
     def test_pre_agent_candidate_mutation_blocks_before_invocation_and_guard_stays_active(self):
@@ -262,7 +262,7 @@ class RejectionLifecycleTests(RepoCase):
             resumed.resume(engine.run['id'], reject_continuation=path)
         saved = read_json(engine.directory / 'state.json')
         self.assertEqual(len(backend.calls), 1)
-        for key in ('attempts', 'total_attempts', 'agent_dispatches'):
+        for key in ('attempts', 'agent_dispatches'):
             self.assertEqual(saved[key], engine.run[key])
         self.assertFalse(any(d.get('continuation_rejection_id') and d.get('invoked') for d in saved['dispatches']))
         with self.assertRaises(HarnessError):
@@ -282,11 +282,11 @@ class RejectionLifecycleTests(RepoCase):
             resumed.resume(engine.run['id'], reject_continuation=path)
         saved = read_json(engine.directory / 'state.json')
         self.assertIsNone(saved['pending_continuation'])
-        self.assertEqual(saved['total_attempts'], 1)
+        self.assertEqual(sum(saved['attempts'].values()), 1)
         self.assertEqual(len(backend.calls), 1)
         result = self.engine(backend).resume(engine.run['id'])
         self.assertEqual(result['status'], 'completed')
-        self.assertEqual(result['total_attempts'], 2)
+        self.assertEqual(sum(result['attempts'].values()), 2)
         self.assertFalse(any(c['role'] == 'commander' for c in backend.calls))
 
     def test_rejection_does_not_reset_exhausted_worker_budget(self):
@@ -297,7 +297,7 @@ class RejectionLifecycleTests(RepoCase):
             resumed.resume(engine.run['id'], reject_continuation=path)
         saved = read_json(engine.directory / 'state.json')
         self.assertEqual(saved['attempts']['greet'], 1)
-        self.assertEqual(saved['total_attempts'], 1)
+        self.assertEqual(sum(saved['attempts'].values()), 1)
         self.assertEqual(len(backend.calls), 1)
         self.assertIsNone(saved['pending_continuation'])
         self.assertEqual(len(saved['continuation_rejections']), 1)
@@ -339,7 +339,7 @@ class RejectionLifecycleTests(RepoCase):
         self.assertEqual(result['status'], 'completed')
         self.assertEqual(self.config.data['runtime']['agent_timeout_seconds'], timeout)
         self.assertEqual(result['attempts']['greet'], 2)
-        self.assertEqual(result['total_attempts'], 2)
+        self.assertEqual(sum(result['attempts'].values()), 2)
         self.assertFalse(any(call['role'] == 'commander' for call in backend.calls))
         self.assertEqual([d['task_id'] for d in result['dispatches'] if d['role'] == 'verification'], ['greet', 'final'])
 
@@ -360,7 +360,7 @@ class RejectionLifecycleTests(RepoCase):
             resumed.resume(engine.run['id'], reject_continuation=path)
         saved = read_json(engine.directory / 'state.json')
         self.assertEqual(saved['command_requirements']['missing'], {'greet': [required]})
-        self.assertEqual(saved['total_attempts'], 1)
+        self.assertEqual(sum(saved['attempts'].values()), 1)
         self.assertEqual(saved['agent_dispatches'], engine.run['agent_dispatches'])
         self.assertEqual(len(backend.calls), 1)
         self.assertEqual(status_summary(saved)['continuation']['state'], 'revision_pending')

@@ -97,7 +97,7 @@ def handle(request, memory, skills, run):
             value = read_skill(skills, args["name"])
         elif name == "run_status":
             state = read_json(run) if run else {}
-            value = {k: state.get(k) for k in ("id", "goal", "status", "accepted", "total_attempts", "replan_attempts")}
+            value = {k: state.get(k) for k in ("id", "goal", "status", "accepted", "attempts", "replan_attempts")}
         else:
             raise HarnessError("Unknown tool")
         return {"content": [{"type": "text", "text": json.dumps(value, ensure_ascii=False)}], "isError": False}

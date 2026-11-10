@@ -47,7 +47,7 @@ class DecisionTextRecoveryTests(RepoCase):
                 self.engine(backend).resume(engine.run['id'])
         after = self.saved(engine)
         self.assertEqual(len(backend.calls), calls)
-        for key in ('attempts', 'total_attempts', 'agent_dispatches', 'accepted', 'decision_requests'):
+        for key in ('attempts', 'agent_dispatches', 'accepted', 'decision_requests'):
             self.assertEqual(after[key], before[key])
 
     def test_malformed_operator_questions_wait_for_explicit_answer(self):
@@ -141,7 +141,7 @@ class DecisionTextRecoveryTests(RepoCase):
         self.assertEqual(result['accepted']['greet'], before['accepted']['greet'])
         self.assertEqual(result['attempts'], {'greet': 1, 'later': 1})
         self.assertEqual(Path(source['artifact']).read_bytes(), raw)
-        self.assertEqual(result['schema_version'], 15)
+        self.assertEqual(result['schema_version'], 16)
 
     def test_legacy_operator_registration_failure_recovers_to_explicit_gate(self):
         for blockers in (['Proceed\0?'], ['']):

@@ -43,7 +43,7 @@ class ExplicitOutputRepairTests(RepoCase):
         result = self.engine(backend).resume(engine.run["id"], repair_invalid=source["dispatch_id"])
         self.assertEqual(result["status"], "awaiting_approval")
         self.assertEqual(result["agent_dispatches"], 2)
-        self.assertEqual(result["total_attempts"], 0)
+        self.assertEqual(sum(result["attempts"].values()), 0)
         self.assertEqual(Path(source["artifact"]).read_bytes(), original)
         repair = result["invalid_repairs"]["commander:plan:planning"]
         self.assertEqual(repair["status"], "completed")
@@ -58,7 +58,7 @@ class ExplicitOutputRepairTests(RepoCase):
                 old_checks = [d["id"] for d in engine.run["dispatches"] if d["role"] == "verification"]
                 result = self.engine(backend).resume(engine.run["id"], repair_invalid=source["dispatch_id"])
                 self.assertEqual(result["status"], "completed")
-                self.assertEqual(result["total_attempts"], 1)
+                self.assertEqual(sum(result["attempts"].values()), 1)
                 self.assertEqual(result["final_attempts"], 1)
                 checks = [d["id"] for d in result["dispatches"] if d["role"] == "verification"]
                 self.assertEqual(checks[:len(old_checks)], old_checks)
@@ -122,7 +122,7 @@ class ExplicitOutputRepairTests(RepoCase):
                         source = copy.deepcopy(engine.run["review_receipts"][key])
                         original = Path(source["artifact"]).read_bytes()
                         calls = copy.deepcopy(backend.calls)
-                        budgets = {name: engine.run[name] for name in ("agent_dispatches", "total_attempts", "final_attempts")}
+                        budgets = {name: engine.run[name] for name in ("agent_dispatches", "attempts", "final_attempts")}
                         for options in ({"repair_invalid": source["dispatch_id"]}, {}):
                             with self.assertRaises(HarnessError) as caught:
                                 self.engine(backend).resume(engine.run["id"], **options)
@@ -152,7 +152,7 @@ class ExplicitOutputRepairTests(RepoCase):
                     with self.assertRaises(HarnessError):
                         self.engine(backend).resume(engine.run["id"], **options)
                     self.assertEqual(backend.calls, calls)
-                self.assertEqual(saved["total_attempts"], 1)
+                self.assertEqual(sum(saved["attempts"].values()), 1)
                 self.assertEqual(saved["format_repairs"], {})
 
     def test_unreturned_correction_failure_resumes_fresh_dispatch_with_same_guard(self):
@@ -171,7 +171,7 @@ class ExplicitOutputRepairTests(RepoCase):
             saved = read_json(engine.directory / "state.json")
             result = self.engine(backend).resume(engine.run["id"])
         self.assertEqual(result["status"], "completed")
-        self.assertEqual(result["total_attempts"], 1)
+        self.assertEqual(sum(result["attempts"].values()), 1)
         self.assertEqual(result["agent_dispatches"], saved["agent_dispatches"] + 2)
         self.assertEqual(result["invalid_repairs"][key]["source"]["dispatch_id"], source["dispatch_id"])
 
@@ -272,7 +272,7 @@ class ExplicitOutputRepairTests(RepoCase):
         result = self.engine(backend).resume(engine.run["id"])
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["agent_dispatches"], 4)
-        self.assertEqual(result["total_attempts"], 1)
+        self.assertEqual(sum(result["attempts"].values()), 1)
 
     def test_version_seven_cannot_ignore_new_repair_guards(self):
         engine, backend, key, source = self.blocked_approval()

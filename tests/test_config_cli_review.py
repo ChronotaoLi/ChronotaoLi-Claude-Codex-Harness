@@ -120,7 +120,7 @@ class IndependentCLICommandsTests(RepoCase):
         for command in ("resume", "abandon"):
             engine = Mock()
             getattr(engine, command).return_value = result
-            with self.subTest(command=command), patch("harness.cli.Engine", return_value=engine):
+            with self.subTest(command=command), patch("harness.cli.Runtime", return_value=engine):
                 code, output, errors = self.invoke([
                     command, "run_test", "--confirm-exited", "dispatch_one", "--confirm-exited", "dispatch_two",
                 ], ROOT / "harness.toml")
@@ -193,7 +193,7 @@ class ExitConfirmationRecoveryTests(RepoCase):
                 result = self.engine(backend).resume(engine.run["id"], approve_plan=True,
                                                      confirm_exited=[old["id"]])
         self.assertEqual(result["status"], "completed")
-        self.assertEqual(result["total_attempts"], 1)
+        self.assertEqual(sum(result["attempts"].values()), 1)
         self.assertEqual(set(result["accepted"]), {"greet"})
         self.assertTrue(any(call["kind"] == "final_review" for call in backend.calls))
         self.assertTrue(all(call.args[0] != old["pgid"] for call in signal_group.call_args_list))

@@ -10,7 +10,7 @@ from .util import HarnessError
 DEFAULTS = {
     "runtime": {
         "agent_timeout_seconds": 3600, "verify_timeout_seconds": 300,
-        "max_attempts": 3, "max_final_attempts": 3, "max_total_attempts": 60, "max_replans": 2,
+        "max_attempts": 3, "max_final_attempts": 3, "max_replans": 2,
         "max_agent_dispatches": 200,
         "max_tasks": 20, "context_chars": 100000, "claude_max_turns": 50,
         "claude_max_turns_by_role": {}, "claude_output_mode": "legacy_json",
@@ -21,9 +21,15 @@ DEFAULTS = {
 }
 RESUME_INCREASES = (
     "agent_timeout_seconds", "verify_timeout_seconds", "context_chars",
-    "claude_max_turns", "max_attempts", "max_final_attempts", "max_total_attempts",
+    "claude_max_turns", "max_attempts", "max_final_attempts",
     "max_replans", "max_agent_dispatches", "max_tasks",
 )
+# Deleted keys stay unknown; the error names what to delete and what replaces it.
+# This hint is the only place the removed key name remains.
+REMOVED_KEYS = {
+    "runtime.max_total_attempts": "请删除 runtime.max_total_attempts：每任务上限是 runtime.max_attempts，"
+                                  "整个 run 的模型调用上限是 runtime.max_agent_dispatches",
+}
 DISPATCH_ROLES = ("commander", "worker", "reviewer")
 
 
@@ -100,7 +106,8 @@ class Config:
             for name in role_names:
                 check_keys(roles.get(name), ("cli", "model", "effort"), f"roles.{name}.")
         if unknown:
-            raise HarnessError("未知配置键：" + "、".join(sorted(unknown)))
+            hints = [REMOVED_KEYS[key] for key in sorted(unknown) if key in REMOVED_KEYS]
+            raise HarnessError("未知配置键：" + "、".join(sorted(unknown)) + "".join("；" + hint for hint in hints))
         shared = data.get("shared")
         if not isinstance(shared, dict):
             raise HarnessError("shared 必须为配置表，包含 rules、skills、mcp、hooks")

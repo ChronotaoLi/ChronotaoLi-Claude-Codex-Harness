@@ -10,7 +10,7 @@ from .budgets import work_attempts
 from .memory import Memory
 from .shared import Hooks
 from .run_store import RunStore
-from .util import append_event, confirm_dispatches_exited, dump, ensure_dispatches_exited, group_alive, validate_command_directories, write_json
+from .util import append_event, confirm_dispatches_exited, ensure_dispatches_exited, group_alive, validate_command_directories, write_json
 
 class RunContext:
     def __init__(self, config, repo, state=None, backend=None, commander="astra", operation=None):
@@ -103,7 +103,7 @@ class RunContext:
                    "accepted": self.run["accepted"], "pending": [t for t in self.run["tasks"] if t["id"] not in self.run["accepted"]],
                    "feedback": self.run.get("feedback"), "expected_head": self.run["expected_head"],
                    "original_tasks": self.run["original_tasks"], "base_commit": self.run["base_commit"],
-                   "total_attempts": self.run["total_attempts"], "replan_attempts": self.run["replan_attempts"],
+                   "attempts": deepcopy(self.run["attempts"]), "replan_attempts": self.run["replan_attempts"],
                    "work_attempts": work_attempts(self.run),
                    "final_history": self.run["final_history"], "plan_revision": len(self.run["plan_history"]),
                    "environment_updates": deepcopy(self.run.get("environment_updates", [])),
@@ -112,8 +112,9 @@ class RunContext:
                    "operator_decisions": deepcopy(self.run.get("operator_decisions", [])),
                    "task_checkpoints": deepcopy(self.run.get("task_checkpoints", [])),
                    "next": "Resume the harness run; every dispatch creates a fresh agent process."}
+        # handoff.json is the only handoff artifact; older run directories may
+        # still hold a handoff.md, which observation keeps readable.
         write_json(self.directory / "handoff.json", handoff)
-        (self.directory / "handoff.md").write_text("# Run handoff\n\n```json\n" + dump(handoff) + "\n```\n", encoding="utf-8")
 
     def ensure_exited(self):
         validate_command_directories(self.run["dispatches"], self.directory)

@@ -34,7 +34,7 @@ class DispatchReplanTests(RepoCase):
         original = self.plan()
         with self.assertRaisesRegex(HarnessError, "停止重新规划"):
             engine.start("Implement greet", original)
-        self.assertEqual(engine.run["total_attempts"], 1)
+        self.assertEqual(sum(engine.run["attempts"].values()), 1)
         self.assertEqual(engine.run["original_tasks"], original["tasks"])
         self.assertEqual(engine.run["tasks"], original["tasks"])
         self.assertEqual(engine.run["accepted"], {})
@@ -108,16 +108,55 @@ class DispatchReplanTests(RepoCase):
         result = engine.start("Implement greet", self.plan())
         self.assertEqual(result["status"], "completed")
         self.assertEqual(set(result["accepted"]), {"greet", "prerequisite"})
-        self.assertEqual(result["total_attempts"], 3)
+        self.assertEqual(sum(result["attempts"].values()), 3)
         self.assertEqual(result["tasks"][0]["acceptance"], self.plan()["tasks"][0]["acceptance"])
         self.assertEqual(result["final_history"][-1]["status"], "approved")
 
-    def test_format_correction_cannot_replace_routing_but_keeps_legacy_selection(self):
-        previous = {"selected_task": "greet", "instruction": " "}
-        current = {**previous, "instruction": "Implement", "action": "implement"}
+    def test_format_correction_cannot_replace_routing(self):
+        previous = {"selected_task": "greet", "action": "implement", "instruction": " "}
+        current = {**previous, "instruction": "Implement"}
         validate_commander_format_correction("dispatch", previous, current)
         with self.assertRaisesRegex(HarnessError, "再规划选择"):
             validate_commander_format_correction("dispatch", {**previous, "action": "replan"}, current)
+        with self.assertRaisesRegex(HarnessError, "再规划选择"):
+            validate_commander_format_correction("dispatch", previous, {**current, "action": "replan"})
+
+    def test_selection_without_action_is_a_contract_error_not_an_implement_route(self):
+        def omit_action(backend, kwargs, packet, result):
+            if kwargs["kind"] == "review" and sum(c["kind"] == "review" for c in backend.calls) == 1:
+                result.update(verdict="request_changes", findings=[finding(category="evidence")])
+            if kwargs["kind"] == "dispatch":
+                result.pop("action")
+        backend = ScriptedBackend(omit_action)
+        engine = self.engine(backend)
+        with self.assertRaisesRegex(HarnessError, "missing or unexpected fields"):
+            engine.start("Implement greet", self.plan())
+        # One worker ran under the deterministic first directive; the selection was
+        # rejected without a format correction or a second worker.
+        self.assertEqual([c["kind"] for c in backend.calls], ["implement", "review", "dispatch"])
+        self.assertEqual(engine.run["attempts"], {"greet": 1})
+        self.assertNotIn("pending_directive", engine.run)
+        self.assertFalse(engine.run["pending_format_corrections"])
+        saved = read_json(engine.directory / "state.json")
+        self.assertIn("commander:dispatch:dispatching", saved["commander_receipts"])
+        calls = len(backend.calls)
+        with self.assertRaisesRegex(HarnessError, "missing or unexpected fields"):
+            self.engine(backend).resume(engine.run["id"])
+        self.assertEqual(len(backend.calls), calls)
+
+    def test_deterministic_first_directive_routes_to_implement_without_commander(self):
+        # The pristine directive names action=implement itself; routing reads it
+        # with no default, so a missing action could not reach the worker.
+        backend = ScriptedBackend()
+        result = self.engine(backend).start("Implement greet", self.plan())
+        self.assertEqual(result["status"], "completed")
+        self.assertFalse(any(c["kind"] == "dispatch" for c in backend.calls))
+        worker = next(c for c in backend.calls if c["role"] == "worker")
+        self.assertTrue(worker["packet"]["instruction"].startswith("Implement this task"))
+        from harness.contracts import task_directive
+        schema = task_directive(["greet"])
+        self.assertIn("action", schema["required"])
+        self.assertEqual(schema["properties"]["action"]["enum"], ["implement", "replan"])
 
     def test_engine_format_repair_cannot_turn_replan_into_worker_execution(self):
         backend = self.backend()

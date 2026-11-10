@@ -188,7 +188,7 @@ class EngineWorktreeBindingTests(RepoCase):
             engine.start("Implement greet", read_json(ROOT / "examples" / "plan.json"))
         self.assertFalse(engine.run["accepted"])
         self.assertEqual(len(backend.calls), 1)
-        self.assertEqual(engine.run["total_attempts"], 1)
+        self.assertEqual(sum(engine.run["attempts"].values()), 1)
         self.assertEqual(git.head(self.repo), base)
         self.assertEqual(git.git(self.repo, "rev-parse", engine.run["branch"]).strip(), base)
         self.assertEqual((self.repo / ".git" / "index").read_bytes(), main_index)

@@ -147,7 +147,7 @@ class FreshVerificationTests(RepoCase):
         result = self.engine(backend).resume(engine.run["id"])
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["final_attempts"], 1)
-        self.assertEqual(result["total_attempts"], 1)
+        self.assertEqual(sum(result["attempts"].values()), 1)
         self.assertEqual(sum(call["role"] == "worker" for call in backend.calls), 1)
         artifacts = self.checkout_artifacts(engine)
         self.assertEqual(len(artifacts), 2)
@@ -173,7 +173,7 @@ class FreshVerificationTests(RepoCase):
         result = self.engine(backend).resume(engine.run["id"])
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["final_attempts"], 1)
-        self.assertEqual(result["total_attempts"], 1)
+        self.assertEqual(sum(result["attempts"].values()), 1)
         self.assertEqual(self.final_checks(result), before)
         self.assertEqual(self.checkout_artifacts(engine), artifacts)
 
@@ -202,7 +202,7 @@ class FreshVerificationTests(RepoCase):
         result = self.engine(backend).resume(engine.run["id"])
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["final_attempts"], 1)
-        self.assertEqual(result["total_attempts"], 1)
+        self.assertEqual(sum(result["attempts"].values()), 1)
         second_checkout = read_json(self.checkout_artifacts(engine)[1])["worktree"]
         self.assertNotEqual(first_checkout, second_checkout)
         self.assertEqual(sentinel.read_text(), second_checkout)

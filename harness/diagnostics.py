@@ -132,6 +132,14 @@ def budget_explanation(run, work):
         valid = type(used) is int and type(limit) is int
         return {'used': used, 'limit': limit, 'remaining': max(0, limit-used) if valid else None}
     started = sum(type(d.get('pgid')) is int and d['pgid'] > 0 for d in workers.values())
+    shown = {'task_work': {tid: budget(count, 'max_attempts') for tid, count in work.items()},
+             'agent_dispatches': budget(run.get('agent_dispatches'), 'max_agent_dispatches'),
+             'replans': budget(run.get('replan_attempts'), 'max_replans'),
+             'final_attempts': budget(run.get('final_attempts'), 'max_final_attempts')}
+    if 'total_attempts' in run:
+        # Historical display branch: schema 15 and earlier saved a run-wide
+        # worker counter and limit; schema 16 has neither.
+        shown['total_worker'] = budget(run.get('total_attempts'), 'max_total_attempts')
     return {'dimensions': {'actual_worker_invocations': started,
                 'charged_worker_invocations': len(workers),
                 'process_start_unconfirmed': len(workers) - started,
@@ -141,10 +149,6 @@ def budget_explanation(run, work):
                 'worker_format_corrections': sum(d.get('format_correction') is True for d in workers.values()),
                 'historical_invocation_unknown': sum(d.get('role') == 'worker' and 'invoked' not in d for d in unique.values()),
                 'duplicate_dispatch_ids': duplicate},
-            'limits': {'task_work': {tid: budget(count, 'max_attempts') for tid, count in work.items()},
-                       'total_worker': budget(run.get('total_attempts'), 'max_total_attempts'),
-                       'agent_dispatches': budget(run.get('agent_dispatches'), 'max_agent_dispatches'),
-                       'replans': budget(run.get('replan_attempts'), 'max_replans'),
-                       'final_attempts': budget(run.get('final_attempts'), 'max_final_attempts')},
+            'limits': shown,
             'evidence_basis': 'recorded_ledger_links_not_revalidated_artifacts',
             'acceptance_basis': 'accepted_tasks', 'recovery_command': 'status ' + str(run.get('id'))}

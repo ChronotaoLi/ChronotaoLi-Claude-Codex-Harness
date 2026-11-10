@@ -74,13 +74,14 @@ class CommandAdmissionTests(unittest.TestCase):
                 self.broker.run_command({'command_id': command_id(self.argv)})
         self.assertEqual(list((self.job / 'commands').iterdir()), [])
 
-    def test_intent_write_failure_never_starts(self):
+    def test_intent_write_failure_never_starts_or_publishes(self):
         with patch('harness.command_server.write_json', side_effect=OSError('disk full')), patch('harness.command_server.run_process') as runner:
             with self.assertRaises(OSError):
                 self.broker.run_command({'command_id': command_id(self.argv)})
             runner.assert_not_called()
-        with self.assertRaises(HarnessError):
-            self.broker.run_command({'command_id': command_id(self.argv)})
+        # No journal-less folder was published, so the next call is admitted.
+        self.assertEqual(list((self.job / 'commands').iterdir()), [])
+        self.assertEqual(self.broker.run_command({'command_id': command_id(self.argv)})['exit_code'], 0)
 
     def test_receipt_write_failure_blocks_next_call(self):
         original = write_json

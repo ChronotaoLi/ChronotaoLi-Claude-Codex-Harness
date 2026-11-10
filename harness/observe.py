@@ -3,7 +3,7 @@
 Every byte this module reads comes through one descriptor walk below the resolved
 `.harness` directory: each intermediate directory opens with O_DIRECTORY|O_NOFOLLOW
 from its parent descriptor, the final component opens with O_NOFOLLOW|O_NONBLOCK and
-must fstat as a regular file. Nothing here constructs an Engine, loads a run for
+must fstat as a regular file. Nothing here constructs a Runtime, loads a run for
 recovery, takes run.lock, writes files, runs git or probes processes.
 
 Ledger interpretation stays in `harness.cli.status_summary`; this module only adds
@@ -27,6 +27,7 @@ RUN_ID = re.compile(r"^run_[A-Za-z0-9]+$")
 COMPONENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,95}$")
 COMMAND_ID = re.compile(r"^[0-9a-f]{32}$")
 MAX_DEPTH = 8
+# handoff.md is no longer written; run directories from earlier versions keep it readable.
 TOP_LEVEL_FILES = frozenset(("state.json", "events.jsonl", "handoff.json", "handoff.md",
                              "ignored-baseline.json", "ignored-paths.json", "worktree-cleanup.json"))
 ROOT_DIRECTORIES = frozenset(("plans", "dispatches", "verification", "hooks", "recovery", "decisions",
@@ -682,10 +683,17 @@ class Observer:
     @staticmethod
     def _budgets(run):
         budgets = {key: _integer(run.get(key)) for key in
-                   ("total_attempts", "agent_dispatches", "replan_attempts", "final_attempts")}
+                   ("agent_dispatches", "replan_attempts", "final_attempts")}
         attempts = run.get("attempts")
         budgets["attempts"] = ({key: value for key, value in attempts.items() if type(value) is int}
                                if isinstance(attempts, dict) else None)
+        # Every worker invocation, derived from the per-task counters (schema 16).
+        budgets["attempts_total"] = (_integer(sum(budgets["attempts"].values()))
+                                     if budgets["attempts"] is not None else None)
+        # Historical display branch: schema 15 and earlier also saved total_attempts,
+        # attempt_budget_policy and runtime.max_total_attempts. They are shown as
+        # saved and stay null for schema 16 ledgers, which have none of them.
+        budgets["total_attempts"] = _integer(run.get("total_attempts"))
         budgets["attempt_budget_policy"] = _string(run.get("attempt_budget_policy"))
         snapshot = run.get("config_snapshot")
         runtime = snapshot.get("runtime") if isinstance(snapshot, dict) else None

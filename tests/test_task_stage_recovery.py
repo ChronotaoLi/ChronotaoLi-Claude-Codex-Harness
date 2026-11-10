@@ -23,7 +23,6 @@ class TaskStageRecoveryTests(RepoCase):
                 raise failure(kwargs)
 
         self.config.data["runtime"]["max_attempts"] = 1
-        self.config.data["runtime"]["max_total_attempts"] = 1
         backend = RecordingBackend(fail_once)
         engine = self.engine(backend)
         with self.assertRaises((HarnessError, KeyboardInterrupt)):
@@ -36,7 +35,7 @@ class TaskStageRecoveryTests(RepoCase):
         result = self.engine(backend).resume(engine.run["id"])
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["attempts"], {"greet": 1})
-        self.assertEqual(result["total_attempts"], 1)
+        self.assertEqual(sum(result["attempts"].values()), 1)
         self.assertEqual(self.task_checks(result), checks)
         self.assertEqual(sum(call["role"] == "worker" for call in backend.calls), 1)
         self.assertFalse(any(call["role"] == "commander" for call in backend.calls))
@@ -59,7 +58,6 @@ class TaskStageRecoveryTests(RepoCase):
 
     def test_verification_interrupt_retries_checks_in_new_directory_without_worker(self):
         self.config.data["runtime"]["max_attempts"] = 1
-        self.config.data["runtime"]["max_total_attempts"] = 1
         backend = RecordingBackend()
         engine = self.engine(backend)
 
@@ -77,7 +75,7 @@ class TaskStageRecoveryTests(RepoCase):
         result = self.engine(backend).resume(engine.run["id"])
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["attempts"], {"greet": 1})
-        self.assertEqual(result["total_attempts"], 1)
+        self.assertEqual(sum(result["attempts"].values()), 1)
         self.assertEqual(sum(call["role"] == "worker" for call in backend.calls), 1)
         self.assertFalse(any(call["role"] == "commander" for call in backend.calls))
         self.assertEqual(len(self.task_checks(result)), 2)
@@ -101,7 +99,7 @@ class TaskStageRecoveryTests(RepoCase):
         result = self.engine(backend).resume(engine.run["id"])
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["attempts"], {"greet": 2})
-        self.assertEqual(result["total_attempts"], 2)
+        self.assertEqual(sum(result["attempts"].values()), 2)
         self.assertEqual(sum(call["role"] == "worker" for call in backend.calls), 2)
         self.assertEqual(len(self.task_checks(result)), 2)
         self.assertNotEqual(result["accepted"]["greet"]["verification"], old_pending["verification"])
@@ -125,7 +123,7 @@ class TaskStageRecoveryTests(RepoCase):
             with self.assertRaisesRegex(HarnessError, "清理越界修改"):
                 resumed.resume(engine.run["id"])
             self.assertEqual(resumed.run["attempts"], {"greet": 1})
-            self.assertEqual(resumed.run["total_attempts"], 1)
+            self.assertEqual(sum(resumed.run["attempts"].values()), 1)
             self.assertEqual(resumed.run["agent_dispatches"], 1)
             self.assertEqual(resumed.run["dispatches"], dispatches)
             self.assertEqual(backend.calls, calls)
@@ -157,7 +155,7 @@ class TaskStageRecoveryTests(RepoCase):
         with self.assertRaisesRegex(HarnessError, "尝试次数上限"):
             resumed.resume(engine.run["id"])
         self.assertEqual(resumed.run["attempts"], {"greet": 1})
-        self.assertEqual(resumed.run["total_attempts"], 1)
+        self.assertEqual(sum(resumed.run["attempts"].values()), 1)
         self.assertEqual(resumed.run["accepted"], {})
         self.assertEqual(sum(call["role"] == "worker" for call in backend.calls), 1)
         review = resumed.run["review_history"]["greet"][-1]["review"]
@@ -176,11 +174,11 @@ class TaskStageRecoveryTests(RepoCase):
         engine = self.engine(backend)
         with self.assertRaisesRegex(HarnessError, "Planning service"):
             engine.start("Implement greet")
-        self.assertEqual(engine.run["total_attempts"], 0)
+        self.assertEqual(sum(engine.run["attempts"].values()), 0)
         self.assertEqual(engine.run["tasks"], [])
         result = self.engine(backend).resume(engine.run["id"])
         self.assertEqual(result["status"], "completed")
-        self.assertEqual(result["total_attempts"], 1)
+        self.assertEqual(sum(result["attempts"].values()), 1)
         self.assertEqual(sum(call["kind"] == "plan" for call in backend.calls), 2)
         self.assertFalse(any(call["kind"] == "dispatch" for call in backend.calls))
         worker = next(call for call in backend.calls if call["role"] == "worker")

@@ -10,7 +10,6 @@ import sys
 import threading
 import time
 
-from .notifications import NotificationStore
 from .operations import OPERATION_ID
 from .private_state import ensure_private_state, _path
 from .util import HarnessError, uid, write_json
@@ -125,16 +124,6 @@ def supervise(repo, arguments, *, config_path=None, operation_id=None, popen=Non
             signal.signal(signum, handler)
         receipt.update(run_id=_linked_run(state, operation_id), observed_at=time.time(),
                        forwarded_signal=interrupted)
-        _write_receipt(path, receipt, propagating)
-        # The inbox is optional: its failure must neither replace the child's
-        # exit code nor mask an exception already propagating from this block.
-        try:
-            with NotificationStore(repo) as store:
-                receipt['notification_id'] = store.add_process_observation(receipt)
-        except Exception as error:
-            lines = str(error).splitlines()
-            receipt['notification_error'] = {'type': type(error).__name__,
-                                             'message': (lines[0] if lines else '')[:200]}
         _write_receipt(path, receipt, propagating)
     return receipt
 

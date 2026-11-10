@@ -315,15 +315,14 @@ def validate_commander_format_correction(kind, previous, current):
     fields = ("selected_task",) if kind == "dispatch" else ("action", "new_tasks", "updates")
     if kind not in ("dispatch", "replan") or any(previous[field] != current[field] for field in fields):
         raise HarnessError("指挥格式修正不得改变原任务选择或修订操作")
-    if kind == "dispatch" and previous.get("action", "implement") != current.get("action", "implement"):
+    if kind == "dispatch" and previous["action"] != current["action"]:
         raise HarnessError("指挥格式修正不得改变原派发或再规划选择")
 
 
 def task_directive(task_ids):
-    """Old selection receipts remain executable; new providers may route to replan."""
-    schema = obj(selected_task={"type": "string", "enum": list(task_ids)}, instruction=DETAIL)
-    schema["properties"]["action"] = {"type": "string", "enum": ["implement", "replan"]}
-    return schema
+    """A selection must name its route; a missing action is a contract error."""
+    return obj(selected_task={"type": "string", "enum": list(task_ids)}, instruction=DETAIL,
+               action={"type": "string", "enum": ["implement", "replan"]})
 
 
 def validate_required_commands(task):

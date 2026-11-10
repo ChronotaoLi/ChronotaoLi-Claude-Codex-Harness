@@ -24,7 +24,7 @@ class EnvironmentCLITests(unittest.TestCase):
         output, errors = io.StringIO(), io.StringIO()
         with patch("harness.cli.Config.load"), patch("harness.cli.git.repository", return_value=self.repo), \
                 patch("harness.operations.probe_cli", return_value={"path": None, "version": None}), \
-                patch("harness.cli.Engine", return_value=engine), contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+                patch("harness.cli.Runtime", return_value=engine), contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
             code = _main(["resume", "run_abc", *extra])
         return code, engine.resume, errors.getvalue()
 
@@ -43,7 +43,7 @@ class EnvironmentCLITests(unittest.TestCase):
         self.assertIn("missing update", errors)
 
     def fixture(self):
-        return {"current_task": "task", "accepted": {}, "total_attempts": 7,
+        return {"schema_version": 16, "current_task": "task", "accepted": {}, "attempts": {"task": 5, "other": 2},
                 "feedback": {"task_id": "task", "attempt": 2, "worker": {"status": "blocked", "blocker_kind": "environment", "blockers": ["missing dependency"]},
                              "worker_artifact": "/private/dispatches/d3/returned-result.json", "worker_artifact_digest": "abc"},
                 "dispatches": [{"id": "d1", "role": "worker", "status": "completed"},
@@ -55,7 +55,9 @@ class EnvironmentCLITests(unittest.TestCase):
     def test_outcomes_are_observations_and_current_blocker_has_source(self):
         run = self.fixture()
         summary = status_summary(run)
-        self.assertEqual(summary["budgets"]["total_attempts"], 7)
+        # Schema 16 derives the run total from the per-task counters.
+        self.assertEqual(summary["budgets"]["attempts_total"], 7)
+        self.assertNotIn("total_attempts", summary["budgets"])
         self.assertEqual(summary["worker_outcomes"], dict(completed=0, task_blocked=0, environment_blocked=1, operator_blocked=0, continuation_blocked=0, runtime_failed=1, unknown=1))
         blocker = summary["last_environment_blocker"]
         self.assertFalse(blocker["stale"])

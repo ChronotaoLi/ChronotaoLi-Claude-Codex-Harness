@@ -154,7 +154,7 @@ class RoleTurnLimitRecoveryTests(RepoCase):
         result = self.engine(backend).resume(engine.run["id"])
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["attempts"], {"greet": 2})
-        self.assertEqual(result["total_attempts"], 2)
+        self.assertEqual(sum(result["attempts"].values()), 2)
         self.assertEqual(result["agent_dispatches"], 5)
         self.assertEqual(artifact.read_bytes(), original)
         workers = [call for call in backend.adapter_calls if call["role"] == "worker"]

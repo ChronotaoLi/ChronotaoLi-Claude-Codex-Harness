@@ -234,8 +234,6 @@ class Planner(RuntimeService):
                 raise HarnessError("整体审阅要求干净的已接受提交；请核对并清理未接受修改")
             if snapshot_digest(self.context.snapshot()) != final["snapshot_digest"]:
                 raise HarnessError("待再规划的整体审阅快照已变化；请核对检查点")
-        if self.context.run["total_attempts"] >= self.context.config.data["runtime"]["max_total_attempts"]:
-            raise HarnessError("已达 run 总尝试次数上限；不通过新增任务绕过预算")
         tid = trigger.get("task_id")
         if tid and self.services.budgets.task_budget_used(tid) >= self.context.config.data["runtime"]["max_attempts"]:
             raise HarnessError(f"{tid} 已达尝试次数上限；不通过重新命名任务绕过预算")
@@ -257,7 +255,6 @@ class Planner(RuntimeService):
              "accepted": self.services.packets.accepted_context(), "trigger": compact_feedback(trigger),
              "approved_scope": deepcopy(self.context.run.get("approved_scope", [])),
              "attempts": self.context.run["attempts"], "work_attempts": work_attempts(self.context.run),
-             "total_attempts": self.context.run["total_attempts"],
              "max_tasks": self.context.config.data["runtime"]["max_tasks"],
              "remaining_replans": self.context.config.data["runtime"]["max_replans"] - attempt,
              "tool_constraints": self.services.packets.tool_constraints(),

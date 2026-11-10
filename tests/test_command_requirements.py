@@ -6,7 +6,7 @@ from unittest.mock import patch
 from harness.adapters import CLIBackend, DemoBackend
 from harness.contracts import WORK, validate_plan, validate_revision
 from harness.cli import status_summary
-from harness.engine import Engine
+from harness.runtime import Runtime
 from harness.requirements import missing_commands
 from harness.util import HarnessError, read_json
 from test_harness import ROOT, RepoCase
@@ -63,7 +63,7 @@ class CommandRequirementsTests(RepoCase):
             with self.assertRaises(HarnessError):
                 self.engine(backend).resume(engine.run['id'])
             saved = self.saved(engine)
-            for key in ('attempts', 'total_attempts', 'agent_dispatches'):
+            for key in ('attempts', 'agent_dispatches'):
                 self.assertEqual(saved[key], before[key])
         self.assertEqual(backend.calls, [])
         self.assertEqual(self.config.data['permissions']['worker_commands'], [])
@@ -108,7 +108,7 @@ class CommandRequirementsTests(RepoCase):
         with self.assertRaises(HarnessError):
             self.engine(backend).resume(engine.run['id'])
         self.assertEqual([call['kind'] for call in backend.calls], ['plan'])
-        self.assertEqual(self.saved(engine)['total_attempts'], 0)
+        self.assertEqual(sum(self.saved(engine)['attempts'].values()), 0)
         self.config.data['permissions']['worker_commands'].append(self.command)
         result = self.engine(backend).resume(engine.run['id'])
         self.assertEqual(result['status'], 'completed')
@@ -135,7 +135,7 @@ class CommandRequirementsTests(RepoCase):
         self.assertEqual(backend.calls, calls)
         saved = self.saved(engine)
         self.assertEqual(saved['commander_receipts'][key], source)
-        for field in ('agent_dispatches', 'attempts', 'total_attempts', 'replan_attempts'):
+        for field in ('agent_dispatches', 'attempts', 'replan_attempts'):
             self.assertEqual(saved[field], before[field])
 
         result = self.engine(backend).resume(engine.run['id'], repair_invalid=source['dispatch_id'])
@@ -172,7 +172,7 @@ class CommandRequirementsTests(RepoCase):
                 self.assertEqual(result['original_tasks'][0]['required_commands'], corrected)
                 self.assertEqual(result['tasks'], result['original_tasks'])
                 self.assertEqual(result['attempts'], {'greet': 1})
-                self.assertEqual(result['total_attempts'], 1)
+                self.assertEqual(sum(result['attempts'].values()), 1)
                 self.assertEqual(result['agent_dispatches'], 5)
 
     def test_invalid_new_task_commands_require_explicit_replan_repair(self):
@@ -204,7 +204,7 @@ class CommandRequirementsTests(RepoCase):
                     self.assertEqual(result['tasks'][1]['required_commands'], corrected)
                     self.assertEqual(list(result['accepted']), ['prep', 'greet'])
                     self.assertEqual(result['attempts'], {'greet': 2, 'prep': 1})
-                    self.assertEqual(result['total_attempts'], 3)
+                    self.assertEqual(sum(result['attempts'].values()), 3)
                     self.assertEqual(result['replan_attempts'], 1)
                     # Blocker feedback and the greet retry each require selection.
                     self.assertEqual(sum(call['kind'] == 'dispatch' for call in backend.calls), 2)
@@ -226,7 +226,7 @@ class CommandRequirementsTests(RepoCase):
         saved = self.saved(engine)
         directive = saved['pending_directive']['directive']
         self.assertEqual(saved['current_task'], directive['selected_task'])
-        self.assertEqual(saved['total_attempts'], 0)
+        self.assertEqual(sum(saved['attempts'].values()), 0)
         self.assertEqual([call['kind'] for call in backend.calls], ['dispatch'])
         result = self.engine(backend).resume(saved['id'], step=True)
         self.assertEqual(set(result['accepted']), {directive['selected_task']})
@@ -268,7 +268,7 @@ class CommandRequirementsTests(RepoCase):
         self.config.data['permissions']['worker_commands'] = []
         with self.assertRaises(HarnessError):
             engine.services.dispatch.dispatch_once('worker', 'implement', 'greet', WORK, {}, task=engine.run['tasks'][0])
-        for key in ('attempts', 'total_attempts', 'agent_dispatches'):
+        for key in ('attempts', 'agent_dispatches'):
             self.assertEqual(engine.run[key], before[key])
         self.assertEqual(backend.calls, [])
 
@@ -319,7 +319,7 @@ class ProviderWireSchemaTests(RepoCase):
 
     def test_codex_outputs_require_every_key_while_local_plan_field_stays_optional(self):
         backend = WireSchemaBackend(self.config, self.repo / '.harness')
-        engine = Engine(self.config, self.repo, backend=backend)
+        engine = Runtime(self.config, self.repo, backend=backend)
         self.assertEqual(engine.start('Implement greet')['status'], 'completed')
         codex = [(kind, schema) for role, kind, cli, schema in backend.wire if cli == 'codex']
         self.assertIn('plan', [kind for kind, _ in codex])

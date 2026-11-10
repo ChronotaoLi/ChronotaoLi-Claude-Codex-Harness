@@ -119,7 +119,7 @@ class ProviderUsageTests(RepoCase):
         entry = saved["dispatches"][-1]
         self.assertEqual(entry["status"], "failed")
         self.assertEqual(entry["provider_usage"]["reported_cost_usd"], 0.25)
-        self.assertEqual(saved["total_attempts"], 1)
+        self.assertEqual(sum(saved["attempts"].values()), 1)
         self.assertEqual(saved["agent_dispatches"], 1)
         self.assertEqual(saved["accepted"], {})
         self.assertEqual(self.events(engine)[-1]["provider_usage"], entry["provider_usage"])
@@ -224,7 +224,7 @@ class ProviderUsageTests(RepoCase):
                 patch.object(engine.context, "event", side_effect=unavailable_event):
             result = engine.start("Implement greet", self.plan())
         self.assertEqual(result["status"], "completed")
-        self.assertEqual(result["total_attempts"], 1)
+        self.assertEqual(sum(result["attempts"].values()), 1)
 
     def test_codex_totals_do_not_assume_missing_usage_fields_are_zero(self):
         options = {"reviewer": {"events": [

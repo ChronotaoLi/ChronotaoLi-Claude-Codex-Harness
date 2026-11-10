@@ -37,12 +37,11 @@ class RunLifecycle(RuntimeService):
         operation = self.context.operation
         self.context.run = {"schema_version": RUN_SCHEMA_VERSION, "workspace_inputs": None, "id": ident, "repo": str(self.context.repo), "goal": goal, "status": "planning", "commander": self.context.commander,
                     "branch": "harness/" + ident, "worktree": str(worktree), "tasks": [], "accepted": {}, "attempts": {},
-                    "attempt_budget_policy": "work",
                     "dispatches": [], "expected_head": git.head(self.context.repo), "feedback": None,
                     "config_path": str(self.context.config.path), "config_snapshot": deepcopy(self.context.config.data),
                     "asset_digest": asset_digest(self.context.config), "base_commit": git.head(self.context.repo),
                     "original_tasks": deepcopy(supplied_tasks),
-                    "total_attempts": 0, "replan_attempts": 0, "final_attempts": 0,
+                    "replan_attempts": 0, "final_attempts": 0,
                     "review_history": {}, "final_history": [], "plan_history": [], "format_repairs": {},
                     "worker_receipts": {}, "review_corrections": {}, "review_receipts": {}, "commander_receipts": {},
                     "invalid_repairs": {}, "approved_scope": [],
@@ -100,8 +99,12 @@ class RunLifecycle(RuntimeService):
         self.context.run = read_json(self.context.state / "runs" / ident / "state.json")
         if not isinstance(self.context.run, dict):
             raise HarnessError("运行台账必须为对象")
-        if self.context.run.get("schema_version") != RUN_SCHEMA_VERSION:
-            raise HarnessError("旧 run 仅保留为历史证据；新内核不恢复旧执行状态，请开始新 run")
+        version = self.context.run.get("schema_version")
+        if version != RUN_SCHEMA_VERSION:
+            shown = version if type(version) is int else "无效"
+            raise HarnessError(f"旧 run 仅保留为历史证据（台账版本 {shown}，当前 {RUN_SCHEMA_VERSION}）；"
+                               "不迁移、不恢复执行，只能用 status、dashboard 查看，"
+                               "或用 cleanup-run、cleanup-verification 清理；请开始新 run")
         required = {"id": str, "repo": str, "worktree": str, "status": str, "commander": str,
                     "goal": str, "branch": str, "expected_head": str, "base_commit": str,
                     "config_snapshot": dict, "tasks": list, "original_tasks": list,
@@ -111,10 +114,10 @@ class RunLifecycle(RuntimeService):
                     "invalid_repairs": dict, "approved_scope": list,
                     "pending_format_corrections": dict,
                     "final_history": list, "plan_history": list, "format_repairs": dict,
-                    "total_attempts": int, "agent_dispatches": int, "final_attempts": int,
+                    "agent_dispatches": int, "final_attempts": int,
                     "replan_attempts": int, "plan_approval_required": bool, "plan_approved": bool,
                     "environment_updates": list, "environment_checks": list,
-                    "decision_requests": list, "operator_decisions": list, "task_checkpoints": list, "checkpoint_batches": list, "attempt_budget_policy": str,
+                    "decision_requests": list, "operator_decisions": list, "task_checkpoints": list, "checkpoint_batches": list,
                     "continuation_history": list, "execution_guidance": list, "store_revision": int}
         if (self.context.run.get("id") != ident or any(type(self.context.run.get(k)) is not t for k, t in required.items())
                 or any(not isinstance(d, dict) for d in self.context.run["dispatches"])):

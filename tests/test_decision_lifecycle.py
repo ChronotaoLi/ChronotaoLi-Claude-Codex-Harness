@@ -3,6 +3,7 @@ import copy
 from pathlib import Path
 from unittest.mock import patch
 
+from harness.budgets import work_attempts
 from harness.util import HarnessError, read_json, write_json
 from test_harness import ROOT, RepoCase
 from test_runtime_changes import ScriptedBackend, finding
@@ -133,7 +134,7 @@ class DecisionLifecycleTests(RepoCase):
             with self.assertRaises(HarnessError):
                 self.engine(backend).resume(engine.run['id'])
         saved = self.saved(engine)
-        for key in ('attempts', 'total_attempts', 'agent_dispatches', 'accepted', 'decision_requests'):
+        for key in ('attempts', 'agent_dispatches', 'accepted', 'decision_requests'):
             self.assertEqual(saved[key], before[key])
         self.assertEqual(len(backend.calls), 1)
 
@@ -305,20 +306,24 @@ class DecisionLifecycleTests(RepoCase):
         self.assertFalse(any(c['role'] == 'worker' for c in backend.calls[calls:]))
 
     def test_continue_preserves_exhausted_worker_budget(self):
-        self.config.data['runtime']['max_total_attempts'] = 1
+        # The operator wait is exempt from max_attempts=1 but still spent a dispatch.
+        self.config.data['runtime'].update(max_attempts=1, max_agent_dispatches=1)
         engine, backend = self.blocked()
         before = self.saved(engine)
-        with self.assertRaises(HarnessError):
+        self.assertEqual((before['agent_dispatches'], work_attempts(before)), (1, {'greet': 0}))
+        with self.assertRaisesRegex(HarnessError, '模型派发次数上限'):
             self.engine(backend).resume(engine.run['id'], operator_decision=self.response(engine))
         state = self.saved(engine)
         self.assertEqual(len(state['operator_decisions']), 1)
         self.assertEqual(state['attempts'], before['attempts'])
-        self.assertEqual(state['total_attempts'], before['total_attempts'])
+        self.assertEqual(state['agent_dispatches'], before['agent_dispatches'])
         self.assertEqual(len(backend.calls), 1)
-        self.config.data['runtime']['max_total_attempts'] = 2
+        self.config.data['runtime']['max_agent_dispatches'] = 200
         result = self.engine(backend).resume(engine.run['id'])
         self.assertEqual(result['status'], 'completed')
         self.assertEqual(result['attempts'], {'greet': 2})
+        self.assertEqual(work_attempts(result), {'greet': 1})
+        self.assertEqual(result['agent_dispatches'], len(backend.calls))
 
     def test_handoff_registration_waits_for_post_accept_completion(self):
         engine, backend, plan = self.handoff()

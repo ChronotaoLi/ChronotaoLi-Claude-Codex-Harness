@@ -95,7 +95,7 @@ class FinalContextCapacityTests(RepoCase):
         self.assertLess(report["required_chars"], report["budget_chars"])
         self.assertGreater(report["projected_chars"], report["budget_chars"])
         self.assertEqual(backend.calls, [])
-        self.assertEqual(engine.run["total_attempts"], 0)
+        self.assertEqual(sum(engine.run["attempts"].values()), 0)
         self.assertEqual(engine.run["accepted"], {})
         self.config.data["runtime"]["context_chars"] = report["projected_chars"]
         self.assertEqual(engine.services.packets.final_context_capacity()["status"], "fits")
@@ -114,13 +114,13 @@ class FinalContextCapacityTests(RepoCase):
         self.assertEqual(saved["tasks"], plan["tasks"])
         self.assertEqual(saved["original_tasks"], plan["tasks"])
         self.assertEqual(len(saved["plan_history"]), 1)
-        self.assertEqual(saved["total_attempts"], 0)
+        self.assertEqual(sum(saved["attempts"].values()), 0)
         self.assertEqual(backend.calls, [])
         self.config.data["runtime"]["context_chars"] = report["projected_chars"] + 20000
         result = self.engine(backend).resume(saved["id"])
         self.assertEqual(result["status"], "completed")
         self.assertEqual(len(result["plan_history"]), 1)
-        self.assertEqual(result["total_attempts"], 1)
+        self.assertEqual(sum(result["attempts"].values()), 1)
         self.assertFalse(any(call["role"] == "commander" for call in backend.calls))
 
     def test_projected_overflow_warns_before_worker_but_allows_task_acceptance(self):
@@ -135,7 +135,7 @@ class FinalContextCapacityTests(RepoCase):
         with contextlib.redirect_stderr(output):
             result = engine.start("Implement greeting throughout the project", {"tasks": tasks}, step=True)
         self.assertEqual(result["status"], "paused")
-        self.assertEqual(result["total_attempts"], 1)
+        self.assertEqual(sum(result["attempts"].values()), 1)
         self.assertEqual(set(result["accepted"]), {"task0"})
         report = result["context_capacity"]
         self.assertEqual(report["status"], "projected_overflow")

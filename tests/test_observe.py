@@ -24,6 +24,8 @@ ROLES = {"commander": {"cli": "codex", "model": "gpt-6-astra", "effort": "high"}
 
 
 def ledger(run_id, **fields):
+    # Historical schema-11 shape: it still saved total_attempts, attempt_budget_policy
+    # and runtime.max_total_attempts, which observation shows as saved.
     base = {"schema_version": 11, "id": run_id, "status": "running", "goal": "Implement greet",
             "branch": "harness/" + run_id, "worktree": "/tmp/worktree", "commander": "astra",
             "tasks": [{"id": "greet", "title": "Implement greet", "depends_on": []},
@@ -76,7 +78,7 @@ class DemoRunObservationTests(RepoCase):
         item = listing["runs"][0]
         self.assertEqual({key: item[key] for key in ("id", "status", "goal", "branch")},
                          {key: ledger_value[key] for key in ("id", "status", "goal", "branch")})
-        self.assertEqual(item["schema_version"], 15)
+        self.assertEqual(item["schema_version"], 16)
         self.assertEqual(item["last_event_time"], events[-1]["time"])
 
         detail = observe.run_detail(state, result["id"])

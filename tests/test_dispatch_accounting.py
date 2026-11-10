@@ -18,7 +18,7 @@ class DispatchAccountingTests(RepoCase):
         def lengthy_worker_skill(path, name):
             return "Worker instructions " * 2000 if name == "harness-worker" else read_skill(path, name)
 
-        self.config.data["runtime"].update(max_attempts=1, max_total_attempts=1, context_chars=32000)
+        self.config.data["runtime"].update(max_attempts=1, context_chars=32000)
         backend = RecordingBackend()
         engine = self.engine(backend)
         with patch("harness.packets.read_skill", side_effect=lengthy_worker_skill):
@@ -29,7 +29,7 @@ class DispatchAccountingTests(RepoCase):
                     self.engine(backend).resume(engine.run["id"])
                 saved = read_json(engine.directory / "state.json")
                 self.assertEqual(saved["attempts"], {})
-                self.assertEqual(saved["total_attempts"], 0)
+                self.assertEqual(sum(saved["attempts"].values()), 0)
                 self.assertEqual(saved["agent_dispatches"], 0)
                 self.assertEqual(backend.requests, [])
             self.config.data["runtime"]["context_chars"] = 100000
@@ -54,7 +54,7 @@ class DispatchAccountingTests(RepoCase):
         self.assertEqual(entry["status"], "failed")
         self.assertTrue(entry["exit_confirmed"])
         self.assertEqual(saved["attempts"], {})
-        self.assertEqual(saved["total_attempts"], 0)
+        self.assertEqual(sum(saved["attempts"].values()), 0)
         self.assertEqual(saved["agent_dispatches"], 0)
         self.assertEqual(backend.requests, [])
         result = self.engine(backend).resume(saved["id"])
@@ -80,7 +80,7 @@ class DispatchAccountingTests(RepoCase):
         self.assertEqual(saved["dispatches"][-1]["status"], "failed")
         self.assertTrue(saved["dispatches"][-1]["exit_confirmed"])
         self.assertEqual(saved["attempts"], {})
-        self.assertEqual(saved["total_attempts"], 0)
+        self.assertEqual(sum(saved["attempts"].values()), 0)
         self.assertEqual(saved["agent_dispatches"], 0)
         self.assertEqual(backend.requests, [])
 
@@ -97,7 +97,7 @@ class DispatchAccountingTests(RepoCase):
         saved = read_json(engine.directory / "state.json")
         self.assertEqual(saved["agent_dispatches"], 1)
         self.assertEqual(saved["attempts"], {})
-        self.assertEqual(saved["total_attempts"], 0)
+        self.assertEqual(sum(saved["attempts"].values()), 0)
         self.assertEqual([call["role"] for call in backend.calls], ["commander"])
         self.assertTrue(saved["dispatches"][-1]["exit_confirmed"])
         self.assertEqual(saved["dispatches"][-1]["status"], "failed")
@@ -107,7 +107,7 @@ class DispatchAccountingTests(RepoCase):
             if kwargs["role"] == "worker":
                 saved = read_json(kwargs["run_path"])
                 self.assertEqual(saved["attempts"], {"greet": 1})
-                self.assertEqual(saved["total_attempts"], 1)
+                self.assertEqual(sum(saved["attempts"].values()), 1)
                 self.assertEqual(saved["agent_dispatches"], 1)
                 raise HarnessError("worker provider unavailable")
 
@@ -119,7 +119,7 @@ class DispatchAccountingTests(RepoCase):
             engine.start("Implement greet", self.plan())
         saved = read_json(engine.directory / "state.json")
         self.assertEqual(saved["attempts"], {"greet": 1})
-        self.assertEqual(saved["total_attempts"], 1)
+        self.assertEqual(sum(saved["attempts"].values()), 1)
         self.assertEqual(saved["agent_dispatches"], 1)
         self.assertFalse((backend.requests[0]["job"] / "response.json").exists())
         with self.assertRaisesRegex(HarnessError, "尝试次数上限"):
@@ -140,20 +140,20 @@ class DispatchAccountingTests(RepoCase):
             if kwargs["role"] == "worker" and sum(c["role"] == "worker" for c in backend.calls) == 1:
                 result["summary"] = "x" * 32001
 
-        self.config.data["runtime"].update(max_attempts=2, max_total_attempts=2)
+        self.config.data["runtime"].update(max_attempts=2)
         backend = RecordingBackend(malformed_once)
         engine = self.engine(backend)
         self.fail_worker_correction_preparation(engine, backend)
         saved = read_json(engine.directory / "state.json")
         self.assertEqual(saved["attempts"], {"greet": 1})
-        self.assertEqual(saved["total_attempts"], 1)
+        self.assertEqual(sum(saved["attempts"].values()), 1)
         self.assertEqual(saved["agent_dispatches"], 1)
         self.assertEqual(saved["format_repairs"], {})
         self.assertIsNone(saved["feedback"])
         self.assertIn("worker:implement:greet", saved["pending_format_corrections"])
         result = self.engine(backend).resume(saved["id"])
         self.assertEqual(result["status"], "completed")
-        self.assertEqual(result["total_attempts"], 2)
+        self.assertEqual(sum(result["attempts"].values()), 2)
         workers = [call for call in backend.calls if call["role"] == "worker"]
         self.assertIn("format_correction", workers[-1]["packet"])
         self.assertIsNone(workers[-1]["packet"]["feedback"])

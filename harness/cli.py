@@ -14,14 +14,14 @@ from pathlib import Path
 
 from . import dashboard, git, observe
 from .adapters import DemoBackend
-from .budgets import work_attempts
+from .budgets import attempts_total, counts_work, historical_policy, legacy_accounting, work_attempts
 from .cleanup import cleanup_verification
 from .config import Config
 from .convergence import convergence_summary, review_rounds
-from .engine import Engine
 from .memory import Memory, bind_source_files
 from .operations import RUN_ID, OperationRecord, config_identity, digest_assets, harness_identity, shared_paths
 from .run_cleanup import cleanup_run
+from .runtime import Runtime
 from .shared import mcp_configs, toml_value
 from .util import HarnessError, dump, read_json, write_json
 
@@ -64,7 +64,7 @@ def demo(config, live=False, commander="astra"):
     config.data["runtime"]["max_attempts"] = 1 if live else 3
     config.data["runtime"]["max_final_attempts"] = 1 if live else 3
     print(f"[harness] {'LIVE SMOKE' if live else 'OFFLINE DEMO'} repo={root}", file=sys.stderr, flush=True)
-    result = Engine(config, root, backend=None if live else DemoBackend(), commander=commander).start(
+    result = Runtime(config, root, backend=None if live else DemoBackend(), commander=commander).start(
         "Implement greet(name) in hello.py, returning 'Hello, {name}!'. Keep the existing test unchanged.")
     print(dump({"simulation": not live, "models_called": live, "verification": "real unittest + git", "repo": str(root),
                 "run": result["id"], "branch": result["branch"], "status": result["status"]}))
@@ -100,10 +100,9 @@ def status_work_attempts(run):
             or any(not isinstance(key, str) or type(value) is not int or value < 0
                    for key, value in attempts.items())):
         raise HarnessError(diagnostic)
-    policy = run.get("attempt_budget_policy", "all_invocations")
-    if policy not in ("all_invocations", "work"):
+    if legacy_accounting(run) and historical_policy(run) not in ("all_invocations", "work"):
         raise HarnessError(diagnostic)
-    if policy == "work":
+    if counts_work(run):
         dispatches = run.get("dispatches", [])
         if not isinstance(dispatches, list):
             raise HarnessError(diagnostic)
@@ -125,9 +124,15 @@ def status_summary(run):
     result = {key: run.get(key) for key in ("id", "status", "goal", "branch", "worktree", "current_task")}
     result["accepted_tasks"] = list(run.get("accepted", {}))
     result["budgets"] = {key: run.get(key) for key in
-                         ("attempts", "total_attempts", "agent_dispatches", "replan_attempts", "final_attempts")}
-    result["budgets"].update(work_attempts=status_work_attempts(run),
-                             attempt_budget_policy=run.get("attempt_budget_policy", "all_invocations"))
+                         ("attempts", "agent_dispatches", "replan_attempts", "final_attempts")}
+    result["budgets"]["work_attempts"] = status_work_attempts(run)
+    # Every worker invocation, summed from the validated per-task counters.
+    result["budgets"]["attempts_total"] = attempts_total(run)
+    if legacy_accounting(run):
+        # Historical display branch: schema 15 and earlier saved total_attempts
+        # and attempt_budget_policy; show them as saved, without recomputing.
+        result["budgets"].update(total_attempts=run.get("total_attempts"),
+                                 attempt_budget_policy=historical_policy(run))
     result["convergence"] = convergence_summary(run, result["budgets"]["work_attempts"])
     result["review_rounds"] = review_rounds(run)
     from .diagnostics import budget_explanation, remaining_model_calls
@@ -364,12 +369,12 @@ def operate(args, config, repo, state):
     try:
         print(f"[harness] operation_id={operation.id} record={operation.path}", file=sys.stderr)
         if args.command == "run":
-            engine = Engine(config, repo, commander=args.commander, operation=operation)
+            engine = Runtime(config, repo, commander=args.commander, operation=operation)
             result = engine.start(args.goal, read_json(args.plan) if args.plan else None,
                                   pause_after_plan=args.pause_after_plan, step=args.step)
             keys = ("id", "status", "branch", "worktree", "accepted")
         else:
-            engine = Engine(config, repo, operation=operation)
+            engine = Runtime(config, repo, operation=operation)
             result = engine.resume(args.run_id, approve_plan=args.approve_plan, step=args.step,
                                    reverify=args.reverify, **resume_options(args))
             keys = ("id", "status", "branch", "worktree")
@@ -454,17 +459,6 @@ def _main(argv=None):
     source.add_argument("--plan", type=Path)
     readiness.add_argument("--goal")
     readiness.add_argument("--coverage", type=Path)
-    notify = sub.add_parser("notify", help="原生事件驱动的持久本地通知；不调用模型")
-    notify.add_argument("run_ids", nargs="+")
-    notify.add_argument("--once", action="store_true", help="重放当前事件并投递一次后退出")
-    inbox = sub.add_parser("inbox", help="只读查询通知和当前状态；不自动确认")
-    inbox.add_argument("--run", dest="run_id")
-    inbox.add_argument("--unacknowledged", action="store_true")
-    ack = sub.add_parser("ack", help="确认看过一条通知；不批准恢复或任务")
-    ack.add_argument("notification_id")
-    ack_source = ack.add_mutually_exclusive_group(required=True)
-    ack_source.add_argument("--run", dest="run_id")
-    ack_source.add_argument("--operation", dest="operation_id")
     supervisor = sub.add_parser("supervise", help="启动一次 Harness run/resume 并记录真实进程退出；不自动重启")
     supervisor.add_argument("--operation-id")
     supervisor.add_argument("arguments", nargs=argparse.REMAINDER)
@@ -498,7 +492,7 @@ def _main(argv=None):
     if args.command == "status" and args.full and not args.run_id:
         parser.error("status --full 需要 run_id")
     try:
-        if args.command in ("prepare-run", "plan-readiness", "notify", "inbox", "ack", "supervise"):
+        if args.command in ("prepare-run", "plan-readiness", "supervise"):
             repo = git.repository(args.repo)
             if args.command == "prepare-run":
                 from .workspace_inputs import prepare_run
@@ -514,25 +508,13 @@ def _main(argv=None):
                     plan, goal = read_json(args.plan), args.goal
                 print(dump(save_readiness(repo, plan, goal,
                            read_json(args.coverage) if args.coverage else None, run_id=args.run_id)))
-            elif args.command == "supervise":
+            else:
                 from .supervisor import supervise
                 arguments = args.arguments[1:] if args.arguments[:1] == ["--"] else args.arguments
                 receipt = supervise(repo, arguments, config_path=args.config, operation_id=args.operation_id)
                 print(dump(receipt), file=sys.stderr)
                 code = receipt.get("exit_code")
                 return (128 - code if code < 0 else code) if type(code) is int else 1
-            else:
-                from .notifications import NotificationStore, observe_notifications
-                if args.command == "notify":
-                    observe_notifications(repo, args.run_ids, once=args.once)
-                else:
-                    with NotificationStore(repo, readonly=args.command == "inbox") as store:
-                        if args.command == "inbox":
-                            print(dump(store.list_notifications(run_id=args.run_id,
-                                                               unacknowledged=args.unacknowledged)))
-                        else:
-                            print(dump(store.acknowledge(args.notification_id, run_id=args.run_id,
-                                                         operation_id=args.operation_id)))
             return 0
         if args.command == "watch":
             from .watch_cli import watch_run
@@ -621,7 +603,7 @@ def _main(argv=None):
             return operate(args, config, repo, state)
         if args.command == "abandon":
             options = {"confirm_exited": args.confirm_exited} if args.confirm_exited else {}
-            result = Engine(config, repo).abandon(args.run_id, remove_worktree=args.remove_worktree, **options)
+            result = Runtime(config, repo).abandon(args.run_id, remove_worktree=args.remove_worktree, **options)
             print(dump(status_summary(result)))
         elif args.command == "sync":
             git.ignore_state(repo)

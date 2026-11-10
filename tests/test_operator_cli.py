@@ -23,7 +23,7 @@ class OperatorCLITests(unittest.TestCase):
         errors = io.StringIO()
         with patch("harness.cli.Config.load"), patch("harness.cli.git.repository", return_value=self.repo), \
                 patch("harness.operations.probe_cli", return_value={"path": None, "version": None}), \
-                patch("harness.cli.Engine", return_value=engine), contextlib.redirect_stderr(errors):
+                patch("harness.cli.Runtime", return_value=engine), contextlib.redirect_stderr(errors):
             code = _main(["resume", "run_test", "--operator-decision", "answer.json", "--step"])
         self.assertEqual(code, 1)
         self.assertEqual(engine.resume.call_args.kwargs["operator_decision"], Path("answer.json"))
@@ -35,7 +35,7 @@ class OperatorCLITests(unittest.TestCase):
         engine.resume.side_effect = HarnessError("batch rejected")
         with patch("harness.cli.Config.load"), patch("harness.cli.git.repository", return_value=self.repo), \
                 patch("harness.operations.probe_cli", return_value={"path": None, "version": None}), \
-                patch("harness.cli.Engine", return_value=engine), contextlib.redirect_stderr(io.StringIO()):
+                patch("harness.cli.Runtime", return_value=engine), contextlib.redirect_stderr(io.StringIO()):
             code = _main(["resume", "run_test", "--operator-decision", "a.json",
                           "--operator-decision", "b.json"])
         self.assertEqual(code, 1)

@@ -40,7 +40,7 @@ class InputDispatchIntegrationTests(RepoCase):
             with self.assertRaises(HarnessError):
                 resumed.resume(engine.run['id'], approve_plan=True)
         state = read_json(engine.directory / 'state.json')
-        self.assertEqual(state['total_attempts'], 0)
+        self.assertEqual(sum(state['attempts'].values()), 0)
         self.assertEqual(state['agent_dispatches'], 0)
         self.assertFalse(any(call['role'] == 'worker' for call in backend.calls))
         self.assertFalse(state['dispatches'][-1]['invoked'])
@@ -49,7 +49,7 @@ class InputDispatchIntegrationTests(RepoCase):
     def test_schema12_missing_input_binding_refuses_resume_without_calls(self):
         engine, backend = self.prepared()
         state = read_json(engine.directory / 'state.json')
-        self.assertEqual(state['schema_version'], 15)
+        self.assertEqual(state['schema_version'], 16)
         del state['workspace_inputs']
         write_json(engine.directory / 'state.json', state)
         before = (engine.directory / 'state.json').read_bytes()

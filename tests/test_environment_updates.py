@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 from unittest.mock import patch
 
+from harness.budgets import work_attempts
 from harness.cli import status_summary
 from harness.util import HarnessError, read_json, write_json
 from test_harness import ROOT, RepoCase
@@ -98,7 +99,7 @@ class EnvironmentUpdateTests(RepoCase):
             self.engine(backend).resume(engine.run['id'], step=True)
         saved = self.saved(engine)
         self.assertEqual([(call['role'], call['kind']) for call in backend.calls[calls:]], [('commander', 'dispatch')])
-        for key in ('attempts', 'total_attempts'):
+        for key in ('attempts',):
             self.assertEqual(saved[key], before[key])
         self.assertEqual(saved['agent_dispatches'], before['agent_dispatches'] + 1)
         self.assertFalse(saved['environment_checks'][-1]['passed'])
@@ -110,7 +111,7 @@ class EnvironmentUpdateTests(RepoCase):
         self.assertEqual(len(backend.calls), calls)
         retried = self.saved(engine)
         self.assertEqual(retried['pending_directive'], directive)
-        for key in ('attempts', 'total_attempts', 'agent_dispatches'):
+        for key in ('attempts', 'agent_dispatches'):
             self.assertEqual(retried[key], saved[key])
         marker.touch()
         result = self.engine(backend).resume(engine.run['id'], step=True)
@@ -137,7 +138,7 @@ class EnvironmentUpdateTests(RepoCase):
                         resumed.resume(engine.run['id'])
                 saved = self.saved(engine)
                 self.assertEqual(saved['status'], 'running' if abrupt else 'interrupted')
-                for key in ('dispatches', 'attempts', 'total_attempts', 'agent_dispatches', 'feedback'):
+                for key in ('dispatches', 'attempts', 'agent_dispatches', 'feedback'):
                     self.assertEqual(saved[key], before[key])
                 self.assertFalse(status_summary(saved)['last_environment_blocker']['stale'])
                 result = self.engine(backend).resume(engine.run['id'], environment_update=path)
@@ -195,7 +196,7 @@ class EnvironmentUpdateTests(RepoCase):
         calls = len(backend.calls)
         result = self.engine(backend).resume(engine.run['id'], environment_update=path)
         self.assertEqual(result['status'], 'completed')
-        self.assertEqual(result['schema_version'], 15)
+        self.assertEqual(result['schema_version'], 16)
         self.assertEqual(result['tasks'], before['tasks'])
         self.assertEqual(result['config_snapshot']['roles'], before['config_snapshot']['roles'])
         self.assertEqual(result['original_tasks'], before['original_tasks'])
@@ -228,7 +229,7 @@ class EnvironmentUpdateTests(RepoCase):
             with self.assertRaises(HarnessError):
                 self.engine(backend).resume(engine.run['id'], environment_update=path)
             saved = self.saved(engine)
-            for key in ('attempts', 'total_attempts', 'agent_dispatches', 'tasks', 'feedback', 'accepted'):
+            for key in ('attempts', 'agent_dispatches', 'tasks', 'feedback', 'accepted'):
                 self.assertEqual(saved[key], before[key])
             self.assertEqual(len(saved['environment_updates']), 1)
             self.assertTrue(saved['environment_checks'])
@@ -271,7 +272,7 @@ class EnvironmentUpdateTests(RepoCase):
                 self.engine(backend).resume(engine.run['id'], environment_update=path)
             self.assertEqual(len(backend.calls), 1)
             saved = self.saved(engine)
-            for key in ('attempts', 'total_attempts', 'agent_dispatches', 'tasks', 'accepted'):
+            for key in ('attempts', 'agent_dispatches', 'tasks', 'accepted'):
                 self.assertEqual(saved[key], before[key])
             self.assertFalse(saved.get('environment_updates'))
 
@@ -406,21 +407,26 @@ class EnvironmentUpdateTests(RepoCase):
         self.assertFalse(self.saved(engine).get('environment_updates'))
 
     def test_budget_exhaustion_retains_update_without_authorizing_an_attempt(self):
-        self.config.data['runtime']['max_total_attempts'] = 1
+        # The environment wait is exempt from max_attempts=1 but still spent a dispatch.
+        self.config.data['runtime'].update(max_attempts=1, max_agent_dispatches=1)
         engine, backend, path, _ = self.blocked()
         before = self.saved(engine)
-        with self.assertRaises(HarnessError):
+        self.assertEqual((before['agent_dispatches'], work_attempts(before)), (1, {'greet': 0}))
+        with self.assertRaisesRegex(HarnessError, '模型派发次数上限'):
             self.engine(backend).resume(engine.run['id'], environment_update=path)
         saved = self.saved(engine)
         self.assertEqual(len(saved['environment_updates']), 1)
-        for key in ('attempts', 'total_attempts', 'agent_dispatches', 'feedback', 'tasks', 'accepted'):
+        for key in ('attempts', 'agent_dispatches', 'feedback', 'tasks', 'accepted'):
             self.assertEqual(saved[key], before[key])
         self.assertEqual(len(backend.calls), 1)
-        self.config.data['runtime']['max_total_attempts'] = 2
+        self.config.data['runtime']['max_agent_dispatches'] = 200
         result = self.engine(backend).resume(engine.run['id'])
         self.assertEqual(result['status'], 'completed')
         self.assertEqual(len(result['environment_updates']), 1)
         self.assertEqual(result['attempts'], {'greet': 2})
+        self.assertEqual(work_attempts(result), {'greet': 1})
+        self.assertEqual(result['agent_dispatches'], len(backend.calls))
+        self.assertEqual(status_summary(result)['budgets']['attempts_total'], 2)
 
     def test_newer_update_replaces_checks_but_preserves_history_in_all_packets(self):
         engine, backend, path, value = self.blocked()
@@ -464,7 +470,7 @@ class EnvironmentUpdateTests(RepoCase):
         workers = [c for c in backend.calls if c['role'] == 'worker']
         self.assertEqual(len(workers), 2)
         self.assertEqual(saved['attempts'], {'greet': 2})
-        self.assertEqual(saved['total_attempts'], 2)
+        self.assertEqual(sum(saved['attempts'].values()), 2)
         self.assertEqual(saved['agent_dispatches'], len(backend.calls))
         self.assertIn('worker:implement:greet', saved['pending_format_corrections'])
         before = copy.deepcopy(saved)
@@ -472,7 +478,7 @@ class EnvironmentUpdateTests(RepoCase):
         with self.assertRaises(HarnessError):
             self.engine(backend).resume(engine.run['id'])
         self.assertEqual(len(backend.calls), calls)
-        for key in ('attempts', 'total_attempts', 'agent_dispatches'):
+        for key in ('attempts', 'agent_dispatches'):
             self.assertEqual(self.saved(engine)[key], before[key])
         marker.write_text('ready again')
         result = self.engine(backend).resume(engine.run['id'])
@@ -537,7 +543,7 @@ class EnvironmentUpdateTests(RepoCase):
                 self.engine(backend).resume(engine.run['id'], environment_update=path)
         saved = self.saved(engine)
         self.assertEqual(len(saved['environment_updates']), 1)
-        for key in ('attempts', 'total_attempts', 'agent_dispatches'):
+        for key in ('attempts', 'agent_dispatches'):
             self.assertEqual(saved[key], before[key])
         self.assertEqual(len(backend.calls), 1)
         result = self.engine(backend).resume(engine.run['id'])

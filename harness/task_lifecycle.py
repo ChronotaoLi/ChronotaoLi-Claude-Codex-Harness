@@ -110,8 +110,6 @@ class TaskLifecycle(RuntimeService):
             self.check_task_scope(task)
         if current and self.services.budgets.task_budget_used(current) >= self.context.config.data["runtime"]["max_attempts"]:
             raise HarnessError(f"{current} 已达尝试次数上限")
-        if self.context.run["total_attempts"] >= self.context.config.data["runtime"]["max_total_attempts"]:
-            raise HarnessError("已达 run 总尝试次数上限")
         # A task's prerequisites must not prevent selecting other ready work.
         # The selected worker is checked again before its invocation is counted.
         if current:
@@ -123,7 +121,7 @@ class TaskLifecycle(RuntimeService):
                 raise HarnessError("待派发指令的代码快照已变化；请核对并恢复原快照")
             directive = saved_directive["directive"]
         elif pristine:
-            directive = {"selected_task": ready[0]["id"],
+            directive = {"selected_task": ready[0]["id"], "action": "implement",
                          "instruction": "Implement this task within its complete stated scope and acceptance. Inspect dependency evidence and follow the supplied tool and verification constraints."}
         else:
             schema = task_directive(t["id"] for t in ready)
@@ -136,7 +134,7 @@ class TaskLifecycle(RuntimeService):
                          "instruction": "Select one ready task and return action=implement for a feasible implementation or repair. Return action=replan when feedback exposes missing prerequisites or acceptance that cannot be met within current scope and decisions; explain the unmet requirement in instruction. Replanning can stop without another worker. Retain the original acceptance: completing a report of unresolved failures is not completing the task."}, task=ready[0])
         task = next(t for t in ready if t["id"] == directive["selected_task"])
         tid = task["id"]
-        if directive.get("action", "implement") == "replan":
+        if directive["action"] == "replan":
             receipt = self.context.run["commander_receipts"]["commander:dispatch:dispatching"]
             trigger = {"task_id": tid, "feedback": deepcopy(self.context.run.get("feedback")),
                        "coordination": {**{key: receipt[key] for key in

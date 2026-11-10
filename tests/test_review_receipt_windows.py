@@ -121,7 +121,7 @@ class ReviewReceiptWindowTests(RepoCase):
                        if entry["role"] == "verification" and entry["task_id"] == "greet"]
         result = self.engine(backend).resume(engine.run["id"])
         self.assertEqual(result["status"], "completed")
-        self.assertEqual(result["total_attempts"], 1)
+        self.assertEqual(sum(result["attempts"].values()), 1)
         self.assertEqual(result["attempts"]["greet"], 1)
         self.assertEqual([call for call in backend.calls if call["task_id"] == "greet"], task_calls)
         self.assertEqual([entry for entry in result["dispatches"]
@@ -184,13 +184,13 @@ class ReviewReceiptWindowTests(RepoCase):
         saved = read_json(engine.directory / "state.json")
         self.assertEqual(saved["agent_dispatches"], 5)
         self.assertEqual(saved["final_attempts"], 1)
-        self.assertEqual(saved["total_attempts"], 1)
+        self.assertEqual(sum(saved["attempts"].values()), 1)
         available = True
         self.config.data["runtime"]["max_agent_dispatches"] = 6
         result = self.engine(backend).resume(engine.run["id"])
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["agent_dispatches"], 6)
         self.assertEqual(result["final_attempts"], 1)
-        self.assertEqual(result["total_attempts"], 1)
+        self.assertEqual(sum(result["attempts"].values()), 1)
         self.assertEqual(len(dispatch_ids), 4)
         self.assertEqual(len(dispatch_ids), len(set(dispatch_ids)))

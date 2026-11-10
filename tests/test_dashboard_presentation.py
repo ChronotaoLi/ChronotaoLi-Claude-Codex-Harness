@@ -115,6 +115,8 @@ def detail(run_id, goal, *, status="running", summary=None, dispatches=(), event
            "repo": "/tmp/repo", "commander": "fable", "current_task": "t2", "error_type": None,
            "created_by_operation": "op_1", "config_path": "/tmp/harness.toml", "expected_head": "abc",
            "base_commit": "def", "error": error, "worktree_removed": False}
+    # Historical schema-12 projection: it saved total_attempts, attempt_budget_policy
+    # and runtime.max_total_attempts, shown as saved.
     return {"id": run_id, "sampled_at": 2000.0, "sampled_at_utc": "2026-11-09T00:00:00Z", "ledger_error": None,
             "summary": base, "summary_error": None, "schema_version": 12, "unavailable": [], "run": run,
             "budgets": {"total_attempts": 3, "agent_dispatches": 5, "replan_attempts": 0, "final_attempts": 0,
@@ -532,6 +534,30 @@ class DashboardPresentationTests(unittest.TestCase):
   assert.deepEqual(amounts, ["$0.2500", "$0.2500"], "provider card and task group only, no total");
   // Cost detail lives in a tab, not in the default view.
   assert.ok(!visibleText(byId.main).includes("$0.2500"));
+''')
+
+    def test_budget_panel_shows_schema16_attempt_sum_and_historical_saved_counter(self):
+        current = detail("run_new", "Schema 16")
+        current["schema_version"] = 16
+        current["budgets"].update(total_attempts=None, attempt_budget_policy=None, attempts_total=3)
+        current["budgets"]["limits"]["max_total_attempts"] = None
+        data = {"current": current, "historical": detail("run_old", "Schema 12")}
+        self.run_browser(data, r'''
+  navigate("#/runs/run_new");
+  await respond("/api/runs/run_new", D.current);
+  fire(one(attrIs("data-tab", "cost")), "click");
+  let panel = visibleText(one(attrIs("data-panel", "cost")));
+  assert.ok(panel.includes("worker 尝试总数"), "schema 16 shows the summed attempts");
+  assert.ok(panel.includes("各任务 attempts 之和"));
+  assert.ok(panel.includes("work（台账 16 固定）"));
+  assert.ok(!panel.includes("总尝试（历史台账）"), "no run-wide limit meter for schema 16");
+  navigate("#/runs/run_old");
+  await respond("/api/runs/run_old", D.historical);
+  fire(one(attrIs("data-tab", "cost")), "click");
+  panel = visibleText(one(attrIs("data-panel", "cost")));
+  assert.ok(panel.includes("总尝试（历史台账）"), "historical ledgers keep their saved counter");
+  assert.ok(panel.includes("3 / 10"));
+  assert.ok(panel.includes("all_invocations（历史台账保存）"));
 ''')
 
     def test_dispatch_event_meanings_review_rounds_and_lower_bound_are_projected(self):

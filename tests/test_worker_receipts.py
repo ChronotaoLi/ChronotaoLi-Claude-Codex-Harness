@@ -1,5 +1,6 @@
 """Worker-return interruptions preserve candidates and invocation accounting."""
 import json
+from pathlib import Path
 from unittest.mock import patch
 
 from test_harness import RepoCase, ROOT
@@ -148,9 +149,9 @@ class WorkerReceiptTests(RepoCase):
         with self.assertRaisesRegex(HarnessError, 'returned result changed'):
             engine.resume(engine.run['id'])
 
-    def test_replay_does_not_charge_exhausted_total_or_dispatch_budget(self):
+    def test_replay_does_not_charge_exhausted_task_or_dispatch_budget(self):
         engine = self.interrupted('publish')
-        self.config.data['runtime']['max_total_attempts'] = engine.run['total_attempts']
+        self.config.data['runtime']['max_attempts'] = engine.run['attempts']['greet']
         self.config.data['runtime']['max_agent_dispatches'] = engine.run['agent_dispatches']
         # Stop after pending publication: reviewers still require their own budget.
         with patch.object(engine.services.tasks, 'continue_task', return_value=False):
@@ -158,7 +159,7 @@ class WorkerReceiptTests(RepoCase):
         self.assertIn('pending_task', engine.run)
         self.assertFalse(engine.run['worker_receipts'])
         self.assertEqual(engine.run['agent_dispatches'], 1)
-        self.assertEqual(engine.run['total_attempts'], 1)
+        self.assertEqual(sum(engine.run['attempts'].values()), 1)
 
     def test_raw_success_followed_by_backend_error_never_retries(self):
         class ReturnedThenFailed(DemoBackend):
@@ -364,7 +365,9 @@ class WorkerReceiptTests(RepoCase):
             engine.start('Implement greeting', self.plan())
         self.assertNotIn('evidence_files', backend.asserted_contract['properties'])
         receipt = engine.run['dispatches'][-1]['worker_receipt']
-        self.assertEqual(receipt['schema'], backend.asserted_contract)
+        # The ledger references the delivered contract; the file holds its body.
+        self.assertNotIn('schema', receipt)
+        self.assertEqual(read_json(Path(receipt['schema_artifact'])), backend.asserted_contract)
         self.assertNotIn('pending_task', engine.run)
         self.assertFalse(engine.run['accepted'])
         with self.assertRaises(HarnessError):

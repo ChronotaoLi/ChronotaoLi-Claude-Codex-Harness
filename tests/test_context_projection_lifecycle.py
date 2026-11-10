@@ -29,7 +29,7 @@ class ContextProjectionLifecycleTests(RepoCase):
             if kwargs['kind'] == 'replan':
                 required['packet']['overflow_fixture'] = 'x' * 110000
                 before.append({key: deepcopy(builder.context.run.get(key)) for key in
-                    ('attempts', 'total_attempts', 'agent_dispatches', 'replan_attempts', 'dispatches')})
+                    ('attempts', 'agent_dispatches', 'replan_attempts', 'dispatches')})
                 requests.append(deepcopy(builder.context.run['pending_replan']))
             return contract, required
         with patch.object(PacketBuilder, 'role_input', oversized):
@@ -50,7 +50,7 @@ class ContextProjectionLifecycleTests(RepoCase):
         self.assertEqual(result['status'], 'completed')
         self.assertEqual(requests[0]['request_id'], requests[1]['request_id'])
         self.assertEqual(sum(c['kind'] == 'replan' for c in backend.calls), 1)
-        self.assertEqual(result['total_attempts'], 2)
+        self.assertEqual(sum(result['attempts'].values()), 2)
 
     def test_saved_command_index_tamper_blocks_recovery_before_any_model_call(self):
         self.config.data['permissions']['worker_commands'] = [['python3', '-c', '#' + 'x' * 9000]]

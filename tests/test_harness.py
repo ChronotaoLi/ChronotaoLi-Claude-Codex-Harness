@@ -14,7 +14,7 @@ from harness.adapters import CLIBackend, DemoBackend
 from harness.config import Config
 from harness.context import compose
 from harness.contracts import PLAN, WORK, envelope, validate, validate_plan
-from harness.engine import Engine
+from harness.runtime import Runtime
 from harness.mcp_server import handle
 from harness.memory import Memory
 from harness.shared import Hooks, mcp_configs, toml_value
@@ -51,7 +51,7 @@ class RepoCase(unittest.TestCase):
         self.config.data["verification"]["commands"] = [[sys.executable, "-m", "unittest", "-v"]]
 
     def engine(self, backend=None):
-        return Engine(self.config, self.repo, backend=backend or DemoBackend())
+        return Runtime(self.config, self.repo, backend=backend or DemoBackend())
 
 
 class ContractTests(unittest.TestCase):

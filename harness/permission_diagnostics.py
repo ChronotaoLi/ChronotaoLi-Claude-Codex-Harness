@@ -44,7 +44,8 @@ def permission_diagnostics(config, provider_result=None, *, argv=None):
               "native_read_tools": ["Read", "Glob", "Grep"],
               "readonly_file_tools": ["harness.file_sha256", "harness.json_check", "harness.file_diff"],
               "readonly_git_tool": GIT_QUERY_TOOL,
-              "command_broker": "harness_commands.list_commands / harness_commands.run_command",
+              "command_broker": ("harness_commands.list_commands / harness_commands.run_command / "
+                                 "harness_commands.delete_path (worker with a task scope)"),
               "provider_allowance_verified": False}
     if argv is not None:
         result['local_command_capability'] = command_capability_projection(config, argv)

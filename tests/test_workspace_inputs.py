@@ -25,7 +25,7 @@ class WorkspaceInputsTests(unittest.TestCase):
         self.directory.mkdir(parents=True)
         self.checkout = self.repo / '.harness/worktrees' / self.ident
         git.git(self.repo, 'worktree', 'add', '-b', 'harness/' + self.ident, str(self.checkout))
-        self.run = dict(schema_version=15, workspace_inputs=None, id=self.ident,
+        self.run = dict(schema_version=16, workspace_inputs=None, id=self.ident,
                         repo=str(self.repo), worktree=str(self.checkout), status='paused',
                         expected_head=git.head(self.checkout), dispatches=[], worker_receipts={},
                         worktree_binding=git.capture_worktree_binding(self.checkout, 'harness/' + self.ident))

@@ -13,7 +13,7 @@ from pathlib import Path
 
 from . import git
 from .adapters import CLIBackend
-from .command_server import command_id, ensure_command_processes_exited
+from .command_server import DELETE_COMMAND_ID, command_id, ensure_command_processes_exited
 from .config import Config
 from .permission_smoke import _git
 from .util import HarnessError, dump, read_json, run_process, write_json
@@ -29,6 +29,8 @@ def prepare_fixture(directory):
     (repo / 'argv_fixture.py').write_text(script, encoding='utf-8')
     known = 'known hash fixture\n'
     (repo / 'known.txt').write_text(known, encoding='utf-8')
+    deletable = 'tracked file removed by delete_path\n'
+    (repo / 'deletable.txt').write_text(deletable, encoding='utf-8')
     _git(repo, 'init', '-q', '-b', 'main')
     _git(repo, 'add', '.')
     _git(repo, '-c', 'user.name=Harness Tool Smoke', '-c', 'user.email=smoke@localhost',
@@ -73,12 +75,23 @@ def prepare_fixture(directory):
          {'exit_code': 0, 'stdout': blob + '\n', 'implementation': 'python_blob_hash'})
     case('git_query_rejected', 'mcp__harness__git_query',
          {'argv': ['git', 'ls-files', '--output=marker', '--', 'known.txt']}, error=True)
+    # The broker has no run ledger here, so the probe grants an explicit scope.
+    # These cases show that the provider reaches delete_path, that an in-scope
+    # tracked file is removed and an out-of-scope one refused, and that each
+    # call leaves a record. Nothing renames directories concurrently here;
+    # delete_path does not isolate against that (see its tool description).
+    case('delete_in_scope', 'mcp__harness_commands__delete_path', {'path': 'deletable.txt'},
+         {'outcome': 'deleted', 'deleted': True, 'bytes': len(deletable.encode()),
+          'sha256': hashlib.sha256(deletable.encode()).hexdigest()})
+    case('delete_out_of_scope', 'mcp__harness_commands__delete_path', {'path': 'known.txt'}, error=True)
     expected = {str(worktree / 'argv-marker.json'): json.dumps([os.fsencode(x).hex() for x in values]),
                 str(worktree / '.git'): (worktree / '.git').read_text(),
                 str(worktree / 'known.txt'): known, str(worktree / 'argv_fixture.py'): script,
                 str(worktree / 'untracked-valid.json'): valid, str(worktree / 'untracked-invalid.json'): invalid,
                 str(left): 'before\n', str(right): 'after\n'}
     fixture = dict(worktree=str(worktree), cases=cases, commands=commands, expected_files=expected,
+                   absent_files=[str(worktree / 'deletable.txt')],
+                   delete_scope={'task_id': 'tool-smoke', 'allowed_paths': ['deletable.txt']},
                    run_state=str(directory / 'run-state.json'))
     write_json(directory / 'fixture.json', fixture)
     return fixture
@@ -146,9 +159,10 @@ def inspect_evidence(path, fixture, job=None):
             passed = passed and key in results and bool(result.get('is_error', False)) == case['error']
             # Broker rejections must reach MCP; CLI permission denials are not broker evidence.
             passed = passed and not any(d.get('tool_use_id') == key for d in denials if isinstance(d, dict))
-            if case['error'] and case['name'] in ('unknown_id', 'extra_argv', 'git_query_rejected'):
+            if case['error'] and case['name'] in ('unknown_id', 'extra_argv', 'git_query_rejected', 'delete_out_of_scope'):
                 expected_error = {'unknown_id': 'Unknown command_id', 'extra_argv': 'run_command accepts only command_id',
-                                  'git_query_rejected': 'git_query rejected without execution'}[case['name']]
+                                  'git_query_rejected': 'git_query rejected without execution',
+                                  'delete_out_of_scope': 'outside the task scope'}[case['name']]
                 passed = passed and expected_error in json.dumps(result.get('content', ''), ensure_ascii=False)
             if not case['error']:
                 try:
@@ -164,6 +178,9 @@ def inspect_evidence(path, fixture, job=None):
                             passed = passed and artifact.is_file() and (job is None or artifact.is_relative_to(Path(job) / 'commands'))
                             if artifact.is_file():
                                 passed = passed and hashlib.sha256(artifact.read_bytes()).hexdigest() == value.get(stream + '_sha256')
+                    if case['tool'].endswith('__delete_path') and isinstance(value, dict):
+                        receipt = Path(str(value.get('intent_path'))).with_name('receipt.json')
+                        passed = passed and receipt.is_file() and (job is None or receipt.is_relative_to(Path(job) / 'commands'))
                 except (ValueError, TypeError, OSError):
                     passed = False
         checks.append(dict(name=case['name'], passed=bool(passed), tool_use_ids=[k for k, _ in matched]))
@@ -174,10 +191,16 @@ def inspect_evidence(path, fixture, job=None):
         except (OSError, UnicodeError):
             passed = False
         checks.append(dict(name='file:' + name, passed=passed))
+    for name in fixture.get('absent_files', []):
+        checks.append(dict(name='absent:' + name, passed=not os.path.lexists(name)))
     if job is not None:
         records = ensure_command_processes_exited(job)
-        checks.append(dict(name='exactly_two_command_processes', passed=len(records) == 2 and
-                           sorted(r['command_id'] for r in records) == sorted(command_id(c) for c in fixture['commands'])))
+        ran = sorted(r['command_id'] for r in records if r['command_id'] != DELETE_COMMAND_ID)
+        checks.append(dict(name='exactly_two_command_processes',
+                           passed=ran == sorted(command_id(c) for c in fixture['commands'])))
+        deletes = sum(c['tool'].endswith('__delete_path') for c in fixture['cases'])
+        checks.append(dict(name='one_record_per_delete_call',
+                           passed=sum(r['command_id'] == DELETE_COMMAND_ID for r in records) == deletes))
     return dict(passed=final.get('subtype') == 'success' and not final.get('is_error', False) and all(c['passed'] for c in checks),
                 checks=checks, provider_subtype=final.get('subtype'), provider_model=init.get('model'),
                 claude_code_version=init.get('claude_code_version'), total_cost_usd=final.get('total_cost_usd'),
@@ -218,22 +241,24 @@ def tool_smoke(config, repo, *, timeout=180, max_turns=20, max_budget_usd=1.0):
     probe.data['runtime']['claude_max_turns_by_role'] = {'worker': max_turns}
     write_json(directory / 'external-mcp.json', {'servers': {}})
     probe.data['shared']['mcp'] = str(directory / 'external-mcp.json')
-    argv = CLIBackend(probe, directory / 'state').command('worker', model, Path(fixture['worktree']), job, {}, None)
+    argv = CLIBackend(probe, directory / 'state').command('worker', model, Path(fixture['worktree']), job, {}, None,
+                                                         delete_scope=fixture['delete_scope'])
     bind_readonly_run(job / 'mcp.json', fixture['run_state'])
     index = argv.index('--json-schema')
     del argv[index:index + 2]
     argv[argv.index('--output-format') + 1] = 'stream-json'
     argv += ['--verbose', '--max-budget-usd', str(max_budget_usd)]
     prompt = ('Execute this harmless disposable MCP integration probe. Call each exact named MCP tool once '
-              'with exactly the listed input, in order. Unknown ID, extra argv and the rejected git_query must '
-              'actually be attempted and rejected by MCP. Invalid JSON is a successful tool result with valid=false. '
+              'with exactly the listed input, in order. Unknown ID, extra argv, the rejected git_query and the '
+              'out-of-scope delete must actually be attempted and rejected by MCP. Invalid JSON is a successful tool result with valid=false. '
               'Continue after errors. Do not ask the user, retry, use agents, change permissions, substitute tools, '
               'or invoke Bash. Use only these MCP calls. Finish briefly; prose is not evidence.\n' +
               dump([{k: c[k] for k in ('name', 'tool', 'input')} for c in fixture['cases']]))
     write_json(job / 'command.json', argv)
     (job / 'prompt.txt').write_text(prompt, encoding='utf-8')
     report = dict(cli_attempted=True, models_called=False, simulation=False, model=model['model'], dispatch_id=job.name, evidence=str(directory),
-                  limitations='One CLI version and bounded fixture; not OS isolation or exhaustive coverage')
+                  limitations=('One CLI version and bounded fixture; not OS isolation or exhaustive coverage; '
+                               'delete_path is not exercised against concurrent renames'))
     print(f"[harness] LIVE TOOL SMOKE model={model['model']} max_budget_usd={max_budget_usd} evidence={directory}", file=sys.stderr, flush=True)
     env = dict(os.environ, CLAUDE_CODE_DISABLE_AUTO_MEMORY='1')
     try:

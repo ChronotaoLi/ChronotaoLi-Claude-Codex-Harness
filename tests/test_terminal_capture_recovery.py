@@ -84,7 +84,7 @@ class TerminalCaptureRecoveryTests(RepoCase):
         backend = self.backend(duration=.15, change=self.reject)
         result = self.engine(backend).start("Implement greet", read_json(ROOT / "examples/plan.json"))
         self.assertEqual(result["status"], "completed")
-        self.assertEqual(result["total_attempts"], 2)
+        self.assertEqual(sum(result["attempts"].values()), 2)
         self.assertEqual([item["review"]["verdict"] for item in result["review_history"]["greet"]],
                          ["request_changes", "approve"])
         entry = next(d for d in result["dispatches"] if d["id"] == backend.jobs[0].name)
@@ -108,7 +108,7 @@ class TerminalCaptureRecoveryTests(RepoCase):
             error.add_note("Observed process outcomes: " + json.dumps(facts))
             raise
         self.assertEqual(result["status"], "completed")
-        self.assertEqual(result["total_attempts"], 1)
+        self.assertEqual(sum(result["attempts"].values()), 1)
         for entry in result["dispatches"]:
             if entry["role"] in ("worker", "verification"):
                 self.assertTrue(entry["evidence_complete"])
@@ -128,7 +128,7 @@ class TerminalCaptureRecoveryTests(RepoCase):
         backend.release()
         result = self.engine(backend).resume(engine.run["id"])
         self.assertEqual(result["status"], "completed")
-        self.assertEqual(result["total_attempts"], 2)
+        self.assertEqual(sum(result["attempts"].values()), 2)
         self.assertEqual([item["review"]["verdict"] for item in result["review_history"]["greet"]],
                          ["request_changes", "approve"])
         original = next(d for d in result["dispatches"] if d["id"] == backend.jobs[0].name)
@@ -163,7 +163,7 @@ class TerminalCaptureRecoveryTests(RepoCase):
             path.write_bytes(original)
         result = self.engine(backend).resume(engine.run["id"])
         self.assertEqual(result["status"], "completed")
-        self.assertEqual(result["total_attempts"], 1)
+        self.assertEqual(sum(result["attempts"].values()), 1)
         self.assertEqual(sum(c["kind"] == "review" for c in backend.calls), 1)
 
     def test_cancellation_during_descendant_drain_never_rerolls_or_accepts(self):
@@ -303,7 +303,7 @@ class TerminalCaptureRecoveryTests(RepoCase):
                 backend.release()
                 result = self.engine(backend).resume(engine.run["id"])
                 self.assertEqual(result["status"], "completed")
-                self.assertEqual(result["total_attempts"], 1)
+                self.assertEqual(sum(result["attempts"].values()), 1)
                 self.assertEqual(sum(c["kind"] == "review" for c in backend.calls), 2)
 
     def test_nonzero_after_terminal_without_live_descendants_never_rerolls(self):
