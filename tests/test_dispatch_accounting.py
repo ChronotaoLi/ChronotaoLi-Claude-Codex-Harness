@@ -138,7 +138,7 @@ class DispatchAccountingTests(RepoCase):
     def test_worker_correction_preparation_can_resume_without_spending_attempt(self):
         def malformed_once(backend, kwargs, packet, result):
             if kwargs["role"] == "worker" and sum(c["role"] == "worker" for c in backend.calls) == 1:
-                result["summary"] = "x" * 4001
+                result["summary"] = "x" * 32001
 
         self.config.data["runtime"].update(max_attempts=2, max_total_attempts=2)
         backend = RecordingBackend(malformed_once)
@@ -164,7 +164,7 @@ class DispatchAccountingTests(RepoCase):
     def test_changed_candidate_discards_pending_worker_format_correction(self):
         def malformed_once(backend, kwargs, packet, result):
             if kwargs["role"] == "worker" and sum(c["role"] == "worker" for c in backend.calls) == 1:
-                result["summary"] = "x" * 4001
+                result["summary"] = "x" * 32001
 
         backend = RecordingBackend(malformed_once)
         engine = self.engine(backend)

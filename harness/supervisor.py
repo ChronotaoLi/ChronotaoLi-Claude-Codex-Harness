@@ -77,50 +77,85 @@ def supervise(repo, arguments, *, config_path=None, operation_id=None, popen=Non
     child = None
     handlers = {}
     interrupted = None
+    propagating = None
     try:
-        child = (popen or subprocess.Popen)(command, start_new_session=True)
-        receipt.update(pid=child.pid, process_observation='running')
-        write_json(path, receipt)
-        if threading.current_thread() is threading.main_thread():
-            def forward(signum, frame):
-                nonlocal interrupted
-                interrupted = signum
+        try:
+            child = (popen or subprocess.Popen)(command, start_new_session=True)
+            receipt.update(pid=child.pid, process_observation='running')
+            write_json(path, receipt)
+            if threading.current_thread() is threading.main_thread():
+                def forward(signum, frame):
+                    nonlocal interrupted
+                    interrupted = signum
+                    try:
+                        os.killpg(child.pid, signum)
+                    except ProcessLookupError:
+                        pass
+                    if signum == signal.SIGINT:
+                        raise KeyboardInterrupt
+                    raise SystemExit(128 + signum)
+                for signum in (signal.SIGINT, signal.SIGTERM):
+                    handlers[signum] = signal.signal(signum, forward)
+            receipt['exit_code'] = child.wait()
+            receipt['process_observation'] = 'exited'
+        except BaseException as error:
+            if child is None and isinstance(error, OSError):
+                receipt.update(process_observation='launch_failed', launch_error=type(error).__name__)
+            elif child is not None:
+                # On local cancellation, reap the supervised process group. This still
+                # does not prove separately grouped broker children have terminated.
                 try:
-                    os.killpg(child.pid, signum)
+                    os.killpg(child.pid, signal.SIGTERM)
+                    child.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    os.killpg(child.pid, signal.SIGKILL)
+                    child.wait()
                 except ProcessLookupError:
-                    pass
-                if signum == signal.SIGINT:
-                    raise KeyboardInterrupt
-                raise SystemExit(128 + signum)
-            for signum in (signal.SIGINT, signal.SIGTERM):
-                handlers[signum] = signal.signal(signum, forward)
-        receipt['exit_code'] = child.wait()
-        receipt['process_observation'] = 'exited'
+                    child.wait()
+                receipt.update(exit_code=child.returncode, process_observation='exited')
+                raise
+            else:
+                raise
     except BaseException as error:
-        if child is None and isinstance(error, OSError):
-            receipt.update(process_observation='launch_failed', launch_error=type(error).__name__)
-        elif child is not None:
-            # On local cancellation, reap the supervised process group. This still
-            # does not prove separately grouped broker children have terminated.
-            try:
-                os.killpg(child.pid, signal.SIGTERM)
-                child.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                os.killpg(child.pid, signal.SIGKILL)
-                child.wait()
-            except ProcessLookupError:
-                child.wait()
-            receipt.update(exit_code=child.returncode, process_observation='exited')
-            raise
-        else:
-            raise
+        # Whatever escapes the supervised wait, including a failure while reaping.
+        propagating = error
+        raise
     finally:
         for signum, handler in handlers.items():
             signal.signal(signum, handler)
         receipt.update(run_id=_linked_run(state, operation_id), observed_at=time.time(),
                        forwarded_signal=interrupted)
-        write_json(path, receipt)
-        with NotificationStore(repo) as store:
-            receipt['notification_id'] = store.add_process_observation(receipt)
-        write_json(path, receipt)
+        _write_receipt(path, receipt, propagating)
+        # The inbox is optional: its failure must neither replace the child's
+        # exit code nor mask an exception already propagating from this block.
+        try:
+            with NotificationStore(repo) as store:
+                receipt['notification_id'] = store.add_process_observation(receipt)
+        except Exception as error:
+            lines = str(error).splitlines()
+            receipt['notification_error'] = {'type': type(error).__name__,
+                                             'message': (lines[0] if lines else '')[:200]}
+        _write_receipt(path, receipt, propagating)
     return receipt
+
+
+def _write_receipt(path, receipt, propagating):
+    """Persist the receipt; while another exception propagates, a failure only annotates it.
+
+    Without a propagating exception a write failure is the result and is raised.
+    """
+    if propagating is None:
+        write_json(path, receipt)
+        return
+    try:
+        write_json(path, receipt)
+    except Exception as error:
+        note = (f'supervision receipt {path} was not updated while {type(propagating).__name__} '
+                f'propagated: {type(error).__name__}: {error}')
+        propagating.add_note(note)
+        # The CLI reports an interrupt in one line without notes; keep the diagnostic
+        # visible, but a broken stderr must not replace the propagating exception either.
+        try:
+            print(f'harness: {note}', file=sys.stderr, flush=True)
+        except Exception:
+            pass

@@ -17,7 +17,7 @@ def maximum_worker(blocker_kind="task"):
 
     result = {
         "status": "blocked", "blocker_kind": blocker_kind,
-        "summary": detail("Blocked summary "),
+        "summary": detail("Blocked summary ", 32000),
         "evidence": [detail(f"Evidence {index} ") for index in range(20)],
         "blockers": [detail(f"Blocker {index} ") for index in range(20)],
         "proposed_memories": [
@@ -111,7 +111,7 @@ class BoundedWorkerLifecycleTests(RepoCase):
         def repair(backend, kwargs, packet, result):
             if kwargs["role"] == "worker":
                 if "format_correction" not in packet:
-                    result["summary"] = "x" * 4001
+                    result["summary"] = "x" * 32001
                 else:
                     result["proposed_memories"] = [copy.deepcopy(proposal)]
                     corrected.append(result["dispatch_id"])

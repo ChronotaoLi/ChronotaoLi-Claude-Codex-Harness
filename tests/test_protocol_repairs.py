@@ -63,14 +63,14 @@ class OutputContractTests(unittest.TestCase):
         self.assertEqual(constraints["response.summary"]["maxLength"], 17)
         self.assertTrue(constraints["response.summary"]["non_blank"])
         self.assertTrue(constraints["response.proposed_memories[].source_paths"]["uniqueItems"])
-        validate_work({**work(), "summary": "x" * 4000})
+        validate_work({**work(), "summary": "x" * 32000})
         with self.assertRaises(RepairableFormatError):
-            validate_work({**work(), "summary": "x" * 4001})
+            validate_work({**work(), "summary": "x" * 32001})
 
     def test_hard_boundaries_take_priority_over_format_defects(self):
         schema = envelope(WORK, "implement", "dispatch-1")
         result = {"task_id": "implement", "dispatch_id": "dispatch-1", **work(),
-                  "summary": "x" * 4001}
+                  "summary": "x" * 32001}
         for changes in ({"dispatch_id": "other"}, {"extra": "unexpected"},
                         {"blocker_kind": "forged"}, {"proposed_memories": [False]}):
             with self.subTest(changes=changes):
@@ -79,7 +79,7 @@ class OutputContractTests(unittest.TestCase):
                 self.assertNotIsInstance(raised.exception, RepairableFormatError)
 
     def test_worker_semantics_cannot_be_repaired_as_formatting(self):
-        result = {**work(), "summary": "x" * 4001, "blocker_kind": "task"}
+        result = {**work(), "summary": "x" * 32001, "blocker_kind": "task"}
         with self.assertRaises(HarnessError) as raised:
             validate_work(result)
         self.assertNotIsInstance(raised.exception, RepairableFormatError)

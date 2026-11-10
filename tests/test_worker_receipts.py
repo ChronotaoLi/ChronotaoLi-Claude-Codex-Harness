@@ -303,7 +303,7 @@ class WorkerReceiptTests(RepoCase):
                 if kwargs['role'] == 'worker':
                     self.workers += 1
                     if self.workers == 1:
-                        result['summary'] = 'x' * 4001
+                        result['summary'] = 'x' * 32001
                     from harness.util import write_json
                     write_json(kwargs['job'] / 'response.json', result)
                 return result

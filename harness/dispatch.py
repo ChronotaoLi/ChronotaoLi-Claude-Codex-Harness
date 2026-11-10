@@ -260,7 +260,8 @@ class Dispatcher(RuntimeService):
             entry["command_directory"] = str(job / "commands")
             bind_worker_findings(self.context, entry, required["packet"])
         self.context.save()
-        self.context.event("dispatch_started", task_id=task_id, dispatch_id=dispatch_id, role=role)
+        # Events observe the ledger; the saved invoked flag stays authoritative.
+        self._observe("dispatch_prepared", task_id=task_id, dispatch_id=dispatch_id, role=role)
         def on_start(pgid):
             entry["pgid"] = pgid
             entry["process_state"] = "running"
@@ -317,8 +318,14 @@ class Dispatcher(RuntimeService):
             self.services.recovery.validate_invalid_repair_source(f"{role}:{kind}:{task_id}", before)
             if role == "commander":
                 self.services.recovery.commander_format_source(f"{role}:{kind}:{task_id}", packet, before)
-            if self.context.run["agent_dispatches"] >= self.context.config.data["runtime"]["max_agent_dispatches"]:
-                raise HarnessError("已达 run 模型派发次数上限；可显式增大 max_agent_dispatches 后恢复")
+            limit = self.context.config.data["runtime"]["max_agent_dispatches"]
+            if self.context.run["agent_dispatches"] >= limit:
+                from .diagnostics import remaining_model_calls
+                remaining = remaining_model_calls(self.context.run)
+                raise HarnessError(
+                    f"已达 run 模型派发次数上限（已用 {self.context.run['agent_dispatches']}，上限 {limit}）；"
+                    + (remaining["message"] + "；" if remaining else "")
+                    + "可显式增大 max_agent_dispatches 后恢复")
             # Persist all invocation budgets together after local preparation.
             # Provider failures still count; local context/hook/MCP/snapshot failures do not.
             if role == "worker":
@@ -367,6 +374,8 @@ class Dispatcher(RuntimeService):
                 entry["retained_candidate_revision"] = self.context.run.pop("retained_candidate")["plan_revision"]
             self.context.save()
             invoked = True
+            # Only after the durable invoked=True; a failed append never blocks the call.
+            self._observe("dispatch_started", task_id=task_id, dispatch_id=dispatch_id, role=role, invoked=True)
             result = self.context.backend.invoke(role=role, model=self.context.config.role(role, self.context.commander), cwd=self.context.worktree,
                                          job=job, schema=contract, prompt=prompt, run_path=self.context.directory / "state.json",
                                          on_start=on_start, task=task, kind=kind, on_outcome=on_outcome)
@@ -430,8 +439,16 @@ class Dispatcher(RuntimeService):
                 except Exception:
                     pass
             self.context.save()
-            try:
-                self.context.event("dispatch_finished", task_id=task_id, dispatch_id=dispatch_id, role=role,
-                           status=entry["status"], provider_usage=entry.get("provider_usage"))
-            except Exception:
-                pass
+            self._observe("dispatch_finished", task_id=task_id, dispatch_id=dispatch_id, role=role,
+                          status=entry["status"], invoked=invoked, provider_usage=entry.get("provider_usage"))
+
+    def _observe(self, event, **fields):
+        """Append a best-effort observation; consumers de-duplicate by dispatch_id.
+
+        The ledger and its event log are not written atomically: a crash can omit
+        an event, and recovery neither re-emits nor repeats one.
+        """
+        try:
+            self.context.event(event, **fields)
+        except Exception:
+            pass

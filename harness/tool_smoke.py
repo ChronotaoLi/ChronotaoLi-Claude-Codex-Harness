@@ -11,11 +11,12 @@ import sys
 import uuid
 from pathlib import Path
 
+from . import git
 from .adapters import CLIBackend
 from .command_server import command_id, ensure_command_processes_exited
 from .config import Config
 from .permission_smoke import _git
-from .util import HarnessError, dump, run_process, write_json
+from .util import HarnessError, dump, read_json, run_process, write_json
 
 
 def prepare_fixture(directory):
@@ -59,14 +60,42 @@ def prepare_fixture(directory):
     case('invalid_json', 'mcp__harness__json_check', {'path': 'untracked-invalid.json'}, {'valid': False})
     case('external_diff', 'mcp__harness__file_diff', {'left': str(left), 'right': str(right)},
          {'different': True, 'binary': False, 'diff': '--- left\n+++ right\n@@ -1 +1 @@\n-before\n+after\n'})
+    # The read-only harness MCP sees a bound run worktree; the broker does not.
+    binding = git.capture_worktree_binding(worktree, None)
+    write_json(directory / 'run-state.json', {'worktree': binding['worktree'], 'worktree_binding': binding})
+    blob = hashlib.sha1(b'blob %d\0' % len(known.encode()) + known.encode()).hexdigest()
+    case('git_query_ls_tree', 'mcp__harness__git_query',
+         {'argv': ['git', 'ls-tree', '-r', binding['detached_head'], '--', 'known.txt']},
+         {'exit_code': 0, 'stdout': f'100644 blob {blob}\tknown.txt\n', 'observed_complete': True,
+          'stdout_truncated': False})
+    case('git_query_hash_object', 'mcp__harness__git_query',
+         {'argv': ['git', 'hash-object', '--no-filters', '--', 'known.txt']},
+         {'exit_code': 0, 'stdout': blob + '\n', 'implementation': 'python_blob_hash'})
+    case('git_query_rejected', 'mcp__harness__git_query',
+         {'argv': ['git', 'ls-files', '--output=marker', '--', 'known.txt']}, error=True)
     expected = {str(worktree / 'argv-marker.json'): json.dumps([os.fsencode(x).hex() for x in values]),
                 str(worktree / '.git'): (worktree / '.git').read_text(),
                 str(worktree / 'known.txt'): known, str(worktree / 'argv_fixture.py'): script,
                 str(worktree / 'untracked-valid.json'): valid, str(worktree / 'untracked-invalid.json'): invalid,
                 str(left): 'before\n', str(right): 'after\n'}
-    fixture = dict(worktree=str(worktree), cases=cases, commands=commands, expected_files=expected)
+    fixture = dict(worktree=str(worktree), cases=cases, commands=commands, expected_files=expected,
+                   run_state=str(directory / 'run-state.json'))
     write_json(directory / 'fixture.json', fixture)
     return fixture
+
+
+def bind_readonly_run(mcp_path, run_state):
+    """Give only the read-only harness MCP the fixture worktree binding.
+
+    The broker keeps run_path=None: it has no live dispatch ledger to verify.
+    """
+    document = read_json(mcp_path)
+    server = document['mcpServers']['harness']
+    if '--run' in server['args']:
+        raise HarnessError('Tool smoke harness MCP already has a run binding')
+    server['args'] = [*server['args'], '--run', str(run_state)]
+    write_json(mcp_path, document)
+    return document
 
 
 def _value(outcome):
@@ -117,8 +146,9 @@ def inspect_evidence(path, fixture, job=None):
             passed = passed and key in results and bool(result.get('is_error', False)) == case['error']
             # Broker rejections must reach MCP; CLI permission denials are not broker evidence.
             passed = passed and not any(d.get('tool_use_id') == key for d in denials if isinstance(d, dict))
-            if case['error'] and case['name'] in ('unknown_id', 'extra_argv'):
-                expected_error = 'Unknown command_id' if case['name'] == 'unknown_id' else 'run_command accepts only command_id'
+            if case['error'] and case['name'] in ('unknown_id', 'extra_argv', 'git_query_rejected'):
+                expected_error = {'unknown_id': 'Unknown command_id', 'extra_argv': 'run_command accepts only command_id',
+                                  'git_query_rejected': 'git_query rejected without execution'}[case['name']]
                 passed = passed and expected_error in json.dumps(result.get('content', ''), ensure_ascii=False)
             if not case['error']:
                 try:
@@ -189,13 +219,14 @@ def tool_smoke(config, repo, *, timeout=180, max_turns=20, max_budget_usd=1.0):
     write_json(directory / 'external-mcp.json', {'servers': {}})
     probe.data['shared']['mcp'] = str(directory / 'external-mcp.json')
     argv = CLIBackend(probe, directory / 'state').command('worker', model, Path(fixture['worktree']), job, {}, None)
+    bind_readonly_run(job / 'mcp.json', fixture['run_state'])
     index = argv.index('--json-schema')
     del argv[index:index + 2]
     argv[argv.index('--output-format') + 1] = 'stream-json'
     argv += ['--verbose', '--max-budget-usd', str(max_budget_usd)]
     prompt = ('Execute this harmless disposable MCP integration probe. Call each exact named MCP tool once '
-              'with exactly the listed input, in order. Unknown ID and extra argv must actually be attempted '
-              'and rejected by the MCP broker. Invalid JSON is a successful tool result with valid=false. '
+              'with exactly the listed input, in order. Unknown ID, extra argv and the rejected git_query must '
+              'actually be attempted and rejected by MCP. Invalid JSON is a successful tool result with valid=false. '
               'Continue after errors. Do not ask the user, retry, use agents, change permissions, substitute tools, '
               'or invoke Bash. Use only these MCP calls. Finish briefly; prose is not evidence.\n' +
               dump([{k: c[k] for k in ('name', 'tool', 'input')} for c in fixture['cases']]))

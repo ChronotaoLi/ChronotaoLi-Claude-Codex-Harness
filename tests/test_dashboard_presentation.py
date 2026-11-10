@@ -534,6 +534,39 @@ class DashboardPresentationTests(unittest.TestCase):
   assert.ok(!visibleText(byId.main).includes("$0.2500"));
 ''')
 
+    def test_dispatch_event_meanings_review_rounds_and_lower_bound_are_projected(self):
+        rounds = {"read_only": True, "cause": "unknown", "tasks": {"t2": [
+            {"round": 1, "attempt": 1, "review_dispatch_id": REVIEWER, "snapshot_digest": "a" * 64,
+             "verdict": "request_changes", "new_blocking": ["OLD-001"]},
+            {"round": 2, "attempt": 2, "review_dispatch_id": LATER, "snapshot_digest": "b" * 64,
+             "verdict": "request_changes", "new_blocking": ["ROUND-TWO-NEW"], "status": "invalidated"}]}}
+        remaining = {"lower_bound": 2, "tasks": {"t2": 1}, "final_review": 1,
+                     "message": "如果之后全部一次通过，至少还需 2 次模型调用（下界：BOUND-TEXT）"}
+        records = [event(1990.0, "dispatch_started", dispatch_id=WORKER),
+                   event(1991.0, "dispatch_prepared", dispatch_id=LATER),
+                   event(1992.0, "dispatch_finished", dispatch_id=LATER, invoked=False),
+                   event(1993.0, "dispatch_started", dispatch_id=REVIEWER, invoked=True),
+                   event(1994.0, "dispatch_finished", dispatch_id=REVIEWER, invoked=True)]
+        data = {"detail": detail("run_obs", "Observe", dispatches=[dispatch(WORKER)], events=records,
+                                 summary={"review_rounds": rounds, "remaining_model_calls": remaining})}
+        self.run_browser(data, r'''
+  navigate("#/runs/run_obs");
+  await respond("/api/runs/run_obs", D.detail);
+  fire(one(attrIs("data-tab", "events")), "click");
+  const shown = visibleText(byId.main);
+  for (const label of ["派发准备（旧版事件，不表示已调用）", "准备派发", "派发结束（未调用）", "开始调用", "调用结束"]) {
+    assert.ok(shown.includes(label), "event label shown: " + label);
+  }
+  fire(one(attrIs("data-tab", "cost")), "click");
+  const bound = one(attrIs("data-remaining-calls", "2"));
+  assert.ok(visibleText(bound).includes("BOUND-TEXT"));
+  fire(one(attrIs("data-tab", "meta")), "click");
+  const meta = visibleText(byId.main);
+  for (const expected of ["OLD-001", "ROUND-TWO-NEW", "invalidated", "b".repeat(64)]) {
+    assert.ok(meta.includes(expected), "review round shown: " + expected);
+  }
+''')
+
     def test_stale_detail_and_index_responses_never_render_on_newer_views(self):
         data = {"one": detail("run_one", "GOAL-ONE"), "two": detail("run_two", "GOAL-TWO"),
                 "stale_index": file_index("run_two", "STALE-INDEX-PATH.json"),

@@ -20,6 +20,10 @@ DEPENDENCIES = {"type": "array", "items": TASK_ID}
 OBLIGATIONS = {"type": "array", "items": NONBLANK, "minItems": 1}
 SAFE_ID = {"type": "string", "pattern": r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,95}$"}
 DETAIL = {"type": "string", "minLength": 1, "maxLength": 4000}
+# The worker's own summary only bounds ledger size: feedback projections excerpt
+# it with a digest-bound reference to the full artifact. DETAIL stays unchanged
+# for blockers, evidence and findings.
+WORK_SUMMARY = {"type": "string", "minLength": 1, "maxLength": 32000}
 EVIDENCE = {"type": "array", "items": DETAIL, "maxItems": 20}
 PROPOSAL = obj(key=SAFE_ID,
                abstract={"type": "string", "minLength": 1, "maxLength": 500},
@@ -46,7 +50,7 @@ REPLAN = obj(action={"type": "string", "enum": ["revise", "stop"]},
              reason=DETAIL, new_tasks={"type": "array", "items": TASK},
              updates={"type": "array", "items": TASK_UPDATE})
 WORK = obj(status={"type": "string", "enum": ["completed", "blocked"]},
-           summary=DETAIL, evidence=EVIDENCE, blockers=EVIDENCE,
+           summary=WORK_SUMMARY, evidence=EVIDENCE, blockers=EVIDENCE,
            blocker_kind={"type": "string", "enum": ["none", "task", "environment", "operator", "continuation"]},
            proposed_memories=PROPOSALS)
 FILE_EVIDENCE = obj(path={"type": "string", "minLength": 1, "maxLength": 4096},

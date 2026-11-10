@@ -22,7 +22,7 @@ class ReplanFormatRecoveryTests(RepoCase):
         def fail_repair(backend, kwargs, packet, result):
             if kwargs["role"] == "worker":
                 if "format_correction" not in packet:
-                    result["summary"] = "x" * 4001
+                    result["summary"] = "x" * 32001
             elif kwargs["kind"] == "dispatch":
                 result.update(action="replan", instruction="Resolve the unmet requirement through planning")
 

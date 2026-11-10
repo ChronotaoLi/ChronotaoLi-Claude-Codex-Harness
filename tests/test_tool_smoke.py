@@ -77,7 +77,11 @@ class ToolSmokeStartupTests(unittest.TestCase):
                 (output.parent / 'process.stderr').write_text('Invalid session ID')
                 return 1
             argv = ['claude', '--json-schema', '{}', '--output-format', 'json']
-            with patch('harness.tool_smoke.CLIBackend.command', return_value=argv), patch('harness.tool_smoke.run_process', side_effect=failed):
+            def command(role, model, cwd, job, schema, run_path):
+                # Like the real adapter, publish the per-dispatch MCP config.
+                (job / 'mcp.json').write_text(json.dumps({'mcpServers': {'harness': {'args': []}}}))
+                return list(argv)
+            with patch('harness.tool_smoke.CLIBackend.command', side_effect=command), patch('harness.tool_smoke.run_process', side_effect=failed):
                 with self.assertRaises(HarnessError):
                     tool_smoke(config, tmp)
             reports = list(Path(tmp).glob('.harness/tool-smoke/*/report.json'))

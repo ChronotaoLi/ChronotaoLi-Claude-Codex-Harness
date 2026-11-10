@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 
 from .file_tools import file_diff, file_sha256, json_check
+from . import git_query as git_queries
 from .memory import Memory
 from .shared import read_skill, skills_catalog
 from .util import HarnessError, read_json
@@ -26,6 +27,13 @@ TOOLS.extend([
      "inputSchema": {"type": "object", "properties": {"path": {"type": "string", "minLength": 1, "maxLength": 4096}}, "required": ["path"], "additionalProperties": False}},
     {"name": "file_diff", "description": "Compare two regular files up to 8 MiB each using Python, without Git, filters, subprocesses or writes. Relative paths use the run worktree; absolute external paths are allowed. Returns byte difference, both SHA256 digests, binary flag, and UTF-8 unified diff limited to 24000 characters with truncated flag. Binary files return digests and difference without text diff.",
      "inputSchema": {"type": "object", "properties": {"left": {"type": "string", "minLength": 1, "maxLength": 4096}, "right": {"type": "string", "minLength": 1, "maxLength": 4096}}, "required": ["left", "right"], "additionalProperties": False}},
+    {"name": "git_query", "description": "Run one fixed-form read-only Git query on the run worktree without a shell, pager, writes or network. Forms: "
+     + "; ".join(git_queries.FORMS) + ". " + git_queries.RULES + " Any other argv is rejected without execution. "
+     "An argv in these forms needs no operator grant when a plan's required_commands or self_checks, or a continuation "
+     "request, lists it: run it with this tool, not Bash or the command broker. Pipelines, redirections and other "
+     "options are not covered.",
+     "inputSchema": {"type": "object", "properties": {"argv": {"type": "array", "items": {"type": "string"},
+                     "minItems": 2, "maxItems": git_queries.MAX_ARGV}}, "required": ["argv"], "additionalProperties": False}},
 ])
 for tool in TOOLS:
     tool["annotations"] = {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False}
@@ -59,6 +67,16 @@ def handle(request, memory, skills, run):
             base = Path(state["worktree"]) if state.get("worktree") else Path.cwd()
             value = {"file_sha256": file_sha256, "json_check": json_check,
                      "file_diff": file_diff}[name](**args, base=base)
+        elif name == "git_query":
+            if not isinstance(args, dict) or set(args) != {"argv"}:
+                raise HarnessError("git_query requires exactly: argv")
+            query, reason = git_queries.parse_git_query(args["argv"])
+            if query is None:
+                raise HarnessError(f"git_query rejected without execution: {reason}")
+            state = read_json(run) if run else {}
+            if not state.get("worktree") or not isinstance(state.get("worktree_binding"), dict):
+                raise HarnessError("git_query requires a run worktree with its Git binding")
+            value = git_queries.run_git_query(query, Path(state["worktree"]), state["worktree_binding"])
         elif name == "memory_search":
             if not isinstance(args, dict) or set(args) - {"query", "key", "level"}:
                 raise HarnessError("memory_search requires query or key and optional level")

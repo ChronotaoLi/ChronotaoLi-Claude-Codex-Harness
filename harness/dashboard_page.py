@@ -252,7 +252,7 @@ APP_JS = r""""use strict";
     operator_blocked: "等待操作者", continuation_blocked: "等待续作授权", runtime_failed: "运行失败", unknown: "未知"
   };
   var EVENT = {
-    dispatch_started: "开始调用", dispatch_finished: "调用结束", task_accepted: "任务已接受",
+    dispatch_prepared: "准备派发", dispatch_started: "开始调用", dispatch_finished: "派发结束", task_accepted: "任务已接受",
     review_rejected: "审阅要求修改", verification_failed: "验证失败", worker_result_rejected: "worker 结果被拒绝",
     run_completed: "运行完成", run_paused: "运行暂停", run_stopped: "运行停止", run_abandoned: "运行已放弃",
     plan_awaiting_approval: "计划等待批准", plan_approved: "计划已批准", plan_revised: "计划已修订",
@@ -847,7 +847,12 @@ APP_JS = r""""use strict";
     return node;
   }
 
+  // Event names are observations; invoked comes from the ledger write they follow.
+  // Older dispatch_started records (no invoked field) were written before the budget check.
   function eventLabel(record) {
+    if (record.event === "dispatch_started" && record.invoked !== true) { return "派发准备（旧版事件，不表示已调用）"; }
+    if (record.event === "dispatch_finished" && record.invoked === true) { return "调用结束"; }
+    if (record.event === "dispatch_finished" && record.invoked === false) { return "派发结束（未调用）"; }
     return EVENT[record.event] || show(record.event);
   }
 
@@ -937,6 +942,7 @@ APP_JS = r""""use strict";
       "本页不探测进程，只显示 process_state、exit_confirmed、pgid 与事件时间；没有新日志不等于卡死。",
       "worker completed 只表示 worker 返回了结果，不等于任务 accepted；接受以任务进度为准。",
       data.notes && data.notes.invoked ? data.notes.invoked : "invoked=true 不证明供应商已收到请求。",
+      data.notes && data.notes.events ? data.notes.events : "事件只是观察，调用计数以台账为准。",
       "各文件分别读取，显示采样时间而不是原子快照。"]));
     nodes.push(explain);
 
@@ -1238,6 +1244,12 @@ APP_JS = r""""use strict";
     meters.appendChild(budgetMeter("再规划", b.replan_attempts, limits.max_replans));
     meters.appendChild(budgetMeter("整体验收", b.final_attempts, limits.max_final_attempts));
     panel.appendChild(meters);
+    var remaining = summary.remaining_model_calls;
+    if (remaining && typeof remaining.message === "string") {
+      var bound = notice(remaining.message + "；只读投影，不改变预算。", "hint");
+      attr(bound, "data-remaining-calls", show(remaining.lower_bound));
+      panel.appendChild(bound);
+    }
     panel.appendChild(kv([
       ["任务尝试（work_attempts）", attempts && Object.keys(attempts).length ? Object.keys(attempts).map(function (key) {
         return key + "=" + attempts[key] + "/" + show(limits.max_attempts); }).join("，") : UNAVAILABLE],
@@ -1344,6 +1356,19 @@ APP_JS = r""""use strict";
     if (summary.continuation) {
       panel.appendChild(el("h3", null, "续作绑定"));
       panel.appendChild(kv(Object.keys(summary.continuation).map(function (key) { return [key, summary.continuation[key]]; })));
+    }
+    var rounds = summary.review_rounds && summary.review_rounds.tasks ? summary.review_rounds.tasks : null;
+    if (rounds && Object.keys(rounds).length) {
+      panel.appendChild(el("h3", null, "审阅逐轮首次出现的阻断问题（只读度量，不推断成因）"));
+      var rows = [];
+      Object.keys(rounds).forEach(function (task) {
+        (Array.isArray(rounds[task]) ? rounds[task] : []).forEach(function (item) {
+          var ids = Array.isArray(item.new_blocking) ? item.new_blocking : [];
+          rows.push([task, show(item.round) + (item.status ? "（" + item.status + "）" : ""), item.verdict,
+            ids.length ? ids.join("、") : optional(null), mono(item.review_dispatch_id), mono(item.snapshot_digest)]);
+        });
+      });
+      panel.appendChild(table(["任务", "轮次", "结论", "首次出现的阻断", "审阅 dispatch", "候选摘要"], rows, "review-rounds"));
     }
     return panel;
   }

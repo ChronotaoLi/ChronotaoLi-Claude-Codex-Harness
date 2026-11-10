@@ -14,6 +14,7 @@ import shutil
 import time
 
 from .contracts import WORK, envelope, validate_structure, validate_work_semantics
+from .git_query import covers as git_query_covers
 from .recovery import RECOVERY_BUSY_KEYS, read_bound_result, snapshot_digest
 from .util import HarnessError, dump, write_json
 
@@ -352,6 +353,10 @@ class EnvironmentRecovery(RuntimeService):
                 else:
                     allowed = self.context.config.data["permissions"]["worker_commands"] + self.context.config.data["verification"]["commands"]
                     passed = check["argv"] in allowed
+                    if not passed and git_query_covers(check["argv"]):
+                        # Built-in read-only capability exists; nothing was executed.
+                        results.append({"check": check, "passed": True, "coverage": "builtin_git_query"})
+                        continue
                 results.append({"check": check, "passed": passed})
             except OSError as error:
                 results.append({"check": check, "passed": False, "error": str(error)})

@@ -455,7 +455,7 @@ class EnvironmentUpdateTests(RepoCase):
         def remove_prerequisite(backend, kwargs, packet, result):
             if kwargs['role'] == 'worker' and sum(c['role'] == 'worker' for c in backend.calls) == 2:
                 marker.unlink()
-                result['summary'] = 'x' * 4001
+                result['summary'] = 'x' * 32001
 
         backend.change = remove_prerequisite
         with self.assertRaises(HarnessError):

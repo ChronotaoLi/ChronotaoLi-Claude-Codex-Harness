@@ -126,12 +126,17 @@ class SupervisorTests(unittest.TestCase):
             launches.append(argv)
             return subprocess.Popen([sys.executable, '-c', 'raise SystemExit(9)'], **kwargs)
         with patch.object(NotificationStore, 'add_process_observation', side_effect=sqlite3.OperationalError('simulated unavailable inbox')):
-            with self.assertRaises(sqlite3.OperationalError):
-                supervise(self.repo, ['run', 'goal'], popen=launch)
+            # The inbox failure is recorded, never substituted for the child's exit.
+            receipt = supervise(self.repo, ['run', 'goal'], popen=launch)
+            self.assertEqual(receipt['exit_code'], 9)
+            self.assertEqual(receipt['notification_error'],
+                             {'type': 'OperationalError', 'message': 'simulated unavailable inbox'})
+            self.assertNotIn('notification_id', receipt)
             receipts = list((self.repo / '.harness/supervision').glob('supervision_*.json'))
             self.assertEqual(len(receipts), 1)
             saved = receipts[0].read_bytes()
             terminal = json.loads(saved)
+            self.assertEqual(terminal, receipt)
             self.assertEqual(terminal['process_observation'], 'exited')
             self.assertEqual(terminal['exit_code'], 9)
             for _ in range(2):
@@ -156,8 +161,9 @@ class SupervisorTests(unittest.TestCase):
         import sqlite3
         with NotificationStore(self.repo) as active:
             with patch('harness.supervisor.NotificationStore', side_effect=sqlite3.OperationalError):
-                with self.assertRaises(sqlite3.OperationalError):
-                    supervise(self.repo, ['run', 'goal'], popen=lambda *a, **k: (_ for _ in ()).throw(FileNotFoundError()))
+                receipt = supervise(self.repo, ['run', 'goal'], popen=lambda *a, **k: (_ for _ in ()).throw(FileNotFoundError()))
+            self.assertEqual(receipt['process_observation'], 'launch_failed')
+            self.assertEqual(receipt['notification_error']['type'], 'OperationalError')
             for _ in range(2):
                 with patch.object(active, '_insert', side_effect=sqlite3.OperationalError):
                     with self.assertRaises(sqlite3.OperationalError):
@@ -168,3 +174,137 @@ class SupervisorTests(unittest.TestCase):
             self.assertEqual(seen[0]['process_observation'], 'launch_failed')
             active.deliver_due(seen.append)
             self.assertEqual(len(seen), 1)
+
+    def test_cli_exit_code_follows_child_when_inbox_cannot_open(self):
+        import sqlite3
+        from harness import cli
+        real = subprocess.Popen
+        launched = []
+        def launch(argv, **kwargs):
+            # Stand in for the supervised Harness command; no run or model call happens.
+            launched.append(argv)
+            return real([sys.executable, '-c', 'raise SystemExit(7)'], **kwargs)
+        from types import SimpleNamespace
+        # Replace only the supervisor's launcher; git and other subprocesses stay real.
+        stub = SimpleNamespace(Popen=launch, TimeoutExpired=subprocess.TimeoutExpired)
+        with patch('harness.supervisor.subprocess', stub), \
+                patch('harness.supervisor.NotificationStore', side_effect=sqlite3.OperationalError('inbox locked')):
+            code = cli._main(['--repo', str(self.repo), 'supervise', '--', 'run', 'goal'])
+        self.assertEqual(code, 7)
+        self.assertEqual(len(launched), 1)
+        self.assertEqual(launched[0][:3], [sys.executable, '-m', 'harness'])
+        receipt, = [json.loads(path.read_text()) for path in (self.repo / '.harness/supervision').glob('supervision_*.json')]
+        self.assertEqual(receipt['exit_code'], 7)
+        self.assertEqual(receipt['process_observation'], 'exited')
+        self.assertEqual(receipt['notification_error'], {'type': 'OperationalError', 'message': 'inbox locked'})
+        self.assertNotIn('notification_id', receipt)
+
+    def interrupted_launch(self):
+        """A real sleeping child whose first wait() is interrupted like Ctrl-C."""
+        children = []
+        class Interrupted:
+            def __init__(self, child):
+                self.child, self.pid, self.calls = child, child.pid, 0
+            @property
+            def returncode(self):
+                return self.child.returncode
+            def wait(self, timeout=None):
+                self.calls += 1
+                if self.calls == 1:
+                    raise KeyboardInterrupt
+                return self.child.wait(timeout)
+        def launch(argv, **kwargs):
+            children.append(subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'], **kwargs))
+            return Interrupted(children[-1])
+        def cleanup():
+            for child in children:
+                if child.poll() is None:
+                    child.kill()
+                child.wait()
+        self.addCleanup(cleanup)
+        return launch
+
+    def receipts(self):
+        return [json.loads(path.read_text()) for path in (self.repo / '.harness/supervision').glob('supervision_*.json')]
+
+    def test_inbox_failure_never_replaces_a_propagating_interrupt(self):
+        import sqlite3
+        with patch('harness.supervisor.NotificationStore', side_effect=sqlite3.OperationalError('inbox locked')):
+            with self.assertRaises(KeyboardInterrupt):
+                supervise(self.repo, ['run', 'goal'], popen=self.interrupted_launch())
+        receipt, = self.receipts()
+        self.assertEqual(receipt['exit_code'], -signal.SIGTERM)
+        self.assertEqual(receipt['process_observation'], 'exited')
+        self.assertEqual(receipt['notification_error']['type'], 'OperationalError')
+
+    def test_receipt_write_failure_after_inbox_failure_never_replaces_a_propagating_interrupt(self):
+        import io
+        import sqlite3
+        from harness import supervisor
+        real = supervisor.write_json
+        # Fail only the final write that carries notification_error, or every write in
+        # the cleanup once the observation time is set.
+        for failing in ('notification_error', 'observed_at'):
+            with self.subTest(failing=failing):
+                self.setUp()
+                def write(path, value, failing=failing):
+                    if value.get(failing) is not None:
+                        raise OSError('simulated receipt write failure')
+                    return real(path, value)
+                stderr = io.StringIO()
+                with patch('harness.supervisor.NotificationStore', side_effect=sqlite3.OperationalError('inbox locked')), \
+                        patch('harness.supervisor.write_json', side_effect=write), patch('sys.stderr', stderr):
+                    with self.assertRaises(KeyboardInterrupt) as raised:
+                        supervise(self.repo, ['run', 'goal'], popen=self.interrupted_launch())
+                notes = getattr(raised.exception, '__notes__', [])
+                self.assertTrue(notes)
+                self.assertTrue(all('simulated receipt write failure' in note for note in notes))
+                self.assertIn('simulated receipt write failure', stderr.getvalue())
+                receipt, = self.receipts()
+                self.assertNotIn('notification_error', receipt)
+                if failing == 'notification_error':
+                    self.assertEqual(len(notes), 1)
+                    self.assertEqual(receipt['process_observation'], 'exited')
+                    self.assertEqual(receipt['exit_code'], -signal.SIGTERM)
+                else:
+                    self.assertEqual(len(notes), 2)
+                    self.assertEqual(receipt['process_observation'], 'running')
+
+    def test_failing_stderr_after_receipt_write_failure_never_replaces_a_propagating_interrupt(self):
+        import sqlite3
+        from harness import supervisor
+        real = supervisor.write_json
+        attempts = []
+        class BrokenStderr:
+            def write(self, text):
+                attempts.append(text)
+                raise OSError('simulated stderr failure')
+            def flush(self):
+                raise OSError('simulated stderr failure')
+        def write(path, value):
+            if value.get('observed_at') is not None:
+                raise OSError('simulated receipt write failure')
+            return real(path, value)
+        with patch('harness.supervisor.NotificationStore', side_effect=sqlite3.OperationalError('inbox locked')), \
+                patch('harness.supervisor.write_json', side_effect=write), patch('sys.stderr', BrokenStderr()):
+            with self.assertRaises(KeyboardInterrupt) as raised:
+                supervise(self.repo, ['run', 'goal'], popen=self.interrupted_launch())
+        self.assertTrue(attempts)
+        notes = raised.exception.__notes__
+        self.assertEqual(len(notes), 2)
+        self.assertTrue(all('simulated receipt write failure' in note for note in notes))
+        receipt, = self.receipts()
+        self.assertEqual(receipt['process_observation'], 'running')
+
+    def test_receipt_write_failure_without_a_propagating_exception_is_raised(self):
+        from harness import supervisor
+        real = supervisor.write_json
+        def write(path, value):
+            if value.get('observed_at') is not None:
+                raise OSError('simulated receipt write failure')
+            return real(path, value)
+        def launch(argv, **kwargs):
+            return subprocess.Popen([sys.executable, '-c', 'raise SystemExit(0)'], **kwargs)
+        with patch('harness.supervisor.write_json', side_effect=write):
+            with self.assertRaisesRegex(OSError, 'simulated receipt write failure'):
+                supervise(self.repo, ['run', 'goal'], popen=launch)

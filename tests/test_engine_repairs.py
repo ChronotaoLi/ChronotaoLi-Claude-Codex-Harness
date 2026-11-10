@@ -43,7 +43,7 @@ class EngineRepairsTests(RepoCase):
     def test_one_format_repair_has_fresh_dispatch_and_preserves_model_and_budget(self):
         def malformed(backend, kwargs, packet, result):
             if kwargs["role"] == "worker" and sum(c["role"] == "worker" for c in backend.calls) == 1:
-                result["summary"] = "x" * 4001
+                result["summary"] = "x" * 32001
         backend = RecordingBackend(malformed)
         engine = self.engine(backend)
         result = engine.start("Implement greet", self.plan())
@@ -57,14 +57,14 @@ class EngineRepairsTests(RepoCase):
         self.assertEqual(result["total_attempts"], 2)
         correction = [call for call in backend.calls if call["role"] == "worker"][1]["packet"]["format_correction"]
         self.assertEqual(correction["previous_dispatch"], workers[0]["dispatch_id"])
-        self.assertEqual(len(read_json(Path(correction["artifact"]) / "response.json")["summary"]), 4001)
+        self.assertEqual(len(read_json(Path(correction["artifact"]) / "response.json")["summary"]), 32001)
         self.assertEqual(result["accepted"]["greet"]["verification"],
                          str(engine.services.verification.verification_directory("greet", 2) / "results.json"))
 
     def test_second_format_violation_blocks_without_a_third_worker(self):
         def malformed(backend, kwargs, packet, result):
             if kwargs["role"] == "worker":
-                result["summary"] = "x" * 4001
+                result["summary"] = "x" * 32001
         backend = RecordingBackend(malformed)
         engine = self.engine(backend)
         with self.assertRaises(HarnessError):
@@ -78,7 +78,7 @@ class EngineRepairsTests(RepoCase):
     def test_format_repair_cannot_exceed_task_or_total_worker_budget(self):
         def malformed(backend, kwargs, packet, result):
             if kwargs["role"] == "worker":
-                result["summary"] = "x" * 4001
+                result["summary"] = "x" * 32001
         for limit in ("max_attempts", "max_total_attempts"):
             with self.subTest(limit=limit):
                 self.config.data["runtime"]["max_attempts"] = 3
@@ -96,7 +96,7 @@ class EngineRepairsTests(RepoCase):
         for mode in ("identity", "scope", "worker_state", "memory_approval"):
             def invalid(backend, kwargs, packet, result):
                 if kwargs["role"] == "worker" and mode != "memory_approval":
-                    result["summary"] = "x" * 4001
+                    result["summary"] = "x" * 32001
                     if mode == "identity":
                         result["dispatch_id"] = "previous-dispatch"
                     elif mode == "scope":
@@ -159,7 +159,7 @@ class EngineRepairsTests(RepoCase):
             def blocked(backend, kwargs, packet, result):
                 if kwargs["role"] == "worker":
                     result.update(status="blocked", blocker_kind=blocker_kind,
-                                  blockers=["Required capability is missing"], summary="x" * 4001)
+                                  blockers=["Required capability is missing"], summary="x" * 32001)
             with self.subTest(blocker_kind=blocker_kind):
                 backend = RecordingBackend(blocked)
                 engine = self.engine(backend)

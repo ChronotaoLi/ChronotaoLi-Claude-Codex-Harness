@@ -36,7 +36,7 @@ class WorkerCorrectionRecoveryTests(RepoCase):
 
         def malformed(backend, kwargs, packet, result):
             if kwargs["role"] == "worker":
-                result["summary"] = "x" * 4001
+                result["summary"] = "x" * 32001
 
         backend = RecordingBackend(malformed)
         engine = self.engine(backend)
@@ -80,7 +80,7 @@ class WorkerCorrectionRecoveryTests(RepoCase):
                         return
                     attempt = len(self.workers(backend))
                     if attempt == 1:
-                        result["summary"] = "x" * 4001
+                        result["summary"] = "x" * 32001
                     elif attempt == 2:
                         if invalid_kind == "identity":
                             result["dispatch_id"] = "another-dispatch"
@@ -113,7 +113,7 @@ class WorkerCorrectionRecoveryTests(RepoCase):
                 return
             attempt = len(self.workers(backend))
             if attempt == 1:
-                result["summary"] = "x" * 4001
+                result["summary"] = "x" * 32001
 
 
         backend = RecordingBackend(unavailable_correction)
@@ -142,7 +142,7 @@ class WorkerCorrectionRecoveryTests(RepoCase):
     def test_atomic_return_before_pending_cleanup_does_not_replay_correction(self):
         def malformed_twice(backend, kwargs, packet, result):
             if kwargs["role"] == "worker" and len(self.workers(backend)) <= 2:
-                result["summary"] = "x" * 4001
+                result["summary"] = "x" * 32001
 
         backend = RecordingBackend(malformed_twice)
         engine = self.engine(backend)

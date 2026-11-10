@@ -19,7 +19,7 @@ class WorkAttemptBudgetTests(RepoCase):
             if kwargs["role"] == "worker" and sum(c["role"] == "worker" for c in backend.calls) == 1:
                 result.update(status="blocked", blocker_kind=kind, blockers=["Wait for prerequisite"])
                 if malformed:
-                    result["summary"] = "x" * 4001
+                    result["summary"] = "x" * 32001
 
         backend = ScriptedBackend(block_first)
         engine = self.engine(backend)

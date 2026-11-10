@@ -4,6 +4,7 @@ from __future__ import annotations
 import sys
 from copy import deepcopy
 
+from . import git_query
 from .command_server import command_id
 from .context import (
     capacity_report, compact_checks, compact_plan, compact_reviews, FINAL_REVIEW_INSTRUCTION,
@@ -172,6 +173,12 @@ class PacketBuilder(RuntimeService):
             constraints["permission_guidance"] = ("Command broker is worker-only. Use file tools for JSON, hashes and differences; "
                 "append readonly Bash paths after --. A denied command does not prove a path unreadable; use Read/Glob/Grep. "
                 "Command grants do not expand task scope.")
+            packet = {**packet, "tool_constraints": constraints}
+        elif role == "worker" and git_query.TOOL not in packet.get("tool_constraints", {}).get("file_tools", [git_query.TOOL]):
+            # Workers run the queries; the tool's own MCP description carries the
+            # form table, so the prompt only names it. Idempotent across replays.
+            constraints = dict(packet["tool_constraints"])
+            constraints["file_tools"] = [*constraints["file_tools"], git_query.TOOL]
             packet = {**packet, "tool_constraints": constraints}
         task = next((item for item in self.context.run.get("tasks", []) if item["id"] == task_id), None)
         if role == "worker" and self.context.run.get("review_history", {}).get(task_id):

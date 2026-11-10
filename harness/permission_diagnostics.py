@@ -1,6 +1,18 @@
 """Read-only permission evidence; local grants never explain provider decisions."""
+from .git_query import parse_git_query
 from .stream_capture import permission_denial_projection
 from .util import HarnessError
+
+GIT_QUERY_TOOL = "harness.git_query"
+
+
+def builtin_coverage(argv):
+    """Built-in capability is reported apart from configured exact argv."""
+    query, reason = parse_git_query(argv)
+    if query is None:
+        return {"tool": GIT_QUERY_TOOL, "covered": False, "reason": reason}
+    return {"tool": GIT_QUERY_TOOL, "covered": True, "form": query["form"],
+            "meaning": "capability_available_not_executed"}
 
 
 def command_capability_projection(config, argv):
@@ -13,8 +25,10 @@ def command_capability_projection(config, argv):
         if argv in config.data[section][key]:
             matches.append(section + "." + key)
     return {"local_exact_argv_match": bool(matches), "configured_sources": matches,
+            "builtin_coverage": builtin_coverage(argv),
             "provider_permission_reason": "unavailable", "native_read_tools": ["Read", "Glob", "Grep"],
             "readonly_file_tools": ["harness.file_sha256", "harness.json_check", "harness.file_diff"],
+            "readonly_git_tool": GIT_QUERY_TOOL,
             "command_broker": "harness_commands.run_command", "provider_allowance_verified": False}
 
 
@@ -29,6 +43,7 @@ def permission_diagnostics(config, provider_result=None, *, argv=None):
               "provider_denial_reason": "unavailable",
               "native_read_tools": ["Read", "Glob", "Grep"],
               "readonly_file_tools": ["harness.file_sha256", "harness.json_check", "harness.file_diff"],
+              "readonly_git_tool": GIT_QUERY_TOOL,
               "command_broker": "harness_commands.list_commands / harness_commands.run_command",
               "provider_allowance_verified": False}
     if argv is not None:

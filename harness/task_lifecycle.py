@@ -29,6 +29,19 @@ from .verification import checks_passed
 from .shared import HookError
 from .util import dump, HarnessError, read_json, write_json
 
+# The environment-blocked stop message reaches the ledger error, run_stopped and
+# the on_error hook; it carries an excerpt and the digest-bound full artifact.
+ENVIRONMENT_BLOCKER_EXCERPT_CHARS = 2000
+
+
+def environment_blocker_excerpt(result):
+    """Blockers then summary, together at most the excerpt bound, truncation stated."""
+    text = f"{'；'.join(result['blockers'])} {result['summary']}"
+    if len(text) <= ENVIRONMENT_BLOCKER_EXCERPT_CHARS:
+        return text
+    return (text[:ENVIRONMENT_BLOCKER_EXCERPT_CHARS]
+            + f"……（已截断：共 {len(text)} 字符，保留前 {ENVIRONMENT_BLOCKER_EXCERPT_CHARS} 字符）")
+
 
 class TaskLifecycle(RuntimeService):
     def finish_post_accept(self):
@@ -248,7 +261,8 @@ class TaskLifecycle(RuntimeService):
                 self.services.workflow.synchronize_decision_requests()
                 raise self.services.workflow.decision_required(self.services.workflow.task_decision_gate(tid))
             if result["blocker_kind"] != "task":
-                raise HarnessError(f"worker 环境受阻：{result['blockers']} {result['summary']}。"
+                raise HarnessError(f"worker 环境受阻：{environment_blocker_excerpt(result)}。"
+                                   f"完整 worker 结果：{worker_artifact}（SHA256 {worker_source['worker_artifact_digest']}）。"
                                    "若必要命令被拒绝，可在 permissions.worker_commands 追加精确 argv 后 resume；"
                                    "环境事实有变化可使用 --environment-update FILE 记录补充说明与本地检查；"
                                    "原尝试和派发预算仍保留。")

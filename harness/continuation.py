@@ -10,6 +10,7 @@ from pathlib import Path
 
 from . import git
 from .contracts import WORK, envelope, validate_structure, validate_work_semantics
+from .git_query import covers as git_query_covers
 from .recovery import RECOVERY_BUSY_KEYS, read_bound_result, snapshot_digest
 from .util import HarnessError, dump, write_json
 
@@ -155,7 +156,8 @@ def continuation_gate(context, current_snapshot=None):
     config, request = _config(context), row['request']
     if request['kind'] == 'commands':
         allowed = config['verification']['commands'] + config['permissions']['worker_commands']
-        missing = [argv for argv in request['commands'] if argv not in allowed]
+        # Built-in harness.git_query forms need no grant; everything else stays exact.
+        missing = [argv for argv in request['commands'] if argv not in allowed and not git_query_covers(argv)]
         if missing:
             return {'kind': 'commands', 'task_id': row['task_id'], 'missing_commands': deepcopy(missing)}
     elif request['kind'] == 'budget':

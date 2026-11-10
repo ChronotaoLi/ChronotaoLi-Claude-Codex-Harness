@@ -2,6 +2,7 @@
 from copy import deepcopy
 
 from .contracts import validate_required_commands
+from .git_query import covers as git_query_covers
 
 
 def missing_commands(tasks, accepted, config):
@@ -12,7 +13,10 @@ def missing_commands(tasks, accepted, config):
         commands = validate_required_commands(task)
         if task["id"] in accepted:
             continue
-        unmet = [deepcopy(argv) for argv in commands if tuple(argv) not in allowed]
+        # Exact table forms are available through the built-in read-only
+        # harness.git_query tool; that is capability, not a command grant.
+        unmet = [deepcopy(argv) for argv in commands
+                 if tuple(argv) not in allowed and not git_query_covers(argv)]
         if unmet:
             missing[task["id"]] = unmet
     return missing

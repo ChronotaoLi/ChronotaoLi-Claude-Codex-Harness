@@ -38,7 +38,7 @@ class BrokerCheckpointLifecycleTests(RepoCase):
                             'inputs': [], 'evidence': [{'path': receipt['stdout_path'], 'sha256': receipt['stdout_sha256']}],
                             'freshness': 'volatile', 'max_age_seconds': 60}]
                     if count == 1:
-                        result['summary'] = 'x' * 4001
+                        result['summary'] = 'x' * 32001
                 backend = ScriptedBackend(repair)
                 engine = self.engine(backend)
                 result = engine.start('Implement greet', read_json(ROOT / 'examples' / 'plan.json'))

@@ -32,6 +32,59 @@ def invocation_diagnostics(job, provider, error=None):
     return value
 
 
+def remaining_model_calls(run):
+    """Model calls still needed if every later call passes first time; never an over-estimate.
+
+    Counted from the recorded stage only: an approved task awaiting acceptance
+    or with a started task review (its returned result may still approve)
+    counts 0; a task with a candidate (pending, or a started worker whose
+    result may still be usable) needs only its review, 1; any other unaccepted
+    task needs a worker and a review, 2. The whole-run review counts 1 unless
+    every task is accepted and an approval of the accepted HEAD, or a started
+    whole-run review, already exists. Terminal runs return None.
+    """
+    if not isinstance(run, dict) or run.get('status') in ('completed', 'abandoned'):
+        return None
+    accepted = run.get('accepted')
+    accepted = accepted if isinstance(accepted, dict) else {}
+    tasks = run.get('tasks')
+    tasks = [task['id'] for task in tasks if isinstance(task, dict) and isinstance(task.get('id'), str)] \
+        if isinstance(tasks, list) else []
+
+    def stage_task(field):
+        value = run.get(field)
+        return value.get('task_id') if isinstance(value, dict) else None
+
+    def keys(field):
+        value = run.get(field)
+        return set(value) if isinstance(value, dict) else set()
+
+    review_receipts, worker_receipts = keys('review_receipts'), keys('worker_receipts')
+    remaining = {}
+    for task_id in dict.fromkeys(tasks):
+        if task_id in accepted:
+            continue
+        if stage_task('pending_acceptance') == task_id or f'reviewer:review:{task_id}' in review_receipts:
+            remaining[task_id] = 0
+        elif stage_task('pending_task') == task_id or f'worker:implement:{task_id}' in worker_receipts:
+            remaining[task_id] = 1
+        else:
+            remaining[task_id] = 2
+    final = 1
+    if not remaining:
+        history = run.get('final_history')
+        history = [item for item in history if isinstance(item, dict)] if isinstance(history, list) else []
+        if ('reviewer:final_review:final' in review_receipts
+                or any(item.get('status') == 'approved' and item.get('head') == run.get('expected_head')
+                       for item in history)):
+            final = 0
+    bound = sum(remaining.values()) + final
+    return {'lower_bound': bound, 'tasks': remaining, 'final_review': final,
+            'message': (f'如果之后全部一次通过，至少还需 {bound} 次模型调用（下界：只计 worker、任务审阅与整体审阅，'
+                        '不含指挥调用、返工、格式修正与再规划）'),
+            'basis': 'recorded_stage_lower_bound; read-only, never changes a budget'}
+
+
 def budget_explanation(run, work):
     entries = run.get('dispatches', [])
     entries = entries if isinstance(entries, list) else []

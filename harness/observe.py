@@ -629,7 +629,10 @@ class Observer:
                   "tasks": [], "invalid_tasks": 0, "dispatches": [], "invalid_dispatches": 0,
                   "cost": cost_summary([]), "timing": None, "events": None, "operations": None,
                   "notes": {"invoked": "invoked=true 在进程启动前写入；它不证明 CLI 已启动或供应商已收到请求",
-                            "process": "首版不探测进程；台账记为 running 与进程是否仍在工作是两回事"}}
+                            "process": "首版不探测进程；台账记为 running 与进程是否仍在工作是两回事",
+                            "events": ("事件只是观察，计数以台账为准：dispatch_prepared 在预算检查前写入，"
+                                       "dispatch_started 在台账保存 invoked=true 之后写入；"
+                                       "不带 invoked 字段的旧版 dispatch_started 早于预算检查，不表示已调用")}}
         try:
             detail["events"] = self._events(run_id, DEFAULT_TAIL)
         except ObserveError as error:
@@ -663,10 +666,12 @@ class Observer:
         rows, detail["invalid_dispatches"], model_unavailable = dispatch_rows(run)
         if model_unavailable:
             unavailable.append("model_id")
+        # Events only add an end time, at most one per ledger dispatch ID; invocation
+        # facts and cost stay with the ledger row, never with event counts.
         finished = {}
         for record in detail["events"]["records"]:
             if record.get("event") == "dispatch_finished" and isinstance(record.get("dispatch_id"), str):
-                finished[record["dispatch_id"]] = _number(record.get("time"))
+                finished.setdefault(record["dispatch_id"], _number(record.get("time")))
         for row in rows:
             row["finished_at"] = finished.get(row["id"])
             row["files"] = self._dispatch_files(run_id, row["id"])

@@ -17,7 +17,7 @@ from .adapters import DemoBackend
 from .budgets import work_attempts
 from .cleanup import cleanup_verification
 from .config import Config
-from .convergence import convergence_summary
+from .convergence import convergence_summary, review_rounds
 from .engine import Engine
 from .memory import Memory, bind_source_files
 from .operations import RUN_ID, OperationRecord, config_identity, digest_assets, harness_identity, shared_paths
@@ -129,8 +129,12 @@ def status_summary(run):
     result["budgets"].update(work_attempts=status_work_attempts(run),
                              attempt_budget_policy=run.get("attempt_budget_policy", "all_invocations"))
     result["convergence"] = convergence_summary(run, result["budgets"]["work_attempts"])
-    from .diagnostics import budget_explanation
+    result["review_rounds"] = review_rounds(run)
+    from .diagnostics import budget_explanation, remaining_model_calls
     result["budget_explanation"] = budget_explanation(run, result["budgets"]["work_attempts"])
+    remaining = remaining_model_calls(run)
+    if remaining is not None:
+        result["remaining_model_calls"] = remaining
     dispatches = run.get("dispatches", [])
     dispatches = [entry for entry in dispatches if isinstance(entry, dict)] if isinstance(dispatches, list) else []
     outcomes = dict.fromkeys(("completed", "task_blocked", "environment_blocked", "operator_blocked",
