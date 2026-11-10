@@ -1,337 +1,200 @@
-# 设计取舍与参考
+# 设计：架构、不变量与状态转换
 
-本项目把模型当作可替换的决策与执行部件，把任务状态、权限边界、证据和接受条件留在确定性的运行时。指挥保有逻辑上的连续性；它的历史由检查点提供。执行者与审阅者是一次性的。
+模型是可替换的决策与执行部件；任务状态、权限边界、证据和接受条件留在确定性的运行时。本文描述台账版本 16 的系统。用法见 [README](../README.md)，停止后的出口见[恢复与操作者出口](recovery.md)，工具接口与观察见[操作与观察](operations.md)，历史改动见 git log 与[验证记录](validation.md)。
 
-## 运行时职责与持久化边界
+- [架构](#架构)
+- [不变量](#不变量)
+- [状态转换](#状态转换)
+- [参考项目](#参考项目)
+- [厂商接口依据](#厂商接口依据)
+- [仍需明确的限制](#仍需明确的限制)
 
-`Runtime` 是公开生命周期 API，由 `RunContext` 持有当前运行资源，`Services` 显式组装命名阶段服务，`Scheduler` 是唯一调度循环。服务通过 context 访问当前台账，通过命名 services 调用其他阶段；没有万能 Engine 引用或动态转发。`engine.py` 仅保留 `Engine = Runtime` 导入别名，不包含旧执行器。
+## 架构
 
-`RunStore` 是权威台账提交入口：在稳定 `store.lock` 下比较已加载原始字节摘要与修订，拒绝旧写入，再原子发布并增加 `store_revision`。外部动作前也检查当前权威；阶段、累计预算、能力变更和接受均经该入口保存。broker 和验证组件各自保存 journal／receipt，不因此获得台账提交权。`run.lock` 仍保护运行生命周期。
+一个 **run** 对应一个目标、一条分支 `harness/<run_id>`、一个隔离工作树 `.harness/worktrees/<run_id>` 和一份台账 `.harness/runs/<run_id>/state.json`。run 内的 **task** 构成串行执行的 DAG，各带验收条件和文件范围 `allowed_paths`。一次 **dispatch** 是一次模型调用（新进程、新 UUID）。三种角色：**指挥**（commander，调用类型 `plan`、`dispatch`、`replan`）拆分、选择和再规划，连续性只来自台账（唯一就绪、没有反馈且未尝试过的任务直接派发，不调用指挥）；**执行者**（worker，`implement`）完成一个任务的一次尝试，是唯一有写工具和 `harness_commands` 的角色；**审阅者**（reviewer，`review`、`final_review`）只读地审阅任务候选或整条分支。
 
 | 模块 | 职责 |
 | --- | --- |
-| `runtime.py`、`run_context.py`、`run_store.py`、`services.py` | 公开入口、当前资源、权威提交与显式组合 |
-| `scheduler.py`、`workflow.py` | 唯一调度循环与任务推进 |
-| `run_lifecycle.py`、`planning.py` | 创建、恢复预检、放弃及计划修订 |
-| `dispatch.py`、`receipts.py`、`packets.py` | 新派发、预算、来源结果与角色输入 |
-| `process_runtime.py`、`util.py`、`stream_capture.py`、`command_server.py` | 进程所有权、截止时间、退出事实与命令准入 |
-| `task_lifecycle.py`、`finalization.py` | 任务及整体接受阶段、后续待办 |
-| `verification.py`、`verification_plan.py`、`review_progress.py` | 正式验证、责任计划、候选预检与来源绑定返工 |
-| `continuation.py` | 续作资格与有来源的操作约束 |
-| `watch.py`、`dashboard.py`、`run_cleanup.py` | 只读观察与显式终态清理 |
+| `__init__.py`、`__main__.py`、`cli.py` | 命令行入口；`status` 摘要、`doctor`、`demo`／`smoke`、`sync`、`permission-diagnostics` |
+| `runtime.py`、`services.py`、`run_context.py` | 生命周期 API `Runtime`；组装命名服务；当前 run 的台账、事件、hooks、快照 |
+| `run_store.py` | 台账唯一提交入口（不变量 27） |
+| `run_lifecycle.py` | 新建 run、`load_run` 校验、恢复预检与选项互斥、`abandon` |
+| `scheduler.py`、`workflow.py` | 唯一调度循环；停止记账、交接目标、决定请求同步、worker 失败来源 |
+| `planning.py`、`requirements.py` | 计划登记、再规划与候选保留、范围授权；任务命令前置条件 |
+| `dispatch.py`、`packets.py`、`context.py`、`input_projection.py`、`path_evidence.py` | 派发、预算、`invoked`、格式修正；角色输入；上下文与容量报告；输入和路径索引 |
+| `receipts.py`、`worker_receipts.py`、`worker_returns.py`、`recovery.py` | 指挥与审阅回执；worker 接收意图、封存、交接；无结果判定；显式修正与恢复忙碌键 |
+| `task_lifecycle.py`、`finalization.py`、`verification.py`、`verification_plan.py`、`review_progress.py` | 任务验证、审阅、接受；整体验收；验证命令；候选预检；必需问题与审阅来源 |
+| `budgets.py`、`diagnostics.py`、`convergence.py` | 工作尝试与豁免；预算解释与剩余调用下界；返工提示与审阅轮次 |
+| `continuation.py`、`environment.py`、`decisions.py`、`progress.py` | 续作、续作拒绝、执行指导；环境更新与前置检查；操作者决定；检查点 |
+| `adapters.py`、`process_runtime.py`、`util.py`、`stream_capture.py` | CLI 参数与模拟后端；进程组、截止时间与退出事实；流式捕获 |
+| `command_server.py`、`command_entry.py` | worker 专属 `harness_commands` MCP：`list_commands`、`run_command`、`delete_path` |
+| `mcp_server.py`、`mcp_entry.py`、`file_tools.py`、`git_query.py` | 三种角色共用的只读 `harness` MCP：记忆、技能、运行状态、文件工具、`git_query` |
+| `git.py`、`memory.py` | Git 绑定、快照、范围、接受提交与归档；SQLite 项目记忆 |
+| `shared.py`、`contracts.py`、`config.py`、`versions.py` | 共享资产摘要、MCP 校验、hooks；输出契约；配置；台账版本 |
+| `private_state.py`、`workspace_inputs.py` | `.harness` 私有根保护；依赖副本清单 |
+| `cleanup.py`、`run_cleanup.py` | `cleanup-verification`、`cleanup-run` |
+| `observe.py`、`dashboard.py`、`dashboard_page.py`、`watch.py`、`watch_cli.py` | 只读观察：列表与详情、本地网页、原生文件通知 |
+| `operations.py`、`supervisor.py`、`plan_readiness.py` | 操作记录；`supervise`；计划覆盖审阅材料 |
+| `permission_diagnostics.py`、`permission_smoke.py`、`tool_smoke.py`、`stream_smoke.py` | 权限诊断；真实账号联调入口 |
 
-环境、操作者决定、检查点、格式修正、记忆和 hooks 保留各自协议，不产生第二套调度或自动恢复路径。
+`dispatches/<id>/` 保存一次调用的输入（worker 的 `packet.json`、`schema.json`）、输出、`returned-result.json`、`worker-seal.<SHA256>.json`、命令清单 `commands.json` 与 `commands/<call>/` 下的记录。
 
-任务审阅结束时，先保留完整审阅产物，再在同一次台账保存中登记审阅历史并转入待接受或返工反馈。提交完成时，在同一次保存中登记 accepted、expected_head 和 pending_post_accept，同时清除 pending_acceptance、当前任务及旧反馈。转换先检查来源阶段及目标冲突；原有进程、快照、范围、审阅与 hook 门禁仍分别执行。Git 提交与台账保存之间的中断限制保持原样，不新增自动修复 HEAD 的路径。
+## 不变量
 
-检查点的源结果、manifest、证据副本和批次清单在一次完整校验／投影内各读取一次，复用已核验的解析结果与证据长度；该数据仅在本次调用中存活。后续投影、恢复或派发仍重新核验全部绑定证据和当前输入，不能用跨调用缓存掩盖篡改或刷新 volatile 有效期。
+**派发与进程**
 
-当前执行台账为版本 15；旧台账不迁移、不执行，只保留历史读取与受保护清理。关键持久化顺序保持：调用身份与预算先于进程启动、返回结果先于 post_agent、待接受先于 pre_accept、接受记录与后续待办共同保存、最终尝试先于快照产物写入、最终拒绝与待再规划意图共同保存。
+1. 每次 worker、reviewer 和修正调用都是新进程、新 `dispatch_id`；Claude 用 `--no-session-persistence`，Codex 用 `--ephemeral`，原生子 agent 关闭，不恢复供应商会话。模型 ID、供应商和 effort 按配置原样使用，同一 run 内不变，出错不换模型。
+2. 调用身份与预算先于进程启动保存：本地准备（上下文、`pre_agent`、MCP、快照、额度检查）成功后，`attempts`、`agent_dispatches`、接收意图和 `invoked=true` 同一次保存，然后才调用后端。本地准备失败不扣额度，后端失败照常计数。
+3. 退出未确认就不继续：恢复、放弃和清理要求父 dispatch 及其每个命令子进程都有退出证据；`starting` 或缺 pgid 且未确认的记录阻塞。`--confirm-exited` 是审计过的操作者断言，不补造退出码、输出或成功。
+4. 领导进程正常退出后，同组后代最多观察 2 秒，仍未退出就停止消费结果，不向身份不明的进程组发信号。
+5. 台账的 `invoked` 是调用事实的权威。事件 `dispatch_prepared`（预算检查前）、`dispatch_started`（`invoked=true` 保存后）和带 `invoked` 的 `dispatch_finished` 只是尽力而为的观察：追加失败不阻止调用，崩溃可能缺事件且不补发；按 `dispatch_id` 去重，费用只按台账统计。
+
+**结论与证据**
+
+6. 已返回的指挥与审阅结论不重抽：调用前的接收意图绑定原请求、候选快照和返回位置，恢复继续校验同一结果，缺失或被改即停止；拒绝、停止和非法结果不因重复 resume 消失。
+7. worker 结果先封存再交接：确认 worker 与命令子进程退出后，把结果、来源文件摘要、返回后候选、HEAD、Git 绑定和进程事实写成内容寻址的 `worker-seal.<SHA256>.json`，再做契约、范围、`post_agent` 与交接。未封存的原始输出不补绑恢复时的工作树。
+8. 无结果判定绑定原始证据：确认退出后按派发前保存的输出模式（`legacy_json` 或 `stream_metadata_v1`）把来源判为 retryable、returned 或 unknown，只有 retryable 允许新的计费尝试；判定、故障来源和回执消费同次保存，证据删改后不能改判。
+9. 不可变证据先发布，再登记引用：packet、契约、封存、续作类记录、环境更新、决定和检查点先写成内容寻址或带 SHA256 的文件，再在台账存路径与摘要。文件写入失败时不登记引用；worker 输入写入失败时也不扣调用预算、不保存接收意图或 `invoked=true`，但此前保存的准备条目与随后的失败状态、诊断仍会落盘。未引用的遗留文件被忽略，同内容重试时复用。
+10. 台账对 worker 输入和续作类记录只存摘要与引用：接收意图存 `packet.json`、`schema.json` 的路径与 SHA256；续作、执行指导、续作拒绝行只存 `snapshot_digest`，整棵快照只在不可变文件里。引用文件缺失、被改或换成符号链接时，恢复停止并保留现场。
+11. 格式修正只修格式：每个“角色:调用类型:任务”整个 run 最多一次自动修正（`format_repairs`）和一次显式修正（`invalid_repairs`），不因 resume、新尝试或新快照清零；指挥选择固定用任务身份 `dispatching`，再规划用 `replanning`。审阅修正保留 verdict、批准 key 和全部 finding；指挥修正不改 `selected_task`、`action` 或修订操作；worker 自动修正读回已发布的原 packet 并核对摘要；worker 已报告 blocker 时即使有格式错误也保留阻断并停止。
+
+**接受**
+
+12. 任务接受同时要求：合法结果声明完成且无 blocker；Git 绑定与 HEAD 未变，改动（含暂存区）在 `allowed_paths` 内；全部验证命令成功；新审阅实例批准、无 blocking finding、必需问题全部独立处置为 resolved；接受前快照等于审阅时快照。
+13. `pre_accept` 前后都重新哈希完整快照（含暂存区），不用 mtime、size 或 Git 的未变判断；快照变化时旧批准持久标为失效，任务重新执行、验证和审阅。
+14. 提交与接受记录共用一道屏障：commit 后，`accepted`、`expected_head`、`pending_post_accept` 同次保存，同时清除 `pending_acceptance`、`current_task` 和反馈。commit 已落盘而台账未保存时，恢复因 HEAD 不符停止，不自动修复。
+15. 全部任务接受后重新验证，再由新审阅者审阅 base 到 HEAD 的完整 diff；最终快照不变才 `completed`。同一快照的整体拒绝不能靠 resume 重抽，只能由通过正常门禁的修正任务改变候选。
+16. Git 绑定在创建工作树后按实际解析结果保存（`.git`、gitdir 反向链接、公共目录、预期分支）；每个工作树 Git 命令显式指定 git-dir 与 work-tree 并剔除 `GIT_*` 环境变量，操作前后核验绑定。接受、归档、恢复、移除和记忆来源核验都使用它。
+17. `allowed_paths` 从仓库根匹配，`*`、`?`、字符集只作用于单段，独立 `**` 段跨层级；`.git`、`.harness`、`.codex`、`.claude` 在规划和接受时都被拒绝，工作树内的 `.harness` 一律拒绝；索引含 gitlink 的仓库在创建工作树前拒绝。
+18. 接受记录和任务记忆用审阅者的摘要；记忆提案须审阅者逐项批准才写入 `knowledge:`；记忆都是参考（`reference_only`），不授予权限或替代决定。
+
+**预算**
+
+19. 预算只增不减：`attempts`、`agent_dispatches`、`replan_attempts`、`final_attempts` 累计保存，resume 不清零。恢复只允许提高超时、上下文、轮数、各项上限与 `max_tasks`，以及追加精确 `worker_commands`。
+20. `max_attempts` 按每个任务的工作尝试计数：worker 调用数减去已完整校验、与反馈同次保存的 environment／operator 阻断（`attempt_exemption`），豁免在使用前复核原始结果。没有全 run 的 worker 尝试上限；再规划新增的任务各有自己的 `max_attempts`，全局由计入每次模型调用的 `max_agent_dispatches` 封顶。`max_tasks` 限制计划任务数。
+21. 观察投影不改变预算：`status` 的 `budget_explanation`、`remaining_model_calls`（下界）、`convergence`、`review_rounds` 只读已保存事实。
+
+**权限与工具**
+
+22. worker 应优先用 broker 的 `run_command` 执行命令；broker 只接受 `verification.commands` 与 `permissions.worker_commands` 中的完整 argv，不能附加参数、改 cwd 或 env，不经 shell。Claude worker 另有 CLI 层的 Bash 许可：`config.py` 的只读前缀（参数只能接在 `--` 之后），以及已配置命令中不含 `*`、换行的精确 argv；这些调用不经 broker、不留命令记录。任务的 `required_commands`、`self_checks` 是前置条件不是授权；缺授权时不启动 worker、不扣尝试。
+23. `git_query` 只执行形式表内的 argv，表外 argv 不执行即返回工具错误。同一解析函数决定执行与“已覆盖”：计划前置命令、续作命令请求、环境检查和权限诊断把表内形式算作已满足——只表示能力存在，不表示已执行或成功，也不是 Bash 或 broker 授权。
+24. 命令与删除先发布 journal：每次调用先在 `command-staging/` 写好完整 `process.json`，再一次原子改名进 `commands/`；发布前不启动子进程、不删除文件。保护：退出门禁不会遇到缺 journal 的目录。
+25. `delete_path` 保证：路径从工作树根目录描述符逐级以 no-follow 打开；不跟随符号链接；最后一次核对时，最终项是 HEAD 中已跟踪、在任务范围内的普通文件；每次被准入的调用都留下记录。不保证：在最后一次核对与 `unlinkat` 之间，能在工作树内改名的并发进程可以让被删除的文件位于别处，包括工作树外；事后的并发变化检测是尽力而为，可能漏报（例如目录被移回）。删除立即生效，接受门禁只决定候选能否被接受，不能撤销删除。
+26. 角色能力不是 OS 隔离：Codex 只读角色用 `--sandbox read-only`，Claude 只读角色只有读工具与只读 Git 命令，Claude worker 的 Edit／Write 限于工作树并拒绝 `.git`，Codex 不能作为 worker。候选中的 `AGENTS.md`、`CLAUDE.md` 等指令文件是待审阅数据，不授予权力；两种 CLI 都关闭项目指令自动注入。
+
+**台账、版本与观察**
+
+27. 台账只经 `RunStore` 提交：在 `store.lock` 下比较已加载字节的摘要，拒绝旧写入，原子写入并递增 `store_revision`；外部动作前也核对当前权威。`run.lock` 保护生命周期。
+28. 旧版本台账不迁移、不执行：`resume`、`abandon`、`prepare-run` 只接受版本 16；版本 15 及更早仍可用只读、诊断与报告入口（`status`、`watch`、`dashboard`、`plan-readiness --run`、`permission-diagnostics`）和受门禁保护的 `cleanup-run`、`cleanup-verification`（版本 7–16，按各自形状核对）；不补写旧默认值。resume 另核对共享资产摘要（不含 hook 脚本的依赖）和完整配置快照。
+29. hooks 至少一次：`post_agent` 只作用于通过校验的结果和 `invalid_rejected` 审阅；`pre_accept`、`post_accept`、`on_error` 执行前递增计数并用独立日志目录，中断后可能重复。配置出现 `context_compacted` 时报未知事件并提示改用 `context_prepared`。
+30. 必要输入超过 `context_chars` 时不调用模型、不扣额度，报告仍写入 `context-report.json`；可选记忆按整条加入剩余空间。成功派发的报告保留根与顶层字段尺寸及最大的 30 个嵌套字段并给出省略数，超限报告保留全部明细。
+31. 观察层（`status`、`watch`、`dashboard`、操作记录、`supervise` 回执）不写台账、不取 `run.lock`、不参与恢复。
+
+## 状态转换
+
+### run 状态
+
+| 状态 | 进入 | 离开 |
+| --- | --- | --- |
+| `planning` | 首次保存 | 计划登记后进入 `running` 或 `awaiting_approval` |
+| `awaiting_approval` | `--pause-after-plan` 且计划未批准 | `resume --approve-plan` |
+| `running` | 每次进入执行循环，同时清除 `error`、`error_type` | 停止、暂停或完成 |
+| `paused` | `--step` 下本次已接受一个任务 | 普通 `resume` |
+| `blocked` | 执行中出错：先保存状态与错误，再写 `run_stopped`、运行 `on_error` | 对应恢复出口或 `abandon` |
+| `interrupted` | Ctrl-C、SIGTERM、SIGHUP | 普通 `resume` 或 `abandon` |
+| `completed` | 整体批准后保存 | 终态；普通 `resume` 返回保存结果 |
+| `abandoned` | `abandon` | 终态；不能 resume |
+
+### 新建台账的键
+
+`run_lifecycle.py` 新建台账的全部顶层键（`store_revision` 由首次提交加入）；“恢复”列是中断后 `resume` 的处理。
+
+| 键 | 设置与更新 | 清除 | 持久化顺序 | 恢复 |
+| --- | --- | --- | --- | --- |
+| `schema_version`、`id`、`repo`、`goal`、`commander`、`branch`、`worktree`、`base_commit`、`config_path`、`asset_digest`、`created_by_operation` | 首次保存 | 不变 | 早于创建工作树 | 要求版本 16、ID 与仓库一致；比较共享资产摘要 |
+| `config_snapshot` | 首次保存；resume 接受合法放宽后替换 | 不清除 | 先写 `resume_config_relaxed` 再保存 | 与当前配置比较，只许放宽 |
+| `status` | 见上表 | — | 先保存再运行 hook | 终态拒绝修改选项 |
+| `worktree_binding`、`ignored_baseline` | 首次保存为空；`git worktree add` 后第二次保存填入 | 不清除 | 第一次保存在创建工作树前 | 绑定为空时 resume 拒绝，只能 `abandon` |
+| `original_tasks` | 供给计划在首次保存；模型计划与首个计划版本同次 | 不变 | 早于 `tasks` | `tasks` 为空且无未消费规划回执时，重新校验并登记同一计划 |
+| `tasks`、`plan_history` | 计划登记、再规划应用 | 不清除 | 先写 `plans/revision-N.json` | 按计划版本继续 |
+| `plan_approval_required`、`plan_approved` | 创建时；`--approve-plan` | 不变 | 先写 `plan_approved` 再保存 | 普通 resume 不批准 |
+| `expected_head`、`accepted` | 任务接受 | 不清除 | 与 `pending_post_accept` 同次 | 工作树 HEAD 必须等于 `expected_head` |
+| `attempts`、`agent_dispatches` | 调用后端前 | 只增 | 与接收意图、`invoked` 同次 | 已记账的调用不退回 |
+| `replan_attempts` | 修订通过校验或保存 stop | 只增 | 与修订进入 validated、消费回执同次 | 失败的请求不计数 |
+| `final_attempts`、`final_history` | 新的整体尝试追加 `running` 记录，随后更新阶段与结论 | 不清除 | 尝试记录先于快照产物；失败或拒绝与 `feedback`、`pending_replan` 同次 | 同一快照：未完成则复用该尝试，已批准则完成，已拒绝则要求修正任务 |
+| `dispatches` | 准备完成追加（`prepared`、`invoked=false`）；调用前 `starting`、`invoked=true`；启动记 pgid；结束记进程事实与用量 | 不清除 | 准备条目先于 `pre_agent` | 退出门禁读进程事实；`worker_receipt_consumed` 记 worker 回执结局 |
+| `feedback` | worker 阻断、审阅拒绝、验证或预检失败、候选变化、`pre_accept` 失败、整体失败、修订应用 | 接受、整体批准时置 null | 与引起它的转换同次 | 下一次指挥与 worker 的输入 |
+| `review_history` | 任务审阅结束；候选变化前把已返回审阅存为 invalidated | 不清除 | 与审阅后的阶段同次 | 返工输入、`review_rounds` 来源 |
+| `worker_receipts` | 调用前存意图（`invoking`、packet／契约引用、输出模式）；封存后 `sealed`；`post_agent` 后记 `post_hook_digest` | 交接时消费 | 封存文件先于 `sealed`；消费与后续阶段同次 | 未封存：retryable 则消费并新开尝试，否则停止；封存文件已写而 `sealed` 未保存：找到并核验该文件后继续；已封存：复核后继续原门禁 |
+| `review_receipts` | 调用前存意图；返回后绑定 `artifact_digest` | 审阅结束；候选变化（先存原文）；无返回时重派前 | 结果文件先于摘要 | 有结果则校验同一结果；无结果才新派发并计费 |
+| `commander_receipts` | 调用前存意图（含原请求与摘要；再规划绑 `request_id`） | 首版计划、任务选择、修订或 stop 登记时同次移除 | 同上 | 校验同一结果，不重抽 |
+| `format_repairs` | 修正调用前 | 不清除 | 与该调用预算同次 | 额度不清零 |
+| `pending_format_corrections` | 可修复格式错误后登记；修正调用前写入 `dispatch_id` | 修正返回、候选变化、转再规划或 stop、修订应用 | 与回执消费同次 | 快照未变则重派同一修正 |
+| `review_corrections` | 审阅首次可修复格式错误时登记守卫，可标 exhausted、unrepairable、failed | 审阅结束或候选变化 | 先于修正派发 | failed、unrepairable 阻塞同一快照；exhausted 只接受显式修正 |
+| `invalid_repairs` | `--repair-invalid`（`pending`），之后 completed 或 invalidated | 不清除 | 先保存再写 `invalid_output_repair_requested` | 每个身份只授权一次 |
+| `approved_scope` | `--allow-scope` | 不清除 | 先写 `scope_extension_approved` 再保存 | 只扩大新任务可选范围 |
+| `environment_updates` | `--environment-update` | 不清除 | 先写 `environment/<id>.json` 与事件 | 同任务最新一条替代旧检查列表 |
+| `environment_checks` | 选中任务每次 worker 尝试前 | 不清除 | 报告文件先于追加 | 检查失败不启动 worker、不扣尝试 |
+| `decision_requests` | operator 阻断、指挥 stop、来源任务接受且 `post_accept` 完成 | 不清除 | 先写 `decisions/<id>.json` 与事件 | 未答或答 stop 时阻止目标任务派发 |
+| `operator_decisions` | `--operator-decision` 整批 | 不清除 | 全部答复文件先写，再一次保存 | 只解除匹配请求的等待 |
+| `task_checkpoints`、`checkpoint_batches` | worker 结果交接时逐项核对 | 不清除 | 证据副本、manifest、批次文件先写 | 批次文件已写未登记时登记同一结果 |
+| `continuation_history` | worker 返回 `blocker_kind=continuation` | 不清除 | 先写 `continuations/<id>.json`；与 `pending_continuation` 同次 | 条件满足后新派发继续 |
+| `execution_guidance` | `--execution-guidance` | 不清除 | 先写 `execution-guidance/<id>.json` | 进入该任务后续输入 |
+| `workspace_inputs` | 首次为 null；`prepare-run` 写入清单摘要 | 不清除 | 例外：绑定先保存，再写冻结清单和副本回执；缺失时失败关闭 | resume 与每次派发前核对副本 |
+| `store_revision` | 每次提交 | 只增 | 由 `RunStore` 写入 | 修订不符的写入被拒绝 |
+
+### 运行中出现的键
+
+| 键 | 设置 | 清除 | 持久化顺序与恢复 |
+| --- | --- | --- | --- |
+| `current_task` | 选择任务；选择转再规划；保留候选的修订 | 接受、需归档的修订应用 | 有当前任务时只调度它 |
+| `pending_directive` | 指挥选择 `implement`（与回执消费同次）；续作拒绝 | worker 调用前与预算同次消费 | 本地准备失败时保留；恢复先核对快照 |
+| `pending_task` | worker 交接（`verifying`，与回执消费同次）；验证后 `reviewing` | 审阅结束（与 `review_history` 及后续阶段同次）；候选变化、预检或验证失败 | 同一快照复用已完成阶段 |
+| `pending_acceptance` | 审阅批准 | 接受登记或候选变化 | `pre_accept` 前递增 `hook_attempts`；快照未变只重试 hook |
+| `pending_post_accept` | 与接受同次 | 任务记忆、知识提案、`task_accepted`、`post_accept` 依次完成 | 每步完成即保存，记忆用稳定操作 ID 去重；完成前不派发后续任务 |
+| `pending_replan` | task 阻断、整体失败、指挥 `action=replan`、stop 被重开、空修正被接受 | 修订应用、保存 stop、允许的 `--reverify` 取消 | `pending` → `request` → `validated`；早于预算检查保存，提高预算后继续同一请求 |
+| `replan_stopped` | 指挥 stop（同次消费回执、移除 `pending_replan`） | 匹配请求的 continue 或 `--retry-stopped` | 普通 resume 不重新派发 |
+| `retained_candidate` | 只改当前任务说明的修订应用 | 该任务下一次 worker 调用前与预算同次 | 绑定原修订结果与完整快照，变化即停止 |
+| `pending_continuation` | 续作登记 | 条件满足或被拒绝时置 null | 条件未满足时停止并列出缺口 |
+| `continuation_rejections` | `--reject-continuation` | 不清除；由 worker dispatch 的 `continuation_rejection_id` 消费 | 拒绝文件先写；与 `pending_directive` 同次 |
+| `worker_recovery` | 已调用的 worker 失败、结果或交接被拒 | 同 dispatch 正常交接、接受、需归档的修订 | 后续指挥与 worker 的 `recovery` 输入 |
+| `last_runtime_error` | 调用或回执处理失败 | 不清除 | 诊断 |
+| `error`、`error_type`、`error_hook_attempts` | 停止时 | 前两项在重新 `running` 时清除 | 先保存再运行 `on_error` |
+| `command_requirements` | 计划登记、恢复、调度时重算，变化才保存 | 不清除 | 只是诊断，派发前总是重算 |
+| `context_capacity` | 整体审阅容量预估，变化才保存 | 不清除 | 必要下界超限时提前停止 |
+| `ignored_diagnostics` | 开始、worker 返回、验证结束 | 不清除 | 只是路径清单摘要 |
+| `pending_worktree_removal`、`worktree_removed` | `abandon --remove-worktree` 删除前存意图 | 删除后登记 `worktree_removed` | 路径与 Git 注册都已消失时完成记账 |
+
+`recovery.py` 的 `RECOVERY_BUSY_KEYS` 列出共用的十个待处理键，环境更新、续作拒绝、执行指导和操作者决定在其中任一有值时拒绝（见[恢复选项](recovery.md#恢复选项与互斥)）。`load_run` 在任何副作用前检查这些对象的类型、所引 dispatch 的角色与任务、`pending_task` 与 `pending_replan` 互斥，失败时不改写台账。
 
 ## 参考项目
 
 参考时间：2026-10-21。
 
-| 来源 | 阅读内容 | 本项目采用的部分 |
-| --- | --- | --- |
-| [stablyai/orca orchestration](https://github.com/stablyai/orca/blob/main/skill-guides/orchestration.md) | Run、Task、Dispatch 的职责与完成归属 | 每次尝试独立 UUID，结构化结果校验，不根据空闲或缺少消息推断成功 |
-| [Orca CLI orchestration docs](https://github.com/stablyai/orca/blob/main/docs/site/content/docs/cli/orchestration.mdx) | 生命周期、派发、完成与恢复 | 保留任务与派发分层，进程未确认退出时不重复派发 |
-| [ECC](https://github.com/affaan-m/ECC/tree/90606c8315ee09cafc303515c5f33024db6b9882) | 共用 rules / skills / hooks、memory vault、strategic compact | 核心行为一份源文件，两种 CLI 仅负责适配；记忆是参考资料；阶段边界交接 |
-| [ECC memory vault](https://github.com/affaan-m/ECC/blob/90606c8315ee09cafc303515c5f33024db6b9882/docs/design/ecc-memory-vault.md) | 来源、可检查性与按项目隔离 | 本地来源记录、显式版本、可导出记忆；未采用其 Markdown 作为唯一真相的存储实现 |
-| [OpenWiki](https://github.com/Neuroant/OpenWiki#second-brain--agent-memory-path-b-opt-in) | Second Brain、记忆替换、三层上下文、session handoff | 必要状态与可检索知识分离；旧版本保留；摘要引用证据；本地词法检索首版 |
+| 来源 | 采用的部分 |
+| --- | --- |
+| [stablyai/orca orchestration](https://github.com/stablyai/orca/blob/main/skill-guides/orchestration.md)、[CLI orchestration docs](https://github.com/stablyai/orca/blob/main/docs/site/content/docs/cli/orchestration.mdx) | run／task／dispatch 分层；每次尝试独立 ID；结构化结果校验；不根据空闲推断成功；退出未确认不重复派发 |
+| [ECC](https://github.com/affaan-m/ECC/tree/90606c8315ee09cafc303515c5f33024db6b9882)、[ECC memory vault](https://github.com/affaan-m/ECC/blob/90606c8315ee09cafc303515c5f33024db6b9882/docs/design/ecc-memory-vault.md) | 规则、技能、hooks 一份源文件，CLI 只做适配；记忆带来源、按项目隔离、可导出 |
+| [OpenWiki](https://github.com/Neuroant/OpenWiki#second-brain--agent-memory-path-b-opt-in) | 必要状态与可检索知识分离；旧版本保留；摘要引用证据；本地词法检索 |
 
-这里按本机发现的 stablyai/orca（CLI 1.4.237）参考 Orca；它有多个同名项目。当前实现不需要运行 Orca，也不向它发送任务。用户要求的“一任务一实例”比 Orca 可复用 worker 的策略更严格。
-
-OpenWiki 参考的是 Neuroant/OpenWiki。如果原意是 OpenViking，它是另一个项目；本项目没有把二者混称，也不依赖它们的服务。
+Orca 按本机 CLI 1.4.237 参考，不运行它；“一任务一实例”比 Orca 可复用 worker 的策略更严格。OpenWiki 指 Neuroant/OpenWiki，不是 OpenViking。
 
 ## 厂商接口依据
 
-- [Codex non-interactive mode](https://learn.chatgpt.com/docs/non-interactive-mode)：exec、JSON 输出、schema、已有登录复用。
-- [Codex configuration](https://learn.chatgpt.com/docs/config-file/config-reference)：模型、原生多 agent、记忆、hooks 设置。
-- [Codex MCP](https://learn.chatgpt.com/docs/extend/mcp?surface=cli)：stdio / HTTP 连接配置。
-- [Claude Code CLI](https://code.claude.com/docs/en/cli-reference)：print、JSON schema、会话持久化、工具许可和 MCP 参数。
-- [Claude Code MCP](https://code.claude.com/docs/en/mcp)：环境变量引用和 strict MCP 配置。
-- [MCP stdio transport](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports)：逐行 JSON-RPC；stdout 仅用于协议。
-- [MCP tools](https://modelcontextprotocol.io/specification/2025-11-25/server/tools)：工具声明和调用结果。
-- [OpenAI models](https://developers.openai.com/api/docs/models) 与 [Claude models](https://platform.claude.com/docs/en/models/overview)：保留用户指定模型 ID，账户可用性由实际 CLI 调用确认。
-
-实际实现同时对照了本机 Codex CLI 0.163.0、Claude Code 2.1.306 的 `--help`。命令行接口可能变化；模型 ID 保存在配置中，不自动替换。
-
-## 状态与接受条件
-
-通常为 `planning → running → completed`，最后还必须通过整体目标验收。可选计划确认进入 `awaiting_approval`，分步执行在任务边界进入 `paused`；异常进入 `blocked` 或 `interrupted`。这些是本地运行状态，与任何外部产品的自动化目标状态无关。所有 worker 和 reviewer dispatch 始终使用新进程，指挥也通过台账恢复上下文。
-
-操作者可显式将未完成运行标为 `abandoned`，此后不能 resume；分支与证据保留。可选移除 worktree 必须在运行锁内确认旧进程退出、路径归属与 HEAD，拒绝未保存文件（含忽略文件）及隐藏索引标记，并独立核对已跟踪内容。删除意图先持久化，删除完成但记账中断时通过路径缺失及 Git 注销状态恢复。resume 获锁后重新读取台账，防止覆盖并发放弃操作。
-
-`cleanup-run` 为已完成或已放弃的运行提供独立清理入口，保持原终态。默认预览；显式移除在运行锁内核对台账归属、原分支及 HEAD、Git 绑定、派发与 broker 子进程退出和工作树原始字节。受保护的嵌套 `.harness` 及任何未保存文件都会阻止清理，不搬运未知数据。独立的 `worktree-cleanup.json` 绑定清理时台账字节摘要、原 Git 绑定和检查点；先持久化意图，再删除，再记录完成。路径已不存在时，还须有绑定的清理意图（或已有放弃清理记录），且 Git 注册和管理目录也不存在。清理不调用模型、不合并或删除分支、不清空运行证据。
-
-运行观察只读：原生通知注册在初次采样之前，macOS 使用 kqueue，Linux 使用 inotify 并通过 `/proc/self/fd` 绑定已验证的文件描述符；目录和文件替换后重建子订阅。队列溢出意味着重新读取当前投影，不把通知当作完整事件历史。超时不重读台账，缺少原生后端时显式失败。网页 SSE 只发送订阅就绪、变化和不可用通知；连接心跳不证明 worker 存活。订阅有独立连接上限，断连、慢客户端及服务关闭均释放资源。
-
-Codex 非零退出的诊断从 stdout 最后 64 KiB 中提取完整 JSONL 的 `error`／`turn.failed` 错误信封，最多三个去重消息，每条最多 240 字符并转义控制字符；模型结果和工具输出不作为错误摘要。原日志仍保留，错误诊断不触发重试、模型替换或批准。
-
-一个任务只有在以下条件同时满足时才进入 accepted：
-
-1. 当前 dispatch 返回匹配 ID 的合法结果，声明完成且无 blocker。
-2. Git 工作树的管理目录、公共目录、链接文件和分支绑定未变，HEAD 未被 agent 改动，文件变更落在任务的 allowed_paths。
-3. 所有配置验证命令成功，且没有修改待审阅文件。
-4. 新 Sol 实例返回 approve，没有未处理的 blocking findings；advisory 可以保留。
-5. 接受前文件快照等于审阅时快照。
-
-分支提交、结果记忆和台账都带来源引用。review 失败或测试失败只保留诊断，不提升为长期成功经验。身份不匹配、结构非法、权限错误和范围违例停止运行。语义非法也不能接受；其中身份和结构正确且明确含拒绝或阻断的首次审阅可进入独立的 `invalid_rejected` 恢复路径。首次拒绝的 finding 不可变字段格式超限也走此路径，保留完整证据并返工；仅可变字段格式错误时，自动额度未用则进行有界格式修复，该身份额度已用的首次拒绝直接保存为 `invalid_rejected`。这些路径均须核对快照和 hook，不放宽接受条件，也不适用于自动或显式修正返回的非法结果。
-
-审阅问题使用稳定 ID、严重级别、类别、位置、说明和证据。偏好只能是 advisory。返工审阅收到历轮问题与对应证据，既要复核旧问题，也要独立检查整个当前修改；运行时不因为 worker 的辩解而豁免门禁。原始目标和任务义务独立保留，全部任务接受并提交后重新执行验证，并由新的 reviewer 审阅原始 base 到当前 HEAD 的完整 diff。任务验证发生在接受提交之前，最终验证覆盖提交后的状态，不能以命令相同为由省略。最终文件快照不变才允许 completed。整体拒绝需要通过正常门禁的修复任务，重复 resume 不能对同一拒绝结果重新抽签。
-
-文件范围从仓库根目录匹配，普通 `*`、`?`、字符集合只作用于单个路径段；独立 `**` 路径段匹配零个或多个层级。因而 `src/*` 不包含 `src/a/b.py`，`**/*.py` 包含根目录的 `main.py`。规划时拒绝不合法范围、显式受保护根路径和不存在的 skill；接受门禁仍独立拒绝受保护路径变更。路径不做裁剪或 Unicode 规范化，以免改变实际文件名。
-
-显式提供的计划在创建运行目录、分支或 worktree 前完整校验，非法输入不留下可误恢复为模型规划的空 run。已校验任务的独立副本随首次台账写入保存为 `original_tasks`；初始计划登记前中断后，若 Git 绑定已保存，恢复沿用该计划并重新校验、登记，保留原审批门禁，不改由指挥规划。模型规划仍在隔离工作树中执行；存在未消费的模型规划 receipt 时，恢复继续核验其原始结果、请求与快照，不能用 `original_tasks` 跳过证据检查。
-
-`**`、`**/*` 及仅重复 `**` 路径段的等价常见形式允许使用；新任务首次登记全仓库范围时输出提示并保存 `broad_scope_warning`，不自动缩小范围或引入额外批准门禁。此提示不推断一般 glob 的包含关系，也不替代受保护路径检查。
-
-指令文件可以属于合法编辑范围。任务审阅按当前候选、整体审阅按原始 base 到 HEAD 的完整变更，分别列出根级及嵌套的 `AGENTS.md`、`AGENTS.override.md`、`CLAUDE.md`、`CLAUDE.local.md`，覆盖新增、修改、删除和重命名涉及的路径。诊断标记为 `untrusted_candidate_instructions`，要求独立核对其对后续派发的影响；候选内容不授予改变原目标、接受条件或工具权限的权力。Codex 只读角色通过 `project_doc_max_bytes=0` 关闭项目指令文件自动注入；Claude 通过空 `--setting-sources` 关闭项目／本地来源，当前适配版本不自动加载这些来源的指令。已提交的项目规则也不再自动注入，各角色仍按需读取；审阅者将 `instruction_file_changes` 列出的候选指令作为证据核对。这不隔离普通文件读取，也不禁止合法指令维护。
-
-任务可选 `required_commands` 保存最多 32 条不同的完整 argv，旧任务不补写默认字段。它声明已知执行前置条件，不改变授权或验收。计划登记及恢复保存 `command_requirements` 诊断并记录变化；诊断不参与授权，派发前始终从当前任务和配置重新计算。匹配仅使用 `verification.commands` 与 `permissions.worker_commands` 的精确 argv，不采用前缀、路径归一化、只读命令示例或 fresh checkout 的 setup 授权。模型若未声明或尚不知道命令，仍可能在执行时报告环境阻断。
-
-模型计划或再规划新增任务的 `required_commands` 重复或超过 32 条时，按计划语义错误拒绝，保留原始 receipt，允许操作者通过 `--repair-invalid` 请求一次显式修正。普通恢复复核原结果，不追加派发；不自动去重、截断或进入禁止改变计划操作的文本格式修正。操作者提供的 `--plan` 仍在创建 run 前拒绝。已保存结果的受控修正边界见[恢复协议](recovery.md#阻塞状态与操作者出口)。
-
-调度先保留操作者决定门禁，再从就绪任务中选取命令条件满足者；已有 current_task 或 pending_directive 不得借此换任务。worker 普通调用和格式修正都在本地准备及预算记账前重检，缺少授权时不调用 worker。全部就绪任务均缺命令时停止，保留计划和现场，追加精确 worker 授权后普通恢复即可；无需伪造 worker blocker 或环境更新来源。已返回候选的验证、审阅和接受阶段不增加这个执行前置门禁。再规划保留既有 required_commands，新任务可另行声明。当前执行要求版本 15，恢复仍核验共享资产。
-
-## 调度、再规划与恢复
-
-调度、恢复与再规划遵循以下不变量，详细状态转换和[阻塞状态与操作者出口](recovery.md#阻塞状态与操作者出口)集中在 [恢复协议](recovery.md)。
-
-- 每次 worker、reviewer 与修正调用使用新进程和新 dispatch；不恢复供应商会话，不替换配置模型。
-- 已返回的指挥与审阅结果绑定原请求、代码快照和产物摘要；恢复继续校验同一结果，不能重抽以消除拒绝。
-- 任务、总 worker、派发、再规划与最终验收预算累计保存。准备失败不扣调用额度，所有实际 worker 调用都计入 attempts/total_attempts。新 run 的 max_attempts 使用 work_attempts，仅扣除通过完整校验并保存的 environment/operator 阻断；max_total_attempts 与派发上限仍包含它们。当前 run 的计数策略由保存的 attempt_budget_policy 固定。豁免绑定原始结果并在恢复和派发前 hook 之后核验，未知或非法结果不豁免；操作者可按允许范围增大预算。
-- 再规划保留既有任务的身份、验收和范围，只追加前置工作、描述细化与依赖；已接受任务不变。额外范围必须由操作者显式授权。
-- 仅当前未接受任务的 description 变化、所有其他任务及字段和次序均不变时，修订绑定原结果与完整代码／索引快照，保留候选并固定 current_task。新计划和绑定同次保存，直到该任务的新 worker 调用同次消费；恢复与派发前重检，变化则停止并保留现场。其他修订仍归档清理。已校验修订必须声明候选保留策略；缺失时停止并保留现场，不推断归档或继续执行。
-- 当前有效的 replan_stop 请求未答或已答 stop 时，`--retry-stopped` 在调用和预算计数前拒绝，指向该请求的操作者决定入口。没有可用决定请求的历史停止保留显式重试出口。
-- 指挥任务选择返回 `selected_task`、`instruction` 和 `action=implement|replan`。旧结果省略 action 等价 implement；Codex 投影仍要求全部字段。replan 将原反馈和摘要绑定的选择结果一起转入持久待再规划，同一次保存清除同任务已被取代的待执行 worker 格式修正，不先启动 worker；可按已有协议修订或 stop。当前协议中出现已被再规划取代却仍活动的 worker 修正时，直接拒绝该冲突状态，不迁移或清理旧协议残留。返回结果、选择快照和预算仍须核验，格式修正不得改变 action。验收不可达必须停止或补齐前置工作，不将报告完成解释为任务完成。
-- 验证、审阅和接受阶段在同一快照上复用已有证据。代码变化使旧批准失效，进程退出未知、Git 绑定异常或证据篡改均停止。
-- 失败恢复输入区分原失败来源与最新 worker、验证和审阅阶段，未知历史不补造时间或尝试序号；投影不删除原证据或宣称根因已经修复。接受候选变化时持久标记对应审阅失效，后续再规划不会使旧批准重新有效。
-- 恢复出口不能跳过接受条件；恢复未完成的 run 时，`--reverify` 只作用于当前恢复的首次整体验收，与 `--retry-stopped` 互斥，整体验收预算耗尽时不取消待再规划意图。无法继续时保留现场；台账恢复链接有效且进程退出已确认时可 abandon，链接损坏时同样停止该操作。最终集成始终由操作者完成。
-
-新运行台账为版本 15。旧版本不升级、不恢复执行；历史查看与清理见恢复协议。离线故障注入与真实模型联调分别记录，不互相代替。
-
-`resume --environment-update FILE` 仅在无待处理阶段、receipt、指令或活动修正的当前 worker 环境阻断边界接受严格版本 1 JSON。资格由保存来源及后续调用决定；首次后续调用前 interrupted/running 不使来源失效，完成或放弃仍拒绝更新。更新绑定任务、blocker dispatch 和原结果摘要并私有保存；它不能修改目标、范围、验收、权限或记忆权威，也不能重抽旧结果。
-
-可选的路径、可执行文件及已配置精确命令检查只读、不启动子进程；最新同任务更新替代旧环境假设及检查列表。选中任务每次 worker 尝试（含格式修正）前重检，失败不启动本次 worker、不消耗其尝试或派发预算；此前的指挥选择仍计入预算，指令可复用。worker 返回后验证和审阅保持原门禁。全部历史及报告按路径与 SHA256 保存并核验，工作上下文仅投影相关任务最新摘要、检查数量和结果，完整检查及 argv 按引用检索；派发看 ready 任务，再规划看触发任务，整体审阅看各任务。`environment_history` 仅投影相关任务，`environment_check_history` 每个相关 update 仅投影最新报告，完整更新及报告台账通过摘要绑定的不可变 `environment_index` 检索；未投影的历史仍须在恢复和派发前完整核验。不能把某任务的环境声明推广为其他任务的限制或授权。旧 v9 更新输入契约不变，实际必要上下文仍受容量门禁。
-
-启动检查要求主检出的已跟踪文件及暂存区无修改；未跟踪文件仅以有界、转义后的路径提示，保留原位。任务工作树从 HEAD 创建，不复制主检出的未跟踪文件。再规划、整体验收及清理仍使用各自严格的现场检查；这个启动便利不放宽任务范围、快照或删除门禁，也不隔离工具向父目录查找文件的行为。
-
-默认编排输入预算为 100,000 字符，agent 总调用超时为 3,600 秒。超时是固定墙钟上限，worker 超时计入尝试，工作树改动保留，原配置显式设置的时限不被改写。角色 skill 固定注入，任务目录不再向规划者推荐内置角色 skill；旧计划引用当前角色 skill 时组装层去重，其他任务技能保留。上下文报告区分 `required_chars` 与可选记忆 `memory_chars`，两者相加为 `used_chars`。必要输入超限停止，可选记忆只按剩余空间加入；较大的默认预算不取消历史压缩和容量门禁，也不代表模型窗口或 token 预算。
-
-Claude 单次派发轮数使用 `runtime.claude_max_turns_by_role` 中的实际角色覆盖，未列出的角色沿用 `claude_max_turns`；覆盖只允许 commander、worker、reviewer 的正整数。Fable 是模型路由名称，仍使用 commander 限额；Codex 不使用此参数。旧配置省略覆盖时保留原全局上限（缺省 50），仓库示例显式将 worker 设为 200，作为需按到限率和验收结果校准的长任务起点，不提高全局缺省。恢复同时检查全局值及每个角色的实际生效值只能保持或增加，删除覆盖导致回退变小时同样拒绝；合法覆盖调整进入既有配置变更记录，台账版本不变。独立 permission/tool smoke 的显式轮数参数优先于项目配置中的 worker 覆盖。
-
-轮数上限用于限制单次失控循环，不是任务累计工具调用预算，也不是完成条件。按需检索把部分上下文成本转成工具读取，固定小阈值可能截断有效工作并增加新实例重读成本；应结合任务粒度、墙钟时限、累计尝试及派发预算调节。到限仍保存失败与候选，不自动扩容、重派或豁免工作尝试；供应商 num_turns 只作观测。当前没有到限前自动交接协议，不能把未完成候选标成 completed 或环境等待来规避预算。
-
-当前保留角色轮数、单次墙钟时限及累计尝试／派发预算，不另设统一的任务累计工具次数硬上限。文件读取、测试与远程操作的成本不同，批量调用也会改变次数；运行时未统一截获原生工具，broker 记录不能代表全部工具使用。配置校准应按任务类型观察明确到限错误、最终验收率、总耗时和恢复重复工作，区分有效长任务与无效循环；200 轮只是起点，不由 num_turns 单独判定到限，也不据此自动扩大预算。
-
-频繁到限时先核对候选进展、验证及失败证据，再决定增加容量或细化后续任务；工具次数和文件是否变化都不能单独证明有效进展或无效循环。轮数与墙钟上限应一起评估，避免提高轮数后仅转为超时。预算到限属于资源停止，不能据此认定验收不可达；调整预算仍保留累计调用和原验收门禁。到限前的协作交接需要独立协议，当前仅保留已有候选与错误证据，不承诺硬停止前生成完整交接结果。
-
-## 项目记忆的提升与过时
-
-任务历史与可复用项目知识分别保存。任务结果使用 run/task 唯一 key，不互相覆盖。接受台账、后续依赖简报和任务记忆使用 reviewer 基于代码与证据独立形成的摘要；worker summary 留在执行证据中，不直接提升为成功知识。worker 可提交有界的知识提案，但没有直接写记忆工具。审阅者逐项核实来源并返回 approved_memory_keys；代码通过不能隐含批准提案。
-
-必要上下文保留原始目标、验收、范围和未解决问题，日志与重复内容通过证据引用缩减。每条验证命令的 stdout/stderr 摘录合计最多 500 字符，保留 argv、退出状态和完整日志路径。审阅历史仅合并完全相同的 finding；变化后的严重程度、说明或证据保留独立记录及全文引用，旧摘要保留产物引用。当前计划与原始计划相同则传入 `tasks_ref: "original_tasks"`；再规划后以 `tasks_base_ref` 和可无损重建的 `tasks_delta` 传入新增任务、描述更新和新增依赖，不重复嵌入未变义务。接受摘要引用各任务独立审阅产物。最终文件快照独立落盘，台账只保存内容摘要和路径；门禁仍重新哈希完整内容，不使用 mtime/size 缓存代替完整性检查。
-
-当前变更、历史恢复与候选指令文件的路径数组共享 4,000 字符的内联额度。超过时在最终角色输入组装层将较大的数组换成 `path_index` 引用，完整、有序、保留原始字符串的清单写入 run 的 `path-indexes/<SHA256>.json`。`path_evidence_indexes` 提供摘要、路径和数量，相同清单只提供一个索引；不同来源的父字段不变，路径相同不表示文件内容相同。目标、验收、allowed_paths、失败原因和审阅问题不采用此投影。小清单仍直接传递，完整原始台账不被投影结果覆盖。
-
-索引是路径证据，不授予权限或替代 diff／快照。已有损坏索引不被重写，符号链接不能重定向产物；引用随 dispatch 保存，在派发、返回及恢复门禁核验。损坏的审阅证据阻止接受，恢复原字节后沿用已返回结论，不重新抽取审阅。未生成路径索引时可省略该字段；正式预算仍检查投影后的实际输入，不能保证任意计划或历史均能装入默认预算。
-
-契约允许的大型审阅保持原始结果与接受语义不变，在输入层压缩文本：审阅历史共享 9,000 字符的序列化额度，反馈和格式修正引用相同的有界表示。每条问题的 ID、severity、category 和所有产物引用必须保留，location/message/evidence 可以摘录，并明确要求行动或判定解决前读取全文。旧审阅在删除重复 finding 或摘要前保存原始内容摘要，裁剪后未超预算也保留；反馈据此去重，同时区分摘录相同而原文不同的审阅。没有全文产物引用时不压缩。标识及引用的必要开销优先于摘录预算，超出全局预算仍停止；这不是任意长度历史都能装入默认上下文的承诺。
-
-worker 反馈使用共享 9,000 字符序列化额度，保留完成／阻断语义、数量、提案 key 和原始结果摘要及路径；文本摘录不改变完整结果或待审阅提案。没有全文引用时不压缩；使用引用前核验文件内容摘要，原文缺失或篡改停止。
-
-初次执行任务、应用再规划前，以及已有环境更新或操作者答复的恢复中，估算整体审阅容量，包含实际规则、契约、计划、已接受结果和先前完成的审阅证据。必要内容下限已超预算时保存计划并停止，允许增加上下文预算后恢复；对尚未接受任务预留每条 600 字符摘要、每条验证命令 500 字符输出及路径长度，预计超限只提前警告。操作者决定会被显式修订，其共享摘录随条数变化，整个决定投影仅计入 projected_chars，不作为 required_chars 的硬下界；这不改变正式派发必须携带的决定信息。最终检查点投影始终只提供索引，预检也不展开尚未接受任务的检查点。组装预检输入仍完整校验证据。该估计不能保证未来历史、转义字符和实际输出的大小；正式派发始终以真实序列化后的完整字符数检查预算。
-
-只有已接受任务中的明确获批提案才能写入 `knowledge:` 命名空间。写入校验相对来源路径、文件哈希、批准 key 和操作者所有权；存在操作者历史的 key 不得被自动提案替代。可选记忆的来源或所有权不满足条件时，记录诊断并丢弃该批提案；非法审阅批准 key 属于协议错误，阻止接受。
-
-自动任务历史和项目知识默认有 180 天召回期限，操作者事实默认无期限；均保留历史证据。知识来源改变或提交不可核实时，召回标记 possibly_stale 并降权。类型权重只作为相关性排序的辅助信号，不把人工记录视为永远正确。没有自动模型整理或语义冲突覆盖。
-
-来源表达与检索排序分别实现。`source_status` 是读取投影，按 invalid、无绑定的 unbound、changed、unavailable、not_checked、matching 的优先级归纳既有核验结果，不修改 SQLite 结构、历史 provenance、possibly_stale 或完整原因。原因按第一个冒号前的代码分类，文件名保留。旧空人工来源仍带 missing_provenance 与 0.7 折减；无 repo 的合法绑定显示 not_checked，未绑定仍显示 unbound。matching 只表示已声明来源匹配，不证明事实正确、依赖完整或提交已合入当前分支。
-
-人工文件绑定是显式操作：`memory add --source-file` 先拒绝越界、保留路径等非法输入，再词法规范化并去重，最多十个文件、每个 2 MiB。固定一个 HEAD，以精确 Git 路径读取普通文件 blob，与主检出原始字节比较，保存 commit 和 SHA256；不调用过滤器、不跟随符号链接，也不凭 Git clean 状态判断。整批在版本替换前核对，既有事务继续保护人工所有权和作用域。`--source` 不隐式变成路径；CLI 主检出绑定与 run 工作树读取分别核验，不为匹配而改变历史分支或自动路由数据库。
-
-精确 key 查询和普通词法查询共用有效期、active、适用性与来源门禁。精确查询保留输入的大小写、空格和 Unicode 原貌；普通查询在正文之外匹配可形成完整词项的小写 key、`knowledge:` 去前缀名称以及合法来源路径。运行时生成的 `task:<run_id>:<task_id>` 去前缀后仍含冒号，不能按 key 名称词法命中，任务历史应通过正文（任务标题与摘要）或精确 key 查找；保留手工单段 `task:deploy` 等 key 的既有查询行为。同词命中多个字段只计一次。历史来源路径仅在检索投影中规范化，原始来源键和接受证据不改写；公共 knowledge/task 前缀不单独制造命中。已知自由文本 key 应使用精确入口，普通词法查询不承诺跨语言或任意路径匹配。
-
-匹配且适用的记录先按来源原因分为 preferred／needs_review 两组，再使用原相关性、时间、类型权重和过时折减作组内排序，最后截断 limit。任一 source_changed、source_unavailable、commit_unavailable、invalid_provenance 或未知原因进入需复核组；无原因、missing_provenance 及仅未核验原因仍在优先组。未知原因的来源状态为 not_checked（无绑定时为 unbound），不会被宣称已证明非法。两组均为 reference_only，排序不授予事实权威或必然召回保证。
-
-检索诊断在同一次 search 中累计 active 未过期候选、匹配、作用域、排序及 limit 计数；不扫描被 SQL 排除的历史，不额外核验作用域排除项。compose 按实际装入 ID 补充 included／capacity_excluded，保持原列表 API 和报告字段。查询摘录最多 1,024 字符并附全文 SHA256；明细最多四十条，依次优先保留返回项、limit 排除项、scope 排除项和未匹配项。各排除阶段独立保留最多四十条候选明细，最后按优先级合并截断，不保证每个阶段都有明细。每条最多十个命中词项，长字段最多 256 字符且明确截断。报告不保存候选正文、不进入提示词，只写 dispatch 的 context-report.json 并随已有上下文 hook 传递。计数不受明细上限影响，后续检索仍重新核验来源。
-
-`memory history KEY` 与 read ID 同属只读审计，按原 key 返回所有版本、active、expired、scope、historical、source_status、来源及 supersedes；来源再次匹配不重新激活旧版本。它不参与自动召回、不新增 MCP history，不以 inactive 或相同哈希推断撤回意图。
-
-词法记忆检索仍扫描有效记录，并在单次请求内缓存来源核验。暂不引入索引或跨请求缓存，以保留当前过期、来源变化和排序语义；数千条以上记录的检索成本需要单独测量，当前没有大规模记忆库的延迟保证。
-
-同一项目的多个 run 各有工作树和运行锁，共享项目记忆；跨 run 检索到的知识依然需要核验来源。初始化使用数据库真实路径旁的持久 `.init.lock` 文件和等待式文件锁，覆盖 WAL 设置、建表与迁移，不锁整个 run；常规读写仍使用 SQLite 事务锁。只读 memory 子命令不创建数据库、不迁移或修改 Git 排除配置，已有库使用 SQLite mode=ro，允许 SQLite 管理 WAL 辅助文件。
-
-自动任务记忆保存 commit/run_id/task_id 的结构化来源，召回核对来源 run 及其接受记录。abandoned、来源缺失或无效的任务历史不自动召回；其他 run 已接受的结果带 historical/reference_only 标记。项目知识继续独立核对文件哈希与提交。人工事实默认 project scope，memory add/search --run 可限定运行作用域；旧无 scope 的人工记录标为 unscoped，空 provenance 不再视为已核实。key 保持项目内全局唯一；同名版本替换只允许同一有效作用域，run 还须匹配 run_id。写事务在停用旧记录前拒绝跨作用域冲突，调用方应使用不同 key；所有插入入口遵守此规则，不改数据库结构。旧 unscoped 人工记录与 project 共用替换身份，旧任务记录沿用 source/key 的 run 身份推断；历史版本不追溯重启用。MCP read 与 search 传入相同当前 run，统一计算适用性与历史标记；CLI read/export 保留无 run 视角的历史查询。所有记忆都是参考，不替代当前操作者决定或命令授权。每次检索仅对词法命中的来源进行有界台账读取并在请求内缓存，不跨请求缓存状态。
-
-接受提交与台账保存后，任务记忆、批准提案、接受事件及 post_accept 按持久待办依次完成，成功前不能派发后续任务或 completed。任务记忆使用有界摘要与审阅产物引用，不嵌入契约允许的完整大型审阅。SQLite 将稳定操作 ID、请求摘要和结果 ID 与实际记忆写入同事务保存；恢复重复操作返回原结果，不新增版本、刷新 TTL 或覆盖后来版本。接受事件通过稳定 ID 去重，可选知识提案校验失败保存丢弃诊断，存储故障保留待办供重试。恢复补完待办计入 step 的接受边界。Git commit 与接受台账写入之间的中断仍因 HEAD 不符停止，要求人工核对。
-
-## 共享工具与 hooks
-
-MCP 配置在创建 run 前预检全部角色可见且启用的服务，在 pre_agent 后、计入调用预算前复检当前角色。配置容器、角色可见性、只读声明与连接字段错误给出服务及字段诊断；关闭或对当前角色不可见的服务不要求填写连接字段。生成两端配置复用同一校验，sync 也返回可读错误。预检只验证本地结构，不连接服务；修复运行开始前的配置错误不需要新增恢复出口。
-
-生命周期 hooks 是可配置的运行时门禁，默认不附带策略。初始化时完整校验事件对象、脚本列表、argv 和正有限超时值，任何事件的无效配置都会在脚本执行前被拒绝。上下文组装事件命名为 context_prepared，保留旧名 context_compacted 作为互斥别名。暂不增加原生工具 hooks 翻译层：两端事件语义和权限效果需要按实际需求单独验证。
-
-RunContext 在所有生命周期事件及恢复重试中统一附加 `run_id`、`repo`、`worktree`、`run_dir`，避免 hook 从配置目录或日志路径猜测目标项目。运行身份与根路径来自台账，事件可以显式指定其实际 worktree；fresh_checkout 的 pre_verify/post_verify 保留验证目录，并提供 source_worktree。hook 的配置目录 CWD、stdin JSON、别名和独立日志行为保持不变。
-
-子进程 stdin 通过日志目录内的匿名临时文件提供 UTF-8 字节，避免 Python 3.11 在分段等待超时后遗漏管道中尚未写完的输入。输入文件随调用退出关闭，模型 prompt 仍保存在原派发产物中；60 秒进度提示、总超时和进程组清理保持独立生效。
-
-`post_agent` 作用于通过结果校验的调用，以及明确归类为 `invalid_rejected` 的审阅；其他非法结果在它之前停止。至少一次语义描述的是已进入 hook 门禁后的执行与重试，不要求所有非法输出都调用 hook，也不将 hook 成功视为结果合法的替代证明。
-
-pre_accept 前持久化审阅通过的快照摘要、证据和待接受阶段。hook 拒绝、超时或无法启动时保留结构化错误与日志引用；恢复时快照相同则只重试门禁，无需重复派发该任务的 worker/reviewer，且每次尝试保存独立日志。快照变化则丢弃旧批准，重新执行任务、验证及审阅，不能把先前结论用于新文件。post_accept 的待执行状态与接受台账一起保存，失败后恢复先重试该门禁，成功后才清除。这些 hook 具有至少一次执行语义，脚本需能处理重复执行。共享资产摘要使用版本域、逻辑资源身份和带长度边界的内容，支持字节一致的 Harness 安装搬迁；目标仓库和运行状态本身仍使用原路径。摘要不递归追踪任意脚本及其依赖，后者由配置维护者保证一致。
-
-post_accept 在每次执行前持久增加 hook_attempts，写入 `post_accept-N` 独立目录；on_error 同样在停止记账时分配 `error-N`。恢复不会覆盖此前的失败日志。
-
-调用结束的用量观测只读取 CLI 输出中的供应商元数据，过滤字段类型、负值及非有限数值，记录在既有 dispatch 的 provider_usage 和 dispatch_finished 事件中。Claude 保留报告成本、轮数及 token 字段；Codex 汇总完成轮次中共同报告的 token 字段，不补造缺失用量或美元成本。观测失败不改变原错误或验收结果；原始输出过大、损坏或进程突然退出可能没有用量，不能据此计算完整账单。复用 receipt 不新增 dispatch 或重复累计；不新增执行状态、费用预算或台账版本。
-
-Git 文件快照还包含暂存区条目摘要；范围检查同时检查暂存变更，提交前从已接受 HEAD 重建暂存区，再仅加入审阅过的路径。仅存在于原暂存区、且已从工作树删除的新文件在重建后跳过；真实的已跟踪删除及符号链接仍提交。再规划归档同时保存工作区与暂存差异，遇到路径祖先是符号链接时停止，避免归档写入跟随链接。验证产生的未忽略文件也属于快照变化，会留下文件差异诊断；应配置或忽略实际生成产物，不普遍豁免新文件。
-
-接受过程中，运行时的暂存区重建或 git add 若改变了已审阅的暂存区摘要，此时中断、尚未 commit，恢复也会作废旧批准，即使文件内容和 HEAD 未变。随后重新执行任务、验证与审阅，消耗新的工作尝试；任务预算已用满时需显式增加后恢复。这是现有恢复限制，不通过忽略 index 或自动 reset 绕过；审阅前暂存区可能本就不同于 HEAD，简单 reset 不能普遍恢复原审阅快照。commit 已落盘但接受台账未保存仍按 HEAD 不符停止。
-
-运行时所有工作树快照与范围检查还直接拒绝工作树内部的 `.harness` 文件、目录和符号链接，避免本地 Git 排除规则隐藏该保留路径；项目根目录的真实运行状态除外。索引含 160000 模式的仓库在创建 worktree 前拒绝，单独存在 `.gitmodules` 文件不作为拒绝依据。验证生成文件可由操作者核对后精确加入公共 Git 目录的 info/exclude，既有已跟踪文件不受豁免。
-
-保留全量内容哈希，不按 mtime、size 或 Git 的未变判断复用文件摘要。仅在相邻调用之间没有 hook、验证命令或模型执行时复用刚获得的快照；验证后的全量比较证明该候选未变，可将同一候选写入证据。单任务一次通过的离线流程由 20 次降至 15 次全量快照，恢复、hooks、审阅后及接受前的完整性检查保留。成本仍随文件数和内容大小增长，当前不承诺对大型仓库的性能上限。
-
-Claude 只读角色获得受限 Git 查询命令，worker 可配置额外的精确 argv 授权，包括必要时带明确路径的删除或移动命令；默认不开放通用 `rm`、`mv`，也不新增命令前缀授权。CLI 仍可能内建只读命令许可，配置中的额外 argv 并非所有可执行命令的穷尽清单。CLI 授权是能力配置，不能替代 OS 隔离。Codex 适配器当前只提供只读模式，配置其为 worker 时提前拒绝；不会替换模型来迁就适配器。
-
-Claude worker 通过 `Edit(//<resolved-worktree>/**)` 将内置 Edit、Write 写入授权限定到工作树，按字面转义路径中的 gitignore 模式字符，不保留裸 Edit／Write 授权或无效的 Write(path) 规则。它不限制任意脚本间接写文件；读取证据的权限和登录环境保持原配置。Codex 调用传入 `--sandbox read-only`。两种调用不具有相同的执行约束，也不承诺对工作树外读取的隔离。shared 配置四个资源路径须提前校验；doctor 按配置实际引用的 CLI 判定可用性。
-
-独立的 `python3 -m harness.permission_smoke` 使用真实 Claude worker 账号与原模型 ID，在 `.harness/permission-smoke/` 的专用 Git 现场检查权限。它保留原始 stream-json、工具调用和结果、最终 permission_denials、文件内容检查及报告；被拒绝的测试必须实际发起匹配的工具调用并得到对应拒绝，模型文字不作证。测试涵盖允许的内置读写、精确 Bash、额外参数与未列命令、工作树外读写和 `.git` 修改；外部读取按现有 Read 授权应成功。专用精确命令替换项目 worker/验证命令，外部 MCP 关闭，故不执行项目命令或访问其外部服务。该命令消耗账号额度，结果仅覆盖现场和 CLI 版本，不证明完整命令许可策略或 OS 隔离；离线证据解析测试不代表真实 CLI 已通过。
-
-完整输出契约保存在 schema.json 并由本地校验。两种供应商使用仅含基础类型、字段、必填、枚举与数组项结构的投影，另存 provider-schema.json；模型输入的 output_constraints 从同一契约生成长度、数量、非空、唯一性及标识符格式限制，本地仍强制执行，不假设两端支持相同 JSON Schema 扩展。
-
-Codex 的 provider-schema.json 另递归将每个对象的全部 properties 列入 required，以满足 [OpenAI 严格结构化输出的字段要求](https://developers.openai.com/api/docs/guides/structured-outputs#all-fields-must-be-required)。因此 Codex 生成的计划和再规划新增任务必须包含 required_commands，无已知命令前置条件时返回空数组。转换仅作用于供应商投影；本地完整契约仍允许旧计划或操作者提供的计划省略该字段，Claude 投影也保留原有可选字段语义。
-
-审阅输入另提供 uniqueBy=id、blocking 条件下 evidence 至少一项且类别不能为 preference、approved_memory_keys 的提案子集等机器可读约束。无提案包括 final_review 时批准数组 maxItems=0。预估最终上下文与实际派发使用同一生成函数；这些约束不扩展供应商 wire schema，也不替代本地校验。
-
-校验先检查身份、结构、权限及任务／审阅语义，再检查这些可修复格式限制。仅格式错误允许每个角色／调用类型／任务组合在整个 run 内自动修复一次，额度不随 resume、新尝试或新快照清零。指挥任务选择固定使用任务身份 `dispatching`，再规划固定使用 `replanning`；两种调用类型各自在整个 run 内共享一次自动格式修正额度和一次显式修正额度，不按工程任务、worker 尝试或再规划轮次重置。格式修正单独保存，不混入任务反馈，成功或候选失效时清除待修正状态。当前计划格式边界由规划检查作为硬错误拒绝。修复启动新进程、新 dispatch，传入错误和上次证据引用，必须重新检查当前文件；worker 修复同时消耗任务及整个 run 的尝试预算。缺字段、错类型、无效枚举、身份不匹配、越权、语义矛盾或 CLI 故障均不走该路径。
-
-worker 的修正派发身份在调用后端前与预算共同保存；返回结果一经落盘即结束 pending 修正，恢复也检查该返回位置以覆盖落盘与清理之间的中断。指挥修正结果由 receipt 继续处理原校验和 hook，硬错误或已耗尽的修正不重新抽取。再次失败后，worker 的人工 resume 是携带最近故障来源的新普通尝试，不重放旧修正；尝试和派发额度继续累计。准备失败或 CLI 没有返回结果时保留修正状态。
-
-worker 已报告 blocker 时，即使同时存在格式错误也保留阻断并停止，不自动重派。reviewer 格式修复必须保持原 verdict、获批知识 key 集合以及所有 finding 的数量、顺序、严重程度、说明和证据；只允许改写摘要、修正非法 finding ID 和去重批准 key。该约束与快照一起持久化，恢复不能通过重抽审阅消除原有阻断问题。修正调用的 CLI/超时故障保留原守卫，人工恢复可以重派修正；实际改变原结论或 findings 将守卫标为 failed。首次可归属的拒绝若含不可变字段格式超限，直接保留为 invalid_rejected，不派发无解的修正；非阻断批准仍标记 unrepairable。仅可变字段格式错误时，自动额度未用则按原规则修正，额度已用的首次拒绝直接保存为 invalid_rejected，保留原文、摘要及 hook 门禁后进入返工或整体再规划。格式与显式修正返回的结果不适用此拒绝出口；修正已返回但再次格式失败，或非阻断批准的自动额度已用时，仍标记 exhausted。unrepairable 和 exhausted 均禁止普通恢复对同一快照重复派发；只有满足上述批准条件的 exhausted 可显式授权一次元数据修正，failed 继续阻断同一快照。旧运行已有的拒绝型 exhausted 或 unrepairable 守卫不自动转换。任务候选真实变化时，仅按既有证据归档与完整重做路径恢复。其他身份、结构或语义错误同样阻止接受；非法拒绝按 invalid_rejected 保留证据并返工，少量非法批准元数据可经上述显式授权修正，其余已返回的非法结果持续保留并校验，不能借普通恢复改抽。
-
-修正守卫也绑定原始结果内容摘要，读取时验证，缺失或篡改直接停止。结构非法并不等于没有审阅结论：多余字段也可能伴随明确拒绝，因此不提供通用 discard-review 出口。操作者可放弃运行并保留证据，不能用恢复参数抹掉已有阻断。
-
-Git 绑定在 worktree 创建后按实际解析结果捕获，不猜测 Git 管理目录名称。保存 .git、gitdir 反向链接、commondir 摘要及实际目录、预期分支；每个工作树 Git 命令显式传入 git-dir/work-tree，并排除环境中的 Git 重定向。操作前后核验绑定，symbolic-ref 解析还拒绝 run 分支间接指向主分支。接受、归档、恢复、移除和记忆来源核验均使用绑定。detached 验证工作树额外固定提交；分支运行只允许运行时接受后推进检查点。文件快照单独按索引模式拒绝 gitlink，同名文件替换为目录按原文件删除及子路径变化处理。上述措施收紧运行时自身的提交目标，不构成对并发恶意进程的 OS 隔离。
-
-可选 verification.fresh_checkout 在仓库之外的私有临时目录创建全新 detached worktree，只用于整体验证；verification.setup_commands 是操作者声明的精确 argv，不授予 worker 能力。准备阶段只能生成忽略产物，不能改变受检代码；失败停在当前最终尝试，恢复使用另一新检出并保留旧日志。验证同时核对新检出和原 run 候选，审阅只在验证完成后派发。新检出路径、绑定、准备和验证证据保留，当前不自动清理。默认保持原工作树验证方式；设置在 run 内不可变化。该模式减少忽略文件残留与父目录依赖影响，但仍受当前环境、Git 配置及显式准备命令影响，不承诺 hermetic 构建。任务工作树仍位于项目内部，向上查找的工具可能读取主检出依赖。
-
-`cleanup-verification RUN` 独立于运行配置，支持版本 7 至 15 台账，默认在运行锁内预览已记录的全新验证检出。`--remove` 先确认派发进程退出、外部路径归属、Git 绑定和固定验证提交，并独立核对内容及索引；已跟踪修改、未跟踪和忽略文件、隐藏索引标记均拒绝清理。各检出单独返回结果，符合条件者可移除，受阻者保留。原台账、checkout.json、日志和 diff 不改写，新增绑定原证据摘要的 cleanup.json，删除意图先落盘，以恢复移除与记账之间的中断。目录已缺失而 Git 注册仍在时，只能核验原反向链接、公共目录及 detached HEAD 后注销该精确路径，不使用全仓库 prune，也不触及其他运行。
-
-显式 `--confirm-exited` 是上述不改写台账的例外，仅更新已审计确认的 dispatch；未指定时保持只读预览及原有证据保留语义。未跟踪文件（包括忽略文件）的清理诊断列出前 10 个路径及剩余数量，转义特殊字符并限制单路径显示长度；这些内容仍由操作者核对，不自动删除。
-
-初始、worker 返回和验证结束记录折叠的忽略路径清单、增减及全文摘要引用，审阅者收到诊断。清单不是内容哈希，对已有忽略文件及目录内部变化无完整性保证。内置 MCP 使用 mode=ro 记忆连接，不进行初始化或迁移；不存在数据库时返回空检索。
-
-## 为什么先串行
-
-多模型分工不要求同时写代码。串行 DAG 能先验证模型路由、一次性实例、门禁和恢复协议；每个 run 独立工作树保证原始工作区不受普通任务编辑影响。后续并行需要进一步实现每任务工作树、依赖提交集成和冲突处理，不能只加线程池。
+- [Codex non-interactive mode](https://learn.chatgpt.com/docs/non-interactive-mode)、[Codex configuration](https://learn.chatgpt.com/docs/config-file/config-reference)、[Codex MCP](https://learn.chatgpt.com/docs/extend/mcp?surface=cli)；[Claude Code CLI](https://code.claude.com/docs/en/cli-reference)、[Claude Code MCP](https://code.claude.com/docs/en/mcp)：非交互调用、JSON 输出与 schema、会话持久化、工具许可、MCP 配置。
+- [MCP stdio transport](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports)、[MCP tools](https://modelcontextprotocol.io/specification/2025-11-25/server/tools)：逐行 JSON-RPC，stdout 只用于协议。
+- [OpenAI 严格结构化输出](https://developers.openai.com/api/docs/guides/structured-outputs#all-fields-must-be-required)：Codex 的 `provider-schema.json` 把每个对象的全部属性列为必填，计划任务因此必须带 `required_commands`（可为空数组）；本地 `schema.json` 仍是校验依据。
+- [OpenAI models](https://developers.openai.com/api/docs/models)、[Claude models](https://platform.claude.com/docs/en/models/overview)：模型 ID 按配置保留，可用性由实际调用确认。实现对照了本机 Codex CLI 0.163.0 与 Claude Code 2.1.306 的 `--help`。
 
 ## 仍需明确的限制
 
-这不是恶意代码隔离系统。原生 CLI、配置的 hooks、验证命令和 MCP 服务在用户权限下运行；只读声明、prompt 和 Git 范围检查不是完整的 OS 权限边界。强隔离应使用专用 OS 用户或容器，并在那个边界内运行本编排器。
-
-SQLite 是长期记忆的存储真相；JSON 导出和 Markdown handoff 提供可检查产物。没有自动学习新技能、语义冲突检测、向量数据库、夜间 consolidation 或精确 token 计费。这些都可独立增加，不改变 task/dispatch/acceptance 契约。
-
-## 检查复用与决策边界
-
-WORK 可提交带输入和证据 SHA256 的检查点，运行时私有保存原始证据，按声明输入及 content/volatile 有效期投影 reusable/stale。content 至少绑定一个输入；volatile TTL 为 0 时每次重验，非零 TTL 从来源 worker 调用开始计时，不能因长任务结束或恢复而刷新。检查点仅核验声明依赖及证据完整性，不保证依赖完整或结论正确，不替代验证和审阅。新 worker 仍用新进程、新 dispatch，不恢复供应商会话。
-
-worker 通过身份、结构、完成／停止语义及格式门禁后，本次可选检查点逐项处理。content 缺少输入或 TTL 非零，以及源文件、路径、实际哈希等声明核对失败，只丢弃对应项；重复 ID 丢弃整批检查点并记录事件，保留 worker 结果。检查点可用性不属于 worker 完成／停止语义，不得使 operator 决策门禁、environment 反馈或合法等待的预算豁免丢失。结构非法仍停止；超过 16 项、空 evidence、SHA256 格式非法、字段长度超限等格式错误仍走原有有界修正路径，合法 blocked 语义保留阻断但不豁免预算。进入逐项处理的有效项与丢弃原因写入绑定原始结果的 batch resolution，其摘要登记到 checkpoint_batches 后才构成完整台账。恢复核验有效 manifest 集合与 resolution 一致，不把部分副本当作成功登记。checkpoints_discarded 记录任务、dispatch、逐项索引与原因，blocked feedback 携带前 2,000 字符原因；completed 结果保留事件。原始结果、已有台账、resolution 和私有副本的完整性错误，以及私有写入失败仍直接停止。
-
-检查点 evidence 额外允许当前 worker dispatch 的 `commands/` 中的普通文件，可直接使用 broker 返回的 stdout/stderr 路径和摘要。路径归属按真实路径比较，仍拒绝符号链接、父目录跳转及超限文件；inputs 和其他私有路径不获得此例外。
-
-格式修正拥有新的 dispatch 和命令目录，也遵守同一边界。修正可省略可选检查点，或对已授权且可安全重复的检查重新取证；不得仅为检查点重复有副作用的命令。其他允许的普通文件来源仍有效。本轮不引入跨 dispatch 的 broker 证据继承；这避免把旧 volatile 证据的有效期起点错误地刷新为修正调用时间。原命令输出与修正结果各自保留，验证、审阅和接受门禁不变。
-
-检查点投影仅展开相关任务最新条目；无特定任务时展开未接受任务，整体审阅及其容量预检一律只提供索引。来源按 dispatch 共享，重复标识和记录时间从完整 manifest 检索。历史不重复最新行，历史序列化超过 4,000 字符时转为索引检索。每次投影提供内容寻址、SHA256 绑定的不可变 `checkpoint_index`，收录全部台账行；旧索引在新增检查点后仍可读取。索引只是证据导航，不增加接受状态或提升证据可信度；投影前仍校验全部原始结果、manifest 和证据副本。完整运行时上下文测试覆盖单任务三次尝试各 16 个同 ID 检查点，以及四任务各四项的整体审阅；更多不同 ID、较长路径或其他必要内容仍可能超限，需增加 `context_chars`。
-
-`blocker_kind=operator` 将当前任务停在显式决策边界，回答前不再规划；completed worker 可为传递依赖于本任务的后续任务提交 decision_requests，自身仍经过正常验证和接受。`resume --operator-decision` 可重复指定，整批先校验、预写不可变证据再一次保存所有答复；任一 stop 保存整批后停止。按 request ID 记录任务范围内的 continue/stop，绑定来源和摘要；不改变授权、验收或原目标。handoff 无论是否已答复，都只由目标任务的后续调用使修订窗口过期，无关工作可以继续。worker 和指挥 stop 的答复仍在后续模型调用后过期；指挥 stop 的 continue 复用原规划问题及证据。详细格式见恢复协议。
-
-结构、格式和主状态合法的 blocked 结果中附带的 decision_requests 不登记后续门禁，记录 decision_requests_discarded 及原产物摘要；原始结果、阻断、检查点和预算豁免仍保留。首次处理与恢复采用相同校验，completed 请求保持严格，不能通过忽略必要的下游决定而接受任务。
-
-worker 的 handoff_targets 提供所有未接受的直接／传递下游 ID 和标题，输出约束与目标校验共用这一集合。非法目标或问题仍拒绝当前结果，不丢弃决定或自动改目标；独立校验成功的检查点在此门禁前保存，保留为未接受参考证据，不推进验证／审阅／接受阶段。没有合法下游时，需要的决定应作为当前任务的 operator blocker 报告。
-
-决定投影按任务筛选，整体审阅和再规划仍涵盖全部请求。内联保留请求／任务／来源身份及最新答复 ID 和 continue/stop；question 与 response.summary 合计共享 4,000 字符、每段最多 500 字符，并标记截断。重复的审计元数据、完整问题和答复及全部答复历史通过内容寻址、SHA256 绑定的不可变 `operator_decision_index` 检索；使用截断信息前必须读取全文。生成索引前仍校验全部台账与原来源，旧索引不随新答复变化，已存在的损坏索引不覆盖。该投影不改输入契约、保存原文、门禁、台账版本或累计预算。默认预算覆盖四个满长度答复及八个短决定的完整运行时流程，不承诺任意条数或长度都能放入默认预算。
-
-新返回的 completed 结果在接受前校验 handoff 目标和问题文本；非法请求拒绝本次尝试并保存 `worker_recovery`，使后续指挥和 worker 得到原因，不过滤请求后接受。已明确报告且结构、停止语义合法的 operator 阻断，其问题即使空白、含 NUL 或超过登记长度，也不能变成可由普通 resume 重试的 worker 故障：运行时登记确定性的有界说明和转义摘录，要求读取绑定的原始结果后显式回答。原始结果和接受记录均不改写，合法问题的请求 ID 保持不变。旧 run 已持久化的候选继续既有验证、审阅和接受门禁，旧候选或接受记录中的非法 handoff 文本同样转换为绑定原证据的请求，后续目标任务在回答前不能派发；不重跑已接受任务，不清零预算或提升台账版本。指挥 stop 的原因含 NUL 时仍保留停止状态，通过 `--retry-stopped` 显式重开。
-
-规划应把分析产物验收与后续操作的风险决定分开。分析可以得出“不建议”或“尚无修复”的结论，只要满足自身验收；已知兼容性风险应作为后续任务的操作者决定，不能要求分析阶段先证明尚未执行的后续操作成功。可变环境假设放入环境信息，当前工具权限包才是命令授权依据，不把短期环境事实写成不可变验收条件。
-
-审阅要求完成当前范围内的一轮检查并列出能够证实的全部阻断问题，复核旧问题及返工引入的回归。执行方案需检查步骤前置条件、实际载荷版本、重启／恢复状态，以及动态观测是否采用合适的阈值；这不保证模型一次发现所有缺陷，也不增加运行时无法核实的“已解决”标记。静态产物检查和动态设备观测分开登记，历史证据通过已有检查点检索，不能通过重新登记旧 broker 输出刷新时效。
-
-
-生命周期回归应区分有效会话活动与持续错误响应、发出取消与阻塞 I/O 真正退出、处理函数返回与底层连接释放。用可控时钟或同步夹具覆盖相关竞争顺序；不能靠追加输入、主动断开对端或将超时判为成功来证明取消有效。这些检查围绕原验收边界，不扩大任务范围；角色规则只提供检查方向，离线测试不证明真实模型的缺陷检出率提升。
-
-## 精确命令 broker 与只读文件证据（版本 11）
-
-只有 worker 获得 `harness_commands` MCP。`list_commands` 读取已配置命令，`run_command({command_id})` 仅执行 `verification.commands` 和 `permissions.worker_commands` 中与 ID 对应的完整 argv。工具约束 `command_execution` 中的 `worker_command_ids` 与 `permissions.worker_commands`、`verification_command_ids` 与 `verification.commands` 分别逐项对应；worker 优先使用 broker。调用不能附加参数或覆盖 cwd、env，不经 shell 插值。字面 `*` 和换行可原样作为 argv，旧 Bash grants 仍过滤它们。管道或重定向必须配置完整的 `["/bin/sh", "-c", "固定脚本"]`；不会自动拼接命令、授权 `gh`／`ssh`／`curl` 前缀，或借后台运行和权限绕过执行。
-
-每次命令的 stdout/stderr 原文、摘要绑定的 receipt 和子进程 journal 留在 dispatch 私有 `commands/` 目录。每条命令超时为 `runtime.verify_timeout_seconds`，恢复时可以调大；适配器的 MCP 超时另加 10 秒，worker 总调用仍受 `agent_timeout_seconds` 限制。所有恢复与清理均核对命令子进程，不能以父 CLI 退出代替子进程退出证据。`--confirm-exited` 使用父 dispatch ID 并审计子日志摘要；确认仍不放宽候选、HEAD、Git 绑定和接受门禁。此接口起始于台账版本 11；当前执行要求版本 15，cleanup-verification 支持 7 至 15。
-
-只读 `harness` MCP 保留记忆只读连接，新增 `file_sha256({path})`、`json_check({path})` 和 `file_diff({left,right})`。相对路径锚定 run 工作树，绝对外部路径允许读取；解析符号链接后只读普通文件并检查文件变化。SHA256 流式读取上限 1 GiB；JSON 与 diff 每个源上限 8 MiB。JSON 严格拒绝重复 key 与非有限数，返回有效性、根类型、值数量、摘要和可用错误位置；非法内容是 `valid=false` 的证据。diff 使用 Python difflib，返回两边摘要、不同／二进制标志，文本输出上限 24,000 字符并报告截断。它们不写文件、不启动子进程、不运行 Git 过滤器。
-
-`python3 -m harness.tool_smoke --config ... --repo ...` 是独立真实联调，使用配置的 Claude worker 模型与真实账号额度。离线测试只证明本地行为，不能据此声称真实模型调用成功。
-
-JSON 检查对浮点数要求 Python 可表示的有限数值范围；超出该范围返回 `valid=false`。整数字面量不受 Python 默认 4,300 位转换限制。嵌套深度等解析能力或资源限制返回工具错误，不将有效但无法解析的内容宣称为非法 JSON。
-
-## 运行观察与操作记录
-
-观察层（`observe.py`、`dashboard.py`）与操作记录（`operations.py`）都是只读附属物，不构成第二套执行真相：它们不写 run 台账、不取 `run.lock`、不升级台账版本、不初始化记忆库、不调用模型；操作记录创建时只执行只读的 Git 查询（目标仓库 HEAD、Harness 检出修订与修改状态）和 CLI `--version` 探测，网页服务在启动前解析一次仓库根，服务开始后不调用 Git、不启动子进程；台账解释仍复用 `status_summary`，`status` 列表与网页读同一份投影。费用按供应商分列并以台账 dispatch ID 为唯一累计单位：Claude 的数字是 CLI 报告的估算而非账户账单，Codex 不报告美元，没有合法费用字段时显示不可用而不是 0，不给全 run 合计，token 不跨 dispatch 或供应商相加。网页只通过固定根目录读取 run 目录内的普通文件：从解析后的 `.harness` 目录描述符逐级以 `O_DIRECTORY|O_NOFOLLOW` 打开中间目录，末级以 `O_NOFOLLOW|O_NONBLOCK` 打开并要求是普通文件，检查后把中间目录替换为符号链接也无法逃出根；台账中的绝对路径只显示不打开，文件内容永远以 `text/plain` 返回。服务只绑定 127.0.0.1，要求 Host 精确匹配，在创建处理线程之前把同时连接限制为 8 个，超出的连接直接 503。
-
-操作记录在加载配置之后、构造引擎之前独占创建，只有取得该 ID 的进程继续。可选字段 `created_by_operation` 随 run 的首次台账保存一起落盘；保存成功后追加 `run_created` 事件、向 stderr 输出 `[harness-json]` 通知并立即把 run ID 写回记录；resume 自身预检门禁通过、进入执行阶段前同样处理。`run_resumed` 不表示已派发模型，执行阶段仍可停止并写 `run_stopped`；预检拒绝前已保存的显式审计和配置记录保留，不承诺所有拒绝均保持台账字节不变。这些观察步骤的普通异常只发出警告，警告输出本身失败也被忽略，不改变生命周期、保存顺序或退出码；进程中断仍按既有恢复限制处理，当前 schema 的 run 缺少该可选字段也可恢复；不提供旧 schema 执行兼容。含文件型输入的调用出错时记录只保留异常类型，不复制错误文本。本批不实现：有界规划调查、进程存活探测、远端访问、多仓库汇总、跨供应商 token 汇总与按公开单价估算账单，也不把观察结果变成运行预算。详细用法与限制见[操作与观察](operations.md)。
-
-## 计划粒度与运行可靠性（版本 12）
-
-保留平面串行 DAG 和原接受协议。`plan-readiness` 生成独立私有报告，以摘要绑定原目标、原文要求和计划；计算最终责任节点对全部证据任务的传递依赖，暴露未声明产物、输入、验证命令、成本依据与未知前置条件。它不判断语义覆盖已充分，也不新增固定模型审阅或执行授权。复杂任务沿发现、实现、生命周期验证、综合验收等可独立审阅的成果拆分，不按每个文件或几行修改机械拆分；共同维护同一约束的原子生命周期修复与关键回归可以保持同一节点。交接复用 accepted commit、审阅、验证和绑定检查点，不保存私人推理，也不建立第二套接受真相。
-
-私有状态写入口先检查真实 Git 公共目录与工作树归属，在公共目录锁内保留并补充 exclude、建立私有根 `.gitignore` 的 `*` 规则、拒绝已跟踪私有文件与冲突/链接控制文件，再写操作记录或运行证据。项目中的负向忽略规则不再暴露私有状态；运行 worktree 内的 `.harness` 仍禁止。重复 operation ID 在忽略规则变更前拒绝。只读预览仅锁已有文件，缺锁不创建。
-
-版本 12 要求 `workspace_inputs` 字段：未准备为 null，准备后绑定不可变清单摘要。不允许删除 sidecar 后降级为无输入运行。版本 15 继续要求该字段；旧 run 不迁移执行。清单声明主检出源与被忽略的 worktree 目标、内容摘要/权限、数量和字节上限；复制和删除均采用意图与身份回执，未知、改变、链接和来源不符时保留现场。准备不是任意环境脚本执行或可编辑源码导入，详见[依赖副本清单](operations.md#依赖副本清单)。
-
-通知库独立于台账和接受：原生订阅先于初次采样，完整记录的游标与收件箱原子提交，坏行保留异常并继续消费，替换/截断保留旧游标并停止该来源自动消费。来源身份和游标前 4 KiB 摘要用于发现替换及附近变化，不保证检测同 inode 的任意早期历史改写。终端投递持久重试、显式 ACK 与当前资格查询分开；恢复入口始终只建议查询 status。单次监督仅记录真实启动/wait 结果，不重启，也不以父退出证明全部 broker 退出。后台常驻托管与外部通知不在本版本。
-
-Claude 新运行可选 `stream_metadata_v1`。每个 Claude CLI 派发独占冻结捕获模式；新流模式记录实际 CLI 版本，直接 JSON 模式明示版本未记录；读取结果必须有捕获清单，缺失不回退到其他格式。stdout/stderr 同时排空；有界记录解析后仅把白名单事件交给独立有界元数据队列。工具参数/结果正文、assistant 文本和 thinking 不进入元数据，stderr只记字节计数。元数据容量不足或存储失败标记 diagnostics_incomplete 并继续排空；终态使用独立 16 MiB 上限。运输损坏、第二终态、缺终态、超长记录、EOF后非零退出或未收敛的写线程均拒绝接受。全程保留墙钟超时与进程组清理，不随事件延长、不回退调用旧模式。旧 read_result 的读取语义不改。
-
-新流模式已用正式 schema、配置的原模型和独立一次性夹具验证；这不保证未来 CLI 版本兼容。工具 start/end 仅表示供应商报告调用/返回，不能推出“全文已读”或理解正确。权限摘要不给供应商未报告的原因，精确 argv 本地匹配单独呈现，不改变能力。HTTP 状态区分 missing/null/valid/invalid，missing/null均可显示未提供；失败仍按既有 is_error/subtype 判定。
-
-状态和网页增加预算事实投影。已记账调用与已确认进程启动分别列出；候选须有 worker/source 摘要关联才能计为审阅，去重 dispatch 与 receipt，格式修正独立于失败类别。失败分类只取结构化供应商证据或本地异常类型；旧缺来源保留未知，不扫描错误正文猜原因。该投影只解释已保存事实，不重新核验产物或增加豁免、额度和重试。
-
-## 验证责任与进程事实（版本 13）
-
-`verification_plan` 分开列出 worker 自检、正式任务门禁、最终准备与最终门禁，保持配置顺序，包含义务引用、适用范围及有来源的已测耗时或 unknown。耗时只是规划参考，不是硬上界；worker 工具时间已经包含在派发墙钟内，不能重复累计。所有接受候选仍执行全部配置任务门禁，最终仍执行完整验证和独立审阅，包括 fresh checkout/setup；不跨候选缓存门禁成功。
-
-任务可声明 `self_checks` 和 `evidence_requirements`；WORK 用 `evidence_files` 返回 requirement_id/path/sha256/kind。预检核对源结果、候选、必需材料身份及摘要，再执行昂贵门禁。kind 与义务映射不能证明语义覆盖。已知阻断问题按 review_dispatch_id/finding_id 绑定，worker 的 `repair_claims` 必须完整回应所需问题并引用候选内路径；reviewer 独立给出 `finding_dispositions`，approve 要求全部所需问题 resolved 且有证据。遗漏旧 finding 或 worker 自称修好均不关闭问题；解决结论只适用于其已绑定候选。 任务审阅历史与 `final_history` 均生成 required_findings；整体批准也须逐项独立处置旧整体阻断。历史 finding ID 非法或重复时，按原审阅 dispatch 与原列表位置生成 `finding-N` 别名，并保留 original_finding_id/finding_index 与原始结果；别名用于协议关联，不改写原文。无效拒绝中的问题仍须处理，其 dispositions 不能关闭问题。
-
-worker 的必需修复声明以本次实际发送的 `required_findings` 为准：调用前将完整来源身份清单绑定到 task、dispatch 和内容摘要，候选预检核验该清单及原审阅来源，不按 worker 改动后或 pre_agent hook 后的快照重算其已收到的要求。worker 可以额外回应当前候选重新打开的历史问题，未知来源仍拒绝。reviewer 独立按新候选计算全部待处置问题；输入清单绑定不延长旧解决结论的有效期，不减少正式验证或独立审阅。
-
-共享进程结果分别保留真实 exit_code、termination_reason、退出确认、cleanup 失败与证据完整性，收尾失败不覆盖已知退出码或超时原因。成功门禁不能仅看 code=0。命令准入在资源锁内检查全部未解决 journal 并持久化 starting 意图；未知退出或启动状态阻止下一命令。worker 父派发与其委托命令保留所有权区别，正式验证不得与活动候选修改竞争。子命令有效绝对截止不超过自身上限及父派发截止减 2 秒收尾余量，无剩余时间不启动。退出确认不补造退出码、输出或成功证据；进程组监督不等于完整 OS 进程树隔离。
-
-领导进程正常退出后，同组后代最多有 2 秒只观察的退出窗口，且不超过 cleanup_deadline；回收领导后不向身份连续性未知的进程组发送终止信号。窗口结束仍未确认退出时停止消费结果。指挥与审阅的已捕获终态另行绑定原输出、进程事实和结果摘要，恢复须先确认退出、核验原始证据与候选，再继续同一结果的契约和 hook 门禁，不重新抽取结论。该恢复仅允许正常零退出且唯一缺口为后代退出确认的结果；超时、取消、非零退出、协议损坏或证据不完整不因后代退出而成为成功。保留的原始 process outcome 不改写为成功，捕获未完成或证据损坏时持续阻断并保留现场。
-
-续作和执行约束的输入、来源及恢复门禁见[恢复协议](recovery.md#续作与操作指导)。这些行为边界不构成模型效果、提速或返工下降的测量结论。
-
-续作支持显式拒绝并返回修正。拒绝记录引用不可变原请求、来源结果和候选，在同一次 RunStore 保存中解除旧请求并安装同任务的待执行指令，复用现有 worker 派发路径。未消费的拒绝历史构成候选守卫；唯一消费凭证是新 worker 派发上的 rejection ID、来源候选摘要和 invoked 标记，与预算同时保存。守卫缺少指令、消费身份不符、插入其他模型调用或 pre_agent 后候选改变均停止，避免仅清空 pending 指针造成恢复缺口。无需添加另一套调度循环或修改任务的正式命令前置条件；权限、预算及接受规则保持独立。版本 13 原运行没有拒绝历史时沿用原协议，带拒绝引用却缺失对应证据时拒绝恢复。
-
-角色输入的 `context.prompt_json` 使用无缩进 JSON 紧凑编码，保留字段和值；容量预估与实际组包使用同一序列化方式。`compact_checks` 保留命令门禁事实、错误及日志引用，将重复的进程／计时详情通过 details 指向完整 results.json，输出摘录仍受合计 500 字符限制。`compact_reviews` 在已有原工件引用时省略调度 phase、verification_rounds 等执行记账信息；结论、候选关联、问题与证据引用仍保留，完整材料从原工件检索。投影不改写源证据、不推断问题已解决，也不绕过 32,000 字符等配置容量门禁。
-
-完整问题进度表保存在私有 `finding-progress/indexes/<SHA256>.json`，角色输入提供数量、状态分布及摘要绑定的检索引用，避免与审阅摘录重复展开；已有索引损坏或符号链接均拒绝。`required_findings` 的全部必需身份仍在输入中。仅当实际输入更短时，重复来源路径按 dispatch 收入 `required_finding_sources`，输入中的修复声明可用从 0 起的 `required_finding_index` 引用完整问题身份；原始 WORK、审阅结果和确定性门禁保持原格式。引用可逐项还原，不删除问题或修复声明。
-
-## Worker 接收与角色输入（版本 14）
-
-worker 与只读角色分别绑定候选：调用前保存接收意图，确认进程退出后把返回结果和返回后候选一起封存，再进行可恢复的结果校验、post_agent 与交接发布。hook 前后候选分别登记；未封存的原始输出不构成可恢复候选，不能用恢复时的文件补绑。活动接收状态属于恢复忙碌边界，接收原结果早于新调用预算与上下文准备。完整保存顺序和无法自动恢复的窗口见[进程退出与阶段恢复](recovery.md#进程退出与阶段恢复)。
-
-上下文诊断按实际角色输入的 prompt_json 计算，每个字段尺寸与容器自身开销可以加总到全文；超限仍保存报告而不记作模型调用。历史续作、指导和长命令目录使用内容寻址的 input-indexes，原始台账与命令授权不变；引用损坏或路径不安全时停止，读取和恢复不重新制造旧索引。当前条件和适用指导保留在输入或明确的全文必读义务中，不以历史压缩宣布问题解决。容量报告只说明当前输入，不保证未来重规划能放入同一预算。
-
-修复声明草稿与实际派发的 worker-findings.json 共用身份和摘要绑定，输入只携带引用及必需数，避免重复展开全部问题。草稿中的空 summary 和 evidence_paths 不构成声明或接受证据；正式预检及独立审阅保持原门禁。时间等待继续使用 operator blocker；budget continuation 只比较单次超时，不解释文字时间或引入隐式调度器。共享规则变更仍导致旧资产摘要不匹配，版本 14 及更早不自动升级执行。
-
-
-## Worker 恢复证据（版本 15）
-
-执行协议仅接受版本 15，不升级版本 14 及更早的 run；历史查看与受保护清理独立保留。配置快照、worker 接收意图中的输出模式和模型派发的 invoked 事实均为必需字段。执行只使用 work 计数策略；不补齐旧默认值，不修复旧再规划／格式修正的冲突状态。供应商模型 ID、新进程／新 dispatch、权限、候选绑定与接受门禁保持原约束。
-
-worker 的无结果判定从调用 finally 中移至统一恢复边界。进程与委托命令退出确认后，worker_returns 将来源分为 retryable、returned 和 unknown，并绑定所有相关原始文件的摘要与缺失项。直接 JSON 文件为空或为完整明确错误时可以重试；流式捕获需要完整且未损坏的传输事实，捕获读者崩溃后不能以缺少终态文件推断没有返回。确认退出只解除进程门禁，不提升结果可信度。可重试判定、故障来源与回执消费同次写入 RunStore；来源判定不可因文件删除或覆盖而改成可重试，后续新派发仍累计原预算。
-
-流式解析首次收到完整终态即独占发布 stream-received-terminal.json，保存有界终态正文，供中断后判断已有返回。它不证明传输成功，也不绑定候选。EOF、进程等待和元数据写入收敛后，版本 2 的 stream-capture.json 分别记录 transport_complete、damaged 和 terminal_count；只有完整唯一终态才发布 stream-terminal.json。控制进程在任一发布窗口被 SIGKILL，已有终态证据或捕获未知状态都会阻止 worker 重抽；不保存完整过程文本、thinking 或工具正文。
-
-首次结果和格式修正结果的结构／语义拒绝共用拒绝处理：保留产物、候选和恢复来源，原子消费被拒绝回执，不接受或豁免该尝试。操作者下一次普通恢复使用新派发及原预算。来源、候选、Git 绑定和 hook 错误继续保留活动回执。worker 回执自己的处理入口统一记录未封存判定与封存结果重放错误，避免只有 run 状态反映失败。
+- 不是恶意代码隔离系统：CLI、hooks、验证命令和 MCP 服务以用户权限运行；强隔离需要专用 OS 用户或容器。`delete_path` 不隔离并发进程（不变量 25）。
+- 未发布的 `command-staging/` 准备目录不参与枚举，也不自动回收；反复失败会累积磁盘占用，不影响恢复。
+- 调用前的台账保存失败时，`finally` 的保存可能留下已扣预算、`invoked=true` 的条目；恢复按可重试处理，保守地多计一次尝试。
+- 接受时重建暂存区改变了已审阅的暂存区摘要、在 commit 前中断，恢复作废旧批准并消耗新的工作尝试。
+- 进程组监督不是完整的 OS 进程树隔离；`--confirm-exited` 依赖操作者核实。
+- 快照每次全量哈希，成本随仓库增长；忽略路径清单不校验内容；全新检出验证不保证 hermetic 构建。
+- 记忆检索是本地词法排序，没有 embedding 或语义冲突检测；来源 `matching` 不证明事实正确。
+- 串行 DAG；并行需要每任务工作树、依赖集成和冲突处理。
+- 轮数上限与墙钟超时只限制单次调用，不是任务累计工具预算；到限不自动扩容、续接会话或豁免预算，也没有到限前的交接协议。
+- 供应商用量来自 CLI 输出，缺失不当作零；Claude 的美元数是 CLI 估算，Codex 不报告美元。

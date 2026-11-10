@@ -483,7 +483,7 @@ Python 3.11.17 执行 7 个焦点模块：`test_worker_repair_obligations`、`te
 
 独立 `gpt-6.1-sol` 审阅发现的终态后超时／普通非零退出重抽，以及不可变处置格式错误被其他元数据错误遮蔽的问题，均已修复并复验；最终审阅无未解决问题，记录为 `.harness/v27-fixes/independent-review.txt`。审阅者另以 Python 3.11 执行 4 个针对性测试方法及其子场景，全部通过，日志为 `.harness/v27-fixes/independent-regressions.log`。`git diff --check` 通过。
 
-全部流程测试使用模拟响应、stub CLI 与真实本地 Git／子进程，不证明真实模型调用成功；未运行 `harness smoke`、`harness.tool_smoke` 或 `harness.permission_smoke`。有界等待不保证所有后代都在窗口内退出，窗口外仍保留退出未知门禁；更新前缺少实际输入绑定的待预检 worker 不补造证据，恢复边界见[恢复协议](recovery.md#进程退出与阶段恢复)。
+全部流程测试使用模拟响应、stub CLI 与真实本地 Git／子进程，不证明真实模型调用成功；未运行 `harness smoke`、`harness.tool_smoke` 或 `harness.permission_smoke`。有界等待不保证所有后代都在窗口内退出，窗口外仍保留退出未知门禁；更新前缺少实际输入绑定的待预检 worker 不补造证据，恢复边界见[恢复协议](recovery.md#不能自动恢复的窗口)。
 
 ## 续作拒绝与候选修正验证（2026-11-05，台账 v13）
 
@@ -522,3 +522,27 @@ Python 3.11.17 执行 worker 返回恢复、接收回执、流式捕获、版本
 结构与语义拒绝测试核对首次返回和格式修正返回都保留拒绝来源、消费回执，并由后续全新派发继续累计预算，直到预算耗尽；候选变化及未封存结果的恢复错误同步进入 dispatch 与 last_runtime_error。旧 run 不升级或恢复执行，当前协议缺少捕获契约、完整配置快照或模型调用标记时拒绝；再规划残留的冲突修正不自动清理，测试核对没有派发、预算变化或台账重写。历史查看与受保护清理继续保留。
 
 全部流程验证使用模拟模型响应、stub CLI 与真实本地 Git／子进程；未运行真实账号的 `harness smoke`、`harness.tool_smoke` 或 `harness.permission_smoke`，离线结果不证明真实供应商调用可用。原审阅文档保留未改动。
+
+## 瘦身与实测改进验证（2026-11-10，台账 v16）
+
+本节记录 `slim-fieldtest-2026-11-09` 分支两批改动的离线验证结果：第一批 `0f86525`（内置只读 Git 查询 `git_query`、worker summary 上限、派发事件区分准备与调用、剩余调用下界、审阅轮次投影、测试分片入口），第二批 `7adcf9d`（worker 专属 `delete_path`、命令与删除 journal 先准备后发布、台账只存摘要与引用、删除冗余旋钮与通知收件箱、台账升到 16）。
+
+完整套件均为四分片执行，Python 3.15.2，无其他负载。起点 `8bef516` 没有分片脚本，在临时检出上用标准 discovery 收集后手工分成四组运行；第一批和第二批用 `python3 tests/run_shards.py --shards 4`：
+
+| 对象 | 收集 | 执行 | 通过 | 失败 | 跳过 | 用时 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 起点 `8bef516`（临时检出，手工四分片） | 1,287 | 1,287 | 1,286 | 0 | 1 | 544.9 秒 |
+| 第一批 `0f86525` | 1,345 | 1,345 | 1,344 | 0 | 1 | 536.7 秒 |
+| 第二批 `7adcf9d` | 1,396 | 1,396 | 1,395 | 0 | 1 | 538.0 秒 |
+
+跳过的一项是 `test_git_repairs` 中的 `test_non_utf8_paths_and_link_targets_survive_snapshot_and_acceptance`，本机文件系统拒绝非 UTF-8 文件名。`test_command_admission.CommandAdmissionTests.test_short_lived_descendant_drain_allows_following_commands` 对负载敏感：四分片与审阅探针并发时因 2 秒退出确认窗口失败过一次，单独重跑和无负载全量均通过；它所测的代码在这两批中没有改动。
+
+Python 3.11.17 在 `7adcf9d` 上执行 18 个重点模块，233 项全部通过，250.132 秒。命令在仓库根目录执行：`PYTHONPATH=tests python3.11 -m unittest test_git_query test_git_query_requirements test_dispatch_events test_worker_summary_bounds test_review_rounds test_run_shards test_delete_path test_command_journal_publication test_ledger_references test_schema16_history test_supervisor test_config_changes test_dispatch_replan test_work_attempt_budget test_command_admission test_worker_receipts test_continuation test_continuation_rejection`。覆盖新工具（`git_query`、`delete_path`）、journal 发布、台账引用、版本 16 历史只读路径、派发事件、summary 上限、审阅轮次、分片入口、`supervise`、配置变化、指挥选择路由、工作尝试预算、命令准入、worker 回执与续作。本轮没有在 Python 3.11 上执行完整套件。
+
+台账体积用固定离线夹具比较（同一计划、同一脚本化后端，含 400 个额外跟踪文件、1 次续作、2 次 worker 尝试）：`state.json` 由 95,682 字节降到 21,981 字节，`context-report.json` 平均由 49,974 字节降到 7,546 字节。
+
+独立审阅由 `gpt-6.1-sol` 执行，每轮新进程。规格审阅提出 6 条阻断、3 条建议，全部并入规格。第一批实现审阅提出 1 条阻断（`git_query` 输出上限没有区分保留上限与观测上限）和 4 条建议，修复后确认通过，确认轮另提的 2 条建议也已修复。第二批实现审阅提出 2 条阻断：命令目录在 journal 写入前失败会留下没有恢复出口的目录；`delete_path` 的“不删除工作树外路径”是不成立的绝对表述。前者改为先在 `command-staging/` 写好完整 journal 再原子改名发布，后者改为[设计不变量](design.md#不变量)中的保证与不保证表述，修复后确认通过。确认轮留下 1 条未处理的建议：未发布的 `command-staging/` 准备目录不自动回收，反复失败会累积磁盘占用，不影响恢复，已作为已知限制写入设计文档。文档审阅以只读方式对照 `7adcf9d` 的代码进行，提出 6 条文档与代码不符的阻断和 3 条建议，例如对证据损坏承诺了实际被 `load_run` 拒绝的 `abandon` 出口、把 worker 仍有的 Bash 授权写成不存在，全部已修正；确认轮认定这九项已解决，另发现 README 中一处关于 `git_query` 输出字节数与摘要的无条件表述，也已修正。审阅认定可接受并写入文档的两项行为：调用前台账保存失败时保守多计一次尝试；去掉全 run worker 尝试上限后，再规划新增的任务各有独立的 `max_attempts`，全局由 `max_agent_dispatches` 封顶。审阅记录在被忽略的 `.harness/design-proposals/2026-11-09-execution/reviews/`。
+
+全部流程验证使用模拟模型响应与真实本地 Git／子进程。未运行真实账号的 `harness smoke`、`harness.tool_smoke`、`harness.permission_smoke`、`harness.stream_smoke`；`harness.tool_smoke` 中新增的 `git_query` 与 `delete_path` 用例只有代码，尚未用真实账号执行。离线结果不证明真实模型调用可用。
+
+延期到下一次实测核对的指标（不作为本次提交的门禁）：因只读 Git 命令导致的停止数，以及 worker 格式修正派发数，目标都为 0；停止总数（基线 5）、模型调用数（基线 52）和 commander 调用占比（基线 27%）与基线对比。

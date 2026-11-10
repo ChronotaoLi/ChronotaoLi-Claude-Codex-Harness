@@ -21,10 +21,13 @@ effort = "high"
 [runtime]
 agent_timeout_seconds = 3600
 verify_timeout_seconds = 300
+# 每个任务的 worker 工作尝试上限；已校验的环境或操作者阻断不计入。
 max_attempts = 3
 max_final_attempts = 3
+# 整个 run 的模型调用总数（指挥、worker、审阅、格式修正都计入），通常远多于任务数。
 max_agent_dispatches = 200
 max_replans = 2
+# 计划中的任务数上限，不是调用数。
 max_tasks = 20
 context_chars = 100000
 claude_max_turns = 50
@@ -35,6 +38,7 @@ claude_max_turns_by_role = { worker = 200 }
 [permissions]
 # 额外授权给 Claude worker 的精确 argv，由命令 MCP 按 ID 执行；* 和换行按字面传入。
 # 例如 [["npm", "run", "build"]]；管道需单独授权完整 shell argv。这不是操作系统沙箱。
+# 形式表内的只读 Git 查询用内置 git_query，范围内已跟踪文件的删除用 delete_path，二者无需在此授权。
 worker_commands = []
 
 [memory]

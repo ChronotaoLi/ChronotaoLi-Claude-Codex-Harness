@@ -3,7 +3,7 @@
 Read `README.md` for usage and `docs/design.md` for constraints and reference sources.
 Runtime code is in `harness/`, common agent instructions in `shared/`, and offline behavior tests in `tests/`.
 
-Keep the core Python 3.11+ and dependency-free. Run `python3 -m unittest discover -s tests -v` after runtime changes.
+Keep the core Python 3.11+ and dependency-free. Run `python3 -m unittest discover -s tests -v` after runtime changes; `python3 tests/run_shards.py` (default `--shards 4`) runs the same discovered tests in parallel processes and exits non-zero unless every collected test ran exactly once. The single-process command remains the reference run.
 Tests must exercise lifecycle behavior, acceptance gates, isolation, retrieval or recovery rather than matching prompt wording.
 
 Preserve exact model IDs configured by the user. Workers and reviewers must get fresh processes and dispatch IDs; never add implicit resume, model fallback, recursive agents, or automatic merges.
