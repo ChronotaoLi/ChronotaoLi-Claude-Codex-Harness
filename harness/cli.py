@@ -447,12 +447,6 @@ def _main(argv=None):
     prepare = sub.add_parser("prepare-run", help="在暂停边界按清单准备不可变依赖副本")
     prepare.add_argument("run_id")
     prepare.add_argument("--manifest", type=Path, required=True)
-    readiness = sub.add_parser("plan-readiness", help="生成私有计划覆盖审阅材料，不改变 PLAN 或批准状态")
-    source = readiness.add_mutually_exclusive_group(required=True)
-    source.add_argument("--run", dest="run_id")
-    source.add_argument("--plan", type=Path)
-    readiness.add_argument("--goal")
-    readiness.add_argument("--coverage", type=Path)
     supervisor = sub.add_parser("supervise", help="启动一次 Harness run/resume 并记录真实进程退出；不自动重启")
     supervisor.add_argument("--operation-id")
     supervisor.add_argument("arguments", nargs=argparse.REMAINDER)
@@ -486,22 +480,11 @@ def _main(argv=None):
     if args.command == "status" and args.full and not args.run_id:
         parser.error("status --full 需要 run_id")
     try:
-        if args.command in ("prepare-run", "plan-readiness", "supervise"):
+        if args.command in ("prepare-run", "supervise"):
             repo = git.repository(args.repo)
             if args.command == "prepare-run":
                 from .workspace_inputs import prepare_run
                 print(dump(prepare_run(repo, args.run_id, args.manifest)))
-            elif args.command == "plan-readiness":
-                from .plan_readiness import save_readiness
-                if args.run_id:
-                    if not RUN_ID.fullmatch(args.run_id):
-                        raise HarnessError("无效 run ID")
-                    ledger = read_ledger(repo / ".harness" / "runs" / args.run_id / "state.json")
-                    plan, goal = {"tasks": ledger["tasks"]}, ledger["goal"]
-                else:
-                    plan, goal = read_json(args.plan), args.goal
-                print(dump(save_readiness(repo, plan, goal,
-                           read_json(args.coverage) if args.coverage else None, run_id=args.run_id)))
             else:
                 from .supervisor import supervise
                 arguments = args.arguments[1:] if args.arguments[:1] == ["--"] else args.arguments

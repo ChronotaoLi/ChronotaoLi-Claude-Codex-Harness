@@ -34,7 +34,7 @@
 | `private_state.py`、`workspace_inputs.py` | `.harness` 私有根保护；依赖副本清单 |
 | `cleanup.py` | `cleanup-run`：共同门禁之后分别处理全新验证检出与分支工作树 |
 | `observe.py`、`dashboard.py`、`dashboard_page.py`、`watch.py`、`watch_cli.py` | 只读观察：列表与详情、本地网页、原生文件通知 |
-| `operations.py`、`supervisor.py`、`plan_readiness.py` | 操作记录；`supervise`；计划覆盖审阅材料 |
+| `operations.py`、`supervisor.py` | 操作记录；`supervise` |
 | `permission_diagnostics.py`、`permission_smoke.py`、`tool_smoke.py`、`stream_smoke.py` | 权限诊断；真实账号联调入口 |
 
 `dispatches/<id>/` 保存一次调用的输入（worker 的 `packet.json`、`schema.json`）、输出、`returned-result.json`、`worker-seal.<SHA256>.json`、命令清单 `commands.json` 与 `commands/<call>/` 下的记录。
@@ -85,7 +85,7 @@
 **台账、版本与观察**
 
 27. 台账只经 `RunStore` 提交：在 `store.lock` 下比较已加载字节的摘要，拒绝旧写入，原子写入并递增 `store_revision`；外部动作前也核对当前权威。`run.lock` 保护生命周期。
-28. 旧版本台账不迁移、不执行：`resume`、`abandon`、`prepare-run` 只接受版本 16；版本 15 及更早仍可用只读、诊断与报告入口（`status`、`watch`、`dashboard`、`plan-readiness --run`、`permission-diagnostics`）和受门禁保护的 `cleanup-run`（版本 7–16，按各自形状核对）；不补写旧默认值。resume 另核对共享资产摘要（不含 hook 脚本的依赖）和完整配置快照。
+28. 旧版本台账不迁移、不执行：`resume`、`abandon`、`prepare-run` 只接受版本 16；版本 15 及更早仍可用只读与诊断入口（`status`、`watch`、`dashboard`、`permission-diagnostics`）和受门禁保护的 `cleanup-run`（版本 7–16，按各自形状核对）；不补写旧默认值。resume 另核对共享资产摘要（不含 hook 脚本的依赖）和完整配置快照。
 29. hooks 至少一次：`post_agent` 只作用于通过校验的结果和 `invalid_rejected` 审阅；`pre_accept`、`post_accept`、`on_error` 执行前递增计数并用独立日志目录，中断后可能重复。配置出现 `context_compacted` 时报未知事件并提示改用 `context_prepared`。
 30. 必要输入超过 `context_chars` 时不调用模型、不扣额度，报告仍写入 `context-report.json`；可选记忆按整条加入剩余空间。成功派发的报告保留根与顶层字段尺寸及最大的 30 个嵌套字段并给出省略数，超限报告保留全部明细。
 31. 观察层（`status`、`watch`、`dashboard`、操作记录、`supervise` 回执）不写台账、不取 `run.lock`、不参与恢复。

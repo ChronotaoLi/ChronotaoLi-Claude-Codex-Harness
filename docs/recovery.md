@@ -51,7 +51,7 @@
 | 停止信息或状态 | 操作者该做什么 | 命令 |
 | --- | --- | --- |
 | `--plan` 文件被拒绝（此时没有创建 run） | 修正计划文件 | 重新 `run` |
-| `计划等待明确批准` | 审阅计划，可生成 `plan-readiness` 材料 | `resume RUN --approve-plan` |
+| `计划等待明确批准` | 用 `status RUN --full` 审阅保存的计划 | `resume RUN --approve-plan` |
 | `任务所需命令尚未授权`，或 `missing_command_requirements` 非空 | 在 `permissions.worker_commands` 追加精确 argv；`git_query` 形式表内的 Git 查询无需授权 | 普通 `resume RUN` |
 | `等待续作条件：{'kind': 'commands', …}` | 授权缺少的命令，或认为方案需修正时拒绝续作 | 普通 `resume`；或 `resume RUN --reject-continuation FILE` |
 | `等待续作条件：{'kind': 'budget', …}` | 把 `agent_timeout_seconds` 提高到请求下限，或拒绝续作 | 同上 |
@@ -222,7 +222,7 @@ python3 -m harness --config /path/to/harness.toml --repo /path/to/project resume
 
 `completed` run 的普通 `resume` 返回保存结果，不派发；修改选项被拒绝。
 
-版本 15 及更早的台账不迁移、不执行：`resume`、`abandon` 和 `prepare-run` 都要求版本 16，对旧台账拒绝。以下只读、诊断与报告入口不要求当前版本，仍可用于旧台账：`status`（含 `status RUN` 与 `--full`）、`watch`、`dashboard`、`plan-readiness --run`、`permission-diagnostics`，以及受门禁保护的 `cleanup-run`（版本 7–16；验证检出不限状态，工作树仅限 `completed` 或 `abandoned`）。旧版本中未到终态的 run 不能 `abandon`，因此 `cleanup-run` 只能清理它的验证检出，不能清理其工作树。升级前应完成或放弃进行中的旧 run。
+版本 15 及更早的台账不迁移、不执行：`resume`、`abandon` 和 `prepare-run` 都要求版本 16，对旧台账拒绝。以下只读与诊断入口不要求当前版本，仍可用于旧台账：`status`（含 `status RUN` 与 `--full`）、`watch`、`dashboard`、`permission-diagnostics`，以及受门禁保护的 `cleanup-run`（版本 7–16；验证检出不限状态，工作树仅限 `completed` 或 `abandoned`）。旧版本中未到终态的 run 不能 `abandon`，因此 `cleanup-run` 只能清理它的验证检出，不能清理其工作树。升级前应完成或放弃进行中的旧 run。
 
 ## 不能自动恢复的窗口
 

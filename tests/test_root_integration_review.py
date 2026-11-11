@@ -1,53 +1,11 @@
-"""Independent behavioral checks for advisory reports and read-only telemetry."""
+"""Independent behavioral checks for read-only budget telemetry."""
 import copy
-from pathlib import Path
-import tempfile
 import unittest
 
-from harness import git
 from harness.diagnostics import budget_explanation
-from harness.plan_readiness import build_readiness, save_readiness
-from harness.private_state import ensure_private_state
-from harness.util import HarnessError
-
-
-def task(ident, dependencies=()):
-    return dict(id=ident, title=ident, description='implement ' + ident, acceptance=['verified output'],
-                allowed_paths=['src/**'], depends_on=list(dependencies), skills=[])
 
 
 class RootIntegrationReviewTests(unittest.TestCase):
-    def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temp.cleanup)
-        self.repo = Path(self.temp.name).resolve() / 'repo'
-        self.repo.mkdir()
-        git.git(self.repo, 'init', '-q')
-
-    def test_readiness_refuses_symlink_output_ancestor(self):
-        ensure_private_state(self.repo)
-        outside = self.repo.parent / 'outside'
-        outside.mkdir()
-        (self.repo / '.harness/plans').symlink_to(outside, target_is_directory=True)
-        with self.assertRaises(HarnessError):
-            save_readiness(self.repo, {'tasks': [task('work')]}, 'original goal')
-        self.assertEqual(list(outside.iterdir()), [])
-
-    def test_transitive_evidence_owner_report_remains_advisory(self):
-        plan = {'tasks': [task('source'), task('evidence', ['source']), task('owner', ['evidence'])]}
-        coverage = {'schema_version': 1, 'requirements': [dict(id='R1', text='original requirement',
-                    evidence_tasks=['source', 'evidence'], owner_task='owner')]}
-        original = copy.deepcopy(plan)
-        report = build_readiness(plan, 'original goal', coverage)
-        self.assertFalse(any(w['code'] == 'owner_precedes_evidence' for w in report['warnings']))
-        self.assertEqual(report['authority'], 'advisory_only')
-        self.assertEqual(report['semantic_coverage'], 'requires_independent_review')
-        self.assertEqual(plan, original)
-        plan['tasks'][-1]['depends_on'] = []
-        report = build_readiness(plan, 'original goal', coverage)
-        warning = next(w for w in report['warnings'] if w['code'] == 'owner_precedes_evidence')
-        self.assertEqual(warning['missing_dependencies'], ['evidence', 'source'])
-
     def test_dimensions_deduplicate_and_preserve_unknown_candidates(self):
         workers = [dict(id=f'w{i}', role='worker', invoked=True, pgid=100+i, task_id='task', status='finished') for i in range(5)]
         for worker in workers[3:]:
