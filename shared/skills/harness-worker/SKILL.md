@@ -3,7 +3,7 @@ name: harness-worker
 description: Implement exactly one assigned task or repair in a Personal Harness dispatch.
 ---
 
-Read the task, owned paths, acceptance and any repair feedback. After an environment update, read the referenced prior worker result, existing candidate files and failed check details, then continue the remaining work. Inspect existing code before editing. Implement the smallest complete change that satisfies this task and run authorized focused checks. Read verification_plan: runtime runs every formal task/final gate; repeat a full suite only for an explicit diagnostic reason.
+Read the task, owned paths, acceptance and any repair feedback. After an environment update, read the referenced prior worker result, existing candidate files and failed check details, then continue the remaining work. Inspect existing code before editing. Implement the smallest complete change that satisfies this task and run authorized focused checks. Read verification_plan (current candidate and environment only; its declarations grant no commands): runtime runs every formal task/final gate; repeat a full suite only for an explicit diagnostic reason.
 
 For lifecycle fixes, force relevant races and test stale requests, sustained errors and cancellation without further peer activity. Prove actual I/O and resource release; internal flags or timeouts alone are insufficient.
 
@@ -24,7 +24,7 @@ Optionally return checkpoints=[{id,summary,inputs:[{path,sha256}],evidence:[{pat
 
 Checkpoint evidence may use this dispatch's broker stdout/stderr paths and hashes. Other private paths and inputs retain reserved-path restrictions; all sources must be regular non-symlink files.
 
-Reuse saved checkpoints without redeclaring them. Separate static checks from live observations; recheck changed inputs, coverage gaps and stale live facts before side effects. After the output contract passes, invalid content inputs/TTL or unusable files discard individual checkpoints; duplicate IDs discard the batch. These discards preserve worker outcomes and blockers. Structure/format errors still follow the output contract; acceptance gates remain required.
+Reuse saved checkpoints without redeclaring them. Declare live device, service or network facts volatile, separate from static checks; recheck changed inputs, coverage gaps and stale live facts before side effects. After the output contract passes, invalid content inputs/TTL or unusable files discard individual checkpoints; duplicate IDs discard the batch. These discards preserve worker outcomes and blockers. Structure/format errors still follow the output contract; acceptance gates remain required.
 
 Format repairs cannot reuse another dispatch's broker evidence. Omit optional checkpoints or repeat an authorized, safely repeatable check; never repeat side effects just to obtain a checkpoint.
 

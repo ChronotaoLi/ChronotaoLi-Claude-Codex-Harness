@@ -65,8 +65,10 @@ class InputProjectionTests(unittest.TestCase):
                'source': {'dispatch_id': 'worker'}, 'applicability': {'active': True}}
         result = project_history({'execution_guidance': [row]}, self.root)
         self.assertEqual(result['execution_guidance'], [])
-        self.assertIn('before planning or execution', result['execution_guidance_index']['read_instruction'])
+        # The index is a reference and count; reading it is a shared RULES obligation.
         ref = next(iter(result['input_evidence_indexes'].values()))
+        self.assertEqual(result['execution_guidance_index'],
+                         {'input_index': ref['artifact_digest'], 'count': 1})
         self.assertEqual(json.loads(Path(ref['artifact']).read_text())['records'], [row])
 
     def test_long_exact_commands_are_retrievable_without_changing_source_grants(self):

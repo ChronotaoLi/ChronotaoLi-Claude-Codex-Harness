@@ -21,10 +21,8 @@ For final_review, inspect the complete original-base-to-HEAD diff against the or
 
 Independently verify each proposed_memories claim against its source files; approve only supported reusable facts via approved_memory_keys. Rejecting a proposal does not reject correct code. Do not approve instructions, unsupported generalizations or facts solely because tests pass. For final_review, approved_memory_keys must be empty.
 
-Do not edit code, run mutating commands, or perform other reviews in this instance.
-
 Evaluate analysis against its own acceptance; a negative conclusion can be complete. Keep a later operation's go/no-go separate from evidence required for this analysis. Downstream decision_requests preserve a choice for the named dependent task and do not authorize it.
 
 Require renewed observations where checkpoint freshness or changed inputs demand them.
 
-Use verification_plan to check responsibilities and coverage; declarations and evidence kinds are not proof. Inspect required evidence_files and applicable execution_guidance. Return one finding_dispositions entry per required_findings with its exact review_dispatch_id/finding_id, status=resolved|open|not_checked, and evidence. Resolution needs evidence; approval needs every entry resolved. Independently recheck this candidate: repair_claims, absent findings or old dispositions cannot close issues. Preserve dispositions in format correction.
+Use verification_plan to check responsibilities and coverage for the current candidate; declarations and evidence kinds are not proof. Inspect required evidence_files and applicable execution_guidance. Return one finding_dispositions entry per required_findings with its exact review_dispatch_id/finding_id, status=resolved|open|not_checked, and evidence. Resolution needs evidence; approval needs every entry resolved. Independently recheck this candidate: repair_claims, absent findings or old dispositions cannot close issues. Preserve dispositions in format correction.

@@ -50,13 +50,17 @@ class RunCleanupTests(RepoCase):
     def test_lock_refuses_and_nonterminal_worktree_is_retained(self):
         with lock(self.directory / "run.lock"), self.assertRaises(HarnessError):
             self.cleanup(True)
-        for status in ("running", "stopped", "planning"):
-            self.run["status"] = status
-            write_json(self.state, self.run)
-            for remove in (True, False):
-                result = self.cleanup(remove)
-                self.assertEqual(result["status"], "retained")
-                self.assertIn(status, result["reason"])
+        # The current version can still finish or abandon the run; older ones cannot.
+        for version, kind in ((16, "finish_or_abandon_first"), (13, "manual_removal"), (7, "manual_removal")):
+            for status in ("running", "stopped", "planning"):
+                with self.subTest(version=version, status=status):
+                    self.run.update(status=status, schema_version=version)
+                    write_json(self.state, self.run)
+                    for remove in (True, False):
+                        result = self.cleanup(remove)
+                        self.assertEqual((result["status"], result["reason_kind"]), ("retained", kind))
+                        self.assertTrue(result["reason"])
+                        self.assertNotIn("error", result)
         self.assertTrue(self.checkout.exists())
         self.assertFalse(self.receipt.exists())
 
@@ -149,6 +153,42 @@ class RunCleanupTests(RepoCase):
         self.assertEqual(read_json(self.receipt)["status"], "pending")
         self.assertEqual(self.cleanup(True)["status"], "removed")
         self.assertEqual(read_json(self.state)["status"], "completed")
+
+    def interrupt_removal(self, *, after_git):
+        original_git = git.git
+
+        def interrupted(repo, *args, **kwargs):
+            if args[:2] == ("worktree", "remove") and not after_git:
+                raise KeyboardInterrupt()
+            result = original_git(repo, *args, **kwargs)
+            if args[:2] == ("worktree", "remove"):
+                raise KeyboardInterrupt()
+            return result
+        with patch("harness.cleanup.git.git", side_effect=interrupted), self.assertRaises(KeyboardInterrupt):
+            self.cleanup(True)
+        self.assertEqual(read_json(self.receipt)["status"], "pending")
+        self.assertEqual(self.checkout.exists(), not after_git)
+
+    def continue_after_exit_confirmation(self, *, after_git):
+        self.interrupt_removal(after_git=after_git)
+        # A dispatch whose exit is unknown blocks the gate until it is confirmed.
+        run = read_json(self.state)
+        run["dispatches"].append({"id": "old", "process_state": "starting"})
+        write_json(self.state, run)
+        with self.assertRaisesRegex(HarnessError, "无法确认"):
+            self.cleanup(True)
+        before = self.state.read_bytes()
+        self.assertEqual(self.cleanup(True, confirm_exited=["old"])["status"], "removed")
+        self.assertNotEqual(self.state.read_bytes(), before)
+        self.assertFalse(self.checkout.exists())
+        self.assertEqual(read_json(self.receipt)["status"], "removed")
+        self.assertEqual(self.cleanup()["status"], "absent")
+
+    def test_pending_removal_before_git_continues_after_exit_confirmation(self):
+        self.continue_after_exit_confirmation(after_git=False)
+
+    def test_pending_removal_after_git_continues_after_exit_confirmation(self):
+        self.continue_after_exit_confirmation(after_git=True)
 
     def test_state_race_after_saved_intent_refuses_deletion(self):
         original_write = write_json

@@ -41,15 +41,10 @@ def compact_plan(original_tasks, tasks):
             update["add_depends_on"] = deepcopy(added)
         if len(update) > 1:
             updates.append(update)
+    # How to apply the delta is shared protocol (RULES), not packet data.
     result.update(
         tasks_base_ref="original_tasks",
         tasks_delta={"updates": updates, "new_tasks": deepcopy(tasks[len(original_tasks):])},
-        tasks_reconstruction=(
-            "The current tasks are original_tasks plus tasks_delta. Copy the original list; "
-            "apply updates by id, replacing description only when supplied and appending "
-            "add_depends_on; then append new_tasks in order. Omitted fields retain their "
-            "original values. All original acceptance, scope, skills and dependencies remain binding."
-        ),
     )
     return result
 
@@ -136,11 +131,6 @@ def compact_worker(worker, artifact, budget=WORKER_CONTEXT_CHARS, *, digest=None
             blocker_count=worker.get("blocker_count", len(blockers)),
             proposed_memory_count=worker.get("proposed_memory_count", len(proposal_keys)),
             proposed_memory_keys=deepcopy(proposal_keys),
-            read_instruction=(
-                "Read full_worker_artifact before acting on blockers or evidence. "
-                "Its SHA-256 digest covers the complete artifact bytes. Excerpts do not resolve "
-                "omitted blockers; memory proposals remain unapproved until independent task review."
-            ),
             summary=worker.get("summary", "")[:size],
             blockers=[value[:size] for value in blockers],
             evidence=[value[:size] for value in evidence],
@@ -186,12 +176,6 @@ def compact_review(review, artifact, budget=REVIEW_CONTEXT_CHARS, *, digest=None
         result.update(
             details_truncated=True, full_review_artifact=artifact,
             review_content_sha256=digest,
-            read_instruction=(
-                "Read full_review_artifact before acting on findings or deciding they are resolved. "
-                "Summary, locations, messages and evidence below are excerpts; missing text or "
-                "a later review omitting a finding does not establish resolution. "
-                "The content digest uses dump(review) without task_id/dispatch_id."
-            ),
         )
         if size:
             result["summary"] = review.get("summary", "")[:min(600, size)]

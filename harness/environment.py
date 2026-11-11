@@ -232,7 +232,7 @@ class EnvironmentRecovery(RuntimeService):
                     "passed": report["passed"], "observed_at": report["observed_at"],
                     "check_count": len(report["results"]),
                     "failed_check_indices": [i for i, result in enumerate(report["results"]) if not result["passed"]],
-                    "limitation": report["limitation"], **reference(report)})
+                    **reference(report)})
         lists = {"environment_updates": updates, "environment_observations": observations,
                  "environment_history": history,
                  "environment_check_history": [{"update_id": report["update_id"],

@@ -16,7 +16,7 @@ import stat
 import time
 from pathlib import Path
 
-from .versions import HISTORICAL_CLEANUP_VERSIONS
+from .versions import HISTORICAL_CLEANUP_VERSIONS, RUN_SCHEMA_VERSION
 from . import git
 from .input_projection import validate_dispatch_indexes as validate_input_dispatch_indexes
 from .path_evidence import validate_dispatch_indexes
@@ -260,6 +260,14 @@ def _clean_checkout(repo, run, artifact, expected_head, common, remove):
     return {**result, "status": "removed"}
 
 
+def _branch_matches(repo, branch, expected):
+    """True when the retained branch still names the run's checkpoint."""
+    try:
+        return git.git(repo, "rev-parse", "--verify", "refs/heads/" + branch).strip() == expected
+    except HarnessError:
+        return False
+
+
 def _clean_worktree(repo, run, directory, original, remove, remove_input_copies):
     """The run's branch worktree; its receipt is worktree-cleanup.json in the run directory."""
     checkout, branch = Path(run["worktree"]), run["branch"]
@@ -268,17 +276,20 @@ def _clean_worktree(repo, run, directory, original, remove, remove_input_copies)
     state, receipt_path = directory / "state.json", directory / "worktree-cleanup.json"
     result = {"worktree": str(checkout), "branch": branch}
     if run.get("status") not in TERMINAL:
-        # Policy, not a refusal: the run may still resume in this worktree.
-        return {**result, "status": "retained",
-                "reason": f"run 状态为 {run.get('status')}；工作树只在 run 完成（completed）"
-                          "或放弃（abandoned）之后清理，请先完成或放弃该 run"}
+        # Policy, not a refusal. Only the current ledger version can still be
+        # finished or abandoned; an older one leaves the worktree to the operator.
+        if run.get("schema_version") == RUN_SCHEMA_VERSION:
+            return {**result, "status": "retained", "reason_kind": "finish_or_abandon_first",
+                    "reason": f"run 状态为 {run.get('status')}；工作树只在 run 完成（completed）"
+                              "或放弃（abandoned）之后清理，请先完成或放弃该 run"}
+        return {**result, "status": "retained", "reason_kind": "manual_removal",
+                "reason": f"run 状态为 {run.get('status')}，台账版本 {run.get('schema_version')} "
+                          "不能由当前版本恢复或放弃；cleanup-run 不删除这个工作树，请人工核对后自行移除"}
     expected = run["expected_head"]
-    # Refuse losing the last named reference to the delivered checkpoint.
-    if git.git(repo, "rev-parse", "--verify", "refs/heads/" + branch).strip() != expected:
-        raise HarnessError("保留分支与运行检查点不同；保留工作树供核对")
+    # The receipt names the resource, not the whole ledger: an audited
+    # --confirm-exited may rewrite the ledger between an interruption and its rerun.
     identity = {"id": run["id"], "worktree": str(checkout), "branch": branch,
-                "head": expected, "state_digest": hashlib.sha256(original).hexdigest(),
-                "binding": binding}
+                "head": expected, "binding": binding}
     previous = None
     if receipt_path.exists():
         previous = json.loads(_regular_bytes(receipt_path))
@@ -290,6 +301,7 @@ def _clean_worktree(repo, run, directory, original, remove, remove_input_copies)
     input_summary = {"status": "none", "files": []}
     registered = str(checkout) in _registered(repo)
     if previous and previous["status"] == "removed":
+        # Finished stays finished, even after the operator deletes or moves the branch.
         if exists or registered or admin.exists():
             raise HarnessError("已清理工作树或注册重新出现；保留现场")
         return {**result, "status": "removed" if remove else "absent", "input_copies": input_summary}
@@ -301,6 +313,9 @@ def _clean_worktree(repo, run, directory, original, remove, remove_input_copies)
             raise HarnessError("工作树缺失但清理意图或 Git 注册不符；保留现场")
         status = "absent"
     else:
+        # Removing the worktree must not lose the last named reference to the checkpoint.
+        if not _branch_matches(repo, branch, expected):
+            raise HarnessError("保留分支与运行检查点不同；保留工作树供核对")
         git.check_worktree_binding(checkout, binding)
         if git.head(checkout, binding=binding) != expected:
             raise HarnessError("worktree HEAD 与检查点不同；保留工作树供核对")
@@ -314,13 +329,15 @@ def _clean_worktree(repo, run, directory, original, remove, remove_input_copies)
     result = {**result, "status": status, "input_copies": input_summary}
     if not remove:
         return result
-    write_json(receipt_path, {**identity, "status": "pending", "time": time.time()})
+    # The ledger digest is kept as a record of the state that authorized the removal.
+    record = {**identity, "state_digest": hashlib.sha256(original).hexdigest()}
+    write_json(receipt_path, {**record, "status": "pending", "time": time.time()})
     _ensure_exited(run)
     if _regular_bytes(state) != original:
         raise HarnessError("运行台账在清理前改变；保留现场")
-    if git.git(repo, "rev-parse", "--verify", "refs/heads/" + branch).strip() != expected:
-        raise HarnessError("保留分支在清理前改变；保留现场")
     if exists:
+        if not _branch_matches(repo, branch, expected):
+            raise HarnessError("保留分支在清理前改变；保留现场")
         git.check_worktree_binding(checkout, binding)
         if git.head(checkout, binding=binding) != expected:
             raise HarnessError("worktree HEAD 在清理前改变；保留现场")
@@ -329,5 +346,5 @@ def _clean_worktree(repo, run, directory, original, remove, remove_input_copies)
         git.git(repo, "worktree", "remove", str(checkout))
     if checkout.exists() or checkout.is_symlink() or admin.exists() or str(checkout) in _registered(repo):
         raise HarnessError("工作树尚未完全移除；保留待清理记录")
-    write_json(receipt_path, {**identity, "status": "removed", "time": time.time()})
+    write_json(receipt_path, {**record, "status": "removed", "time": time.time()})
     return {**result, "status": "removed"}

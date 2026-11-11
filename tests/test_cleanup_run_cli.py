@@ -45,7 +45,7 @@ class CleanupRunCliTests(RepoCase):
         self.assertEqual(result, 0)
         worktree = json.loads(output.getvalue())["worktree"]
         self.assertEqual(worktree["status"], "retained")
-        self.assertIn("awaiting_approval", worktree["reason"])
+        self.assertEqual(worktree["reason_kind"], "finish_or_abandon_first")
         self.assertEqual((engine.directory / "state.json").read_bytes(), original)
         self.assertTrue(engine.worktree.exists())
         self.assertIs(observe.run_detail(self.repo / ".harness", run["id"])["run"]["worktree_removed"], False)

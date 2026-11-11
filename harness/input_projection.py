@@ -81,11 +81,8 @@ def project_history(packet, directory):
         ref = _index(directory, history)
         indexes[ref['artifact_digest']] = ref
         result[key] = active
-        result[key + '_index'] = {'input_index': ref['artifact_digest'], 'count': len(history),
-            'read_instruction': ('Read the complete indexed execution guidance, including applicable constraints and source identities, before planning or execution; '
-                'a successor dispatch does not waive historical constraints. Resolve applicability and conflicts explicitly.'
-                if key == 'execution_guidance' else
-                'Retrieve complete indexed historical records when assessing unfinished work or prior resolutions; active conditions remain inline.')}
+        # How to read the index is shared protocol (RULES), not packet data.
+        result[key + '_index'] = {'input_index': ref['artifact_digest'], 'count': len(history)}
     if not indexes:
         result.pop('input_evidence_indexes', None)
     return result
@@ -132,10 +129,7 @@ def project_commands(packet, directory):
         result.setdefault('input_evidence_indexes', {})[ref['artifact_digest']] = ref
         catalog = {'input_index': ref['artifact_digest'], 'count': len(records)}
     result['exact_command_catalog'] = catalog
-    result['exact_command_policy'] = ('Resolve exact_command_ref through the catalog, reading indexed argv in full before use. '
-        'This is a role-input view only; current exact configuration is the sole command authority. '
-        'References do not grant commands or allow argument changes.')
-    # Include metadata and policy costs; small payloads retain their old shape.
+    # Include catalog costs; small payloads retain their old shape.
     return result if len(prompt_json(result)) < len(prompt_json(packet)) else deepcopy(packet)
 
 

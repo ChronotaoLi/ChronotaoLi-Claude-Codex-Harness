@@ -199,14 +199,15 @@ python3 -m harness --config /path/to/harness.toml --repo /path/to/project resume
   - 共同门禁：在运行锁内核对台账版本与归属（run ID、仓库、工作树路径、分支名、Git 公共目录与管理目录绑定）、命令目录、路径索引与输入索引、worker 回执链接，以及全部派发与命令子进程的退出证据。任一项不通过时整条命令报错，不处理任何资源。
   - 全新验证检出：run 处于任何状态都可清理。已跟踪修改、未跟踪或忽略文件、`assume-unchanged`／`skip-worktree` 标记阻止清理，错误列出前 10 个阻塞路径。目录已缺失而 Git 注册仍在时，只注销该精确路径，不做全仓库 prune。记录写在检出证据旁的 `cleanup.json`。
   - 分支工作树：只在 `completed` 或 `abandoned` 时清理，其他状态下按规则保留（`retained`）。要求原分支仍指向检查点，HEAD 与 Git 绑定未变，没有任何未保存文件（含忽略文件）或隐藏索引标记，已跟踪文件的字节与 HEAD 一致。记录写在 `worktree-cleanup.json`。`--remove --remove-input-copies` 另删除登记且未修改的依赖副本。
-  - 每个资源先保存删除意图，再执行 Git 删除，完成后记为 `removed`。删除后记账前中断时，重跑同一命令按已存意图续做，已经删掉的资源不再执行删除。
+  - 每个资源先保存删除意图，再执行 Git 删除，完成后记为 `removed`。删除后记账前中断时，重跑同一命令按已存意图续做，已经删掉的资源不再执行删除。工作树的记录绑定 run、工作树路径、分支名、检查点和 Git 绑定，不绑定整份台账，所以中断后用 `--confirm-exited` 补的退出确认不妨碍续做。
+  - 工作树记为 `removed` 之后，操作者删除或移动分支、或之后的 `--confirm-exited` 改写台账，都不会改变结果：再次运行仍报告 `removed`（预览为 `absent`），只有路径、Git 注册或管理目录重新出现才报 `blocked`。分支核对只在工作树仍存在、即将删除时进行。
   - 输出逐项列出每个资源的 `status`：
     - `eligible`：预览时可以删除。
     - `removed`：已删除，完成记录已写入。
     - `absent`：预览时资源已不存在（有删除记录，或检出的目录、注册和管理目录都已消失）；加 `--remove` 时补写完成记录，报告 `removed`。
     - `stale_registration`：仅验证检出，目录已缺失而 Git 注册仍在；`--remove` 只注销该精确路径。
     - `input_copies_present`：仅工作树的预览，有登记的依赖副本，需 `--remove --remove-input-copies`。
-    - `retained`：仅工作树，run 还没有 `completed` 或 `abandoned`，按规则保留；`reason` 写明当前状态，并说明要先完成或放弃 run。
+    - `retained`：仅工作树，run 还没有 `completed` 或 `abandoned`，按规则保留，`reason` 写明当前状态。`reason_kind` 为 `finish_or_abandon_first` 时，台账是当前版本，先完成或 `abandon` 该 run 再清理；为 `manual_removal` 时，台账是旧版本，当前版本既不能恢复也不能放弃它，`cleanup-run` 不删除这个工作树，需人工核对后自行移除。
     - `blocked`：资源本可清理，但门禁挡住了删除或预览；`error` 写明原因和阻塞路径，资源原样保留。
   - 某个资源受阻不影响其余资源。只有出现 `blocked` 时退出码为 1；只有 `retained` 的工作树时退出码为 0。
   - 已删除的 `abandon --remove-worktree` 在旧台账里留下的 `worktree_removed` 或 `pending_worktree_removal` 被当作已有的删除意图：工作树目录、Git 注册和管理目录都已消失时，工作树按已移除处理，其余资源照常清理。

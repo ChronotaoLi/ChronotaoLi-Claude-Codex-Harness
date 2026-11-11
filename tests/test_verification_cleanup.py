@@ -105,7 +105,7 @@ class VerificationCleanupTests(RepoCase):
             result = json.loads(stdout.getvalue())
             self.assertEqual(result["run_status"], "stopped")
             self.assertEqual(self.statuses(result), (checkouts, "retained"))
-            self.assertIn("stopped", result["worktree"]["reason"])
+            self.assertEqual(result["worktree"]["reason_kind"], "finish_or_abandon_first")
             self.assertNotIn("error", result["worktree"])
         self.assertFalse(self.checkout.exists())
         self.assertEqual(git.head(worktree), self.run["expected_head"])
@@ -118,6 +118,51 @@ class VerificationCleanupTests(RepoCase):
         with contextlib.redirect_stdout(stdout):
             self.assertEqual(main(["--repo", str(self.repo), "cleanup-run", self.run["id"], "--remove"]), 1)
         self.assertEqual(self.statuses(json.loads(stdout.getvalue())), (["removed", "blocked"], "retained"))
+
+    def cli(self, *extra):
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            code = main(["--repo", str(self.repo), "cleanup-run", self.run["id"], *extra])
+        return code, self.statuses(json.loads(stdout.getvalue()))
+
+    def test_closing_sequence_survives_branch_deletion_and_movement(self):
+        # README order: clean first, then the operator handles the branch.
+        self.assertEqual(self.cli("--remove"), (0, (["removed"], "removed")))
+        git.git(self.repo, "branch", "-D", self.run["branch"])
+        self.assertEqual(self.cli(), (0, (["absent"], "absent")))
+        self.assertEqual(self.cli("--remove"), (0, (["removed"], "removed")))
+        # A branch recreated elsewhere (moved) does not reopen a finished removal.
+        git.git(self.repo, "branch", self.run["branch"], self.run["base_commit"])
+        self.assertEqual(self.cli("--remove"), (0, (["removed"], "removed")))
+        # Nor does a later audited exit confirmation that rewrites the ledger.
+        self.run = read_json(self.directory / "state.json")
+        self.run["dispatches"].append({"id": "late", "process_state": "starting"})
+        write_json(self.directory / "state.json", self.run)
+        result = self.cleanup(remove=True, confirm_exited=["late"])
+        self.assertEqual(self.statuses(result), (["removed"], "removed"))
+        self.assertTrue(read_json(self.directory / "state.json")["dispatches"][-1]["exit_confirmed"])
+        self.assertEqual(read_json(self.directory / "worktree-cleanup.json")["status"], "removed")
+
+    def test_closing_sequence_with_a_remaining_checkout_after_branch_deletion(self):
+        scratch = self.checkout / "scratch.txt"
+        scratch.write_text("inspect first")
+        self.assertEqual(self.cli("--remove"), (1, (["blocked"], "removed")))
+        git.git(self.repo, "branch", "-D", self.run["branch"])
+        self.assertEqual(self.cli(), (1, (["blocked"], "absent")))
+        scratch.unlink()
+        self.assertEqual(self.cli(), (0, (["eligible"], "absent")))
+        self.assertEqual(self.cli("--remove"), (0, (["removed"], "removed")))
+        self.assertFalse(self.checkout.exists())
+
+    def test_old_ledger_removal_key_survives_branch_deletion(self):
+        worktree = self.engine_instance.worktree
+        state = self.directory / "state.json"
+        git.git(self.repo, "worktree", "remove", str(worktree))
+        git.git(self.repo, "branch", "-D", self.run["branch"])
+        write_json(state, {**read_json(state), "status": "abandoned", "schema_version": 12, "worktree_removed": True})
+        self.assertEqual(self.cli(), (0, (["eligible"], "absent")))
+        self.assertEqual(self.cli("--remove"), (0, (["removed"], "removed")))
+        self.assertEqual(self.cli(), (0, (["absent"], "absent")))
 
     def test_interrupted_removals_resume_without_repeating_deletion_or_losing_receipts(self):
         worktree = self.engine_instance.worktree

@@ -87,10 +87,9 @@ def build_verification_plan(config, task=None, *, cost_samples=None):
 def verification_role_view(plan, role):
     result = deepcopy(plan)
     # Common applicability/cost facts are emitted once in role views.
+    # What a plan entry does and does not prove is shared protocol (RULES).
     result["check_defaults"] = {"cost_estimate": {"seconds": None, "source": "unknown"},
-                                "after": [], "obligation_refs": [],
-                                "applicability": "current candidate/environment only",
-                                "mapping": "independent review must establish semantic coverage"}
+                                "after": [], "obligation_refs": []}
     for check in result["checks"]:
         for field in ("applicability", "mapping"):
             check.pop(field, None)
@@ -102,12 +101,6 @@ def verification_role_view(plan, role):
     result["obligations"] = [{"task_id": o["task_id"], "acceptance_index": o["acceptance_index"]}
                              for o in result["obligations"]]
     result["role"] = role
-    if role != "reviewer":  # The reviewer skill carries the reviewer's coverage rule.
-        result["instruction"] = (
-            "Use authorized focused self-checks as needed. Runtime executes every task gate and every final gate; "
-            "repeat a full suite only for an explicit diagnostic reason. Declarations grant no command permission."
-            if role == "worker" else
-            "Independently verify obligation coverage; evidence kinds and command mappings are declarations, not proof.")
     return result
 
 
@@ -229,10 +222,7 @@ def finding_progress(run, task_id, *, limit=60):
     selected = items if limit is None else items[-limit:] if limit > 0 else []
     return {"findings": selected,
             "omitted_count": len(items) - len(selected),
-            "history_task_ids": task_ids,
-            "policy": "History facts only. Missing findings and worker repair claims do not establish resolution. "
-                      "Resolved dispositions apply only to their recorded candidate; recheck changed candidates. "
-                      "If omitted_count is nonzero, retrieve full review_history before assessing issue coverage."}
+            "history_task_ids": task_ids}
 
 
 def finding_progress_packet(run, task_id, directory):
@@ -264,10 +254,7 @@ def finding_progress_packet(run, task_id, directory):
         severity_counts[row["severity"]] = severity_counts.get(row["severity"], 0) + 1
     return {"count": len(progress["findings"]), "status_counts": status_counts,
             "severity_counts": severity_counts, "history_task_ids": progress["history_task_ids"],
-            "index": {"artifact": str(artifact), "artifact_digest": digest},
-            "policy": progress["policy"] + " Read the SHA256-bound index for the complete ordered findings "
-                      "matrix, original IDs, source artifacts and candidate-scoped dispositions before "
-                      "acting on an issue. Summary counts do not prove resolution or acceptance."}
+            "index": {"artifact": str(artifact), "artifact_digest": digest}}
 
 
 def project_finding_sources(packet):

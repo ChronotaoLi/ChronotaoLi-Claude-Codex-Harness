@@ -182,7 +182,7 @@ python3 -m harness --repo /path/to/project cleanup-run RUN --remove
 
 `abandon RUN` 保留分支、工作树和证据并禁止恢复；它与 `resume` 一样先核验台账和加载时证据，这些证据损坏时同样被拒绝（见[证据损坏](docs/recovery.md#证据损坏)）。放弃不删除文件，移除工作树用之后的 `cleanup-run RUN --remove`。
 
-`cleanup-run RUN` 是唯一的清理入口：默认预览，逐项列出保留的全新验证检出和分支工作树能否清理、被什么挡住；`--remove` 才逐项删除。验证检出在任何 run 状态都可清理；工作树只在 `completed` 或 `abandoned` 时清理，其他状态下报告 `retained` 并在 `reason` 中写明当前状态，要先完成或放弃 run。未保存文件（含忽略文件）、隐藏索引标记、与 HEAD 不符的字节，或原分支已离开检查点，会让对应资源报告 `blocked`，`error` 列出原因与阻塞路径，资源保留，其余资源照常清理。每项的 `status` 为 `eligible`（可删除）、`removed`（已删除）、`absent`（已不存在）、`stale_registration`（检出目录缺失但仍有 Git 注册）、`input_copies_present`（需加 `--remove-input-copies`）、`retained` 或 `blocked`，含义见[放弃与清理](docs/recovery.md#放弃与清理)；只有出现 `blocked` 时退出码为 1。派发或命令子进程退出未确认时整条命令拒绝；父 dispatch 退出不能证明 broker 命令子进程退出，核实后可加 `--confirm-exited DISPATCH_ID` 记录确认。删除意图和完成记录分别写在检出证据旁的 `cleanup.json` 和 run 目录的 `worktree-cleanup.json`，中断后重跑同一命令续做；普通预览不生成记录。命令不改 run 状态，不删除分支、台账或运行证据；需要删除分支时，先完成清理，再由操作者核对集成结果并处理分支。完整规则见[放弃与清理](docs/recovery.md#放弃与清理)。
+`cleanup-run RUN` 是唯一的清理入口：默认预览，逐项列出保留的全新验证检出和分支工作树能否清理、被什么挡住；`--remove` 才逐项删除。验证检出在任何 run 状态都可清理；工作树只在 `completed` 或 `abandoned` 时清理，其他状态下报告 `retained`，`reason` 写明当前状态：当前版本的 run 要先完成或放弃，旧版本未结束的 run 需人工核对后自行移除工作树。工作树清理完成后可以删除或移动分支，之后再运行仍报告已清理。未保存文件（含忽略文件）、隐藏索引标记、与 HEAD 不符的字节，或原分支已离开检查点，会让对应资源报告 `blocked`，`error` 列出原因与阻塞路径，资源保留，其余资源照常清理。每项的 `status` 为 `eligible`（可删除）、`removed`（已删除）、`absent`（已不存在）、`stale_registration`（检出目录缺失但仍有 Git 注册）、`input_copies_present`（需加 `--remove-input-copies`）、`retained` 或 `blocked`，含义见[放弃与清理](docs/recovery.md#放弃与清理)；只有出现 `blocked` 时退出码为 1。派发或命令子进程退出未确认时整条命令拒绝；父 dispatch 退出不能证明 broker 命令子进程退出，核实后可加 `--confirm-exited DISPATCH_ID` 记录确认。删除意图和完成记录分别写在检出证据旁的 `cleanup.json` 和 run 目录的 `worktree-cleanup.json`，中断后重跑同一命令续做；普通预览不生成记录。命令不改 run 状态，不删除分支、台账或运行证据；需要删除分支时，先完成清理，再由操作者核对集成结果并处理分支。完整规则见[放弃与清理](docs/recovery.md#放弃与清理)。
 
 新台账版本为 16，要求完整的 worker 接收意图、输出模式与配置快照，缺失时不补造旧默认值。台账只存摘要与引用：worker 接收意图记录派发目录中不可变的 `packet.json`、`schema.json` 的路径与 SHA256，续作、执行指导和续作拒绝行只记 `snapshot_digest`，完整快照在 `continuations/` 等目录的不可变文件里；这些文件被删除、修改或换成符号链接时 `resume` 停止并保留现场。版本 15 及更早不迁移、不执行：`resume`、`abandon`、`prepare-run` 拒绝旧台账；`status`、`watch`、`dashboard`、`permission-diagnostics` 仍可只读使用，`cleanup-run` 仍可在门禁通过后清理（工作树仅限终态）。共享规则变更也受资产摘要门禁约束。版本 16 已完成 run 的普通恢复返回保存结果；终态限制见[终态与历史台账](docs/recovery.md#终态与历史台账)。
 
@@ -199,7 +199,7 @@ python3 -m harness --repo /path/to/project cleanup-run RUN --remove
 | [shared/mcp.json](shared/mcp.json) | 外部 MCP 服务的唯一配置源 |
 | [shared/hooks.json](shared/hooks.json) | 确定性的编排生命周期 hooks |
 
-RULES 与角色 skill 是协议说明的唯一来源，每次派发都注入；包里只放数据、索引和现场事实，不再重复环境、决定、检查点、权限和审阅的说明。某任务没有相关的环境更新、决定或检查点时，包里只带对应索引。指挥包另带 `workspace: {head, clean}`：当时的 `expected_head` 与工作树 `git status` 是否干净。
+协议说明放在 RULES 与角色 skill 里，每次派发都注入；包里放数据、索引和现场事实。环境更新、操作者决定、检查点、执行指导、权限、审阅、路径与命令索引、问题进度和计划增量的读法都只在 RULES 与技能里。仍留在包里的静态说明只有这几类，会随后续协议改动移除或改写：指挥 plan／dispatch／replan 的 `instruction`、不经指挥直接派发时的默认 worker 指令和续作拒绝后的 worker 指令、格式修正与显式修正的 `instruction`、修复声明模板的 `policy` 和 `required_finding_source_policy`。某任务没有相关的环境更新、决定或检查点时，包里只带对应索引。指挥包另带 `workspace: {head, clean}`：当时的 `expected_head` 与工作树 `git status` 是否干净。
 
 角色 skill 自动注入一次；计划的 `skills` 选择额外技能，不需要时用 `[]`。其他技能先加载目录，再通过 `skill_read` 按需读取。旧计划引用角色 skill 仍合法且不会重复注入；不会自动安装整个 ECC 技能目录。
 

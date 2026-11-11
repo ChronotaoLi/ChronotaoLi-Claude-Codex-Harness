@@ -10,14 +10,6 @@ from .util import HarnessError, dump, write_json
 
 
 INLINE_PATH_CHARS = 4000
-PATH_EVIDENCE_POLICY = (
-    "A path list may be inline or a {path_index: SHA256} reference. Resolve references "
-    "through path_evidence_indexes; each artifact contains the complete ordered paths array. "
-    "Use bounded reads/searches to locate relevant entries, fetch more when needed, and verify artifact_digest. "
-    "Counts and references are not excerpts or proof of acceptance. These indexes enumerate "
-    "paths only: the original diff, snapshot, recovery source and instruction-file trust rules "
-    "still govern file contents and provenance. An identical index does not mean identical file contents."
-)
 
 
 def _folder(directory):
@@ -133,5 +125,4 @@ def project_paths(packet, directory):
         remaining -= size
     if indexes:
         result["path_evidence_indexes"] = indexes
-        result["path_evidence_policy"] = PATH_EVIDENCE_POLICY
     return result

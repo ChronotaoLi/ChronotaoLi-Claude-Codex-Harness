@@ -37,7 +37,7 @@
 | `operations.py`、`supervisor.py` | 操作记录；`supervise` |
 | `permission_diagnostics.py`、`permission_smoke.py`、`tool_smoke.py`、`stream_smoke.py` | 权限诊断；真实账号联调入口 |
 
-每次调用的输入由三部分组成：`shared/RULES.md` 与该角色的 skill（协议说明的唯一来源，包括各类索引的读法），以及包（`packet`）。包只放数据、索引和现场事实：环境更新、操作者决定和检查点在包里是有界摘录加 SHA256 绑定的索引，与本次任务无关时只带索引；包里不带环境、决定、检查点、权限或审阅的静态说明。worker 包的 `instruction` 是指挥写的指令，属于数据；指挥包另带 `workspace: {head, clean}`，在构造包时同时读取 `expected_head` 和工作树 `git status` 是否干净。
+每次调用的输入由三部分组成：`shared/RULES.md` 与该角色的 skill（协议说明，包括各类摘录与索引的读法），以及包（`packet`）。包放数据、索引和现场事实：环境更新、操作者决定和检查点在包里是有界摘录加 SHA256 绑定的索引，与本次任务无关时只带索引。环境、决定、检查点、执行指导、权限、审阅、路径索引、命令目录、问题进度和计划增量的说明不在包里。仍在包里的静态说明及其去向：指挥 plan／dispatch／replan 的 `instruction`、默认 worker 指令和续作拒绝后写入拒绝记录的 worker 指令（随指挥调用合并改写，B4）；格式修正与显式修正的 `instruction`（随无效输出规则统一删除，B3）；修复声明模板的 `policy` 与 `required_finding_source_policy`（随身份归运行时删除或改写，B2）。另有几个分类标签（`instruction_file_changes.trust`、`ignored_paths.coverage`、环境检查结果的 `coverage`）、`verification_plan.policy` 的布尔标记、操作者决定里替代非法问题的有界说明，以及提示词中可选记忆前的分隔标题，它们描述具体数据，不是协议说明。worker 包的 `instruction` 是指挥写的指令，属于数据；指挥包另带 `workspace: {head, clean}`，在构造包时同时读取 `expected_head` 和工作树 `git status` 是否干净。
 
 `dispatches/<id>/` 保存一次调用的输入（worker 的 `packet.json`、`schema.json`）、输出、`returned-result.json`、`worker-seal.<SHA256>.json`、命令清单 `commands.json` 与 `commands/<call>/` 下的记录。
 

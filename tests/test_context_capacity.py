@@ -218,7 +218,9 @@ class FinalContextCapacityTests(RepoCase):
         self.assertLessEqual(len(prompt_json(final)), self.config.data["runtime"]["context_chars"])
         duplicated = copy.deepcopy(final)
         duplicated["packet"]["tasks"] = reconstruct(packet)
-        for key in ("tasks_base_ref", "tasks_delta", "tasks_reconstruction"):
+        # The delta carries no procedure text; RULES describes how to apply it.
+        self.assertNotIn("tasks_reconstruction", packet)
+        for key in ("tasks_base_ref", "tasks_delta"):
             duplicated["packet"].pop(key)
         self.assertGreater(len(prompt_json(duplicated)), self.config.data["runtime"]["context_chars"])
 

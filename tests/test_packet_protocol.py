@@ -96,6 +96,31 @@ class PacketProtocolTests(RepoCase):
         self.assertTrue({"environment_updates", "environment_index", "task_checkpoints", "checkpoint_index"} <= set(worker))
         self.assert_data_only(backend.calls)
 
+    def test_replan_packet_carries_workspace_saved_in_its_commander_receipt(self):
+        receipt_keys = {"plan": "planning", "dispatch": "dispatching", "replan": "replanning"}
+        observed = []
+
+        def change(backend, kwargs, packet, result):
+            if kwargs["role"] == "commander":
+                state = read_json(kwargs["run_path"])
+                receipt = state["commander_receipts"][f"commander:{kwargs['kind']}:{receipt_keys[kwargs['kind']]}"]
+                observed.append((kwargs["kind"], packet["workspace"], receipt["request"]["packet"]["workspace"],
+                                 state["expected_head"], git.git(kwargs["cwd"], "status", "--porcelain")))
+            if kwargs["role"] == "worker" and sum(c["role"] == "worker" for c in backend.calls) == 1:
+                result.update(status="blocked", blocker_kind="task", blockers=["Missing prerequisite"])
+
+        backend = ScriptedBackend(change)
+        engine = self.engine(backend)
+        with self.assertRaises(HarnessError):
+            engine.start("Implement greet", self.plan())  # The offline replan stops the run.
+        self.assertEqual([kind for kind, *_ in observed], ["replan"])
+        _, workspace, saved, ledger_head, status = observed[0]
+        self.assertEqual(workspace, saved)
+        self.assertEqual(workspace["head"], ledger_head)
+        # The blocked candidate is retained for replanning, so the tree is dirty.
+        self.assertIs(workspace["clean"], status == "")
+        self.assertIs(workspace["clean"], False)
+
     def test_task_without_environment_update_receives_only_the_index(self):
         def change(backend, kwargs, packet, result):
             if kwargs["role"] == "worker" and kwargs["task"]["id"] == "greet" and not any(

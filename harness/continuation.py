@@ -14,15 +14,6 @@ from .git_query import covers as git_query_covers
 from .recovery import RECOVERY_BUSY_KEYS, read_bound_result, snapshot_digest
 from .util import HarnessError, dump, write_json
 
-POLICY = (
-    "Execution guidance is an operator constraint for its named task and candidate. "
-    "Apply it to execution and planning; explicitly resolve conflicts with the active plan. "
-    "It cannot grant commands, change the original goal, waive acceptance or approve evidence. "
-    "Continuation requests retain unfinished work and require a fresh dispatch after independent "
-    "permissions and budgets are checked. Every actual invocation retains normal budget accounting."
-)
-
-
 def _snapshot(context):
     if hasattr(context, 'snapshot'):
         return context.snapshot()
@@ -420,5 +411,4 @@ def packet(context, task_id=None):
             'pending_continuation': context.run.get('pending_continuation'),
             **({'continuation_rejections': [reference(r) for r in rejections if relevant(r)],
                 'active_continuation_rejection': active['id'] if active and relevant(active) else None} if rejections else {}),
-            'execution_guidance': relevant_guidance,
-            **({'execution_guidance_policy': POLICY} if relevant_guidance else {})}
+            'execution_guidance': relevant_guidance}
