@@ -17,6 +17,7 @@ from unittest.mock import patch
 from harness import git
 from harness.recovery import snapshot_digest
 from harness.util import HarnessError, read_json, write_json
+from harness.versions import RUN_SCHEMA_VERSION
 import harness.worker_receipts as receipts_module
 from test_harness import RepoCase, ROOT
 from test_runtime_changes import ScriptedBackend
@@ -609,8 +610,11 @@ class LedgerReferenceTests(RepoCase):
         run['continuation_history'] = [{**read_json(Path(row['artifact'])), 'artifact': row['artifact'],
                                          'artifact_digest': row['artifact_digest']}
                                         for row in run['continuation_history']]
-        self.assertEqual(run['schema_version'], 16)
-        # Historical schema-15 fields: the saved run-wide counter and budget policy.
+        self.assertEqual(run['schema_version'], RUN_SCHEMA_VERSION)
+        # Historical schema-15 fields: the declared capture mode, the saved run-wide
+        # counter and the budget policy.
+        from test_ledger_history import adopt_capture_contract
+        adopt_capture_contract(engine.directory, run, 'legacy_json')
         run.update(schema_version=15, total_attempts=sum(run['attempts'].values()), attempt_budget_policy='work')
         write_json(engine.directory / 'state.json', run)
         return engine, backend, run

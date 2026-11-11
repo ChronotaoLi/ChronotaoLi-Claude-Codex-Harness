@@ -19,6 +19,7 @@ from harness.run_context import RunContext
 from harness.operations import OperationRecord
 from harness.shared import asset_digest
 from harness.util import HarnessError, read_json, write_json
+from harness.versions import RUN_SCHEMA_VERSION
 from test_harness import ROOT, RepoCase
 
 
@@ -119,7 +120,7 @@ class OperationRecordTests(OperationCase):
         self.assertLessEqual(record["run_linked_at"], record["finished_at"])
         self.assertRegex(record["finished_at_utc"], r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
         ledger = self.ledger(run_id)
-        self.assertEqual((ledger["schema_version"], ledger["created_by_operation"]), (16, "op-a"))
+        self.assertEqual((ledger["schema_version"], ledger["created_by_operation"]), (RUN_SCHEMA_VERSION, "op-a"))
         created = self.events(run_id, "run_created")
         self.assertEqual([(event["run_id"], event["operation_id"]) for event in created], [(run_id, "op-a")])
         self.assertIn(notice("run_created", run_id, "op-a"), errors.splitlines())
@@ -418,7 +419,7 @@ class OperationRecordTests(OperationCase):
         self.assertEqual(code, 0, errors)
         self.assertEqual(json.loads(output)["status"], "completed")
         self.assertNotIn("created_by_operation", read_json(path))
-        self.assertEqual(read_json(path)["schema_version"], 16)
+        self.assertEqual(read_json(path)["schema_version"], RUN_SCHEMA_VERSION)
 
     def test_engine_accepts_operation_double_and_null_operation(self):
         state = self.state

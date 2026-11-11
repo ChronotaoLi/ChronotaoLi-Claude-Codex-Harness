@@ -1,0 +1,2494 @@
+{
+ "baseline": "bc94b6f harness/worker_returns.py inspect_return",
+ "generator": "tests/data/worker_return_history_bc94b6f.gen.py",
+ "rows": [
+  {
+   "capture": {
+    "mode": "legacy_json",
+    "provider": "claude"
+   },
+   "files": {
+    "capture-manifest.json": {
+     "text": "{\"version\": 1, \"mode\": \"legacy_json\", \"cli_version\": \"not_recorded\", \"transport\": \"json\"}"
+    },
+    "response.json": {
+     "text": "{}"
+    }
+   },
+   "mode": "legacy",
+   "name": "L1 response.json exists",
+   "record": {
+    "capture": {
+     "mode": "legacy_json",
+     "provider": "claude"
+    },
+    "reason": "worker result exists without a candidate seal",
+    "sources": {
+     "capture-manifest.json": "b166f054d000c2f6ddbad4b8e849cffa8ab6ce53e0c86998a6f304269d5f1c1c",
+     "process.outcome.json": null,
+     "process.stdout": null,
+     "provider-result.json": null,
+     "response.json": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+     "result.json": null,
+     "returned-result.json": null,
+     "stream-capture.json": null,
+     "stream-received-terminal.json": null,
+     "stream-terminal.json": null,
+     "terminal-capture.json": null
+    },
+    "state": "returned",
+    "version": 1
+   }
+  },
+  {
+   "capture": {
+    "mode": "legacy_json",
+    "provider": "claude"
+   },
+   "files": {
+    "capture-manifest.json": {
+     "text": "{\"version\": 1, \"mode\": \"stream_metadata_v1\", \"cli_version\": \"x\", \"transport\": \"jsonl\"}"
+    },
+    "process.stdout": {
+     "text": ""
+    }
+   },
+   "mode": "legacy",
+   "name": "L2 manifest declares stream",
+   "record": {
+    "capture": {
+     "mode": "legacy_json",
+     "provider": "claude"
+    },
+    "reason": "capture manifest does not match invocation",
+    "sources": {
+     "capture-manifest.json": "f743e07f9b06008c09cb2018f29c591d0ed0051a2f6bd19bb4b234273fde0c3e",
+     "process.outcome.json": null,
+     "process.stdout": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+     "provider-result.json": null,
+     "response.json": null,
+     "result.json": null,
+     "returned-result.json": null,
+     "stream-capture.json": null,
+     "stream-received-terminal.json": null,
+     "stream-terminal.json": null,
+     "terminal-capture.json": null
+    },
+    "state": "unknown",
+    "version": 1
+   }
+  },
+  {
+   "capture": {
+    "mode": "legacy_json",
+    "provider": "claude"
+   },
+   "files": {
+    "capture-manifest.json": {
+     "text": "[]"
+    },
+    "process.stdout": {
+     "text": ""
+    }
+   },
+   "mode": "legacy",
+   "name": "L2b manifest is a list",
+   "record": {
+    "capture": {
+     "mode": "legacy_json",
+     "provider": "claude"
+    },
+    "reason": "capture manifest does not match invocation",
+    "sources": {
+     "capture-manifest.json": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+     "process.outcome.json": null,
+     "process.stdout": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+     "provider-result.json": null,
+     "response.json": null,
+     "result.json": null,
+     "returned-result.json": null,
+     "stream-capture.json": null,
+     "stream-received-terminal.json": null,
+     "stream-terminal.json": null,
+     "terminal-capture.json": null
+    },
+    "state": "unknown",
+    "version": 1
+   }
+  },
+  {
+   "capture": {
+    "mode": "legacy_json",
+    "provider": "claude"
+   },
+   "files": {
+    "capture-manifest.json": {
+     "text": "{\"version\": 1, \"mode\": \"legacy_json\", \"cli_version\": \"not_recorded\", \"transport\": \"json\"}"
+    },
+    "process.stdout": {
+     "text": ""
+    },
+    "stream-terminal.json": {
+     "text": "{\"type\": \"result\", \"subtype\": \"success\", \"is_error\": false, \"structured_output\": {\"status\": \"completed\"}}"
+    }
+   },
+   "mode": "legacy",
+   "name": "L3 stream-terminal.json present",
+   "record": {
+    "capture": {
+     "mode": "legacy_json",
+     "provider": "claude"
+    },
+    "reason": "stream evidence conflicts with JSON invocation",
+    "sources": {
+     "capture-manifest.json": "b166f054d000c2f6ddbad4b8e849cffa8ab6ce53e0c86998a6f304269d5f1c1c",
+     "process.outcome.json": null,
+     "process.stdout": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+     "provider-result.json": null,
+     "response.json": null,
+     "result.json": null,
+     "returned-result.json": null,
+     "stream-capture.json": null,
+     "stream-received-terminal.json": null,
+     "stream-terminal.json": "7dd3bea7b3d8b7c0a0a50c04a0224b04ff1901194a1935c68611190879d6e6e1",
+     "terminal-capture.json": null
+    },
+    "state": "unknown",
+    "version": 1
+   }
+  },
+  {
+   "capture": {
+    "mode": "legacy_json",
+    "provider": "claude"
+   },
+   "files": {
+    "capture-manifest.json": {
+     "text": "{\"version\": 1, \"mode\": \"legacy_json\", \"cli_version\": \"not_recorded\", \"transport\": \"json\"}"
+    },
+    "process.stdout": {
+     "text": "{\"type\": \"result\", \"subtype\": \"success\", \"is_error\": false, \"structured_output\": {\"status\": \"completed\"}}"
+    },
+    "provider-result.json": {
+     "text": "{\"type\": \"result\", \"subtype\": \"error_during_execution\", \"is_error\": true}"
+    }
+   },
+   "mode": "legacy",
+   "name": "L4 provider-result differs from stdout",
+   "record": {
+    "capture": {
+     "mode": "legacy_json",
+     "provider": "claude"
+    },
+    "reason": "provider result conflicts with original output",
+    "sources": {
+     "capture-manifest.json": "b166f054d000c2f6ddbad4b8e849cffa8ab6ce53e0c86998a6f304269d5f1c1c",
+     "process.outcome.json": null,
+     "process.stdout": "7dd3bea7b3d8b7c0a0a50c04a0224b04ff1901194a1935c68611190879d6e6e1",
+     "provider-result.json": "a8f5663eb98aefa3fad87c24c52a171eee8daf2cdc2b3b7471eb1eb63795fc9a",
+     "response.json": null,
+     "result.json": null,
+     "returned-result.json": null,
+     "stream-capture.json": null,
+     "stream-received-terminal.json": null,
+     "stream-terminal.json": null,
+     "terminal-capture.json": null
+    },
+    "state": "unknown",
+    "version": 1
+   }
+  },
+  {
+   "capture": {
+    "mode": "legacy_json",
+    "provider": "claude"
+   },
+   "files": {
+    "capture-manifest.json": {
+     "text": "{\"version\": 1, \"mode\": \"stream_metadata_v1\", \"cli_version\": \"x\", \"transport\": \"jsonl\"}"
+    },
+    "response.json": {
+     "text": "{}"
+    }
+   },
+   "mode": "legacy",
+   "name": "L1b response.json with a stream manifest",
+   "record": {
+    "capture": {
+     "mode": "legacy_json",
+     "provider": "claude"
+    },
+    "reason": "worker result exists without a candidate seal",
+    "sources": {
+     "capture-manifest.json": "f743e07f9b06008c09cb2018f29c591d0ed0051a2f6bd19bb4b234273fde0c3e",
+     "process.outcome.json": null,
+     "process.stdout": null,
+     "provider-result.json": null,
+     "response.json": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+     "result.json": null,
+     "returned-result.json": null,
+     "stream-capture.json": null,
+     "stream-received-terminal.json": null,
+     "stream-terminal.json": null,
+     "terminal-capture.json": null
+    },
+    "state": "returned",
+    "version": 1
+   }
+  },
+  {
+   "capture": {
+    "mode": "legacy_json",
+    "provider": "claude"
+   },
+   "files": {
+    "capture-manifest.json": {
+     "text": "{\"version\": 1, \"mode\": \"stream_metadata_v1\", \"cli_version\": \"x\", \"transport\": \"jsonl\"}"
+    },
+    "process.stdout": {
+     "text": ""
+    },
+    "stream-terminal.json": {
+     "text": "{\"type\": \"result\", \"subtype\": \"success\", \"is_error\": false, \"structured_output\": {\"status\": \"completed\"}}"
+    }
+   },
+   "mode": "legacy",
+   "name": "L3b stream file with a stream manifest",
+   "record": {
+    "capture": {
+     "mode": "legacy_json",
+     "provider": "claude"
+    },
+    "reason": "capture manifest does not match invocation",
+    "sources": {
+     "capture-manifest.json": "f743e07f9b06008c09cb2018f29c591d0ed0051a2f6bd19bb4b234273fde0c3e",
+     "process.outcome.json": null,
+     "process.stdout": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+     "provider-result.json": null,
+     "response.json": null,
+     "result.json": null,
+     "returned-result.json": null,
+     "stream-capture.json": null,
+     "stream-received-terminal.json": null,
+     "stream-terminal.json": "7dd3bea7b3d8b7c0a0a50c04a0224b04ff1901194a1935c68611190879d6e6e1",
+     "terminal-capture.json": null
+    },
+    "state": "unknown",
+    "version": 1
+   }
+  },
+  {
+   "capture": {
+    "mode": "legacy_json",
+    "provider": "claude"
+   },
+   "files": {
+    "capture-manifest.json": {
+     "text": "{\"version\": 1, \"mode\": \"legacy_json\", \"cli_version\": \"not_recorded\", \"transport\": \"json\"}"
+    },
+    "process.stdout": {
+     "text": ""
+    },
+    "provider-result.json": {
+     "text": "{\"type\": \"result\", \"subtype\": \"success\", \"is_error\": false, \"structured_output\": {\"status\": \"completed\"}}"
+    }
+   },
+   "mode": "legacy",
+   "name": "L4b provider-result with empty stdout",
+   "record": {
+    "capture": {
+     "mode": "legacy_json",
+     "provider": "claude"
+    },
+    "reason": "provider result conflicts with original output",
+    "sources": {
+     "capture-manifest.json": "b166f054d000c2f6ddbad4b8e849cffa8ab6ce53e0c86998a6f304269d5f1c1c",
+     "process.outcome.json": null,
+     "process.stdout": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+     "provider-result.json": "7dd3bea7b3d8b7c0a0a50c04a0224b04ff1901194a1935c68611190879d6e6e1",
+     "response.json": null,
+     "result.json": null,
+     "returned-result.json": null,
+     "stream-capture.json": null,
+     "stream-received-terminal.json": null,
+     "stream-terminal.json": null,
+     "terminal-capture.json": null
+    },
+    "state": "unknown",
+    "version": 1
+   }
+  },
+  {
+   "capture": {
+    "mode": "legacy_json",
+    "provider": "claude"
+   },
+   "files": {
+    "capture-manifest.json": {
+     "text": "{\"version\": 1, \"mode\": \"legacy_json\", \"cli_version\": \"not_recorded\", \"transport\": \"json\"}"
+    },
+    "process.stdout": {
+     "text": ""
+    }
+   },
+   "mode": "legacy",
+   "name": "L5 stdout empty",
+   "record": {
+    "capture": {
+     "mode": "legacy_json",
+     "provider": "claude"
+    },
+    "reason": "direct JSON output is absent or empty after exit",
+    "sources": {
+     "capture-manifest.json": "b166f054d000c2f6ddbad4b8e849cffa8ab6ce53e0c86998a6f304269d5f1c1c",
+     "process.outcome.json": null,
+     "process.stdout": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+     "provider-result.json": null,
+     "response.json": null,
+     "result.json": null,
+     "returned-result.json": null,
+     "stream-capture.json": null,
+     "stream-received-terminal.json": null,
+     "stream-terminal.json": null,
+     "terminal-capture.json": null
+    },
+    "state": "retryable",
+    "version": 1
+   }
+  },
+  {
+   "capture": {
+    "mode": "legacy_json",
+    "provider": "claude"
+   },
+   "files": {},
+   "mode": "legacy",
+   "name": "L5b stdout absent, no manifest",
+   "record": {
+    "capture": {
+     "mode": "legacy_json",
+     "provider": "claude"
+    },
+    "reason": "direct JSON output is absent or empty after exit",
+    "sources": {
+     "capture-manifest.json": null,
+     "process.outcome.json": null,
+     "process.stdout": null,
+     "provider-result.json": null,
+     "response.json": null,
+     "result.json": null,
+     "returned-result.json": null,
+     "stream-capture.json": null,
+     "stream-received-terminal.json": null,
+     "stream-terminal.json": null,
+     "terminal-capture.json": null
+    },
+    "state": "retryable",
+    "version": 1
+   }
+  },
+  {
+   "capture": {
+    "mode": "legacy_json",
+    "provider": "claude"
+   },
+   "files": {
+    "capture-manifest.json": {
+     "text": "{\"version\": 1, \"mode\": \"legacy_json\", \"cli_version\": \"not_recorded\", \"transport\": \"json\"}"
+    },
+    "process.stdout": {
+     "text": "{\"type\": \"result\", \"subtype\": \"error_during_execution\", \"is_error\": true}"
+    }
+   },
+   "mode": "legacy",
+   "name": "L6 explicit error",
+   "record": {
+    "capture": {
+     "mode": "legacy_json",
+     "provider": "claude"
+    },
+    "reason": "provider returned a complete explicit error",
+    "sources": {
+     "capture-manifest.json": "b166f054d000c2f6ddbad4b8e849cffa8ab6ce53e0c86998a6f304269d5f1c1c",
+     "process.outcome.json": null,
+     "process.stdout": "a8f5663eb98aefa3fad87c24c52a171eee8daf2cdc2b3b7471eb1eb63795fc9a",
+     "provider-result.json": null,
+     "response.json": null,
+     "result.json": null,
+     "returned-result.json": null,
+     "stream-capture.json": null,
+     "stream-received-terminal.json": null,
+     "stream-terminal.json": null,
+     "terminal-capture.json": null
+    },
+    "state": "retryable",
+    "version": 1
+   }
+  },
+  {
+   "capture": {
+    "mode": "legacy_json",
+    "provider": "claude"
+   },
+   "files": {
+    "capture-manifest.json": {
+     "text": "{\"version\": 1, \"mode\": \"legacy_json\", \"cli_version\": \"not_recorded\", \"transport\": \"json\"}"
+    },
+    "process.stdout": {
+     "text": "{\"type\": \"result\", \"subtype\": \"error_max_turns\"}"
+    }
+   },
+   "mode": "legacy",
+   "name": "L6b error_max_turns without is_error",
+   "record": {
+    "capture": {
+     "mode": "legacy_json",
+     "provider": "claude"
+    },
+    "reason": "provider returned a complete explicit error",
+    "sources": {
+     "capture-manifest.json": "b166f054d000c2f6ddbad4b8e849cffa8ab6ce53e0c86998a6f304269d5f1c1c",
+     "process.outcome.json": null,
+     "process.stdout": "55e269986db7d0a8a9552943b44b559d463f405d15d0bd995b209d7ea4c72d43",
+     "provider-result.json": null,
+     "response.json": null,
+     "result.json": null,
+     "returned-result.json": null,
+     "stream-capture.json": null,
+     "stream-received-terminal.json": null,
+     "stream-terminal.json": null,
+     "terminal-capture.json": null
+    },
+    "state": "retryable",
+    "version": 1
+   }
+  },
+  {
+   "capture": {
+    "mode": "legacy_json",
+    "provider": "claude"
+   },
+   "files": {
+    "capture-manifest.json": {
+     "text": "{\"version\": 1, \"mode\": \"legacy_json\", \"cli_version\": \"not_recorded\", \"transport\": \"json\"}"
+    },
+    "process.stdout": {
+     "text": "{\"type\": \"result\", \"subtype\": \"success\", \"is_error\": false, \"structured_output\": {\"status\": \"completed\"}}"
+    }
+   },
+   "mode": "legacy",
+   "name": "L7 success terminal",
+   "record": {
+    "capture": {
+     "mode": "legacy_json",
+     "provider": "claude"
+    },
+    "reason": "non-error or ambiguous direct JSON output",
+    "sources": {
+     "capture-manifest.json": "b166f054d000c2f6ddbad4b8e849cffa8ab6ce53e0c86998a6f304269d5f1c1c",
+     "process.outcome.json": null,
+     "process.stdout": "7dd3bea7b3d8b7c0a0a50c04a0224b04ff1901194a1935c68611190879d6e6e1",
+     "provider-result.json": null,
+     "response.json": null,
+     "result.json": null,
+     "returned-result.json": null,
+     "stream-capture.json": null,
+     "stream-received-terminal.json": null,
+     "stream-terminal.json": null,
+     "terminal-capture.json": null
+    },
+    "state": "returned",
+    "version": 1
+   }
+  },
+  {
+   "capture": {
+    "mode": "legacy_json",
+    "provider": "claude"
+   },
+   "files": {
+    "capture-manifest.json": {
+     "text": "{\"version\": 1, \"mode\": \"legacy_json\", \"cli_version\": \"not_recorded\", \"transport\": \"json\"}"
+    },
+    "process.stdout": {
+     "text": "{\"type\": \"result\", \"subtype\": \"success\", \"is_error\": false, \"structured_output\": {\"status\": \"completed\"}}"
+    },
+    "provider-result.json": {
+     "text": "{\"type\": \"result\", \"subtype\": \"success\", \"is_error\": false, \"structured_output\": {\"status\": \"completed\"}}"
+    }
+   },
+   "mode": "legacy",
+   "name": "L7b success terminal + equal provider-result",
+   "record": {
+    "capture": {
+     "mode": "legacy_json",
+     "provider": "claude"
+    },
+    "reason": "non-error or ambiguous direct JSON output",
+    "sources": {
+     "capture-manifest.json": "b166f054d000c2f6ddbad4b8e849cffa8ab6ce53e0c86998a6f304269d5f1c1c",
+     "process.outcome.json": null,
+     "process.stdout": "7dd3bea7b3d8b7c0a0a50c04a0224b04ff1901194a1935c68611190879d6e6e1",
+     "provider-result.json": "7dd3bea7b3d8b7c0a0a50c04a0224b04ff1901194a1935c68611190879d6e6e1",
+     "response.json": null,
+     "result.json": null,
+     "returned-result.json": null,
+     "stream-capture.json": null,
+     "stream-received-terminal.json": null,
+     "stream-terminal.json": null,
+     "terminal-capture.json": null
+    },
+    "state": "returned",
+    "version": 1
+   }
+  },
+  {
+   "capture": {
+    "mode": "legacy_json",
+    "provider": "claude"
+   },
+   "files": {
+    "capture-manifest.json": {
+     "text": "{\"version\": 1, \"mode\": \"legacy_json\", \"cli_version\": \"not_recorded\", \"transport\": \"json\"}"
+    },
+    "process.stdout": {
+     "text": "{\"type\": \"assistant\"}"
+    }
+   },
+   "mode": "legacy",
+   "name": "L8 non-result JSON",
+   "record": {
+    "capture": {
+     "mode": "legacy_json",
+     "provider": "claude"
+    },
+    "reason": "non-error or ambiguous direct JSON output",
+    "sources": {
+     "capture-manifest.json": "b166f054d000c2f6ddbad4b8e849cffa8ab6ce53e0c86998a6f304269d5f1c1c",
+     "process.outcome.json": null,
+     "process.stdout": "ecd57dd932397dfc44c8f732dbead687d5bb8d7e2f76367d83d311ea4a3d39f7",
+     "provider-result.json": null,
+     "response.json": null,
+     "result.json": null,
+     "returned-result.json": null,
+     "stream-capture.json": null,
+     "stream-received-terminal.json": null,
+     "stream-terminal.json": null,
+     "terminal-capture.json": null
+    },
+    "state": "unknown",
+    "version": 1
+   }
+  },
+  {
+   "capture": {
+    "mode": "legacy_json",
+    "provider": "claude"
+   },
+   "files": {
+    "capture-manifest.json": {
+     "text": "{\"version\": 1, \"mode\": \"legacy_json\", \"cli_version\": \"not_recorded\", \"transport\": \"json\"}"
+    },
+    "process.stdout": {
+     "text": "[]"
+    }
+   },
+   "mode": "legacy",
+   "name": "L8b JSON list",
+   "record": {
+    "capture": {
+     "mode": "legacy_json",
+     "provider": "claude"
+    },
+    "reason": "non-error or ambiguous direct JSON output",
+    "sources": {
+     "capture-manifest.json": "b166f054d000c2f6ddbad4b8e849cffa8ab6ce53e0c86998a6f304269d5f1c1c",
+     "process.outcome.json": null,
+     "process.stdout": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+     "provider-result.json": null,
+     "response.json": null,
+     "result.json": null,
+     "returned-result.json": null,
+     "stream-capture.json": null,
+     "stream-received-terminal.json": null,
+     "stream-terminal.json": null,
+     "terminal-capture.json": null
+    },
+    "state": "unknown",
+    "version": 1
+   }
+  },
+  {
+   "capture": {
+    "mode": "legacy_json",
+    "provider": "claude"
+   },
+   "files": {
+    "capture-manifest.json": {
+     "text": "{\"version\": 1, \"mode\": \"legacy_json\", \"cli_version\": \"not_recorded\", \"transport\": \"json\"}"
+    },
+    "process.stdout": {
+     "text": "{\"type\":\"result\",\"subtype\":\"succ"
+    }
+   },
+   "mode": "legacy",
+   "name": "L9 truncated JSON",
+   "record": {
+    "capture": {
+     "mode": "legacy_json",
+     "provider": "claude"
+    },
+    "reason": "unreadable worker return evidence: JSONDecodeError",
+    "sources": {
+     "capture-manifest.json": "b166f054d000c2f6ddbad4b8e849cffa8ab6ce53e0c86998a6f304269d5f1c1c",
+     "process.outcome.json": null,
+     "process.stdout": "f1c52f4dd4822db1527e144b67a83f2b6f4d58713a24a502211f8f638bcfc42e",
+     "provider-result.json": null,
+     "response.json": null,
+     "result.json": null,
+     "returned-result.json": null,
+     "stream-capture.json": null,
+     "stream-received-terminal.json": null,
+     "stream-terminal.json": null,
+     "terminal-capture.json": null
+    },
+    "state": "unknown",
+    "version": 1
+   }
+  },
+  {
+   "capture": {
+    "mode": "legacy_json",
+    "provider": "claude"
+   },
+   "files": {
+    "capture-manifest.json": {
+     "text": "{\"version\": 1, \"mode\": \"legacy_json\", \"cli_version\": \"not_recorded\", \"transport\": \"json\"}"
+    },
+    "process.stdout": {
+     "base64": "//57"
+    }
+   },
+   "mode": "legacy",
+   "name": "L9b invalid UTF-8",
+   "record": {
+    "capture": {
+     "mode": "legacy_json",
+     "provider": "claude"
+    },
+    "reason": "unreadable worker return evidence: UnicodeDecodeError",
+    "sources": {
+     "capture-manifest.json": "b166f054d000c2f6ddbad4b8e849cffa8ab6ce53e0c86998a6f304269d5f1c1c",
+     "process.outcome.json": null,
+     "process.stdout": "5f8e3f357eca3664fc07caa7b3d65f601a5941f143c11a3416d5475a805d63d7",
+     "provider-result.json": null,
+     "response.json": null,
+     "result.json": null,
+     "returned-result.json": null,
+     "stream-capture.json": null,
+     "stream-received-terminal.json": null,
+     "stream-terminal.json": null,
+     "terminal-capture.json": null
+    },
+    "state": "unknown",
+    "version": 1
+   }
+  },
+  {
+   "capture": {
+    "mode": "legacy_json",
+    "provider": "claude"
+   },
+   "files": {
+    "capture-manifest.json": {
+     "text": "{bad"
+    },
+    "process.stdout": {
+     "text": ""
+    }
+   },
+   "mode": "legacy",
+   "name": "L9c manifest unreadable",
+   "record": {
+    "capture": {
+     "mode": "legacy_json",
+     "provider": "claude"
+    },
+    "reason": "unreadable worker return evidence: JSONDecodeError",
+    "sources": {
+     "capture-manifest.json": "17eed55d881c0dd5fe0935a98d89dd9e52d62aed941f3fb7d17bd490e5aa3e8f",
+     "process.outcome.json": null,
+     "process.stdout": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+     "provider-result.json": null,
+     "response.json": null,
+     "result.json": null,
+     "returned-result.json": null,
+     "stream-capture.json": null,
+     "stream-received-terminal.json": null,
+     "stream-terminal.json": null,
+     "terminal-capture.json": null
+    },
+    "state": "unknown",
+    "version": 1
+   }
+  },
+  {
+   "capture": {
+    "mode": "stream_metadata_v1",
+    "provider": "claude"
+   },
+   "files": {
+    "capture-manifest.json": {
+     "text": "{\"version\": 1, \"mode\": \"stream_metadata_v1\", \"cli_version\": \"x\", \"transport\": \"jsonl\"}"
+    },
+    "response.json": {
+     "text": "{}"
+    }
+   },
+   "mode": "stream",
+   "name": "S1 response.json exists",
+   "record": {
+    "capture": {
+     "mode": "stream_metadata_v1",
+     "provider": "claude"
+    },
+    "reason": "worker result exists without a candidate seal",
+    "sources": {
+     "capture-manifest.json": "f743e07f9b06008c09cb2018f29c591d0ed0051a2f6bd19bb4b234273fde0c3e",
+     "process.outcome.json": null,
+     "process.stdout": null,
+     "provider-result.json": null,
+     "response.json": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+     "result.json": null,
+     "returned-result.json": null,
+     "stream-capture.json": null,
+     "stream-received-terminal.json": null,
+     "stream-terminal.json": null,
+     "terminal-capture.json": null
+    },
+    "state": "returned",
+    "version": 1
+   }
+  },
+  {
+   "capture": {
+    "mode": "stream_metadata_v1",
+    "provider": "claude"
+   },
+   "files": {
+    "capture-manifest.json": {
+     "text": "{\"version\": 1, \"mode\": \"legacy_json\", \"cli_version\": \"not_recorded\", \"transport\": \"json\"}"
+    }
+   },
+   "mode": "stream",
+   "name": "S2 manifest declares legacy",
+   "record": {
+    "capture": {
+     "mode": "stream_metadata_v1",
+     "provider": "claude"
+    },
+    "reason": "capture manifest does not match invocation",
+    "sources": {
+     "capture-manifest.json": "b166f054d000c2f6ddbad4b8e849cffa8ab6ce53e0c86998a6f304269d5f1c1c",
+     "process.outcome.json": null,
+     "process.stdout": null,
+     "provider-result.json": null,
+     "response.json": null,
+     "result.json": null,
+     "returned-result.json": null,
+     "stream-capture.json": null,
+     "stream-received-terminal.json": null,
+     "stream-terminal.json": null,
+     "terminal-capture.json": null
+    },
+    "state": "unknown",
+    "version": 1
+   }
+  },
+  {
+   "capture": {
+    "mode": "stream_metadata_v1",
+    "provider": "claude"
+   },
+   "files": {
+    "capture-manifest.json": {
+     "text": "{\"version\": 1, \"mode\": \"stream_metadata_v1\", \"cli_version\": \"x\", \"transport\": \"jsonl\"}"
+    },
+    "stream-received-terminal.json": {
+     "text": "{\"version\": 1}"
+    }
+   },
+   "mode": "stream",
+   "name": "S3 invalid witness",
+   "record": {
+    "capture": {
+     "mode": "stream_metadata_v1",
+     "provider": "claude"
+    },
+    "reason": "invalid received terminal witness",
+    "sources": {
+     "capture-manifest.json": "f743e07f9b06008c09cb2018f29c591d0ed0051a2f6bd19bb4b234273fde0c3e",
+     "process.outcome.json": null,
+     "process.stdout": null,
+     "provider-result.json": null,
+     "response.json": null,
+     "result.json": null,
+     "returned-result.json": null,
+     "stream-capture.json": null,
+     "stream-received-terminal.json": "c3aa9744214caf6eb993d6f88f3f1dda3e4e60d59f712b6463c4ce2c4b00dfa1",
+     "stream-terminal.json": null,
+     "terminal-capture.json": null
+    },
+    "state": "unknown",
+    "version": 1
+   }
+  },
+  {
+   "capture": {
+    "mode": "stream_metadata_v1",
+    "provider": "claude"
+   },
+   "files": {
+    "capture-manifest.json": {
+     "text": "{\"version\": 1, \"mode\": \"stream_metadata_v1\", \"cli_version\": \"x\", \"transport\": \"jsonl\"}"
+    },
+    "stream-received-terminal.json": {
+     "text": "{\"version\": 1, \"terminal\": {\"type\": \"result\", \"subtype\": \"success\", \"is_error\": false, \"structured_output\": {\"status\": \"completed\"}}}"
+    }
+   },
+   "mode": "stream",
+   "name": "S4 non-error witness",
+   "record": {
+    "capture": {
+     "mode": "stream_metadata_v1",
+     "provider": "claude"
+    },
+    "reason": "stream received a non-error terminal before interruption",
+    "sources": {
+     "capture-manifest.json": "f743e07f9b06008c09cb2018f29c591d0ed0051a2f6bd19bb4b234273fde0c3e",
+     "process.outcome.json": null,
+     "process.stdout": null,
+     "provider-result.json": null,
+     "response.json": null,
+     "result.json": null,
+     "returned-result.json": null,
+     "stream-capture.json": null,
+     "stream-received-terminal.json": "878a223ea899a5fdb63aefdab9b4430afd6adda3f825b2772539772b913a1868",
+     "stream-terminal.json": null,
+     "terminal-capture.json": null
+    },
+    "state": "returned",
+    "version": 1
+   }
+  },
+  {
+   "capture": {
+    "mode": "stream_metadata_v1",
+    "provider": "claude"
+   },
+   "files": {
+    "capture-manifest.json": {
+     "text": "{\"version\": 1, \"mode\": \"stream_metadata_v1\", \"cli_version\": \"x\", \"transport\": \"jsonl\"}"
+    },
+    "process.outcome.json": {
+     "text": "{\"started\": true, \"startup_state\": \"started\"}"
+    },
+    "stream-received-terminal.json": {
+     "text": "{\"version\": 1, \"terminal\": {\"type\": \"result\", \"subtype\": \"error_during_execution\", \"is_error\": true}}"
+    }
+   },
+   "mode": "stream",
+   "name": "S5 error witness, no capture",
+   "record": {
+    "capture": {
+     "mode": "stream_metadata_v1",
+     "provider": "claude"
+    },
+    "reason": "terminal exists but stream completion is unproven",
+    "sources": {
+     "capture-manifest.json": "f743e07f9b06008c09cb2018f29c591d0ed0051a2f6bd19bb4b234273fde0c3e",
+     "process.outcome.json": "811f3424e5c807a99c7df7f8fb1d484aea3a202c81f2b1a536ad220f932c48a3",
+     "process.stdout": null,
+     "provider-result.json": null,
+     "response.json": null,
+     "result.json": null,
+     "returned-result.json": null,
+     "stream-capture.json": null,
+     "stream-received-terminal.json": "50a9824033a358b04b288995d51da1d9643ffdc9e861fa6f6bf4466f0888ecb6",
+     "stream-terminal.json": null,
+     "terminal-capture.json": null
+    },
+    "state": "unknown",
+    "version": 1
+   }
+  },
+  {
+   "capture": {
+    "mode": "stream_metadata_v1",
+    "provider": "claude"
+   },
+   "files": {
+    "capture-manifest.json": {
+     "text": "{\"version\": 1, \"mode\": \"stream_metadata_v1\", \"cli_version\": \"x\", \"transport\": \"jsonl\"}"
+    }
+   },
+   "mode": "stream",
+   "name": "S6 no outcome",
+   "record": {
+    "capture": {
+     "mode": "stream_metadata_v1",
+     "provider": "claude"
+    },
+    "reason": "stream process was not launched",
+    "sources": {
+     "capture-manifest.json": "f743e07f9b06008c09cb2018f29c591d0ed0051a2f6bd19bb4b234273fde0c3e",
+     "process.outcome.json": null,
+     "process.stdout": null,
+     "provider-result.json": null,
+     "response.json": null,
+     "result.json": null,
+     "returned-result.json": null,
+     "stream-capture.json": null,
+     "stream-received-terminal.json": null,
+     "stream-terminal.json": null,
+     "terminal-capture.json": null
+    },
+    "state": "retryable",
+    "version": 1
+   }
+  },
+  {
+   "capture": {
+    "mode": "stream_metadata_v1",
+    "provider": "claude"
+   },
+   "files": {
+    "capture-manifest.json": {
+     "text": "{\"version\": 1, \"mode\": \"stream_metadata_v1\", \"cli_version\": \"x\", \"transport\": \"jsonl\"}"
+    },
+    "process.outcome.json": {
+     "text": "{\"started\": false, \"startup_state\": \"not_started\"}"
+    }
+   },
+   "mode": "stream",
+   "name": "S6b outcome not started",
+   "record": {
+    "capture": {
+     "mode": "stream_metadata_v1",
+     "provider": "claude"
+    },
+    "reason": "stream process was not launched",
+    "sources": {
+     "capture-manifest.json": "f743e07f9b06008c09cb2018f29c591d0ed0051a2f6bd19bb4b234273fde0c3e",
+     "process.outcome.json": "1fa70caa32c5eb94792259ba0949b58c7054cf35539ed47562a8b098c544c58a",
+     "process.stdout": null,
+     "provider-result.json": null,
+     "response.json": null,
+     "result.json": null,
+     "returned-result.json": null,
+     "stream-capture.json": null,
+     "stream-received-terminal.json": null,
+     "stream-terminal.json": null,
+     "terminal-capture.json": null
+    },
+    "state": "retryable",
+    "version": 1
+   }
+  },
+  {
+   "capture": {
+    "mode": "stream_metadata_v1",
+    "provider": "claude"
+   },
+   "files": {
+    "capture-manifest.json": {
+     "text": "{\"version\": 1, \"mode\": \"stream_metadata_v1\", \"cli_version\": \"x\", \"transport\": \"jsonl\"}"
+    },
+    "process.outcome.json": {
+     "text": "{\"started\": true, \"startup_state\": \"started\"}"
+    }
+   },
+   "mode": "stream",
+   "name": "S7 outcome started, no capture (the timeout dead end)",
+   "record": {
+    "capture": {
+     "mode": "stream_metadata_v1",
+     "provider": "claude"
+    },
+    "reason": "stream reader stopped before durable transport completion",
+    "sources": {
+     "capture-manifest.json": "f743e07f9b06008c09cb2018f29c591d0ed0051a2f6bd19bb4b234273fde0c3e",
+     "process.outcome.json": "811f3424e5c807a99c7df7f8fb1d484aea3a202c81f2b1a536ad220f932c48a3",
+     "process.stdout": null,
+     "provider-result.json": null,
+     "response.json": null,
+     "result.json": null,
+     "returned-result.json": null,
+     "stream-capture.json": null,
+     "stream-received-terminal.json": null,
+     "stream-terminal.json": null,
+     "terminal-capture.json": null
+    },
+    "state": "unknown",
+    "version": 1
+   }
+  },
+  {
+   "capture": {
+    "mode": "stream_metadata_v1",
+    "provider": "claude"
+   },
+   "files": {
+    "capture-manifest.json": {
+     "text": "{\"version\": 1, \"mode\": \"stream_metadata_v1\", \"cli_version\": \"x\", \"transport\": \"jsonl\"}"
+    },
+    "stream-capture.json": {
+     "text": "{\"version\": 2, \"transport_complete\": true, \"damaged\": true, \"terminal_count\": 1, \"protocol_complete\": true}"
+    }
+   },
+   "mode": "stream",
+   "name": "S8 damaged",
+   "record": {
+    "capture": {
+     "mode": "stream_metadata_v1",
+     "provider": "claude"
+    },
+    "reason": "stream transport is incomplete or damaged",
+    "sources": {
+     "capture-manifest.json": "f743e07f9b06008c09cb2018f29c591d0ed0051a2f6bd19bb4b234273fde0c3e",
+     "process.outcome.json": null,
+     "process.stdout": null,
+     "provider-result.json": null,
+     "response.json": null,
+     "result.json": null,
+     "returned-result.json": null,
+     "stream-capture.json": "0f15b7d7cd3afde5495c0bee12b5579329bbd3fe61e9b6417c5fd8dadef3e2ef",
+     "stream-received-terminal.json": null,
+     "stream-terminal.json": null,
+     "terminal-capture.json": null
+    },
+    "state": "unknown",
+    "version": 1
+   }
+  },
+  {
+   "capture": {
+    "mode": "stream_metadata_v1",
+    "provider": "claude"
+   },
+   "files": {
+    "stream-capture.json": {
+     "text": "{\"version\": 2, \"transport_complete\": true, \"damaged\": false, \"terminal_count\": 0, \"protocol_complete\": false}"
+    }
+   },
+   "mode": "stream",
+   "name": "S8b complete capture but manifest missing",
+   "record": {
+    "capture": {
+     "mode": "stream_metadata_v1",
+     "provider": "claude"
+    },
+    "reason": "stream transport is incomplete or damaged",
+    "sources": {
+     "capture-manifest.json": null,
+     "process.outcome.json": null,
+     "process.stdout": null,
+     "provider-result.json": null,
+     "response.json": null,
+     "result.json": null,
+     "returned-result.json": null,
+     "stream-capture.json": "e7790f1492a635f405acc9acff9022f19b11ffe8d3af1631503f04ba20092001",
+     "stream-received-terminal.json": null,
+     "stream-terminal.json": null,
+     "terminal-capture.json": null
+    },
+    "state": "unknown",
+    "version": 1
+   }
+  },
+  {
+   "capture": {
+    "mode": "stream_metadata_v1",
+    "provider": "claude"
+   },
+   "files": {
+    "capture-manifest.json": {
+     "text": "{\"version\": 1, \"mode\": \"stream_metadata_v1\", \"cli_version\": \"x\", \"transport\": \"jsonl\"}"
+    },
+    "stream-capture.json": {
+     "text": "{\"version\": 2, \"transport_complete\": true, \"damaged\": false, \"terminal_count\": 0, \"protocol_complete\": false}"
+    }
+   },
+   "mode": "stream",
+   "name": "S9 complete, zero terminals",
+   "record": {
+    "capture": {
+     "mode": "stream_metadata_v1",
+     "provider": "claude"
+    },
+    "reason": "complete stream contains no terminal",
+    "sources": {
+     "capture-manifest.json": "f743e07f9b06008c09cb2018f29c591d0ed0051a2f6bd19bb4b234273fde0c3e",
+     "process.outcome.json": null,
+     "process.stdout": null,
+     "provider-result.json": null,
+     "response.json": null,
+     "result.json": null,
+     "returned-result.json": null,
+     "stream-capture.json": "e7790f1492a635f405acc9acff9022f19b11ffe8d3af1631503f04ba20092001",
+     "stream-received-terminal.json": null,
+     "stream-terminal.json": null,
+     "terminal-capture.json": null
+    },
+    "state": "retryable",
+    "version": 1
+   }
+  },
+  {
+   "capture": {
+    "mode": "stream_metadata_v1",
+    "provider": "claude"
+   },
+   "files": {
+    "capture-manifest.json": {
+     "text": "{\"version\": 1, \"mode\": \"stream_metadata_v1\", \"cli_version\": \"x\", \"transport\": \"jsonl\"}"
+    },
+    "stream-capture.json": {
+     "text": "{\"version\": 2, \"transport_complete\": true, \"damaged\": false, \"terminal_count\": 2, \"protocol_complete\": false}"
+    },
+    "stream-received-terminal.json": {
+     "text": "{\"version\": 1, \"terminal\": {\"type\": \"result\", \"subtype\": \"error_during_execution\", \"is_error\": true}}"
+    }
+   },
+   "mode": "stream",
+   "name": "S10 two terminals",
+   "record": {
+    "capture": {
+     "mode": "stream_metadata_v1",
+     "provider": "claude"
+    },
+    "reason": "stream terminal identity is ambiguous",
+    "sources": {
+     "capture-manifest.json": "f743e07f9b06008c09cb2018f29c591d0ed0051a2f6bd19bb4b234273fde0c3e",
+     "process.outcome.json": null,
+     "process.stdout": null,
+     "provider-result.json": null,
+     "response.json": null,
+     "result.json": null,
+     "returned-result.json": null,
+     "stream-capture.json": "a3ba331fbb5fcc01375a88dc336919f9bab07d3644ada80442994ecd9c3e5165",
+     "stream-received-terminal.json": "50a9824033a358b04b288995d51da1d9643ffdc9e861fa6f6bf4466f0888ecb6",
+     "stream-terminal.json": null,
+     "terminal-capture.json": null
+    },
+    "state": "unknown",
+    "version": 1
+   }
+  },
+  {
+   "capture": {
+    "mode": "stream_metadata_v1",
+    "provider": "claude"
+   },
+   "files": {
+    "capture-manifest.json": {
+     "text": "{\"version\": 1, \"mode\": \"stream_metadata_v1\", \"cli_version\": \"x\", \"transport\": \"jsonl\"}"
+    },
+    "stream-capture.json": {
+     "text": "{\"version\": 2, \"transport_complete\": true, \"damaged\": false, \"terminal_count\": 1, \"protocol_complete\": true}"
+    }
+   },
+   "mode": "stream",
+   "name": "S11 one terminal recorded, not published, no witness",
+   "record": {
+    "capture": {
+     "mode": "stream_metadata_v1",
+     "provider": "claude"
+    },
+    "reason": "complete stream recorded a terminal before publication",
+    "sources": {
+     "capture-manifest.json": "f743e07f9b06008c09cb2018f29c591d0ed0051a2f6bd19bb4b234273fde0c3e",
+     "process.outcome.json": null,
+     "process.stdout": null,
+     "provider-result.json": null,
+     "response.json": null,
+     "result.json": null,
+     "returned-result.json": null,
+     "stream-capture.json": "50e9351bac7648ea6a392ca0c01de7b6df92c57939a0039c3f728a3db6c9e0ae",
+     "stream-received-terminal.json": null,
+     "stream-terminal.json": null,
+     "terminal-capture.json": null
+    },
+    "state": "returned",
+    "version": 1
+   }
+  },
+  {
+   "capture": {
+    "mode": "stream_metadata_v1",
+    "provider": "claude"
+   },
+   "files": {
+    "capture-manifest.json": {
+     "text": "{\"version\": 1, \"mode\": \"stream_metadata_v1\", \"cli_version\": \"x\", \"transport\": \"jsonl\"}"
+    },
+    "stream-capture.json": {
+     "text": "{\"version\": 2, \"transport_complete\": true, \"damaged\": false, \"terminal_count\": 1, \"protocol_complete\": true}"
+    },
+    "stream-received-terminal.json": {
+     "text": "{\"version\": 1, \"terminal\": {\"type\": \"result\", \"subtype\": \"error_during_execution\", \"is_error\": true, \"x\": 1}}"
+    },
+    "stream-terminal.json": {
+     "text": "{\"type\": \"result\", \"subtype\": \"error_during_execution\", \"is_error\": true}"
+    }
+   },
+   "mode": "stream",
+   "name": "S12 published differs from witness",
+   "record": {
+    "capture": {
+     "mode": "stream_metadata_v1",
+     "provider": "claude"
+    },
+    "reason": "published terminal differs from received terminal",
+    "sources": {
+     "capture-manifest.json": "f743e07f9b06008c09cb2018f29c591d0ed0051a2f6bd19bb4b234273fde0c3e",
+     "process.outcome.json": null,
+     "process.stdout": null,
+     "provider-result.json": null,
+     "response.json": null,
+     "result.json": null,
+     "returned-result.json": null,
+     "stream-capture.json": "50e9351bac7648ea6a392ca0c01de7b6df92c57939a0039c3f728a3db6c9e0ae",
+     "stream-received-terminal.json": "4ec2d853a5dcdf0e9f8abac8120ebee32bbf737d03b3848213e07d3964dcee61",
+     "stream-terminal.json": "a8f5663eb98aefa3fad87c24c52a171eee8daf2cdc2b3b7471eb1eb63795fc9a",
+     "terminal-capture.json": null
+    },
+    "state": "unknown",
+    "version": 1
+   }
+  },
+  {
+   "capture": {
+    "mode": "stream_metadata_v1",
+    "provider": "claude"
+   },
+   "files": {
+    "capture-manifest.json": {
+     "text": "{\"version\": 1, \"mode\": \"stream_metadata_v1\", \"cli_version\": \"x\", \"transport\": \"jsonl\"}"
+    },
+    "provider-result.json": {
+     "text": "{\"type\": \"result\", \"subtype\": \"success\", \"is_error\": false, \"structured_output\": {\"status\": \"completed\"}}"
+    },
+    "stream-capture.json": {
+     "text": "{\"version\": 2, \"transport_complete\": true, \"damaged\": false, \"terminal_count\": 1, \"protocol_complete\": true}"
+    },
+    "stream-received-terminal.json": {
+     "text": "{\"version\": 1, \"terminal\": {\"type\": \"result\", \"subtype\": \"error_during_execution\", \"is_error\": true}}"
+    },
+    "stream-terminal.json": {
+     "text": "{\"type\": \"result\", \"subtype\": \"error_during_execution\", \"is_error\": true}"
+    }
+   },
+   "mode": "stream",
+   "name": "S13 provider-result differs from published",
+   "record": {
+    "capture": {
+     "mode": "stream_metadata_v1",
+     "provider": "claude"
+    },
+    "reason": "provider result differs from published terminal",
+    "sources": {
+     "capture-manifest.json": "f743e07f9b06008c09cb2018f29c591d0ed0051a2f6bd19bb4b234273fde0c3e",
+     "process.outcome.json": null,
+     "process.stdout": null,
+     "provider-result.json": "7dd3bea7b3d8b7c0a0a50c04a0224b04ff1901194a1935c68611190879d6e6e1",
+     "response.json": null,
+     "result.json": null,
+     "returned-result.json": null,
+     "stream-capture.json": "50e9351bac7648ea6a392ca0c01de7b6df92c57939a0039c3f728a3db6c9e0ae",
+     "stream-received-terminal.json": "50a9824033a358b04b288995d51da1d9643ffdc9e861fa6f6bf4466f0888ecb6",
+     "stream-terminal.json": "a8f5663eb98aefa3fad87c24c52a171eee8daf2cdc2b3b7471eb1eb63795fc9a",
+     "terminal-capture.json": null
+    },
+    "state": "unknown",
+    "version": 1
+   }
+  },
+  {
+   "capture": {
+    "mode": "stream_metadata_v1",
+    "provider": "claude"
+   },
+   "files": {
+    "capture-manifest.json": {
+     "text": "{\"version\": 1, \"mode\": \"stream_metadata_v1\", \"cli_version\": \"x\", \"transport\": \"jsonl\"}"
+    },
+    "stream-capture.json": {
+     "text": "{\"version\": 2, \"transport_complete\": true, \"damaged\": false, \"terminal_count\": 1, \"protocol_complete\": true}"
+    },
+    "stream-received-terminal.json": {
+     "text": "{\"version\": 1, \"terminal\": {\"type\": \"result\", \"subtype\": \"error_during_execution\", \"is_error\": true}}"
+    },
+    "stream-terminal.json": {
+     "text": "{\"type\": \"result\", \"subtype\": \"error_during_execution\", \"is_error\": true}"
+    }
+   },
+   "mode": "stream",
+   "name": "S14 complete explicit error",
+   "record": {
+    "capture": {
+     "mode": "stream_metadata_v1",
+     "provider": "claude"
+    },
+    "reason": "complete stream returned an explicit provider error",
+    "sources": {
+     "capture-manifest.json": "f743e07f9b06008c09cb2018f29c591d0ed0051a2f6bd19bb4b234273fde0c3e",
+     "process.outcome.json": null,
+     "process.stdout": null,
+     "provider-result.json": null,
+     "response.json": null,
+     "result.json": null,
+     "returned-result.json": null,
+     "stream-capture.json": "50e9351bac7648ea6a392ca0c01de7b6df92c57939a0039c3f728a3db6c9e0ae",
+     "stream-received-terminal.json": "50a9824033a358b04b288995d51da1d9643ffdc9e861fa6f6bf4466f0888ecb6",
+     "stream-terminal.json": "a8f5663eb98aefa3fad87c24c52a171eee8daf2cdc2b3b7471eb1eb63795fc9a",
+     "terminal-capture.json": null
+    },
+    "state": "retryable",
+    "version": 1
+   }
+  },
+  {
+   "capture": {
+    "mode": "stream_metadata_v1",
+    "provider": "claude"
+   },
+   "files": {
+    "capture-manifest.json": {
+     "text": "{\"version\": 1, \"mode\": \"stream_metadata_v1\", \"cli_version\": \"x\", \"transport\": \"jsonl\"}"
+    },
+    "stream-capture.json": {
+     "text": "{bad"
+    }
+   },
+   "mode": "stream",
+   "name": "S16 capture unreadable",
+   "record": {
+    "capture": {
+     "mode": "stream_metadata_v1",
+     "provider": "claude"
+    },
+    "reason": "unreadable worker return evidence: JSONDecodeError",
+    "sources": {
+     "capture-manifest.json": "f743e07f9b06008c09cb2018f29c591d0ed0051a2f6bd19bb4b234273fde0c3e",
+     "process.outcome.json": null,
+     "process.stdout": null,
+     "provider-result.json": null,
+     "response.json": null,
+     "result.json": null,
+     "returned-result.json": null,
+     "stream-capture.json": "17eed55d881c0dd5fe0935a98d89dd9e52d62aed941f3fb7d17bd490e5aa3e8f",
+     "stream-received-terminal.json": null,
+     "stream-terminal.json": null,
+     "terminal-capture.json": null
+    },
+    "state": "unknown",
+    "version": 1
+   }
+  },
+  {
+   "capture": {
+    "mode": "legacy_json",
+    "provider": "claude"
+   },
+   "files": {
+    "capture-manifest.json": {
+     "text": "{\"version\": 1, \"mode\": \"legacy_json\", \"cli_version\": \"not_recorded\", \"transport\": \"json\"}"
+    },
+    "process.stdout": {
+     "text": ""
+    },
+    "terminal-capture.json": {
+     "text": "{}"
+    }
+   },
+   "mode": "legacy",
+   "name": "E1 only terminal-capture.json",
+   "record": {
+    "capture": {
+     "mode": "legacy_json",
+     "provider": "claude"
+    },
+    "reason": "worker result exists without a candidate seal",
+    "sources": {
+     "capture-manifest.json": "b166f054d000c2f6ddbad4b8e849cffa8ab6ce53e0c86998a6f304269d5f1c1c",
+     "process.outcome.json": null,
+     "process.stdout": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+     "provider-result.json": null,
+     "response.json": null,
+     "result.json": null,
+     "returned-result.json": null,
+     "stream-capture.json": null,
+     "stream-received-terminal.json": null,
+     "stream-terminal.json": null,
+     "terminal-capture.json": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
+    },
+    "state": "returned",
+    "version": 1
+   }
+  },
+  {
+   "capture": {
+    "mode": "legacy_json",
+    "provider": "claude"
+   },
+   "files": {
+    "capture-manifest.json": {
+     "text": "{\"version\": 1, \"mode\": \"legacy_json\", \"cli_version\": \"not_recorded\", \"transport\": \"json\"}"
+    },
+    "process.stdout": {
+     "text": ""
+    },
+    "result.json": {
+     "text": "{}"
+    }
+   },
+   "mode": "legacy",
+   "name": "E2 only result.json",
+   "record": {
+    "capture": {
+     "mode": "legacy_json",
+     "provider": "claude"
+    },
+    "reason": "worker result exists without a candidate seal",
+    "sources": {
+     "capture-manifest.json": "b166f054d000c2f6ddbad4b8e849cffa8ab6ce53e0c86998a6f304269d5f1c1c",
+     "process.outcome.json": null,
+     "process.stdout": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+     "provider-result.json": null,
+     "response.json": null,
+     "result.json": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+     "returned-result.json": null,
+     "stream-capture.json": null,
+     "stream-received-terminal.json": null,
+     "stream-terminal.json": null,
+     "terminal-capture.json": null
+    },
+    "state": "returned",
+    "version": 1
+   }
+  },
+  {
+   "capture": {
+    "mode": "legacy_json",
+    "provider": "claude"
+   },
+   "files": {
+    "capture-manifest.json": {
+     "text": "{\"version\": 1, \"mode\": \"legacy_json\", \"cli_version\": \"not_recorded\", \"transport\": \"json\"}"
+    },
+    "process.stdout": {
+     "text": ""
+    },
+    "returned-result.json": {
+     "text": "{}"
+    }
+   },
+   "mode": "legacy",
+   "name": "E3 only returned-result.json",
+   "record": {
+    "capture": {
+     "mode": "legacy_json",
+     "provider": "claude"
+    },
+    "reason": "worker result exists without a candidate seal",
+    "sources": {
+     "capture-manifest.json": "b166f054d000c2f6ddbad4b8e849cffa8ab6ce53e0c86998a6f304269d5f1c1c",
+     "process.outcome.json": null,
+     "process.stdout": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+     "provider-result.json": null,
+     "response.json": null,
+     "result.json": null,
+     "returned-result.json": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+     "stream-capture.json": null,
+     "stream-received-terminal.json": null,
+     "stream-terminal.json": null,
+     "terminal-capture.json": null
+    },
+    "state": "returned",
+    "version": 1
+   }
+  },
+  {
+   "capture": {
+    "mode": "legacy_json",
+    "provider": "claude"
+   },
+   "files": {
+    "capture-manifest.json": {
+     "text": "{\"version\": 1, \"mode\": \"legacy_json\", \"cli_version\": \"not_recorded\", \"transport\": \"json\"}"
+    },
+    "process.stdout": {
+     "text": ""
+    },
+    "stream-received-terminal.json": {
+     "text": "{\"version\": 1, \"terminal\": {\"type\": \"result\", \"subtype\": \"success\", \"is_error\": false, \"structured_output\": {\"status\": \"completed\"}}}"
+    }
+   },
+   "mode": "legacy",
+   "name": "E4 stream-received-terminal.json beside JSON invocation",
+   "record": {
+    "capture": {
+     "mode": "legacy_json",
+     "provider": "claude"
+    },
+    "reason": "stream evidence conflicts with JSON invocation",
+    "sources": {
+     "capture-manifest.json": "b166f054d000c2f6ddbad4b8e849cffa8ab6ce53e0c86998a6f304269d5f1c1c",
+     "process.outcome.json": null,
+     "process.stdout": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+     "provider-result.json": null,
+     "response.json": null,
+     "result.json": null,
+     "returned-result.json": null,
+     "stream-capture.json": null,
+     "stream-received-terminal.json": "878a223ea899a5fdb63aefdab9b4430afd6adda3f825b2772539772b913a1868",
+     "stream-terminal.json": null,
+     "terminal-capture.json": null
+    },
+    "state": "unknown",
+    "version": 1
+   }
+  },
+  {
+   "capture": {
+    "mode": "legacy_json",
+    "provider": "claude"
+   },
+   "files": {
+    "capture-manifest.json": {
+     "text": "{\"version\": 1, \"mode\": \"legacy_json\", \"cli_version\": \"not_recorded\", \"transport\": \"json\"}"
+    },
+    "process.stdout": {
+     "text": ""
+    },
+    "stream-capture.json": {
+     "text": "{\"version\": 2, \"transport_complete\": true, \"damaged\": false, \"terminal_count\": 1, \"protocol_complete\": true}"
+    }
+   },
+   "mode": "legacy",
+   "name": "E5 stream-capture.json beside JSON invocation",
+   "record": {
+    "capture": {
+     "mode": "legacy_json",
+     "provider": "claude"
+    },
+    "reason": "stream evidence conflicts with JSON invocation",
+    "sources": {
+     "capture-manifest.json": "b166f054d000c2f6ddbad4b8e849cffa8ab6ce53e0c86998a6f304269d5f1c1c",
+     "process.outcome.json": null,
+     "process.stdout": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+     "provider-result.json": null,
+     "response.json": null,
+     "result.json": null,
+     "returned-result.json": null,
+     "stream-capture.json": "50e9351bac7648ea6a392ca0c01de7b6df92c57939a0039c3f728a3db6c9e0ae",
+     "stream-received-terminal.json": null,
+     "stream-terminal.json": null,
+     "terminal-capture.json": null
+    },
+    "state": "unknown",
+    "version": 1
+   }
+  },
+  {
+   "capture": {
+    "mode": "legacy_json",
+    "provider": "claude"
+   },
+   "files": {
+    "capture-manifest.json": {
+     "text": "{\"version\": 1, \"mode\": \"legacy_json\", \"cli_version\": \"not_recorded\", \"transport\": \"json\"}"
+    },
+    "process.stdout": {
+     "text": "{\"type\": \"result\", \"is_error\": 1}"
+    }
+   },
+   "mode": "legacy",
+   "name": "E6 is_error truthy but not true",
+   "record": {
+    "capture": {
+     "mode": "legacy_json",
+     "provider": "claude"
+    },
+    "reason": "non-error or ambiguous direct JSON output",
+    "sources": {
+     "capture-manifest.json": "b166f054d000c2f6ddbad4b8e849cffa8ab6ce53e0c86998a6f304269d5f1c1c",
+     "process.outcome.json": null,
+     "process.stdout": "ed85027aadb536a6b2d5652a1b3a635b1b0cab5fd7e199c31f9932c86c6785cf",
+     "provider-result.json": null,
+     "response.json": null,
+     "result.json": null,
+     "returned-result.json": null,
+     "stream-capture.json": null,
+     "stream-received-terminal.json": null,
+     "stream-terminal.json": null,
+     "terminal-capture.json": null
+    },
+    "state": "returned",
+    "version": 1
+   }
+  },
+  {
+   "capture": {
+    "mode": "legacy_json",
+    "provider": "claude"
+   },
+   "files": {
+    "capture-manifest.json": {
+     "text": "{\"version\": 1, \"mode\": \"legacy_json\", \"cli_version\": \"not_recorded\", \"transport\": \"json\"}"
+    },
+    "process.stdout": {
+     "text": "{\"type\": \"result\", \"subtype\": \"errorish\"}"
+    }
+   },
+   "mode": "legacy",
+   "name": "E7 subtype starts with error but not error_",
+   "record": {
+    "capture": {
+     "mode": "legacy_json",
+     "provider": "claude"
+    },
+    "reason": "non-error or ambiguous direct JSON output",
+    "sources": {
+     "capture-manifest.json": "b166f054d000c2f6ddbad4b8e849cffa8ab6ce53e0c86998a6f304269d5f1c1c",
+     "process.outcome.json": null,
+     "process.stdout": "95efead06355911f03b5139bd0aa3d57c9c4610224face2942227eab47a78707",
+     "provider-result.json": null,
+     "response.json": null,
+     "result.json": null,
+     "returned-result.json": null,
+     "stream-capture.json": null,
+     "stream-received-terminal.json": null,
+     "stream-terminal.json": null,
+     "terminal-capture.json": null
+    },
+    "state": "returned",
+    "version": 1
+   }
+  },
+  {
+   "capture": {
+    "mode": "legacy_json",
+    "provider": "claude"
+   },
+   "files": {
+    "capture-manifest.json": {
+     "text": "{\"version\": 1, \"mode\": \"legacy_json\", \"cli_version\": \"not_recorded\", \"transport\": \"json\"}"
+    },
+    "process.stdout": {
+     "text": "{\"is_error\": true}"
+    }
+   },
+   "mode": "legacy",
+   "name": "E7b is_error true without type result",
+   "record": {
+    "capture": {
+     "mode": "legacy_json",
+     "provider": "claude"
+    },
+    "reason": "non-error or ambiguous direct JSON output",
+    "sources": {
+     "capture-manifest.json": "b166f054d000c2f6ddbad4b8e849cffa8ab6ce53e0c86998a6f304269d5f1c1c",
+     "process.outcome.json": null,
+     "process.stdout": "7eebf53f9dbde14d2999180b26a653254550459a3940692aecc29b41e670c57d",
+     "provider-result.json": null,
+     "response.json": null,
+     "result.json": null,
+     "returned-result.json": null,
+     "stream-capture.json": null,
+     "stream-received-terminal.json": null,
+     "stream-terminal.json": null,
+     "terminal-capture.json": null
+    },
+    "state": "unknown",
+    "version": 1
+   }
+  },
+  {
+   "capture": {
+    "mode": "legacy_json",
+    "provider": "claude"
+   },
+   "files": {
+    "capture-manifest.json": {
+     "text": "{\"version\": 2, \"mode\": \"legacy_json\", \"cli_version\": \"not_recorded\", \"transport\": \"json\"}"
+    },
+    "process.stdout": {
+     "text": ""
+    }
+   },
+   "mode": "legacy",
+   "name": "E7c manifest version 2",
+   "record": {
+    "capture": {
+     "mode": "legacy_json",
+     "provider": "claude"
+    },
+    "reason": "capture manifest does not match invocation",
+    "sources": {
+     "capture-manifest.json": "72ff23e1be7d07e77c2562084b614f922e8ab474a75f13a8d3736f6acab24bd3",
+     "process.outcome.json": null,
+     "process.stdout": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+     "provider-result.json": null,
+     "response.json": null,
+     "result.json": null,
+     "returned-result.json": null,
+     "stream-capture.json": null,
+     "stream-received-terminal.json": null,
+     "stream-terminal.json": null,
+     "terminal-capture.json": null
+    },
+    "state": "unknown",
+    "version": 1
+   }
+  },
+  {
+   "capture": {
+    "mode": "stream_metadata_v1",
+    "provider": "claude"
+   },
+   "files": {
+    "capture-manifest.json": {
+     "text": "{\"version\": 1, \"mode\": \"stream_metadata_v1\", \"cli_version\": \"x\", \"transport\": \"jsonl\"}"
+    },
+    "process.outcome.json": {
+     "text": "{\"started\": true, \"startup_state\": \"started\"}"
+    },
+    "stream-terminal.json": {
+     "text": "{\"type\": \"result\", \"subtype\": \"error_during_execution\", \"is_error\": true}"
+    }
+   },
+   "mode": "stream",
+   "name": "E8 published terminal without capture",
+   "record": {
+    "capture": {
+     "mode": "stream_metadata_v1",
+     "provider": "claude"
+    },
+    "reason": "terminal exists but stream completion is unproven",
+    "sources": {
+     "capture-manifest.json": "f743e07f9b06008c09cb2018f29c591d0ed0051a2f6bd19bb4b234273fde0c3e",
+     "process.outcome.json": "811f3424e5c807a99c7df7f8fb1d484aea3a202c81f2b1a536ad220f932c48a3",
+     "process.stdout": null,
+     "provider-result.json": null,
+     "response.json": null,
+     "result.json": null,
+     "returned-result.json": null,
+     "stream-capture.json": null,
+     "stream-received-terminal.json": null,
+     "stream-terminal.json": "a8f5663eb98aefa3fad87c24c52a171eee8daf2cdc2b3b7471eb1eb63795fc9a",
+     "terminal-capture.json": null
+    },
+    "state": "unknown",
+    "version": 1
+   }
+  },
+  {
+   "capture": {
+    "mode": "stream_metadata_v1",
+    "provider": "claude"
+   },
+   "files": {
+    "capture-manifest.json": {
+     "text": "{\"version\": 1, \"mode\": \"stream_metadata_v1\", \"cli_version\": \"x\", \"transport\": \"jsonl\"}"
+    },
+    "process.outcome.json": {
+     "text": "{\"started\": true, \"startup_state\": \"started\"}"
+    },
+    "provider-result.json": {
+     "text": "{\"type\": \"result\", \"subtype\": \"error_during_execution\", \"is_error\": true}"
+    }
+   },
+   "mode": "stream",
+   "name": "E9 provider-result without capture",
+   "record": {
+    "capture": {
+     "mode": "stream_metadata_v1",
+     "provider": "claude"
+    },
+    "reason": "terminal exists but stream completion is unproven",
+    "sources": {
+     "capture-manifest.json": "f743e07f9b06008c09cb2018f29c591d0ed0051a2f6bd19bb4b234273fde0c3e",
+     "process.outcome.json": "811f3424e5c807a99c7df7f8fb1d484aea3a202c81f2b1a536ad220f932c48a3",
+     "process.stdout": null,
+     "provider-result.json": "a8f5663eb98aefa3fad87c24c52a171eee8daf2cdc2b3b7471eb1eb63795fc9a",
+     "response.json": null,
+     "result.json": null,
+     "returned-result.json": null,
+     "stream-capture.json": null,
+     "stream-received-terminal.json": null,
+     "stream-terminal.json": null,
+     "terminal-capture.json": null
+    },
+    "state": "unknown",
+    "version": 1
+   }
+  },
+  {
+   "capture": {
+    "mode": "stream_metadata_v1",
+    "provider": "claude"
+   },
+   "files": {
+    "capture-manifest.json": {
+     "text": "{\"version\": 1, \"mode\": \"stream_metadata_v1\", \"cli_version\": \"x\", \"transport\": \"jsonl\"}"
+    },
+    "process.outcome.json": {
+     "text": "{\"started\": false, \"startup_state\": \"starting\"}"
+    }
+   },
+   "mode": "stream",
+   "name": "E10 outcome not started but startup_state starting",
+   "record": {
+    "capture": {
+     "mode": "stream_metadata_v1",
+     "provider": "claude"
+    },
+    "reason": "stream reader stopped before durable transport completion",
+    "sources": {
+     "capture-manifest.json": "f743e07f9b06008c09cb2018f29c591d0ed0051a2f6bd19bb4b234273fde0c3e",
+     "process.outcome.json": "4e7c98e82b7030cdaf63fdde99b5c9cc6e415228e560c1d7476be5320dc5cef3",
+     "process.stdout": null,
+     "provider-result.json": null,
+     "response.json": null,
+     "result.json": null,
+     "returned-result.json": null,
+     "stream-capture.json": null,
+     "stream-received-terminal.json": null,
+     "stream-terminal.json": null,
+     "terminal-capture.json": null
+    },
+    "state": "unknown",
+    "version": 1
+   }
+  },
+  {
+   "capture": {
+    "mode": "stream_metadata_v1",
+    "provider": "claude"
+   },
+   "files": {
+    "capture-manifest.json": {
+     "text": "{\"version\": 1, \"mode\": \"stream_metadata_v1\", \"cli_version\": \"x\", \"transport\": \"jsonl\"}"
+    },
+    "process.outcome.json": {
+     "text": "{\"started\": true, \"startup_state\": \"not_started\"}"
+    }
+   },
+   "mode": "stream",
+   "name": "E11 outcome started with startup_state not_started",
+   "record": {
+    "capture": {
+     "mode": "stream_metadata_v1",
+     "provider": "claude"
+    },
+    "reason": "stream reader stopped before durable transport completion",
+    "sources": {
+     "capture-manifest.json": "f743e07f9b06008c09cb2018f29c591d0ed0051a2f6bd19bb4b234273fde0c3e",
+     "process.outcome.json": "618702c8ecaee5bb8391793190266dfa5ef6d17036733973762fd4f57db48982",
+     "process.stdout": null,
+     "provider-result.json": null,
+     "response.json": null,
+     "result.json": null,
+     "returned-result.json": null,
+     "stream-capture.json": null,
+     "stream-received-terminal.json": null,
+     "stream-terminal.json": null,
+     "terminal-capture.json": null
+    },
+    "state": "unknown",
+    "version": 1
+   }
+  },
+  {
+   "capture": {
+    "mode": "stream_metadata_v1",
+    "provider": "claude"
+   },
+   "files": {
+    "capture-manifest.json": {
+     "text": "{\"version\": 1, \"mode\": \"stream_metadata_v1\", \"cli_version\": \"x\", \"transport\": \"jsonl\"}"
+    },
+    "process.outcome.json": {
+     "text": "{\"startup_state\": \"not_started\"}"
+    }
+   },
+   "mode": "stream",
+   "name": "E11b outcome without started key, not_started",
+   "record": {
+    "capture": {
+     "mode": "stream_metadata_v1",
+     "provider": "claude"
+    },
+    "reason": "stream reader stopped before durable transport completion",
+    "sources": {
+     "capture-manifest.json": "f743e07f9b06008c09cb2018f29c591d0ed0051a2f6bd19bb4b234273fde0c3e",
+     "process.outcome.json": "45c9d98bf9b0f7a204a0a267746eceb5981cd736922924c2fe89f112cb27a6a4",
+     "process.stdout": null,
+     "provider-result.json": null,
+     "response.json": null,
+     "result.json": null,
+     "returned-result.json": null,
+     "stream-capture.json": null,
+     "stream-received-terminal.json": null,
+     "stream-terminal.json": null,
+     "terminal-capture.json": null
+    },
+    "state": "unknown",
+    "version": 1
+   }
+  },
+  {
+   "capture": {
+    "mode": "stream_metadata_v1",
+    "provider": "claude"
+   },
+   "files": {
+    "capture-manifest.json": {
+     "text": "{\"version\": 1, \"mode\": \"stream_metadata_v1\", \"cli_version\": \"x\", \"transport\": \"jsonl\"}"
+    },
+    "process.outcome.json": {
+     "text": "[]"
+    }
+   },
+   "mode": "stream",
+   "name": "E11c outcome is a list",
+   "record": {
+    "capture": {
+     "mode": "stream_metadata_v1",
+     "provider": "claude"
+    },
+    "reason": "stream reader stopped before durable transport completion",
+    "sources": {
+     "capture-manifest.json": "f743e07f9b06008c09cb2018f29c591d0ed0051a2f6bd19bb4b234273fde0c3e",
+     "process.outcome.json": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+     "process.stdout": null,
+     "provider-result.json": null,
+     "response.json": null,
+     "result.json": null,
+     "returned-result.json": null,
+     "stream-capture.json": null,
+     "stream-received-terminal.json": null,
+     "stream-terminal.json": null,
+     "terminal-capture.json": null
+    },
+    "state": "unknown",
+    "version": 1
+   }
+  },
+  {
+   "capture": {
+    "mode": "stream_metadata_v1",
+    "provider": "claude"
+   },
+   "files": {
+    "capture-manifest.json": {
+     "text": "{\"version\": 1, \"mode\": \"stream_metadata_v1\", \"cli_version\": \"x\", \"transport\": \"jsonl\"}"
+    },
+    "stream-capture.json": {
+     "text": "{\"version\": 1, \"transport_complete\": true, \"damaged\": false, \"terminal_count\": 1, \"protocol_complete\": true}"
+    }
+   },
+   "mode": "stream",
+   "name": "E12 capture version 1",
+   "record": {
+    "capture": {
+     "mode": "stream_metadata_v1",
+     "provider": "claude"
+    },
+    "reason": "stream transport is incomplete or damaged",
+    "sources": {
+     "capture-manifest.json": "f743e07f9b06008c09cb2018f29c591d0ed0051a2f6bd19bb4b234273fde0c3e",
+     "process.outcome.json": null,
+     "process.stdout": null,
+     "provider-result.json": null,
+     "response.json": null,
+     "result.json": null,
+     "returned-result.json": null,
+     "stream-capture.json": "a7918f9576163c0d22b331592150cae2eebe1bf7a0b84c1c0dc48d97b1701213",
+     "stream-received-terminal.json": null,
+     "stream-terminal.json": null,
+     "terminal-capture.json": null
+    },
+    "state": "unknown",
+    "version": 1
+   }
+  },
+  {
+   "capture": {
+    "mode": "stream_metadata_v1",
+    "provider": "claude"
+   },
+   "files": {
+    "capture-manifest.json": {
+     "text": "{\"version\": 1, \"mode\": \"stream_metadata_v1\", \"cli_version\": \"x\", \"transport\": \"jsonl\"}"
+    },
+    "stream-capture.json": {
+     "text": "{\"version\": 2, \"transport_complete\": false, \"damaged\": false, \"terminal_count\": 1, \"protocol_complete\": true}"
+    }
+   },
+   "mode": "stream",
+   "name": "E13 transport incomplete",
+   "record": {
+    "capture": {
+     "mode": "stream_metadata_v1",
+     "provider": "claude"
+    },
+    "reason": "stream transport is incomplete or damaged",
+    "sources": {
+     "capture-manifest.json": "f743e07f9b06008c09cb2018f29c591d0ed0051a2f6bd19bb4b234273fde0c3e",
+     "process.outcome.json": null,
+     "process.stdout": null,
+     "provider-result.json": null,
+     "response.json": null,
+     "result.json": null,
+     "returned-result.json": null,
+     "stream-capture.json": "917069d78eb1d837572372ba87aba898e6db8a5d202932280f7a6b7d25df4a5b",
+     "stream-received-terminal.json": null,
+     "stream-terminal.json": null,
+     "terminal-capture.json": null
+    },
+    "state": "unknown",
+    "version": 1
+   }
+  },
+  {
+   "capture": {
+    "mode": "stream_metadata_v1",
+    "provider": "claude"
+   },
+   "files": {
+    "capture-manifest.json": {
+     "text": "{\"version\": 1, \"mode\": \"stream_metadata_v1\", \"cli_version\": \"x\", \"transport\": \"jsonl\"}"
+    },
+    "stream-capture.json": {
+     "text": "{\"version\": 2, \"transport_complete\": true, \"damaged\": false, \"terminal_count\": \"1\", \"protocol_complete\": true}"
+    }
+   },
+   "mode": "stream",
+   "name": "E14 terminal_count is a string",
+   "record": {
+    "capture": {
+     "mode": "stream_metadata_v1",
+     "provider": "claude"
+    },
+    "reason": "stream transport is incomplete or damaged",
+    "sources": {
+     "capture-manifest.json": "f743e07f9b06008c09cb2018f29c591d0ed0051a2f6bd19bb4b234273fde0c3e",
+     "process.outcome.json": null,
+     "process.stdout": null,
+     "provider-result.json": null,
+     "response.json": null,
+     "result.json": null,
+     "returned-result.json": null,
+     "stream-capture.json": "e004e3f13ee9a87aeb51c7535edb6deb5a887506695a6c51e209aa7b5d569dd5",
+     "stream-received-terminal.json": null,
+     "stream-terminal.json": null,
+     "terminal-capture.json": null
+    },
+    "state": "unknown",
+    "version": 1
+   }
+  },
+  {
+   "capture": {
+    "mode": "stream_metadata_v1",
+    "provider": "claude"
+   },
+   "files": {
+    "capture-manifest.json": {
+     "text": "{\"version\": 1, \"mode\": \"stream_metadata_v1\", \"cli_version\": \"x\", \"transport\": \"jsonl\"}"
+    },
+    "stream-capture.json": {
+     "text": "{\"version\": 2, \"transport_complete\": true, \"damaged\": false, \"terminal_count\": -1, \"protocol_complete\": true}"
+    }
+   },
+   "mode": "stream",
+   "name": "E14b terminal_count negative",
+   "record": {
+    "capture": {
+     "mode": "stream_metadata_v1",
+     "provider": "claude"
+    },
+    "reason": "stream transport is incomplete or damaged",
+    "sources": {
+     "capture-manifest.json": "f743e07f9b06008c09cb2018f29c591d0ed0051a2f6bd19bb4b234273fde0c3e",
+     "process.outcome.json": null,
+     "process.stdout": null,
+     "provider-result.json": null,
+     "response.json": null,
+     "result.json": null,
+     "returned-result.json": null,
+     "stream-capture.json": "0df59c28b29b43642e0f1c4acd22de47043016deefe7817401dfff6a97e5efe5",
+     "stream-received-terminal.json": null,
+     "stream-terminal.json": null,
+     "terminal-capture.json": null
+    },
+    "state": "unknown",
+    "version": 1
+   }
+  },
+  {
+   "capture": {
+    "mode": "stream_metadata_v1",
+    "provider": "claude"
+   },
+   "files": {
+    "capture-manifest.json": {
+     "text": "{\"version\": 1, \"mode\": \"stream_metadata_v1\", \"cli_version\": \"x\", \"transport\": \"jsonl\"}"
+    },
+    "stream-capture.json": {
+     "text": "[]"
+    }
+   },
+   "mode": "stream",
+   "name": "E15 capture is a list",
+   "record": {
+    "capture": {
+     "mode": "stream_metadata_v1",
+     "provider": "claude"
+    },
+    "reason": "stream transport is incomplete or damaged",
+    "sources": {
+     "capture-manifest.json": "f743e07f9b06008c09cb2018f29c591d0ed0051a2f6bd19bb4b234273fde0c3e",
+     "process.outcome.json": null,
+     "process.stdout": null,
+     "provider-result.json": null,
+     "response.json": null,
+     "result.json": null,
+     "returned-result.json": null,
+     "stream-capture.json": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+     "stream-received-terminal.json": null,
+     "stream-terminal.json": null,
+     "terminal-capture.json": null
+    },
+    "state": "unknown",
+    "version": 1
+   }
+  },
+  {
+   "capture": {
+    "mode": "stream_metadata_v1",
+    "provider": "claude"
+   },
+   "files": {
+    "capture-manifest.json": {
+     "text": "{\"version\": 1, \"mode\": \"stream_metadata_v1\", \"cli_version\": \"x\", \"transport\": \"jsonl\"}"
+    },
+    "stream-capture.json": {
+     "text": "{\"version\": 2, \"transport_complete\": true, \"damaged\": false, \"terminal_count\": 0, \"protocol_complete\": false}"
+    },
+    "stream-terminal.json": {
+     "text": "{\"type\": \"result\", \"subtype\": \"error_during_execution\", \"is_error\": true}"
+    }
+   },
+   "mode": "stream",
+   "name": "E16 zero terminals but a published terminal",
+   "record": {
+    "capture": {
+     "mode": "stream_metadata_v1",
+     "provider": "claude"
+    },
+    "reason": "stream terminal identity is ambiguous",
+    "sources": {
+     "capture-manifest.json": "f743e07f9b06008c09cb2018f29c591d0ed0051a2f6bd19bb4b234273fde0c3e",
+     "process.outcome.json": null,
+     "process.stdout": null,
+     "provider-result.json": null,
+     "response.json": null,
+     "result.json": null,
+     "returned-result.json": null,
+     "stream-capture.json": "e7790f1492a635f405acc9acff9022f19b11ffe8d3af1631503f04ba20092001",
+     "stream-received-terminal.json": null,
+     "stream-terminal.json": "a8f5663eb98aefa3fad87c24c52a171eee8daf2cdc2b3b7471eb1eb63795fc9a",
+     "terminal-capture.json": null
+    },
+    "state": "unknown",
+    "version": 1
+   }
+  },
+  {
+   "capture": {
+    "mode": "stream_metadata_v1",
+    "provider": "claude"
+   },
+   "files": {
+    "capture-manifest.json": {
+     "text": "{\"version\": 1, \"mode\": \"stream_metadata_v1\", \"cli_version\": \"x\", \"transport\": \"jsonl\"}"
+    },
+    "provider-result.json": {
+     "text": "{\"type\": \"result\", \"subtype\": \"error_during_execution\", \"is_error\": true}"
+    },
+    "stream-capture.json": {
+     "text": "{\"version\": 2, \"transport_complete\": true, \"damaged\": false, \"terminal_count\": 0, \"protocol_complete\": false}"
+    }
+   },
+   "mode": "stream",
+   "name": "E17 zero terminals but a provider-result",
+   "record": {
+    "capture": {
+     "mode": "stream_metadata_v1",
+     "provider": "claude"
+    },
+    "reason": "stream terminal identity is ambiguous",
+    "sources": {
+     "capture-manifest.json": "f743e07f9b06008c09cb2018f29c591d0ed0051a2f6bd19bb4b234273fde0c3e",
+     "process.outcome.json": null,
+     "process.stdout": null,
+     "provider-result.json": "a8f5663eb98aefa3fad87c24c52a171eee8daf2cdc2b3b7471eb1eb63795fc9a",
+     "response.json": null,
+     "result.json": null,
+     "returned-result.json": null,
+     "stream-capture.json": "e7790f1492a635f405acc9acff9022f19b11ffe8d3af1631503f04ba20092001",
+     "stream-received-terminal.json": null,
+     "stream-terminal.json": null,
+     "terminal-capture.json": null
+    },
+    "state": "unknown",
+    "version": 1
+   }
+  },
+  {
+   "capture": {
+    "mode": "stream_metadata_v1",
+    "provider": "claude"
+   },
+   "files": {
+    "capture-manifest.json": {
+     "text": "{\"version\": 1, \"mode\": \"stream_metadata_v1\", \"cli_version\": \"x\", \"transport\": \"jsonl\"}"
+    },
+    "stream-capture.json": {
+     "text": "{\"version\": 2, \"transport_complete\": true, \"damaged\": false, \"terminal_count\": 0, \"protocol_complete\": false}"
+    },
+    "stream-received-terminal.json": {
+     "text": "{\"version\": 1, \"terminal\": {\"type\": \"result\", \"subtype\": \"error_during_execution\", \"is_error\": true}}"
+    }
+   },
+   "mode": "stream",
+   "name": "E17b zero terminals but an error witness",
+   "record": {
+    "capture": {
+     "mode": "stream_metadata_v1",
+     "provider": "claude"
+    },
+    "reason": "stream terminal identity is ambiguous",
+    "sources": {
+     "capture-manifest.json": "f743e07f9b06008c09cb2018f29c591d0ed0051a2f6bd19bb4b234273fde0c3e",
+     "process.outcome.json": null,
+     "process.stdout": null,
+     "provider-result.json": null,
+     "response.json": null,
+     "result.json": null,
+     "returned-result.json": null,
+     "stream-capture.json": "e7790f1492a635f405acc9acff9022f19b11ffe8d3af1631503f04ba20092001",
+     "stream-received-terminal.json": "50a9824033a358b04b288995d51da1d9643ffdc9e861fa6f6bf4466f0888ecb6",
+     "stream-terminal.json": null,
+     "terminal-capture.json": null
+    },
+    "state": "unknown",
+    "version": 1
+   }
+  },
+  {
+   "capture": {
+    "mode": "stream_metadata_v1",
+    "provider": "claude"
+   },
+   "files": {
+    "capture-manifest.json": {
+     "text": "{\"version\": 1, \"mode\": \"stream_metadata_v1\", \"cli_version\": \"x\", \"transport\": \"jsonl\"}"
+    },
+    "stream-capture.json": {
+     "text": "{\"version\": 2, \"transport_complete\": true, \"damaged\": false, \"terminal_count\": 1, \"protocol_complete\": false}"
+    }
+   },
+   "mode": "stream",
+   "name": "E18 one terminal, protocol incomplete",
+   "record": {
+    "capture": {
+     "mode": "stream_metadata_v1",
+     "provider": "claude"
+    },
+    "reason": "stream terminal identity is ambiguous",
+    "sources": {
+     "capture-manifest.json": "f743e07f9b06008c09cb2018f29c591d0ed0051a2f6bd19bb4b234273fde0c3e",
+     "process.outcome.json": null,
+     "process.stdout": null,
+     "provider-result.json": null,
+     "response.json": null,
+     "result.json": null,
+     "returned-result.json": null,
+     "stream-capture.json": "02adc21f6fb7a293410f02705834911b1d50b5b2ca8a84fc5c9f648a22ed6bf2",
+     "stream-received-terminal.json": null,
+     "stream-terminal.json": null,
+     "terminal-capture.json": null
+    },
+    "state": "unknown",
+    "version": 1
+   }
+  },
+  {
+   "capture": {
+    "mode": "stream_metadata_v1",
+    "provider": "claude"
+   },
+   "files": {
+    "capture-manifest.json": {
+     "text": "{\"version\": 1, \"mode\": \"stream_metadata_v1\", \"cli_version\": \"x\", \"transport\": \"jsonl\"}"
+    },
+    "stream-capture.json": {
+     "text": "{\"version\": 2, \"transport_complete\": true, \"damaged\": false, \"terminal_count\": 2, \"protocol_complete\": true}"
+    }
+   },
+   "mode": "stream",
+   "name": "E19 two terminals, protocol complete",
+   "record": {
+    "capture": {
+     "mode": "stream_metadata_v1",
+     "provider": "claude"
+    },
+    "reason": "stream terminal identity is ambiguous",
+    "sources": {
+     "capture-manifest.json": "f743e07f9b06008c09cb2018f29c591d0ed0051a2f6bd19bb4b234273fde0c3e",
+     "process.outcome.json": null,
+     "process.stdout": null,
+     "provider-result.json": null,
+     "response.json": null,
+     "result.json": null,
+     "returned-result.json": null,
+     "stream-capture.json": "108eb6b3ec3857b1d6c79f7d3e567796e43a550ecbc9796454345cbe86728e41",
+     "stream-received-terminal.json": null,
+     "stream-terminal.json": null,
+     "terminal-capture.json": null
+    },
+    "state": "unknown",
+    "version": 1
+   }
+  },
+  {
+   "capture": {
+    "mode": "stream_metadata_v1",
+    "provider": "claude"
+   },
+   "files": {
+    "capture-manifest.json": {
+     "text": "{\"version\": 1, \"mode\": \"stream_metadata_v1\", \"cli_version\": \"x\", \"transport\": \"jsonl\"}"
+    },
+    "stream-received-terminal.json": {
+     "text": "{\"version\": 2, \"terminal\": {\"type\": \"result\", \"subtype\": \"success\", \"is_error\": false, \"structured_output\": {\"status\": \"completed\"}}}"
+    }
+   },
+   "mode": "stream",
+   "name": "E20 witness version 2",
+   "record": {
+    "capture": {
+     "mode": "stream_metadata_v1",
+     "provider": "claude"
+    },
+    "reason": "invalid received terminal witness",
+    "sources": {
+     "capture-manifest.json": "f743e07f9b06008c09cb2018f29c591d0ed0051a2f6bd19bb4b234273fde0c3e",
+     "process.outcome.json": null,
+     "process.stdout": null,
+     "provider-result.json": null,
+     "response.json": null,
+     "result.json": null,
+     "returned-result.json": null,
+     "stream-capture.json": null,
+     "stream-received-terminal.json": "61b0477a4110d3b51a06d22eee84537b3df53ac17c587c68c2fc24d3743ffc71",
+     "stream-terminal.json": null,
+     "terminal-capture.json": null
+    },
+    "state": "unknown",
+    "version": 1
+   }
+  },
+  {
+   "capture": {
+    "mode": "stream_metadata_v1",
+    "provider": "claude"
+   },
+   "files": {
+    "capture-manifest.json": {
+     "text": "{\"version\": 1, \"mode\": \"stream_metadata_v1\", \"cli_version\": \"x\", \"transport\": \"jsonl\"}"
+    },
+    "stream-received-terminal.json": {
+     "text": "[]"
+    }
+   },
+   "mode": "stream",
+   "name": "E21 witness is a list",
+   "record": {
+    "capture": {
+     "mode": "stream_metadata_v1",
+     "provider": "claude"
+    },
+    "reason": "invalid received terminal witness",
+    "sources": {
+     "capture-manifest.json": "f743e07f9b06008c09cb2018f29c591d0ed0051a2f6bd19bb4b234273fde0c3e",
+     "process.outcome.json": null,
+     "process.stdout": null,
+     "provider-result.json": null,
+     "response.json": null,
+     "result.json": null,
+     "returned-result.json": null,
+     "stream-capture.json": null,
+     "stream-received-terminal.json": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+     "stream-terminal.json": null,
+     "terminal-capture.json": null
+    },
+    "state": "unknown",
+    "version": 1
+   }
+  },
+  {
+   "capture": {
+    "mode": "stream_metadata_v1",
+    "provider": "claude"
+   },
+   "files": {
+    "capture-manifest.json": {
+     "text": "{\"version\": 1, \"mode\": \"stream_metadata_v1\", \"cli_version\": \"x\", \"transport\": \"jsonl\"}"
+    },
+    "stream-capture.json": {
+     "text": "{\"version\": 2, \"transport_complete\": true, \"damaged\": null, \"terminal_count\": 1, \"protocol_complete\": true}"
+    }
+   },
+   "mode": "stream",
+   "name": "E22 damaged is null",
+   "record": {
+    "capture": {
+     "mode": "stream_metadata_v1",
+     "provider": "claude"
+    },
+    "reason": "stream transport is incomplete or damaged",
+    "sources": {
+     "capture-manifest.json": "f743e07f9b06008c09cb2018f29c591d0ed0051a2f6bd19bb4b234273fde0c3e",
+     "process.outcome.json": null,
+     "process.stdout": null,
+     "provider-result.json": null,
+     "response.json": null,
+     "result.json": null,
+     "returned-result.json": null,
+     "stream-capture.json": "227b4be7f9666268c55d1ecaa8073015be8faf63922ab369212a0fa939da107d",
+     "stream-received-terminal.json": null,
+     "stream-terminal.json": null,
+     "terminal-capture.json": null
+    },
+    "state": "unknown",
+    "version": 1
+   }
+  }
+ ]
+}

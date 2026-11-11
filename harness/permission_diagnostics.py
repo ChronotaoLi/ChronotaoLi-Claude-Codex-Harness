@@ -1,6 +1,6 @@
 """Read-only permission evidence; local grants never explain provider decisions."""
 from .git_query import parse_git_query
-from .stream_capture import permission_denial_projection
+from .diagnostics import permission_denial_projection
 from .util import HarnessError
 
 GIT_QUERY_TOOL = "harness.git_query"

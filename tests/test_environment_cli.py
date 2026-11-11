@@ -8,6 +8,7 @@ from unittest.mock import Mock, patch
 from harness import git
 from harness.cli import _main, status_summary
 from harness.util import HarnessError
+from harness.versions import RUN_SCHEMA_VERSION
 
 
 class EnvironmentCLITests(unittest.TestCase):
@@ -43,7 +44,7 @@ class EnvironmentCLITests(unittest.TestCase):
         self.assertIn("missing update", errors)
 
     def fixture(self):
-        return {"schema_version": 16, "current_task": "task", "accepted": {}, "attempts": {"task": 5, "other": 2},
+        return {"schema_version": RUN_SCHEMA_VERSION, "current_task": "task", "accepted": {}, "attempts": {"task": 5, "other": 2},
                 "feedback": {"task_id": "task", "attempt": 2, "worker": {"status": "blocked", "blocker_kind": "environment", "blockers": ["missing dependency"]},
                              "worker_artifact": "/private/dispatches/d3/returned-result.json", "worker_artifact_digest": "abc"},
                 "dispatches": [{"id": "d1", "role": "worker", "status": "completed"},

@@ -1,6 +1,7 @@
 import copy
 import unittest
 from harness.diagnostics import budget_explanation
+from harness.versions import RUN_SCHEMA_VERSION
 
 
 class BudgetExplanationTests(unittest.TestCase):
@@ -12,7 +13,7 @@ class BudgetExplanationTests(unittest.TestCase):
         records = [{'artifact': 'review'+str(i), 'worker_source': {'dispatch_id': 'd'+str(i),
                     'artifact_digest': 'a'*64}} for i in range(3)]
         run = {'id': 'run_a', 'dispatches': workers + [workers[-1]],
-               'review_history': {'x': records + [records[-1]]}, 'schema_version': 16,
+               'review_history': {'x': records + [records[-1]]}, 'schema_version': RUN_SCHEMA_VERSION,
                'agent_dispatches': 8, 'final_attempts': 0, 'replan_attempts': 0,
                'config_snapshot': {'runtime': {'max_attempts': 5, 'max_agent_dispatches': 20}}}
         original = copy.deepcopy(run)

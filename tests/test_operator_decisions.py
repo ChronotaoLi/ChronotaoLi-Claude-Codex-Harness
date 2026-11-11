@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 from harness.decisions import DecisionRecovery, read_decision
 from harness.util import HarnessError, write_json
+from harness.versions import RUN_SCHEMA_VERSION
 
 
 class Fixture(DecisionRecovery):
@@ -18,7 +19,7 @@ class Fixture(DecisionRecovery):
         self.context.directory = Path(directory).resolve()
         self.events = []
         self.saves = 0
-        self.context.run = {'id': 'run_test', 'schema_version': 16, 'status': 'blocked',
+        self.context.run = {'id': 'run_test', 'schema_version': RUN_SCHEMA_VERSION, 'status': 'blocked',
                     'tasks': [{'id': 'one', 'depends_on': []}, {'id': 'two', 'depends_on': ['one']}],
                     'accepted': {}, 'dispatches': [{'id': 'dispatch_one', 'role': 'commander',
                     'kind': 'replan', 'task_id': 'replanning', 'invoked': True}],

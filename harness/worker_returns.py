@@ -1,8 +1,9 @@
 """Classify an exited worker's durable output without inventing a return.
 
-An absent file is meaningful only under the transport declared before invocation.
-Stream capture must finish before it can prove absence; a dead reader cannot
-attest that its pipes contained no terminal. These records never bind a candidate.
+Schema 17 has one transport: Claude's JSON output in process.stdout. Schema 15
+and 16 ledgers also declared a capture mode before invocation; their records are
+checked only by the frozen historical classifier at the end of this module.
+These records never bind a candidate.
 """
 import hashlib
 import json
@@ -10,21 +11,22 @@ import json
 from .util import HarnessError
 
 
+# Every file schema 17 can write into a worker dispatch directory that bears on
+# whether the worker returned. Nothing else is fingerprinted.
 SOURCES = (
-    'returned-result.json', 'response.json', 'terminal-capture.json',
-    'provider-result.json', 'result.json', 'process.stdout', 'process.outcome.json',
-    'capture-manifest.json', 'stream-capture.json', 'stream-terminal.json',
-    'stream-received-terminal.json',
+    'returned-result.json', 'response.json', 'provider-result.json',
+    'process.stdout', 'process.outcome.json',
 )
+STATES = ('retryable', 'returned', 'unknown')
 LIMIT = 16 * 1024 * 1024
 _EMPTY = object()
 
 
-def fingerprint(job):
+def fingerprint(job, names):
     if job.is_symlink() or job.resolve() != job or not job.is_dir():
         raise HarnessError('unsafe worker return evidence directory')
     result = {}
-    for name in SOURCES:
+    for name in names:
         path = job / name
         if path.is_symlink() or path.exists() and not path.is_file():
             raise HarnessError('unsafe worker return evidence: ' + name)
@@ -50,12 +52,66 @@ def _provider_error(value):
                  isinstance(value.get('subtype'), str) and value['subtype'].startswith('error_')))
 
 
-def inspect_return(job, capture):
+def inspect_return(job):
     """Return retryable/returned/unknown plus the exact evidence used, after exit."""
-    sources = fingerprint(job)
+    sources = fingerprint(job, SOURCES)
+
+    def result(state, reason):
+        # A writer or external edit must not race the classification.
+        if fingerprint(job, SOURCES) != sources:
+            raise HarnessError('worker return evidence changed during inspection')
+        return {'version': 1, 'state': state, 'reason': reason, 'sources': sources}
+
+    if sources['returned-result.json'] is not None or sources['response.json'] is not None:
+        return result('returned', 'worker result exists without a candidate seal')
+    try:
+        value = _read(job, 'process.stdout') if sources['process.stdout'] is not None else _EMPTY
+        if sources['provider-result.json'] is not None and _read(job, 'provider-result.json') != value:
+            return result('unknown', 'provider result conflicts with original output')
+        if value is _EMPTY:
+            return result('retryable', 'direct JSON output is absent or empty after exit')
+        if _provider_error(value):
+            return result('retryable', 'provider returned a complete explicit error')
+        return result('returned' if isinstance(value, dict) and value.get('type') == 'result' else 'unknown',
+                      'non-error or ambiguous direct JSON output')
+    except (OSError, ValueError, UnicodeError, RecursionError) as error:
+        return result('unknown', 'unreadable worker return evidence: ' + type(error).__name__)
+
+
+def validate_return_evidence(job, record):
+    if (not isinstance(record, dict) or set(record) != {'version', 'state', 'reason', 'sources'}
+            or record['version'] != 1 or record['state'] not in STATES
+            or not isinstance(record['reason'], str)
+            or not isinstance(record['sources'], dict) or set(record['sources']) != set(SOURCES)):
+        raise HarnessError('invalid worker return evidence record')
+    if fingerprint(job, SOURCES) != record['sources']:
+        raise HarnessError('worker return evidence changed; preserve original dispatch')
+    if inspect_return(job) != record:
+        raise HarnessError('worker return classification does not match bound evidence')
+
+
+# ----- Schema 15 and 16: read-only history, frozen ------------------------------
+# Byte-for-byte the bc94b6f classifier, renamed and given its own file list. The
+# evidence those versions saved embeds the intent's capture and these eleven
+# sources, and cleanup re-derives it exactly; never change it with schema 17.
+# An absent file is meaningful only under the transport declared before
+# invocation. Stream capture must finish before it can prove absence; a dead
+# reader cannot attest that its pipes contained no terminal.
+
+HISTORICAL_SOURCES = (
+    'returned-result.json', 'response.json', 'terminal-capture.json',
+    'provider-result.json', 'result.json', 'process.stdout', 'process.outcome.json',
+    'capture-manifest.json', 'stream-capture.json', 'stream-terminal.json',
+    'stream-received-terminal.json',
+)
+
+
+def inspect_historical_return(job, capture):
+    """Return retryable/returned/unknown plus the exact evidence used, after exit."""
+    sources = fingerprint(job, HISTORICAL_SOURCES)
     def result(state, reason):
         # A capture writer or external edit must not race the classification.
-        if fingerprint(job) != sources:
+        if fingerprint(job, HISTORICAL_SOURCES) != sources:
             raise HarnessError('worker return evidence changed during inspection')
         return {'version': 1, 'capture': capture.copy(), 'state': state,
                 'reason': reason, 'sources': sources}
@@ -129,13 +185,13 @@ def inspect_return(job, capture):
         return result('unknown', 'unreadable worker return evidence: ' + type(error).__name__)
 
 
-def validate_return_evidence(job, record, capture):
+def validate_historical_return_evidence(job, record, capture):
     if (not isinstance(record, dict) or record.get('version') != 1
             or record.get('capture') != capture or record.get('state') not in ('retryable', 'returned', 'unknown')
             or not isinstance(record.get('reason'), str)
-            or not isinstance(record.get('sources'), dict) or set(record['sources']) != set(SOURCES)):
+            or not isinstance(record.get('sources'), dict) or set(record['sources']) != set(HISTORICAL_SOURCES)):
         raise HarnessError('invalid worker return evidence record')
-    if fingerprint(job) != record['sources']:
+    if fingerprint(job, HISTORICAL_SOURCES) != record['sources']:
         raise HarnessError('worker return evidence changed; preserve original dispatch')
-    if inspect_return(job, capture) != record:
+    if inspect_historical_return(job, capture) != record:
         raise HarnessError('worker return classification does not match bound evidence')

@@ -82,8 +82,7 @@ class ResultReceipts(RuntimeService):
             if (not isinstance(capture, dict) or capture.get("version") != 1
                     or capture.get("provider") not in ("claude", "codex")
                     or capture["provider"] != self.context.config.role(entry["role"], self.context.commander)["cli"]
-                    or capture.get("source") not in (("response.json",) if capture["provider"] == "codex"
-                                                     else ("process.stdout", "stream-terminal.json", "stream-received-terminal.json"))):
+                    or capture.get("source") != ("response.json" if capture["provider"] == "codex" else "process.stdout")):
                 raise ValueError("invalid terminal capture")
             for name, field in ((capture["source"], "source_digest"),
                                 ("process.outcome.json", "outcome_digest"),
@@ -91,26 +90,12 @@ class ResultReceipts(RuntimeService):
                 path = job / name
                 if path.is_symlink() or not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != capture[field]:
                     raise ValueError("terminal evidence changed")
-            support = capture.get("support_digests")
-            expected_support = ({"capture-manifest.json", "stream-capture.json"}
-                                if capture["source"] == "stream-terminal.json" else
-                                {"capture-manifest.json"} if capture["provider"] == "claude" else set())
-            if not isinstance(support, dict) or set(support) != expected_support:
-                raise ValueError("missing terminal protocol evidence")
-            for name, expected in support.items():
-                path = job / name
-                if path.is_symlink() or not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != expected:
-                    raise ValueError("terminal protocol evidence changed")
             original = read_json(job / "process.outcome.json")
             if (original != outcome or original.get("started") is not True
                     or type(original.get("exit_code")) is not int or original["exit_code"] != 0
                     or original.get("termination_reason") != "normal"
                     or original.get("errors") or original.get("cleanup_errors")):
                 raise ValueError("terminal process did not complete normally")
-            if capture["source"] == "stream-terminal.json":
-                protocol = read_json(job / "stream-capture.json")
-                if protocol.get("protocol_complete") is not True or protocol.get("terminal_count") != 1 or protocol.get("exit_code") != 0:
-                    raise ValueError("terminal stream incomplete")
         except (OSError, ValueError, TypeError, KeyError) as error:
             raise HarnessError("终端结果证据缺失、改变或进程未正常完成；保留证据，禁止重新抽取结论") from error
         if "terminal_capture_digest" not in receipt:

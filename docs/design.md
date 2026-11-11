@@ -1,6 +1,6 @@
 # 设计：架构、不变量与状态转换
 
-模型是可替换的决策与执行部件；任务状态、权限边界、证据和接受条件留在确定性的运行时。本文描述台账版本 16 的系统。用法见 [README](../README.md)，停止后的出口见[恢复与操作者出口](recovery.md)，工具接口与观察见[操作与观察](operations.md)，历史改动见 git log 与[验证记录](validation.md)。
+模型是可替换的决策与执行部件；任务状态、权限边界、证据和接受条件留在确定性的运行时。本文描述台账版本 17 的系统。用法见 [README](../README.md)，停止后的出口见[恢复与操作者出口](recovery.md)，工具接口与观察见[操作与观察](operations.md)，历史改动见 git log 与[验证记录](validation.md)。
 
 - [架构](#架构)
 - [不变量](#不变量)
@@ -26,7 +26,7 @@
 | `task_lifecycle.py`、`finalization.py`、`verification.py`、`verification_plan.py`、`review_progress.py` | 任务验证、审阅、接受；整体验收；验证命令；候选预检；必需问题与审阅来源 |
 | `budgets.py`、`diagnostics.py`、`convergence.py` | 工作尝试与豁免；预算解释与剩余调用下界；返工提示与审阅轮次 |
 | `continuation.py`、`environment.py`、`decisions.py`、`progress.py` | 续作、续作拒绝、执行指导；环境更新与前置检查；操作者决定；检查点 |
-| `adapters.py`、`process_runtime.py`、`util.py`、`stream_capture.py` | CLI 参数与模拟后端；进程组、截止时间与退出事实；流式捕获 |
+| `adapters.py`、`process_runtime.py`、`util.py` | CLI 参数与模拟后端；进程组、截止时间与退出事实 |
 | `command_server.py`、`command_entry.py` | worker 专属 `harness_commands` MCP：`list_commands`、`run_command`、`delete_path` |
 | `mcp_server.py`、`mcp_entry.py`、`file_tools.py`、`git_query.py` | 三种角色共用的只读 `harness` MCP：记忆、技能、运行状态、文件工具、`git_query` |
 | `git.py`、`memory.py` | Git 绑定、快照、范围、接受提交与归档；SQLite 项目记忆 |
@@ -35,7 +35,7 @@
 | `cleanup.py` | `cleanup-run`：共同门禁之后分别处理全新验证检出与分支工作树 |
 | `observe.py`、`dashboard.py`、`dashboard_page.py`、`watch.py`、`watch_cli.py` | 只读观察：列表与详情、本地网页、原生文件通知 |
 | `operations.py`、`supervisor.py` | 操作记录；`supervise` |
-| `permission_diagnostics.py`、`permission_smoke.py`、`tool_smoke.py`、`stream_smoke.py` | 权限诊断；真实账号联调入口 |
+| `permission_diagnostics.py`、`permission_smoke.py`、`tool_smoke.py` | 权限诊断；真实账号联调入口 |
 
 每次调用的输入由三部分组成：`shared/RULES.md` 与该角色的 skill（协议说明，包括各类摘录与索引的读法），以及包（`packet`）。包放数据、索引和现场事实：环境更新、操作者决定和检查点在包里是有界摘录加 SHA256 绑定的索引，与本次任务无关时只带索引。环境、决定、检查点、执行指导、权限、审阅、路径索引、命令目录、问题进度和计划增量的说明不在包里。仍在包里的静态说明及其去向：指挥 plan／dispatch／replan 的 `instruction`、默认 worker 指令和续作拒绝后写入拒绝记录的 worker 指令（随指挥调用合并改写，B4）；格式修正与显式修正的 `instruction`（随无效输出规则统一删除，B3）；修复声明模板的 `policy` 与 `required_finding_source_policy`（随身份归运行时删除或改写，B2）。另有几个分类标签（`instruction_file_changes.trust`、`ignored_paths.coverage`、环境检查结果的 `coverage`）、`verification_plan.policy` 的布尔标记、操作者决定里替代非法问题的有界说明，以及提示词中可选记忆前的分隔标题，它们描述具体数据，不是协议说明。worker 包的 `instruction` 是指挥写的指令，属于数据；指挥包另带 `workspace: {head, clean}`，在构造包时同时读取 `expected_head` 和工作树 `git status` 是否干净。
 
@@ -55,7 +55,7 @@
 
 6. 已返回的指挥与审阅结论不重抽：调用前的接收意图绑定原请求、候选快照和返回位置，恢复继续校验同一结果，缺失或被改即停止；拒绝、停止和非法结果不因重复 resume 消失。
 7. worker 结果先封存再交接：确认 worker 与命令子进程退出后，把结果、来源文件摘要、返回后候选、HEAD、Git 绑定和进程事实写成内容寻址的 `worker-seal.<SHA256>.json`，再做契约、范围、`post_agent` 与交接。未封存的原始输出不补绑恢复时的工作树。
-8. 无结果判定绑定原始证据：确认退出后按派发前保存的输出模式（`legacy_json` 或 `stream_metadata_v1`）把来源判为 retryable、returned 或 unknown，只有 retryable 允许新的计费尝试；判定、故障来源和回执消费同次保存，证据删改后不能改判。
+8. 无结果判定绑定原始证据：确认退出后，按 Claude 的 JSON 输出（`process.stdout`）和派发目录中的结果文件把来源判为 retryable、returned 或 unknown，只有 retryable 允许新的计费尝试。retryable 时，判定、故障来源和回执消费同次保存，普通 resume 开始新尝试；returned 或 unknown 时，判定与停止原因同次保存，回执保留，`--confirm-exited` 不能解开。判定记录所依据文件的 SHA256，证据删改后不能改判。
 9. 不可变证据先发布，再登记引用：packet、契约、封存、续作类记录、环境更新、决定和检查点先写成内容寻址或带 SHA256 的文件，再在台账存路径与摘要。文件写入失败时不登记引用；worker 输入写入失败时也不扣调用预算、不保存接收意图或 `invoked=true`，但此前保存的准备条目与随后的失败状态、诊断仍会落盘。未引用的遗留文件被忽略，同内容重试时复用。
 10. 台账对 worker 输入和续作类记录只存摘要与引用：接收意图存 `packet.json`、`schema.json` 的路径与 SHA256；续作、执行指导、续作拒绝行只存 `snapshot_digest`，整棵快照只在不可变文件里。引用文件缺失、被改或换成符号链接时，恢复停止并保留现场。
 11. 格式修正只修格式：每个“角色:调用类型:任务”整个 run 最多一次自动修正（`format_repairs`）和一次显式修正（`invalid_repairs`），不因 resume、新尝试或新快照清零；指挥选择固定用任务身份 `dispatching`，再规划用 `replanning`。审阅修正保留 verdict、批准 key 和全部 finding；指挥修正不改 `selected_task`、`action` 或修订操作；worker 自动修正读回已发布的原 packet 并核对摘要；worker 已报告 blocker 时即使有格式错误也保留阻断并停止。
@@ -87,7 +87,7 @@
 **台账、版本与观察**
 
 27. 台账只经 `RunStore` 提交：在 `store.lock` 下比较已加载字节的摘要，拒绝旧写入，原子写入并递增 `store_revision`；外部动作前也核对当前权威。`run.lock` 保护生命周期。
-28. 旧版本台账不迁移、不执行：`resume`、`abandon`、`prepare-run` 只接受版本 16；版本 15 及更早仍可用只读与诊断入口（`status`、`watch`、`dashboard`、`permission-diagnostics`）和受门禁保护的 `cleanup-run`（版本 7–16，按各自形状核对）；不补写旧默认值。resume 另核对共享资产摘要（不含 hook 脚本的依赖）和完整配置快照。
+28. 旧版本台账不迁移、不执行：`resume`、`abandon`、`prepare-run` 只接受版本 17；版本 16 及更早仍可用只读与诊断入口（`status`、`watch`、`dashboard`、`permission-diagnostics`）和受门禁保护的 `cleanup-run`（版本 7–17，按各自形状核对；版本 15、16 的 worker 回执按其意图保存的输出模式、用当时的分类规则原样复核）；不补写旧默认值。resume 另核对共享资产摘要（不含 hook 脚本的依赖）和完整配置快照。
 29. hooks 至少一次：`post_agent` 只作用于通过校验的结果和 `invalid_rejected` 审阅；`pre_accept`、`post_accept`、`on_error` 执行前递增计数并用独立日志目录，中断后可能重复。配置出现 `context_compacted` 时报未知事件并提示改用 `context_prepared`。
 30. 必要输入超过 `context_chars` 时不调用模型、不扣额度，报告仍写入 `context-report.json`；可选记忆按整条加入剩余空间。成功派发的报告保留根与顶层字段尺寸及最大的 30 个嵌套字段并给出省略数，超限报告保留全部明细。
 31. 观察层（`status`、`watch`、`dashboard`、操作记录、`supervise` 回执）不写台账、不取 `run.lock`、不参与恢复。
@@ -113,7 +113,7 @@
 
 | 键 | 设置与更新 | 清除 | 持久化顺序 | 恢复 |
 | --- | --- | --- | --- | --- |
-| `schema_version`、`id`、`repo`、`goal`、`commander`、`branch`、`worktree`、`base_commit`、`config_path`、`asset_digest`、`created_by_operation` | 首次保存 | 不变 | 早于创建工作树 | 要求版本 16、ID 与仓库一致；比较共享资产摘要 |
+| `schema_version`、`id`、`repo`、`goal`、`commander`、`branch`、`worktree`、`base_commit`、`config_path`、`asset_digest`、`created_by_operation` | 首次保存 | 不变 | 早于创建工作树 | 要求版本 17、ID 与仓库一致；比较共享资产摘要 |
 | `config_snapshot` | 首次保存；resume 接受合法放宽后替换 | 不清除 | 先写 `resume_config_relaxed` 再保存 | 与当前配置比较，只许放宽 |
 | `status` | 见上表 | — | 先保存再运行 hook | 终态拒绝修改选项 |
 | `worktree_binding`、`ignored_baseline` | 首次保存为空；`git worktree add` 后第二次保存填入 | 不清除 | 第一次保存在创建工作树前 | 绑定为空时 resume 拒绝，只能 `abandon` |
@@ -127,7 +127,7 @@
 | `dispatches` | 准备完成追加（`prepared`、`invoked=false`）；调用前 `starting`、`invoked=true`；启动记 pgid；结束记进程事实与用量 | 不清除 | 准备条目先于 `pre_agent` | 退出门禁读进程事实；`worker_receipt_consumed` 记 worker 回执结局 |
 | `feedback` | worker 阻断、审阅拒绝、验证或预检失败、候选变化、`pre_accept` 失败、整体失败、修订应用 | 接受、整体批准时置 null | 与引起它的转换同次 | 下一次指挥与 worker 的输入 |
 | `review_history` | 任务审阅结束；候选变化前把已返回审阅存为 invalidated | 不清除 | 与审阅后的阶段同次 | 返工输入、`review_rounds` 来源 |
-| `worker_receipts` | 调用前存意图（`invoking`、packet／契约引用、输出模式）；封存后 `sealed`；`post_agent` 后记 `post_hook_digest` | 交接时消费 | 封存文件先于 `sealed`；消费与后续阶段同次 | 未封存：retryable 则消费并新开尝试，否则停止；封存文件已写而 `sealed` 未保存：找到并核验该文件后继续；已封存：复核后继续原门禁 |
+| `worker_receipts` | 调用前存意图（`invoking`、packet／契约引用）；封存后 `sealed`；`post_agent` 后记 `post_hook_digest` | 交接时消费 | 封存文件先于 `sealed`；消费与后续阶段同次 | 未封存：retryable 则消费并新开尝试，否则停止；封存文件已写而 `sealed` 未保存：找到并核验该文件后继续；已封存：复核后继续原门禁 |
 | `review_receipts` | 调用前存意图；返回后绑定 `artifact_digest` | 审阅结束；候选变化（先存原文）；无返回时重派前 | 结果文件先于摘要 | 有结果则校验同一结果；无结果才新派发并计费 |
 | `commander_receipts` | 调用前存意图（含原请求与摘要；再规划绑 `request_id`） | 首版计划、任务选择、修订或 stop 登记时同次移除 | 同上 | 校验同一结果，不重抽 |
 | `format_repairs` | 修正调用前 | 不清除 | 与该调用预算同次 | 额度不清零 |

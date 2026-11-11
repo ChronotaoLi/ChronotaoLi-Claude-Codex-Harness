@@ -3,6 +3,7 @@ import unittest
 
 from harness.cli import status_summary
 from harness.convergence import convergence_summary
+from harness.versions import RUN_SCHEMA_VERSION
 
 
 def rejection(*ids):
@@ -31,7 +32,7 @@ class ConvergenceTests(unittest.TestCase):
             self.assertEqual(convergence_summary({**run, "status": status}, {"old": 10})["warnings"], [])
 
     def test_signal_uses_work_attempts_and_only_consecutive_rejections(self):
-        run = {"schema_version": 16, "status": "running", "attempts": {"task": 3},
+        run = {"schema_version": RUN_SCHEMA_VERSION, "status": "running", "attempts": {"task": 3},
                "dispatches": [{"role": "worker", "task_id": "task", "attempt_exemption": {
                    "blocker_kind": "environment", "artifact": "/evidence/returned-result.json",
                    "artifact_digest": "0" * 64}}],

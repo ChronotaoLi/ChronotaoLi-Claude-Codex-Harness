@@ -1,3 +1,4 @@
+import copy
 from pathlib import Path
 import shutil
 from unittest.mock import patch
@@ -5,6 +6,7 @@ from unittest.mock import patch
 from harness import git
 from harness.cleanup import cleanup_run
 from harness.util import HarnessError, lock, read_json, write_json
+from harness.versions import RUN_SCHEMA_VERSION
 from test_harness import RepoCase, ROOT
 
 
@@ -51,11 +53,17 @@ class RunCleanupTests(RepoCase):
         with lock(self.directory / "run.lock"), self.assertRaises(HarnessError):
             self.cleanup(True)
         # The current version can still finish or abandon the run; older ones cannot.
-        for version, kind in ((16, "finish_or_abandon_first"), (13, "manual_removal"), (7, "manual_removal")):
+        # A schema 16 ledger also carries the capture contract that version declared.
+        from test_ledger_history import adopt_capture_contract
+        schema16 = copy.deepcopy(self.run)
+        adopt_capture_contract(self.directory, schema16, "legacy_json")
+        for version, kind in ((RUN_SCHEMA_VERSION, "finish_or_abandon_first"), (16, "manual_removal"),
+                              (13, "manual_removal"), (7, "manual_removal")):
             for status in ("running", "stopped", "planning"):
                 with self.subTest(version=version, status=status):
-                    self.run.update(status=status, schema_version=version)
-                    write_json(self.state, self.run)
+                    ledger = schema16 if version == 16 else self.run
+                    ledger.update(status=status, schema_version=version)
+                    write_json(self.state, ledger)
                     for remove in (True, False):
                         result = self.cleanup(remove)
                         self.assertEqual((result["status"], result["reason_kind"]), ("retained", kind))

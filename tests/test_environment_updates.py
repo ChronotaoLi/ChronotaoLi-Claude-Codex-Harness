@@ -8,6 +8,7 @@ from unittest.mock import patch
 from harness.budgets import work_attempts
 from harness.cli import status_summary
 from harness.util import HarnessError, read_json, write_json
+from harness.versions import RUN_SCHEMA_VERSION
 from test_harness import ROOT, RepoCase
 from test_runtime_changes import ScriptedBackend
 
@@ -196,7 +197,7 @@ class EnvironmentUpdateTests(RepoCase):
         calls = len(backend.calls)
         result = self.engine(backend).resume(engine.run['id'], environment_update=path)
         self.assertEqual(result['status'], 'completed')
-        self.assertEqual(result['schema_version'], 16)
+        self.assertEqual(result['schema_version'], RUN_SCHEMA_VERSION)
         self.assertEqual(result['tasks'], before['tasks'])
         self.assertEqual(result['config_snapshot']['roles'], before['config_snapshot']['roles'])
         self.assertEqual(result['original_tasks'], before['original_tasks'])

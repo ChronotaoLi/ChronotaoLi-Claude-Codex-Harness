@@ -7,7 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from harness.adapters import CLIBackend
-from harness.config import Config, RESUME_INCREASES
+from harness.config import Config, REMOVED_KEYS, RESUME_INCREASES
 from harness.contracts import REVIEW, WORK, envelope, validate
 from harness.shared import toml_value
 from harness.util import HarnessError, read_json, write_json
@@ -46,24 +46,37 @@ class ConfigChangesTests(unittest.TestCase):
         self.assertEqual(self.data, before)
         self.assertEqual(config.resume_changes(config.data), {})
 
-    def test_removed_run_wide_attempt_limit_is_rejected_with_its_replacements(self):
-        self.data["runtime"]["max_total_attempts"] = 60
-        with self.assertRaises(HarnessError) as raised:
-            self.load()
-        message = str(raised.exception)
-        self.assertIn("未知配置键：runtime.max_total_attempts", message)
-        self.assertIn("请删除 runtime.max_total_attempts", message)
-        self.assertIn("runtime.max_attempts", message)
-        self.assertIn("runtime.max_agent_dispatches", message)
-        # A saved snapshot carrying the key is equally unknown, never silently dropped.
-        current = copy.deepcopy(self.data)
-        del current["runtime"]["max_total_attempts"]
-        config = self.load(current)
-        self.assertNotIn("max_total_attempts", config.data["runtime"])
-        with self.assertRaisesRegex(HarnessError, "未知配置键：runtime.max_total_attempts"):
-            config.resume_changes(self.data)
+    # Each removed key, a value it used to accept, and what its hint must name.
+    REMOVED = {
+        "max_total_attempts": (60, ("runtime.max_attempts", "runtime.max_agent_dispatches")),
+        "claude_output_mode": ("legacy_json", ("JSON 输出", "stream_metadata_v1 已删除")),
+    }
 
-    def test_cli_startup_reports_the_removed_key_before_any_run(self):
+    def test_removed_keys_are_rejected_with_their_replacements(self):
+        self.assertEqual(set(REMOVED_KEYS), {"runtime." + key for key in self.REMOVED})
+        values = {"claude_output_mode": ("legacy_json", "stream_metadata_v1", "anything")}
+        for key, (value, hints) in self.REMOVED.items():
+            for written in values.get(key, (value,)):
+                with self.subTest(key=key, value=written):
+                    data = copy.deepcopy(self.data)
+                    data["runtime"][key] = written
+                    with self.assertRaises(HarnessError) as raised:
+                        self.load(data)
+                    message = str(raised.exception)
+                    self.assertIn(f"未知配置键：runtime.{key}", message)
+                    self.assertIn(f"请删除 runtime.{key}", message)
+                    for hint in hints:
+                        self.assertIn(hint, message)
+            with self.subTest(key=key, snapshot=True):
+                # A saved snapshot carrying the key is equally unknown, never silently dropped.
+                config = self.load()
+                self.assertNotIn(key, config.data["runtime"])
+                snapshot = copy.deepcopy(config.data)
+                snapshot["runtime"][key] = value
+                with self.assertRaisesRegex(HarnessError, f"未知配置键：runtime.{key}"):
+                    config.resume_changes(snapshot)
+
+    def test_cli_startup_reports_a_removed_key_before_any_run(self):
         import contextlib
         import io
         import subprocess
@@ -71,15 +84,18 @@ class ConfigChangesTests(unittest.TestCase):
         repo = self.root / "repo"
         repo.mkdir()
         subprocess.run(["git", "init", "-q", str(repo)], check=True)
-        self.data["runtime"]["max_total_attempts"] = 60
-        path = self.root / "harness.toml"
-        path.write_text("\n".join(f"{key} = {toml_value(value)}" for key, value in self.data.items()))
-        errors = io.StringIO()
-        with contextlib.redirect_stderr(errors), contextlib.redirect_stdout(io.StringIO()):
-            code = main(["--config", str(path), "--repo", str(repo), "resume", "run_missing"])
-        self.assertEqual(code, 1)
-        self.assertIn("请删除 runtime.max_total_attempts", errors.getvalue())
-        self.assertFalse((repo / ".harness").exists())
+        for key, (value, _) in self.REMOVED.items():
+            with self.subTest(key=key):
+                data = copy.deepcopy(self.data)
+                data["runtime"][key] = value
+                path = self.root / "harness.toml"
+                path.write_text("\n".join(f"{name} = {toml_value(item)}" for name, item in data.items()))
+                errors = io.StringIO()
+                with contextlib.redirect_stderr(errors), contextlib.redirect_stdout(io.StringIO()):
+                    code = main(["--config", str(path), "--repo", str(repo), "resume", "run_missing"])
+                self.assertEqual(code, 1)
+                self.assertIn(f"请删除 runtime.{key}", errors.getvalue())
+                self.assertFalse((repo / ".harness").exists())
 
     def test_rejects_unsupported_codex_worker_before_dispatch(self):
         self.data["roles"]["worker"]["cli"] = "codex"
@@ -217,6 +233,14 @@ class ConfigChangesTests(unittest.TestCase):
                 self.assertEqual(argv[argv.index("--model") + 1], model["model"])
                 self.assertIn("--no-session-persistence" if cli == "claude" else "--ephemeral", argv)
                 self.assertFalse(set(argv) & {"--resume", "--continue", "--fallback-model", "--dangerously-skip-permissions"})
+                if cli == "claude":
+                    # One output mode: the JSON terminal, never stream-json with its --verbose.
+                    self.assertEqual(argv[argv.index("--output-format") + 1], "json")
+                    self.assertFalse({"stream-json", "--verbose"} & set(argv))
+        worker = CLIBackend(config, self.root / ".harness").command(
+            "worker", config.role("worker"), self.root, self.root / "claude", {}, None)
+        self.assertEqual(worker[worker.index("--output-format") + 1], "json")
+        self.assertFalse({"stream-json", "--verbose"} & set(worker))
 
     def test_adapter_rejects_codex_worker_even_if_config_was_mutated(self):
         config = self.load()

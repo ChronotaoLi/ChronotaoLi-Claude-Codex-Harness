@@ -549,7 +549,7 @@ class DashboardPresentationTests(unittest.TestCase):
   let panel = visibleText(one(attrIs("data-panel", "cost")));
   assert.ok(panel.includes("worker 尝试总数"), "schema 16 shows the summed attempts");
   assert.ok(panel.includes("各任务 attempts 之和"));
-  assert.ok(panel.includes("work（台账 16 固定）"));
+  assert.ok(panel.includes("work（台账 16 起固定）"));
   assert.ok(!panel.includes("总尝试（历史台账）"), "no run-wide limit meter for schema 16");
   navigate("#/runs/run_old");
   await respond("/api/runs/run_old", D.historical);

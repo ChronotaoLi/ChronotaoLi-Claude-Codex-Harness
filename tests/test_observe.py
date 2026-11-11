@@ -15,6 +15,7 @@ from unittest.mock import patch
 from harness import cli, observe
 from harness.cli import status_summary
 from harness.util import read_json, write_json
+from harness.versions import RUN_SCHEMA_VERSION
 from test_harness import RepoCase
 
 ROLES = {"commander": {"cli": "codex", "model": "gpt-6-astra", "effort": "high"},
@@ -78,7 +79,7 @@ class DemoRunObservationTests(RepoCase):
         item = listing["runs"][0]
         self.assertEqual({key: item[key] for key in ("id", "status", "goal", "branch")},
                          {key: ledger_value[key] for key in ("id", "status", "goal", "branch")})
-        self.assertEqual(item["schema_version"], 16)
+        self.assertEqual(item["schema_version"], RUN_SCHEMA_VERSION)
         self.assertEqual(item["last_event_time"], events[-1]["time"])
 
         detail = observe.run_detail(state, result["id"])

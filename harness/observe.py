@@ -705,12 +705,12 @@ class Observer:
         attempts = run.get("attempts")
         budgets["attempts"] = ({key: value for key, value in attempts.items() if type(value) is int}
                                if isinstance(attempts, dict) else None)
-        # Every worker invocation, derived from the per-task counters (schema 16).
+        # Every worker invocation, derived from the per-task counters (schema 16 and later).
         budgets["attempts_total"] = (_integer(sum(budgets["attempts"].values()))
                                      if budgets["attempts"] is not None else None)
         # Historical display branch: schema 15 and earlier also saved total_attempts,
         # attempt_budget_policy and runtime.max_total_attempts. They are shown as
-        # saved and stay null for schema 16 ledgers, which have none of them.
+        # saved and stay null for schema 16 and later ledgers, which have none of them.
         budgets["total_attempts"] = _integer(run.get("total_attempts"))
         budgets["attempt_budget_policy"] = _string(run.get("attempt_budget_policy"))
         snapshot = run.get("config_snapshot")

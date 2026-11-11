@@ -13,7 +13,7 @@ DEFAULTS = {
         "max_attempts": 3, "max_final_attempts": 3, "max_replans": 2,
         "max_agent_dispatches": 200,
         "max_tasks": 20, "context_chars": 100000, "claude_max_turns": 50,
-        "claude_max_turns_by_role": {}, "claude_output_mode": "legacy_json",
+        "claude_max_turns_by_role": {},
     },
     "permissions": {"worker_commands": []},
     "memory": {"task_ttl_days": 180, "knowledge_ttl_days": 180},
@@ -25,10 +25,13 @@ RESUME_INCREASES = (
     "max_replans", "max_agent_dispatches", "max_tasks",
 )
 # Deleted keys stay unknown; the error names what to delete and what replaces it.
-# This hint is the only place the removed key name remains.
+# Apart from read-only checks of historical ledgers, this hint is the only
+# place a removed key name remains.
 REMOVED_KEYS = {
     "runtime.max_total_attempts": "请删除 runtime.max_total_attempts：每任务上限是 runtime.max_attempts，"
                                   "整个 run 的模型调用上限是 runtime.max_agent_dispatches",
+    "runtime.claude_output_mode": "请删除 runtime.claude_output_mode：Claude 只使用 JSON 输出（原 legacy_json），"
+                                  "流式元数据模式 stream_metadata_v1 已删除",
 }
 DISPATCH_ROLES = ("commander", "worker", "reviewer")
 
@@ -126,10 +129,6 @@ class Config:
         if data["roles"]["worker"]["cli"] == "codex":
             raise HarnessError("当前 Codex 适配器仅支持只读角色，不能配置为 worker")
         for key in DEFAULTS["runtime"]:
-            if key == "claude_output_mode":
-                if data["runtime"][key] not in ("legacy_json", "stream_metadata_v1"):
-                    raise HarnessError("runtime.claude_output_mode must be legacy_json or stream_metadata_v1")
-                continue
             if key == "claude_max_turns_by_role":
                 continue
             value = data["runtime"][key]

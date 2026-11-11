@@ -163,7 +163,7 @@ run 列表 → run 详情 → 文件查看。列表按最近事件排序，以�
 
 审阅轮次投影 `review_rounds` 按任务列出 `review_history` 的每一轮（按记录顺序从 1 编号，含失效或结构非法的记录）：`attempt`、来源审阅 `review_dispatch_id`、候选 `snapshot_digest`、`verdict`，以及本轮首次出现的 blocking finding ID `new_blocking`（按审阅者原始 ID 字符串判断）。它只读、不调用模型，`cause` 固定为 `unknown`，不推断问题为何在后续轮次才出现。详情页在“运行信息”标签显示该表。
 
-预算区显示 `attempts_total`（各任务 `attempts` 之和；版本 16 没有全 run worker 上限）、模型派发、再规划与整体验收的已用／上限，以及未终止 run 的 `remaining_model_calls`：“如果之后全部一次通过，至少还需 N 次模型调用”。N 按记录的阶段计算：已在待接受或任务审阅已开始的任务计 0，已有候选的计 1，其余未接受任务计 2，整体审阅计 1（全部已接受且同一 HEAD 已批准或整体审阅已开始时计 0）。N 是下界，不含指挥调用、返工、格式修正与再规划；`max_agent_dispatches` 用尽时停止信息里也给出它。版本 15 及更早的台账另显示保存的 `total_attempts` 与 `attempt_budget_policy`。
+预算区显示 `attempts_total`（各任务 `attempts` 之和；版本 16 起没有全 run worker 上限）、模型派发、再规划与整体验收的已用／上限，以及未终止 run 的 `remaining_model_calls`：“如果之后全部一次通过，至少还需 N 次模型调用”。N 按记录的阶段计算：已在待接受或任务审阅已开始的任务计 0，已有候选的计 1，其余未接受任务计 2，整体审阅计 1（全部已接受且同一 HEAD 已批准或整体审阅已开始时计 0）。N 是下界，不含指挥调用、返工、格式修正与再规划；`max_agent_dispatches` 用尽时停止信息里也给出它。版本 15 及更早的台账另显示保存的 `total_attempts` 与 `attempt_budget_policy`。
 
 脚本可直接读 JSON 接口：`/api/runs`、`/api/runs/<run_id>`、`/api/runs/<run_id>/events?tail=`、`/api/runs/<run_id>/files`、`/api/runs/<run_id>/files/<相对路径>?tail=&format=json`。无效 ID 或参数 400，拒绝的路径与 Host 不匹配 403，不存在的 run 或文件 404，GET／HEAD 以外的方法 405；台账可读但摘要失败的 run 仍返回 200 并带 `summary_error`。
 
@@ -236,13 +236,9 @@ WORK 结果可以带可选的 `checkpoints`，每项为 `{id, summary, inputs, e
 - 已满足本任务验收的 completed 结果可以附带最多 16 条 `decision_requests: [{id, task_id, question}]`，目标只能是传递依赖于本任务、尚未接受的任务；目标或问题不合法时本次尝试被拒绝，原因经 `worker_recovery` 交给后续调用。blocked 结果附带的 `decision_requests` 不登记，只写 `decision_requests_discarded` 事件和原结果摘要；该结果的 blocker、有效检查点和尝试豁免照常登记。
 - 审阅结果里的 finding ID 有重复或不符合 ID 格式时，这份审阅的所有 finding 都按原列表位置用 `finding-N`（N 从 1 起）作协议引用，同时保留 `original_finding_id` 与从 0 起的 `finding_index`。worker 的 `repair_claims` 和审阅者的 `finding_dispositions` 用原审阅 dispatch ID 加该引用关联；原始结果不改写，不要按非法的原 ID 猜测或合并问题。无效拒绝中的处置声明不能关闭旧问题。
 
-### 流式捕获诊断
-
-`stream_metadata_v1` 模式下，`stream-capture.json`（版本 2）分别记录 `transport_complete`、`damaged`、`terminal_count`、`protocol_complete`、`diagnostics_incomplete`、`dropped_events`、`stderr_bytes` 和 `exit_code`。`diagnostics_incomplete=true` 表示元数据容量用尽、队列满、写线程失败或 stderr 超出元数据上限，部分工具元数据被丢弃；stdout 仍被完整排空，终态另按 `damaged`、`terminal_count` 判定。因此它本身不说明终态结果损坏：只有 `damaged=true`、终态缺失或重复、非零退出才拒绝结果。元数据写线程没有收敛时捕获直接报错。
-
 ## 依赖副本清单
 
-`prepare-run RUN --manifest FILE` 在 run 锁内预检主检出源文件、当前 HEAD、worktree Git 绑定、所有已登记派发和命令进程。仅接受当前台账版本（16）的 `paused` / `awaiting_approval` run，没有待消费候选、审阅、再规划等阶段；历史版本的 run 只读。已接受任务和预算不改变。
+`prepare-run RUN --manifest FILE` 在 run 锁内预检主检出源文件、当前 HEAD、worktree Git 绑定、所有已登记派发和命令进程。仅接受当前台账版本（17）的 `paused` / `awaiting_approval` run，没有待消费候选、审阅、再规划等阶段；历史版本的 run 只读。已接受任务和预算不改变。
 
 清单示例（HEAD 和 SHA256 必须替换为实际值，mode 是十进制 POSIX 权限）：
 
@@ -318,12 +314,10 @@ python3 -m harness smoke
 python3 -m harness smoke --commander fable
 python3 -m harness.permission_smoke --config /path/to/harness.toml --repo /path/to/project
 python3 -m harness.tool_smoke --config /path/to/harness.toml --repo /path/to/project
-python3 -m harness.stream_smoke --config /path/to/harness.toml --output /path/to/project/.harness/stream-smoke/NAME --case success
 ```
 
 - `smoke` 在临时 Git 仓库由真实指挥生成计划，再调用执行者、任务审阅者和整体审阅者，运行真实测试；不改动本仓库。
 - `permission_smoke` 在 `--repo` 的 `.harness/permission-smoke/` 建立专用现场，检查工作树内读写、精确命令、额外参数、工作树外读写和 `.git` 修改；通过要求实际工具调用、工具结果、对应的 `permission_denials` 和文件内容一致，模型自称“已拒绝”不算证据。专用命令替换项目命令，外部 MCP 关闭。默认超时 180 秒、最多 16 轮、预算参数 1 美元，可用 `--timeout`、`--max-turns`、`--max-budget-usd` 调整。
 - `tool_smoke` 让配置的 Claude worker 调用 broker、文件工具、`git_query`（`ls-tree`、`hash-object` 与一条被拒绝的 argv）和 `delete_path`（范围内删除与范围外拒绝），核对工具结果与文件；默认最多 20 轮。
-- `stream_smoke` 用正式 schema 验证 `stream_metadata_v1` 捕获，`--case` 为 `success` 或 `denial`；`--output` 必须是受保护 `.harness` 下的新目录。
 
 结果只覆盖这组现场和实际 CLI 版本，不证明完整命令白名单或 OS 隔离。已执行的联调记录在[验证记录](validation.md)。

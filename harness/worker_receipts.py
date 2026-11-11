@@ -11,16 +11,17 @@ from .contracts import RepairableFormatError, validate, validate_structure, vali
 from .recovery import snapshot_digest
 from .services import RuntimeService
 from .util import HarnessError, dump, read_json, write_json
-from .worker_returns import inspect_return, validate_return_evidence
+from .worker_returns import inspect_return, validate_historical_return_evidence, validate_return_evidence
 
 # Worker inputs live beside the dispatch as immutable files; the ledger keeps
-# their paths and SHA256 (schema 16). Schema 14 and 15 ledgers embed the same
-# inputs; only read-only history checks accept that shape.
+# their paths and SHA256 (schema 16 and later). Schema 14 and 15 ledgers embed
+# the same inputs; only read-only history checks accept that shape.
 INPUTS = {'packet': 'packet.json', 'schema': 'schema.json'}
 REFERENCED, EMBEDDED = 'referenced', 'embedded'
-# The capture contract has been mandatory since schema 15; it stays checked for
-# every later version, including historical schema 15 ledgers.
-CAPTURE_CONTRACT_SCHEMA = 15
+# Schema 15 and 16 intents declared the Claude capture mode, which had to match
+# the run configuration; their history is checked in that shape. Schema 17 has
+# a single output mode and its intent carries no capture contract.
+CAPTURE_CONTRACT_VERSIONS = (15, 16)
 
 
 def receipt_shape(run):
@@ -101,8 +102,6 @@ class WorkerReceipts(RuntimeService):
         job = self.context.directory / 'dispatches' / entry['id']
         receipt = {'dispatch_id': entry['id'], 'artifact': str(job / 'returned-result.json'),
                    'seal': str(job / 'worker-seal.json'), **deepcopy(inputs),
-                   'capture': {'provider': self.context.config.role('worker', self.context.commander)['cli'],
-                               'mode': self.context.config.data['runtime']['claude_output_mode']},
                    'snapshot_digest': entry['snapshot_digest'],
                    'attempt': self.context.run['attempts'][entry['task_id']], 'phase': 'invoking'}
         entry['worker_receipt'] = deepcopy(receipt)
@@ -127,7 +126,7 @@ class WorkerReceipts(RuntimeService):
         receipt = self.context.run['worker_receipts'][key]
         job = Path(receipt['artifact']).parent
         sources = {}
-        names = ['response.json', 'process.stdout', 'process.stderr', 'provider-result.json', 'result.json', 'stream-terminal.json', 'stream-received-terminal.json', 'terminal-capture.json', 'process.outcome.json', 'capture-manifest.json', 'stream-capture.json']
+        names = ['response.json', 'process.stdout', 'process.stderr', 'provider-result.json', 'process.outcome.json']
         command_dir = job / 'commands'
         if command_dir.exists():
             if command_dir.is_symlink():
@@ -203,20 +202,31 @@ class WorkerReceipts(RuntimeService):
                 raise HarnessError('missing mandatory worker receipt linkage')
             contract = self.delivered_contract(entry, intent, shape)
             job = self.context.directory / 'dispatches' / entry['id']
-            if self.context.run['schema_version'] >= CAPTURE_CONTRACT_SCHEMA:
-                capture = intent.get('capture')
-                if (not isinstance(capture, dict) or set(capture) != {'provider', 'mode'}
-                        or capture['provider'] != 'claude'
-                        or capture['mode'] not in ('legacy_json', 'stream_metadata_v1')
-                        or 'worker_no_result' in entry):
-                    raise HarnessError('missing/invalid mandatory worker capture contract')
-                snapshot = self.context.run.get('config_snapshot', {})
-                if (capture['provider'] != snapshot.get('roles', {}).get('worker', {}).get('cli')
-                        or capture['mode'] != snapshot.get('runtime', {}).get('claude_output_mode')):
-                    raise HarnessError('worker capture contract differs from run configuration')
+            version = self.context.run['schema_version']
+            if version >= CAPTURE_CONTRACT_VERSIONS[0]:
                 evidence = entry.get('worker_return_evidence')
-                if evidence is not None:
-                    validate_return_evidence(job, evidence, capture)
+                if version in CAPTURE_CONTRACT_VERSIONS:
+                    capture = intent.get('capture')
+                    if (not isinstance(capture, dict) or set(capture) != {'provider', 'mode'}
+                            or capture['provider'] != 'claude'
+                            or capture['mode'] not in ('legacy_json', 'stream_metadata_v1')
+                            or 'worker_no_result' in entry):
+                        raise HarnessError('missing/invalid mandatory worker capture contract')
+                    snapshot = self.context.run.get('config_snapshot', {})
+                    if (capture['provider'] != snapshot.get('roles', {}).get('worker', {}).get('cli')
+                            or capture['mode'] != snapshot.get('runtime', {}).get('claude_output_mode')):
+                        raise HarnessError('worker capture contract differs from run configuration')
+                    if evidence is not None:
+                        validate_historical_return_evidence(job, evidence, capture)
+                else:
+                    # Schema 17 has no capture contract; a capture here is not
+                    # ignored or defaulted, it is refused like any foreign shape.
+                    if 'capture' in intent:
+                        raise HarnessError('worker receipt carries a capture contract removed in schema 17')
+                    if 'worker_no_result' in entry:
+                        raise HarnessError('worker dispatch carries a worker_no_result record from an older protocol')
+                    if evidence is not None:
+                        validate_return_evidence(job, evidence)
                 if entry.get('worker_receipt_consumed') == 'provider_failure' and (
                         evidence is None or evidence['state'] != 'retryable'):
                     raise HarnessError('worker provider failure lacks retry evidence')
@@ -266,10 +276,10 @@ class WorkerReceipts(RuntimeService):
             job = Path(receipt['artifact']).parent
             evidence = entry.get('worker_return_evidence')
             if evidence is None:
-                evidence = inspect_return(job, receipt['capture'])
+                evidence = inspect_return(job)
                 entry['worker_return_evidence'] = evidence
             else:
-                validate_return_evidence(job, evidence, receipt['capture'])
+                validate_return_evidence(job, evidence)
             if evidence['state'] == 'retryable':
                 error = HarnessError(entry.get('error') or 'Worker invocation requires a fresh attempt: ' + evidence['reason'])
                 # Classification, failure provenance and receipt retirement share
@@ -413,7 +423,7 @@ def validate_worker_receipt_links(run, directory, shape=None):
     """Read-only structural check for input preparation and guarded historical cleanup.
 
     Without an explicit shape the ledger's version selects it: schema 14 and 15
-    use their embedded inputs, schema 16 the referenced files. Old ledgers are
+    use their embedded inputs, schema 16 and later the referenced files. Old ledgers are
     checked in their own shape; no default is filled in.
     """
     from types import SimpleNamespace

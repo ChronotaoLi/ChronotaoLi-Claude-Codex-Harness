@@ -1,4 +1,5 @@
 import contextlib
+import copy
 import io
 import json
 from pathlib import Path
@@ -197,9 +198,14 @@ class VerificationCleanupTests(RepoCase):
         # What abandon --remove-worktree left: no worktree, no cleanup receipt.
         git.git(self.repo, "worktree", "remove", str(worktree))
         base = read_json(state)
+        # A schema 16 ledger also declared its worker capture mode; schema 12 had none.
+        from test_ledger_history import adopt_capture_contract
+        schema16 = copy.deepcopy(base)
+        adopt_capture_contract(self.directory, schema16, "legacy_json")
         for version, key in ((16, "worktree_removed"), (12, "worktree_removed"), (16, "pending_worktree_removal")):
             with self.subTest(version=version, key=key):
-                write_json(state, {**base, "status": "abandoned", "schema_version": version, key: True})
+                write_json(state, {**(schema16 if version == 16 else base), "status": "abandoned",
+                                   "schema_version": version, key: True})
                 self.assertEqual(self.statuses(self.cleanup()), (["eligible"], "absent"))
                 # Observation keeps reading the old completion key; there is no receipt yet.
                 self.assertIs(observe.run_detail(self.repo / ".harness", self.run["id"])["run"]["worktree_removed"],

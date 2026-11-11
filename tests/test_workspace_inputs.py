@@ -7,6 +7,7 @@ from unittest.mock import patch
 from harness import git
 from harness.util import HarnessError, write_json
 from harness.workspace_inputs import prepare_run, validate_inputs, cleanup_inputs
+from harness.versions import RUN_SCHEMA_VERSION
 
 class WorkspaceInputsTests(unittest.TestCase):
     def setUp(self):
@@ -25,7 +26,7 @@ class WorkspaceInputsTests(unittest.TestCase):
         self.directory.mkdir(parents=True)
         self.checkout = self.repo / '.harness/worktrees' / self.ident
         git.git(self.repo, 'worktree', 'add', '-b', 'harness/' + self.ident, str(self.checkout))
-        self.run = dict(schema_version=16, workspace_inputs=None, id=self.ident,
+        self.run = dict(schema_version=RUN_SCHEMA_VERSION, workspace_inputs=None, id=self.ident,
                         repo=str(self.repo), worktree=str(self.checkout), status='paused',
                         expected_head=git.head(self.checkout), dispatches=[], worker_receipts={},
                         worktree_binding=git.capture_worktree_binding(self.checkout, 'harness/' + self.ident))

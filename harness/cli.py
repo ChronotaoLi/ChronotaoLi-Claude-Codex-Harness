@@ -25,6 +25,23 @@ from .shared import mcp_configs, toml_value
 from .util import HarnessError, dump, read_json, write_json
 
 
+def historical_claude_terminal(observer, components):
+    """The Claude terminal file a schema 16-or-earlier dispatch declared in its capture manifest."""
+    try:
+        capture = observer.reader.read(components + ["capture-manifest.json"], limit=4096)
+        if capture["too_large"] or capture["changed_while_reading"]:
+            raise HarnessError("捕获元数据过大或读取时改变")
+        manifest = json.loads(capture["data"])
+        if not isinstance(manifest, dict) or manifest.get("version") != 1:
+            raise HarnessError("捕获元数据格式无效")
+        mode = manifest.get("mode")
+    except observe.NotFound:
+        mode = "legacy_json"
+    if mode not in ("legacy_json", "stream_metadata_v1"):
+        raise HarnessError("未知捕获模式")
+    return "stream-terminal.json" if mode == "stream_metadata_v1" else "process.stdout"
+
+
 def doctor(config):
     result = {"python": sys.version.split()[0], "models": config.data["roles"], "checks": {}}
     for cli in sorted({config.data["roles"][name]["cli"] for name in ("commander", "worker", "reviewer", "fable")}):
@@ -541,19 +558,11 @@ def _main(argv=None):
                     role_key = "fable" if entry.get("role") == "commander" and run.get("commander") == "fable" else entry.get("role")
                     provider = roles.get(role_key, {}).get("cli")
                     if provider == "claude":
-                        try:
-                            capture = observer.reader.read(components + ["capture-manifest.json"], limit=4096)
-                            if capture["too_large"] or capture["changed_while_reading"]:
-                                raise HarnessError("捕获元数据过大或读取时改变")
-                            manifest = json.loads(capture["data"])
-                            if not isinstance(manifest, dict) or manifest.get("version") != 1:
-                                raise HarnessError("捕获元数据格式无效")
-                            mode = manifest.get("mode")
-                        except observe.NotFound:
-                            mode = "legacy_json"
-                        if mode not in ("legacy_json", "stream_metadata_v1"):
-                            raise HarnessError("未知捕获模式")
-                        name = "stream-terminal.json" if mode == "stream_metadata_v1" else "process.stdout"
+                        version = run.get("schema_version")
+                        # Schema 17 has one output, Claude's JSON terminal in process.stdout.
+                        # Earlier ledgers declared their mode in a capture manifest (history only).
+                        name = ("process.stdout" if type(version) is int and version >= 17
+                                else historical_claude_terminal(observer, components))
                         try:
                             source = observer.reader.read(components + [name], limit=16*1024*1024)
                             if not source["too_large"] and not source["changed_while_reading"]:

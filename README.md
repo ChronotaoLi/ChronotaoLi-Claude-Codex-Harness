@@ -162,7 +162,7 @@ python3 -m harness --repo /path/to/project cleanup-run RUN --remove
 
 运行详情默认通过事件订阅更新，列表和文件页使用手动刷新。连接心跳仅表示观察服务可用；订阅断开后显示断开提示，由刷新按钮重新连接，不退回定时轮询。
 
-同一快照上的已保存阶段可复用：验证中断只重跑验证，审阅调用故障只新派发 reviewer，接受 hook 失败只重试 hook。worker 的完整接收记录绑定结果与返回后候选，恢复继续原校验及交接，复用封存结果本身不重新派发或扣除调用额度。仅有原始输出、尚未封存候选时中断则停止，不能把恢复时的文件补认原候选。调用失败且退出得到确认后，只有原始传输证据证明可以重试时才启动新尝试；流式捕获不完整仍阻塞。首次结构／语义拒绝保留证据并消费回执，后续普通恢复走新的计费尝试。代码变化使旧批准失效，进程未确认退出、HEAD／Git 绑定异常或证据损坏会停止；保存顺序见[设计：状态转换](docs/design.md#状态转换)。
+同一快照上的已保存阶段可复用：验证中断只重跑验证，审阅调用故障只新派发 reviewer，接受 hook 失败只重试 hook。worker 的完整接收记录绑定结果与返回后候选，恢复继续原校验及交接，复用封存结果本身不重新派发或扣除调用额度。仅有原始输出、尚未封存候选时中断则停止，不能把恢复时的文件补认原候选。调用失败且退出得到确认后，只有原始输出证明可以重试时（`process.stdout` 为空或是完整的供应商错误）才启动新尝试；输出不完整或读不出时仍阻塞。首次结构／语义拒绝保留证据并消费回执，后续普通恢复走新的计费尝试。代码变化使旧批准失效，进程未确认退出、HEAD／Git 绑定异常或证据损坏会停止；保存顺序见[设计：状态转换](docs/design.md#状态转换)。
 
 | 情况 | 常用出口 |
 | --- | --- |
@@ -184,9 +184,9 @@ python3 -m harness --repo /path/to/project cleanup-run RUN --remove
 
 `cleanup-run RUN` 是唯一的清理入口：默认预览，逐项列出保留的全新验证检出和分支工作树能否清理、被什么挡住；`--remove` 才逐项删除。验证检出在任何 run 状态都可清理；工作树只在 `completed` 或 `abandoned` 时清理，其他状态下报告 `retained`，`reason` 写明当前状态：当前版本的 run 要先完成或放弃，旧版本未结束的 run 需人工核对后自行移除工作树。工作树清理完成后可以删除或移动分支，之后再运行仍报告已清理。未保存文件（含忽略文件）、隐藏索引标记、与 HEAD 不符的字节，或原分支已离开检查点，会让对应资源报告 `blocked`，`error` 列出原因与阻塞路径，资源保留，其余资源照常清理。每项的 `status` 为 `eligible`（可删除）、`removed`（已删除）、`absent`（已不存在）、`stale_registration`（检出目录缺失但仍有 Git 注册）、`input_copies_present`（需加 `--remove-input-copies`）、`retained` 或 `blocked`，含义见[放弃与清理](docs/recovery.md#放弃与清理)；只有出现 `blocked` 时退出码为 1。派发或命令子进程退出未确认时整条命令拒绝；父 dispatch 退出不能证明 broker 命令子进程退出，核实后可加 `--confirm-exited DISPATCH_ID` 记录确认。删除意图和完成记录分别写在检出证据旁的 `cleanup.json` 和 run 目录的 `worktree-cleanup.json`，中断后重跑同一命令续做；普通预览不生成记录。命令不改 run 状态，不删除分支、台账或运行证据；需要删除分支时，先完成清理，再由操作者核对集成结果并处理分支。完整规则见[放弃与清理](docs/recovery.md#放弃与清理)。
 
-新台账版本为 16，要求完整的 worker 接收意图、输出模式与配置快照，缺失时不补造旧默认值。台账只存摘要与引用：worker 接收意图记录派发目录中不可变的 `packet.json`、`schema.json` 的路径与 SHA256，续作、执行指导和续作拒绝行只记 `snapshot_digest`，完整快照在 `continuations/` 等目录的不可变文件里；这些文件被删除、修改或换成符号链接时 `resume` 停止并保留现场。版本 15 及更早不迁移、不执行：`resume`、`abandon`、`prepare-run` 拒绝旧台账；`status`、`watch`、`dashboard`、`permission-diagnostics` 仍可只读使用，`cleanup-run` 仍可在门禁通过后清理（工作树仅限终态）。共享规则变更也受资产摘要门禁约束。版本 16 已完成 run 的普通恢复返回保存结果；终态限制见[终态与历史台账](docs/recovery.md#终态与历史台账)。
+新台账版本为 17，要求完整的 worker 接收意图与配置快照，缺失时不补造旧默认值。台账只存摘要与引用：worker 接收意图记录派发目录中不可变的 `packet.json`、`schema.json` 的路径与 SHA256，续作、执行指导和续作拒绝行只记 `snapshot_digest`，完整快照在 `continuations/` 等目录的不可变文件里；这些文件被删除、修改或换成符号链接时 `resume` 停止并保留现场。版本 16 及更早不迁移、不执行：`resume`、`abandon`、`prepare-run` 拒绝旧台账；`status`、`watch`、`dashboard`、`permission-diagnostics` 仍可只读使用，`cleanup-run` 仍可在门禁通过后清理（工作树仅限终态）。共享规则变更也受资产摘要门禁约束。版本 17 已完成 run 的普通恢复返回保存结果；终态限制见[终态与历史台账](docs/recovery.md#终态与历史台账)。
 
-以下接口已删除：命令 `notify`、`inbox`、`ack` 与通知收件箱（已有的 `.harness/notifications/` 不再读写，可手工删除）；命令 `cleanup-verification` 与选项 `abandon --remove-worktree`（都改用 `cleanup-run`；旧台账的 `worktree_removed` 仍被识别）；命令 `plan-readiness` 与 `examples/plan-readiness.json`（改为用 `status RUN --full` 审阅保存的计划，再 `resume RUN --approve-plan`）；`handoff.md`（只写 `handoff.json`）；hooks 事件名 `context_compacted`（改用 `context_prepared`）；配置键 `runtime.max_total_attempts`。
+以下接口已删除：命令 `notify`、`inbox`、`ack` 与通知收件箱（已有的 `.harness/notifications/` 不再读写，可手工删除）；命令 `cleanup-verification` 与选项 `abandon --remove-worktree`（都改用 `cleanup-run`；旧台账的 `worktree_removed` 仍被识别）；命令 `plan-readiness` 与 `examples/plan-readiness.json`（改为用 `status RUN --full` 审阅保存的计划，再 `resume RUN --approve-plan`）；`handoff.md`（只写 `handoff.json`）；hooks 事件名 `context_compacted`（改用 `context_prepared`）；配置键 `runtime.max_total_attempts`；配置键 `runtime.claude_output_mode` 与联调入口 `python3 -m harness.stream_smoke`（流式元数据模式 `stream_metadata_v1` 已删除，Claude 只用 JSON 输出）。
 
 ## 共用 skills / MCP / hooks
 
@@ -325,4 +325,4 @@ python3 -m harness --repo /abs/project cleanup-run RUN --remove --remove-input-c
 
 `supervise` 只启动一次指定的 Harness `run`/`resume`，保留子进程 stdout，监督回执写入 `.harness/supervision/` 并输出到 stderr，退出码等于子进程退出码；不会重启或自动恢复。父进程退出仍不证明 broker 子进程退出。要在 run 停下时得到提示，用 `watch RUN`（到阻塞、暂停、等待批准或终态时退出）或 `supervise`。
 
-可选 `runtime.claude_output_mode = "stream_metadata_v1"` 只适用于新运行，默认仍为 `legacy_json`；两种模式都受支持。新模式将唯一终态与白名单工具元数据分别保存；过程文本、thinking、工具参数及正文不进入元数据。错误、缺失/重复/损坏终态及非零退出均不能接受。旧运行不能在恢复时切换格式；观察不到的读取范围或拒绝原因保持未知。只读 `permission-diagnostics RUN DISPATCH --argv-json '["python3", "-m", "unittest"]'` 对比供应商拒绝证据和当前配置中的精确命令能力，并在 `builtin_coverage` 中单独说明该 argv 是否由内置 `git_query` 覆盖；它不执行命令或扩大权限。`status` 和 dashboard 同时显示预算的已用/上限/剩余与调用、审阅候选、失败、格式修正等独立维度。
+Claude 调用只用 JSON 输出（`--output-format json`），终态只从派发目录的 `process.stdout` 读取；错误、缺失或损坏的终态及非零退出均不能接受。观察不到的读取范围或拒绝原因保持未知。只读 `permission-diagnostics RUN DISPATCH --argv-json '["python3", "-m", "unittest"]'` 对比供应商拒绝证据和当前配置中的精确命令能力，并在 `builtin_coverage` 中单独说明该 argv 是否由内置 `git_query` 覆盖；它不执行命令或扩大权限。`status` 和 dashboard 同时显示预算的已用/上限/剩余与调用、审阅候选、失败、格式修正等独立维度。

@@ -12,7 +12,6 @@ from pathlib import Path
 
 from .command_server import create_manifest
 from .shared import mcp_configs, toml_value
-from .stream_capture import claude_result_path, freeze_capture, run_stream_process
 from .util import HarnessError, dump, read_json, run_process, tail, write_json
 
 
@@ -77,7 +76,7 @@ def provider_usage(job, provider):
     not an account bill; none of these observations affect execution budgets.
     """
     try:
-        with (claude_result_path(job) if provider == "claude" else job / "process.stdout").open("rb") as stream:
+        with (job / "process.stdout").open("rb") as stream:
             raw = stream.read(_USAGE_MAX_BYTES + 1)
         if len(raw) > _USAGE_MAX_BYTES:
             return None
@@ -113,8 +112,8 @@ def provider_usage(job, provider):
             return None
         if tokens:
             metrics["tokens"] = tokens
-        return {"provider": provider, "source": claude_result_path(job).name if provider == "claude" else "process.stdout", **metrics} if metrics else None
-    except (OSError, ValueError, UnicodeError, RecursionError, HarnessError):
+        return {"provider": provider, **metrics} if metrics else None
+    except (OSError, ValueError, UnicodeError, RecursionError):
         return None
 
 
@@ -171,10 +170,10 @@ def cli_error_summary(job, provider):
     if provider != "claude":
         return ""
     try:
-        with (claude_result_path(job) if provider == "claude" else job / "process.stdout").open("rb") as stream:
+        with (job / "process.stdout").open("rb") as stream:
             raw = stream.read(_USAGE_MAX_BYTES + 1)
         return claude_error_summary(json.loads(raw)) if len(raw) <= _USAGE_MAX_BYTES else ""
-    except (OSError, ValueError, UnicodeError, RecursionError, HarnessError):
+    except (OSError, ValueError, UnicodeError, RecursionError):
         return ""
 
 
@@ -214,9 +213,8 @@ def claude_worktree_git_deny_rules(cwd):
 
 
 class CLIBackend:
-    def __init__(self, config, state, *, allow_stream_fixture=False):
+    def __init__(self, config, state):
         self.config, self.state = config, state
-        self.allow_stream_fixture = allow_stream_fixture
 
     def command(self, role, model, cwd, job, schema, run_path, *, parent_deadline=None, delete_scope=None):
         if role == "worker" and model["cli"] == "codex":
@@ -268,18 +266,14 @@ class CLIBackend:
                 "--no-session-persistence", "--session-id", job.name,
                 "--setting-sources", "", "--settings", json.dumps(settings),
                 "--strict-mcp-config", "--mcp-config", str(job / "mcp.json"),
-                "--output-format", self.output_format(), *(["--verbose"] if self.output_format() == "stream-json" else []),
+                "--output-format", "json",
                 "--json-schema", json.dumps(wire_schema),
                 "--max-turns", str(self.config.claude_max_turns(role)),
                 "--permission-mode", "dontAsk", "--disallowedTools", "Agent,Task",
                 "--tools", tools]
 
-    def output_format(self):
-        return "stream-json" if self.config.data["runtime"].get("claude_output_mode", "legacy_json") == "stream_metadata_v1" else "json"
-
     def invoke(self, *, role, model, cwd, job, schema, prompt, run_path, on_start, task=None, kind=None, on_outcome=None):
         parent_deadline = time.monotonic() + self.config.data["runtime"]["agent_timeout_seconds"]
-        mode = self.config.data["runtime"].get("claude_output_mode", "legacy_json")
         contract = job / "schema.json"
         if role == "worker":
             # The runtime published this immutable contract before charging the
@@ -298,21 +292,6 @@ class CLIBackend:
         write_json(job / "command.json", argv)
         env = os.environ.copy()
         env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] = "1"
-        runner = run_process
-        if model["cli"] == "claude":
-            version = "not_recorded"
-            if mode == "stream_metadata_v1":
-                import subprocess
-                try:
-                    version = subprocess.run([argv[0], "--version"], capture_output=True,
-                                             timeout=10, check=True).stdout.decode("utf-8").strip()
-                except (OSError, ValueError, subprocess.SubprocessError, UnicodeError) as error:
-                    raise HarnessError("Unable to identify Claude CLI version") from error
-                if not version or len(version) > 200 or any(ord(c) < 32 for c in version):
-                    raise HarnessError("Invalid Claude CLI version")
-            freeze_capture(job, mode, version)
-            if mode == "stream_metadata_v1":
-                runner = run_stream_process
         remaining = parent_deadline - time.monotonic()
         if remaining <= 0:
             raise HarnessError("Agent budget exhausted before CLI startup")
@@ -323,7 +302,7 @@ class CLIBackend:
             if on_outcome:
                 on_outcome(value)
         try:
-            code = runner(argv, cwd, job / "process", stdin=prompt,
+            code = run_process(argv, cwd, job / "process", stdin=prompt,
                                timeout=remaining, env=env, on_start=on_start,
                                execution_deadline=parent_deadline, on_outcome=record_outcome)
         except (Exception, KeyboardInterrupt, SystemExit) as error:
@@ -345,10 +324,7 @@ class CLIBackend:
 
     def preserve_terminal(self, job, provider, outcome, *, terminal_only=False):
         """Save designated terminal evidence separately from process success."""
-        source = job / "response.json" if provider == "codex" else claude_result_path(job)
-        incomplete_stream = job / "stream-received-terminal.json"
-        if provider == "claude" and not source.exists() and incomplete_stream.exists():
-            source = incomplete_stream
+        source = job / ("response.json" if provider == "codex" else "process.stdout")
         known_completion = (outcome.get("exit_code") is not None
                             and (outcome.get("termination_reason") == "normal" or outcome["exit_code"] == 0))
         value = None
@@ -360,27 +336,20 @@ class CLIBackend:
                 if source.is_symlink() or not source.is_file():
                     return False
                 terminal = self.read_result(source, provider)
-                if provider == "claude" and terminal.get("type") != "result" and source != incomplete_stream:
+                if provider == "claude" and terminal.get("type") != "result":
                     return False
-                if source != incomplete_stream:
-                    value = self.completed_result(job, provider)
+                value = self.completed_result(job, provider)
             except HarnessError:
                 return False
-        support = (("capture-manifest.json", "stream-capture.json")
-                   if source.name == "stream-terminal.json" else
-                   ("capture-manifest.json",) if provider == "claude" else ())
-        for path in (source, job / "process.outcome.json", *(job / name for name in support)):
+        for path in (source, job / "process.outcome.json"):
             if path.is_symlink() or not path.is_file():
                 raise HarnessError("Terminal evidence must be a regular file")
         capture = {"version": 1, "provider": provider, "source": source.name,
                    "source_digest": hashlib.sha256(source.read_bytes()).hexdigest(),
-                   "outcome_digest": hashlib.sha256((job / "process.outcome.json").read_bytes()).hexdigest(),
-                   "support_digests": {name: hashlib.sha256((job / name).read_bytes()).hexdigest() for name in support}}
+                   "outcome_digest": hashlib.sha256((job / "process.outcome.json").read_bytes()).hexdigest()}
         # Publish intent before parsing or result publication. Incomplete intent
         # is a permanent evidence blocker, never permission to redraw a decision.
         write_json(job / "terminal-capture.json", capture)
-        if source == incomplete_stream:
-            return True
         if value is not None or outcome.get("exit_code") == 0:
             value = value if value is not None else self.completed_result(job, provider)
             capture["result_digest"] = hashlib.sha256((dump(value) + "\n").encode("utf-8")).hexdigest()
@@ -394,7 +363,7 @@ class CLIBackend:
             if not (job / "response.json").exists():
                 raise HarnessError(f"Codex 未输出结构化结果：{job}")
             return self.read_result(job / "response.json", "Codex")
-        result = self.read_result(claude_result_path(job), "Claude")
+        result = self.read_result(job / "process.stdout", "Claude")
         write_json(job / "provider-result.json", result)
         if result.get("is_error") or result.get("subtype", "success") != "success":
             raise HarnessError(f"Claude 未成功完成：{claude_error_summary(result) or 'unclassified CLI error'}；日志：{job}")

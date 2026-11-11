@@ -5,6 +5,7 @@ from unittest.mock import Mock, patch
 
 from harness.cli import main
 from harness.util import HarnessError, read_json, write_json
+from harness.versions import RUN_SCHEMA_VERSION
 from test_harness import ROOT, RepoCase
 from test_runtime_changes import ScriptedBackend
 
@@ -101,7 +102,7 @@ class OperationalControlsTests(RepoCase):
 
     def test_damaged_attempt_accounting_keeps_status_readable_and_ledger_unchanged(self):
         path = self.repo / ".harness" / "runs" / "run_damaged" / "state.json"
-        base = {"id": "run_damaged", "schema_version": 16, "attempts": {"task": 1}, "dispatches": []}
+        base = {"id": "run_damaged", "schema_version": RUN_SCHEMA_VERSION, "attempts": {"task": 1}, "dispatches": []}
         exemption = {"task_id": "task", "attempt_exemption": {"blocker_kind": "operator"}}
         variants = [{"attempts": value} for value in
                     (None, 5, ["a"], [["task", 1]], {"task": "1"}, {"task": True}, {"task": -1})]

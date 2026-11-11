@@ -19,14 +19,14 @@ class DeferredSignals(list):
 
 
 @contextlib.contextmanager
-def defer_cleanup_signals(captured=None, *, primary=None):
+def defer_cleanup_signals(*, primary=None):
     """Defer cancellation through cleanup, including the handler handoff.
 
-    The first signal is retained by nested scopes. An existing exception always
+    Each scope retains the first signal it receives. An existing exception always
     wins; otherwise a deferred request must prevent a normal return.
     """
     import sys
-    captured = DeferredSignals() if captured is None else captured
+    captured = DeferredSignals()
     def remember(signum, frame):
         if not captured:
             captured.append(signum)
@@ -141,9 +141,9 @@ class ProcessSupervisor:
             self.outcome.cleanup_errors.append(failure("observe_group", error))
             return None
 
-    def finish(self, primary=None, captured=None):
+    def finish(self, primary=None):
         try:
-            self._finish_deferred(primary, captured)
+            self._finish_deferred(primary)
         except KeyboardInterrupt as error:
             if primary is not None:
                 return
@@ -167,9 +167,9 @@ class ProcessSupervisor:
                 out.evidence_complete = False
                 out.errors.append(failure("persist_cancellation", persistence_error))
 
-    def _finish_deferred(self, primary=None, captured=None):
+    def _finish_deferred(self, primary=None):
         from .util import HarnessError
-        with defer_cleanup_signals(captured, primary=primary) as deferred:
+        with defer_cleanup_signals(primary=primary) as deferred:
             try:
                 self._finish(primary)
             except HarnessError:

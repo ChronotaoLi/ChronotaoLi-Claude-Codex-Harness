@@ -4,6 +4,7 @@ from unittest.mock import patch
 from harness import git
 from harness.util import HarnessError, read_json, write_json
 from harness.workspace_inputs import prepare_run
+from harness.versions import RUN_SCHEMA_VERSION
 from test_harness import RepoCase, ROOT
 from test_runtime_changes import ScriptedBackend
 
@@ -49,7 +50,7 @@ class InputDispatchIntegrationTests(RepoCase):
     def test_schema12_missing_input_binding_refuses_resume_without_calls(self):
         engine, backend = self.prepared()
         state = read_json(engine.directory / 'state.json')
-        self.assertEqual(state['schema_version'], 16)
+        self.assertEqual(state['schema_version'], RUN_SCHEMA_VERSION)
         del state['workspace_inputs']
         write_json(engine.directory / 'state.json', state)
         before = (engine.directory / 'state.json').read_bytes()

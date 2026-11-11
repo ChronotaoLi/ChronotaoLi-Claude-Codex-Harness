@@ -4,8 +4,30 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from .stream_capture import claude_result_path, permission_denial_projection
 from .util import ProcessStartError, ProcessTimeout
+
+
+def _identifier(value):
+    return value if isinstance(value, str) and 0 < len(value) <= 160 and all(
+        char.isascii() and (char.isalnum() or char in "_-.:") for char in value) else None
+
+
+def permission_denial_projection(value):
+    """Reason is unknown unless a verified provider enum is supported."""
+    entries = value.get("permission_denials", []) if isinstance(value, dict) else []
+    if not isinstance(entries, list):
+        return []
+    projected = []
+    for entry in entries[:100]:
+        if not isinstance(entry, dict):
+            continue
+        item = {"reason": "unavailable"}
+        for source, target in (("tool_name", "tool"), ("tool_use_id", "tool_id")):
+            ident = _identifier(entry.get(source))
+            if ident:
+                item[target] = ident
+        projected.append(item)
+    return projected
 
 
 def invocation_diagnostics(job, provider, error=None):
@@ -18,7 +40,7 @@ def invocation_diagnostics(job, provider, error=None):
         value['failure_class'] = 'unknown'
     if provider == 'claude':
         try:
-            with claude_result_path(job).open('rb') as stream:
+            with (job / 'process.stdout').open('rb') as stream:
                 raw = stream.read(16 * 1024 * 1024 + 1)
             if len(raw) <= 16 * 1024 * 1024:
                 envelope = json.loads(raw)
@@ -138,7 +160,7 @@ def budget_explanation(run, work):
              'final_attempts': budget(run.get('final_attempts'), 'max_final_attempts')}
     if 'total_attempts' in run:
         # Historical display branch: schema 15 and earlier saved a run-wide
-        # worker counter and limit; schema 16 has neither.
+        # worker counter and limit; schema 16 and later have neither.
         shown['total_worker'] = budget(run.get('total_attempts'), 'max_total_attempts')
     return {'dimensions': {'actual_worker_invocations': started,
                 'charged_worker_invocations': len(workers),

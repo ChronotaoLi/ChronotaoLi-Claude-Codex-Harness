@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 from harness.decisions import decision_question
 from harness.util import HarnessError, read_json, write_json
+from harness.versions import RUN_SCHEMA_VERSION
 from test_harness import ROOT, RepoCase
 from test_runtime_changes import ScriptedBackend
 
@@ -141,7 +142,7 @@ class DecisionTextRecoveryTests(RepoCase):
         self.assertEqual(result['accepted']['greet'], before['accepted']['greet'])
         self.assertEqual(result['attempts'], {'greet': 1, 'later': 1})
         self.assertEqual(Path(source['artifact']).read_bytes(), raw)
-        self.assertEqual(result['schema_version'], 16)
+        self.assertEqual(result['schema_version'], RUN_SCHEMA_VERSION)
 
     def test_legacy_operator_registration_failure_recovers_to_explicit_gate(self):
         for blockers in (['Proceed\0?'], ['']):

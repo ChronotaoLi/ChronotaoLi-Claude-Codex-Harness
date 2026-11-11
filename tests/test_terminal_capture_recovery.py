@@ -147,25 +147,6 @@ class TerminalCaptureRecoveryTests(RepoCase):
         self.assertEqual(result["agent_dispatches"], 1)
         self.assertEqual(len(backend.calls), 1)
 
-    def test_stream_terminal_replays_only_with_bound_complete_protocol(self):
-        self.config.data["runtime"]["claude_output_mode"] = "stream_metadata_v1"
-        backend = self.backend()
-        engine = self.start_failed(backend)
-        backend.release()
-        calls = len(backend.calls)
-        for filename in ("stream-capture.json", "capture-manifest.json"):
-            path = backend.jobs[0] / filename
-            original = path.read_bytes()
-            path.write_bytes(original + b"\n")
-            with self.assertRaisesRegex(HarnessError, "终端结果"):
-                self.engine(backend).resume(engine.run["id"])
-            self.assertEqual(len(backend.calls), calls)
-            path.write_bytes(original)
-        result = self.engine(backend).resume(engine.run["id"])
-        self.assertEqual(result["status"], "completed")
-        self.assertEqual(sum(result["attempts"].values()), 1)
-        self.assertEqual(sum(c["kind"] == "review" for c in backend.calls), 1)
-
     def test_cancellation_during_descendant_drain_never_rerolls_or_accepts(self):
         backend = self.backend()
         original = time.sleep
@@ -212,7 +193,11 @@ class TerminalCaptureRecoveryTests(RepoCase):
         backend.release()
         calls = len(backend.calls)
         job = backend.jobs[0]
-        for filename in ("terminal-capture.json", "process.stdout", "returned-result.json", "process.outcome.json", "capture-manifest.json"):
+        capture = read_json(job / "terminal-capture.json")
+        self.assertEqual((capture["provider"], capture["source"]), ("claude", "process.stdout"))
+        self.assertNotIn("support_digests", capture)
+        self.assertFalse((job / "capture-manifest.json").exists())
+        for filename in ("terminal-capture.json", "process.stdout", "returned-result.json", "process.outcome.json"):
             path = job / filename
             original = path.read_bytes()
             for mutation in ("missing", "changed", "symlink"):
@@ -264,32 +249,28 @@ class TerminalCaptureRecoveryTests(RepoCase):
             self.engine(backend).resume(engine.run["id"])
         self.assertEqual(len(backend.calls), calls)
 
-    def test_complete_terminal_before_timeout_blocks_reroll_in_both_transports(self):
-        for mode in ("legacy_json", "stream_metadata_v1"):
-            with self.subTest(mode=mode):
-                self.config.data["runtime"]["claude_output_mode"] = mode
-                self.config.data["runtime"]["agent_timeout_seconds"] = 1
-                backend = self.backend(duration=.01, leader_delay=30, change=self.reject)
-                engine = self.engine(backend)
-                from harness.util import ProcessTimeout
-                with self.assertRaises(ProcessTimeout):
-                    engine.start("Implement greet", read_json(ROOT / "examples/plan.json"))
-                backend.release()
-                calls = len(backend.calls)
-                entry = engine.run["dispatches"][-1]
-                self.assertEqual(entry["exit_code"], -signal.SIGTERM)
-                self.assertEqual(entry["termination_reason"], "timeout")
-                for attempt in range(2):
-                    if attempt:
-                        # Deleting all captured bytes cannot turn an observed
-                        # terminal into a retryable call with no terminal.
-                        (backend.jobs[0] / "terminal-capture.json").unlink()
-                        source = "stream-received-terminal.json" if mode == "stream_metadata_v1" else "process.stdout"
-                        (backend.jobs[0] / source).unlink()
-                    with self.assertRaisesRegex(HarnessError, "终端结果"):
-                        self.engine(backend).resume(engine.run["id"])
-                    self.assertEqual(len(backend.calls), calls)
-                self.assertFalse(engine.run["accepted"])
+    def test_complete_terminal_before_timeout_blocks_reroll(self):
+        self.config.data["runtime"]["agent_timeout_seconds"] = 1
+        backend = self.backend(duration=.01, leader_delay=30, change=self.reject)
+        engine = self.engine(backend)
+        from harness.util import ProcessTimeout
+        with self.assertRaises(ProcessTimeout):
+            engine.start("Implement greet", read_json(ROOT / "examples/plan.json"))
+        backend.release()
+        calls = len(backend.calls)
+        entry = engine.run["dispatches"][-1]
+        self.assertEqual(entry["exit_code"], -signal.SIGTERM)
+        self.assertEqual(entry["termination_reason"], "timeout")
+        for attempt in range(2):
+            if attempt:
+                # Deleting all captured bytes cannot turn an observed
+                # terminal into a retryable call with no terminal.
+                (backend.jobs[0] / "terminal-capture.json").unlink()
+                (backend.jobs[0] / "process.stdout").unlink()
+            with self.assertRaisesRegex(HarnessError, "终端结果"):
+                self.engine(backend).resume(engine.run["id"])
+            self.assertEqual(len(backend.calls), calls)
+        self.assertFalse(engine.run["accepted"])
 
     def test_no_terminal_or_partial_terminal_timeout_remains_retryable(self):
         from harness.util import ProcessTimeout

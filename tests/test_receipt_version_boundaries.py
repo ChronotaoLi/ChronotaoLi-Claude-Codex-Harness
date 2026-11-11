@@ -4,6 +4,7 @@ import shutil
 from harness.cli import status_summary
 from harness.cleanup import cleanup_run
 from harness.util import HarnessError, read_json, write_json
+from harness.versions import RUN_SCHEMA_VERSION
 from test_engine_repairs import RecordingBackend
 from test_harness import RepoCase, ROOT
 
@@ -22,27 +23,41 @@ class ReceiptVersionBoundaryTests(RepoCase):
         self.assertEqual(path.read_bytes(), before)
         self.assertEqual(backend.calls, [])
 
-    def test_current_capture_contract_and_config_snapshot_cannot_be_omitted(self):
+    def test_current_ledger_refuses_capture_contract_and_removed_output_mode(self):
         import copy
         runtime = self.engine()
         state = runtime.start('Implement greet', read_json(ROOT / 'examples/plan.json'))
+        shutil.rmtree(runtime.worktree / '__pycache__', ignore_errors=True)
         original = copy.deepcopy(state)
         path = runtime.directory / 'state.json'
-        for missing in ('capture', 'output_mode', 'invoked'):
-            with self.subTest(missing=missing):
+        for change in ('capture', 'invoked'):
+            with self.subTest(change=change):
                 state = copy.deepcopy(original)
                 worker = next(d for d in state['dispatches'] if d['role'] == 'worker')
-                if missing == 'capture':
-                    worker['worker_receipt'].pop('capture')
-                elif missing == 'output_mode':
-                    state['config_snapshot']['runtime'].pop('claude_output_mode')
+                if change == 'capture':
+                    # The schema 16 shape is not ignored or defaulted on a schema 17 ledger.
+                    worker['worker_receipt']['capture'] = {'provider': 'claude', 'mode': 'legacy_json'}
                 else:
                     worker.pop('invoked')
                 write_json(path, state)
                 before = path.read_bytes()
-                with self.assertRaises(HarnessError):
+                with self.assertRaises(HarnessError) as caught:
                     self.engine().resume(state['id'])
+                if change == 'capture':
+                    self.assertIn('capture contract', str(caught.exception))
+                    with self.assertRaisesRegex(HarnessError, 'capture contract'):
+                        cleanup_run(self.repo, state['id'])
+                    self.assertTrue(runtime.worktree.exists())
                 self.assertEqual(path.read_bytes(), before)
+        # A saved configuration snapshot cannot carry the removed output-mode key.
+        paused = self.engine().start('Implement greet', read_json(ROOT / 'examples/plan.json'), pause_after_plan=True)
+        paused['config_snapshot']['runtime']['claude_output_mode'] = 'legacy_json'
+        path = self.repo / '.harness' / 'runs' / paused['id'] / 'state.json'
+        write_json(path, paused)
+        before = path.read_bytes()
+        with self.assertRaisesRegex(HarnessError, '未知配置键：runtime.claude_output_mode'):
+            self.engine().resume(paused['id'], approve_plan=True)
+        self.assertEqual(path.read_bytes(), before)
 
     def test_schema13_stays_inspectable_and_cleanable_but_cannot_resume(self):
         backend = RecordingBackend()
@@ -71,7 +86,7 @@ class ReceiptVersionBoundaryTests(RepoCase):
         backend = RecordingBackend()
         runtime = self.engine(backend)
         state = runtime.start("Implement greet", read_json(ROOT / "examples/plan.json"))
-        self.assertEqual(state["schema_version"], 16)
+        self.assertEqual(state["schema_version"], RUN_SCHEMA_VERSION)
         shutil.rmtree(runtime.worktree / "__pycache__", ignore_errors=True)
         state.pop("worker_receipts")
         path = runtime.directory / "state.json"

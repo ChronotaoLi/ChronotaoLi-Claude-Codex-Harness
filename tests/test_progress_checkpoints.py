@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 from harness.progress import ProgressRecovery
 from harness.util import HarnessError, write_json
+from harness.versions import RUN_SCHEMA_VERSION
 
 
 def sha(raw):
@@ -23,7 +24,7 @@ class Runtime(ProgressRecovery):
         self.context.directory = root / 'run'
         self.context.worktree = root / 'worktree'
         self.context.worktree.mkdir()
-        self.context.run = {'schema_version': 16, 'tasks': [{'id': 'task'}], 'dispatches': [], 'task_checkpoints': [], 'checkpoint_batches': []}
+        self.context.run = {'schema_version': RUN_SCHEMA_VERSION, 'tasks': [{'id': 'task'}], 'dispatches': [], 'task_checkpoints': [], 'checkpoint_batches': []}
         self.events = []
         self.saved = 0
 

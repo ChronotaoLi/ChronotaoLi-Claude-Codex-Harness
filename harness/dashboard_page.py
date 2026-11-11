@@ -1264,7 +1264,7 @@ APP_JS = r""""use strict";
       ["任务尝试（work_attempts）", attempts && Object.keys(attempts).length ? Object.keys(attempts).map(function (key) {
         return key + "=" + attempts[key] + "/" + show(limits.max_attempts); }).join("，") : UNAVAILABLE],
       ["计数策略", typeof b.attempt_budget_policy === "string" ? b.attempt_budget_policy + "（历史台账保存）"
-        : typeof data.schema_version === "number" && data.schema_version >= 16 ? "work（台账 16 固定）"
+        : typeof data.schema_version === "number" && data.schema_version >= 16 ? "work（台账 16 起固定）"
         : b.attempt_budget_policy],
       ["单次调用超时（秒）", limits.agent_timeout_seconds]
     ]));

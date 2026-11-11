@@ -1,6 +1,6 @@
 # 恢复与操作者出口
 
-本文写给处理停止 run 的操作者：看到哪种停止信息，该做什么，用哪个命令。它只适用于台账版本 16 的 run。保存顺序、子状态的设置与清除见[设计：状态转换](design.md#状态转换)，日常命令见 [README](../README.md)。
+本文写给处理停止 run 的操作者：看到哪种停止信息，该做什么，用哪个命令。它只适用于台账版本 17 的 run。保存顺序、子状态的设置与清除见[设计：状态转换](design.md#状态转换)，日常命令见 [README](../README.md)。
 
 - [通用规则](#通用规则)
 - [恢复选项与互斥](#恢复选项与互斥)
@@ -88,7 +88,7 @@
 | `共享规则、skills、MCP 或 hooks 已改变` | 恢复原版本的共享资产 | 普通 `resume` |
 | `配置已改变：…` | 恢复不可放宽的配置值 | 普通 `resume` |
 | `缺少已保存的 worktree Git 绑定` | 启动在绑定保存前中断；核对后手工 `git worktree remove` 并删除 `harness/<run>` 分支 | `abandon RUN` 后重新 `run` |
-| `旧 run 仅保留为历史证据（台账版本 N，当前 16）` | 查看或清理，开始新 run | `status`、`dashboard`、`cleanup-run` |
+| `旧 run 仅保留为历史证据（台账版本 N，当前 17）` | 查看或清理，开始新 run | `status`、`dashboard`、`cleanup-run` |
 | `已有进程持有运行锁` | 等另一个 `run`／`resume`／`abandon` 结束 | 稍后重试 |
 
 ## 恢复步骤
@@ -195,7 +195,7 @@ python3 -m harness --config /path/to/harness.toml --repo /path/to/project resume
 ### 放弃与清理
 
 - `abandon RUN` 把未完成的 run 标为 `abandoned`，保留分支、工作树和证据，之后不能 resume。它先经过 `load_run`：台账恢复链接损坏或加载时核验的证据被删改时拒绝放弃，保留现场供核对；路径索引与输入索引不在加载时核验，它们损坏时仍可放弃。放弃不删除文件；要移除工作树，之后执行 `cleanup-run RUN --remove`。
-- `cleanup-run RUN` 是唯一的清理入口，默认只读预览，加 `--remove` 才逐项删除。它不加载配置、不调用模型，支持版本 7–16 的台账，不改 run 状态，不删除分支、台账或运行证据。
+- `cleanup-run RUN` 是唯一的清理入口，默认只读预览，加 `--remove` 才逐项删除。它不加载配置、不调用模型，支持版本 7–17 的台账，不改 run 状态，不删除分支、台账或运行证据。
   - 共同门禁：在运行锁内核对台账版本与归属（run ID、仓库、工作树路径、分支名、Git 公共目录与管理目录绑定）、命令目录、路径索引与输入索引、worker 回执链接，以及全部派发与命令子进程的退出证据。任一项不通过时整条命令报错，不处理任何资源。
   - 全新验证检出：run 处于任何状态都可清理。已跟踪修改、未跟踪或忽略文件、`assume-unchanged`／`skip-worktree` 标记阻止清理，错误列出前 10 个阻塞路径。目录已缺失而 Git 注册仍在时，只注销该精确路径，不做全仓库 prune。记录写在检出证据旁的 `cleanup.json`。
   - 分支工作树：只在 `completed` 或 `abandoned` 时清理，其他状态下按规则保留（`retained`）。要求原分支仍指向检查点，HEAD 与 Git 绑定未变，没有任何未保存文件（含忽略文件）或隐藏索引标记，已跟踪文件的字节与 HEAD 一致。记录写在 `worktree-cleanup.json`。`--remove --remove-input-copies` 另删除登记且未修改的依赖副本。
@@ -223,7 +223,9 @@ python3 -m harness --config /path/to/harness.toml --repo /path/to/project resume
 
 `completed` run 的普通 `resume` 返回保存结果，不派发；修改选项被拒绝。
 
-版本 15 及更早的台账不迁移、不执行：`resume`、`abandon` 和 `prepare-run` 都要求版本 16，对旧台账拒绝。以下只读与诊断入口不要求当前版本，仍可用于旧台账：`status`（含 `status RUN` 与 `--full`）、`watch`、`dashboard`、`permission-diagnostics`，以及受门禁保护的 `cleanup-run`（版本 7–16；验证检出不限状态，工作树仅限 `completed` 或 `abandoned`）。旧版本中未到终态的 run 不能 `abandon`，因此 `cleanup-run` 只能清理它的验证检出，不能清理其工作树。升级前应完成或放弃进行中的旧 run。
+版本 16 及更早的台账不迁移、不执行：`resume`、`abandon` 和 `prepare-run` 都要求版本 17，对旧台账拒绝。以下只读与诊断入口不要求当前版本，仍可用于旧台账：`status`（含 `status RUN` 与 `--full`）、`watch`、`dashboard`、`permission-diagnostics`，以及受门禁保护的 `cleanup-run`（版本 7–17；验证检出不限状态，工作树仅限 `completed` 或 `abandoned`）。旧版本中未到终态的 run 不能 `abandon`，因此 `cleanup-run` 只能清理它的验证检出，不能清理其工作树。升级前应完成或放弃进行中的旧 run。
+
+版本 16 及更早的 `stream_metadata_v1` 模式 run，派发目录里保留 `capture-manifest.json` 与 `stream-*` 文件，观察层按普通文件展示；`cleanup-run` 按 worker 接收意图保存的输出模式、用当时的分类规则复核，stream 超时后放弃、仍带活动回执和 unknown 判定的 run 也能清理。
 
 ## 不能自动恢复的窗口
 
@@ -231,15 +233,14 @@ python3 -m harness --config /path/to/harness.toml --repo /path/to/project resume
 
 1. **Git commit 之后、接受台账保存之前被杀**：恢复因 HEAD 不符停止。核对含 `Harness-Run`／`Harness-Task` 的提交，再决定恢复现场或 `abandon`。
 2. **接受时重建暂存区后、commit 之前中断**：暂存区摘要变化使旧批准失效，任务重新执行、验证、审阅并消耗一次工作尝试；预算用满时需先提高 `max_attempts`。
-3. **worker 已有原始输出、封存之前中断**：不能把恢复时的工作树补绑为原候选，也不自动重派；保留证据后 `abandon`。
-4. **流式捕获未完成，或已收到终态但未封存**：`stream-received-terminal.json` 存在或捕获状态未知时阻塞；`--confirm-exited` 不证明没有结果。
-5. **调用前台账保存失败**：可能留下已扣预算、`invoked=true` 的条目；恢复按可重试处理，多计一次尝试。
-6. **派发 `starting` 后、pgid 落盘前中断**：缺 pgid 的记录不能证明未启动，需核实后 `--confirm-exited`。
-7. **启动时 `worktree_binding` 保存前中断**：没有可信绑定，只能 `abandon` 后重新运行，并手工清理已创建的工作树和分支。
-8. **供给计划在首次保存前中断**（`tasks` 与 `original_tasks` 都为空）：无法辨认原计划来源；`abandon` 后用原 `--plan` 重新运行。
-9. **`post_accept` 或其他 hook 成功后、完成记账前中断**：hook 会再次执行；外部副作用必须可重复。
-10. **结构非法的审阅结果**：即使候选变化也继续阻塞，因为其中可能有拒绝；保留证据后 `abandon`。
-11. **`delete_path` 删除之后**：删除立即生效，接受门禁只决定候选是否被接受；需要恢复文件时从 Git 历史中取回。
-12. **`prepare-run` 在保存临时文件身份之前中断**：不能凭相同字节接管文件，需人工核对。
-13. **`command-staging/` 中的准备目录**：发布前失败或被杀时留下；运行时不枚举它们，也不回收，反复失败会累积磁盘占用。
-14. **当前协议下仍有同任务的 worker 格式修正与再规划共存**：这是不再修复的旧状态，`resume` 在预检后拒绝；保留现场后 `abandon`。
+3. **worker 已有原始输出、封存之前中断**：不能把恢复时的工作树补绑为原候选，也不自动重派；输出不完整或读不出（判为 unknown）同样阻塞，`--confirm-exited` 不能解开。保留证据后 `abandon`。
+4. **调用前台账保存失败**：可能留下已扣预算、`invoked=true` 的条目；恢复按可重试处理，多计一次尝试。
+5. **派发 `starting` 后、pgid 落盘前中断**：缺 pgid 的记录不能证明未启动，需核实后 `--confirm-exited`。
+6. **启动时 `worktree_binding` 保存前中断**：没有可信绑定，只能 `abandon` 后重新运行，并手工清理已创建的工作树和分支。
+7. **供给计划在首次保存前中断**（`tasks` 与 `original_tasks` 都为空）：无法辨认原计划来源；`abandon` 后用原 `--plan` 重新运行。
+8. **`post_accept` 或其他 hook 成功后、完成记账前中断**：hook 会再次执行；外部副作用必须可重复。
+9. **结构非法的审阅结果**：即使候选变化也继续阻塞，因为其中可能有拒绝；保留证据后 `abandon`。
+10. **`delete_path` 删除之后**：删除立即生效，接受门禁只决定候选是否被接受；需要恢复文件时从 Git 历史中取回。
+11. **`prepare-run` 在保存临时文件身份之前中断**：不能凭相同字节接管文件，需人工核对。
+12. **`command-staging/` 中的准备目录**：发布前失败或被杀时留下；运行时不枚举它们，也不回收，反复失败会累积磁盘占用。
+13. **当前协议下仍有同任务的 worker 格式修正与再规划共存**：这是不再修复的旧状态，`resume` 在预检后拒绝；保留现场后 `abandon`。

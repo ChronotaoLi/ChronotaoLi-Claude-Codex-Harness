@@ -1,5 +1,6 @@
 import copy
 import json
+import subprocess
 import sys
 from unittest.mock import patch
 
@@ -87,14 +88,14 @@ class ProviderUsageTests(RepoCase):
         self.assertEqual(result["status"], "completed")
         worker = next(entry for entry in result["dispatches"] if entry["role"] == "worker")
         self.assertEqual(worker["provider_usage"], {
-            "provider": "claude", "source": "process.stdout", "reported_cost_usd": 0.25,
+            "provider": "claude", "reported_cost_usd": 0.25,
             "num_turns": 3, "tokens": {"input_tokens": 20, "output_tokens": 5,
                                       "cache_creation_input_tokens": 10, "cache_read_input_tokens": 40}})
         reviews = [entry for entry in result["dispatches"] if entry["role"] == "reviewer"]
         self.assertEqual(len(reviews), 2)
         for entry in reviews:
             self.assertEqual(entry["provider_usage"], {
-                "provider": "codex", "source": "process.stdout", "completed_turns": 1,
+                "provider": "codex", "completed_turns": 1,
                 "tokens": {"input_tokens": 100, "cached_input_tokens": 60, "output_tokens": 20}})
         events = self.events(engine)
         self.assertEqual(len(events), 3)
@@ -108,6 +109,49 @@ class ProviderUsageTests(RepoCase):
         self.assertEqual(backend.calls, calls)
         self.assertEqual([call["model"] for call in calls], [self.config.role(call["role"]) for call in calls])
         self.assertEqual(len({call["dispatch_id"] for call in calls}), len(calls))
+
+    def test_claude_invocation_has_one_output_mode_and_no_version_probe(self):
+        from test_worker_return_recovery import stub_provider_clis
+        stub_provider_clis(self)
+        original, probes = subprocess.run, []
+
+        def recording(argv, *args, **kwargs):
+            if isinstance(argv, (list, tuple)) and list(argv[1:2]) == ["--version"]:
+                probes.append(list(argv))
+            return original(argv, *args, **kwargs)
+        with patch.object(subprocess, "run", recording):
+            result = self.engine(self.backend()).start("Implement greet", self.plan())
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(probes, [])
+        worker = next(entry for entry in result["dispatches"] if entry["role"] == "worker")
+        self.assertNotIn("source", worker["provider_usage"])
+        job = self.repo / ".harness" / "runs" / result["id"] / "dispatches" / worker["id"]
+        self.assertTrue((job / "process.stdout").is_file())
+        self.assertEqual([path.name for path in job.iterdir()
+                          if path.name == "capture-manifest.json" or path.name.startswith("stream-")], [])
+
+    def test_success_terminal_with_nonzero_exit_is_never_accepted(self):
+        """Two gates hold this: the adapter refuses a non-zero exit, the seal refuses it again."""
+        from test_worker_return_recovery import stub_provider_clis
+        stub_provider_clis(self)
+        backend = self.backend({"worker": {"exit_code": 9}})
+        engine = self.engine(backend)
+        with self.assertRaisesRegex(HarnessError, "worker CLI exit=9"):
+            engine.start("Implement greet", self.plan())
+        worker = engine.run["dispatches"][-1]
+        job = engine.directory / "dispatches" / worker["id"]
+        self.assertEqual(read_json(job / "process.stdout")["subtype"], "success")
+        self.assertFalse((job / "response.json").exists())
+        self.assertEqual((engine.run["accepted"], engine.run["attempts"]), ({}, {"greet": 1}))
+        self.assertEqual([call["role"] for call in backend.calls], ["worker"])
+        for _ in range(2):
+            with self.assertRaisesRegex(HarnessError, "before immutable seal"):
+                self.engine(backend).resume(engine.run["id"])
+        saved = read_json(engine.directory / "state.json")
+        evidence = saved["dispatches"][-1]["worker_return_evidence"]
+        self.assertEqual((evidence["state"], evidence["reason"]), ("returned", "non-error or ambiguous direct JSON output"))
+        self.assertEqual((saved["accepted"], saved["attempts"]), ({}, {"greet": 1}))
+        self.assertEqual(len(backend.calls), 1)
 
     def test_cli_failure_keeps_reported_usage_and_original_error(self):
         backend = self.backend({"worker": {"exit_code": 7, "envelope": {
@@ -176,7 +220,7 @@ class ProviderUsageTests(RepoCase):
         worker = next(entry for entry in result["dispatches"] if entry["role"] == "worker")
         self.assertEqual(result["status"], "completed")
         self.assertEqual(worker["provider_usage"], {
-            "provider": "claude", "source": "process.stdout", "tokens": {"output_tokens": 0}})
+            "provider": "claude", "tokens": {"output_tokens": 0}})
         options["worker"] = {"missing_usage": True}
         engine = self.engine(self.backend(options))
         result = engine.start("Implement greet", self.plan())
@@ -236,7 +280,7 @@ class ProviderUsageTests(RepoCase):
         reviews = [entry for entry in result["dispatches"] if entry["role"] == "reviewer"]
         for entry in reviews:
             self.assertEqual(entry["provider_usage"], {
-                "provider": "codex", "source": "process.stdout", "completed_turns": 2,
+                "provider": "codex", "completed_turns": 2,
                 "tokens": {"input_tokens": 150}})
             with patch("harness.adapters._USAGE_MAX_BYTES", 10):
                 self.assertIsNone(provider_usage(engine.directory / "dispatches" / entry["id"], "codex"))
