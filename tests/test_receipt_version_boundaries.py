@@ -2,7 +2,7 @@
 import shutil
 
 from harness.cli import status_summary
-from harness.run_cleanup import cleanup_run
+from harness.cleanup import cleanup_run
 from harness.util import HarnessError, read_json, write_json
 from test_engine_repairs import RecordingBackend
 from test_harness import RepoCase, ROOT
@@ -63,8 +63,8 @@ class ReceiptVersionBoundaryTests(RepoCase):
             self.engine(backend).resume(state["id"])
         self.assertEqual(len(backend.calls), calls)
         self.assertEqual(path.read_bytes(), before)
-        self.assertEqual(cleanup_run(self.repo, state["id"])["status"], "eligible")
-        self.assertEqual(cleanup_run(self.repo, state["id"], remove=True)["status"], "removed")
+        self.assertEqual(cleanup_run(self.repo, state["id"])["worktree"]["status"], "eligible")
+        self.assertEqual(cleanup_run(self.repo, state["id"], remove=True)["worktree"]["status"], "removed")
         self.assertEqual(path.read_bytes(), before)
 
     def test_current_schema_missing_receipts_blocks_terminal_resume_and_cleanup(self):

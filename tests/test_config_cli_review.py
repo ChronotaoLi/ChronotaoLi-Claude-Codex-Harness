@@ -10,6 +10,7 @@ from unittest.mock import Mock, patch
 
 from harness.cli import main
 from harness import git
+from harness.cleanup import cleanup_run
 from harness.config import Config
 from harness.shared import toml_value
 from harness.util import HarnessError, read_json
@@ -224,31 +225,33 @@ class ExitConfirmationRecoveryTests(RepoCase):
             with self.assertRaisesRegex(HarnessError, "HEAD"):
                 self.engine(backend).resume(engine.run["id"], approve_plan=True,
                                             confirm_exited=[entries[0]["id"]])
-            with self.assertRaisesRegex(HarnessError, "HEAD"):
-                self.engine(backend).abandon(engine.run["id"], remove_worktree=True,
-                                             confirm_exited=[entries[0]["id"]])
+        self.assertEqual(self.engine(backend).abandon(engine.run["id"])["status"], "abandoned")
+        removal = cleanup_run(self.repo, engine.run["id"], remove=True)["worktree"]
+        self.assertEqual(removal["status"], "blocked")
+        self.assertIn("检查点", removal["error"])
         self.assertEqual(backend.calls, [])
         self.assertTrue(engine.worktree.exists())
-        self.assertEqual(read_json(engine.directory / "state.json")["status"], "awaiting_approval")
 
     def test_confirmation_does_not_bypass_ignored_unsaved_file_removal_gate(self):
         engine, entries = self.paused_run()
         unsaved = engine.worktree / "__pycache__" / "uncommitted.bin"
         unsaved.parent.mkdir()
         unsaved.write_bytes(b"unsaved ignored file")
-        with patch("harness.run_context.group_alive", return_value=True), \
-                self.assertRaises(HarnessError):
-            self.engine().abandon(engine.run["id"], remove_worktree=True,
-                                  confirm_exited=[entries[0]["id"]])
+        with patch("harness.run_context.group_alive", return_value=True):
+            self.assertEqual(self.engine().abandon(engine.run["id"], confirm_exited=[entries[0]["id"]])["status"],
+                             "abandoned")
+        # The confirmed group still looks alive; the audited confirmation stands.
+        with patch("harness.cleanup.group_alive", return_value=True):
+            removal = cleanup_run(self.repo, engine.run["id"], remove=True)["worktree"]
+        self.assertEqual(removal["status"], "blocked")
+        self.assertIn("uncommitted.bin", removal["error"])
         self.assertEqual(unsaved.read_bytes(), b"unsaved ignored file")
-        saved = read_json(engine.directory / "state.json")
-        self.assertTrue(saved["dispatches"][0]["exit_confirmed"])
-        self.assertEqual(saved["status"], "awaiting_approval")
+        self.assertTrue(read_json(engine.directory / "state.json")["dispatches"][0]["exit_confirmed"])
         unsaved.unlink()
         unsaved.parent.rmdir()
-        result = self.engine().abandon(engine.run["id"], remove_worktree=True)
+        self.assertEqual(cleanup_run(self.repo, engine.run["id"], remove=True)["worktree"]["status"], "removed")
+        result = read_json(engine.directory / "state.json")
         self.assertEqual(result["status"], "abandoned")
-        self.assertTrue(result["worktree_removed"])
         self.assertFalse(engine.worktree.exists())
         self.assertEqual(git.git(self.repo, "rev-parse", result["branch"]).strip(), result["expected_head"])
         self.assertEqual(len(self.confirmation_events(engine)), 1)

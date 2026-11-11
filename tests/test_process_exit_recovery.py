@@ -6,7 +6,7 @@ import sys
 from unittest.mock import patch
 
 from harness.adapters import CLIBackend
-from harness.cleanup import cleanup_verification
+from harness.cleanup import cleanup_run
 from harness.util import HarnessError, group_alive, read_json, write_json
 from test_harness import RepoCase, ROOT
 from test_runtime_changes import ScriptedBackend
@@ -31,7 +31,7 @@ class ProcessExitRecoveryTests(RepoCase):
                 with self.assertRaisesRegex(HarnessError, "无法确认.*unknown"):
                     self.engine(backend).resume(run["id"], approve_plan=True)
                 with self.assertRaisesRegex(HarnessError, "无法确认.*unknown"):
-                    cleanup_verification(self.repo, run["id"], remove=True)
+                    cleanup_run(self.repo, run["id"], remove=True)
                 self.assertEqual((engine.directory / "state.json").read_bytes(), before)
                 self.assertEqual(backend.calls, [])
         result = self.engine(backend).resume(run["id"], approve_plan=True, confirm_exited=[entry["id"]])
@@ -107,7 +107,7 @@ engine.start("Implement greet", read_json(root / "examples/plan.json"))
                     with self.assertRaisesRegex(HarnessError, "无法确认"):
                         resumed.context.ensure_exited()
                     with self.assertRaisesRegex(HarnessError, "无法确认"):
-                        cleanup_verification(self.repo, run["id"], remove=True)
+                        cleanup_run(self.repo, run["id"], remove=True)
                 finally:
                     with contextlib.suppress(ProcessLookupError):
                         os.killpg(pgid, signal.SIGKILL)
@@ -151,7 +151,7 @@ engine.start("Implement greet", read_json(root / "examples/plan.json"))
                     with self.assertRaisesRegex(HarnessError, "无法确认"):
                         self.engine().resume(run["id"])
                     with self.assertRaisesRegex(HarnessError, "无法确认"):
-                        cleanup_verification(self.repo, run["id"])
+                        cleanup_run(self.repo, run["id"])
                 finally:
                     for process in started:
                         with contextlib.suppress(ProcessLookupError):

@@ -18,10 +18,9 @@ from unittest.mock import patch
 import uuid
 
 from harness import cli, git, observe
-from harness.cleanup import cleanup_verification
+from harness.cleanup import cleanup_run
 from harness.cli import status_summary
 from harness.recovery import snapshot_digest
-from harness.run_cleanup import cleanup_run
 from harness.util import HarnessError, read_json, write_json
 from harness.versions import HISTORICAL_CLEANUP_VERSIONS, RUN_SCHEMA_VERSION
 from test_harness import ROOT, RepoCase
@@ -122,80 +121,78 @@ class HistoryCase(RepoCase):
         change(state, self.workers(state)[-1])
         write_json(self.path, state)
 
-    def assert_both_cleanups_refuse(self, pattern):
-        with self.assertRaisesRegex(HarnessError, pattern):
-            cleanup_run(self.repo, self.run['id'])
-        with self.assertRaisesRegex(HarnessError, pattern):
-            cleanup_verification(self.repo, self.run['id'])
-        with self.assertRaisesRegex(HarnessError, pattern):
-            cleanup_run(self.repo, self.run['id'], remove=True)
-        with self.assertRaisesRegex(HarnessError, pattern):
-            cleanup_verification(self.repo, self.run['id'], remove=True)
+    def assert_cleanup_refuses(self, pattern):
+        for remove in (False, True):
+            with self.assertRaisesRegex(HarnessError, pattern):
+                cleanup_run(self.repo, self.run['id'], remove=remove)
         self.assertTrue(self.engine_.worktree.exists())
+        self.assertTrue(self.checkout().exists())
+
+    def checkout(self):
+        return Path(read_json(next(self.directory.glob('verification/final/*/verification-*/checkout.json')))['worktree'])
+
+    def statuses(self, result):
+        return [item['status'] for item in result['checkouts']], result['worktree']['status']
 
     # ----- the four cleanup cases, run for each version -----
 
     def test_cleanup_previews_leave_everything_unchanged(self):
-        self.assertEqual(cleanup_run(self.repo, self.run['id'])['status'], 'eligible')
-        self.assertEqual([item['status'] for item in cleanup_verification(self.repo, self.run['id'])['checkouts']],
-                         ['eligible'])
-        for command in ('cleanup-run', 'cleanup-verification'):
-            output = io.StringIO()
-            with contextlib.redirect_stdout(output):
-                self.assertEqual(cli.main(['--repo', str(self.repo), command, self.run['id']]), 0)
-            self.assertFalse(json.loads(output.getvalue())['remove'])
+        self.assertEqual(self.statuses(cleanup_run(self.repo, self.run['id'])), (['eligible'], 'eligible'))
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(cli.main(['--repo', str(self.repo), 'cleanup-run', self.run['id']]), 0)
+        result = json.loads(output.getvalue())
+        self.assertFalse(result['remove'])
+        self.assertEqual(self.statuses(result), (['eligible'], 'eligible'))
         self.assertEqual(self.path.read_bytes(), self.before)
         self.assertTrue(self.engine_.worktree.exists())
+        self.assertTrue(self.checkout().exists())
 
     def test_cleanup_remove_retires_checkouts_and_keeps_ledger_and_branch(self):
-        checkout = Path(read_json(next(self.directory.glob('verification/final/*/verification-*/checkout.json')))['worktree'])
-        result = cleanup_verification(self.repo, self.run['id'], remove=True)
-        self.assertEqual([item['status'] for item in result['checkouts']], ['removed'])
+        checkout = self.checkout()
+        result = cleanup_run(self.repo, self.run['id'], remove=True)
+        self.assertEqual(self.statuses(result), (['removed'], 'removed'))
         self.assertFalse(checkout.exists())
-        self.assertEqual(cleanup_run(self.repo, self.run['id'], remove=True)['status'], 'removed')
         self.assertFalse(self.engine_.worktree.exists())
         self.assertEqual(git.git(self.repo, 'rev-parse', self.run['branch']).strip(), self.run['expected_head'])
         self.assertEqual(self.path.read_bytes(), self.before)
         self.assertEqual(read_json(self.directory / 'worktree-cleanup.json')['status'], 'removed')
 
     def test_confirm_exited_records_audit_without_upgrading_the_ledger(self):
-        for name, cleanup in (('cleanup-run', cleanup_run), ('cleanup-verification', cleanup_verification)):
-            with self.subTest(command=name):
-                _, child = journal(self.worker['command_directory'], self.worker['id'], 'b' * 64, exited=False)
-                before = self.path.read_bytes()
-                with self.assertRaisesRegex(HarnessError, 'Cannot confirm command process exited'):
-                    cleanup(self.repo, self.run['id'])
-                self.assertEqual(self.path.read_bytes(), before)
-                result = cleanup(self.repo, self.run['id'], confirm_exited=[self.worker['id']])
-                statuses = [result['status']] if 'status' in result else [item['status'] for item in result['checkouts']]
-                self.assertEqual(statuses, ['eligible'])
-                saved = read_json(self.path)
-                entry = next(d for d in saved['dispatches'] if d['id'] == self.worker['id'])
-                self.assertIn(child['id'], entry['command_exit_confirmations'])
-                self.assertEqual((saved['schema_version'], saved['status']), (self.VERSION, 'completed'))
-                original = json.loads(self.before)
-                # Only the confirmation and its store revision changed; no defaults were filled in.
-                self.assertEqual(set(saved) - set(original), {'store_revision'} - set(original))
-                self.assertEqual(REMOVED_KEYS & set(saved), REMOVED_KEYS & set(original))
-                events = [json.loads(line) for line in (self.directory / 'events.jsonl').read_text().splitlines()]
-                self.assertEqual(events[-1]['event'], 'command_exit_confirmed_by_operator')
-                self.assertEqual(events[-1]['command_id'], child['id'])
+        _, child = journal(self.worker['command_directory'], self.worker['id'], 'b' * 64, exited=False)
+        before = self.path.read_bytes()
+        with self.assertRaisesRegex(HarnessError, 'Cannot confirm command process exited'):
+            cleanup_run(self.repo, self.run['id'])
+        self.assertEqual(self.path.read_bytes(), before)
+        result = cleanup_run(self.repo, self.run['id'], confirm_exited=[self.worker['id']])
+        self.assertEqual(self.statuses(result), (['eligible'], 'eligible'))
+        saved = read_json(self.path)
+        entry = next(d for d in saved['dispatches'] if d['id'] == self.worker['id'])
+        self.assertIn(child['id'], entry['command_exit_confirmations'])
+        self.assertEqual((saved['schema_version'], saved['status']), (self.VERSION, 'completed'))
+        original = json.loads(self.before)
+        # Only the confirmation and its store revision changed; no defaults were filled in.
+        self.assertEqual(set(saved) - set(original), {'store_revision'} - set(original))
+        self.assertEqual(REMOVED_KEYS & set(saved), REMOVED_KEYS & set(original))
+        events = [json.loads(line) for line in (self.directory / 'events.jsonl').read_text().splitlines()]
+        self.assertEqual(events[-1]['event'], 'command_exit_confirmed_by_operator')
+        self.assertEqual(events[-1]['command_id'], child['id'])
 
     def test_damaged_ledgers_are_refused_in_their_own_version_shape(self):
         def without_capture(state, worker):
             worker['worker_receipt'].pop('capture')
         # Raising the version constant must not skip the capture contract on schema 15.
         self.damaged(without_capture)
-        self.assert_both_cleanups_refuse('capture contract')
+        self.assert_cleanup_refuses('capture contract')
         self.path.write_bytes(self.before)
         for change, pattern in self.shape_damage():
             with self.subTest(pattern=pattern):
                 undo = change()
-                self.assert_both_cleanups_refuse(pattern)
+                self.assert_cleanup_refuses(pattern)
                 self.path.write_bytes(self.before)
                 if undo is not None:
                     undo()
-        self.assertEqual(cleanup_run(self.repo, self.run['id'])['status'], 'eligible')
+        self.assertEqual(self.statuses(cleanup_run(self.repo, self.run['id'])), (['eligible'], 'eligible'))
 
     # ----- observation -----
 

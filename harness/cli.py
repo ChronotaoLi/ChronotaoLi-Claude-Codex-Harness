@@ -15,12 +15,11 @@ from pathlib import Path
 from . import dashboard, git, observe
 from .adapters import DemoBackend
 from .budgets import attempts_total, counts_work, historical_policy, legacy_accounting, work_attempts
-from .cleanup import cleanup_verification
+from .cleanup import blocked, cleanup_run
 from .config import Config
 from .convergence import convergence_summary, review_rounds
 from .memory import Memory, bind_source_files
 from .operations import RUN_ID, OperationRecord, config_identity, digest_assets, harness_identity, shared_paths
-from .run_cleanup import cleanup_run
 from .runtime import Runtime
 from .shared import mcp_configs, toml_value
 from .util import HarnessError, dump, read_json, write_json
@@ -434,19 +433,14 @@ def _main(argv=None):
     watch.add_argument("--state", type=Path, help="直接观察指定 .harness 目录，可用于归档后的运行证据")
     dash = sub.add_parser("dashboard", help="在 127.0.0.1 启动只读观察网页；不加载配置，不探测进程，不修改 run")
     dashboard.add_arguments(dash)
-    abandon = sub.add_parser("abandon", help="放弃运行并保留分支与证据")
+    abandon = sub.add_parser("abandon", help="放弃运行并保留分支、工作树与证据；之后用 cleanup-run 清理")
     abandon.add_argument("run_id")
-    abandon.add_argument("--remove-worktree", action="store_true", help="同时移除无未保存文件的隔离工作树；保留分支与运行证据")
     abandon.add_argument("--confirm-exited", action="append", metavar="DISPATCH_ID",
                          help="确认指定旧 dispatch 已退出并记录证据；可重复指定")
-    cleanup = sub.add_parser("cleanup-verification", help="检查保留的全新验证检出；不加载运行配置")
-    cleanup.add_argument("run_id")
-    cleanup.add_argument("--remove", action="store_true", help="移除已退出且干净的验证检出；保留运行与验证证据")
-    cleanup.add_argument("--confirm-exited", action="append", metavar="DISPATCH_ID",
-                         help="确认指定旧 dispatch 已退出并记录证据；支持已完成或已放弃的 run，可重复指定")
-    retirement = sub.add_parser("cleanup-run", help="预览终态 run 的工作树清理；保留分支、台账与证据，不加载配置")
+    retirement = sub.add_parser("cleanup-run", help="预览 run 保留的全新验证检出与工作树；保留分支、台账与证据，不加载配置")
     retirement.add_argument("run_id")
-    retirement.add_argument("--remove", action="store_true", help="显式移除通过安全检查的工作树")
+    retirement.add_argument("--remove", action="store_true",
+                            help="逐项移除通过安全检查的资源：验证检出不限 run 状态，工作树仅限终态")
     retirement.add_argument("--remove-input-copies", action="store_true", help="显式删除登记且未修改的依赖副本；保留源文件")
     retirement.add_argument("--confirm-exited", action="append", metavar="DISPATCH_ID",
                             help="显式确认旧派发及其命令进程已退出；可重复指定")
@@ -520,7 +514,7 @@ def _main(argv=None):
             from .watch_cli import watch_run
             state = args.state if args.state is not None else git.repository(args.repo) / ".harness"
             return watch_run(state, args.run_id, follow=args.follow)
-        if args.command in ("status", "dashboard", "memory", "cleanup-verification", "cleanup-run"):
+        if args.command in ("status", "dashboard", "memory", "cleanup-run"):
             repo = git.repository(args.repo)
             state = repo / ".harness"
             if args.command == "status":
@@ -529,15 +523,12 @@ def _main(argv=None):
                 # Serves until SIGINT/SIGTERM (main() maps them to KeyboardInterrupt,
                 # which serve() absorbs) and then returns 0; stdout is only the URL.
                 return dashboard.serve(state, args.port)
-            elif args.command == "cleanup-verification":
-                result = cleanup_verification(repo, args.run_id, remove=args.remove,
-                                              confirm_exited=args.confirm_exited or ())
-                print(dump(result))
-                return 1 if any(item["status"] == "blocked" for item in result["checkouts"]) else 0
             elif args.command == "cleanup-run":
-                print(dump(cleanup_run(repo, args.run_id, remove=args.remove,
-                                       remove_input_copies=args.remove_input_copies,
-                                       confirm_exited=args.confirm_exited or ())))
+                result = cleanup_run(repo, args.run_id, remove=args.remove,
+                                     remove_input_copies=args.remove_input_copies,
+                                     confirm_exited=args.confirm_exited or ())
+                print(dump(result))
+                return 1 if blocked(result) else 0
             else:
                 manage_memory(args, repo, state)
             return 0
@@ -603,7 +594,7 @@ def _main(argv=None):
             return operate(args, config, repo, state)
         if args.command == "abandon":
             options = {"confirm_exited": args.confirm_exited} if args.confirm_exited else {}
-            result = Runtime(config, repo).abandon(args.run_id, remove_worktree=args.remove_worktree, **options)
+            result = Runtime(config, repo).abandon(args.run_id, **options)
             print(dump(status_summary(result)))
         elif args.command == "sync":
             git.ignore_state(repo)

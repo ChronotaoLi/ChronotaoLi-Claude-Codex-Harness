@@ -5,6 +5,7 @@ import json
 from unittest.mock import patch
 
 from harness import git
+from harness.cleanup import cleanup_run
 from harness.util import HarnessError, read_json
 from test_harness import ROOT, RepoCase
 from test_runtime_changes import ScriptedBackend
@@ -111,9 +112,10 @@ class PlanPreflightDiagnosticsTests(RepoCase):
             (folder / name).write_bytes(b"preserve evidence")
         unusual = engine.worktree / "scratch\nfile"
         unusual.write_text("preserve scratch")
-        with self.assertRaises(HarnessError) as caught:
-            self.engine().abandon(engine.run["id"], remove_worktree=True)
-        message = str(caught.exception)
+        self.assertEqual(self.engine().abandon(engine.run["id"])["status"], "abandoned")
+        removal = cleanup_run(self.repo, engine.run["id"], remove=True)["worktree"]
+        self.assertEqual(removal["status"], "blocked")
+        message = removal["error"]
         self.assertIn("__pycache__/evidence-00.pyc", message)
         self.assertIn("__pycache__/evidence-09.pyc", message)
         self.assertNotIn("evidence-11.pyc", message)
@@ -121,11 +123,11 @@ class PlanPreflightDiagnosticsTests(RepoCase):
         for name in names:
             self.assertEqual((folder / name).read_bytes(), b"preserve evidence")
         self.assertEqual(unusual.read_text(), "preserve scratch")
-        self.assertEqual(read_json(engine.directory / "state.json")["status"], "awaiting_approval")
+        self.assertTrue(engine.worktree.is_dir())
         for name in names:
             (folder / name).unlink()
         folder.rmdir()
-        with self.assertRaises(HarnessError) as caught:
-            self.engine().abandon(engine.run["id"], remove_worktree=True)
-        self.assertIn(repr(unusual.name), str(caught.exception))
-        self.assertNotIn("\n", str(caught.exception))
+        removal = cleanup_run(self.repo, engine.run["id"], remove=True)["worktree"]
+        self.assertEqual(removal["status"], "blocked")
+        self.assertIn(repr(unusual.name), removal["error"])
+        self.assertNotIn("\n", removal["error"])

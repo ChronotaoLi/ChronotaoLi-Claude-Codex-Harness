@@ -104,7 +104,7 @@ class RunLifecycle(RuntimeService):
             shown = version if type(version) is int else "无效"
             raise HarnessError(f"旧 run 仅保留为历史证据（台账版本 {shown}，当前 {RUN_SCHEMA_VERSION}）；"
                                "不迁移、不恢复执行，只能用 status、dashboard 查看，"
-                               "或用 cleanup-run、cleanup-verification 清理；请开始新 run")
+                               "或用 cleanup-run 清理；请开始新 run")
         required = {"id": str, "repo": str, "worktree": str, "status": str, "commander": str,
                     "goal": str, "branch": str, "expected_head": str, "base_commit": str,
                     "config_snapshot": dict, "tasks": list, "original_tasks": list,
@@ -244,8 +244,8 @@ class RunLifecycle(RuntimeService):
                 task_reference(guard.get("task_id"), field + ".task_id")
                 source(guard, "commander:replan:replanning", field)
 
-    def abandon(self, ident, *, remove_worktree=False, confirm_exited=()):
-        runtime = self.context
+    def abandon(self, ident, *, confirm_exited=()):
+        """Mark an unfinished run abandoned; the worktree is removed only by cleanup-run."""
         self.load_run(ident)
         with lock(self.context.directory / "run.lock"):
             # Reload under the lock so a concurrent completion cannot be lost.
@@ -254,39 +254,11 @@ class RunLifecycle(RuntimeService):
                 raise HarnessError("已完成的 run 不能标记为放弃")
             self.context.confirm_exited(confirm_exited)
             self.context.ensure_exited()
-            removal_finished = False
-            if remove_worktree and not self.context.run.get("worktree_removed"):
-                expected = (self.context.state / "worktrees" / ident).resolve()
-                if self.context.worktree.resolve() != expected or self.context.worktree.is_symlink():
-                    raise HarnessError("只能移除该 run 所有的隔离 worktree")
-                if not self.context.worktree.exists() and self.context.run.get("pending_worktree_removal"):
-                    registered = {field.removeprefix("worktree ") for field in
-                                  git.git(self.context.repo, "worktree", "list", "--porcelain", "-z").split("\0")
-                                  if field.startswith("worktree ")}
-                    if str(self.context.worktree) in registered:
-                        raise HarnessError("工作树路径缺失但 Git 注册仍存在；请核对后再清理")
-                    removal_finished = True
-                else:
-                    if not (self.context.worktree / ".git").is_file():
-                        raise HarnessError("只能移除该 run 所有的隔离 worktree")
-                    if git.head(self.context.worktree, binding=self.context.run["worktree_binding"]) != self.context.run["expected_head"]:
-                        raise HarnessError("worktree HEAD 与检查点不同；保留工作树供核对")
-                    git.assert_removable_worktree(self.context.worktree, binding=self.context.run["worktree_binding"])
             if self.context.run["status"] != "abandoned":
                 self.context.run["status"] = "abandoned"
                 self.context.save()
                 self.context.checkpoint()
                 self.context.event("run_abandoned")
-            if remove_worktree and not self.context.run.get("worktree_removed"):
-                if not removal_finished:
-                    self.context.run["pending_worktree_removal"] = True
-                    self.context.save()
-                    git.check_worktree_binding(self.context.worktree, self.context.run["worktree_binding"])
-                    git.git(self.context.repo, "worktree", "remove", str(self.context.worktree))
-                self.context.run["worktree_removed"] = True
-                self.context.run.pop("pending_worktree_removal", None)
-                self.context.save()
-                self.context.event("worktree_removed")
             return self.context.run
 
     def resume(self, ident, *, step=False, approve_plan=False, reverify=False, retry_stopped=None, confirm_exited=(),

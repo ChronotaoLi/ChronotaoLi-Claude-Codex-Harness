@@ -37,6 +37,7 @@ DEFAULT_TAIL = 64 * 1024
 MAX_TAIL = 1024 * 1024
 STATE_MAX_BYTES = 64 * 1024 * 1024
 OPERATION_MAX_BYTES = 256 * 1024
+CLEANUP_RECEIPT_MAX_BYTES = 64 * 1024
 OPERATIONS_MAX_FILES = 1000
 FILE_INDEX_MAX = 2000
 ERROR_CHARS = 200
@@ -661,7 +662,8 @@ class Observer:
                          ("id", "status", "goal", "branch", "worktree", "repo", "commander", "current_task",
                           "error_type", "created_by_operation", "config_path", "expected_head", "base_commit")}
         detail["run"]["error"] = _first_line(run.get("error"))
-        detail["run"]["worktree_removed"] = _boolean(run.get("worktree_removed"))
+        detail["run"]["worktree_removed"] = (_boolean(run["worktree_removed"]) if "worktree_removed" in run
+                                             else self._worktree_cleanup_removed(run_id))
         detail["budgets"] = self._budgets(run)
         detail["tasks"], detail["invalid_tasks"] = task_rows(run)
         rows, detail["invalid_dispatches"], model_unavailable = dispatch_rows(run)
@@ -679,6 +681,22 @@ class Observer:
         detail["dispatches"] = rows
         detail["cost"] = cost_summary(rows)
         return detail
+
+    def _worktree_cleanup_removed(self, run_id):
+        """cleanup-run's receipt: true once it records removal; null when unreadable."""
+        try:
+            read = self.reader.read(["runs", run_id, "worktree-cleanup.json"], limit=CLEANUP_RECEIPT_MAX_BYTES)
+        except NotFound:
+            return False
+        except ObserveError:
+            return None
+        if read["too_large"] or read["changed_while_reading"]:
+            return None
+        try:
+            receipt = json.loads(read["data"])
+        except _PARSE_ERRORS:
+            return None
+        return isinstance(receipt, dict) and receipt.get("status") == "removed"
 
     @staticmethod
     def _budgets(run):

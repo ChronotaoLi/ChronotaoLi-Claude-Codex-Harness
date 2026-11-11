@@ -4,6 +4,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from harness import git
+from harness.cleanup import cleanup_run
 from harness.util import HarnessError, read_json, write_json
 from test_engine_repairs import RecordingBackend
 from test_harness import ROOT, RepoCase
@@ -197,8 +198,8 @@ class StartupRecoveryTests(RepoCase):
                 self.engine(backend).resume(saved["id"])
         self.assertIn("abandon", str(caught.exception))
         self.assertEqual(self.saved(engine), saved)
-        with self.assertRaises(HarnessError):
-            self.engine(backend).abandon(saved["id"], remove_worktree=True)
+        with self.assertRaisesRegex(HarnessError, "绑定"):
+            cleanup_run(self.repo, saved["id"], remove=True)
         self.assertEqual(self.saved(engine), saved)
         result = self.engine(backend).abandon(saved["id"])
         self.assertEqual(result["status"], "abandoned")

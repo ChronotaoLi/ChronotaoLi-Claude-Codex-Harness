@@ -1,4 +1,12 @@
-"""Explicit, conservative cleanup of retained final-verification checkouts."""
+"""The one explicit cleanup entry: retained verification checkouts and the run worktree.
+
+One shared gate (run lock, ledger ownership, historical version, command
+directories, indexes, worker receipt links, exit evidence) precedes two
+concrete resources. Fresh verification checkouts are removable in any run
+status; the branch worktree only for completed or abandoned runs. Each
+resource keeps its own receipt, so an interrupted removal resumes from the
+saved intent. The branch, ledger and run evidence are never removed.
+"""
 from __future__ import annotations
 
 import hashlib
@@ -10,10 +18,15 @@ from pathlib import Path
 
 from .versions import HISTORICAL_CLEANUP_VERSIONS
 from . import git
-from .util import readonly_lock
+from .input_projection import validate_dispatch_indexes as validate_input_dispatch_indexes
+from .path_evidence import validate_dispatch_indexes
 from .run_store import RunStore
+from .worker_receipts import validate_worker_receipt_links
 from .util import (HarnessError, append_event, confirm_dispatches_exited,
-                   ensure_dispatches_exited, group_alive, lock, read_json, validate_command_directories, write_json)
+                   ensure_dispatches_exited, group_alive, lock, readonly_lock,
+                   validate_command_directories, write_json)
+
+TERMINAL = ("completed", "abandoned")
 
 
 def _canonical(path):
@@ -27,8 +40,120 @@ def _regular_bytes(path):
     return path.read_bytes()
 
 
+def _registered(repo):
+    return {field.removeprefix("worktree ") for field in
+            git.git(repo, "worktree", "list", "--porcelain", "-z").split("\0")
+            if field.startswith("worktree ")}
+
+
 def _ensure_exited(run):
     ensure_dispatches_exited(run["dispatches"], observe=group_alive)
+
+
+def cleanup_run(repo: Path, ident: str, *, remove=False, confirm_exited=(), remove_input_copies=False):
+    """Preview every retained resource of one run, or remove the eligible ones.
+
+    Gate failures raise before any resource is touched. A refused resource is
+    reported as ``blocked`` with its error; the others are still handled. The
+    worktree of a non-terminal run is ``retained`` with its reason.
+    """
+    repo = git.repository(repo)
+    if not ident.startswith("run_") or not ident[4:].isalnum():
+        raise HarnessError("无效 run ID")
+    directory = repo / ".harness" / "runs" / ident
+    _canonical(directory)
+    if not directory.is_dir():
+        raise HarnessError(f"运行不存在：{ident}")
+    for name in ("state.json", "run.lock", "worktree-cleanup.json"):
+        _canonical(directory / name)
+    if remove or confirm_exited:
+        from .private_state import ensure_private_state
+        ensure_private_state(repo)
+    with (lock if remove or confirm_exited else readonly_lock)(directory / "run.lock"):
+        run, original, common, artifacts = _gate(repo, ident, directory, confirm_exited)
+        checkouts = []
+        for artifact, expected_head in artifacts:
+            try:
+                checkouts.append(_clean_checkout(repo, run, artifact, expected_head, common, remove))
+            except (HarnessError, OSError, ValueError) as error:
+                checkouts.append({"artifact": str(artifact), "status": "blocked", "error": str(error)})
+        try:
+            worktree = _clean_worktree(repo, run, directory, original, remove, remove_input_copies)
+        except (HarnessError, OSError, ValueError) as error:
+            worktree = {"worktree": run["worktree"], "branch": run["branch"],
+                        "status": "blocked", "error": str(error)}
+        return {"id": ident, "remove": remove, "run_status": run.get("status"),
+                "checkouts": checkouts, "worktree": worktree}
+
+
+def blocked(result):
+    """True when an eligible resource was refused; a policy-retained worktree is not."""
+    return (result["worktree"]["status"] == "blocked"
+            or any(item["status"] == "blocked" for item in result["checkouts"]))
+
+
+def _gate(repo, ident, directory, confirm_exited):
+    """Validate ownership and exit evidence once; return the bound ledger state."""
+    state = directory / "state.json"
+    original = _regular_bytes(state)
+    run = json.loads(original)
+    checkout = repo / ".harness" / "worktrees" / ident
+    _canonical(checkout)
+    branch = "harness/" + ident
+    common = Path(git.git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir").removesuffix("\n")).resolve()
+    if (not isinstance(run, dict) or run.get("schema_version") not in HISTORICAL_CLEANUP_VERSIONS
+            or run.get("id") != ident or run.get("repo") != str(repo)
+            or run.get("worktree") != str(checkout) or run.get("branch") != branch
+            or not isinstance(run.get("expected_head"), str)
+            or not isinstance(run.get("dispatches"), list)
+            or not isinstance(run.get("final_history"), list)):
+        raise HarnessError("运行台账或工作树归属无效；保留现场")
+    binding = run.get("worktree_binding")
+    if (not isinstance(binding, dict) or binding.get("worktree") != str(checkout)
+            or binding.get("common_dir") != str(common)
+            or binding.get("branch") != "refs/heads/" + branch
+            or not isinstance(binding.get("git_dir"), str)):
+        raise HarnessError("运行 worktree Git 绑定无效；不能重新推断绑定")
+    admin = Path(binding["git_dir"])
+    _canonical(admin)
+    if admin.parent != common / "worktrees":
+        raise HarnessError("运行 worktree Git 管理目录不属于该仓库")
+    validate_command_directories(run["dispatches"], directory)
+    validate_dispatch_indexes(directory, run["dispatches"])
+    validate_input_dispatch_indexes(directory, run["dispatches"])
+    if run["schema_version"] >= 14:
+        validate_worker_receipt_links(run, directory)
+    if confirm_exited:
+        store = RunStore(repo / ".harness")
+        store.attach(run)
+        events = directory / "events.jsonl"
+        _canonical(events)
+        if events.exists():
+            _regular_bytes(events)
+        confirm_dispatches_exited(run["dispatches"], confirm_exited,
+            audit=lambda event, **fields: append_event(events, ident, event, **fields),
+            save=store.commit, observe=group_alive)
+        original = _regular_bytes(state)
+    elif _regular_bytes(state) != original:
+        raise HarnessError("运行台账在清理前改变；保留现场")
+    _ensure_exited(run)
+    artifacts = []
+    for final in run["final_history"]:
+        if (not isinstance(final, dict) or type(final.get("attempt")) is not int
+                or final["attempt"] < 1 or not isinstance(final.get("head"), str)
+                or not isinstance(final.get("verification_rounds"), list)):
+            raise HarnessError("整体验证台账无效；保留现场")
+        for index, round_record in enumerate(final["verification_rounds"], 1):
+            folder = directory / "verification" / "final" / str(final["attempt"]) / f"verification-{index}"
+            if not isinstance(round_record, dict) or round_record.get("artifact_dir") != str(folder):
+                raise HarnessError("整体验证证据目录与运行台账不符")
+            artifact = folder / "checkout.json"
+            _canonical(artifact)
+            if artifact.exists():
+                artifacts.append((artifact, final["head"]))
+    if len({artifact for artifact, _ in artifacts}) != len(artifacts):
+        raise HarnessError("整体验证台账重复引用检出证据")
+    return run, original, common, artifacts
 
 
 def _checkout_identity(repo, run, environment, expected_head, common):
@@ -71,13 +196,8 @@ def _check_missing_binding(checkout, binding):
         raise HarnessError("缺失检出的 detached HEAD 绑定已改变；保留注册")
 
 
-def _registered(repo):
-    return {field.removeprefix("worktree ") for field in
-            git.git(repo, "worktree", "list", "--porcelain", "-z").split("\0")
-            if field.startswith("worktree ")}
-
-
-def _remove_checkout(repo, run, artifact, expected_head, common, remove):
+def _clean_checkout(repo, run, artifact, expected_head, common, remove):
+    """One fresh verification checkout; its receipt is cleanup.json beside the evidence."""
     original = _regular_bytes(artifact)
     environment = json.loads(original)
     checkout, binding = _checkout_identity(repo, run, environment, expected_head, common)
@@ -88,8 +208,7 @@ def _remove_checkout(repo, run, artifact, expected_head, common, remove):
                "worktree": str(checkout), "head": expected_head}
     previous = None
     if receipt_path.exists():
-        _regular_bytes(receipt_path)
-        previous = read_json(receipt_path)
+        previous = json.loads(_regular_bytes(receipt_path))
         if (not isinstance(previous, dict) or any(previous.get(key) != value for key, value in receipt.items())
                 or previous.get("status") not in ("pending", "removed")):
             raise HarnessError("清理记录与原验证证据不符；保留现场")
@@ -141,68 +260,74 @@ def _remove_checkout(repo, run, artifact, expected_head, common, remove):
     return {**result, "status": "removed"}
 
 
-def cleanup_verification(repo: Path, ident: str, *, remove=False, confirm_exited=()):
-    """Preview all saved checkouts, or remove eligible ones and report refusals."""
-    repo = git.repository(repo)
-    if not ident.startswith("run_") or not ident[4:].isalnum():
-        raise HarnessError("无效 run ID")
-    directory = repo / ".harness" / "runs" / ident
-    _canonical(directory)
-    if not directory.is_dir():
-        raise HarnessError(f"运行不存在：{ident}")
-    _canonical(directory / "run.lock")
-    if remove or confirm_exited:
-        from .private_state import ensure_private_state
-        ensure_private_state(repo)
-    with (lock if remove or confirm_exited else readonly_lock)(directory / "run.lock"):
-        _regular_bytes(directory / "state.json")
-        run = read_json(directory / "state.json")
-        if (not isinstance(run, dict) or run.get("schema_version") not in HISTORICAL_CLEANUP_VERSIONS or run.get("id") != ident
-                or run.get("repo") != str(repo) or not isinstance(run.get("dispatches"), list)
-                or not isinstance(run.get("final_history"), list)
-                or not isinstance(run.get("worktree_binding"), dict)
-                or run.get("worktree") != str(repo / ".harness" / "worktrees" / ident)):
-            raise HarnessError("运行台账或工作树归属无效；保留现场")
-        validate_command_directories(run["dispatches"], directory)
-        from .input_projection import validate_dispatch_indexes as validate_input_dispatch_indexes
-        from .worker_receipts import validate_worker_receipt_links
-        validate_input_dispatch_indexes(directory, run['dispatches'])
-        if run['schema_version'] >= 14:
-            validate_worker_receipt_links(run, directory)
-        common = Path(git.git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir").removesuffix("\n")).resolve()
-        if run["worktree_binding"].get("common_dir") != str(common):
-            raise HarnessError("运行台账的 Git 公共目录绑定已改变")
-        if confirm_exited:
-            store = RunStore(repo / ".harness")
-            store.attach(run)
-            events = directory / "events.jsonl"
-            _canonical(events)
-            if events.exists():
-                _regular_bytes(events)
-            confirm_dispatches_exited(run["dispatches"], confirm_exited,
-                audit=lambda event, **fields: append_event(events, ident, event, **fields),
-                save=store.commit, observe=group_alive)
-        _ensure_exited(run)
-        artifacts = []
-        for final in run["final_history"]:
-            if (not isinstance(final, dict) or type(final.get("attempt")) is not int
-                    or final["attempt"] < 1 or not isinstance(final.get("head"), str)
-                    or not isinstance(final.get("verification_rounds"), list)):
-                raise HarnessError("整体验证台账无效；保留现场")
-            for index, round_record in enumerate(final["verification_rounds"], 1):
-                folder = directory / "verification" / "final" / str(final["attempt"]) / f"verification-{index}"
-                if not isinstance(round_record, dict) or round_record.get("artifact_dir") != str(folder):
-                    raise HarnessError("整体验证证据目录与运行台账不符")
-                artifact = folder / "checkout.json"
-                _canonical(artifact)
-                if artifact.exists():
-                    artifacts.append((artifact, final["head"]))
-        if len({artifact for artifact, _ in artifacts}) != len(artifacts):
-            raise HarnessError("整体验证台账重复引用检出证据")
-        results = []
-        for artifact, expected_head in artifacts:
-            try:
-                results.append(_remove_checkout(repo, run, artifact, expected_head, common, remove))
-            except (HarnessError, OSError, ValueError) as error:
-                results.append({"artifact": str(artifact), "status": "blocked", "error": str(error)})
-        return {"id": ident, "remove": remove, "checkouts": results}
+def _clean_worktree(repo, run, directory, original, remove, remove_input_copies):
+    """The run's branch worktree; its receipt is worktree-cleanup.json in the run directory."""
+    checkout, branch = Path(run["worktree"]), run["branch"]
+    binding = run["worktree_binding"]
+    admin = Path(binding["git_dir"])
+    state, receipt_path = directory / "state.json", directory / "worktree-cleanup.json"
+    result = {"worktree": str(checkout), "branch": branch}
+    if run.get("status") not in TERMINAL:
+        # Policy, not a refusal: the run may still resume in this worktree.
+        return {**result, "status": "retained",
+                "reason": f"run 状态为 {run.get('status')}；工作树只在 run 完成（completed）"
+                          "或放弃（abandoned）之后清理，请先完成或放弃该 run"}
+    expected = run["expected_head"]
+    # Refuse losing the last named reference to the delivered checkpoint.
+    if git.git(repo, "rev-parse", "--verify", "refs/heads/" + branch).strip() != expected:
+        raise HarnessError("保留分支与运行检查点不同；保留工作树供核对")
+    identity = {"id": run["id"], "worktree": str(checkout), "branch": branch,
+                "head": expected, "state_digest": hashlib.sha256(original).hexdigest(),
+                "binding": binding}
+    previous = None
+    if receipt_path.exists():
+        previous = json.loads(_regular_bytes(receipt_path))
+        if (not isinstance(previous, dict)
+                or any(previous.get(k) != v for k, v in identity.items())
+                or previous.get("status") not in ("pending", "removed")):
+            raise HarnessError("清理记录与运行证据不符；保留现场")
+    exists = checkout.exists()
+    input_summary = {"status": "none", "files": []}
+    registered = str(checkout) in _registered(repo)
+    if previous and previous["status"] == "removed":
+        if exists or registered or admin.exists():
+            raise HarnessError("已清理工作树或注册重新出现；保留现场")
+        return {**result, "status": "removed" if remove else "absent", "input_copies": input_summary}
+    if not exists:
+        # Ledgers from before the single entry recorded removal by abandon
+        # --remove-worktree: an intent (pending_worktree_removal) or its completion.
+        legacy = run.get("worktree_removed") is True or run.get("pending_worktree_removal") is True
+        if registered or admin.exists() or not (previous or legacy):
+            raise HarnessError("工作树缺失但清理意图或 Git 注册不符；保留现场")
+        status = "absent"
+    else:
+        git.check_worktree_binding(checkout, binding)
+        if git.head(checkout, binding=binding) != expected:
+            raise HarnessError("worktree HEAD 与检查点不同；保留工作树供核对")
+        git.check_worktree_state(checkout, binding=binding)
+        from .workspace_inputs import cleanup_inputs
+        input_summary = cleanup_inputs(run, directory, remove=remove and remove_input_copies)
+        if input_summary["files"] and not remove and input_summary["status"] != "removed":
+            return {**result, "status": "input_copies_present", "input_copies": input_summary}
+        git.assert_removable_worktree(checkout, binding=binding)
+        status = "eligible"
+    result = {**result, "status": status, "input_copies": input_summary}
+    if not remove:
+        return result
+    write_json(receipt_path, {**identity, "status": "pending", "time": time.time()})
+    _ensure_exited(run)
+    if _regular_bytes(state) != original:
+        raise HarnessError("运行台账在清理前改变；保留现场")
+    if git.git(repo, "rev-parse", "--verify", "refs/heads/" + branch).strip() != expected:
+        raise HarnessError("保留分支在清理前改变；保留现场")
+    if exists:
+        git.check_worktree_binding(checkout, binding)
+        if git.head(checkout, binding=binding) != expected:
+            raise HarnessError("worktree HEAD 在清理前改变；保留现场")
+        git.check_worktree_state(checkout, binding=binding)
+        git.assert_removable_worktree(checkout, binding=binding)
+        git.git(repo, "worktree", "remove", str(checkout))
+    if checkout.exists() or checkout.is_symlink() or admin.exists() or str(checkout) in _registered(repo):
+        raise HarnessError("工作树尚未完全移除；保留待清理记录")
+    write_json(receipt_path, {**identity, "status": "removed", "time": time.time()})
+    return {**result, "status": "removed"}

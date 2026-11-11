@@ -4,6 +4,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from harness import git
+from harness.cleanup import cleanup_run
 from harness.process_runtime import ProcessOutcome
 from harness.util import HarnessError, read_json, run_process, write_json
 from test_harness import ROOT, RepoCase
@@ -237,19 +238,24 @@ class StoppedRecoveryTests(RepoCase):
         with self.assertRaises(HarnessError):
             self.engine(backend).resume(engine.run["id"])
         self.assertEqual(backend.calls, [])
-        with self.assertRaises(HarnessError):
-            self.engine(backend).abandon(engine.run["id"], remove_worktree=True)
-        self.assertTrue(engine.worktree.exists())
+        removal = cleanup_run(self.repo, engine.run["id"], remove=True)["worktree"]
+        self.assertEqual(removal["status"], "blocked")
+        self.assertIn("unsaved.txt", removal["error"])
+        self.assertEqual((engine.worktree / "unsaved.txt").read_text(), "keep me")
 
-    def test_abandon_removes_only_clean_owned_worktree_and_keeps_branch_evidence(self):
+    def test_abandon_then_cleanup_removes_only_clean_owned_worktree_and_keeps_branch_evidence(self):
         engine = self.engine()
         engine.start("Implement greet", self.plan(), pause_after_plan=True)
-        result = self.engine().abandon(engine.run["id"], remove_worktree=True)
+        result = self.engine().abandon(engine.run["id"])
+        self.assertTrue(engine.worktree.is_dir())
+        ledger = (engine.directory / "state.json").read_bytes()
+        self.assertEqual(cleanup_run(self.repo, engine.run["id"], remove=True)["worktree"]["status"], "removed")
         self.assertFalse(engine.worktree.exists())
         self.assertEqual(git.git(self.repo, "rev-parse", result["branch"]).strip(), result["expected_head"])
-        self.assertTrue((engine.directory / "state.json").exists())
-        self.assertTrue(result["worktree_removed"])
-        self.assertEqual(self.engine().abandon(engine.run["id"], remove_worktree=True)["status"], "abandoned")
+        self.assertEqual((engine.directory / "state.json").read_bytes(), ledger)
+        self.assertFalse({"worktree_removed", "pending_worktree_removal"} & set(read_json(engine.directory / "state.json")))
+        self.assertEqual(self.engine().abandon(engine.run["id"])["status"], "abandoned")
+        self.assertEqual(cleanup_run(self.repo, engine.run["id"], remove=True)["worktree"]["status"], "removed")
 
     def test_abandon_refuses_live_process_or_ignored_unsaved_file(self):
         engine = self.engine()
@@ -263,29 +269,22 @@ class StoppedRecoveryTests(RepoCase):
         cache = engine.worktree / "__pycache__"
         cache.mkdir()
         (cache / "unsaved").write_text("keep")
-        with self.assertRaises(HarnessError):
-            self.engine().abandon(engine.run["id"], remove_worktree=True)
+        self.assertEqual(self.engine().abandon(engine.run["id"])["status"], "abandoned")
+        self.assertEqual(cleanup_run(self.repo, engine.run["id"], remove=True)["worktree"]["status"], "blocked")
         self.assertTrue((cache / "unsaved").exists())
 
-    def test_worktree_removal_interruption_finishes_saved_intent(self):
+    def test_interrupted_removal_by_the_deleted_abandon_option_is_finished_by_cleanup(self):
         engine = self.engine()
         engine.start("Implement greet", self.plan(), pause_after_plan=True)
-        real_git = git.git
-
-        def remove_then_interrupt(repo, *args, **kwargs):
-            result = real_git(repo, *args, **kwargs)
-            if args[:2] == ("worktree", "remove"):
-                raise KeyboardInterrupt()
-            return result
-
-        with patch("harness.git.git", side_effect=remove_then_interrupt), self.assertRaises(KeyboardInterrupt):
-            self.engine().abandon(engine.run["id"], remove_worktree=True)
+        self.engine().abandon(engine.run["id"])
+        # The state abandon --remove-worktree left when interrupted after Git removal.
+        git.git(self.repo, "worktree", "remove", str(engine.worktree))
         saved = read_json(engine.directory / "state.json")
-        self.assertTrue(saved["pending_worktree_removal"])
-        self.assertFalse(engine.worktree.exists())
-        result = self.engine().abandon(engine.run["id"], remove_worktree=True)
-        self.assertTrue(result["worktree_removed"])
-        self.assertNotIn("pending_worktree_removal", result)
+        write_json(engine.directory / "state.json", {**saved, "pending_worktree_removal": True})
+        self.assertEqual(cleanup_run(self.repo, engine.run["id"])["worktree"]["status"], "absent")
+        self.assertEqual(cleanup_run(self.repo, engine.run["id"], remove=True)["worktree"]["status"], "removed")
+        self.assertEqual(read_json(engine.directory / "worktree-cleanup.json")["status"], "removed")
+        self.assertEqual(git.git(self.repo, "rev-parse", saved["branch"]).strip(), saved["expected_head"])
 
     def test_resume_reloads_abandonment_after_acquiring_lock(self):
         engine = self.engine()

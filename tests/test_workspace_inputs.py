@@ -117,19 +117,20 @@ class WorkspaceInputsTests(unittest.TestCase):
         with self.assertRaises(HarnessError): self.prepare()
 
     def test_cleanup_selection_flag_alone_is_readonly_preview(self):
-        from harness.run_cleanup import cleanup_run
+        from harness.cleanup import cleanup_run
         self.prepare()
-        self.run.update(status='completed', branch='harness/' + self.ident)
+        # cleanup-run also enumerates retained verification checkouts.
+        self.run.update(status='completed', branch='harness/' + self.ident, final_history=[])
         self.save()
         target = self.checkout / 'vendor/input.txt'
         state_bytes = (self.directory / 'state.json').read_bytes()
         receipt_bytes = (self.directory / 'workspace-inputs.json').read_bytes()
-        result = cleanup_run(self.repo, self.ident, remove_input_copies=True)
+        result = cleanup_run(self.repo, self.ident, remove_input_copies=True)['worktree']
         self.assertEqual(result['status'], 'input_copies_present')
         self.assertTrue(target.exists())
         self.assertEqual((self.directory / 'state.json').read_bytes(), state_bytes)
         self.assertEqual((self.directory / 'workspace-inputs.json').read_bytes(), receipt_bytes)
-        result = cleanup_run(self.repo, self.ident, remove=True, remove_input_copies=True)
+        result = cleanup_run(self.repo, self.ident, remove=True, remove_input_copies=True)['worktree']
         self.assertEqual(result['status'], 'removed')
         self.assertFalse(self.checkout.exists())
         self.assertEqual(self.source.read_text(), 'dependency')

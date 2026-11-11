@@ -3,7 +3,7 @@ import shutil
 from unittest.mock import patch
 
 from harness import git
-from harness.run_cleanup import cleanup_run
+from harness.cleanup import cleanup_run
 from harness.util import HarnessError, lock, read_json, write_json
 from test_harness import RepoCase, ROOT
 
@@ -21,7 +21,17 @@ class RunCleanupTests(RepoCase):
         self.receipt = self.directory / "worktree-cleanup.json"
 
     def cleanup(self, remove=False, **kwargs):
-        return cleanup_run(self.repo, self.run["id"], remove=remove, **kwargs)
+        """The worktree resource of the single cleanup entry; this fixture has no checkouts."""
+        result = cleanup_run(self.repo, self.run["id"], remove=remove, **kwargs)
+        self.assertEqual(result["checkouts"], [])
+        return {**result["worktree"], "run_status": result["run_status"]}
+
+    def assert_blocked(self, pattern=None, **kwargs):
+        result = self.cleanup(True, **kwargs)
+        self.assertEqual(result["status"], "blocked")
+        if pattern is not None:
+            self.assertRegex(result["error"], pattern)
+        return result
 
     def test_preview_and_removal_retain_exact_state_evidence_and_branch(self):
         original = {p: p.read_bytes() for p in self.directory.rglob("*") if p.is_file()}
@@ -37,23 +47,25 @@ class RunCleanupTests(RepoCase):
         self.assertEqual(self.cleanup()["status"], "absent")
         self.assertEqual(self.cleanup(True)["status"], "removed")
 
-    def test_nonterminal_and_lock_refuse_removal(self):
+    def test_lock_refuses_and_nonterminal_worktree_is_retained(self):
         with lock(self.directory / "run.lock"), self.assertRaises(HarnessError):
             self.cleanup(True)
         for status in ("running", "stopped", "planning"):
             self.run["status"] = status
             write_json(self.state, self.run)
-            with self.assertRaisesRegex(HarnessError, "终态"):
-                self.cleanup(True)
+            for remove in (True, False):
+                result = self.cleanup(remove)
+                self.assertEqual(result["status"], "retained")
+                self.assertIn(status, result["reason"])
         self.assertTrue(self.checkout.exists())
+        self.assertFalse(self.receipt.exists())
 
     def test_removed_receipt_does_not_hide_recreated_git_admin_directory(self):
         admin = Path(self.run["worktree_binding"]["git_dir"])
         self.assertEqual(self.cleanup(True)["status"], "removed")
         admin.mkdir(parents=True)
         (admin / "unrelated-data").write_text("preserve")
-        with self.assertRaises(HarnessError):
-            self.cleanup(True)
+        self.assert_blocked("重新出现")
         self.assertEqual((admin / "unrelated-data").read_text(), "preserve")
 
     def test_abandoned_terminal_is_eligible(self):
@@ -76,8 +88,7 @@ class RunCleanupTests(RepoCase):
                     path.write_text("keep")
                 else:
                     git.git(self.checkout, "update-index", "--" + variant, "hello.py")
-                with self.assertRaises(HarnessError):
-                    self.cleanup(True)
+                self.assert_blocked()
                 self.assertTrue(self.checkout.exists())
                 self.assertFalse(self.receipt.exists())
                 if variant in ("tracked", "staged"):
@@ -118,14 +129,12 @@ class RunCleanupTests(RepoCase):
         path = self.checkout / ".git"
         original = path.read_bytes()
         path.write_bytes(original + b"\n")
-        with self.assertRaises(HarnessError):
-            self.cleanup(True)
+        self.assert_blocked("绑定")
         self.assertTrue(self.checkout.exists())
 
     def test_missing_path_does_not_authorize_stale_registration_removal(self):
         shutil.rmtree(self.checkout)
-        with self.assertRaises(HarnessError):
-            self.cleanup(True)
+        self.assert_blocked("清理意图或 Git 注册不符")
         self.assertIn(str(self.checkout), git.git(self.repo, "worktree", "list", "--porcelain"))
 
     def test_interrupted_removal_recovers_saved_intent(self):
@@ -135,7 +144,7 @@ class RunCleanupTests(RepoCase):
             if args[:2] == ("worktree", "remove"):
                 raise KeyboardInterrupt()
             return result
-        with patch("harness.run_cleanup.git.git", side_effect=interrupted), self.assertRaises(KeyboardInterrupt):
+        with patch("harness.cleanup.git.git", side_effect=interrupted), self.assertRaises(KeyboardInterrupt):
             self.cleanup(True)
         self.assertEqual(read_json(self.receipt)["status"], "pending")
         self.assertEqual(self.cleanup(True)["status"], "removed")
@@ -147,21 +156,20 @@ class RunCleanupTests(RepoCase):
             original_write(path, value)
             if path == self.receipt:
                 self.state.write_bytes(self.state.read_bytes() + b"\n")
-        with patch("harness.run_cleanup.write_json", side_effect=raced), self.assertRaisesRegex(HarnessError, "台账在清理前改变"):
-            self.cleanup(True)
+        with patch("harness.cleanup.write_json", side_effect=raced):
+            self.assert_blocked("台账在清理前改变")
         self.assertTrue(self.checkout.exists())
+        self.assertEqual(read_json(self.receipt)["status"], "pending")
 
     def test_changed_branch_refuses_loss_of_named_checkpoint(self):
         git.git(self.checkout, "checkout", "--detach")
         git.git(self.repo, "update-ref", "refs/heads/" + self.run["branch"], self.run["base_commit"])
-        with self.assertRaises(HarnessError):
-            self.cleanup(True)
+        self.assert_blocked("检查点")
         self.assertTrue(self.checkout.exists())
 
     def test_private_state_directory_is_never_removed(self):
         (self.checkout / ".harness").mkdir()
-        with self.assertRaisesRegex(HarnessError, "受保护路径"):
-            self.cleanup(True)
+        self.assert_blocked("受保护路径")
         self.assertTrue((self.checkout / ".harness").is_dir())
 
     def test_raw_bytes_with_restored_stat_cache_still_refuse_removal(self):
@@ -171,6 +179,5 @@ class RunCleanupTests(RepoCase):
         info = path.stat()
         path.write_bytes(original.replace(b"Hello", b"Hallo"))
         os.utime(path, ns=(info.st_atime_ns, info.st_mtime_ns))
-        with self.assertRaisesRegex(HarnessError, "文件内容与 HEAD 不同"):
-            self.cleanup(True)
+        self.assert_blocked("文件内容与 HEAD 不同")
         self.assertTrue(path.exists())

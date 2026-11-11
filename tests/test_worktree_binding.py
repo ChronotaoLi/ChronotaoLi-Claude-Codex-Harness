@@ -5,6 +5,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from harness import git
+from harness.cleanup import cleanup_run
 from harness.memory import Memory, validate_proposals
 from harness.util import HarnessError, read_json, write_json
 from test_harness import ROOT, RepoCase
@@ -193,10 +194,12 @@ class EngineWorktreeBindingTests(RepoCase):
         self.assertEqual(git.git(self.repo, "rev-parse", engine.run["branch"]).strip(), base)
         self.assertEqual((self.repo / ".git" / "index").read_bytes(), main_index)
         self.assertFalse((self.repo / "hello.py").exists())
-        for operation in (lambda: self.engine(backend).resume(engine.run["id"]),
-                          lambda: self.engine(backend).abandon(engine.run["id"], remove_worktree=True)):
-            with self.assertRaisesRegex(HarnessError, "绑定"):
-                operation()
+        with self.assertRaisesRegex(HarnessError, "绑定"):
+            self.engine(backend).resume(engine.run["id"])
+        self.assertEqual(self.engine(backend).abandon(engine.run["id"])["status"], "abandoned")
+        removal = cleanup_run(self.repo, engine.run["id"], remove=True)["worktree"]
+        self.assertEqual(removal["status"], "blocked")
+        self.assertIn("绑定", removal["error"])
         self.assertEqual(len(backend.calls), 1)
         self.assertTrue((engine.worktree / "hello.py").is_file())
 

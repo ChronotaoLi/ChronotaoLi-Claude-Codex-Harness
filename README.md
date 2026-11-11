@@ -74,7 +74,7 @@ python3 -m harness --config /absolute/path/harness.toml --repo /absolute/path/to
 
 从 Harness 源码目录对任意项目执行时，`--config`、`--repo` 等全局参数必须写在子命令之前，路径使用绝对路径。先运行 `doctor` 核对回显的 `harness.package`、`harness.revision`、`config.sha256` 与 `shared` 路径，确认加载的是预期的包和配置，而不是同名模块或另一份安装。每次 `run`／`resume` 自动在目标项目 `.harness/operations/` 写一份操作记录，可用 `--operation-id ID` 指定 ID，同名记录已存在时拒绝。统一入口、外层 agent 的操作边界、记录与报告模板见[操作与观察](docs/operations.md)。
 
-配置拒绝未知节和键，并指出完整路径。非 editable 安装不附带默认 `harness.toml` 与 `shared/`，执行任务需显式提供配置；`status`、`watch`、`dashboard`、`memory`、`cleanup-run` 和 `cleanup-verification` 不依赖配置。运行事件和诊断写 stderr，`run`、`resume`、`demo` 的 stdout 保持单个 JSON 结果。
+配置拒绝未知节和键，并指出完整路径。非 editable 安装不附带默认 `harness.toml` 与 `shared/`，执行任务需显式提供配置；`status`、`watch`、`dashboard`、`memory` 和 `cleanup-run` 不依赖配置。运行事件和诊断写 stderr，`run`、`resume`、`demo` 的 stdout 保持单个 JSON 结果。
 
 可用 `--plan /path/to/plan.json` 提供已有计划，格式见 [examples/plan.json](examples/plan.json)。输入在创建 run、分支和 worktree 前校验任务 ID、DAG、非空验收、范围和 skill。范围从仓库根目录匹配：`src/*` 只匹配直接子项，`src/**` 匹配所有层级，`**/*.py` 也匹配根目录文件；只有独立 `**` 路径段跨越 `/`。范围应覆盖必要测试与夹具。全仓库模式允许但会警告；`.git`、`.harness`、`.codex`、`.claude` 仍受保护。
 
@@ -124,7 +124,7 @@ setup_commands = [["npm", "ci"]]
 
 默认 `fresh_checkout = false`、`setup_commands = []`。开启后，仅整体验证改用目标仓库外的全新 detached worktree，顺序执行准备与验证；准备不得改变已跟踪文件或留下未忽略文件，也不授予 worker 权限。任务级验证仍在原工作树，依赖仍须可用。同一 run 不可改变这两项设置。
 
-验证检出保留供检查，`abandon --remove-worktree` 不清理它们；失败后恢复及显式清理见[整体验证与重验](docs/recovery.md#整体验证与重验)和[放弃与清理](docs/recovery.md#放弃与清理)。该模式仍使用当前环境、Git 配置及声明的准备命令，不承诺容器级可复现性。忽略路径清单只是诊断，不校验目录内部内容，不能替代全新检出。
+验证检出保留供检查，只由 `cleanup-run` 显式清理；失败后恢复及显式清理见[整体验证与重验](docs/recovery.md#整体验证与重验)和[放弃与清理](docs/recovery.md#放弃与清理)。该模式仍使用当前环境、Git 配置及声明的准备命令，不承诺容器级可复现性。忽略路径清单只是诊断，不校验目录内部内容，不能替代全新检出。
 
 ## 状态、恢复与清理
 
@@ -136,7 +136,6 @@ python3 -m harness --repo /path/to/project watch RUN
 python3 -m harness --repo /path/to/project dashboard --port 8765
 python3 -m harness --config /path/to/harness.toml --repo /path/to/project resume RUN
 python3 -m harness --config /path/to/harness.toml --repo /path/to/project abandon RUN
-python3 -m harness --repo /path/to/project cleanup-verification RUN
 python3 -m harness --repo /path/to/project cleanup-run RUN
 python3 -m harness --repo /path/to/project cleanup-run RUN --remove
 ```
@@ -181,15 +180,13 @@ python3 -m harness --repo /path/to/project cleanup-run RUN --remove
 
 这些入口沿用原预算、范围、权限和接受条件，不能通用地丢弃已返回结果或拒绝。选项互斥见[恢复选项与互斥](docs/recovery.md#恢复选项与互斥)，各停止信息的出口见[阻塞状态与操作者出口](docs/recovery.md#阻塞状态与操作者出口)。环境更新严格 JSON 示例见[环境更新](docs/recovery.md#环境更新)，决定输入格式见[操作者决定](docs/recovery.md#操作者决定)。检查点只说明声明的输入未变且未过期，不代替验证或审阅（协议与限制见[检查点](docs/operations.md#检查点)）；操作者答复只允许对应问题继续，不增加命令权限。
 
-`abandon RUN` 保留分支、工作树和证据并禁止恢复；它与 `resume` 一样先核验台账和加载时证据，这些证据损坏时同样被拒绝（见[证据损坏](docs/recovery.md#证据损坏)）。可追加 `--remove-worktree` 移除干净工作树；任何未保存文件（含忽略文件）、隐藏索引标记、字节与 HEAD 不符或进程退出未知均阻止移除，不强制删除。清理错误列出阻塞路径，需先人工核对。
+`abandon RUN` 保留分支、工作树和证据并禁止恢复；它与 `resume` 一样先核验台账和加载时证据，这些证据损坏时同样被拒绝（见[证据损坏](docs/recovery.md#证据损坏)）。放弃不删除文件，移除工作树用之后的 `cleanup-run RUN --remove`。
 
-`cleanup-verification RUN` 默认预览，`--remove` 才移除符合门禁的验证检出，保留台账和证据。父 dispatch 退出不能证明 broker 命令子进程退出；核实后可用 `cleanup-verification RUN --confirm-exited DISPATCH_ID`，也支持已完成或放弃的 run。完整规则见[放弃与清理](docs/recovery.md#放弃与清理)。
+`cleanup-run RUN` 是唯一的清理入口：默认预览，逐项列出保留的全新验证检出和分支工作树能否清理、被什么挡住；`--remove` 才逐项删除。验证检出在任何 run 状态都可清理；工作树只在 `completed` 或 `abandoned` 时清理，其他状态下报告 `retained` 并在 `reason` 中写明当前状态，要先完成或放弃 run。未保存文件（含忽略文件）、隐藏索引标记、与 HEAD 不符的字节，或原分支已离开检查点，会让对应资源报告 `blocked`，`error` 列出原因与阻塞路径，资源保留，其余资源照常清理。每项的 `status` 为 `eligible`（可删除）、`removed`（已删除）、`absent`（已不存在）、`stale_registration`（检出目录缺失但仍有 Git 注册）、`input_copies_present`（需加 `--remove-input-copies`）、`retained` 或 `blocked`，含义见[放弃与清理](docs/recovery.md#放弃与清理)；只有出现 `blocked` 时退出码为 1。派发或命令子进程退出未确认时整条命令拒绝；父 dispatch 退出不能证明 broker 命令子进程退出，核实后可加 `--confirm-exited DISPATCH_ID` 记录确认。删除意图和完成记录分别写在检出证据旁的 `cleanup.json` 和 run 目录的 `worktree-cleanup.json`，中断后重跑同一命令续做；普通预览不生成记录。命令不改 run 状态，不删除分支、台账或运行证据；需要删除分支时，先完成清理，再由操作者核对集成结果并处理分支。完整规则见[放弃与清理](docs/recovery.md#放弃与清理)。
 
-`cleanup-run RUN` 预览已完成或已放弃 run 的工作树清理，`--remove` 才执行。它保留终态、分支和运行证据，要求原分支仍指向检查点、所有派发与命令子进程已确认退出、工作树无任何未保存文件。清理意图和完成记录保存在 `worktree-cleanup.json`，支持删除后记账中断的重试。显式 `--confirm-exited DISPATCH_ID` 会记录退出确认；普通预览不生成清理记录。需要删除分支时，先完成工作树清理，再由操作者核对集成结果并处理分支。
+新台账版本为 16，要求完整的 worker 接收意图、输出模式与配置快照，缺失时不补造旧默认值。台账只存摘要与引用：worker 接收意图记录派发目录中不可变的 `packet.json`、`schema.json` 的路径与 SHA256，续作、执行指导和续作拒绝行只记 `snapshot_digest`，完整快照在 `continuations/` 等目录的不可变文件里；这些文件被删除、修改或换成符号链接时 `resume` 停止并保留现场。版本 15 及更早不迁移、不执行：`resume`、`abandon`、`prepare-run` 拒绝旧台账；`status`、`watch`、`dashboard`、`plan-readiness --run`、`permission-diagnostics` 仍可只读使用，`cleanup-run` 仍可在门禁通过后清理（工作树仅限终态）。共享规则变更也受资产摘要门禁约束。版本 16 已完成 run 的普通恢复返回保存结果；终态限制见[终态与历史台账](docs/recovery.md#终态与历史台账)。
 
-新台账版本为 16，要求完整的 worker 接收意图、输出模式与配置快照，缺失时不补造旧默认值。台账只存摘要与引用：worker 接收意图记录派发目录中不可变的 `packet.json`、`schema.json` 的路径与 SHA256，续作、执行指导和续作拒绝行只记 `snapshot_digest`，完整快照在 `continuations/` 等目录的不可变文件里；这些文件被删除、修改或换成符号链接时 `resume` 停止并保留现场。版本 15 及更早不迁移、不执行：`resume`、`abandon`、`prepare-run` 拒绝旧台账；`status`、`watch`、`dashboard`、`plan-readiness --run`、`permission-diagnostics` 仍可只读使用，`cleanup-verification` 与 `cleanup-run`（后者仅终态）仍可在门禁通过后清理。共享规则变更也受资产摘要门禁约束。版本 16 已完成 run 的普通恢复返回保存结果；终态限制见[终态与历史台账](docs/recovery.md#终态与历史台账)。
-
-以下接口已删除：命令 `notify`、`inbox`、`ack` 与通知收件箱（已有的 `.harness/notifications/` 不再读写，可手工删除）；`handoff.md`（只写 `handoff.json`）；hooks 事件名 `context_compacted`（改用 `context_prepared`）；配置键 `runtime.max_total_attempts`。
+以下接口已删除：命令 `notify`、`inbox`、`ack` 与通知收件箱（已有的 `.harness/notifications/` 不再读写，可手工删除）；命令 `cleanup-verification` 与选项 `abandon --remove-worktree`（都改用 `cleanup-run`；旧台账的 `worktree_removed` 仍被识别）；`handoff.md`（只写 `handoff.json`）；hooks 事件名 `context_compacted`（改用 `context_prepared`）；配置键 `runtime.max_total_attempts`。
 
 ## 共用 skills / MCP / hooks
 

@@ -141,7 +141,7 @@ def ensure_dispatches_exited(dispatches, *, observe=group_alive):
         if entry.get("exit_confirmed") is True:
             continue
         hint = ("核实旧进程已退出后，可用 --confirm-exited <dispatch_id> 留痕确认；"
-                "已完成或已放弃的 run 使用 cleanup-verification 的同名选项")
+                "已完成或已放弃的 run 使用 cleanup-run 的同名选项")
         if pgid is not None:
             if observe(pgid):
                 raise HarnessError(f"旧 dispatch {entry.get('id', '<unknown>')} 的进程组仍存在；{hint}")

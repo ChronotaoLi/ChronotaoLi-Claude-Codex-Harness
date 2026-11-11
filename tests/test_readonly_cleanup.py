@@ -4,8 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from harness.cleanup import cleanup_verification
-from harness.run_cleanup import cleanup_run
+from harness.cleanup import cleanup_run
 from harness.util import HarnessError, readonly_lock
 
 
@@ -19,15 +18,13 @@ class ReadonlyCleanupTests(unittest.TestCase):
             (directory / 'state.json').write_text('{}')
             before = {str(path.relative_to(repo)): path.read_bytes()
                       for path in repo.rglob('*') if path.is_file()}
-            for preview in (cleanup_run, cleanup_verification):
-                with self.subTest(preview=preview.__name__):
-                    with self.assertRaises(HarnessError):
-                        preview(repo, 'run_test')
-                    after = {str(path.relative_to(repo)): path.read_bytes()
-                             for path in repo.rglob('*') if path.is_file()}
-                    self.assertEqual(before, after)
-                    self.assertFalse((directory / 'run.lock').exists())
-                    self.assertFalse((repo / '.harness/.gitignore').exists())
+            with self.assertRaises(HarnessError):
+                cleanup_run(repo, 'run_test')
+            after = {str(path.relative_to(repo)): path.read_bytes()
+                     for path in repo.rglob('*') if path.is_file()}
+            self.assertEqual(before, after)
+            self.assertFalse((directory / 'run.lock').exists())
+            self.assertFalse((repo / '.harness/.gitignore').exists())
 
     def test_readonly_lock_preserves_existing_bytes_and_refuses_symlink(self):
         with tempfile.TemporaryDirectory() as temporary:

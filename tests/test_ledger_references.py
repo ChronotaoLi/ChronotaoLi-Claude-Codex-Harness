@@ -617,9 +617,8 @@ class LedgerReferenceTests(RepoCase):
 
     def test_completed_embedded_v15_ledger_stays_inspectable_and_cleanable(self):
         from harness import cli
-        from harness.cleanup import cleanup_verification
+        from harness.cleanup import cleanup_run
         from harness.cli import status_summary
-        from harness.run_cleanup import cleanup_run
         engine, backend, run = self.embedded_v15_terminal()
         path = engine.directory / 'state.json'
         before = path.read_bytes()
@@ -629,8 +628,9 @@ class LedgerReferenceTests(RepoCase):
         with contextlib.redirect_stdout(output):
             self.assertEqual(cli.main(['--repo', str(self.repo), 'status', run['id']]), 0)
         self.assertEqual(json.loads(output.getvalue())['status'], 'completed')
-        self.assertEqual(cleanup_run(self.repo, run['id'])['status'], 'eligible')
-        self.assertEqual([item['status'] for item in cleanup_verification(self.repo, run['id'])['checkouts']], ['eligible'])
+        preview = cleanup_run(self.repo, run['id'])
+        self.assertEqual(preview['worktree']['status'], 'eligible')
+        self.assertEqual([item['status'] for item in preview['checkouts']], ['eligible'])
         self.assertEqual(path.read_bytes(), before)
         # Execution never adopts the historical shape; nothing is dispatched or saved.
         calls = len(backend.calls)
@@ -654,10 +654,9 @@ class LedgerReferenceTests(RepoCase):
                         intent[field + '_artifact_digest'] = sha(job / name)
                     intent.pop('packet_digest')
                 write_json(path, damaged)
-                with self.assertRaisesRegex(HarnessError, 'worker receipt linkage'):
-                    cleanup_run(self.repo, run['id'])
-                with self.assertRaisesRegex(HarnessError, 'worker receipt linkage'):
-                    cleanup_verification(self.repo, run['id'])
+                for remove in (False, True):
+                    with self.assertRaisesRegex(HarnessError, 'worker receipt linkage'):
+                        cleanup_run(self.repo, run['id'], remove=remove)
                 path.write_bytes(before)
 
 

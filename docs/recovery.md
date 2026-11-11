@@ -71,7 +71,7 @@
 | `整体验证超时` | 修复环境或提高 `verify_timeout_seconds` | 普通 `resume`（同一快照重验） |
 | `同一代码快照的整体验证曾失败` | 确认环境已修复 | `resume RUN --reverify` |
 | `整体审阅已拒绝同一代码快照` | 等待修正规划；不能重抽 | 普通 `resume` 进入修正规划 |
-| `旧 dispatch … 的进程组仍存在` 或 `无法确认旧 dispatch … 已退出` | 核实该进程及其命令子进程已退出，不终止无关进程 | `resume RUN --confirm-exited ID`；终态 run 用 `cleanup-run`／`cleanup-verification` 的同名选项 |
+| `旧 dispatch … 的进程组仍存在` 或 `无法确认旧 dispatch … 已退出` | 核实该进程及其命令子进程已退出，不终止无关进程 | `resume RUN --confirm-exited ID`；终态 run 用 `cleanup-run` 的同名选项 |
 | `Cannot confirm command process exited: …` | 同上；用父 dispatch ID 确认 | 同上 |
 | worker 调用失败，退出已确认且原始证据判为可重试 | 修复原因 | 普通 `resume`（新的计费尝试） |
 | `worker return interrupted before immutable seal; …; automatic retry forbidden` | 保留证据 | `abandon RUN` |
@@ -88,7 +88,7 @@
 | `共享规则、skills、MCP 或 hooks 已改变` | 恢复原版本的共享资产 | 普通 `resume` |
 | `配置已改变：…` | 恢复不可放宽的配置值 | 普通 `resume` |
 | `缺少已保存的 worktree Git 绑定` | 启动在绑定保存前中断；核对后手工 `git worktree remove` 并删除 `harness/<run>` 分支 | `abandon RUN` 后重新 `run` |
-| `旧 run 仅保留为历史证据（台账版本 N，当前 16）` | 查看或清理，开始新 run | `status`、`dashboard`、`cleanup-run`、`cleanup-verification` |
+| `旧 run 仅保留为历史证据（台账版本 N，当前 16）` | 查看或清理，开始新 run | `status`、`dashboard`、`cleanup-run` |
 | `已有进程持有运行锁` | 等另一个 `run`／`resume`／`abandon` 结束 | 稍后重试 |
 
 ## 恢复步骤
@@ -190,15 +190,26 @@ python3 -m harness --config /path/to/harness.toml --repo /path/to/project resume
 
 ### 进程退出确认
 
-`--confirm-exited DISPATCH_ID` 用于 `resume`、`abandon`、`cleanup-run`、`cleanup-verification`，可重复。运行时在运行锁内校验全部 ID，先写审计事件（含当时的进程组探测与组长身份），再只更新指定记录；命令子进程用父 dispatch ID 确认，审计绑定子日志摘要。确认不终止进程、不放宽 HEAD、快照、Git 绑定或清理门禁，也不证明调用成功或没有结果。
+`--confirm-exited DISPATCH_ID` 用于 `resume`、`abandon`、`cleanup-run`，可重复。运行时在运行锁内校验全部 ID，先写审计事件（含当时的进程组探测与组长身份），再只更新指定记录；命令子进程用父 dispatch ID 确认，审计绑定子日志摘要。确认不终止进程、不放宽 HEAD、快照、Git 绑定或清理门禁，也不证明调用成功或没有结果。
 
 ### 放弃与清理
 
-- `abandon RUN` 把未完成的 run 标为 `abandoned`，保留分支、工作树和证据，之后不能 resume。它先经过 `load_run`：台账恢复链接损坏或加载时核验的证据被删改时拒绝放弃，保留现场供核对；路径索引与输入索引不在加载时核验，它们损坏时仍可放弃。
-- `abandon RUN --remove-worktree` 只移除该 run 的干净工作树：旧进程退出未确认、HEAD 不符、有任何未保存文件（含忽略文件）或 `assume-unchanged`／`skip-worktree` 标记时拒绝，不强制删除。删除意图先保存，删除后记账中断时，路径缺失且 Git 注册已消失才确认完成。
-- `cleanup-run RUN` 预览 `completed` 或 `abandoned` run 的工作树清理，加 `--remove` 才执行：在运行锁内核对台账归属、原分支与检查点、Git 绑定、全部派发与命令子进程退出和工作树原始字节；记录写入 `worktree-cleanup.json`。`--remove --remove-input-copies` 另删除登记且未修改的依赖副本。不删除分支、不清空证据。
-- `cleanup-verification RUN` 预览保留的全新验证检出，`--remove` 逐项移除符合门禁的检出；已跟踪修改、未跟踪或忽略文件阻止清理，错误列出前 10 个阻塞路径。目录已缺失而 Git 注册仍在时，只注销该精确路径，不做全仓库 prune。任一检出受阻时退出码为 1。
-- `cleanup-run` 与 `cleanup-verification` 不加载配置、不调用模型，支持版本 7–16 的台账。
+- `abandon RUN` 把未完成的 run 标为 `abandoned`，保留分支、工作树和证据，之后不能 resume。它先经过 `load_run`：台账恢复链接损坏或加载时核验的证据被删改时拒绝放弃，保留现场供核对；路径索引与输入索引不在加载时核验，它们损坏时仍可放弃。放弃不删除文件；要移除工作树，之后执行 `cleanup-run RUN --remove`。
+- `cleanup-run RUN` 是唯一的清理入口，默认只读预览，加 `--remove` 才逐项删除。它不加载配置、不调用模型，支持版本 7–16 的台账，不改 run 状态，不删除分支、台账或运行证据。
+  - 共同门禁：在运行锁内核对台账版本与归属（run ID、仓库、工作树路径、分支名、Git 公共目录与管理目录绑定）、命令目录、路径索引与输入索引、worker 回执链接，以及全部派发与命令子进程的退出证据。任一项不通过时整条命令报错，不处理任何资源。
+  - 全新验证检出：run 处于任何状态都可清理。已跟踪修改、未跟踪或忽略文件、`assume-unchanged`／`skip-worktree` 标记阻止清理，错误列出前 10 个阻塞路径。目录已缺失而 Git 注册仍在时，只注销该精确路径，不做全仓库 prune。记录写在检出证据旁的 `cleanup.json`。
+  - 分支工作树：只在 `completed` 或 `abandoned` 时清理，其他状态下按规则保留（`retained`）。要求原分支仍指向检查点，HEAD 与 Git 绑定未变，没有任何未保存文件（含忽略文件）或隐藏索引标记，已跟踪文件的字节与 HEAD 一致。记录写在 `worktree-cleanup.json`。`--remove --remove-input-copies` 另删除登记且未修改的依赖副本。
+  - 每个资源先保存删除意图，再执行 Git 删除，完成后记为 `removed`。删除后记账前中断时，重跑同一命令按已存意图续做，已经删掉的资源不再执行删除。
+  - 输出逐项列出每个资源的 `status`：
+    - `eligible`：预览时可以删除。
+    - `removed`：已删除，完成记录已写入。
+    - `absent`：预览时资源已不存在（有删除记录，或检出的目录、注册和管理目录都已消失）；加 `--remove` 时补写完成记录，报告 `removed`。
+    - `stale_registration`：仅验证检出，目录已缺失而 Git 注册仍在；`--remove` 只注销该精确路径。
+    - `input_copies_present`：仅工作树的预览，有登记的依赖副本，需 `--remove --remove-input-copies`。
+    - `retained`：仅工作树，run 还没有 `completed` 或 `abandoned`，按规则保留；`reason` 写明当前状态，并说明要先完成或放弃 run。
+    - `blocked`：资源本可清理，但门禁挡住了删除或预览；`error` 写明原因和阻塞路径，资源原样保留。
+  - 某个资源受阻不影响其余资源。只有出现 `blocked` 时退出码为 1；只有 `retained` 的工作树时退出码为 0。
+  - 已删除的 `abandon --remove-worktree` 在旧台账里留下的 `worktree_removed` 或 `pending_worktree_removal` 被当作已有的删除意图：工作树目录、Git 注册和管理目录都已消失时，工作树按已移除处理，其余资源照常清理。
 - `prepare-run RUN --manifest FILE` 只在 `paused` 或 `awaiting_approval` 且没有待处理阶段时准备依赖副本，格式见[依赖副本清单](operations.md#依赖副本清单)。
 
 ### 证据损坏
@@ -211,7 +222,7 @@ python3 -m harness --config /path/to/harness.toml --repo /path/to/project resume
 
 `completed` run 的普通 `resume` 返回保存结果，不派发；修改选项被拒绝。
 
-版本 15 及更早的台账不迁移、不执行：`resume`、`abandon` 和 `prepare-run` 都要求版本 16，对旧台账拒绝。以下只读、诊断与报告入口不要求当前版本，仍可用于旧台账：`status`（含 `status RUN` 与 `--full`）、`watch`、`dashboard`、`plan-readiness --run`、`permission-diagnostics`，以及受门禁保护的 `cleanup-verification`（版本 7–16，任意状态）和 `cleanup-run`（版本 7–16，仅 `completed` 或 `abandoned`）。旧版本中未到终态的 run 不能 `abandon`，因此也不能用 `cleanup-run` 清理其工作树。升级前应完成或放弃进行中的旧 run。
+版本 15 及更早的台账不迁移、不执行：`resume`、`abandon` 和 `prepare-run` 都要求版本 16，对旧台账拒绝。以下只读、诊断与报告入口不要求当前版本，仍可用于旧台账：`status`（含 `status RUN` 与 `--full`）、`watch`、`dashboard`、`plan-readiness --run`、`permission-diagnostics`，以及受门禁保护的 `cleanup-run`（版本 7–16；验证检出不限状态，工作树仅限 `completed` 或 `abandoned`）。旧版本中未到终态的 run 不能 `abandon`，因此 `cleanup-run` 只能清理它的验证检出，不能清理其工作树。升级前应完成或放弃进行中的旧 run。
 
 ## 不能自动恢复的窗口
 

@@ -32,7 +32,7 @@
 | `git.py`、`memory.py` | Git 绑定、快照、范围、接受提交与归档；SQLite 项目记忆 |
 | `shared.py`、`contracts.py`、`config.py`、`versions.py` | 共享资产摘要、MCP 校验、hooks；输出契约；配置；台账版本 |
 | `private_state.py`、`workspace_inputs.py` | `.harness` 私有根保护；依赖副本清单 |
-| `cleanup.py`、`run_cleanup.py` | `cleanup-verification`、`cleanup-run` |
+| `cleanup.py` | `cleanup-run`：共同门禁之后分别处理全新验证检出与分支工作树 |
 | `observe.py`、`dashboard.py`、`dashboard_page.py`、`watch.py`、`watch_cli.py` | 只读观察：列表与详情、本地网页、原生文件通知 |
 | `operations.py`、`supervisor.py`、`plan_readiness.py` | 操作记录；`supervise`；计划覆盖审阅材料 |
 | `permission_diagnostics.py`、`permission_smoke.py`、`tool_smoke.py`、`stream_smoke.py` | 权限诊断；真实账号联调入口 |
@@ -85,7 +85,7 @@
 **台账、版本与观察**
 
 27. 台账只经 `RunStore` 提交：在 `store.lock` 下比较已加载字节的摘要，拒绝旧写入，原子写入并递增 `store_revision`；外部动作前也核对当前权威。`run.lock` 保护生命周期。
-28. 旧版本台账不迁移、不执行：`resume`、`abandon`、`prepare-run` 只接受版本 16；版本 15 及更早仍可用只读、诊断与报告入口（`status`、`watch`、`dashboard`、`plan-readiness --run`、`permission-diagnostics`）和受门禁保护的 `cleanup-run`、`cleanup-verification`（版本 7–16，按各自形状核对）；不补写旧默认值。resume 另核对共享资产摘要（不含 hook 脚本的依赖）和完整配置快照。
+28. 旧版本台账不迁移、不执行：`resume`、`abandon`、`prepare-run` 只接受版本 16；版本 15 及更早仍可用只读、诊断与报告入口（`status`、`watch`、`dashboard`、`plan-readiness --run`、`permission-diagnostics`）和受门禁保护的 `cleanup-run`（版本 7–16，按各自形状核对）；不补写旧默认值。resume 另核对共享资产摘要（不含 hook 脚本的依赖）和完整配置快照。
 29. hooks 至少一次：`post_agent` 只作用于通过校验的结果和 `invalid_rejected` 审阅；`pre_accept`、`post_accept`、`on_error` 执行前递增计数并用独立日志目录，中断后可能重复。配置出现 `context_compacted` 时报未知事件并提示改用 `context_prepared`。
 30. 必要输入超过 `context_chars` 时不调用模型、不扣额度，报告仍写入 `context-report.json`；可选记忆按整条加入剩余空间。成功派发的报告保留根与顶层字段尺寸及最大的 30 个嵌套字段并给出省略数，超限报告保留全部明细。
 31. 观察层（`status`、`watch`、`dashboard`、操作记录、`supervise` 回执）不写台账、不取 `run.lock`、不参与恢复。
@@ -163,9 +163,10 @@
 | `command_requirements` | 计划登记、恢复、调度时重算，变化才保存 | 不清除 | 只是诊断，派发前总是重算 |
 | `context_capacity` | 整体审阅容量预估，变化才保存 | 不清除 | 必要下界超限时提前停止 |
 | `ignored_diagnostics` | 开始、worker 返回、验证结束 | 不清除 | 只是路径清单摘要 |
-| `pending_worktree_removal`、`worktree_removed` | `abandon --remove-worktree` 删除前存意图 | 删除后登记 `worktree_removed` | 路径与 Git 注册都已消失时完成记账 |
 
 `recovery.py` 的 `RECOVERY_BUSY_KEYS` 列出共用的十个待处理键，环境更新、续作拒绝、执行指导和操作者决定在其中任一有值时拒绝（见[恢复选项](recovery.md#恢复选项与互斥)）。`load_run` 在任何副作用前检查这些对象的类型、所引 dispatch 的角色与任务、`pending_task` 与 `pending_replan` 互斥，失败时不改写台账。
+
+清理状态不在台账里：`cleanup-run` 的删除意图与完成记录写在检出证据旁的 `cleanup.json` 和 run 目录的 `worktree-cleanup.json`，清理不改写台账（`--confirm-exited` 的退出确认除外）。已删除的 `abandon --remove-worktree` 曾写入 `pending_worktree_removal`、`worktree_removed`；新 run 不再写这两个键，`cleanup-run` 读旧台账时把它们当作已有的删除意图：工作树目录、Git 注册和管理目录都已消失时按已移除处理。
 
 ## 参考项目
 

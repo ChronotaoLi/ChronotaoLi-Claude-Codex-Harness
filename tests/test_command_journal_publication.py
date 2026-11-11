@@ -17,10 +17,9 @@ from unittest.mock import patch
 import test_delete_path
 from harness import cli, git
 from harness import command_server as cs
-from harness.cleanup import cleanup_verification
+from harness.cleanup import cleanup_run
 from harness.command_server import (DELETE_COMMAND_ID, STAGING_DIRECTORY, command_id, command_processes,
                                     ensure_command_processes_exited)
-from harness.run_cleanup import cleanup_run
 from harness.util import (ProcessTimeout, confirm_dispatches_exited, ensure_dispatches_exited, read_json,
                           validate_command_directories)
 from test_delete_path import ECHO, BrokerFixture
@@ -164,11 +163,11 @@ class LifecyclePublicationWindowTests(RepoCase):
         self.assertEqual(command_processes(job), [])
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(cli.main(['--repo', str(self.repo), 'status', run['id']]), 0)
-        self.assertEqual(cleanup_verification(self.repo, run['id'])['checkouts'], [])
         # The simulated verification leaves only these known test caches.
         shutil.rmtree(Path(run['worktree']) / '__pycache__', ignore_errors=True)
-        self.assertEqual(cleanup_run(self.repo, run['id'])['status'], 'eligible')
-        self.assertEqual(cleanup_run(self.repo, run['id'], remove=True)['status'], 'removed')
+        preview = cleanup_run(self.repo, run['id'])
+        self.assertEqual((preview['checkouts'], preview['worktree']['status']), ([], 'eligible'))
+        self.assertEqual(cleanup_run(self.repo, run['id'], remove=True)['worktree']['status'], 'removed')
 
     def check_exit(self, operation, injection, exit_name):
         engine, backend, first, later = self.stopped_run(operation, injection)

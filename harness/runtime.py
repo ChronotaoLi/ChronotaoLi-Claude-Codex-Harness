@@ -68,8 +68,8 @@ class Runtime:
     def load_run(self, ident):
         return self.services.lifecycle.load_run(ident)
 
-    def abandon(self, ident, *, remove_worktree=False, confirm_exited=()):
-        return self.services.lifecycle.abandon(ident, remove_worktree=remove_worktree, confirm_exited=confirm_exited)
+    def abandon(self, ident, *, confirm_exited=()):
+        return self.services.lifecycle.abandon(ident, confirm_exited=confirm_exited)
 
     def resume(self, ident, *, step=False, approve_plan=False, reverify=False, retry_stopped=None, confirm_exited=(),
                repair_invalid=None, allow_scope=(), environment_update=None, operator_decision=None,
