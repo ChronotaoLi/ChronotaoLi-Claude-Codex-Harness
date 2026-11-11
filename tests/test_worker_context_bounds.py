@@ -102,14 +102,15 @@ class BoundedWorkerLifecycleTests(RepoCase):
         self.assertEqual(result["attempts"], {"greet": 2})
         self.assertLessEqual(max(sizes), 32000)
 
-    def test_worker_correction_source_and_full_proposals_are_retained_for_independent_review(self):
+    def test_next_attempt_source_and_full_proposals_are_retained_for_independent_review(self):
         proposal = {"key": "greeting", "abstract": "Greeting interface", "content": "greet accepts a name",
                     "source_paths": ["hello.py"]}
         corrected = []
 
         def repair(backend, kwargs, packet, result):
             if kwargs["role"] == "worker":
-                if "format_correction" not in packet:
+                # The first output is invalid; the next ordinary attempt replaces it.
+                if sum(call["role"] == "worker" for call in backend.calls) == 1:
                     result["summary"] = "x" * 32001
                 else:
                     result["proposed_memories"] = [copy.deepcopy(proposal)]

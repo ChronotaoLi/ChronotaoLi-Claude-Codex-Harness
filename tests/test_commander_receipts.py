@@ -145,7 +145,7 @@ class CommanderReceiptTests(RepoCase):
         self.assertEqual(sum(c["kind"] == "dispatch" for c in backend.calls), 1)
         self.assertNotIn("pending_directive", result)
 
-    def test_returned_hard_error_is_rechecked_and_dispatch_error_updated(self):
+    def test_returned_identity_error_is_judged_invalid_and_redone_once(self):
         def invalid(backend, kwargs, packet, result):
             if kwargs["kind"] == "plan":
                 result["dispatch_id"] = "unrelated-dispatch"
@@ -153,15 +153,17 @@ class CommanderReceiptTests(RepoCase):
         backend = ScriptedBackend(invalid)
         engine = self.engine(backend)
         saved = self.interrupt_result(engine, "plan")
-        calls = copy.deepcopy(backend.calls)
-        for _ in range(2):
-            resumed = self.engine(backend)
-            with self.assertRaises(HarnessError):
-                resumed.resume(saved["id"])
-            self.assertEqual(backend.calls, calls)
-            self.assertEqual(resumed.run["dispatches"][-1]["status"], "failed")
-            self.assertIn("dispatch_id", resumed.run["dispatches"][-1]["error"])
-            self.assertEqual(resumed.run["tasks"], [])
+        calls = len(backend.calls)
+        resumed = self.engine(backend)
+        with self.assertRaisesRegex(HarnessError, "连续两次无效"):
+            resumed.resume(saved["id"])
+        # The returned original is judged without a new call; only its redo is new.
+        self.assertEqual(len(backend.calls), calls + 1)
+        first, second = [d for d in resumed.run["dispatches"] if d.get("kind") == "plan"]
+        self.assertEqual((first["status"], second["status"]), ("invalid", "invalid"))
+        self.assertEqual(second["retry_of"], first["id"])
+        self.assertIn("dispatch_id", first["error"])
+        self.assertEqual(resumed.run["tasks"], [])
 
     def test_digest_bound_result_cannot_be_modified_or_deleted_for_new_plan(self):
         for mode in ("changed", "missing"):
@@ -181,47 +183,24 @@ class CommanderReceiptTests(RepoCase):
                     self.engine(backend).resume(saved["id"])
                 self.assertEqual(backend.calls, calls)
 
-    def test_replan_format_correction_result_is_recovered_without_third_dispatch(self):
-        def malformed_first(backend, kwargs, packet, result):
-            if kwargs["role"] == "worker" and sum(c["role"] == "worker" for c in backend.calls) == 1:
-                self.block_worker(backend, kwargs, packet, result)
-            if kwargs["kind"] == "replan":
-                result.update(action="revise", reason="x" * 4001 if "format_correction" not in packet else "Clarify prerequisite",
-                    new_tasks=[], updates=[{"id": "greet", "description": "Implement the clarified greeting", "add_depends_on": []}])
-
-        backend = ScriptedBackend(malformed_first)
-        engine = self.engine(backend)
-        emit = engine.hooks.emit
-
-        def fail_correction(event, payload, logs):
-            if event == "post_agent" and payload.get("kind") == "replan":
-                raise HarnessError("correction hook unavailable")
-            return emit(event, payload, logs)
-
-        with patch.object(engine.hooks, "emit", side_effect=fail_correction):
-            with self.assertRaisesRegex(HarnessError, "correction hook unavailable"):
-                engine.start("Implement greet", self.plan())
-        result = self.engine(backend).resume(engine.run["id"])
-        self.assertEqual(result["status"], "completed")
-        self.assertEqual(sum(c["kind"] == "replan" for c in backend.calls), 2)
-        self.assertEqual(result["replan_attempts"], 1)
-        self.assertEqual(result["commander_receipts"], {})
-
-    def test_second_invalid_selection_is_terminal_after_one_correction(self):
+    def test_second_invalid_selection_stops_and_resume_is_a_new_request(self):
         def malformed(backend, kwargs, packet, result):
             if kwargs["kind"] == "dispatch":
                 result["instruction"] = " "
 
         backend = ScriptedBackend(malformed)
         engine = self.engine(backend)
-        with self.assertRaises(HarnessError):
+        with self.assertRaisesRegex(HarnessError, "连续两次无效"):
             engine.start("Implement greet", self.plan(multiple=True))
-        calls = copy.deepcopy(backend.calls)
-        self.assertEqual(len(calls), 2)
-        with self.assertRaises(HarnessError):
-            self.engine(backend).resume(engine.run["id"])
-        self.assertEqual(backend.calls, calls)
-        self.assertEqual(engine.run["attempts"], {})
+        self.assertEqual(len(backend.calls), 2)
+        resumed = self.engine(backend)
+        with self.assertRaisesRegex(HarnessError, "连续两次无效"):
+            resumed.resume(engine.run["id"])
+        selections = [d for d in resumed.run["dispatches"] if d.get("kind") == "dispatch"]
+        self.assertEqual([d["status"] for d in selections], ["invalid"] * 4)
+        self.assertEqual([d.get("retry_of") for d in selections],
+                         [None, selections[0]["id"], None, selections[2]["id"]])
+        self.assertEqual(resumed.run["attempts"], {})
 
     def test_malformed_task_blocker_preserves_replan_route_and_error_evidence(self):
         def malformed(backend, kwargs, packet, result):
@@ -232,13 +211,15 @@ class CommanderReceiptTests(RepoCase):
         self.config.data["runtime"]["max_attempts"] = 1
         backend = ScriptedBackend(malformed)
         engine = self.engine(backend)
-        with self.assertRaisesRegex(HarnessError, "不自动重派"):
+        # An invalid task blocker keeps its replan route and spends its attempt.
+        with self.assertRaisesRegex(HarnessError, "尝试次数上限"):
             engine.start("Implement greet", self.plan())
         trigger = engine.run["pending_replan"]["trigger"]
-        self.assertIn("format_error", trigger)
+        self.assertIn("output_error", trigger)
         self.assertTrue(Path(trigger["worker_artifact"]).is_file())
         with self.assertRaisesRegex(HarnessError, "尝试次数上限"):
             self.engine(backend).resume(engine.run["id"])
+        self.assertEqual([c["kind"] for c in backend.calls], ["implement"])
         self.config.data["runtime"]["max_attempts"] = 2
         resumed = self.engine(backend)
         with self.assertRaisesRegex(HarnessError, "停止重新规划"):
@@ -316,7 +297,7 @@ class CommanderReceiptTests(RepoCase):
         self.assertEqual(backend.calls, calls)
         self.assertEqual(resumed.run["replan_stopped"]["target"], "final")
 
-    def test_resumed_invalid_review_records_actual_dispatch_failure(self):
+    def test_resumed_invalid_review_records_its_error_and_is_redone(self):
         def invalid(backend, kwargs, packet, result):
             if kwargs["kind"] == "review":
                 result["dispatch_id"] = "unrelated-dispatch"
@@ -325,12 +306,13 @@ class CommanderReceiptTests(RepoCase):
         engine = self.engine(backend)
         saved = self.interrupt_result(engine, "review", self.plan())
         resumed = self.engine(backend)
-        with self.assertRaises(HarnessError):
+        with self.assertRaisesRegex(HarnessError, "连续两次无效"):
             resumed.resume(saved["id"])
-        entry = resumed.run["dispatches"][-1]
-        self.assertEqual(entry["role"], "reviewer")
-        self.assertEqual(entry["status"], "failed")
-        self.assertIn("dispatch_id", entry["error"])
+        first, second = [d for d in resumed.run["dispatches"] if d.get("kind") == "review"]
+        self.assertEqual((first["status"], second["status"]), ("invalid", "invalid"))
+        self.assertEqual(second["retry_of"], first["id"])
+        for entry in (first, second):
+            self.assertIn("dispatch_id", entry["error"])
 
     def test_stop_artifact_interruption_consumes_replan_budget_once(self):
         self.config.data["runtime"]["max_replans"] = 1

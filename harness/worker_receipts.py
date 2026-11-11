@@ -7,7 +7,7 @@ from pathlib import Path
 import stat
 
 from . import git
-from .contracts import RepairableFormatError, validate, validate_structure, validate_work_semantics
+from .contracts import judge_work
 from .recovery import snapshot_digest
 from .services import RuntimeService
 from .util import HarnessError, dump, read_json, write_json
@@ -106,16 +106,6 @@ class WorkerReceipts(RuntimeService):
                    'attempt': self.context.run['attempts'][entry['task_id']], 'phase': 'invoking'}
         entry['worker_receipt'] = deepcopy(receipt)
         self.context.run['worker_receipts'][key] = receipt
-
-    def original_packet(self, key):
-        """The sealed worker's exact input packet, for its automatic format correction."""
-        receipt = self.context.run['worker_receipts'][key]
-        try:
-            entry = self.entry(receipt)
-            return read_worker_input(self.context.directory, entry, entry['worker_receipt'], 'packet')
-        except HarnessError as error:
-            self.services.receipts.record_receipt_error(receipt, error)
-            raise
 
     def seal(self, entry, result):
         self.context.ensure_exited()
@@ -230,6 +220,11 @@ class WorkerReceipts(RuntimeService):
                 if entry.get('worker_receipt_consumed') == 'provider_failure' and (
                         evidence is None or evidence['state'] != 'retryable'):
                     raise HarnessError('worker provider failure lacks retry evidence')
+                if evidence is not None and evidence['state'] == 'retryable' and entry.get('worker_receipt_consumed') not in (None, 'provider_failure'):
+                    raise HarnessError('worker retry evidence has another outcome')
+                if evidence is not None and evidence['state'] == 'invalid' and (
+                        entry.get('worker_receipt_consumed') != 'result_rejected' or entry.get('status') != 'invalid'):
+                    raise HarnessError('worker invalid-output evidence lacks its rejection')
             if intent.get('artifact') != str(job / 'returned-result.json') or intent.get('seal') != str(job / 'worker-seal.json'):
                 raise HarnessError('worker intent paths invalid')
             properties = contract.get('properties', {})
@@ -286,6 +281,14 @@ class WorkerReceipts(RuntimeService):
                 # one commit, including when a crash skipped dispatch.finally.
                 self.reject(key, error, 'provider_failure')
                 return None
+            if evidence['state'] == 'invalid':
+                # A complete output that is not a decodable object result is an
+                # invalid delivery, whether or not the controller crashed first.
+                self.reject(key, HarnessError('worker output invalid: ' + evidence['reason']), 'result_rejected',
+                            status='invalid', invalid_output={
+                                'artifact': str(job / 'process.stdout'),
+                                'artifact_digest': evidence['sources']['process.stdout']})
+                return None
             raise HarnessError('worker return interrupted before immutable seal; ' + evidence['reason'] +
                                '; preserve evidence; automatic retry forbidden')
         return key
@@ -293,8 +296,6 @@ class WorkerReceipts(RuntimeService):
     def finish(self, key, task):
         try:
             return self._finish(key, task)
-        except RepairableFormatError:
-            raise
         except HarnessError as error:
             self.services.receipts.record_receipt_error(self.context.run['worker_receipts'].get(key), error)
             raise
@@ -367,19 +368,15 @@ class WorkerReceipts(RuntimeService):
             self.reject(key, error, 'scope_rejected')
             raise
         # The delivered contract is read back from its immutable file and digest.
-        contract = self.delivered_contract(entry, entry['worker_receipt'])
-        try:
-            validate_structure(result, contract)
-            validate_work_semantics(result)
-        except RepairableFormatError:
-            raise
-        except HarnessError as error:
-            if entry.get('format_correction') is True:
-                self.context.run['pending_format_corrections'].pop(key, None)
-            self.reject(key, error, 'correction_rejected' if entry.get('format_correction') is True else 'result_rejected')
-            raise
+        judgment = judge_work(result, self.delivered_contract(entry, entry['worker_receipt']))
+        if judgment.state == 'veto':
+            # A blocked report stays binding; no post_agent, no exemption.
+            return self.services.tasks.publish_invalid_blocker(task, key, result, judgment)
+        if judgment.state == 'invalid':
+            self.reject(key, judgment.error, 'result_rejected', status='invalid',
+                        invalid_output={'artifact': receipt['artifact'], 'artifact_digest': receipt['artifact_digest']})
+            return None
         entry['worker_outcome'] = ('completed' if result['status'] == 'completed' else result['blocker_kind'] + '_blocked')
-        validate(result, contract)
         if 'post_hook_digest' not in receipt:
             receipt['hook_attempts'] = receipt.get('hook_attempts', 0) + 1
             self.context.save()
@@ -392,11 +389,17 @@ class WorkerReceipts(RuntimeService):
         entry['status'] = 'completed'
         return {k: v for k, v in result.items() if k not in ('task_id', 'dispatch_id')}
 
-    def reject(self, key, error, reason):
-        """Retire a deterministically rejected result without accepting it."""
+    def reject(self, key, error, reason, *, status='failed', invalid_output=None):
+        """Retire a deterministically rejected result without accepting it.
+
+        An invalid output (status ``invalid``) is one spent work attempt: the
+        receipt is consumed and scheduling continues within max_attempts.
+        """
         receipt = self.context.run['worker_receipts'][key]
         entry = self.entry(receipt)
-        entry.update(status='failed', error=str(error))
+        entry.update(status=status, error=str(error))
+        if invalid_output is not None:
+            entry['invalid_output'] = invalid_output
         job = Path(receipt['artifact']).parent
         self.context.run['last_runtime_error'] = {'role': 'worker', 'kind': entry['kind'],
             'task_id': entry['task_id'], 'error': str(error), 'artifact': str(job)}
@@ -407,14 +410,15 @@ class WorkerReceipts(RuntimeService):
             self.services.workflow.record_worker_recovery(entry['task_id'], entry['id'], job, error)
         self.consume(key, reason)
         self.context.save()
+        if status == 'invalid':
+            self.services.receipts.observe_invalid(entry)
 
     def consume(self, key, reason):
         receipt = self.context.run['worker_receipts'].pop(key)
         self.entry(receipt)['worker_receipt_consumed'] = reason
         task_id = self.entry(receipt)['task_id']
         recovery = self.context.run.get('worker_recovery', {}).get(task_id)
-        rejection = reason in ('provider_failure', 'handoff_rejected', 'scope_rejected',
-                               'format_exhausted', 'correction_rejected', 'result_rejected', 'invalid_blocker')
+        rejection = reason in ('provider_failure', 'scope_rejected', 'result_rejected', 'invalid_blocker')
         if not rejection and recovery and recovery.get('dispatch_id') == receipt['dispatch_id']:
             self.context.run['worker_recovery'].pop(task_id)
 

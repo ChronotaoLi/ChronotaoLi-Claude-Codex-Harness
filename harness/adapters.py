@@ -12,7 +12,16 @@ from pathlib import Path
 
 from .command_server import create_manifest
 from .shared import mcp_configs, toml_value
-from .util import HarnessError, dump, read_json, run_process, tail, write_json
+from .util import HarnessError, dump, read_json, run_process, strict_json_loads, tail, write_json
+from .worker_returns import decode_terminal
+
+
+class UndecodableOutput(HarnessError):
+    """A complete provider terminal whose result is not a strictly decodable JSON object."""
+
+    def __init__(self, artifact, message):
+        self.artifact = Path(artifact)
+        super().__init__(message)
 
 
 _USAGE_MAX_BYTES = 16 * 1024 * 1024
@@ -358,31 +367,50 @@ class CLIBackend:
         return True
 
     def completed_result(self, job, provider):
-        """Parse only the provider's designated, complete terminal artifact."""
+        """Parse only the provider's designated, complete terminal artifact.
+
+        A complete, non-error terminal whose result does not strictly decode to a
+        JSON object raises UndecodableOutput: an invalid delivery, not a provider
+        failure. Claude's output is decoded by the same function the worker
+        no-result classifier uses, so both reach the same verdict on the same bytes.
+        """
         if provider == "codex":
-            if not (job / "response.json").exists():
+            path = job / "response.json"
+            if not path.exists():
                 raise HarnessError(f"Codex 未输出结构化结果：{job}")
-            return self.read_result(job / "response.json", "Codex")
-        result = self.read_result(job / "process.stdout", "Claude")
-        write_json(job / "provider-result.json", result)
-        if result.get("is_error") or result.get("subtype", "success") != "success":
-            raise HarnessError(f"Claude 未成功完成：{claude_error_summary(result) or 'unclassified CLI error'}；日志：{job}")
-        value = result.get("structured_output")
-        if value is None:
             try:
-                value = json.loads(result.get("result", ""))
-            except (ValueError, TypeError) as e:
-                raise HarnessError(f"Claude 未返回 JSON；日志：{job}") from e
+                value = strict_json_loads(path.read_bytes())
+            except OSError as e:
+                raise HarnessError(f"Codex 结构化结果无法读取；日志：{path}") from e
+            except (ValueError, UnicodeError, RecursionError) as e:
+                raise UndecodableOutput(path, f"Codex 结构化结果不能严格解码（{type(e).__name__}）；日志：{path}") from e
+            if not isinstance(value, dict):
+                raise UndecodableOutput(path, f"Codex 结构化结果必须为 JSON 对象；日志：{path}")
+            return value
+        path = job / "process.stdout"
+        try:
+            raw = path.read_bytes()
+        except OSError as e:
+            raise HarnessError(f"Claude 未返回有效 JSON；日志：{path}") from e
+        kind, envelope, value, detail = decode_terminal(raw)
+        if isinstance(envelope, dict):
+            write_json(job / "provider-result.json", envelope)
+        if kind == "absent":
+            raise HarnessError(f"Claude 未输出结果；日志：{job}")
+        if kind == "error":
+            raise HarnessError(f"Claude 未成功完成：{claude_error_summary(envelope) or 'unclassified CLI error'}；日志：{job}")
+        if kind == "undecodable":
+            raise UndecodableOutput(path, f"Claude 输出不能解码为 JSON 对象结果（{detail}）；日志：{job}")
+        # Written only once the value is known to be an object: its presence
+        # means an object result was returned (worker_returns.inspect_return).
         write_json(job / "response.json", value)
-        if not isinstance(value, dict):
-            raise HarnessError(f"Claude 结构化结果必须为 JSON 对象；日志：{job}")
         return value
 
     @staticmethod
     def read_result(path, provider):
         try:
-            value = read_json(path)
-        except (OSError, ValueError) as e:
+            value = strict_json_loads(path.read_bytes())
+        except (OSError, ValueError, UnicodeError, RecursionError) as e:
             raise HarnessError(f"{provider} 未返回有效 JSON；日志：{path}") from e
         if not isinstance(value, dict):
             raise HarnessError(f"{provider} 结果必须为 JSON 对象；日志：{path}")

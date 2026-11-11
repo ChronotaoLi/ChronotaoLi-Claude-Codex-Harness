@@ -10,14 +10,19 @@ from test_harness import ROOT, RepoCase
 
 class RecoveryStateValidationTests(RepoCase):
     def blocked_review(self):
-        def invalid_approval(backend, kwargs, packet, result):
-            if kwargs["kind"] == "review":
-                result["approved_memory_keys"] = ["unknown"]
-
-        backend = RecordingBackend(invalid_approval)
+        """Stop on a retained review receipt: the review's post_agent hook fails."""
+        backend = RecordingBackend()
         engine = self.engine(backend)
-        with self.assertRaises(HarnessError):
-            engine.start("Implement greet", read_json(ROOT / "examples/plan.json"))
+        emit = engine.hooks.emit
+
+        def fail(event, payload, logs):
+            if event == "post_agent" and payload.get("kind") == "review":
+                raise HarnessError("policy gate unavailable")
+            return emit(event, payload, logs)
+
+        with patch.object(engine.hooks, "emit", side_effect=fail):
+            with self.assertRaisesRegex(HarnessError, "policy gate unavailable"):
+                engine.start("Implement greet", read_json(ROOT / "examples/plan.json"))
         self.engine_before = engine
         self.backend = backend
         self.saved = copy.deepcopy(engine.run)
@@ -125,42 +130,33 @@ class RecoveryStateValidationTests(RepoCase):
 
     def test_correction_and_recovery_references_are_checked_at_load(self):
         self.blocked_review()
-        invalid = {**self.receipt, "dispatch_id": "missing"}
-        cases = [
-            ("review_corrections", self.key, {**self.receipt,
-                "artifact": str(Path(self.receipt["artifact"]).parents[1] / "missing" / "returned-result.json")}),
-            ("pending_format_corrections", self.key, {"dispatch_id": "missing", "correction": {}}),
-            ("pending_format_corrections", self.key, {"correction": {"previous_dispatch": "missing"}}),
-            ("pending_format_corrections", self.key, {"correction": {"source": invalid}}),
-            ("invalid_repairs", self.key, {"source": invalid}),
-            ("invalid_repairs", self.key, {"source": self.receipt, "original": invalid}),
-            ("invalid_repairs", self.key, {"source": self.receipt, "corrected_dispatch_id": "missing"}),
-            ("worker_recovery", "greet", self.receipt),
-        ]
+        cases = [("worker_recovery", "greet", self.receipt)]
         for field, key, value in cases:
             with self.subTest(field=field, value=value):
                 state = copy.deepcopy(self.saved)
                 state.setdefault(field, {})[key] = value
                 self.assert_stops_before_resume(state)
-        for field in ("review_receipts", "commander_receipts", "review_corrections",
-                      "pending_format_corrections", "invalid_repairs", "worker_recovery"):
+        # Redo links: retry_of must name an invalid output of the same call that
+        # was the previous model call; invalid_output must be that entry's own file.
+        review = next(d for d in self.saved["dispatches"] if d["id"] == self.receipt["dispatch_id"])
+        worker = next(d for d in self.saved["dispatches"] if d["role"] == "worker")
+        foreign = {"artifact": str(Path(self.receipt["artifact"]).parents[1] / review["id"] / "returned-result.json"),
+                   "artifact_digest": "0" * 64}
+        own = {"artifact": str(Path(self.receipt["artifact"]).parents[1] / worker["id"] / "returned-result.json")}
+        for name, field, value, target in (("retry_of missing", "retry_of", "missing", review),
+                                           ("retry_of non-invalid", "retry_of", worker["id"], review),
+                                           ("invalid_output of another entry", "invalid_output", foreign, worker),
+                                           ("invalid_output without digest", "invalid_output", own, worker),
+                                           ("invalid_output malformed", "invalid_output", [], worker)):
+            with self.subTest(case=name):
+                state = copy.deepcopy(self.saved)
+                entry = next(d for d in state["dispatches"] if d["id"] == target["id"])
+                entry[field] = value
+                if field == "invalid_output":
+                    entry["status"] = "invalid"
+                self.assert_stops_before_resume(state)
+        for field in ("review_receipts", "commander_receipts", "worker_recovery"):
             with self.subTest(field=field):
                 state = copy.deepcopy(self.saved)
                 state.setdefault(field, {})[self.key] = []
                 self.assert_stops_before_resume(state)
-
-    def test_unstarted_correction_and_retained_repair_sources_remain_loadable(self):
-        self.blocked_review()
-        state = copy.deepcopy(self.saved)
-        state["review_corrections"][self.key] = copy.deepcopy(self.receipt)
-        state["pending_format_corrections"][self.key] = {
-            "snapshot_digest": self.receipt["snapshot_digest"],
-            "correction": {"artifact": self.receipt["artifact"]}}
-        state["invalid_repairs"][self.key] = {
-            "status": "invalidated", "source": self.receipt, "original": self.receipt,
-            "corrected_dispatch_id": self.receipt["dispatch_id"]}
-        write_json(self.engine_before.directory / "state.json", state)
-        loaded = self.engine(self.backend)
-        loaded.load_run(state["id"])
-        self.assertEqual(loaded.run, state)
-        self.assertEqual(len(self.backend.calls), 2)

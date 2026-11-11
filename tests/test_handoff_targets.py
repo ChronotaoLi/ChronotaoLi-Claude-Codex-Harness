@@ -80,8 +80,22 @@ class HandoffProjectionTests(RepoCase):
         evidence = self.repo.resolve() / 'handoff-check-output.bin'
         evidence.write_bytes(b'actual check output\n')
         evidence_bytes = evidence.read_bytes()
+        seen = {}
 
         def retain_check(backend, kwargs, packet, result):
+            if kwargs['kind'] == 'dispatch' and not seen:
+                # Before the next attempt: the rejected output was never verified,
+                # reviewed or accepted, and its checkpoint is retained.
+                saved = self.saved(engine)
+                first = next(d for d in saved['dispatches'] if d['role'] == 'worker')
+                self.assertEqual((first['status'], first['worker_receipt_consumed']), ('invalid', 'result_rejected'))
+                self.assertEqual(saved['accepted'], {})
+                self.assertEqual(saved['decision_requests'], [])
+                self.assertEqual(len(saved['task_checkpoints']), 1)
+                self.assertFalse(any(d['role'] in ('verification', 'reviewer') for d in saved['dispatches']))
+                original = engine.directory / 'dispatches' / first['id'] / 'returned-result.json'
+                seen.update(dispatch=first['id'], original=original, bytes=original.read_bytes())
+                evidence.unlink()
             if kwargs['role'] != 'worker':
                 return
             workers = [call for call in backend.calls if call['role'] == 'worker']
@@ -98,27 +112,16 @@ class HandoffProjectionTests(RepoCase):
                 checkpoint = packet['task_checkpoints'][0]
                 self.assertEqual(checkpoint['status'], 'reusable')
                 self.assertEqual(Path(checkpoint['evidence'][0]['artifact']).read_bytes(), evidence_bytes)
-                self.assertEqual(checkpoint['dispatch_id'], original_dispatch)
+                self.assertEqual(checkpoint['dispatch_id'], seen['dispatch'])
                 source = packet['checkpoint_sources'][checkpoint['dispatch_id']]
-                self.assertEqual(Path(source['artifact']).read_bytes(), original_bytes)
+                self.assertEqual(Path(source['artifact']).read_bytes(), seen['bytes'])
 
         backend = ScriptedBackend(retain_check)
         engine = self.engine(backend)
-        with self.assertRaisesRegex(HarnessError, '后续决策'):
-            engine.start('Implement greet', self.plan())
-        saved = self.saved(engine)
-        self.assertEqual(saved['accepted'], {})
-        self.assertEqual(saved['decision_requests'], [])
-        self.assertNotIn('pending_task', saved)
-        self.assertEqual(len(saved['task_checkpoints']), 1)
-        self.assertFalse(any(d['role'] in ('verification', 'reviewer') for d in saved['dispatches']))
-        original_dispatch = next(d['id'] for d in saved['dispatches'] if d['role'] == 'worker')
-        original = engine.directory / 'dispatches' / original_dispatch / 'returned-result.json'
-        original_bytes = original.read_bytes()
-        evidence.unlink()
-        result = self.engine(backend).resume(engine.run['id'])
+        result = engine.start('Implement greet', self.plan())
         self.assertEqual(result['status'], 'completed')
-        self.assertEqual(original.read_bytes(), original_bytes)
+        self.assertFalse(evidence.exists())
+        self.assertEqual(seen['original'].read_bytes(), seen['bytes'])
         workers = [d for d in result['dispatches'] if d['role'] == 'worker']
         self.assertEqual(len({d['id'] for d in workers}), 2)
         self.assertEqual(result['attempts'], {'greet': 2})

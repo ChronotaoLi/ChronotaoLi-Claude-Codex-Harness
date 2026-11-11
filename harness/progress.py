@@ -11,7 +11,7 @@ from pathlib import Path
 import re
 import time
 
-from .contracts import validate_structure, validate_work_semantics
+from .contracts import validate_work_core
 from .worker_receipts import delivered_work_contract
 from .util import HarnessError, dump, write_json
 
@@ -141,9 +141,9 @@ class ProgressRecovery(RuntimeService):
             raise HarnessError("checkpoint source identity mismatch")
         if not any(d["id"] == dispatch_id and d["role"] == "worker" and d["task_id"] == task_id for d in self.context.run["dispatches"]):
             raise HarnessError("checkpoint source is not a known worker dispatch")
-        checked = result if validate_declarations else {k: v for k, v in result.items() if k != "checkpoints"}
-        validate_structure(checked, delivered_work_contract(self.context.run, self.context.directory, dispatch_id))
-        validate_work_semantics(checked)
+        # The core contract excludes checkpoints and memory proposals; declared
+        # checkpoints are checked on their own only when they are being relied on.
+        validate_work_core(result, delivered_work_contract(self.context.run, self.context.directory, dispatch_id))
         if validate_declarations:
             validate_checkpoints(result.get("checkpoints", []))
         if _validation is not None:

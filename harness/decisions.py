@@ -9,7 +9,7 @@ from os import PathLike
 from pathlib import Path
 import time
 
-from .contracts import REPLAN, envelope, validate_structure, validate_work_semantics
+from .contracts import REPLAN, envelope, validate_structure, validate_work_core
 from .worker_receipts import delivered_work_contract
 from .recovery import RECOVERY_BUSY_KEYS, read_bound_result, snapshot_digest
 from .util import HarnessError, dump, write_json
@@ -100,8 +100,7 @@ class DecisionRecovery(RuntimeService):
         if request['kind'] in ('worker', 'handoff'):
             if entry.get('role') != 'worker' or entry.get('kind') != 'implement' or entry.get('task_id') != request['source_task_id']:
                 raise HarnessError('decision worker source identity invalid')
-            validate_structure(result, delivered_work_contract(self.context.run, self.context.directory, dispatch_id))
-            validate_work_semantics(result)
+            validate_work_core(result, delivered_work_contract(self.context.run, self.context.directory, dispatch_id))
             if request['kind'] == 'worker':
                 if (request['task_id'] != request['source_task_id'] or result['status'] != 'blocked'
                         or result['blocker_kind'] != 'operator'
@@ -262,8 +261,6 @@ class DecisionRecovery(RuntimeService):
         if request is None or request['task_id'] != value['task_id'] or value['task_id'] in self.context.run['accepted']:
             raise HarnessError('operator decision request unknown or task accepted')
         active = [key for key in RECOVERY_BUSY_KEYS if self.context.run.get(key)]
-        if any(r.get('status') == 'pending' for r in self.context.run.get('invalid_repairs', {}).values()):
-            active.append('invalid_repairs')
         if active:
             raise HarnessError('pending lifecycle gates reject operator decisions: ' + ', '.join(active))
         stopped = self.context.run.get('replan_stopped')

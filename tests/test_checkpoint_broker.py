@@ -18,7 +18,7 @@ def digest(path):
 
 
 class BrokerCheckpointLifecycleTests(RepoCase):
-    def test_format_repair_preserves_broker_evidence_boundary_and_optional_omission(self):
+    def test_invalid_output_redo_preserves_broker_evidence_boundary_and_optional_omission(self):
         for mode in ('old', 'omit', 'repeat'):
             with self.subTest(mode=mode):
                 receipts = []
@@ -46,13 +46,13 @@ class BrokerCheckpointLifecycleTests(RepoCase):
                 workers = [d for d in result['dispatches'] if d['role'] == 'worker']
                 self.assertEqual(len(workers), 2)
                 self.assertNotEqual(workers[0]['id'], workers[1]['id'])
-                repair_call = [c for c in backend.calls if c['role'] == 'worker'][1]
-                self.assertEqual(repair_call['packet']['format_correction']['previous_dispatch'], workers[0]['id'])
+                # The invalid first output spends one attempt; the next worker is a fresh delivery.
+                self.assertEqual((workers[0]['status'], workers[1]['status']), ('invalid', 'completed'))
+                self.assertEqual(result['attempts'], {'greet': 2})
                 self.assertEqual(len(receipts), 2 if mode == 'repeat' else 1)
                 rows = result['task_checkpoints']
                 self.assertEqual(len(rows), 1 if mode == 'repeat' else 0)
                 events = [json.loads(line) for line in (engine.directory / 'events.jsonl').read_text().splitlines()]
-                self.assertEqual(sum(e['event'] == 'output_format_repair' for e in events), 1)
                 discarded = [e for e in events if e['event'] == 'checkpoints_discarded']
                 self.assertEqual(len(discarded), 1 if mode == 'old' else 0)
                 if mode == 'repeat':

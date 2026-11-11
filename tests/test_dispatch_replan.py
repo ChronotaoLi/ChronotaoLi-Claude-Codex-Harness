@@ -3,7 +3,6 @@ import copy
 from pathlib import Path
 from unittest.mock import patch
 
-from harness.contracts import validate_commander_format_correction
 from harness.util import HarnessError, read_json, write_json
 from test_harness import ROOT, RepoCase
 from test_runtime_changes import ScriptedBackend, finding
@@ -112,16 +111,7 @@ class DispatchReplanTests(RepoCase):
         self.assertEqual(result["tasks"][0]["acceptance"], self.plan()["tasks"][0]["acceptance"])
         self.assertEqual(result["final_history"][-1]["status"], "approved")
 
-    def test_format_correction_cannot_replace_routing(self):
-        previous = {"selected_task": "greet", "action": "implement", "instruction": " "}
-        current = {**previous, "instruction": "Implement"}
-        validate_commander_format_correction("dispatch", previous, current)
-        with self.assertRaisesRegex(HarnessError, "再规划选择"):
-            validate_commander_format_correction("dispatch", {**previous, "action": "replan"}, current)
-        with self.assertRaisesRegex(HarnessError, "再规划选择"):
-            validate_commander_format_correction("dispatch", previous, {**current, "action": "replan"})
-
-    def test_selection_without_action_is_a_contract_error_not_an_implement_route(self):
+    def test_selection_without_action_is_invalid_not_an_implement_route(self):
         def omit_action(backend, kwargs, packet, result):
             if kwargs["kind"] == "review" and sum(c["kind"] == "review" for c in backend.calls) == 1:
                 result.update(verdict="request_changes", findings=[finding(category="evidence")])
@@ -129,20 +119,22 @@ class DispatchReplanTests(RepoCase):
                 result.pop("action")
         backend = ScriptedBackend(omit_action)
         engine = self.engine(backend)
-        with self.assertRaisesRegex(HarnessError, "missing or unexpected fields"):
+        with self.assertRaisesRegex(HarnessError, "连续两次无效"):
             engine.start("Implement greet", self.plan())
-        # One worker ran under the deterministic first directive; the selection was
-        # rejected without a format correction or a second worker.
-        self.assertEqual([c["kind"] for c in backend.calls], ["implement", "review", "dispatch"])
+        # One worker ran under the deterministic first directive; the selection
+        # without an action was invalid, redone once, and never became a route.
+        self.assertEqual([c["kind"] for c in backend.calls], ["implement", "review", "dispatch", "dispatch"])
         self.assertEqual(engine.run["attempts"], {"greet": 1})
         self.assertNotIn("pending_directive", engine.run)
-        self.assertFalse(engine.run["pending_format_corrections"])
+        selections = [d for d in engine.run["dispatches"] if d.get("kind") == "dispatch"]
+        self.assertTrue(all(d["status"] == "invalid" and "missing or unexpected fields" in d["error"]
+                            for d in selections))
         saved = read_json(engine.directory / "state.json")
-        self.assertIn("commander:dispatch:dispatching", saved["commander_receipts"])
-        calls = len(backend.calls)
-        with self.assertRaisesRegex(HarnessError, "missing or unexpected fields"):
+        self.assertNotIn("commander:dispatch:dispatching", saved["commander_receipts"])
+        with self.assertRaisesRegex(HarnessError, "连续两次无效"):
             self.engine(backend).resume(engine.run["id"])
-        self.assertEqual(len(backend.calls), calls)
+        self.assertEqual([c["kind"] for c in backend.calls][4:], ["dispatch", "dispatch"])
+        self.assertEqual(read_json(engine.directory / "state.json")["attempts"], {"greet": 1})
 
     def test_deterministic_first_directive_routes_to_implement_without_commander(self):
         # The pristine directive names action=implement itself; routing reads it
@@ -157,22 +149,3 @@ class DispatchReplanTests(RepoCase):
         schema = task_directive(["greet"])
         self.assertIn("action", schema["required"])
         self.assertEqual(schema["properties"]["action"]["enum"], ["implement", "replan"])
-
-    def test_engine_format_repair_cannot_turn_replan_into_worker_execution(self):
-        backend = self.backend()
-        coordinate = backend.change
-        def replace_routing(backend, kwargs, packet, result):
-            coordinate(backend, kwargs, packet, result)
-            if kwargs["kind"] == "dispatch":
-                result.update(action="implement" if "format_correction" in packet else "replan",
-                              instruction="Continue working" if "format_correction" in packet else " ")
-        backend.change = replace_routing
-        engine = self.engine(backend)
-        with self.assertRaisesRegex(HarnessError, "再规划选择"):
-            engine.start("Implement greet", self.plan())
-        self.assertEqual(sum(c["role"] == "worker" for c in backend.calls), 1)
-        self.assertEqual(sum(c["kind"] == "dispatch" for c in backend.calls), 2)
-        before = len(backend.calls)
-        with self.assertRaisesRegex(HarnessError, "再规划选择"):
-            self.engine(backend).resume(engine.run["id"])
-        self.assertEqual(len(backend.calls), before)

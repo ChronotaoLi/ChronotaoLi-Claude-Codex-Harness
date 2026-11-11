@@ -7,7 +7,7 @@ import tempfile
 import unittest
 
 from harness.adapters import provider_schema
-from harness.contracts import (DETAIL, REVIEW, WORK, RepairableFormatError, envelope, output_constraints,
+from harness.contracts import (DETAIL, REVIEW, WORK, envelope, output_constraints,
                                validate_review)
 from harness.context import WORKER_CONTEXT_CHARS
 from harness.util import dump, HarnessError, read_json, write_json
@@ -27,17 +27,16 @@ def events(engine):
 class WorkerSummaryContractTests(unittest.TestCase):
     def test_summary_has_its_own_bound_while_shared_detail_fields_keep_theirs(self):
         validate_work_contract(work(summary="s" * 32000))
-        with self.assertRaises(RepairableFormatError) as raised:
+        with self.assertRaisesRegex(HarnessError, "response.summary"):
             validate_work_contract(work(summary="s" * 32001))
-        self.assertEqual(raised.exception.path, "response.summary")
-        with self.assertRaises(RepairableFormatError):
+        with self.assertRaisesRegex(HarnessError, "response.summary"):
             validate_work_contract(work(summary=" " * 10))
         for field in ("evidence", "blockers"):
-            with self.subTest(field=field), self.assertRaises(RepairableFormatError):
+            with self.subTest(field=field), self.assertRaisesRegex(HarnessError, f"response.{field}"):
                 validate_work_contract(work(**{field: ["e" * 4001]},
                                    **({"status": "blocked", "blocker_kind": "task"} if field == "blockers" else {})))
         self.assertEqual(DETAIL["maxLength"], 4000)
-        with self.assertRaises(RepairableFormatError):
+        with self.assertRaisesRegex(HarnessError, "response.summary"):
             validate_review({"verdict": "approve", "summary": "r" * 4001, "findings": [], "approved_memory_keys": []})
         self.assertIs(REVIEW["properties"]["summary"], DETAIL)
 
@@ -57,7 +56,7 @@ class WorkerSummaryLifecycleTests(RepoCase):
     def plan(self):
         return read_json(ROOT / "examples" / "plan.json")
 
-    def test_field_test_summary_length_reaches_verification_without_format_repair(self):
+    def test_field_test_summary_length_reaches_verification_as_a_valid_result(self):
         summary = ("Implemented greet and recorded the verification evidence. " * 80)[:4484]
         self.assertEqual(len(summary), 4484)
 
@@ -71,11 +70,10 @@ class WorkerSummaryLifecycleTests(RepoCase):
         self.assertEqual(result["attempts"], {"greet": 1})
         self.assertEqual([call["role"] for call in backend.calls].count("worker"), 1)
         names = [event["event"] for event in events(engine)]
-        self.assertNotIn("output_format_repair", names)
-        self.assertEqual(result["format_repairs"], {})
+        self.assertNotIn("output_invalid", names)
         workers = [d for d in result["dispatches"] if d["role"] == "worker"]
         self.assertEqual(len(workers), 1)
-        self.assertNotIn("format_correction", workers[0])
+        self.assertEqual(workers[0]["status"], "completed")
         worker_index = result["dispatches"].index(workers[0])
         self.assertEqual(result["dispatches"][worker_index + 1]["role"], "verification")
         returned = read_json(engine.directory / "dispatches" / workers[0]["id"] / "returned-result.json")
@@ -101,7 +99,7 @@ class WorkerSummaryLifecycleTests(RepoCase):
                 engine = self.engine(backend)
                 result = engine.start("Implement greet", self.plan())
                 self.assertEqual(result["status"], "completed")
-                self.assertNotIn("output_format_repair", [event["event"] for event in events(engine)])
+                self.assertNotIn("output_invalid", [event["event"] for event in events(engine)])
                 excerpt, = seen
                 self.assertTrue(summary.startswith(excerpt["summary"]))
                 self.assertLessEqual(len(dump(excerpt)), WORKER_CONTEXT_CHARS)
@@ -153,18 +151,19 @@ class WorkerSummaryLifecycleTests(RepoCase):
         self.assertLessEqual(len(error), 2000 + len(str(artifact)) + fixed_allowance)
         self.assertEqual(read_json(artifact)["summary"], summary)
 
-    def test_summary_beyond_its_bound_is_still_a_repairable_format_error(self):
+    def test_summary_beyond_its_bound_is_an_invalid_output_that_spends_one_attempt(self):
         def overlong_first(backend, kwargs, packet, result):
-            if kwargs["role"] == "worker" and "format_correction" not in packet:
+            if kwargs["role"] == "worker" and sum(call["role"] == "worker" for call in backend.calls) == 1:
                 result["summary"] = "x" * 32001
         backend = ScriptedBackend(overlong_first)
         engine = self.engine(backend)
         result = engine.start("Implement greet", self.plan())
         self.assertEqual(result["status"], "completed")
-        repairs = [event for event in events(engine) if event["event"] == "output_format_repair"]
-        self.assertEqual([(event["role"], event["task_id"]) for event in repairs], [("worker", "greet")])
-        correction = next(call for call in backend.calls if "format_correction" in call["packet"])
-        self.assertIn("response.summary", correction["packet"]["format_correction"]["error"])
+        invalid = [event for event in events(engine) if event["event"] == "output_invalid"]
+        self.assertEqual([(event["role"], event["task_id"]) for event in invalid], [("worker", "greet")])
+        first = next(d for d in result["dispatches"] if d["role"] == "worker")
+        self.assertEqual(first["status"], "invalid")
+        self.assertIn("response.summary", first["error"])
         self.assertEqual(result["attempts"], {"greet": 2})
 
 

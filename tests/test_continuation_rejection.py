@@ -308,7 +308,7 @@ class RejectionLifecycleTests(RepoCase):
         engine, backend, path, _, _ = self.waiting()
         options = ({'execution_guidance': path}, {'environment_update': path},
                    {'operator_decision': [path]}, {'reverify': True},
-                   {'retry_stopped': 'greet'}, {'repair_invalid': 'worker'}, {'allow_scope': ['extra/**']})
+                   {'retry_stopped': 'greet'}, {'allow_scope': ['extra/**']})
         before = (engine.directory / 'state.json').read_bytes()
         for extra in options:
             with self.subTest(extra=extra), self.assertRaises(HarnessError):

@@ -80,7 +80,7 @@ python3 -m harness --config /absolute/path/harness.toml --repo /absolute/path/to
 
 任务的 `required_commands` 最多声明 32 条不同的完整 argv，表示执行前置条件，不授予权限。派发前与 `verification.commands`、`permissions.worker_commands` 精确比较；不接受前缀，`verification.setup_commands` 不授予 worker 能力。能被内置 [`git_query`](docs/operations.md#git_query) 解析的只读 Git 查询（例如 `["git", "ls-files", "-z", "--", "src"]`）算作已满足，无需授权；`self_checks` 按同样规则比较。缺少授权时不启动 worker 或消耗其尝试，其他满足条件的就绪任务仍可继续；已有任务选择保持绑定。`status RUN` 显示 `missing_command_requirements`，追加精确授权后普通 `resume` 即可重检，无需环境更新。计划批准不增加权限，检查不证明命令存在、执行成功或验收通过。
 
-模型计划的重复／超限声明保留结果并停止，普通恢复不重抽计划。显式修正与恢复边界见[非法结果的显式修正](docs/recovery.md#非法结果的显式修正)及[阻塞出口](docs/recovery.md#阻塞状态与操作者出口)。
+模型计划无效（含 `required_commands` 重复或超过 32 条、任务数超过 `max_tasks`）时自动重做一次，仍无效则停止，普通 `resume` 重新请求。指挥与审阅读不出否决的无效输出都这样处理；worker 的无效输出计一次工作尝试后继续。规则与边界见[无效输出与自动重做](docs/recovery.md#无效输出与自动重做)及[阻塞出口](docs/recovery.md#阻塞状态与操作者出口)。
 
 任务可另声明 `self_checks`（最多 32 条精确 argv）与 `evidence_requirements`（`id`、从 0 起的 `acceptance_index`、`kind`、仓库相对 `path`）。证据类型为 `static`、`simulation`、`host_integration` 或 `device`。角色收到 `verification_plan`，区分 worker 聚焦自检、全部正式任务门禁与最终门禁；自检不授权，也不替代正式验证。worker 无需默认重复全套门禁，仅在有明确诊断理由时重复。运行时按 `evidence_requirements` 直接检查候选中的文件并记录摘要，worker 不再声明证据；内容正确性仍由独立审阅核验。返工时，修复声明和审阅处置都使用运行时按本次必需问题生成的键 `f1…fN`，模型不回填来源与问题 ID；声明不证明修复，候选路径与普通 evidence 中的外部日志引用保持分开。
 
@@ -147,16 +147,16 @@ python3 -m harness --repo /path/to/project cleanup-run RUN --remove
 | 配置键 | 计数 |
 | --- | --- |
 | `max_attempts` | 每个任务的 worker 工作尝试；已完整校验的 environment／operator 阻断不计入 |
-| `max_agent_dispatches` | 整个 run 的模型调用次数，包括指挥、worker、任务审阅、整体审阅和格式修正 |
+| `max_agent_dispatches` | 整个 run 的模型调用次数，包括指挥、worker、任务审阅、整体审阅和无效输出的重做 |
 | `max_replans` | 通过校验的再规划（含 stop） |
 | `max_final_attempts` | 整体验收尝试 |
 | `max_tasks` | 计划中的任务数，不是调用数 |
 
-没有全 run 的 worker 尝试上限：再规划新增的任务各有自己的 `max_attempts`，全局由 `max_agent_dispatches` 封顶。模型调用数远多于任务数，例如一次 7 个任务的 run 用了 52 次模型调用，所以不要把同一个数同时写进 `max_tasks` 和 `max_agent_dispatches`。因派发上限停止时，停止信息和 `status RUN` 的 `remaining_model_calls` 给出“如果之后全部一次通过，至少还需 N 次模型调用”；N 是下界，不含指挥调用、返工、修正和再规划。`status RUN` 的 `budgets` 另给出 `work_attempts`（扣除豁免后的任务尝试）和 `attempts_total`（各任务 worker 调用之和）。`runtime.max_total_attempts` 已删除；配置中出现它会报未知配置键，并说明改用 `max_attempts` 与 `max_agent_dispatches`。
+没有全 run 的 worker 尝试上限：再规划新增的任务各有自己的 `max_attempts`，全局由 `max_agent_dispatches` 封顶。模型调用数远多于任务数，例如一次 7 个任务的 run 用了 52 次模型调用，所以不要把同一个数同时写进 `max_tasks` 和 `max_agent_dispatches`。因派发上限停止时，停止信息和 `status RUN` 的 `remaining_model_calls` 给出“如果之后全部一次通过，至少还需 N 次模型调用”；N 是下界，不含指挥调用、返工、重做和再规划。`status RUN` 的 `budgets` 另给出 `work_attempts`（扣除豁免后的任务尝试）和 `attempts_total`（各任务 worker 调用之和）。`runtime.max_total_attempts` 已删除；配置中出现它会报未知配置键，并说明改用 `max_attempts` 与 `max_agent_dispatches`。
 
 `watch RUN` 用 macOS kqueue 或 Linux inotify 等待文件变化，只在观察结果改变时输出简短 JSONL；等待超时不重读台账。默认到阻塞、暂停、等待批准或终态后退出，`--follow` 可继续等待后续恢复。`watch RUN --state /path/to/.harness` 可以直接观察保留下来的运行证据，不要求该目录仍是 Git 工作树。不支持原生通知的平台会明确报错。观察值来自台账，不证明模型进程仍在工作。
 
-状态和网页提供只读返工提示：未接受任务达到三次工作尝试，或连续两次审阅出现同一阻断 ID 时提示；整体拒绝两次也会提示。任务接受或 run 结束后不再把历史问题显示为当前提示。`review_rounds` 按任务列出每一轮审阅首次出现的 blocking ID、来源审阅 dispatch 和候选摘要，不推断成因。这些信息用于判断范围和方案复杂度，不增加预算、不启动恢复、不改变验收。
+状态和网页提供只读返工提示：未接受任务达到三次工作尝试，或连续两次审阅出现同一阻断标签时提示；整体拒绝两次也会提示。任务接受或 run 结束后不再把历史问题显示为当前提示。`review_rounds` 按任务列出每一轮审阅首次出现的 blocking 标签（审阅者写的 id，可以重复，同名不一定是同一个问题）、来源审阅 dispatch 和候选摘要，不推断成因。这些信息用于判断范围和方案复杂度，不增加预算、不启动恢复、不改变验收。
 
 `dashboard` 在 127.0.0.1 启动只读观察网页，stdout 只打印访问地址，Ctrl-C 停止；与 `status` 一样不加载配置。它不启动、恢复或修改 run，不取锁、不写文件、不探测进程：台账记为 running 不等于进程仍在工作，Claude 的结构化输出可能在调用结束才出现。费用按供应商分列，Claude 为 CLI 报告的估算费用而非账户账单，Codex 不报告美元。页面区块、调用阶段分类与文件访问边界见[观察网页用法与限制](docs/operations.md#观察网页用法与限制)。
 
@@ -174,7 +174,6 @@ python3 -m harness --repo /path/to/project cleanup-run RUN --remove
 | 指挥明确停止 | 已登记的有效请求用 `resume RUN --operator-decision FILE` 回答；无可用请求的历史停止用 `--retry-stopped TASK_ID`，整体阶段用 `final` |
 | 再规划需要额外范围 | `resume RUN --allow-scope 'config/**'`；停止状态另需显式重试 |
 | 最终验证普通非零退出 | 正常修正规划；确认环境已修复时可显式 `resume RUN --reverify` |
-| 可受控修正的非法结果 | `resume RUN --repair-invalid DISPATCH_ID` |
 | 模型派发上限用尽 | 按 `remaining_model_calls` 的下界提高 `max_agent_dispatches` 后普通 `resume RUN` |
 | 旧 dispatch 退出记录无法确认 | 人工核实后 `--confirm-exited DISPATCH_ID` |
 
@@ -186,7 +185,7 @@ python3 -m harness --repo /path/to/project cleanup-run RUN --remove
 
 新台账版本为 17，要求完整的 worker 接收意图与配置快照，缺失时不补造旧默认值。台账只存摘要与引用：worker 接收意图记录派发目录中不可变的 `packet.json`、`schema.json` 的路径与 SHA256，续作、执行指导和续作拒绝行只记 `snapshot_digest`，完整快照在 `continuations/` 等目录的不可变文件里；这些文件被删除、修改或换成符号链接时 `resume` 停止并保留现场。版本 16 及更早不迁移、不执行：`resume`、`abandon`、`prepare-run` 拒绝旧台账；`status`、`watch`、`dashboard`、`permission-diagnostics` 仍可只读使用，`cleanup-run` 仍可在门禁通过后清理（工作树仅限终态）。共享规则变更也受资产摘要门禁约束。版本 17 已完成 run 的普通恢复返回保存结果；终态限制见[终态与历史台账](docs/recovery.md#终态与历史台账)。
 
-以下接口已删除：命令 `notify`、`inbox`、`ack` 与通知收件箱（已有的 `.harness/notifications/` 不再读写，可手工删除）；命令 `cleanup-verification` 与选项 `abandon --remove-worktree`（都改用 `cleanup-run`；旧台账的 `worktree_removed` 仍被识别）；命令 `plan-readiness` 与 `examples/plan-readiness.json`（改为用 `status RUN --full` 审阅保存的计划，再 `resume RUN --approve-plan`）；`handoff.md`（只写 `handoff.json`）；hooks 事件名 `context_compacted`（改用 `context_prepared`）；配置键 `runtime.max_total_attempts`；配置键 `runtime.claude_output_mode` 与联调入口 `python3 -m harness.stream_smoke`（流式元数据模式 `stream_metadata_v1` 已删除，Claude 只用 JSON 输出）。
+以下接口已删除：命令 `notify`、`inbox`、`ack` 与通知收件箱（已有的 `.harness/notifications/` 不再读写，可手工删除）；命令 `cleanup-verification` 与选项 `abandon --remove-worktree`（都改用 `cleanup-run`；旧台账的 `worktree_removed` 仍被识别）；命令 `plan-readiness` 与 `examples/plan-readiness.json`（改为用 `status RUN --full` 审阅保存的计划，再 `resume RUN --approve-plan`）；`handoff.md`（只写 `handoff.json`）；hooks 事件名 `context_compacted`（改用 `context_prepared`）；配置键 `runtime.max_total_attempts`；选项 `resume --repair-invalid` 与格式修正（无效输出改由新调用重做，见[无效输出与自动重做](docs/recovery.md#无效输出与自动重做)）；配置键 `runtime.claude_output_mode` 与联调入口 `python3 -m harness.stream_smoke`（流式元数据模式 `stream_metadata_v1` 已删除，Claude 只用 JSON 输出）。
 
 ## 共用 skills / MCP / hooks
 
@@ -199,7 +198,7 @@ python3 -m harness --repo /path/to/project cleanup-run RUN --remove
 | [shared/mcp.json](shared/mcp.json) | 外部 MCP 服务的唯一配置源 |
 | [shared/hooks.json](shared/hooks.json) | 确定性的编排生命周期 hooks |
 
-协议说明放在 RULES 与角色 skill 里，每次派发都注入；包里放数据、索引和现场事实。环境更新、操作者决定、检查点、执行指导、权限、审阅、路径与命令索引、问题进度和计划增量的读法都只在 RULES 与技能里。仍留在包里的静态说明只有这几类，会随后续协议改动移除或改写：指挥 plan／dispatch／replan 的 `instruction`、不经指挥直接派发时的默认 worker 指令和续作拒绝后的 worker 指令、格式修正与显式修正的 `instruction`。某任务没有相关的环境更新、决定或检查点时，包里只带对应索引。指挥包另带 `workspace: {head, clean}`：当时的 `expected_head` 与工作树 `git status` 是否干净。
+协议说明放在 RULES 与角色 skill 里，每次派发都注入；包里放数据、索引和现场事实。环境更新、操作者决定、检查点、执行指导、权限、审阅、路径与命令索引、问题进度和计划增量的读法都只在 RULES 与技能里。仍留在包里的静态说明只有这几类，会随后续协议改动移除或改写：指挥 plan／dispatch／replan 的 `instruction`、不经指挥直接派发时的默认 worker 指令和续作拒绝后的 worker 指令。重做时包里的 `previous_invalid` 只带上一次无效输出的引用与错误，是数据。某任务没有相关的环境更新、决定或检查点时，包里只带对应索引。指挥包另带 `workspace: {head, clean}`：当时的 `expected_head` 与工作树 `git status` 是否干净。
 
 角色 skill 自动注入一次；计划的 `skills` 选择额外技能，不需要时用 `[]`。其他技能先加载目录，再通过 `skill_read` 按需读取。旧计划引用角色 skill 仍合法且不会重复注入；不会自动安装整个 ECC 技能目录。
 
@@ -325,4 +324,4 @@ python3 -m harness --repo /abs/project cleanup-run RUN --remove --remove-input-c
 
 `supervise` 只启动一次指定的 Harness `run`/`resume`，保留子进程 stdout，监督回执写入 `.harness/supervision/` 并输出到 stderr，退出码等于子进程退出码；不会重启或自动恢复。父进程退出仍不证明 broker 子进程退出。要在 run 停下时得到提示，用 `watch RUN`（到阻塞、暂停、等待批准或终态时退出）或 `supervise`。
 
-Claude 调用只用 JSON 输出（`--output-format json`），终态只从派发目录的 `process.stdout` 读取；错误、缺失或损坏的终态及非零退出均不能接受。观察不到的读取范围或拒绝原因保持未知。只读 `permission-diagnostics RUN DISPATCH --argv-json '["python3", "-m", "unittest"]'` 对比供应商拒绝证据和当前配置中的精确命令能力，并在 `builtin_coverage` 中单独说明该 argv 是否由内置 `git_query` 覆盖；它不执行命令或扩大权限。`status` 和 dashboard 同时显示预算的已用/上限/剩余与调用、审阅候选、失败、格式修正等独立维度。
+Claude 调用只用 JSON 输出（`--output-format json`），终态只从派发目录的 `process.stdout` 读取；错误、缺失或损坏的终态及非零退出均不能接受。观察不到的读取范围或拒绝原因保持未知。只读 `permission-diagnostics RUN DISPATCH --argv-json '["python3", "-m", "unittest"]'` 对比供应商拒绝证据和当前配置中的精确命令能力，并在 `builtin_coverage` 中单独说明该 argv 是否由内置 `git_query` 覆盖；它不执行命令或扩大权限。`status` 和 dashboard 同时显示预算的已用/上限/剩余与调用、审阅候选、失败、无效输出等独立维度。

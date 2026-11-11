@@ -259,7 +259,7 @@ APP_JS = r""""use strict";
     final_verification_failed: "整体验证失败", final_review_rejected: "整体审阅拒绝",
     final_reverification_requested: "请求重新整体验证", environment_update_recorded: "登记环境更新",
     environment_checked: "环境检查", command_requirements_checked: "命令授权检查",
-    task_checkpoint_recorded: "记录检查点", output_format_repair: "输出格式修正",
+    task_checkpoint_recorded: "记录检查点", output_format_repair: "输出格式修正", output_invalid: "输出无效",
     invalid_output_repair_requested: "请求修正非法输出", candidate_preflight_failed: "候选预检失败",
     pending_task_invalidated: "待处理任务作废", pending_acceptance_invalidated: "待接受结果作废",
     worktree_removed: "工作树已删除", broad_scope_warning: "范围过宽提示", scope_extension_approved: "范围扩展已批准",
@@ -1299,7 +1299,7 @@ APP_JS = r""""use strict";
     if (summary.budget_explanation) {
       var explanation = disclosure("cost:dimensions", "调用与候选事实（独立计数维度）", "block");
       var dimensions = summary.budget_explanation.dimensions || {};
-      explanation.appendChild(notice("计数来自台账关联；完成调用不代表接受，来源缺失保留未知。格式修正与失败可重叠。", "hint"));
+      explanation.appendChild(notice("计数来自台账关联；完成调用不代表接受，来源缺失保留未知。无效输出与失败分开计数。", "hint"));
       explanation.appendChild(kv(Object.keys(dimensions).map(function (key) {
         return [key, typeof dimensions[key] === "object" ? JSON.stringify(dimensions[key]) : dimensions[key]];
       })));

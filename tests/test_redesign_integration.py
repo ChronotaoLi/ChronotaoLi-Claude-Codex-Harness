@@ -143,12 +143,15 @@ class RedesignIntegrationTests(RepoCase):
             else:
                 result.pop("finding_dispositions", None)
         engine = self.engine(ScriptedBackend(unresolved))
-        with self.assertRaises(HarnessError):
+        # An approval without its required dispositions is structurally invalid: redone, never accepted.
+        with self.assertRaisesRegex(HarnessError, "连续两次无效"):
             engine.start("Implement greet", self.plan())
         self.assertEqual(engine.run["accepted"], {})
-        last = engine.run["review_history"]["greet"][-1]
-        self.assertEqual(last["review"]["verdict"], "approve")
-        self.assertTrue(last["disposition_errors"])
+        reviews = [d for d in engine.run["dispatches"] if d.get("kind") == "review"]
+        self.assertEqual([d["status"] for d in reviews], ["completed", "invalid", "invalid"])
+        self.assertEqual(reviews[2]["retry_of"], reviews[1]["id"])
+        self.assertEqual([record["review"]["verdict"] for record in engine.run["review_history"]["greet"]],
+                         ["request_changes"])
 
     def test_old_run_is_evidence_only_and_not_migrated(self):
         backend = ScriptedBackend()

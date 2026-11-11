@@ -56,6 +56,29 @@ def read_json(path: Path):
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _unique_pairs(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key: {key!r}")
+        result[key] = value
+    return result
+
+
+def _reject_constant(name):
+    raise ValueError(f"non-finite JSON number: {name}")
+
+
+def strict_json_loads(raw):
+    """Decode model or provider JSON exactly: no duplicate keys, no NaN/Infinity.
+
+    Raises ValueError (including JSONDecodeError), UnicodeError or RecursionError.
+    """
+    if isinstance(raw, (bytes, bytearray)):
+        raw = bytes(raw).decode("utf-8")
+    return json.loads(raw, object_pairs_hook=_unique_pairs, parse_constant=_reject_constant)
+
+
 @contextlib.contextmanager
 def lock(path: Path):
     path.parent.mkdir(parents=True, exist_ok=True)

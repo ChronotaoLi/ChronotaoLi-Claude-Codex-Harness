@@ -1,8 +1,11 @@
 import copy
+import tempfile
 import unittest
+from pathlib import Path
 
 from harness.contracts import (REPLAN, review_approved, validate, validate_review,
                                validate_plan, validate_revision)
+from harness.memory import validate_proposals
 from harness.util import HarnessError
 from test_runtime_changes import validate_work_contract
 
@@ -117,12 +120,14 @@ class AcceptanceContractTests(unittest.TestCase):
             with self.subTest(changes=changes), self.assertRaises(HarnessError):
                 validate_review(review([problem]))
 
-    def test_memory_approval_is_independent_and_keys_must_exist(self):
-        accepted = review(approved_keys=["architecture.storage"])
-        validate_review(accepted, proposed_keys=["architecture.storage"])
-        with self.assertRaises(HarnessError):
-            validate_review(accepted)
-        self.assertTrue(review_approved(review()))
+    def test_memory_approval_is_independent_of_the_review_verdict(self):
+        # Approvals are an optional product: unknown or malformed approvals
+        # never make the review itself invalid; they are filtered on their own.
+        for approved in (["architecture.storage"], ["unknown"], "not a list"):
+            with self.subTest(approved=approved):
+                accepted = {**review(), "approved_memory_keys": approved}
+                self.assertIs(validate_review(accepted), accepted)
+                self.assertTrue(review_approved(accepted))
         self.assertEqual(review()["approved_memory_keys"], [])
 
     def test_worker_blocker_classification_is_consistent(self):
@@ -137,16 +142,23 @@ class AcceptanceContractTests(unittest.TestCase):
             validate_work_contract({**completed, "status": "blocked", "blockers": ["Dependency unavailable"],
                            "blocker_kind": kind})
 
-    def test_worker_proposals_are_bounded_and_unique(self):
+    def test_worker_proposals_are_bounded_and_unique_on_their_own(self):
         proposal = {"key": "architecture.storage", "abstract": "Storage", "content": "SQLite",
                     "source_paths": ["src/store.py"]}
         result = {"status": "completed", "summary": "Complete", "evidence": [],
                   "blockers": [], "blocker_kind": "none", "proposed_memories": [proposal]}
         validate_work_contract(result)
-        for proposals in ([proposal, proposal], [{**proposal, "content": "x" * 8001}],
-                          [{**proposal, "key": "../operator"}], [{**proposal, "source_paths": []}]):
-            with self.subTest(proposals=proposals), self.assertRaises(HarnessError):
-                validate_work_contract({**result, "proposed_memories": proposals})
+        with tempfile.TemporaryDirectory() as root:
+            (Path(root) / "src").mkdir()
+            (Path(root) / "src" / "store.py").write_text("store = 1\n")
+            self.assertEqual(len(validate_proposals([proposal], root)), 1)
+            for proposals in ([proposal, proposal], [{**proposal, "content": "x" * 8001}],
+                              [{**proposal, "key": "../operator"}], [{**proposal, "source_paths": []}]):
+                with self.subTest(proposals=proposals):
+                    # The proposals are rejected alone; the worker result stays valid.
+                    validate_work_contract({**result, "proposed_memories": proposals})
+                    with self.assertRaises(HarnessError):
+                        validate_proposals(proposals, root)
 
 
 if __name__ == "__main__":

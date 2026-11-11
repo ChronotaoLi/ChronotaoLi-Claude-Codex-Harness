@@ -36,7 +36,7 @@ class SnapshotEfficiencyTests(RepoCase):
 
     def test_blank_commander_instruction_needs_new_dispatch_before_worker(self):
         def change(backend, kwargs, packet, result):
-            if kwargs["kind"] == "dispatch" and "format_correction" not in packet:
+            if kwargs["kind"] == "dispatch" and "previous_invalid" not in packet:
                 result["instruction"] = " "
 
         plan = read_json(ROOT / "examples" / "plan.json")
@@ -50,3 +50,5 @@ class SnapshotEfficiencyTests(RepoCase):
         self.assertTrue(all(c["packet"]["instruction"].strip() for c in workers))
         calls = [d["id"] for d in result["dispatches"] if d["role"] == "commander"]
         self.assertEqual(len(calls), len(set(calls)))
+        selections = [d for d in result["dispatches"] if d.get("kind") == "dispatch"]
+        self.assertEqual((selections[0]["status"], selections[1]["retry_of"]), ("invalid", selections[0]["id"]))

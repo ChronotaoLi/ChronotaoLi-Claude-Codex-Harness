@@ -327,45 +327,6 @@ class LedgerReferenceTests(RepoCase):
             engine.start('Implement greet', self.plan())
         return engine, backend
 
-    def test_automatic_format_correction_after_interruption_reads_original_packet_file(self):
-        engine, backend = self.format_invalid_then_interrupted_after_first_seal()
-        first = self.workers(engine.run)[0]
-        stored = read_json(engine.directory / 'dispatches' / first['id'] / 'packet.json')
-        reads = []
-        original = receipts_module.read_worker_input
-
-        def spy(directory, entry, intent, field):
-            reads.append((entry['id'], field))
-            return original(directory, entry, intent, field)
-        with patch.object(receipts_module, 'read_worker_input', spy):
-            run = self.engine(backend).resume(engine.run['id'])
-        self.assertEqual(run['status'], 'completed')
-        calls = [call for call in backend.calls if call['role'] == 'worker']
-        self.assertEqual(len(calls), 2)
-        correction = calls[1]['packet']
-        self.assertEqual(correction['format_correction']['previous_dispatch'], first['id'])
-        # Resume replays with an empty packet; the correction's task input can
-        # only come from the verified original packet file.
-        for field in ('goal', 'task', 'instruction', 'dependencies', 'verification_commands'):
-            self.assertEqual(correction[field], calls[0]['packet'][field], field)
-            self.assertEqual(stored[field], calls[0]['packet'][field], field)
-        self.assertIn((first['id'], 'packet'), reads)
-        self.assertEqual(run['attempts']['greet'], 2)
-        self.assertEqual(self.workers(run)[1]['format_correction'], True)
-
-    def test_format_correction_refuses_changed_original_packet(self):
-        engine, backend = self.format_invalid_then_interrupted_after_first_seal()
-        first = self.workers(engine.run)[0]
-        packet = engine.directory / 'dispatches' / first['id'] / 'packet.json'
-        packet.write_bytes(packet.read_bytes().replace(b'Implement greet', b'Implement GREET', 1))
-        with self.assertRaisesRegex(HarnessError, 'packet artifact changed'):
-            engine.services.worker_receipts.original_packet('worker:implement:greet')
-        calls = len(backend.calls)
-        with self.assertRaisesRegex(HarnessError, 'packet artifact changed'):
-            self.engine(backend).resume(engine.run['id'])
-        self.assertEqual(len(backend.calls), calls)
-        self.assertIn(b'Implement GREET', packet.read_bytes())
-
     def test_changed_worker_inputs_stop_resume_and_preserve_evidence(self):
         cases = [(name, mode) for name in INPUTS for mode in ('delete', 'byte', 'symlink')]
         for index, (name, mode) in enumerate(cases):

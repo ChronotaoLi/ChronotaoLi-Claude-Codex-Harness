@@ -134,23 +134,17 @@ class CheckpointSemanticsTests(RepoCase):
                                     before['feedback']['checkpoints_discarded']
                                     for c in backend.calls[1:] if c['role'] in ('worker', 'commander')))
 
-    def test_over_limit_completed_gets_one_bounded_format_correction(self):
+    def test_over_limit_completed_discards_checkpoints_without_another_attempt(self):
         backend = self.backend('over_limit')
         engine = self.start(backend)
         self.assert_accepted(engine, backend)
-        workers = [c for c in backend.calls if c['role'] == 'worker']
-        self.assertEqual(len(workers), 2)
-        self.assertIn('format_correction', workers[1]['packet'])
-        self.assertEqual(engine.run['attempts'], {'greet': 2})
-        backend = self.backend('over_limit', always=True)
-        engine = self.engine(backend)
-        with self.assertRaises(HarnessError):
-            engine.start('Implement greet', read_json(ROOT / 'examples' / 'plan.json'))
-        self.assertEqual(sum(c['role'] == 'worker' for c in backend.calls), 2)
-        self.assertEqual(engine.run['accepted'], {})
-        self.assertFalse(any(d['role'] == 'verification' for d in engine.run['dispatches']))
+        self.assertEqual(sum(c['role'] == 'worker' for c in backend.calls), 1)
+        self.assertEqual(engine.run['attempts'], {'greet': 1})
+        self.assertFalse(engine.run.get('task_checkpoints'))
+        events = [json.loads(line) for line in (engine.directory / 'events.jsonl').read_text().splitlines()]
+        self.assertTrue(any(e.get('event') == 'checkpoints_discarded' for e in events))
 
-    def test_over_limit_blocked_keeps_blocker_without_correction_or_exemption(self):
+    def test_over_limit_blocked_keeps_blocker_and_exemption(self):
         for blocker in ('operator', 'environment'):
             with self.subTest(blocker=blocker):
                 backend = self.backend('over_limit', blocker)
@@ -159,7 +153,10 @@ class CheckpointSemanticsTests(RepoCase):
                     engine.start('Implement greet', read_json(ROOT / 'examples' / 'plan.json'))
                 self.assertEqual(engine.run['feedback']['worker']['blocker_kind'], blocker)
                 self.assertEqual(engine.run['feedback']['worker']['blockers'], ['Wait for prerequisite'])
-                self.assertEqual(work_attempts(engine.run), {'greet': 1})
+                self.assertEqual(work_attempts(engine.run), {'greet': 0})
+                worker = next(d for d in engine.run['dispatches'] if d['role'] == 'worker')
+                self.assertIn('attempt_exemption', worker)
+                self.assertFalse(engine.run.get('task_checkpoints'))
                 self.assertEqual(len(backend.calls), 1)
                 self.assertEqual(engine.run['accepted'], {})
                 self.assertFalse(any(d['role'] == 'verification' for d in engine.run['dispatches']))

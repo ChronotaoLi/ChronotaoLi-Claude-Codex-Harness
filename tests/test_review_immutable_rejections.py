@@ -22,9 +22,10 @@ class ImmutableRejectionTests(RepoCase):
         self.assertEqual(record["review"]["findings"], original["findings"])
 
     def assert_no_corrections(self, engine, backend):
-        self.assertEqual(engine.run["format_repairs"], {})
-        self.assertEqual(engine.run["review_corrections"], {})
-        self.assertFalse(any("format_correction" in call["packet"] for call in backend.calls))
+        """A binding rejection is never redone: no redo link, no invalid review entry."""
+        reviews = [d for d in engine.run["dispatches"] if d.get("role") == "reviewer"]
+        self.assertFalse(any("retry_of" in d or d.get("status") == "invalid" for d in reviews))
+        self.assertFalse(any("previous_invalid" in call["packet"] for call in backend.calls))
 
     def test_oversized_task_finding_reworks_and_preserves_original_even_with_bad_summary(self):
         originals = []
@@ -43,7 +44,8 @@ class ImmutableRejectionTests(RepoCase):
         self.assertEqual(result["attempts"], {"greet": 2})
         record = result["review_history"]["greet"][0]
         self.assertEqual(record["status"], "invalid_rejected")
-        self.assertIn("findings[0].message", record["validation_error"])
+        # Validation reports the first violated path; the stub returns summary first.
+        self.assertIn("response.summary", record["validation_error"])
         self.assert_evidence(record, originals[0])
         workers = [call for call in backend.calls if call["role"] == "worker"]
         reviews = [call for call in backend.calls if call["kind"] == "review"]

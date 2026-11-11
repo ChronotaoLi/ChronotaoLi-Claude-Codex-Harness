@@ -1,4 +1,5 @@
 import copy
+import json
 import hashlib
 from pathlib import Path
 from unittest.mock import patch
@@ -114,20 +115,20 @@ class InvalidReviewRecoveryTests(RepoCase):
         self.assertNotEqual(accepted["greet"]["commit"], accepted["correct2"]["commit"])
         self.assert_raw_evidence(result["final_history"][0])
 
-    def test_invalid_nonrejecting_approval_remains_blocked_and_cannot_be_redrawn(self):
+    def test_whole_run_memory_approval_is_discarded_without_redraw(self):
         def change(backend, kwargs, packet, result):
             if kwargs["kind"] == "final_review":
                 result["approved_memory_keys"] = ["nonexistent"]
 
         backend = RecordingBackend(change)
         engine = self.engine(backend)
-        with self.assertRaisesRegex(HarnessError, "不存在"):
-            engine.start("Implement greet", self.plan())
-        calls = copy.deepcopy(backend.calls)
-        for _ in range(2):
-            with self.assertRaisesRegex(HarnessError, "不存在"):
-                self.engine(backend).resume(engine.run["id"])
-            self.assertEqual(backend.calls, calls)
+        result = engine.start("Implement greet", self.plan())
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(sum(call["kind"] == "final_review" for call in backend.calls), 1)
+        self.assertEqual([record["status"] for record in result["final_history"]], ["approved"])
+        events = [json.loads(line) for line in (engine.directory / "events.jsonl").read_text().splitlines()]
+        discarded = [e for e in events if e["event"] == "memory_proposals_discarded"]
+        self.assertEqual([(e["task_id"], e["discarded_keys"]) for e in discarded], [("final", ["nonexistent"])])
 
     def test_returned_invalid_rejection_survives_receipt_write_interruption(self):
         self.config.data["runtime"]["max_replans"] = 0

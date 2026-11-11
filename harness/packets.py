@@ -205,16 +205,14 @@ class PacketBuilder(RuntimeService):
         for tid, records in self.context.run.get("review_history", {}).items():
             if scope is None or tid == scope:
                 for record in records:
+                    # A record without a review is a structurally invalid original
+                    # kept when its candidate changed; it carries nothing to check.
                     if record.get("review"):
                         validate_review_source(self.context.run, tid, record)
-                    elif record.get("validation_error"):
-                        raise HarnessError("历史审阅格式无效；必须核对原始证据")
         if scope is None:
             for record in self.context.run.get("final_history", []):
                 if record.get("review"):
                     validate_review_source(self.context.run, "final", record, kind="final_review")
-                elif record.get("validation_error"):
-                    raise HarnessError("历史整体审阅格式无效；必须核对原始证据")
         packet = {**packet, **{key: value for key, value in continuation.items() if value}}
         self.context.store.check_current()
         progress = finding_progress_packet(self.context.run, task_id, self.context.directory)

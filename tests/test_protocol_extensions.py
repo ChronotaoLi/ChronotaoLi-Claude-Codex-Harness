@@ -38,22 +38,30 @@ class ProtocolExtensionTests(unittest.TestCase):
         with self.assertRaises(HarnessError):
             validate(dict(wrapped, surprise=[]), schema)
 
-    def test_optional_fields_are_strict_when_present(self):
+    def test_handoffs_are_strict_and_checkpoints_are_optional_products(self):
         good = dict(self.result(), checkpoints=[self.checkpoint()],
                     decision_requests=[dict(id='risk', task_id='later', question='Proceed?')])
         validate_work_contract(good)
         for mutation in [
-                lambda x: x['checkpoints'][0].update(extra=True),
-                lambda x: x['checkpoints'][0].update(max_age_seconds=True),
-                lambda x: x['checkpoints'][0].update(max_age_seconds=-1),
-                lambda x: x['checkpoints'][0].update(max_age_seconds=86401),
-                lambda x: x['checkpoints'][0].update(evidence=[]),
                 lambda x: x['decision_requests'].append(x['decision_requests'][0]),
                 lambda x: x['decision_requests'][0].update(extra=True)]:
             value = deepcopy(good)
             mutation(value)
             with self.subTest(value=value), self.assertRaises(HarnessError):
                 validate_work_contract(value)
+        # Checkpoints are an optional product: a malformed entry is discarded at
+        # registration and never makes the worker result itself invalid.
+        for mutation in [
+                lambda x: x['checkpoints'][0].update(extra=True),
+                lambda x: x['checkpoints'][0].update(max_age_seconds=True),
+                lambda x: x['checkpoints'][0].update(max_age_seconds=-1),
+                lambda x: x['checkpoints'][0].update(max_age_seconds=86401),
+                lambda x: x['checkpoints'][0].update(evidence=[]),
+                lambda x: x.update(checkpoints='not a list')]:
+            value = deepcopy(good)
+            mutation(value)
+            with self.subTest(value=value):
+                self.assertIs(validate_work_contract(value), value)
 
         # A valid blocker survives inapplicable handoff declarations unchanged;
         # their registration and diagnostics belong to the lifecycle boundary.

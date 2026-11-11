@@ -9,11 +9,8 @@ from pathlib import Path
 from . import git
 from .budgets import work_attempts
 from .context import compact_checks, compact_feedback, compact_reviews, instruction_file_changes
-from .contracts import (
-    envelope, review_approved, review_schema, task_directive, validate_review, validate_structure,
-    WORK,
-)
-from .memory import validate_proposals
+from .contracts import envelope, judge_review, review_approved, review_schema, task_directive, WORK
+from .memory import Memory, validate_proposals
 from .input_projection import validate_dispatch_indexes as validate_input_dispatch_indexes
 from .path_evidence import validate_dispatch_indexes
 from .progress import CheckpointDeclarationError
@@ -146,7 +143,6 @@ class TaskLifecycle(RuntimeService):
             self.context.run["pending_replan"] = {"stage": "pending", "trigger": trigger}
             self.context.run["commander_receipts"].pop("commander:dispatch:dispatching")
             self.context.run.pop("pending_directive", None)
-            self.context.run["pending_format_corrections"].pop(f"worker:implement:{tid}", None)
             self.context.save()
             return False
         if self.services.budgets.task_budget_used(tid) >= self.context.config.data["runtime"]["max_attempts"]:
@@ -167,6 +163,9 @@ class TaskLifecycle(RuntimeService):
                   "handoff_targets": self.services.workflow.handoff_targets(tid),
                   "verification_commands": self.context.config.data["verification"]["commands"],
                   "tool_constraints": self.services.packets.tool_constraints()}, task=task)
+        if result is None:
+            # An invalid output was one spent work attempt; scheduling continues.
+            return False
         return self.publish_worker_result(task, result, prior_reviews)
 
     def replay_worker(self):
@@ -177,6 +176,8 @@ class TaskLifecycle(RuntimeService):
         entry = self.services.worker_receipts.entry(receipt)
         task = next(t for t in self.context.run["tasks"] if t["id"] == entry["task_id"])
         result = self.services.dispatch.dispatch("worker", "implement", task["id"], WORK, {}, task=task)
+        if result is None:
+            return False
         prior_reviews = compact_reviews(self.context.run["review_history"].get(task["id"], []))
         return self.publish_worker_result(task, result, prior_reviews)
 
@@ -223,14 +224,11 @@ class TaskLifecycle(RuntimeService):
         try:
             self.services.workflow.validate_handoff_requests(tid, result)
         except HarnessError as error:
-            worker_dispatch.update(status="failed", error=str(error))
-            self.context.run["last_runtime_error"] = {"role": "worker", "kind": "implement", "task_id": tid,
-                                             "error": str(error), "artifact": str(worker_artifact.parent)}
-            self.services.workflow.record_worker_recovery(tid, worker_dispatch["id"], worker_artifact.parent, error)
-            self.services.worker_receipts.consume(key, "handoff_rejected")
-            self.context.save()
-            self.context.event("worker_result_rejected", task_id=tid, dispatch_id=worker_dispatch["id"], reason=str(error))
-            raise
+            # An invalid output like any other: one spent attempt, no stop. Its
+            # valid checkpoints stay registered for the next worker (R8).
+            self.services.worker_receipts.reject(key, error, "result_rejected", status="invalid", invalid_output={
+                "artifact": str(worker_artifact), "artifact_digest": worker_source["worker_artifact_digest"]})
+            return False
         self.context.record_ignored_paths("worker", worker_artifact.parent)
         if snapshot_digest(self.context.snapshot()) != candidate_digest:
             raise HarnessError("worker candidate changed during handoff preparation")
@@ -271,6 +269,47 @@ class TaskLifecycle(RuntimeService):
         self.context.save()
         return self.continue_task()
 
+    def publish_invalid_blocker(self, task, key, result, judgment):
+        """Keep an invalid blocked report binding: feedback, route and consumption in one save.
+
+        A readable environment, operator or task blocker keeps its route with the
+        original result in feedback; any other blocked output goes to replanning
+        as a task blocker, without a ``worker`` entry. Neither earns an exemption.
+        """
+        tid = task["id"]
+        receipt = self.context.run["worker_receipts"][key]
+        entry = self.services.worker_receipts.entry(receipt)
+        artifact = Path(receipt["artifact"])
+        digest = receipt["artifact_digest"]
+        error, route = judgment.error, judgment.route
+        feedback = {"task_id": tid, "attempt": receipt["attempt"],
+                    "snapshot_digest": snapshot_digest(self.context.snapshot()),
+                    "worker_artifact": str(artifact), "worker_artifact_digest": digest, "output_error": str(error)}
+        if judgment.readable and route == result.get("blocker_kind"):
+            feedback["worker"] = result
+        # Inspect Git before any handoff field changes: an interruption inside it
+        # must not leave a pending replan beside the unconsumed receipt.
+        self.services.workflow.record_worker_recovery(tid, entry["id"], artifact.parent, error)
+        self.context.run["feedback"] = feedback
+        if route == "task":
+            self.context.run["pending_replan"] = {"stage": "pending", "trigger": deepcopy(feedback)}
+        entry.update(status="invalid_blocked", error=str(error), worker_outcome=route + "_blocked")
+        self.context.run["last_runtime_error"] = {"role": "worker", "kind": entry["kind"], "task_id": tid,
+                                                  "error": str(error), "artifact": str(artifact.parent)}
+        self.services.worker_receipts.consume(key, "invalid_blocker")
+        self.context.save()
+        self.services.receipts.observe_invalid(entry)
+        if route == "operator":
+            self.services.workflow.synchronize_decision_requests()
+            raise self.services.workflow.decision_required(self.services.workflow.task_decision_gate(tid))
+        if route == "environment":
+            raise HarnessError(f"worker 环境受阻：{environment_blocker_excerpt(result)}。"
+                               f"完整 worker 结果：{artifact}（SHA256 {digest}）。"
+                               "若必要命令被拒绝，可在 permissions.worker_commands 追加精确 argv 后 resume；"
+                               "环境事实有变化可使用 --environment-update FILE 记录补充说明与本地检查；"
+                               "原尝试和派发预算仍保留。")
+        return None
+
     def check_task_scope(self, task):
         runtime = self.context
         try:
@@ -283,11 +322,7 @@ class TaskLifecycle(RuntimeService):
         """Keep evidence when a changed candidate invalidates its pending gate."""
         runtime = self.context
         history = self.context.run["review_history"].setdefault(pending["task_id"], [])
-        sources = [self.context.run["review_corrections"].get(key), self.context.run["review_receipts"].get(key)]
-        repair = self.services.recovery.active_invalid_repair(key)
-        if repair:
-            sources.append(repair["source"])
-        for source in sources:
+        for source in [self.context.run["review_receipts"].get(key)]:
             if not source:
                 continue
             artifact = Path(source["artifact"])
@@ -324,18 +359,18 @@ class TaskLifecycle(RuntimeService):
                 raise HarnessError("审阅阶段缺少必需问题对照；保留证据")
             record["required_findings"] = deepcopy(pending["required_findings"])
             schema = review_schema(pending["required_findings"])
-            try:
-                validate_structure(result, envelope(schema, pending["task_id"], dispatch_id))
-            except HarnessError as error:
-                # Unattributable or malformed data remains inspectable, but is not
-                # presented as a structurally valid review of this task.
-                record["validation_error"] = str(error)
+            if not isinstance(result, dict):
+                record["validation_error"] = "review result is not a JSON object"
             else:
-                record["review"] = {k: v for k, v in result.items() if k not in ("task_id", "dispatch_id")}
-                try:
-                    validate_review(record["review"], [p["key"] for p in pending.get("proposals", [])], schema)
-                except HarnessError as error:
-                    record["validation_error"] = str(error)
+                judgment = judge_review(result, envelope(schema, pending["task_id"], dispatch_id))
+                if judgment.state == "invalid" and not judgment.readable:
+                    # Malformed data remains inspectable, but is not presented
+                    # as a structurally valid review of this task.
+                    record["validation_error"] = str(judgment.error)
+                else:
+                    record["review"] = {k: v for k, v in result.items() if k not in ("task_id", "dispatch_id")}
+                    if judgment.error is not None:
+                        record["validation_error"] = str(judgment.error)
             history.append(record)
 
     def continue_task(self):
@@ -351,13 +386,8 @@ class TaskLifecycle(RuntimeService):
         snapshot = self.context.snapshot()
         if snapshot_digest(snapshot) != pending["snapshot_digest"]:
             self.preserve_invalidated_reviews(pending, key)
-            if self.services.recovery.active_invalid_repair(key):
-                self.context.run["invalid_repairs"][key]["status"] = "invalidated"
             self.context.run.pop("pending_task")
             self.context.run["review_receipts"].pop(key, None)
-            self.context.run["review_corrections"].pop(key, None)
-            self.context.run["pending_format_corrections"].pop(key, None)
-            self.context.run["pending_format_corrections"].pop(f"worker:implement:{tid}", None)
             self.context.run["feedback"] = {"task_id": tid, "recovery": {
                 "error": "任务候选已变化；旧验证及审阅失效，重新执行任务",
                 "verification": pending.get("verification")}}
@@ -406,7 +436,7 @@ class TaskLifecycle(RuntimeService):
             snapshot_artifact = folder / "snapshot.json"
             write_json(snapshot_artifact, snapshot)
             try:
-                proposals = validate_proposals(pending["worker_result"]["proposed_memories"], self.context.worktree)
+                proposals = validate_proposals(pending["worker_result"].get("proposed_memories", []), self.context.worktree)
             except HarnessError as error:
                 proposals = []
                 self.context.event("memory_proposals_discarded", task_id=tid, reason=str(error))
@@ -451,7 +481,7 @@ class TaskLifecycle(RuntimeService):
                                        "artifact": pending["worker_artifact"],
                                        "artifact_digest": pending["worker_artifact_digest"]}
         write_json(review_artifact, record)
-        approved_keys = [] if diagnostics else review["approved_memory_keys"]
+        approved_keys = [] if diagnostics else self.approved_memory_keys(tid, review, proposals)
         if not diagnostics and review_approved(review):
             try:
                 self.context.memory.check_proposals(proposals, approved_keys)
@@ -462,6 +492,22 @@ class TaskLifecycle(RuntimeService):
             self.context.event("review_rejected", task_id=tid)
             return False
         return self.accept_pending()
+
+    def approved_memory_keys(self, task_id, review, proposals):
+        """Keep only approvals of this candidate's proposals; discard the rest on their own (R8)."""
+        raw = review.get("approved_memory_keys")
+        known = {proposal["key"] for proposal in proposals}
+        kept = (list(dict.fromkeys(key for key in raw if isinstance(key, str) and key in known))
+                if isinstance(raw, list) else [])
+        discarded = (([key for key in raw if not isinstance(key, str) or key not in known]
+                      + [key for index, key in enumerate(raw) if isinstance(key, str) and key in raw[:index]])
+                     if isinstance(raw, list) else [raw])
+        if discarded:
+            # Observation only; an interruption before the review save may repeat it.
+            self.context.event("memory_proposals_discarded", task_id=task_id,
+                               reason="approved keys that are not proposals of this candidate were discarded",
+                               discarded_keys=[key for key in discarded if isinstance(key, str)])
+        return kept
 
     def _require_handoff(self, field, pending, *destinations):
         """Validate the live source before replacing any durable task phase."""
@@ -495,7 +541,6 @@ class TaskLifecycle(RuntimeService):
             successor = {"task_id": tid, "review": review, "artifact": record["artifact"], **diagnostics}
         key = f"reviewer:review:{tid}"
         self.context.run["review_history"].setdefault(tid, []).append(record)
-        self.context.run["review_corrections"].pop(key, None)
         self.context.run["review_receipts"].pop(key, None)
         self.context.run.pop("pending_task")
         self.context.run["pending_acceptance" if approved else "feedback"] = successor
@@ -519,6 +564,20 @@ class TaskLifecycle(RuntimeService):
         self.context.run["pending_post_accept"] = successor
         self.context.save()
 
+    def task_memory_record(self, task, pending, commit, paths):
+        """The accepted task's memory record fields; the preflight uses a same-length placeholder commit."""
+        run_id, tid = self.context.run["id"], task["id"]
+        detail = {"commit": commit, "summary": pending["review"]["summary"], "summary_source": "reviewer",
+                  "changed_file_count": len(paths), "finding_count": len(pending["review"]["findings"]),
+                  "verification": pending["verification"], "review_artifact": pending["review_artifact"],
+                  "snapshot_artifact": pending["snapshot_artifact"]}
+        record = {"key": f"task:{run_id}:{tid}", "abstract": task["title"][:500],
+                  "overview": pending["review"]["summary"], "detail": dump(detail),
+                  "source": f"git:{commit};run:{run_id}",
+                  "ttl_days": self.context.config.data["memory"]["task_ttl_days"] or None}
+        provenance = {"commit": commit, "run_id": run_id, "task_id": tid, "scope": "run", "reference_only": True}
+        return record, provenance
+
     def accept_pending(self):
         runtime = self.context
         pending = self.context.run["pending_acceptance"]
@@ -537,6 +596,12 @@ class TaskLifecycle(RuntimeService):
             self.context.save()
             self.context.event("pending_acceptance_invalidated", task_id=tid)
             return False
+        # A predictable record error must stop before the commit, not after it.
+        try:
+            Memory.validate_record(**self.task_memory_record(task, pending, "0" * len(self.context.run["expected_head"]),
+                                                             pending["files"])[0])
+        except HarnessError as error:
+            raise HarnessError(f"任务记忆记录不合格；未提交：{error}") from error
         pending["hook_attempts"] = pending.get("hook_attempts", 0) + 1
         logs = self.context.directory / "hooks" / f"{tid}-{attempt}" / f"pre_accept-{pending['hook_attempts']}"
         self.context.save()
@@ -563,18 +628,10 @@ class TaskLifecycle(RuntimeService):
         if pending.get("worker_source"):
             accepted.update(worker_source=deepcopy(pending["worker_source"]),
                             decision_requests=deepcopy(pending.get("decision_requests", [])))
-        detail = {"commit": commit, "summary": accepted["summary"], "summary_source": "reviewer",
-                  "changed_file_count": len(paths), "finding_count": len(pending["review"]["findings"]),
-                  "verification": accepted["verification"], "review_artifact": accepted["review_artifact"],
-                  "snapshot_artifact": pending["snapshot_artifact"]}
+        task_memory, provenance = self.task_memory_record(task, pending, commit, paths)
         completion = {
             "id": f"acceptance:{self.context.run['id']}:{tid}",
-            "task_memory": {"key": f"task:{self.context.run['id']}:{tid}", "abstract": task["title"][:500],
-                            "overview": accepted["summary"], "detail": dump(detail),
-                            "source": f"git:{commit};run:{self.context.run['id']}", "kind": "accepted_task",
-                            "provenance": {"commit": commit, "run_id": self.context.run["id"],
-                                           "task_id": tid, "scope": "run", "reference_only": True},
-                            "ttl_days": self.context.config.data["memory"]["task_ttl_days"] or None},
+            "task_memory": {**task_memory, "kind": "accepted_task", "provenance": provenance},
             "proposals": pending["proposals"], "approved_keys": pending["approved_keys"],
             "knowledge_ttl_days": self.context.config.data["memory"]["knowledge_ttl_days"] or None,
             "knowledge": {"status": "pending"},

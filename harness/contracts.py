@@ -99,7 +99,31 @@ def with_keys(schema, field, rows):
 
 
 def review_schema(rows):
-    return with_keys(REVIEW, "finding_dispositions", rows)
+    """A review contract for this dispatch: with required findings, every key must be disposed."""
+    result = with_keys(REVIEW, "finding_dispositions", rows)
+    if rows:
+        result["required"] = [*result["required"], "finding_dispositions"]
+    return result
+
+
+# Optional products are checked on their own: an invalid entry is discarded and
+# recorded, it never decides whether the whole output is a result (R8).
+WORK_OPTIONAL = ("checkpoints", "proposed_memories")
+REVIEW_OPTIONAL = ("approved_memory_keys",)
+
+
+def core_schema(schema, optional):
+    """A contract copy without its optional products."""
+    result = deepcopy(schema)
+    for field in optional:
+        result["properties"].pop(field, None)
+    result["required"] = [field for field in result["required"] if field not in optional]
+    return result
+
+
+def core_value(value, optional):
+    """An output copy without its optional products; non-objects are returned unchanged."""
+    return {k: v for k, v in value.items() if k not in optional} if isinstance(value, dict) else value
 
 
 def envelope(schema, task_id, dispatch_id):
@@ -109,12 +133,8 @@ def envelope(schema, task_id, dispatch_id):
     return result
 
 
-class RepairableFormatError(HarnessError):
-    """A bounded output formatting defect, never an identity or approval error."""
-
-    def __init__(self, path, message):
-        self.path = path
-        super().__init__(f"{path}: {message}")
+class ScopeExtensionRequired(HarnessError):
+    """A revision adds a task outside approved scope; operator authority decides, not a redo."""
 
 
 def output_constraints(schema, path="response"):
@@ -165,7 +185,7 @@ def review_output_constraints(schema, proposed_keys=()):
 
 
 def validate_structure(value, schema, path="response"):
-    """Check all hard schema boundaries before considering a format repair."""
+    """Check types, enums and exact object fields; bounds are checked separately."""
     expected = {"object": dict, "array": list, "string": str, "integer": int}[schema["type"]]
     if not isinstance(value, expected) or (expected is int and type(value) is not int):
         raise HarnessError(f"{path}: expected {schema['type']}")
@@ -185,23 +205,23 @@ def validate_structure(value, schema, path="response"):
 def _validate_format(value, schema, path):
     if schema["type"] == "string":
         if len(value) < schema.get("minLength", 0) or len(value) > schema.get("maxLength", float("inf")):
-            raise RepairableFormatError(path, "string length exceeds permitted bounds")
+            raise HarnessError(f"{path}: string length exceeds permitted bounds")
         if schema.get("minLength", 0) and not value.strip():
-            raise RepairableFormatError(path, "string must not be blank")
+            raise HarnessError(f"{path}: string must not be blank")
         if "pattern" in schema and not re.fullmatch(schema["pattern"], value):
-            raise RepairableFormatError(path, "invalid identifier")
+            raise HarnessError(f"{path}: invalid identifier")
     if schema["type"] == "object":
         for key, field in schema["properties"].items():
             if key in value:
                 _validate_format(value[key], field, f"{path}.{key}")
     if schema["type"] == "integer":
         if not schema.get("minimum", value) <= value <= schema.get("maximum", value):
-            raise RepairableFormatError(path, "integer exceeds permitted bounds")
+            raise HarnessError(f"{path}: integer exceeds permitted bounds")
     if schema["type"] == "array":
         if len(value) < schema.get("minItems", 0) or len(value) > schema.get("maxItems", float("inf")):
-            raise RepairableFormatError(path, "array length exceeds permitted bounds")
+            raise HarnessError(f"{path}: array length exceeds permitted bounds")
         if schema.get("uniqueItems") and any(item in value[:i] for i, item in enumerate(value)):
-            raise RepairableFormatError(path, "duplicate entries")
+            raise HarnessError(f"{path}: duplicate entries")
         for i, item in enumerate(value):
             _validate_format(item, schema["items"], f"{path}[{i}]")
 
@@ -212,7 +232,7 @@ def validate(value, schema, path="response"):
 
 
 def validate_work_semantics(result):
-    """Check worker completion and proposal identity after structural validation."""
+    """Check worker completion, blocker and continuation consistency after structural validation."""
     completed = result["status"] == "completed"
     if completed != (result["blocker_kind"] == "none") or completed != (not result["blockers"]):
         raise HarnessError("worker 状态、blocker_kind 与 blockers 不一致")
@@ -224,11 +244,9 @@ def validate_work_semantics(result):
         if ((continuation["kind"] == "commands" and (not continuation["commands"] or continuation["minimum_timeout_seconds"] != 0))
                 or (continuation["kind"] == "budget" and (continuation["commands"] or continuation["minimum_timeout_seconds"] <= 0))):
             raise HarnessError("续作请求必须明确缺少的精确命令或所需的派发时间预算")
-    keys = [proposal["key"] for proposal in result["proposed_memories"]]
-    if len(keys) != len(set(keys)):
-        raise HarnessError("记忆提案 key 必须唯一")
-    # Optional checkpoint declarations are resolved by progress.record_checkpoints:
-    # a bad item or duplicate batch must not erase completion or a blocker.
+    # Optional checkpoints and memory proposals are checked on their own
+    # (progress.record_checkpoints, memory.validate_proposals): an invalid entry
+    # or batch is discarded and must not erase completion or a blocker.
     # Handoffs have no effect on a blocked result. Keep their original bytes
     # for source validation, but never let their semantics erase the blocker.
     # Structure and format are still checked by the caller for every result.
@@ -238,56 +256,27 @@ def validate_work_semantics(result):
             raise HarnessError("worker decision_requests 的 id 必须唯一")
 
 
-def validate_review_semantics(result, proposed_keys=()):
-    """Keep finding identity and memory approvals outside format correction."""
+def validate_review_semantics(result):
+    """Blocking findings need evidence; resolved dispositions need verification evidence."""
     for finding in result["findings"]:
         if finding["severity"] == "blocking":
             if finding["category"] == "preference" or not finding["evidence"]:
                 raise HarnessError("阻断 finding 必须有证据，且不能仅为偏好")
-    if not set(result["approved_memory_keys"]) <= set(proposed_keys):
-        raise HarnessError("审阅批准了不存在的记忆提案")
     validate_finding_dispositions(result)
 
 
 def validate_finding_dispositions(result):
-    """Check immutable dispositions independently of repairable approval metadata."""
     if any(r["status"] == "resolved" and not r["evidence"] for r in (result.get("finding_dispositions") or {}).values()):
         raise HarnessError("解决问题的审阅处置必须包含核验依据")
 
 
-def validate_review(result, proposed_keys=(), schema=REVIEW):
-    validate_structure(result, schema)
-    validate_review_semantics(result, proposed_keys)
-    _validate_format(result, schema, "response")
+def validate_review(result, schema=REVIEW):
+    """The whole review contract except the optional memory approvals."""
+    core, contract = core_value(result, REVIEW_OPTIONAL), core_schema(schema, REVIEW_OPTIONAL)
+    validate_structure(core, contract)
+    validate_review_semantics(core)
+    _validate_format(core, contract, "response")
     return result
-
-
-def validate_immutable_findings(findings):
-    """Check finding bounds that neither automatic nor explicit repair may change."""
-    immutable = deepcopy(REVIEW["properties"]["findings"])
-    immutable["items"]["properties"]["id"] = TEXT
-    validate(findings, immutable, "response.findings")
-
-
-def validate_review_correction(previous, current):
-    """A fully validated correction must preserve the first review's decision.
-
-    Only its summary and malformed finding IDs may change. In particular, an
-    invalidly long finding cannot be shortened by losing its evidence, and an
-    overfull findings array cannot be repaired by dropping a reported defect.
-    """
-    if (current["verdict"] != previous["verdict"]
-            or set(current["approved_memory_keys"]) != set(previous["approved_memory_keys"])
-            or len(current["findings"]) != len(previous["findings"])
-            or current.get("finding_dispositions") != previous.get("finding_dispositions")):
-        raise HarnessError("审阅格式修复不得改变结论、记忆批准或 findings 数量")
-    fields = ("severity", "category", "location", "message", "evidence")
-    for old, new in zip(previous["findings"], current["findings"]):
-        if any(new[field] != old[field] for field in fields):
-            raise HarnessError("审阅格式修复不得改变 finding 内容、严重级别或顺序")
-        if re.fullmatch(SAFE_ID["pattern"], old["id"]) and new["id"] != old["id"]:
-            raise HarnessError("审阅格式修复不得改变已有合法 finding ID")
-    return current
 
 
 def review_approved(result):
@@ -295,28 +284,76 @@ def review_approved(result):
         finding["severity"] == "blocking" for finding in result["findings"])
 
 
-def validate_approval_repair(previous, current, proposed_keys):
-    """Repair approval metadata without replacing the underlying review."""
-    permitted = set(previous["approved_memory_keys"]) & set(proposed_keys)
-    if (not review_approved(previous) or not review_approved(current)
-            or set(current["approved_memory_keys"]) != permitted
-            or len(previous["findings"]) != len(current["findings"])
-            or current.get("finding_dispositions") != previous.get("finding_dispositions")):
-        raise HarnessError("显式审阅修正必须保留批准结论、有效记忆批准和全部 findings")
-    for old, new in zip(previous["findings"], current["findings"]):
-        if any(old[field] != new[field] for field in ("severity", "category", "location", "message", "evidence")):
-            raise HarnessError("显式审阅修正不得改变 finding 内容、严重级别或顺序")
-        if re.fullmatch(SAFE_ID["pattern"], old["id"]) and new["id"] != old["id"]:
-            raise HarnessError("显式审阅修正不得改变已有合法 finding ID")
+def review_veto(result):
+    """A structurally valid review vetoes when it rejects, blocks or leaves a required finding unresolved."""
+    return (not review_approved(result)
+            or any(item["status"] != "resolved" for item in (result.get("finding_dispositions") or {}).values()))
 
 
-def validate_commander_format_correction(kind, previous, current):
-    """Text formatting cannot replace an already selected task or revision."""
-    fields = ("selected_task",) if kind == "dispatch" else ("action", "new_tasks", "updates")
-    if kind not in ("dispatch", "replan") or any(previous[field] != current[field] for field in fields):
-        raise HarnessError("指挥格式修正不得改变原任务选择或修订操作")
-    if kind == "dispatch" and previous["action"] != current["action"]:
-        raise HarnessError("指挥格式修正不得改变原派发或再规划选择")
+def validate_work_core(result, schema):
+    """Structure and semantics of a worker result, without its optional products."""
+    core = core_value(result, WORK_OPTIONAL)
+    validate_structure(core, core_schema(schema, WORK_OPTIONAL))
+    validate_work_semantics(core)
+
+
+def validate_work_bounds(result, schema):
+    """Length, count, pattern and range bounds of a worker result, without its optional products."""
+    _validate_format(core_value(result, WORK_OPTIONAL), core_schema(schema, WORK_OPTIONAL), "response")
+
+
+class Judgment:
+    """One delivery's verdict: valid, veto (binding despite the invalid output) or invalid.
+
+    ``readable`` says whether the core structure and semantics held, so the
+    original output can still be routed as written.
+    """
+
+    def __init__(self, state, error=None, route=None, readable=True):
+        self.state, self.error, self.route, self.readable = state, error, route, readable
+
+
+def _envelope_matches(result, schema):
+    """A structurally invalid output may still veto only under the dispatch's own identity."""
+    properties = schema.get("properties", {})
+    return all(field not in properties or result.get(field) in properties[field].get("enum", [])
+               for field in ("task_id", "dispatch_id"))
+
+
+def judge_review(result, schema):
+    """Classify a returned review. A veto needs a structurally valid core review."""
+    core, contract = core_value(result, REVIEW_OPTIONAL), core_schema(schema, REVIEW_OPTIONAL)
+    try:
+        validate_structure(core, contract)
+    except HarnessError as error:
+        return Judgment("invalid", error, readable=False)
+    try:
+        validate_review(result, schema)
+    except HarnessError as error:
+        return Judgment("veto" if review_veto(result) else "invalid", error)
+    return Judgment("valid")
+
+
+def judge_work(result, schema):
+    """Classify a sealed worker result; handoff targets are checked later, at publication.
+
+    A blocked result keeps its veto: a readable environment, operator or task
+    blocker keeps its route; any other blocked output is routed as a task blocker.
+    """
+    try:
+        validate_work_core(result, schema)
+    except HarnessError as error:
+        if isinstance(result, dict) and result.get("status") == "blocked" and _envelope_matches(result, schema):
+            return Judgment("veto", error, "task", readable=False)
+        return Judgment("invalid", error, readable=False)
+    try:
+        validate_work_bounds(result, schema)
+    except HarnessError as error:
+        if result["status"] == "blocked":
+            route = result["blocker_kind"] if result["blocker_kind"] in ("environment", "operator", "task") else "task"
+            return Judgment("veto", error, route)
+        return Judgment("invalid", error)
+    return Judgment("valid")
 
 
 def task_directive(task_ids):
@@ -450,7 +487,7 @@ def validate_revision(current_tasks, proposed_tasks, accepted_ids, max_tasks=20,
             raise HarnessError("再规划不得移除既有依赖")
     for ident in proposed.keys() - current.keys():
         if not set(proposed[ident]["allowed_paths"]) <= scope:
-            raise HarnessError("新增任务必须复用既有文件范围或操作者显式批准的范围，不得自行扩大范围")
+            raise ScopeExtensionRequired("新增任务必须复用既有文件范围或操作者显式批准的范围，不得自行扩大范围")
     if proposed == current:
         raise HarnessError("再规划没有产生有效变更")
     return tasks

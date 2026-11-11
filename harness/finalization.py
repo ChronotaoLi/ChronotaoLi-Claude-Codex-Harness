@@ -124,6 +124,9 @@ class FinalAcceptance(RuntimeService):
                          changed_paths=changed_paths, history=history[:-1], required=required),
                      required=required)
             record["review_source"] = bind_review_source(self.context, "final_review", "final", review, digest)
+            if not diagnostics:
+                # The whole-run review approves no memory; any approvals are discarded (R8).
+                self.services.tasks.approved_memory_keys("final", review, [])
             disposition_errors = disposition_gaps(review, required)
             if disposition_errors:
                 diagnostics = {**diagnostics, "disposition_errors": disposition_errors}
@@ -131,7 +134,6 @@ class FinalAcceptance(RuntimeService):
                 raise HarnessError("整体审阅后文件发生变化；禁止完成 run")
             record.update(review=review, phase="finished", status="approved" if not diagnostics and review_approved(review) else "rejected")
             record.update(diagnostics)
-            self.context.run["review_corrections"].pop("reviewer:final_review:final", None)
             self.context.run.get("review_receipts", {}).pop("reviewer:final_review:final", None)
             if record["status"] == "approved":
                 self.context.run["feedback"] = None

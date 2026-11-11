@@ -37,6 +37,7 @@ def stub_provider_clis(case):
 
 OK = {'type': 'result', 'subtype': 'success', 'is_error': False, 'structured_output': {'status': 'completed'}}
 ERROR = {'type': 'result', 'subtype': 'error_during_execution', 'is_error': True}
+INVALID = 'worker output is not a decodable object result: '
 
 
 class WorkerReturnClassificationTests(unittest.TestCase):
@@ -56,20 +57,34 @@ class WorkerReturnClassificationTests(unittest.TestCase):
         ('4b error subtype', {'process.stdout': {'type': 'result', 'subtype': 'error_max_turns'}},
          'retryable', 'provider returned a complete explicit error'),
         # Only is_error true or an error_ subtype is an explicit error; nothing looser is retried.
+        # Without an object result such a terminal is an invalid delivery (spec-B3 2.6).
         ('4c truthy is_error', {'process.stdout': {'type': 'result', 'is_error': 1}},
+         'invalid', INVALID + 'result text JSONDecodeError'),
+        ('4c2 truthy is_error beside an object', {'process.stdout': {**OK, 'is_error': 1}},
          'returned', 'non-error or ambiguous direct JSON output'),
         ('4d errorish subtype', {'process.stdout': {'type': 'result', 'subtype': 'errorish'}},
+         'invalid', INVALID + 'result text JSONDecodeError'),
+        ('4d2 errorish subtype beside an object', {'process.stdout': {**OK, 'subtype': 'errorish'}},
          'returned', 'non-error or ambiguous direct JSON output'),
         ('4e is_error without a result type', {'process.stdout': {'is_error': True}},
-         'unknown', 'non-error or ambiguous direct JSON output'),
+         'invalid', INVALID + 'not a result terminal'),
         ('5a success', {'process.stdout': OK}, 'returned', 'non-error or ambiguous direct JSON output'),
         ('5b success and equal provider result', {'process.stdout': OK, 'provider-result.json': OK},
          'returned', 'non-error or ambiguous direct JSON output'),
-        ('5c non-result object', {'process.stdout': {'type': 'assistant'}}, 'unknown', 'non-error or ambiguous direct JSON output'),
-        ('5d array', {'process.stdout': '[]'}, 'unknown', 'non-error or ambiguous direct JSON output'),
+        ('5c non-result object', {'process.stdout': {'type': 'assistant'}}, 'invalid', INVALID + 'not a result terminal'),
+        ('5d array', {'process.stdout': '[]'}, 'invalid', INVALID + 'not a result terminal'),
+        ('5e prose result text', {'process.stdout': {'type': 'result', 'subtype': 'success', 'result': 'Done.'}},
+         'invalid', INVALID + 'result text JSONDecodeError'),
+        ('5f duplicate key', {'process.stdout': '{"type":"result","subtype":"success",'
+                                                '"structured_output":{"status":"blocked","status":"completed"}}'},
+         'invalid', INVALID + 'ValueError'),
+        ('5g array result', {'process.stdout': {'type': 'result', 'subtype': 'success', 'structured_output': []}},
+         'invalid', INVALID + 'result is not an object'),
+        ('5h non-finite number', {'process.stdout': '{"type":"result","subtype":"success","structured_output":{"n":NaN}}'},
+         'invalid', INVALID + 'ValueError'),
         ('6a truncated', {'process.stdout': '{"type":"result","subtype":"succ'},
-         'unknown', 'unreadable worker return evidence: JSONDecodeError'),
-        ('6b invalid UTF-8', {'process.stdout': b'\xff\xfe{'}, 'unknown', 'unreadable worker return evidence: UnicodeDecodeError'),
+         'invalid', INVALID + 'JSONDecodeError'),
+        ('6b invalid UTF-8', {'process.stdout': b'\xff\xfe{'}, 'invalid', INVALID + 'UnicodeDecodeError'),
         ('7 files schema 17 never writes', {'capture-manifest.json': {'version': 1, 'mode': 'stream_metadata_v1'},
                                             'stream-terminal.json': OK, 'result.json': OK, 'terminal-capture.json': {}},
          'retryable', 'direct JSON output is absent or empty after exit'),
@@ -131,19 +146,18 @@ class WorkerReturnRecoveryTests(RepoCase):
                     write_json(kwargs['job'] / 'response.json', result)
                 return result
         engine = self.engine(Invalid())
-        with self.assertRaisesRegex(HarnessError, '不一致'):
+        # Each semantic rejection spends one attempt; scheduling continues to the limit.
+        with self.assertRaisesRegex(HarnessError, '尝试次数上限'):
             engine.start('Implement greet', self.plan())
-        for attempt in (2, 3):
-            with self.assertRaisesRegex(HarnessError, '不一致'):
-                engine.resume(engine.run['id'])
-            self.assertEqual(engine.run['attempts']['greet'], attempt)
-            self.assertFalse(engine.run['worker_receipts'])
-            self.assertFalse(engine.run['accepted'])
+        self.assertEqual(engine.run['attempts']['greet'], 3)
+        self.assertFalse(engine.run['worker_receipts'])
+        self.assertFalse(engine.run['accepted'])
         with self.assertRaisesRegex(HarnessError, '尝试次数上限'):
             engine.resume(engine.run['id'])
         workers = [d for d in engine.run['dispatches'] if d['role'] == 'worker']
         self.assertEqual(len(workers), 3)
-        self.assertTrue(all(d['worker_receipt_consumed'] == 'result_rejected' for d in workers))
+        self.assertTrue(all(d['worker_receipt_consumed'] == 'result_rejected' and d['status'] == 'invalid'
+                            and '不一致' in d['error'] for d in workers))
         self.assertEqual(engine.run['worker_recovery']['greet']['dispatch_id'], workers[-1]['id'])
 
     def test_retry_classification_preserves_original_timeout_provenance(self):
@@ -278,11 +292,14 @@ class Stub(DemoBackend):
         program = ('import json; print(' + repr(json.dumps(terminal)) + ', flush=True)')
         if boundary == 'no_output':
             program = 'import sys; sys.exit(1)'
+        if boundary == 'truncated':
+            program = 'print(\'{"type":"result","subtype":"succ\', end="", flush=True)'
         cli.command = lambda *args: [sys.executable, '-c', program]
         try:
             return cli.invoke(**kwargs)
         except HarnessError:
-            if boundary == 'no_output':
+            # Killed after the adapter's verdict, before any judgment is saved.
+            if boundary in ('no_output', 'truncated'):
                 os.kill(os.getpid(), signal.SIGKILL)
             raise
 Runtime(config, repo, backend=Stub()).start('Implement greet', read_json(root / 'examples/plan.json'))
@@ -331,38 +348,53 @@ Runtime(config, repo, backend=Stub()).start('Implement greet', read_json(root / 
         self.assertEqual(sum(d['role'] == 'worker' for d in engine.run['dispatches']), 1)
         self.assertFalse(engine.run['accepted'])
 
-    def test_truncated_output_remains_unknown_and_evidence_stays_bound(self):
+    def test_truncated_output_is_an_invalid_delivery_and_the_next_attempt_runs(self):
         stub_provider_clis(self)
         config, repo = self.config, self.repo
 
         class Truncated(DemoBackend):
+            workers = 0
+
             def invoke(self, **kwargs):
                 if kwargs['role'] != 'worker':
+                    return super().invoke(**kwargs)
+                self.workers += 1
+                if self.workers > 1:
                     return super().invoke(**kwargs)
                 cli = CLIBackend(config, repo / '.harness')
                 cli.command = lambda *args: [sys.executable, '-c',
                                              'print(\'{"type":"result","subtype":"succ\', end="", flush=True)']
                 return cli.invoke(**kwargs)
         engine = self.engine(Truncated())
-        with self.assertRaises(HarnessError):
-            engine.start('Implement greet', self.plan())
-        for _ in range(2):
-            with self.assertRaisesRegex(HarnessError, 'before immutable seal'):
-                engine.resume(engine.run['id'])
-        entry = engine.run['dispatches'][0]
+        run = engine.start('Implement greet', self.plan())
+        self.assertEqual(run['status'], 'completed')
+        entry = run['dispatches'][0]
         evidence = entry['worker_return_evidence']
         self.assertEqual((evidence['state'], evidence['reason']),
-                         ('unknown', 'unreadable worker return evidence: JSONDecodeError'))
+                         ('invalid', 'worker output is not a decodable object result: JSONDecodeError'))
         self.assertEqual(set(evidence), {'version', 'state', 'reason', 'sources'})
         self.assertEqual(set(evidence['sources']), set(SOURCES))
-        self.assertEqual(engine.run['attempts'], {'greet': 1})
-        self.assertEqual(list(engine.run['worker_receipts']), ['worker:implement:greet'])
-        self.assertEqual(sum(d['role'] == 'worker' for d in engine.run['dispatches']), 1)
-        # Deleting the bytes the classification used cannot turn it into a retry.
-        (engine.directory / 'dispatches' / entry['id'] / 'process.stdout').unlink()
-        with self.assertRaisesRegex(HarnessError, 'worker return evidence changed'):
-            engine.resume(engine.run['id'])
-        self.assertEqual(engine.run['attempts'], {'greet': 1})
+        stdout = engine.directory / 'dispatches' / entry['id'] / 'process.stdout'
+        self.assertEqual(evidence['sources']['process.stdout'], hashlib.sha256(stdout.read_bytes()).hexdigest())
+        self.assertEqual((entry['status'], entry['worker_receipt_consumed']), ('invalid', 'result_rejected'))
+        self.assertEqual(entry['invalid_output']['artifact'], str(stdout))
+        self.assertEqual(run['attempts'], {'greet': 2})
+        self.assertEqual(sum(d['role'] == 'worker' for d in run['dispatches']), 2)
+
+    def test_controller_death_after_undecodable_output_reaches_the_same_verdict(self):
+        stub_provider_clis(self)
+        run, directory = self.crash_controller('truncated')
+        worker = run['dispatches'][0]
+        self.assertIn('worker:implement:greet', run['worker_receipts'])
+        self.assertNotIn('worker_return_evidence', worker)
+        engine = self.engine()
+        result = engine.resume(run['id'])
+        self.assertEqual(result['status'], 'completed')
+        entry = result['dispatches'][0]
+        self.assertEqual((entry['worker_return_evidence']['state'], entry['worker_return_evidence']['reason']),
+                         ('invalid', 'worker output is not a decodable object result: JSONDecodeError'))
+        self.assertEqual((entry['status'], entry['worker_receipt_consumed']), ('invalid', 'result_rejected'))
+        self.assertEqual(result['attempts'], {'greet': 2})
 
     def test_explicit_provider_error_allows_counted_retry(self):
         stub_provider_clis(self)

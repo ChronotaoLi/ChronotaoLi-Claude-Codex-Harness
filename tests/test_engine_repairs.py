@@ -40,7 +40,7 @@ class EngineRepairsTests(RepoCase):
             "import pathlib,sys; print('checking acceptance policy'); "
             "sys.exit(0 if pathlib.Path(sys.argv[1]).exists() else 7)", str(marker)]}]}
 
-    def test_one_format_repair_has_fresh_dispatch_and_preserves_model_and_budget(self):
+    def test_invalid_worker_output_gets_a_fresh_dispatch_with_the_same_model_and_budget(self):
         def malformed(backend, kwargs, packet, result):
             if kwargs["role"] == "worker" and sum(c["role"] == "worker" for c in backend.calls) == 1:
                 result["summary"] = "x" * 32001
@@ -55,27 +55,15 @@ class EngineRepairsTests(RepoCase):
         self.assertEqual([request["model"] for request in workers], [self.config.role("worker")] * 2)
         self.assertEqual(result["attempts"], {"greet": 2})
         self.assertEqual(sum(result["attempts"].values()), 2)
-        correction = [call for call in backend.calls if call["role"] == "worker"][1]["packet"]["format_correction"]
-        self.assertEqual(correction["previous_dispatch"], workers[0]["dispatch_id"])
-        self.assertEqual(len(read_json(Path(correction["artifact"]) / "response.json")["summary"]), 32001)
+        first = next(d for d in result["dispatches"] if d["role"] == "worker")
+        self.assertEqual((first["id"], first["status"]), (workers[0]["dispatch_id"], "invalid"))
+        # The invalid original stays as evidence; the next attempt is not a correction of it.
+        self.assertEqual(len(read_json(Path(first["invalid_output"]["artifact"]))["summary"]), 32001)
+        self.assertNotIn("previous_invalid", [c for c in backend.calls if c["role"] == "worker"][1]["packet"])
         self.assertEqual(result["accepted"]["greet"]["verification"],
                          str(engine.services.verification.verification_directory("greet", 2) / "results.json"))
 
-    def test_second_format_violation_blocks_without_a_third_worker(self):
-        def malformed(backend, kwargs, packet, result):
-            if kwargs["role"] == "worker":
-                result["summary"] = "x" * 32001
-        backend = RecordingBackend(malformed)
-        engine = self.engine(backend)
-        with self.assertRaises(HarnessError):
-            engine.start("Implement greet", self.plan())
-        self.assertEqual(engine.run["status"], "blocked")
-        self.assertEqual(engine.run["accepted"], {})
-        self.assertEqual(engine.run["attempts"]["greet"], 2)
-        self.assertEqual(sum(call["role"] == "worker" for call in backend.calls), 2)
-        self.assertEqual(sum(engine.run["format_repairs"].values()), 1)
-
-    def test_format_repair_cannot_exceed_task_or_dispatch_budget(self):
+    def test_invalid_worker_output_cannot_exceed_task_or_dispatch_budget(self):
         def malformed(backend, kwargs, packet, result):
             if kwargs["role"] == "worker":
                 result["summary"] = "x" * 32001
@@ -90,9 +78,10 @@ class EngineRepairsTests(RepoCase):
                     engine.start("Implement greet", self.plan())
                 self.assertEqual(sum(engine.run["attempts"].values()), 1)
                 self.assertEqual(sum(call["role"] == "worker" for call in backend.calls), 1)
-                self.assertEqual(engine.run["format_repairs"], {})
+                worker = next(d for d in engine.run["dispatches"] if d["role"] == "worker")
+                self.assertEqual(worker["status"], "invalid")
 
-    def test_identity_scope_and_semantic_errors_never_become_format_repairs(self):
+    def test_identity_scope_semantic_and_review_errors_are_never_accepted(self):
         for mode in ("identity", "scope", "worker_state", "memory_approval"):
             def invalid(backend, kwargs, packet, result):
                 if kwargs["role"] == "worker" and mode != "memory_approval":
@@ -108,53 +97,47 @@ class EngineRepairsTests(RepoCase):
             with self.subTest(mode=mode):
                 backend = RecordingBackend(invalid)
                 engine = self.engine(backend)
-                with self.assertRaises(HarnessError):
+                expected = {"identity": "尝试次数上限", "worker_state": "尝试次数上限",
+                            "scope": "任务越界修改", "memory_approval": "连续两次无效"}[mode]
+                with self.assertRaisesRegex(HarnessError, expected):
                     engine.start("Implement greet", self.plan())
-                self.assertEqual(engine.run["format_repairs"], {})
                 self.assertEqual(engine.run["accepted"], {})
-                self.assertEqual(sum(call["role"] == "worker" for call in backend.calls), 1)
-                self.assertLessEqual(sum(call["kind"] == "review" for call in backend.calls), 1)
+                workers = [d for d in engine.run["dispatches"] if d["role"] == "worker" and d.get("invoked")]
+                reviews = [d for d in engine.run["dispatches"] if d.get("kind") == "review" and d.get("invoked")]
+                if mode in ("identity", "worker_state"):
+                    # Each invalid output spends one attempt; none is reviewed.
+                    self.assertEqual(len(workers), self.config.data["runtime"]["max_attempts"])
+                    self.assertTrue(all(d["status"] == "invalid" for d in workers))
+                    self.assertEqual(reviews, [])
+                elif mode == "scope":
+                    # A scope violation is not an invalid output: it stops without redo.
+                    self.assertEqual([(d["status"], d["worker_receipt_consumed"]) for d in workers],
+                                     [("failed", "scope_rejected")])
+                else:
+                    self.assertEqual([d["status"] for d in reviews], ["invalid", "invalid"])
+                    self.assertEqual(reviews[1]["retry_of"], reviews[0]["id"])
                 self.assertEqual(git.head(engine.worktree), engine.run["base_commit"])
 
-    def test_review_format_correction_cannot_drop_blocking_findings_or_change_verdict(self):
-        for verdict in ("request_changes", "approve"):
-            def rewrite_review(backend, kwargs, packet, result):
-                if kwargs["kind"] == "review":
-                    count = sum(call["kind"] == "review" for call in backend.calls)
-                    if count == 1:
-                        result.update(verdict=verdict, findings=[finding()], summary="x" * 4001)
-                    else:
-                        result.update(verdict="approve", findings=[])
-            with self.subTest(verdict=verdict):
-                backend = RecordingBackend(rewrite_review)
-                engine = self.engine(backend)
-                with self.assertRaises(HarnessError):
-                    engine.start("Implement greet", self.plan())
-                self.assertEqual(engine.run["status"], "blocked")
-                self.assertEqual(engine.run["accepted"], {})
-                self.assertEqual(sum(call["role"] == "worker" for call in backend.calls), 1)
-                self.assertEqual(sum(call["kind"] == "review" for call in backend.calls), 2)
-                self.assertEqual(git.head(engine.worktree), engine.run["base_commit"])
-
-    def test_review_format_correction_keeps_negative_findings_for_normal_rework(self):
-        def preserve_review(backend, kwargs, packet, result):
+    def test_invalid_review_rejection_keeps_negative_findings_for_normal_rework(self):
+        def reject_twice(backend, kwargs, packet, result):
             if kwargs["kind"] == "review":
                 count = sum(call["kind"] == "review" for call in backend.calls)
                 if count <= 2:
                     result.update(verdict="request_changes", findings=[finding()])
                     if count == 1:
                         result["summary"] = "x" * 4001
-        backend = RecordingBackend(preserve_review)
+        backend = RecordingBackend(reject_twice)
         engine = self.engine(backend)
         result = engine.start("Implement greet", self.plan())
         self.assertEqual(result["status"], "completed")
-        self.assertEqual(sum(call["role"] == "worker" for call in backend.calls), 2)
+        self.assertEqual(sum(call["role"] == "worker" for call in backend.calls), 3)
         self.assertEqual(sum(call["kind"] == "review" for call in backend.calls), 3)
         workers = [call for call in backend.calls if call["role"] == "worker"]
         self.assertEqual(workers[1]["packet"]["prior_reviews"][0]["review"]["findings"], [finding()])
-        self.assertEqual(result["review_history"]["greet"][0]["review"]["verdict"], "request_changes")
+        first = result["review_history"]["greet"][0]
+        self.assertEqual((first["status"], first["review"]["verdict"]), ("invalid_rejected", "request_changes"))
 
-    def test_blocked_worker_with_format_fault_does_not_get_automatic_retry(self):
+    def test_invalid_blocked_worker_keeps_its_route_without_another_worker(self):
         for blocker_kind in ("environment", "task"):
             def blocked(backend, kwargs, packet, result):
                 if kwargs["role"] == "worker":
@@ -163,11 +146,14 @@ class EngineRepairsTests(RepoCase):
             with self.subTest(blocker_kind=blocker_kind):
                 backend = RecordingBackend(blocked)
                 engine = self.engine(backend)
-                with self.assertRaises(HarnessError):
+                with self.assertRaisesRegex(HarnessError, "环境受阻" if blocker_kind == "environment" else "停止重新规划"):
                     engine.start("Implement greet", self.plan())
-                self.assertEqual(engine.run["format_repairs"], {})
+                worker = next(d for d in engine.run["dispatches"] if d["role"] == "worker")
+                self.assertEqual((worker["status"], worker["worker_outcome"]), ("invalid_blocked", blocker_kind + "_blocked"))
+                self.assertNotIn("attempt_exemption", worker)
                 self.assertEqual(sum(engine.run["attempts"].values()), 1)
-                self.assertEqual(engine.run["replan_attempts"], 0)
+                self.assertEqual(sum(call["kind"] == "replan" for call in backend.calls),
+                                 0 if blocker_kind == "environment" else 1)
                 self.assertEqual(sum(call["role"] == "worker" for call in backend.calls), 1)
 
     def test_three_loud_failures_reach_repair_within_context_budget_and_keep_logs(self):

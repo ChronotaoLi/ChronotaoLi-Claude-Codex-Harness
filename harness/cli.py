@@ -159,11 +159,12 @@ def status_summary(run):
     dispatches = run.get("dispatches", [])
     dispatches = [entry for entry in dispatches if isinstance(entry, dict)] if isinstance(dispatches, list) else []
     outcomes = dict.fromkeys(("completed", "task_blocked", "environment_blocked", "operator_blocked",
-                              "continuation_blocked", "runtime_failed", "unknown"), 0)
+                              "continuation_blocked", "invalid_output", "runtime_failed", "unknown"), 0)
     for entry in dispatches:
         if entry.get("role") == "worker":
             outcome = entry.get("worker_outcome")
             key = outcome if isinstance(outcome, str) and outcome in outcomes else (
+                "invalid_output" if entry.get("status") == "invalid" else
                 "runtime_failed" if entry.get("status") == "failed" else "unknown")
             outcomes[key] += 1
     result["worker_outcomes"] = outcomes
@@ -321,7 +322,7 @@ def operation_arguments(args):
                 "commander": args.commander, "pause_after_plan": args.pause_after_plan, "step": args.step}
     return {"run_id": args.run_id, "approve_plan": args.approve_plan, "step": args.step,
             "reverify": args.reverify, "retry_stopped": args.retry_stopped,
-            "confirm_exited": list(args.confirm_exited or ()), "repair_invalid": args.repair_invalid,
+            "confirm_exited": list(args.confirm_exited or ()),
             "environment_update": str(args.environment_update) if args.environment_update is not None else None,
             "operator_decision": [str(path) for path in args.operator_decision or ()],
             "execution_guidance": str(args.execution_guidance) if getattr(args, "execution_guidance", None) is not None else None,
@@ -333,8 +334,6 @@ def resume_options(args):
     options = {"retry_stopped": args.retry_stopped} if args.retry_stopped is not None else {}
     if args.confirm_exited:
         options["confirm_exited"] = args.confirm_exited
-    if args.repair_invalid is not None:
-        options["repair_invalid"] = args.repair_invalid
     if args.environment_update is not None:
         options["environment_update"] = args.environment_update
     if args.operator_decision is not None:
@@ -429,8 +428,6 @@ def _main(argv=None):
     resume.add_argument("--retry-stopped", metavar="TASK_ID|final", help="显式重试已被指挥停止的规划请求，仍受累计预算约束")
     resume.add_argument("--confirm-exited", action="append", metavar="DISPATCH_ID",
                         help="确认指定旧 dispatch 已退出并记录证据；可重复指定")
-    resume.add_argument("--repair-invalid", metavar="DISPATCH_ID",
-                        help="显式修正当前非法计划或无拒绝的非法批准元数据；保留证据和累计预算")
     resume.add_argument("--environment-update", type=Path, metavar="FILE",
                         help="提供操作者环境澄清 JSON 文件；不扩展权限、文件范围或命令授权")
     resume.add_argument("--execution-guidance", type=Path, metavar="FILE",

@@ -59,7 +59,7 @@ class EnvironmentCLITests(unittest.TestCase):
         # Schema 16 derives the run total from the per-task counters.
         self.assertEqual(summary["budgets"]["attempts_total"], 7)
         self.assertNotIn("total_attempts", summary["budgets"])
-        self.assertEqual(summary["worker_outcomes"], dict(completed=0, task_blocked=0, environment_blocked=1, operator_blocked=0, continuation_blocked=0, runtime_failed=1, unknown=1))
+        self.assertEqual(summary["worker_outcomes"], dict(completed=0, task_blocked=0, environment_blocked=1, operator_blocked=0, continuation_blocked=0, invalid_output=0, runtime_failed=1, unknown=1))
         blocker = summary["last_environment_blocker"]
         self.assertFalse(blocker["stale"])
         self.assertEqual(blocker["dispatch_id"], "d3")

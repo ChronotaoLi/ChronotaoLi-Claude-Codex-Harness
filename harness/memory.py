@@ -193,7 +193,7 @@ class Memory:
             db.close()
 
     @staticmethod
-    def _validate_record(key, abstract, overview, detail, source, ttl_days):
+    def validate_record(key, abstract, overview, detail, source, ttl_days):
         if not key or not abstract or not source:
             raise HarnessError("记忆必须有 key、摘要和来源")
         if len(detail) > 100000 or len(overview) > 8000 or len(abstract) > 500:
@@ -258,7 +258,7 @@ class Memory:
 
     def remember(self, *, key, abstract, overview, detail, source, kind="operator", ttl_days=None,
                  provenance=None, operation_id=None):
-        self._validate_record(key, abstract, overview, detail, source, ttl_days)
+        self.validate_record(key, abstract, overview, detail, source, ttl_days)
         record = dict(key=key, abstract=abstract, overview=overview, detail=detail,
                       source=source, kind=kind, ttl_days=ttl_days, provenance=provenance)
         request = {"method": "remember", **record}
@@ -320,7 +320,7 @@ class Memory:
     def remember_proposals(self, proposals, approved_keys, commit, run_id, task_id, ttl_days=180,
                            *, operation_id=None):
         """Atomically promote only independently approved keys; preserve operator ownership."""
-        self._validate_record("knowledge", "knowledge", "", "", "review", ttl_days)
+        self.validate_record("knowledge", "knowledge", "", "", "review", ttl_days)
         if commit is None:
             raise HarnessError("提升项目知识必须提供接受的提交")
         request = {"method": "remember_proposals", "proposals": proposals, "approved_keys": approved_keys,

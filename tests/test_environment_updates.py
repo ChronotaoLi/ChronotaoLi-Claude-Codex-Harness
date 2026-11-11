@@ -301,7 +301,7 @@ class EnvironmentUpdateTests(RepoCase):
     def test_conflicting_recovery_options_reject_before_dispatch(self):
         engine, backend, path, value = self.blocked()
         for options in ({'reverify': True}, {'retry_stopped': 'greet'},
-                        {'allow_scope': ['extra.py']}, {'repair_invalid': value['blocker_dispatch_id']}):
+                        {'allow_scope': ['extra.py']}):
             with self.subTest(options=options), self.assertRaises(HarnessError):
                 self.engine(backend).resume(engine.run['id'], environment_update=path, **options)
             self.assertEqual(len(backend.calls), 1)
@@ -451,44 +451,6 @@ class EnvironmentUpdateTests(RepoCase):
             self.assertEqual(len(call['packet']['environment_history']), 2)
             self.assertEqual(records[-1]['summary'], value['summary'])
             self.assertEqual(records[-1]['checks'], [])
-
-    def test_worker_format_correction_rechecks_prerequisite_before_spending_budget(self):
-        engine, backend, path, value = self.blocked()
-        marker = self.repo / 'ready-for-worker'
-        marker.write_text('ready')
-        value['checks'] = [{'kind': 'path', 'path': str(marker), 'path_type': 'file'}]
-        write_json(path, value)
-
-        def remove_prerequisite(backend, kwargs, packet, result):
-            if kwargs['role'] == 'worker' and sum(c['role'] == 'worker' for c in backend.calls) == 2:
-                marker.unlink()
-                result['summary'] = 'x' * 32001
-
-        backend.change = remove_prerequisite
-        with self.assertRaises(HarnessError):
-            self.engine(backend).resume(engine.run['id'], environment_update=path)
-        saved = self.saved(engine)
-        workers = [c for c in backend.calls if c['role'] == 'worker']
-        self.assertEqual(len(workers), 2)
-        self.assertEqual(saved['attempts'], {'greet': 2})
-        self.assertEqual(sum(saved['attempts'].values()), 2)
-        self.assertEqual(saved['agent_dispatches'], len(backend.calls))
-        self.assertIn('worker:implement:greet', saved['pending_format_corrections'])
-        before = copy.deepcopy(saved)
-        calls = len(backend.calls)
-        with self.assertRaises(HarnessError):
-            self.engine(backend).resume(engine.run['id'])
-        self.assertEqual(len(backend.calls), calls)
-        for key in ('attempts', 'agent_dispatches'):
-            self.assertEqual(self.saved(engine)[key], before[key])
-        marker.write_text('ready again')
-        result = self.engine(backend).resume(engine.run['id'])
-        self.assertEqual(result['status'], 'completed')
-        self.assertEqual(result['attempts'], {'greet': 3})
-        workers = [c for c in backend.calls if c['role'] == 'worker']
-        self.assertEqual(len(workers), 3)
-        self.assertIn('format_correction', workers[-1]['packet'])
-        self.assertEqual(result['format_repairs']['worker:implement:greet'], 1)
 
     def test_interrupted_update_recording_reuses_saved_artifact_without_duplicate(self):
         for boundary in ('event', 'ledger'):

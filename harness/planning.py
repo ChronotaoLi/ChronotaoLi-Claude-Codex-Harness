@@ -205,19 +205,6 @@ class Planner(RuntimeService):
             if result.get("action") != "replan" or result["instruction"] != source["instruction"]:
                 raise HarnessError("再规划选择与原指挥结果不符；保留原选择和证据")
 
-    def validate_replan_worker_correction(self):
-        """Current transitions atomically retire superseded worker corrections."""
-        for field in ('pending_replan', 'replan_stopped'):
-            boundary = self.context.run.get(field)
-            if not boundary:
-                continue
-            trigger = boundary.get('trigger', {})
-            if isinstance(trigger, dict) and trigger.get('coordination'):
-                key = f"worker:implement:{trigger.get('task_id')}"
-                if key in self.context.run['pending_format_corrections']:
-                    raise HarnessError('superseded worker correction conflicts with replan; '
-                                       'current protocol does not repair legacy state')
-
     def replan(self, trigger):
         pending = self.context.run.get("pending_replan")
         if pending and pending["stage"] == "validated":
@@ -250,15 +237,24 @@ class Planner(RuntimeService):
         self.context.run["pending_replan"] = {"stage": "request", "trigger": deepcopy(trigger), "attempt": attempt,
             "request_id": self.context.run["pending_replan"].get("request_id") or str(uuid.uuid4())}
         self.context.save()
-        result = self.services.dispatch.dispatch("commander", "replan", "replanning", REPLAN,
-            {"goal": self.context.run["goal"], **self.services.packets.plan_context(),
-             "accepted": self.services.packets.accepted_context(), "trigger": compact_feedback(trigger),
-             "approved_scope": deepcopy(self.context.run.get("approved_scope", [])),
-             "attempts": self.context.run["attempts"], "work_attempts": work_attempts(self.context.run),
-             "max_tasks": self.context.config.data["runtime"]["max_tasks"],
-             "remaining_replans": self.context.config.data["runtime"]["max_replans"] - attempt,
-             "tool_constraints": self.services.packets.tool_constraints(),
-             "instruction": "Apply the replan contract in role_skill to the bound trigger. Additional scope is limited to approved_scope. No file edits."})
+        from .receipts import InvalidReplanStop
+        try:
+            result = self.services.dispatch.dispatch("commander", "replan", "replanning", REPLAN,
+                {"goal": self.context.run["goal"], **self.services.packets.plan_context(),
+                 "accepted": self.services.packets.accepted_context(), "trigger": compact_feedback(trigger),
+                 "approved_scope": deepcopy(self.context.run.get("approved_scope", [])),
+                 "attempts": self.context.run["attempts"], "work_attempts": work_attempts(self.context.run),
+                 "max_tasks": self.context.config.data["runtime"]["max_tasks"],
+                 "remaining_replans": self.context.config.data["runtime"]["max_replans"] - attempt,
+                 "tool_constraints": self.services.packets.tool_constraints(),
+                 "instruction": "Apply the replan contract in role_skill to the bound trigger. Additional scope is limited to approved_scope. No file edits."})
+        except InvalidReplanStop as stop:
+            # A structurally valid stop is a veto even when its other checks fail.
+            stop.entry.update(status="invalid_stopped", error=str(stop))
+            self.record_replan_stop(trigger, stop.result, attempt, output_error=str(stop),
+                                    returned_artifact=stop.artifact)
+            self.services.receipts.observe_invalid(stop.entry)
+            raise HarnessError("指挥已停止再规划；输出另有错误，证据已保留，不自动重派") from stop
         artifact = self.context.directory / "plans" / f"replan-{attempt}.json"
         write_json(artifact, {"trigger": trigger, "result": result})
         tasks = apply_revision(self.context.run["tasks"], result, self.context.run["accepted"],
@@ -295,7 +291,6 @@ class Planner(RuntimeService):
                                               source_digest=hashlib.sha256(Path(receipt["artifact"]).read_bytes()).hexdigest())
         self.context.run.pop("pending_replan", None)
         self.context.run["commander_receipts"].pop("commander:replan:replanning", None)
-        self.context.run["pending_format_corrections"].pop("commander:replan:replanning", None)
         self.context.save()
         self.services.workflow.synchronize_decision_requests()
 
@@ -319,7 +314,6 @@ class Planner(RuntimeService):
         self.context.run["feedback"] = {"replan": pending["artifact"], "trigger": compact_feedback(pending["trigger"])}
         if not retain:
             self.context.run.pop("worker_recovery", None)
-        self.context.run["pending_format_corrections"].clear()
         self.record_plan(pending["tasks"], pending["reason"], pending["trigger"], finish_replan=True)
         self.context.checkpoint()
         self.context.event("plan_revised", revision=len(self.context.run["plan_history"]) - 1)

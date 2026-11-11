@@ -13,7 +13,7 @@ from pathlib import Path
 import shutil
 import time
 
-from .contracts import validate_structure, validate_work_semantics
+from .contracts import validate_work_core
 from .worker_receipts import delivered_work_contract
 from .git_query import covers as git_query_covers
 from .recovery import RECOVERY_BUSY_KEYS, read_bound_result, snapshot_digest
@@ -250,8 +250,7 @@ class EnvironmentRecovery(RuntimeService):
                 or not isinstance(source.get("artifact_digest"), str)):
             raise HarnessError("环境阻断原始证据引用无效")
         result, _ = read_bound_result(source, "环境阻断")
-        validate_structure(result, delivered_work_contract(self.context.run, self.context.directory, dispatch_id))
-        validate_work_semantics(result)
+        validate_work_core(result, delivered_work_contract(self.context.run, self.context.directory, dispatch_id))
         if result["status"] != "blocked" or result["blocker_kind"] != "environment":
             raise HarnessError("环境更新必须绑定 worker 环境阻断结果")
         return result
@@ -270,8 +269,7 @@ class EnvironmentRecovery(RuntimeService):
                 or task_id in self.context.run["accepted"] or feedback.get("task_id") != task_id):
             raise HarnessError("--environment-update 仅用于当前未接受任务的环境阻断")
         busy = (*RECOVERY_BUSY_KEYS, "replan_stopped")
-        if any(self.context.run.get(key) for key in busy) or any(
-                self.services.recovery.active_invalid_repair(key) for key in self.context.run["invalid_repairs"]):
+        if any(self.context.run.get(key) for key in busy):
             raise HarnessError("已有待处理阶段、指令、receipt 或修正；不能用环境更新替换原请求")
         matches = [i for i, d in enumerate(self.context.run["dispatches"])
                    if d["id"] == dispatch_id and d["role"] == "worker" and d["task_id"] == task_id]

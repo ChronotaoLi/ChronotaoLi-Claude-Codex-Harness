@@ -169,12 +169,20 @@ class ProviderUsageTests(RepoCase):
         self.assertEqual(self.events(engine)[-1]["provider_usage"], entry["provider_usage"])
 
     def test_protocol_failure_still_records_usage_and_blocks_acceptance(self):
+        # The fixture has no commander results: one attempt, so no selection is needed.
+        self.config.data["runtime"]["max_attempts"] = 1
         engine = self.engine(self.backend({"worker": {"invalid_result": True}}))
-        with self.assertRaises(HarnessError):
+        # An invalid result spends its attempt; the run stops at the limit.
+        with self.assertRaisesRegex(HarnessError, "尝试次数上限"):
             engine.start("Implement greet", self.plan())
         self.assertEqual(engine.run["accepted"], {})
-        self.assertEqual(engine.run["dispatches"][-1]["provider_usage"]["num_turns"], 3)
-        self.assertEqual(self.events(engine)[-1]["status"], "failed")
+        workers = [entry for entry in engine.run["dispatches"] if entry["role"] == "worker"]
+        self.assertEqual(len(workers), 1)
+        for worker in workers:
+            self.assertEqual(worker["status"], "invalid")
+            self.assertEqual(worker["provider_usage"]["num_turns"], 3)
+        statuses = [event["status"] for event in self.events(engine) if event["role"] == "worker"]
+        self.assertEqual(statuses, ["invalid"] * len(workers))
 
     def test_turn_limit_reason_survives_nonzero_exit_and_does_not_accept_candidate(self):
         backend = self.backend({"worker": {"exit_code": 1, "envelope": {
@@ -211,8 +219,9 @@ class ProviderUsageTests(RepoCase):
                 self.assertEqual(engine.run['accepted'], {})
 
     def test_missing_and_invalid_metrics_remain_unknown_without_blocking_acceptance(self):
+        # Strict JSON has no NaN: a non-finite cost would make the terminal undecodable.
         options = {"worker": {"envelope": {
-            "total_cost_usd": float("nan"), "num_turns": True,
+            "total_cost_usd": "0.25", "num_turns": True,
             "usage": {"input_tokens": -1, "output_tokens": 0,
                       "cache_creation_input_tokens": "20", "cache_read_input_tokens": 2**64}}}}
         engine = self.engine(self.backend(options))

@@ -120,62 +120,35 @@ class CommandRequirementsTests(RepoCase):
         commands = [['required-tool', 'run', str(i)] for i in range(33)]
         yield 'too_many', commands, commands[:32]
 
-    def assert_explicit_command_repair(self, engine, backend, kind):
-        key = f"commander:{kind}:{'planning' if kind == 'plan' else 'replanning'}"
-        before = self.saved(engine)
-        source = before['commander_receipts'][key]
-        original = Path(source['artifact']).read_bytes()
-        self.assertEqual(sum(call['kind'] == kind for call in backend.calls), 1)
-        self.assertNotIn(key, before['format_repairs'])
-        self.assertNotIn(key, before['pending_format_corrections'])
-        self.assertEqual(before['invalid_repairs'], {})
-        calls = copy.deepcopy(backend.calls)
-        with self.assertRaises(HarnessError):
-            self.engine(backend).resume(engine.run['id'])
-        self.assertEqual(backend.calls, calls)
-        saved = self.saved(engine)
-        self.assertEqual(saved['commander_receipts'][key], source)
-        for field in ('agent_dispatches', 'attempts', 'replan_attempts'):
-            self.assertEqual(saved[field], before[field])
-
-        result = self.engine(backend).resume(engine.run['id'], repair_invalid=source['dispatch_id'])
+    def assert_command_redo(self, result, backend, kind):
+        """The invalid declaration is kept as evidence and redone once automatically."""
         self.assertEqual(result['status'], 'completed')
-        self.assertEqual(sum(call['kind'] == kind for call in backend.calls), 2)
-        self.assertEqual(Path(source['artifact']).read_bytes(), original)
-        repair = result['invalid_repairs'][key]
-        self.assertEqual(repair['mode'], 'semantic')
-        self.assertEqual(repair['status'], 'completed')
-        self.assertEqual(repair['source']['dispatch_id'], source['dispatch_id'])
-        self.assertNotEqual(repair['corrected_dispatch_id'], source['dispatch_id'])
-        self.assertNotIn(key, result['format_repairs'])
-        self.assertNotIn(key, result['pending_format_corrections'])
-        self.assertEqual(len({entry['id'] for entry in result['dispatches']}), len(result['dispatches']))
-        self.assertEqual(sum(call['kind'] == 'review' for call in backend.calls), len(result['accepted']))
-        self.assertEqual(sum(call['kind'] == 'final_review' for call in backend.calls), 1)
-        return result
+        first, second = [d for d in result['dispatches'] if d.get('kind') == kind]
+        self.assertEqual((first['status'], second['status']), ('invalid', 'completed'))
+        self.assertEqual(second['retry_of'], first['id'])
+        self.assertTrue(Path(first['invalid_output']['artifact']).is_file())
+        calls = [call for call in backend.calls if call['kind'] == kind]
+        self.assertNotIn('previous_invalid', calls[0]['packet'])
+        self.assertEqual(calls[1]['packet']['previous_invalid']['dispatch_id'], first['id'])
 
-    def test_invalid_model_commands_require_explicit_plan_repair(self):
+    def test_invalid_model_commands_are_redone_once(self):
         for mode, invalid, corrected in self.command_repair_cases():
             with self.subTest(mode=mode):
                 self.config.data['permissions']['worker_commands'] = copy.deepcopy(corrected)
                 def declare(backend, kwargs, packet, result):
                     if kwargs['kind'] == 'plan':
-                        commands = corrected if 'invalid_output_correction' in packet else invalid
+                        commands = corrected if 'previous_invalid' in packet else invalid
                         result['tasks'][0]['required_commands'] = copy.deepcopy(commands)
 
                 backend = ScriptedBackend(declare)
-                engine = self.engine(backend)
-                with self.assertRaises(HarnessError):
-                    engine.start('Implement greet')
-                self.assertEqual(self.saved(engine)['tasks'], [])
-                result = self.assert_explicit_command_repair(engine, backend, 'plan')
+                result = self.engine(backend).start('Implement greet')
+                self.assert_command_redo(result, backend, 'plan')
                 self.assertEqual(result['original_tasks'][0]['required_commands'], corrected)
                 self.assertEqual(result['tasks'], result['original_tasks'])
                 self.assertEqual(result['attempts'], {'greet': 1})
-                self.assertEqual(sum(result['attempts'].values()), 1)
                 self.assertEqual(result['agent_dispatches'], 5)
 
-    def test_invalid_new_task_commands_require_explicit_replan_repair(self):
+    def test_invalid_new_task_commands_are_redone_once(self):
         for mode, invalid, corrected in self.command_repair_cases():
             for long_reason in (False, True):
                 with self.subTest(mode=mode, long_reason=long_reason):
@@ -185,7 +158,7 @@ class CommandRequirementsTests(RepoCase):
                         if kwargs['role'] == 'worker' and sum(call['role'] == 'worker' for call in backend.calls) == 1:
                             result.update(status='blocked', blocker_kind='task', blockers=['Need prerequisite'])
                         if kwargs['kind'] == 'replan':
-                            repairing = 'invalid_output_correction' in packet
+                            repairing = 'previous_invalid' in packet
                             commands = corrected if repairing else invalid
                             original = copy.deepcopy(plan['tasks'][0])
                             result.update(action='revise',
@@ -195,11 +168,8 @@ class CommandRequirementsTests(RepoCase):
                                           'add_depends_on': ['prep']}])
 
                     backend = ScriptedBackend(declare)
-                    engine = self.engine(backend)
-                    with self.assertRaises(HarnessError):
-                        engine.start('Implement greet', plan)
-                    self.assertEqual(self.saved(engine)['tasks'], plan['tasks'])
-                    result = self.assert_explicit_command_repair(engine, backend, 'replan')
+                    result = self.engine(backend).start('Implement greet', plan)
+                    self.assert_command_redo(result, backend, 'replan')
                     self.assertEqual(result['original_tasks'], plan['tasks'])
                     self.assertEqual(result['tasks'][1]['required_commands'], corrected)
                     self.assertEqual(list(result['accepted']), ['prep', 'greet'])

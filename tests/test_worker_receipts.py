@@ -296,40 +296,6 @@ class WorkerReceiptTests(RepoCase):
             engine.resume(engine.run['id'])
         self.assertEqual(engine.run['attempts']['greet'], 1)
 
-    def test_sealed_format_correction_replays_without_third_worker(self):
-        class Correcting(DemoBackend):
-            workers = 0
-            def invoke(self, **kwargs):
-                result = super().invoke(**kwargs)
-                if kwargs['role'] == 'worker':
-                    self.workers += 1
-                    if self.workers == 1:
-                        result['summary'] = 'x' * 32001
-                    from harness.util import write_json
-                    write_json(kwargs['job'] / 'response.json', result)
-                return result
-        backend = Correcting()
-        engine = self.engine(backend)
-        self.config.data['runtime']['max_attempts'] = 2
-        original = receipts_module.write_json
-        seals = 0
-        def write(path, value):
-            nonlocal seals
-            original(path, value)
-            if path.name.startswith('worker-seal.'):
-                seals += 1
-                if seals == 2:
-                    raise KeyboardInterrupt()
-        with patch.object(receipts_module, 'write_json', write):
-            with self.assertRaises(KeyboardInterrupt):
-                engine.start('Implement greeting', self.plan())
-        run = engine.resume(engine.run['id'])
-        self.assertEqual(run['status'], 'completed')
-        self.assertEqual(backend.workers, 2)
-        self.assertEqual(run['attempts']['greet'], 2)
-        self.assertFalse(run['pending_format_corrections'])
-        self.assertEqual(len({e['id'] for e in run['dispatches'] if e['role'] == 'worker'}), 2)
-
     def test_changed_candidate_during_handoff_cannot_be_late_bound(self):
         engine = self.engine()
         original = engine.services.progress.record_checkpoints
@@ -361,22 +327,26 @@ class WorkerReceiptTests(RepoCase):
                 return result
         backend = ExtraField()
         engine = self.engine(backend)
-        with self.assertRaises(HarnessError):
+        limit = self.config.data['runtime']['max_attempts']
+        # Each invalid result spends one attempt and scheduling continues to the limit.
+        with self.assertRaisesRegex(HarnessError, '尝试次数上限'):
             engine.start('Implement greeting', self.plan())
         self.assertNotIn('unexpected_field', backend.asserted_contract['properties'])
-        receipt = engine.run['dispatches'][-1]['worker_receipt']
+        workers = [d for d in engine.run['dispatches'] if d['role'] == 'worker']
+        receipt = workers[-1]['worker_receipt']
         # The ledger references the delivered contract; the file holds its body.
         self.assertNotIn('schema', receipt)
         self.assertEqual(read_json(Path(receipt['schema_artifact'])), backend.asserted_contract)
+        self.assertEqual(backend.workers, limit)
+        self.assertEqual(engine.run['attempts']['greet'], limit)
+        self.assertEqual([(d['status'], d['worker_receipt_consumed']) for d in workers],
+                         [('invalid', 'result_rejected')] * limit)
+        self.assertFalse(engine.run['worker_receipts'])
         self.assertNotIn('pending_task', engine.run)
         self.assertFalse(engine.run['accepted'])
-        with self.assertRaises(HarnessError):
+        with self.assertRaisesRegex(HarnessError, '尝试次数上限'):
             engine.resume(engine.run['id'])
-        self.assertEqual(backend.workers, 2)
-        self.assertEqual(engine.run['attempts']['greet'], 2)
-        self.assertFalse(engine.run['worker_receipts'])
-        self.assertEqual(engine.run['dispatches'][-1]['worker_receipt_consumed'], 'result_rejected')
-        self.assertNotIn('pending_task', engine.run)
+        self.assertEqual(backend.workers, limit)
         self.assertFalse(engine.run['accepted'])
 
     def test_clean_result_free_cancellation_records_retry_fact_after_confirmed_exit(self):
@@ -462,14 +432,16 @@ class WorkerReceiptTests(RepoCase):
                     write_json(kwargs['job'] / 'response.json', result)
                 return result
         engine = self.engine(Handoff())
-        with self.assertRaises(HarnessError):
+        with self.assertRaisesRegex(HarnessError, '尝试次数上限'):
             engine.start('Implement greeting', self.plan())
-        worker = next(e for e in engine.run['dispatches'] if e['role'] == 'worker')
-        self.assertEqual(worker['worker_receipt_consumed'], 'handoff_rejected')
-        self.assertEqual(engine.run['worker_recovery']['greet']['dispatch_id'], worker['id'])
+        workers = [e for e in engine.run['dispatches'] if e['role'] == 'worker']
+        self.assertEqual(len(workers), self.config.data['runtime']['max_attempts'])
+        for worker in workers:
+            self.assertEqual((worker['status'], worker['worker_receipt_consumed']), ('invalid', 'result_rejected'))
+            self.assertNotIn('attempt_exemption', worker)
+        self.assertEqual(engine.run['worker_recovery']['greet']['dispatch_id'], workers[-1]['id'])
         self.assertFalse(engine.run['worker_receipts'])
         self.assertNotIn('pending_task', engine.run)
-        self.assertNotIn('attempt_exemption', worker)
         self.assertFalse(engine.run['accepted'])
         self.assertFalse(any(e['role'] == 'verification' for e in engine.run['dispatches']))
 

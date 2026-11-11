@@ -42,8 +42,8 @@ def required_findings(run, task_id, candidate_digest, *, whole_run=False, record
         records = run.get("final_history", []) if whole_run else run.get("review_history", {}).get(task_id, [])
     for record in records:
         if not record.get("review"):
-            if record.get("validation_error"):
-                raise HarnessError("历史审阅格式无效；必须保留并核对原始阻断证据")
+            # Only a structurally invalid original saved when its candidate
+            # changed: no numbered findings, no usable dispositions.
             continue
         validate_review_source(run, task_id, record, kind="final_review" if whole_run else "review")
         dispositions = record["review"].get("finding_dispositions")
@@ -150,22 +150,6 @@ def claims_for_review(required, delivered, claims):
         if key is not None and key in (claims or {}):
             result[row["key"]] = deepcopy(claims[key])
     return result
-
-
-def active_review_findings(run, kind, task_id):
-    """The saved key mapping of the review currently in progress; never a default."""
-    if kind == "review":
-        pending = run.get("pending_task") or {}
-        if pending.get("task_id") != task_id or pending.get("stage") != "reviewing" or "required_findings" not in pending:
-            raise HarnessError("当前任务审阅缺少必需问题对照；保留证据")
-        return pending["required_findings"]
-    if kind != "final_review":
-        raise HarnessError("不支持此类审阅修正")
-    history = run.get("final_history") or []
-    record = history[-1] if history else {}
-    if record.get("status") != "running" or record.get("phase") != "reviewing" or "required_findings" not in record:
-        raise HarnessError("当前整体审阅缺少必需问题对照；保留证据")
-    return record["required_findings"]
 
 
 def validate_review_source(run, task_id, record, *, kind="review", candidate_digest=None):

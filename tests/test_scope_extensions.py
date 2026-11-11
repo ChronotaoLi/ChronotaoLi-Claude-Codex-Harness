@@ -165,6 +165,23 @@ class ScopeExtensionRecoveryTests(RepoCase):
             engine.services.planning.approve_scope_extensions(["support.txt"])
         self.assertEqual(engine.run, before)
 
+    def test_cli_scope_extension_reaches_runtime(self):
+        from test_cli_controls import CLIControlsTests
+
+        def stopped(backend, kwargs, packet, result):
+            if kwargs["role"] == "worker":
+                result.update(status="blocked", blocker_kind="task", blockers=["Missing scope"])
+        backend = ScriptedBackend(stopped)
+        engine = self.engine(backend)
+        with self.assertRaises(HarnessError):
+            engine.start("Implement greet", self.plan())
+        calls = copy.deepcopy(backend.calls)
+        code, engines, error = CLIControlsTests.invoke(
+            self, ["resume", engine.run["id"], "--allow-scope", "support.txt"], backend)
+        self.assertEqual(code, 1)
+        self.assertIn("停止重新规划", error)
+        self.assertEqual(engines[0].run["approved_scope"], ["support.txt"])
+        self.assertEqual(backend.calls, calls)
 
 if __name__ == "__main__":
     unittest.main()

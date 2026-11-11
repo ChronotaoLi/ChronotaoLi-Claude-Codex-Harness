@@ -57,87 +57,28 @@ class ReviewRecoveryRegressionTests(RepoCase):
     def test_exhausted_replans_preserve_task_blocker_intent(self):
         self.assert_blocker_replans_after_budget_increase("max_replans", 0)
 
-    def assert_immutable_review_format_error_stops(self, kind):
-        malformed = finding("advisory", "preference")
-        malformed["message"] = "x" * 4001
-
-        def long_finding(backend, kwargs, packet, result):
-            if kwargs["kind"] == kind:
-                result.update(verdict="approve", findings=[copy.deepcopy(malformed)])
-
-        backend = ScriptedBackend(long_finding)
-        engine = self.engine(backend)
-        with self.assertRaises(HarnessError):
-            engine.start("Implement greet", self.plan())
-        saved = read_json(engine.directory / "state.json")
-        key = f"reviewer:{kind}:{'final' if kind == 'final_review' else 'greet'}"
-        guard = saved["review_corrections"][key]
-        self.assertTrue(guard["unrepairable"])
-        self.assertEqual(read_json(Path(guard["artifact"]))["findings"], [malformed])
-        self.assertEqual(sum(call["kind"] == kind for call in backend.calls), 1)
-        calls = copy.deepcopy(backend.calls)
-        for _ in range(2):
-            resumed = self.engine(backend)
-            with self.assertRaises(HarnessError):
-                resumed.resume(saved["id"])
-            self.assertEqual(backend.calls, calls)
-            self.assertEqual(resumed.run["agent_dispatches"], saved["agent_dispatches"])
-            self.assertEqual(resumed.run["accepted"], saved["accepted"])
-            self.assertEqual(resumed.run["review_corrections"][key], guard)
-
-    def test_task_review_immutable_format_error_never_dispatches_correction(self):
-        self.assert_immutable_review_format_error_stops("review")
-
-    def test_final_review_immutable_format_error_never_dispatches_correction(self):
-        self.assert_immutable_review_format_error_stops("final_review")
-
-    def test_second_invalid_review_summary_is_terminal_after_one_correction(self):
+    def test_second_invalid_review_summary_stops_after_one_redo(self):
         def long_summary(backend, kwargs, packet, result):
             if kwargs["kind"] == "review":
                 result["summary"] = "x" * 4001
 
         backend = ScriptedBackend(long_summary)
         engine = self.engine(backend)
-        with self.assertRaises(HarnessError):
+        with self.assertRaisesRegex(HarnessError, "连续两次无效"):
             engine.start("Implement greet", self.plan())
         self.assertEqual(sum(call["kind"] == "review" for call in backend.calls), 2)
         saved = read_json(engine.directory / "state.json")
-        self.assertTrue(saved["review_corrections"]["reviewer:review:greet"]["exhausted"])
-        calls = copy.deepcopy(backend.calls)
-        with self.assertRaises(HarnessError):
+        reviews = [d for d in saved["dispatches"] if d.get("kind") == "review"]
+        self.assertEqual([d["status"] for d in reviews], ["invalid", "invalid"])
+        self.assertEqual(reviews[1]["retry_of"], reviews[0]["id"])
+        # A resume is a new request (no retry_of), then its own single redo.
+        with self.assertRaisesRegex(HarnessError, "连续两次无效"):
             self.engine(backend).resume(saved["id"])
-        self.assertEqual(backend.calls, calls)
-        self.assertEqual(read_json(engine.directory / "state.json")["agent_dispatches"], saved["agent_dispatches"])
-
-    def test_interrupted_terminal_guard_write_keeps_invalid_correction_receipt(self):
-        def long_summary(backend, kwargs, packet, result):
-            if kwargs["kind"] == "review":
-                result["summary"] = "x" * 4001
-
-        backend = ScriptedBackend(long_summary)
-        engine = self.engine(backend)
-        save = engine.context.save
-        key = "reviewer:review:greet"
-
-        def crash_before_terminal_save():
-            if engine.run["review_corrections"].get(key, {}).get("exhausted"):
-                raise KeyboardInterrupt()
-            save()
-
-        with patch.object(engine.context, "save", side_effect=crash_before_terminal_save):
-            with self.assertRaises(KeyboardInterrupt):
-                engine.start("Implement greet", self.plan())
-        saved = read_json(engine.directory / "state.json")
-        self.assertFalse(saved["review_corrections"][key].get("exhausted"))
-        receipt = saved["review_receipts"][key]
-        self.assertEqual(receipt["dispatch_id"], saved["dispatches"][-1]["id"])
-        calls = copy.deepcopy(backend.calls)
-        resumed = self.engine(backend)
-        with self.assertRaises(HarnessError):
-            resumed.resume(saved["id"])
-        self.assertTrue(resumed.run["review_corrections"][key]["exhausted"])
-        self.assertEqual(backend.calls, calls)
-        self.assertEqual(resumed.run["agent_dispatches"], saved["agent_dispatches"])
+        after = read_json(engine.directory / "state.json")
+        reviews = [d for d in after["dispatches"] if d.get("kind") == "review"]
+        self.assertEqual([d.get("retry_of") for d in reviews], [None, reviews[0]["id"], None, reviews[2]["id"]])
+        self.assertEqual(after["agent_dispatches"], saved["agent_dispatches"] + 2)
+        self.assertEqual(after["attempts"], saved["attempts"])
 
     def test_blank_reason_stop_is_persistent_counted_and_explicitly_retryable(self):
         def stop_once(backend, kwargs, packet, result):
@@ -162,7 +103,10 @@ class ReviewRecoveryRegressionTests(RepoCase):
         self.assertTrue(Path(stopped["artifact"]).is_file())
         evidence = Path(stopped["artifact"]).read_bytes()
         self.assertEqual(saved["replan_attempts"], 1)
-        self.assertEqual(saved["format_repairs"], {})
+        # A structurally valid stop is a veto even with a blank reason (J11b).
+        self.assertIn("response.reason", stopped["output_error"])
+        replan = next(d for d in saved["dispatches"] if d.get("kind") == "replan")
+        self.assertEqual(replan["status"], "invalid_stopped")
         calls = copy.deepcopy(backend.calls)
         for _ in range(2):
             with self.assertRaises(HarnessError):

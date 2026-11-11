@@ -31,28 +31,27 @@ class TaskBudgetRecoveryTests(RepoCase):
         self.assertEqual([event["changes"] for event in relaxed], [{"max_tasks": {"old": 1, "new": 2}}])
         self.assertEqual(engine.run["config_snapshot"]["runtime"]["max_tasks"], 2)
 
-    def test_increase_revalidates_existing_overlimit_revision_without_new_dispatch(self):
+    def test_overlimit_revision_is_redone_and_an_increase_lets_a_new_request_pass(self):
         self.config.data["runtime"]["max_tasks"] = 1
 
         def revise(backend, kwargs, packet, result):
             self.block_first_worker(backend, kwargs, result)
             if kwargs["kind"] == "replan":
-                self.assertEqual(packet["max_tasks"], 1)
+                self.assertEqual(packet["max_tasks"], self.config.data["runtime"]["max_tasks"])
                 result.update(self.revision(packet["original_tasks"][0]))
 
         backend = ScriptedBackend(revise)
         engine = self.engine(backend)
         original_plan = self.plan()
-        with self.assertRaisesRegex(HarnessError, "max_tasks"):
+        # A revision over max_tasks is an invalid output: redone once, then stopped.
+        with self.assertRaisesRegex(HarnessError, "连续两次无效：.*max_tasks"):
             engine.start("Implement greeting with prerequisite", original_plan)
-        receipt = copy.deepcopy(engine.run["commander_receipts"]["commander:replan:replanning"])
-        artifact = Path(receipt["artifact"])
-        original_result = artifact.read_bytes()
-        calls = copy.deepcopy(backend.calls)
+        replans = [entry for entry in engine.run["dispatches"] if entry.get("kind") == "replan"]
+        self.assertEqual([entry["status"] for entry in replans], ["invalid", "invalid"])
+        self.assertEqual(replans[1]["retry_of"], replans[0]["id"])
+        self.assertNotIn("commander:replan:replanning", engine.run["commander_receipts"])
+        artifacts = {entry["id"]: Path(entry["invalid_output"]["artifact"]).read_bytes() for entry in replans}
         self.assertEqual(engine.run["replan_attempts"], 0)
-        with self.assertRaisesRegex(HarnessError, "max_tasks"):
-            self.engine(backend).resume(engine.run["id"])
-        self.assertEqual(backend.calls, calls)
 
         self.config.data["runtime"]["max_tasks"] = 2
         resumed = self.engine(backend)
@@ -64,9 +63,12 @@ class TaskBudgetRecoveryTests(RepoCase):
         self.assertEqual(result["attempts"], {"greet": 2, "prepare": 1})
         self.assertEqual(result["replan_attempts"], 1)
         replans = [entry for entry in result["dispatches"] if entry.get("kind") == "replan"]
-        self.assertEqual([entry["id"] for entry in replans], [receipt["dispatch_id"]])
-        self.assertEqual(sum(call["kind"] == "replan" for call in backend.calls), 1)
-        self.assertEqual(artifact.read_bytes(), original_result)
+        self.assertEqual([entry["status"] for entry in replans], ["invalid", "invalid", "completed"])
+        self.assertNotIn("retry_of", replans[2])
+        self.assertEqual(sum(call["kind"] == "replan" for call in backend.calls), 3)
+        for ident, raw in artifacts.items():
+            entry = next(d for d in result["dispatches"] if d["id"] == ident)
+            self.assertEqual(Path(entry["invalid_output"]["artifact"]).read_bytes(), raw)
         self.assert_budget_audit(resumed)
 
     def test_increase_preserves_stop_until_explicit_decision_with_fresh_dispatch(self):

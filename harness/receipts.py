@@ -6,15 +6,39 @@ import json
 from pathlib import Path
 
 from . import git
-from .context import compact_review
 from .contracts import (
-    apply_revision, envelope, RepairableFormatError, review_approved, review_schema, validate,
-    validate_approval_repair, validate_commander_format_correction, validate_immutable_findings,
-    validate_review, validate_review_correction, validate_review_semantics, validate_structure,
+    apply_revision, envelope, judge_review, review_schema, ScopeExtensionRequired, validate,
+    validate_structure,
 )
 from .recovery import read_bound_bytes, read_bound_result, snapshot_digest
 from .services import RuntimeService
-from .util import HarnessError, read_json
+from .util import HarnessError, read_json, strict_json_loads
+
+# Error text carried into the next request's previous_invalid and events; the
+# dispatch entry keeps the full text.
+ERROR_EXCERPT_CHARS = 2000
+
+
+class InvalidOutput(HarnessError):
+    """A returned output failed its contract and no veto can be read from it.
+
+    Raised only after its dispatch entry is recorded invalid and its receipt is
+    consumed in one save; the dispatcher then redoes it once or stops.
+    """
+
+    def __init__(self, entry, error):
+        super().__init__(str(error))
+        self.entry = entry
+
+
+class InvalidReplanStop(HarnessError):
+    """A structurally valid commander stop whose other checks failed; its receipt stays."""
+
+    def __init__(self, entry, result, error, artifact):
+        super().__init__(str(error))
+        self.entry = entry
+        self.result = {k: v for k, v in result.items() if k not in ("task_id", "dispatch_id")}
+        self.artifact = artifact
 
 
 class InvalidReviewRejection(HarnessError):
@@ -111,9 +135,35 @@ class ResultReceipts(RuntimeService):
             "task_id": entry["task_id"], "error": str(error), "artifact": str(Path(receipt["artifact"]).parent)}
         self.context.save()
 
+    def record_invalid(self, key, error, *, artifact=None):
+        """Record an output without a readable veto and consume its receipt in one save."""
+        field = "commander_receipts" if key.startswith("commander:") else "review_receipts"
+        receipt = self.context.run[field][key]
+        entry = next(d for d in self.context.run["dispatches"] if d["id"] == receipt["dispatch_id"])
+        if artifact is None:
+            source = {"artifact": receipt["artifact"], "artifact_digest": receipt["artifact_digest"]}
+        else:
+            # An undecodable provider file: bind the bytes the judgment read.
+            source = {"artifact": str(artifact), "artifact_digest": hashlib.sha256(Path(artifact).read_bytes()).hexdigest()}
+        entry.update(status="invalid", error=str(error), invalid_output=source)
+        self.context.run["last_runtime_error"] = {"role": entry["role"], "kind": entry["kind"],
+            "task_id": entry["task_id"], "error": str(error), "artifact": str(Path(receipt["artifact"]).parent)}
+        self.context.run[field].pop(key)
+        self.context.save()
+        self.observe_invalid(entry)
+        return InvalidOutput(entry, error)
+
+    def observe_invalid(self, entry):
+        """Observation only; never a recovery input."""
+        try:
+            self.context.event("output_invalid", task_id=entry["task_id"], role=entry["role"], kind=entry["kind"],
+                               dispatch_id=entry["id"], status=entry["status"], retry_of=entry.get("retry_of"),
+                               error=str(entry.get("error", ""))[:ERROR_EXCERPT_CHARS])
+        except Exception:
+            pass
+
     def finish_commander_receipt(self, key):
-        """Replay the original request's result through validation and hook gates."""
-        self.services.recovery.validate_invalid_repair_source(key)
+        """Judge the original request's result, then run its hook gate when valid."""
         receipt = self.context.run["commander_receipts"][key]
         self.validate_terminal_capture(receipt)
         entry = next(d for d in self.context.run["dispatches"] if d["id"] == receipt["dispatch_id"])
@@ -129,26 +179,34 @@ class ResultReceipts(RuntimeService):
                 or snapshot_digest(self.context.snapshot()) != receipt["snapshot_digest"]):
             raise HarnessError("指挥或 hook 修改了代码/HEAD；原指挥结果不能用于当前快照")
         try:
-            result = json.loads(raw)
-        except (ValueError, UnicodeError) as error:
+            result = strict_json_loads(raw)
+        except (ValueError, UnicodeError, RecursionError) as error:
             raise HarnessError("指挥原始结果不是有效 JSON；保留证据，禁止重新抽取结论") from error
+        self.context.ensure_exited()
         contract = envelope(receipt["request"]["schema"], entry["task_id"], entry["id"])
-        validate_structure(result, contract)
-        previous = self.services.recovery.commander_format_source(key, receipt["request"]["packet"])
-        repair = self.services.recovery.active_invalid_repair(key)
-        if repair and repair.get("mode") == "format":
-            previous = self.services.recovery.validate_invalid_repair_source(key)
-        if previous is not None:
-            validate_commander_format_correction(entry["kind"], previous, result)
+        try:
+            validate_structure(result, contract)
+        except HarnessError as error:
+            raise self.record_invalid(key, error) from error
         payload = {k: v for k, v in result.items() if k not in ("task_id", "dispatch_id")}
-        if entry["kind"] == "plan":
-            self.services.planning.validate_tasks(payload)
-        elif entry["kind"] == "replan":
-            tasks = apply_revision(self.context.run["tasks"], payload, self.context.run["accepted"],
-                                   self.context.config.data["runtime"]["max_tasks"],
-                                   additional_allowed_paths=self.context.run.get("approved_scope", []))
-            self.services.planning.validate_tasks({"tasks": tasks})
-        validate(result, contract)
+        # Only a structurally valid stop is a readable veto (B4's ask must not inherit this).
+        stop = entry["kind"] == "replan" and result["action"] == "stop"
+        try:
+            if entry["kind"] == "plan":
+                self.services.planning.validate_tasks(payload)
+            elif entry["kind"] == "replan":
+                tasks = apply_revision(self.context.run["tasks"], payload, self.context.run["accepted"],
+                                       self.context.config.data["runtime"]["max_tasks"],
+                                       additional_allowed_paths=self.context.run.get("approved_scope", []))
+                self.services.planning.validate_tasks({"tasks": tasks})
+            validate(result, contract)
+        except ScopeExtensionRequired:
+            # Operator scope authority, not a redo: the receipt stays for --allow-scope.
+            raise
+        except HarnessError as error:
+            if stop:
+                raise InvalidReplanStop(entry, result, error, str(artifact)) from error
+            raise self.record_invalid(key, error) from error
         if not receipt.get("hook_completed"):
             receipt["hook_attempts"] = receipt.get("hook_attempts", 0) + 1
             self.context.save()
@@ -158,33 +216,13 @@ class ResultReceipts(RuntimeService):
                     or snapshot_digest(self.context.snapshot()) != receipt["snapshot_digest"]):
                 raise HarnessError("commander hook 修改了代码/HEAD；已停止，保留现场")
             receipt["hook_completed"] = True
-        self.services.recovery.validate_invalid_repair_source(key)
-        self.services.recovery.commander_format_source(key, receipt["request"]["packet"])
         entry["status"] = "completed"
         entry.pop("error", None)
         self.context.save()
         return payload
 
-    @staticmethod
-    def read_review_correction(guard):
-        artifact = Path(guard["artifact"])
-        try:
-            raw = artifact.read_bytes()
-        except OSError as error:
-            raise HarnessError("审阅修正的原始结果缺失或无法读取；保留证据，禁止重新抽取结论") from error
-        if hashlib.sha256(raw).hexdigest() != guard.get("artifact_digest"):
-            raise HarnessError("审阅修正的原始结果已改变；保留证据，禁止重新抽取结论")
-        return json.loads(raw)
-
-    @staticmethod
-    def review_correction(guard, previous_review):
-        preserved = compact_review(previous_review, guard["artifact"])
-        return {"error": guard["error"], "artifact": guard["artifact"],
-                "preserve_review": {k: v for k, v in preserved.items() if k != "summary"},
-                "instruction": "Correct the format using this dispatch's IDs. Read the original result at artifact when preserve_review contains excerpts. Preserve the original verdict, memory approvals and all findings in order, including their exact severity, category, location, message and evidence. Only the summary and invalid finding IDs may be reformatted; do not discard or downgrade findings."}
-
-    def finish_review_receipt(self, key, schema, packet, previous_review=None):
-        """Finish a returned review without treating unvalidated JSON as approval."""
+    def finish_review_receipt(self, key, schema):
+        """Judge a returned review without treating unvalidated JSON as approval."""
         receipt = self.context.run["review_receipts"][key]
         self.validate_terminal_capture(receipt)
         entry = next(d for d in self.context.run["dispatches"] if d["id"] == receipt["dispatch_id"])
@@ -198,47 +236,11 @@ class ResultReceipts(RuntimeService):
         if (git.head(self.context.worktree, binding=self.context.run["worktree_binding"]) != self.context.run["expected_head"]
                 or snapshot_digest(self.context.snapshot()) != receipt["snapshot_digest"]):
             raise HarnessError("审阅或 hook 修改了代码/HEAD；原审阅结果不能用于当前快照")
-        contract = envelope(schema, entry["task_id"], entry["id"])
-        validate_structure(result, contract)
-        repair = self.services.recovery.active_invalid_repair(key)
-        if repair:
-            original = self.services.recovery.validate_invalid_repair_source(key)
-            validate_approval_repair(original, result, repair["proposed_keys"])
-        rejection = None
-        try:
-            validate_review_semantics(result, [p["key"] for p in packet.get("proposed_memories", [])])
-        except HarnessError as error:
-            # Never salvage a correction that may have changed its original verdict,
-            # or infer rejection merely from invalid approval metadata.
-            if previous_review is not None or repair or review_approved(result):
-                raise
-            rejection = InvalidReviewRejection(result, receipt, error)
-        if previous_review is not None:
-            try:
-                validate_review_correction(previous_review, result)
-            except HarnessError:
-                self.context.run["review_corrections"][key]["failed"] = True
-                self.context.save()
-                raise
-        if rejection is None:
-            try:
-                validate(result, contract)
-            except RepairableFormatError as format_error:
-                if previous_review is not None or repair or review_approved(result):
-                    raise
-                # An original rejection with immutable overflow still requires
-                # rework. Preserve its evidence instead of asking for an
-                # impossible format correction or weakening approval gates.
-                try:
-                    validate_immutable_findings(result["findings"])
-                except RepairableFormatError as error:
-                    rejection = InvalidReviewRejection(result, receipt, error)
-                else:
-                    if not self.context.run["format_repairs"].get(key):
-                        raise
-                    # A prior candidate may have spent the correction budget.
-                    # Keep this candidate's original rejection and rework it.
-                    rejection = InvalidReviewRejection(result, receipt, format_error)
+        self.context.ensure_exited()
+        judgment = judge_review(result, envelope(schema, entry["task_id"], entry["id"]))
+        if judgment.state == "invalid":
+            raise self.record_invalid(key, judgment.error) from judgment.error
+        rejection = InvalidReviewRejection(result, receipt, judgment.error) if judgment.state == "veto" else None
         if not receipt.get("hook_completed"):
             receipt["hook_attempts"] = receipt.get("hook_attempts", 0) + 1
             self.context.save()
@@ -250,7 +252,6 @@ class ResultReceipts(RuntimeService):
                     or snapshot_digest(self.context.snapshot()) != receipt["snapshot_digest"]):
                 raise HarnessError("reviewer hook 修改了代码；已停止，保留现场")
             receipt["hook_completed"] = True
-        self.services.recovery.validate_invalid_repair_source(key)
         entry["status"] = "invalid_rejected" if rejection else "completed"
         if rejection:
             entry["error"] = str(rejection)
@@ -258,16 +259,15 @@ class ResultReceipts(RuntimeService):
             entry.pop("error", None)
         self.context.save()
         if rejection:
+            self.observe_invalid(entry)
             self.context.ensure_exited()
             raise rejection
         return {k: v for k, v in result.items() if k not in ("task_id", "dispatch_id")}
 
     def dispatch_review(self, kind, task_id, packet, task=None, *, required):
         """Dispatch one review whose runtime-keyed dispositions follow its saved mapping."""
-        schema = review_schema(required)
         try:
-            review = self.services.dispatch.dispatch("reviewer", kind, task_id, schema, packet, task)
+            review = self.services.dispatch.dispatch("reviewer", kind, task_id, review_schema(required), packet, task)
         except InvalidReviewRejection as rejection:
             return rejection.review, rejection.diagnostics
-        validate_review(review, [p["key"] for p in packet.get("proposed_memories", [])], schema)
         return review, {}

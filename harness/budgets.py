@@ -3,7 +3,7 @@
 from .services import RuntimeService
 import re
 
-from .contracts import validate, validate_work_semantics
+from .contracts import validate_work_bounds, validate_work_core
 from .worker_receipts import delivered_work_contract
 from .recovery import read_bound_result
 from .util import HarnessError
@@ -72,8 +72,10 @@ class AttemptAccounting(RuntimeService):
                     or exemption.get("artifact") != str(self.context.directory / "dispatches" / dispatch_id / "returned-result.json")):
                 raise HarnessError("任务尝试豁免来源无效；保留台账")
             result, _ = read_bound_result(exemption, "任务尝试豁免")
-            validate(result, delivered_work_contract(self.context.run, self.context.directory, dispatch_id))
-            validate_work_semantics(result)
+            contract = delivered_work_contract(self.context.run, self.context.directory, dispatch_id)
+            # The whole core contract, as when the exemption was granted.
+            validate_work_core(result, contract)
+            validate_work_bounds(result, contract)
             if (result["status"] != "blocked" or result["blocker_kind"] != exemption["blocker_kind"]
                     or entry.get("worker_outcome") != exemption["blocker_kind"] + "_blocked"):
                 raise HarnessError("任务尝试豁免与原始阻断结果不符；保留台账")

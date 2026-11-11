@@ -135,36 +135,6 @@ class TaskStageRecoveryTests(RepoCase):
         self.assertEqual(sum(call["role"] == "worker" for call in backend.calls), 2)
         self.assertTrue(git.clean(engine.worktree))
 
-    def test_format_correction_cli_failure_preserves_rejection_without_new_worker(self):
-        def reject_then_unavailable(backend, kwargs, packet, result):
-            if kwargs["kind"] != "review":
-                return
-            number = sum(call["kind"] == "review" for call in backend.calls)
-            if number == 2:
-                raise HarnessError("Reviewer correction service unavailable")
-            result.update(verdict="request_changes", findings=[finding()],
-                          summary="x" * 4001 if number == 1 else "The original defect remains")
-
-        self.config.data["runtime"]["max_attempts"] = 1
-        backend = RecordingBackend(reject_then_unavailable)
-        engine = self.engine(backend)
-        with self.assertRaisesRegex(HarnessError, "correction service"):
-            engine.start("Implement greet", self.plan())
-        self.assertFalse(engine.run["review_corrections"]["reviewer:review:greet"].get("failed"))
-        resumed = self.engine(backend)
-        with self.assertRaisesRegex(HarnessError, "尝试次数上限"):
-            resumed.resume(engine.run["id"])
-        self.assertEqual(resumed.run["attempts"], {"greet": 1})
-        self.assertEqual(sum(resumed.run["attempts"].values()), 1)
-        self.assertEqual(resumed.run["accepted"], {})
-        self.assertEqual(sum(call["role"] == "worker" for call in backend.calls), 1)
-        review = resumed.run["review_history"]["greet"][-1]["review"]
-        self.assertEqual(review["verdict"], "request_changes")
-        self.assertEqual(review["findings"], [finding()])
-        reviews = [request for request in backend.requests if request["kind"] == "review"]
-        self.assertEqual(len(reviews), 3)
-        self.assertEqual(len({request["dispatch_id"] for request in reviews}), 3)
-
     def test_planning_cli_failure_does_not_pollute_worker_feedback_or_force_dispatch_commander(self):
         def unavailable_once(backend, kwargs, packet, result):
             if kwargs["kind"] == "plan" and sum(call["kind"] == "plan" for call in backend.calls) == 1:
@@ -227,8 +197,40 @@ class TaskStageRecoveryTests(RepoCase):
     def test_replan_cli_failures_preserve_revision_budget_but_consume_dispatch_budget(self):
         self.assert_replan_failure_budget("cli")
 
-    def test_replan_unknown_skill_preserves_result_and_budgets_on_resume(self):
-        self.assert_replan_failure_budget("skill")
+    def test_replan_unknown_skill_is_redone_within_the_dispatch_budget(self):
+        def unknown_skill(backend, kwargs, packet, result):
+            if kwargs["role"] == "worker":
+                result.update(status="blocked", blocker_kind="task", blockers=["Need prerequisite"], summary="Needs preparation")
+            elif kwargs["kind"] == "replan":
+                task = deepcopy(packet["original_tasks"][0])
+                task.update(id="prepare", skills=["missing-business-skill"])
+                result.update(action="revise", reason="Add prerequisite", new_tasks=[task], updates=[{
+                    "id": "greet", "description": packet["original_tasks"][0]["description"],
+                    "add_depends_on": ["prepare"]}])
+
+        self.config.data["runtime"]["max_replans"] = 1
+        self.config.data["runtime"]["max_agent_dispatches"] = 3
+        backend = RecordingBackend(unknown_skill)
+        engine = self.engine(backend)
+        with self.assertRaisesRegex(HarnessError, "连续两次无效：.*不存在的 skill"):
+            engine.start("Implement greet", self.plan())
+        replans = [d for d in engine.run["dispatches"] if d.get("kind") == "replan"]
+        self.assertEqual([d["status"] for d in replans], ["invalid", "invalid"])
+        self.assertEqual(replans[1]["retry_of"], replans[0]["id"])
+        self.assertEqual(engine.run["replan_attempts"], 0)
+        self.assertEqual(engine.run["agent_dispatches"], 3)
+        self.assertEqual(engine.run["tasks"], self.plan()["tasks"])
+        self.assertEqual(len(engine.run["plan_history"]), 1)
+        calls = list(backend.calls)
+        again = self.engine(backend)
+        # The new request a resume would make needs a dispatch the budget no longer has.
+        with self.assertRaisesRegex(HarnessError, "模型派发次数上限"):
+            again.resume(engine.run["id"])
+        self.assertEqual(again.run["agent_dispatches"], 3)
+        self.assertEqual(again.run["replan_attempts"], 0)
+        self.assertEqual(again.run["attempts"], {"greet": 1})
+        self.assertEqual(backend.calls, calls)
+        self.assertEqual(len({request["dispatch_id"] for request in backend.requests}), 3)
 
     def test_increasing_replan_budget_resumes_corrective_planning_without_rerolling_rejection(self):
         def corrective(backend, kwargs, packet, result):

@@ -1,9 +1,11 @@
 import copy
 import unittest
+from types import SimpleNamespace
 
 from harness.adapters import provider_schema
-from harness.contracts import (REVIEW, RepairableFormatError, envelope,
+from harness.contracts import (REVIEW, envelope,
                                review_output_constraints, validate_review)
+from harness.task_lifecycle import TaskLifecycle
 from harness.util import HarnessError
 
 
@@ -23,10 +25,19 @@ class ReviewOutputConstraintTests(unittest.TestCase):
         return {item["path"]: item for item in review_output_constraints(
             envelope(REVIEW, "implement", "dispatch-1"), proposed_keys)}
 
-    def assert_semantic_rejection(self, result, proposed_keys=()):
-        with self.assertRaises(HarnessError) as raised:
-            validate_review(result, proposed_keys)
-        self.assertNotIsInstance(raised.exception, RepairableFormatError)
+    def assert_semantic_rejection(self, result):
+        with self.assertRaises(HarnessError):
+            validate_review(result)
+
+    def filtered(self, review_result, proposal_keys):
+        """Approvals are filtered on their own (R8); return kept keys and discard events."""
+        events = []
+        lifecycle = SimpleNamespace(context=SimpleNamespace(
+            event=lambda name, **fields: events.append((name, fields))))
+        kept = TaskLifecycle.approved_memory_keys(
+            lifecycle, "implement", review_result, [{"key": key} for key in proposal_keys])
+        return kept, [fields["discarded_keys"] for name, fields in events
+                      if name == "memory_proposals_discarded"]
 
     def test_finding_labels_may_repeat_because_identity_is_position(self):
         bounds = self.constraints()["response.findings"]
@@ -61,12 +72,14 @@ class ReviewOutputConstraintTests(unittest.TestCase):
         self.assertEqual(approval["subsetOf"], keys)
         self.assertEqual(approval["maxItems"], 8)
         self.assertTrue(approval["uniqueItems"])
-        validate_review(review(approved_keys=[keys[0]]), keys)
-        validate_review(review(approved_keys=keys), keys)
-        validate_review(review(), keys)
-        self.assert_semantic_rejection(review(approved_keys=["invented"]), keys)
-        with self.assertRaises(RepairableFormatError):
-            validate_review(review(approved_keys=[keys[0], keys[0]]), keys)
+        # The review contract does not judge approvals; they are filtered alone.
+        for approved, kept, discarded in (([keys[0]], [keys[0]], []), (keys, keys, []), ([], [], []),
+                                          (["invented"], [], [["invented"]]),
+                                          ([keys[0], keys[0]], [keys[0]], [[keys[0]]])):
+            with self.subTest(approved=approved):
+                result = review(approved_keys=approved)
+                self.assertIs(validate_review(result), result)
+                self.assertEqual(self.filtered(result, keys), (kept, discarded))
         keys.append("new-proposal")
         self.assertNotIn("new-proposal", approval["subsetOf"])
 
@@ -77,7 +90,9 @@ class ReviewOutputConstraintTests(unittest.TestCase):
         self.assertEqual(approval["maxItems"], 0)
         self.assertEqual(approval["subsetOf"], [])
         validate_review(review())
-        self.assert_semantic_rejection(review(approved_keys=["storage.format"]))
+        approved = review(approved_keys=["storage.format"])
+        self.assertIs(validate_review(approved), approved)
+        self.assertEqual(self.filtered(approved, []), ([], [["storage.format"]]))
 
 
 if __name__ == "__main__":

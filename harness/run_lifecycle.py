@@ -42,14 +42,14 @@ class RunLifecycle(RuntimeService):
                     "asset_digest": asset_digest(self.context.config), "base_commit": git.head(self.context.repo),
                     "original_tasks": deepcopy(supplied_tasks),
                     "replan_attempts": 0, "final_attempts": 0,
-                    "review_history": {}, "final_history": [], "plan_history": [], "format_repairs": {},
-                    "worker_receipts": {}, "review_corrections": {}, "review_receipts": {}, "commander_receipts": {},
-                    "invalid_repairs": {}, "approved_scope": [],
+                    "review_history": {}, "final_history": [], "plan_history": [],
+                    "worker_receipts": {}, "review_receipts": {}, "commander_receipts": {},
+                    "approved_scope": [],
                     "environment_updates": [], "environment_checks": [],
                     "decision_requests": [], "operator_decisions": [], "task_checkpoints": [], "checkpoint_batches": [],
                     "continuation_history": [], "execution_guidance": [],
                     "worktree_binding": {}, "ignored_baseline": [],
-                    "pending_format_corrections": {}, "agent_dispatches": 0,
+                    "agent_dispatches": 0,
                     "plan_approval_required": pause_after_plan, "plan_approved": not pause_after_plan,
                     "created_by_operation": getattr(operation, "id", None) if operation is not None else None}
         self.context.directory.mkdir(parents=True, exist_ok=True)
@@ -109,11 +109,10 @@ class RunLifecycle(RuntimeService):
                     "goal": str, "branch": str, "expected_head": str, "base_commit": str,
                     "config_snapshot": dict, "tasks": list, "original_tasks": list,
                     "accepted": dict, "attempts": dict, "dispatches": list,
-                    "review_history": dict, "review_corrections": dict, "review_receipts": dict,
+                    "review_history": dict, "review_receipts": dict,
                     "worker_receipts": dict, "commander_receipts": dict, "worktree_binding": dict, "ignored_baseline": list,
-                    "invalid_repairs": dict, "approved_scope": list,
-                    "pending_format_corrections": dict,
-                    "final_history": list, "plan_history": list, "format_repairs": dict,
+                    "approved_scope": list,
+                    "final_history": list, "plan_history": list,
                     "agent_dispatches": int, "final_attempts": int,
                     "replan_attempts": int, "plan_approval_required": bool, "plan_approved": bool,
                     "environment_updates": list, "environment_checks": list,
@@ -208,31 +207,31 @@ class RunLifecycle(RuntimeService):
                 if not key.startswith(role + ":"):
                     fail(field + "." + key)
                 source(receipt, key, field + "." + key)
-        for key, guard in self.context.run["review_corrections"].items():
-            field = "review_corrections." + key
-            artifact = mapping(guard, field).get("artifact")
-            if not key.startswith("reviewer:") or not isinstance(artifact, str):
-                fail(field)
-            # The guard identifies its original dispatch by the bound artifact path.
-            reference(Path(artifact).parent.name, key, field)
-        for key, pending in self.context.run["pending_format_corrections"].items():
-            field = "pending_format_corrections." + key
-            pending = mapping(pending, field)
-            if "dispatch_id" in pending:
-                reference(pending["dispatch_id"], key, field)
-            correction = mapping(pending.get("correction"), field + ".correction")
-            if "previous_dispatch" in correction:
-                reference(correction["previous_dispatch"], key, field + ".correction")
-            if "source" in correction:
-                source(correction["source"], key, field + ".correction.source")
-        for key, repair in self.context.run["invalid_repairs"].items():
-            field = "invalid_repairs." + key
-            repair = mapping(repair, field)
-            source(repair.get("source"), key, field + ".source")
-            if "original" in repair:
-                source(repair["original"], key, field + ".original")
-            if "corrected_dispatch_id" in repair:
-                reference(repair["corrected_dispatch_id"], key, field)
+        # Redo links (dispatch.redo_basis): rechecked here so the derivation holds at load.
+        model_roles = ("commander", "worker", "reviewer")
+        dispatch_list = self.context.run["dispatches"]
+        retried = set()
+        for index, entry in enumerate(dispatch_list):
+            key = f"{entry.get('role')}:{entry.get('kind')}:{entry.get('task_id')}"
+            if entry.get("status") == "invalid":
+                output = mapping(entry.get("invalid_output"), "dispatches.invalid_output")
+                artifact, digest = output.get("artifact"), output.get("artifact_digest")
+                if (not isinstance(artifact, str) or Path(artifact).parent != self.context.directory / "dispatches" / str(entry.get("id"))
+                        or not isinstance(digest, str) or len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest)):
+                    fail("dispatches.invalid_output 必须指向本派发目录内的原件并带 SHA256")
+            if "retry_of" not in entry:
+                continue
+            previous = next((item for item in reversed(dispatch_list[:index])
+                             if item.get("role") in model_roles and item.get("invoked") is True), None)
+            if (previous is None or previous.get("id") != entry["retry_of"]
+                    or f"{previous.get('role')}:{previous.get('kind')}:{previous.get('task_id')}" != key
+                    or previous.get("status") != "invalid" or "retry_of" in previous
+                    or entry.get("role") not in ("commander", "reviewer")):
+                fail("dispatches.retry_of 必须指向它之前最后一次模型调用，且那是同一调用、未重做过的无效输出")
+            if entry.get("invoked") is True:
+                if entry["retry_of"] in retried:
+                    fail("dispatches.retry_of 重复")
+                retried.add(entry["retry_of"])
         for tid, recovery in self.context.run.get("worker_recovery", {}).items():
             source(recovery, f"worker:implement:{tid}", "worker_recovery." + tid)
         owners = [("retained_candidate", self.context.run)]
@@ -262,7 +261,7 @@ class RunLifecycle(RuntimeService):
             return self.context.run
 
     def resume(self, ident, *, step=False, approve_plan=False, reverify=False, retry_stopped=None, confirm_exited=(),
-               repair_invalid=None, allow_scope=(), environment_update=None, operator_decision=None,
+               allow_scope=(), environment_update=None, operator_decision=None,
                execution_guidance=None, reject_continuation=None):
         runtime = self.context
         self.load_run(ident)
@@ -272,23 +271,21 @@ class RunLifecycle(RuntimeService):
                 raise HarnessError("该 run 已放弃；保留分支、工作树与证据，不能继续派发")
             self.context.commander = self.context.run["commander"]
             if self.context.run["status"] == "completed":
-                if confirm_exited or repair_invalid is not None or allow_scope or environment_update is not None or operator_decision is not None or execution_guidance is not None or reject_continuation is not None:
+                if confirm_exited or allow_scope or environment_update is not None or operator_decision is not None or execution_guidance is not None or reject_continuation is not None:
                     raise HarnessError("恢复修改选项仅用于未完成的 run（含 --reject-continuation 与 --execution-guidance）")
                 return self.context.run
             if reject_continuation is not None and (operator_decision is not None or environment_update is not None
                     or execution_guidance is not None or reverify or retry_stopped is not None
-                    or repair_invalid is not None or allow_scope):
-                raise HarnessError("--reject-continuation 不能与决定、环境更新、执行指导、重验、重规划或修正合用")
+                    or allow_scope):
+                raise HarnessError("--reject-continuation 不能与决定、环境更新、执行指导、重验、重规划或扩展范围合用")
             if execution_guidance is not None and (operator_decision is not None or environment_update is not None
-                    or reverify or retry_stopped is not None or repair_invalid is not None or allow_scope):
-                raise HarnessError("--execution-guidance 不能与决定、环境更新、重验、重规划或修正合用")
+                    or reverify or retry_stopped is not None or allow_scope):
+                raise HarnessError("--execution-guidance 不能与决定、环境更新、重验、重规划或扩展范围合用")
             if operator_decision is not None and (environment_update is not None or reverify or retry_stopped is not None
-                                                   or repair_invalid is not None or allow_scope):
-                raise HarnessError("--operator-decision 不能与环境更新、重验、重试停止、修正或扩展范围合用")
-            if environment_update is not None and (reverify or retry_stopped is not None or repair_invalid is not None or allow_scope):
-                raise HarnessError("--environment-update 不能与 --reverify、--retry-stopped、--repair-invalid 或 --allow-scope 合用")
-            if repair_invalid is not None and (reverify or retry_stopped is not None or allow_scope):
-                raise HarnessError("--repair-invalid 不能与 --reverify、--retry-stopped 或 --allow-scope 合用")
+                                                   or allow_scope):
+                raise HarnessError("--operator-decision 不能与环境更新、重验、重试停止或扩展范围合用")
+            if environment_update is not None and (reverify or retry_stopped is not None or allow_scope):
+                raise HarnessError("--environment-update 不能与 --reverify、--retry-stopped 或 --allow-scope 合用")
             if reverify and retry_stopped is not None:
                 raise HarnessError("--reverify 不能与 --retry-stopped 合用")
             self.context.reverify_requested = reverify
@@ -310,7 +307,6 @@ class RunLifecycle(RuntimeService):
             validate_inputs(self.context.run, self.context.directory)
             self.services.worker_receipts.validate_links()
             self.services.receipts.validate_pending_terminal_captures()
-            self.services.planning.validate_replan_worker_correction()
             update = self.services.environment.prepare_environment_update(environment_update) if environment_update is not None else None
             decision_values, decisions = (self.services.decisions.prepare_operator_decisions(operator_decision)
                                           if operator_decision is not None else ([], []))
@@ -342,8 +338,6 @@ class RunLifecycle(RuntimeService):
                                            "请使用 --operator-decision 显式更新为 continue")
             if allow_scope:
                 self.services.planning.approve_scope_extensions(allow_scope)
-            if repair_invalid is not None:
-                self.services.recovery.prepare_invalid_repair(repair_invalid)
             self.services.decisions.record_operator_decisions(decisions)
             if operator_decision is not None:
                 if any(value["decision"] == "stop" for value in decision_values):

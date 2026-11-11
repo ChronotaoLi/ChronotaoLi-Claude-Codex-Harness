@@ -120,7 +120,11 @@ def compact_worker(worker, artifact, budget=WORKER_CONTEXT_CHARS, *, digest=None
         return deepcopy(worker)
     evidence = worker.get("evidence", [])
     blockers = worker.get("blockers", [])
-    proposal_keys = worker.get("proposed_memory_keys", [p["key"] for p in worker.get("proposed_memories", [])])
+    proposals = worker.get("proposed_memories")
+    # Memory proposals are an optional product: malformed entries were discarded, not rejected.
+    proposal_keys = worker.get("proposed_memory_keys", [p["key"] for p in proposals
+                                                        if isinstance(p, dict) and isinstance(p.get("key"), str)]
+                                                    if isinstance(proposals, list) else [])
 
     def excerpt(size):
         result = {key: deepcopy(worker[key]) for key in ("task_id", "dispatch_id", "status", "blocker_kind")

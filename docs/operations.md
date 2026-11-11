@@ -49,7 +49,7 @@ python3 -m harness --repo /abs/project dashboard --port 8765
 
 不能做的事：
 
-- 循环 `resume` 直到通过。同一快照上的拒绝、停止与非法结果不会因重复恢复而改变，重复恢复只消耗派发预算。
+- 循环 `resume` 直到通过。同一快照上的拒绝与停止不会因重复恢复而改变；读不出否决的无效输出由新调用重做（每次请求最多重做一次）；重复恢复只消耗派发预算。
 - 自动增加预算、超时、轮数或上下文上限来“解除”停止。
 - 更换模型、供应商或 effort。
 - 修改 `state.json`、`events.jsonl`、dispatch 产物或记忆库。
@@ -70,7 +70,7 @@ python3 -m harness --repo /abs/project dashboard --port 8765
 | `operation_id`、`kind` | 记录 ID；`run` 或 `resume` |
 | `status` | `prepared`（已创建）→ `running`（已关联 run）→ `finished`（CLI 结束） |
 | `started_at`、`started_at_utc`、`finished_at`、`finished_at_utc` | epoch 秒与 ISO 8601 UTC |
-| `arguments` | `run`：`goal`、`plan`（路径或 null）、`commander`、`pause_after_plan`、`step`；`resume`：`run_id`、`approve_plan`、`step`、`reverify`、`retry_stopped`、`confirm_exited`、`repair_invalid`、`environment_update`、`execution_guidance`、`reject_continuation`（后三项为路径或 null）、`operator_decision`（路径列表）、`allow_scope`。文件型选项只记路径 |
+| `arguments` | `run`：`goal`、`plan`（路径或 null）、`commander`、`pause_after_plan`、`step`；`resume`：`run_id`、`approve_plan`、`step`、`reverify`、`retry_stopped`、`confirm_exited`、`environment_update`、`execution_guidance`、`reject_continuation`（后三项为路径或 null）、`operator_decision`（路径列表）、`allow_scope`。文件型选项只记路径 |
 | `repo`、`repo_head` | 目标项目绝对路径与当时 HEAD；取不到为 null |
 | `harness` | `package`、`revision`、`runtime_modified`、`python`、`executable`，与 `doctor` 回显相同 |
 | `config` | `path`、`sha256`（配置文件字节摘要） |
@@ -163,7 +163,7 @@ run 列表 → run 详情 → 文件查看。列表按最近事件排序，以�
 
 审阅轮次投影 `review_rounds` 按任务列出 `review_history` 的每一轮（按记录顺序从 1 编号，含失效或结构非法的记录）：`attempt`、来源审阅 `review_dispatch_id`、候选 `snapshot_digest`、`verdict`，以及本轮首次出现的 blocking finding 标签 `new_blocking`（按审阅者写的 id 字符串判断；标签不是身份，同名不一定是同一个问题）。它只读、不调用模型，`cause` 固定为 `unknown`，不推断问题为何在后续轮次才出现。详情页在“运行信息”标签显示该表。
 
-预算区显示 `attempts_total`（各任务 `attempts` 之和；版本 16 起没有全 run worker 上限）、模型派发、再规划与整体验收的已用／上限，以及未终止 run 的 `remaining_model_calls`：“如果之后全部一次通过，至少还需 N 次模型调用”。N 按记录的阶段计算：已在待接受或任务审阅已开始的任务计 0，已有候选的计 1，其余未接受任务计 2，整体审阅计 1（全部已接受且同一 HEAD 已批准或整体审阅已开始时计 0）。N 是下界，不含指挥调用、返工、格式修正与再规划；`max_agent_dispatches` 用尽时停止信息里也给出它。版本 15 及更早的台账另显示保存的 `total_attempts` 与 `attempt_budget_policy`。
+预算区显示 `attempts_total`（各任务 `attempts` 之和；版本 16 起没有全 run worker 上限）、模型派发、再规划与整体验收的已用／上限，以及未终止 run 的 `remaining_model_calls`：“如果之后全部一次通过，至少还需 N 次模型调用”。N 按记录的阶段计算：已在待接受或任务审阅已开始的任务计 0，已有候选的计 1，其余未接受任务计 2，整体审阅计 1（全部已接受且同一 HEAD 已批准或整体审阅已开始时计 0）。N 是下界，不含指挥调用、返工、无效输出的重做与再规划；`max_agent_dispatches` 用尽时停止信息里也给出它。版本 15 及更早的台账另显示保存的 `total_attempts` 与 `attempt_budget_policy`。
 
 脚本可直接读 JSON 接口：`/api/runs`、`/api/runs/<run_id>`、`/api/runs/<run_id>/events?tail=`、`/api/runs/<run_id>/files`、`/api/runs/<run_id>/files/<相对路径>?tail=&format=json`。无效 ID 或参数 400，拒绝的路径与 Host 不匹配 403，不存在的 run 或文件 404，GET／HEAD 以外的方法 405；台账可读但摘要失败的 run 仍返回 200 并带 `summary_error`。
 
@@ -226,10 +226,10 @@ WORK 结果可以带可选的 `checkpoints`，每项为 `{id, summary, inputs, e
 
 - `freshness="content"` 必须绑定至少一个 input，且 `max_age_seconds=0`；任一输入的实际 SHA256 变化即为 stale。
 - `freshness="volatile"` 的有效期从来源 worker 调用开始计时（dispatch 的 `invoked_at`），worker 自己的执行时间也算在内，结果落盘或恢复都不重新计时；`max_age_seconds=0` 表示每次都要重新检查；缺少有效调用时间的记录一律 stale。
-- 路径不得含 `..` 或 `.git`、`.harness`、`.codex`、`.claude` 段，不能是符号链接。唯一例外：evidence 可以引用当前 worker dispatch `commands/` 下的普通文件（broker 返回的 stdout／stderr 路径）。格式修正是新的 dispatch，不能重新登记原 dispatch 的 broker 输出；旧证据也不能靠重新登记刷新有效期，需要时重跑可安全重复的检查。
+- 路径不得含 `..` 或 `.git`、`.harness`、`.codex`、`.claude` 段，不能是符号链接。唯一例外：evidence 可以引用当前 worker dispatch `commands/` 下的普通文件（broker 返回的 stdout／stderr 路径）。新的 worker 尝试是新的 dispatch，不能重新登记原 dispatch 的 broker 输出；旧证据也不能靠重新登记刷新有效期，需要时重跑可安全重复的检查。
 - `reusable` 只表示声明的输入未变且未过期，不证明依赖完整、结论正确或任务已接受；检查点不替代验证、审阅或接受门禁。
 
-声明被丢弃与证据损坏是两回事。结果通过身份、结构、完成／停止语义和格式校验后，单项的声明核对失败（content 缺输入或有效期非零、路径不允许、实际摘要不符、超出大小）只丢弃该项，重复 ID 丢弃整批；结果、blocker 和其余有效项照常登记，写 `checkpoints_discarded` 事件，blocked 反馈带前 2,000 字符原因。超过 16 项、空 evidence、SHA256 格式非法、字段超长属于结果的格式错误：completed 结果走格式修正，blocked 结果保留阻断并停止。原始结果、台账行、manifest、`checkpoints/batches/` 下的批次文件或私有副本被删改，以及私有写入失败，都直接停止并保留现场，不按丢弃处理。
+声明被丢弃与证据损坏是两回事。检查点是可选产物，不参与 worker 结果的契约判定：单项的声明核对失败（字段缺失或超长、空 evidence、SHA256 格式非法、content 缺输入或有效期非零、路径不允许、实际摘要不符、超出大小）只丢弃该项，超过 16 项或重复 ID 丢弃整批；结果、blocker 和其余有效项照常登记，写 `checkpoints_discarded` 事件，blocked 反馈带前 2,000 字符原因。无效的 worker 结果（见[无效输出与自动重做](recovery.md#无效输出与自动重做)）不登记检查点；交接请求非法的 completed 结果例外，它在检查点登记之后才被判为无效，合格的检查点保留给下一次 worker。原始结果、台账行、manifest、`checkpoints/batches/` 下的批次文件或私有副本被删改，以及私有写入失败，都直接停止并保留现场，不按丢弃处理。
 
 ### 决定请求与审阅问题
 

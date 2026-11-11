@@ -273,7 +273,7 @@ class DecisionLifecycleTests(RepoCase):
         path = self.response(engine)
         before = (engine.directory / 'state.json').read_bytes()
         for options in ({'environment_update': path}, {'retry_stopped': 'greet'}, {'reverify': True},
-                        {'repair_invalid': 'missing'}, {'allow_scope': ['extra.py']}):
+                        {'allow_scope': ['extra.py']}):
             with self.subTest(options=options), self.assertRaises(HarnessError):
                 self.engine(backend).resume(engine.run['id'], operator_decision=path, **options)
             self.assertEqual((engine.directory / 'state.json').read_bytes(), before)

@@ -158,21 +158,25 @@ class FinalFindingLifecycleTests(RepoCase):
 
         return RecordingBackend(change)
 
-    def test_missing_final_disposition_cannot_complete_after_corrective_task(self):
+    def test_missing_final_disposition_is_redone_before_completion(self):
         self.config.data['runtime']['max_replans'] = 1
         backend = self.backend(omit_dispositions=True)
         engine = self.engine(backend)
-        with self.assertRaises(HarnessError):
-            engine.start('Implement greet', read_json(ROOT / 'examples/plan.json'))
-        self.assertNotEqual(engine.run['status'], 'completed')
-        self.assertIn('correct', engine.run['accepted'])
-        second = engine.run['final_history'][1]
-        self.assertEqual(second['status'], 'rejected')
-        self.assertEqual(second['review']['verdict'], 'approve')
-        self.assertEqual(second['disposition_errors'][0]['code'], 'finding_not_independently_resolved')
-        packet = [c['packet'] for c in backend.calls if c['kind'] == 'final_review'][1]
-        self.assertEqual(packet['required_findings'][0]['review_dispatch_id'],
-                         engine.run['final_history'][0]['review_source']['dispatch_id'])
+        run = engine.start('Implement greet', read_json(ROOT / 'examples/plan.json'))
+        self.assertEqual(run['status'], 'completed')
+        self.assertIn('correct', run['accepted'])
+        finals = [d for d in run['dispatches'] if d.get('kind') == 'final_review']
+        self.assertEqual([d['status'] for d in finals], ['completed', 'invalid', 'completed'])
+        self.assertEqual(finals[2]['retry_of'], finals[1]['id'])
+        # The invalid approval left no record; the redo approved with every disposition.
+        self.assertEqual([record['status'] for record in run['final_history']], ['rejected', 'approved'])
+        approved = run['final_history'][1]
+        self.assertEqual(set(approved['review']['finding_dispositions']), {'f1'})
+        packets = [c['packet'] for c in backend.calls if c['kind'] == 'final_review']
+        for packet in packets[1:]:
+            self.assertEqual(packet['required_findings'][0]['review_dispatch_id'],
+                             run['final_history'][0]['review_source']['dispatch_id'])
+        self.assertEqual(packets[2]['previous_invalid']['dispatch_id'], finals[1]['id'])
 
     def test_open_final_disposition_cannot_complete(self):
         self.config.data['runtime']['max_replans'] = 1

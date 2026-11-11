@@ -20,7 +20,6 @@ class Services:
         from .planning import Planner
         from .progress import ProgressRecovery
         from .receipts import ResultReceipts
-        from .recovery import InvalidOutputRecovery
         from .run_lifecycle import RunLifecycle
         from .scheduler import Scheduler
         from .task_lifecycle import TaskLifecycle
@@ -37,7 +36,6 @@ class Services:
         self.progress = ProgressRecovery(context, self)
         self.receipts = ResultReceipts(context, self)
         self.worker_receipts = WorkerReceipts(context, self)
-        self.recovery = InvalidOutputRecovery(context, self)
         self.lifecycle = RunLifecycle(context, self)
         self.tasks = TaskLifecycle(context, self)
         self.verification = Verification(context, self)

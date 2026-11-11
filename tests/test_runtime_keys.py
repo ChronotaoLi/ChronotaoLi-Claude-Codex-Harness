@@ -10,7 +10,7 @@ import unittest
 from unittest.mock import patch
 
 from harness.adapters import provider_schema
-from harness.contracts import (PLAN, REPLAN, REVIEW, WORK, RepairableFormatError, envelope, output_constraints,
+from harness.contracts import (PLAN, REPLAN, REVIEW, WORK, envelope, output_constraints,
                                review_schema, validate_structure, with_keys)
 from harness.review_progress import claims_for_review, delivered_worker_findings
 from harness.util import HarnessError, read_json, write_json
@@ -26,8 +26,16 @@ def labelled(packet):
     return [(row["key"], row["finding_index"], row["label"]) for row in packet.get("required_findings", [])]
 
 
-def identity(row):
-    return {field: row[field] for field in ("key", "review_dispatch_id", "finding_index", "label")}
+def complete_rows(packet):
+    """A dispatched packet's required rows with each source artifact restored.
+
+    The packet may factor artifacts into required_finding_sources; comparing
+    complete rows also covers a mutated source path.
+    """
+    sources = packet.get("required_finding_sources", {})
+    return [{**row, "artifact": row["artifact"] if "artifact" in row
+             else sources[row["review_dispatch_id"]]["artifact"]}
+            for row in packet.get("required_findings", [])]
 
 
 class KeyedContractTests(unittest.TestCase):
@@ -39,7 +47,8 @@ class KeyedContractTests(unittest.TestCase):
             keyed = schema["properties"][field]
             self.assertEqual(keyed["required"], ["f1", "f2", "f3"])
             self.assertIs(keyed["additionalProperties"], False)
-            self.assertNotIn(field, schema["required"])  # Optional at the top level, as before.
+            # A review must dispose every required finding; repair claims stay optional.
+            self.assertEqual(field in schema["required"], field == "finding_dispositions")
             for strict in (False, True):
                 wire = provider_schema(envelope(schema, "t", "d"), strict)["properties"][field]
                 self.assertEqual((wire["required"], wire["additionalProperties"]), (["f1", "f2", "f3"], False))
@@ -67,9 +76,10 @@ class KeyedContractTests(unittest.TestCase):
         schema = envelope(review_schema(rows(2)), "t", "d")
         validate_structure({**base, "finding_dispositions": {"f1": good, "f2": good}}, schema)
         for label, value in cases.items():
-            with self.subTest(label=label), self.assertRaises(HarnessError) as raised:
+            with self.subTest(label=label), self.assertRaises(HarnessError):
                 validate_structure({**base, "finding_dispositions": value}, schema)
-            self.assertNotIsInstance(raised.exception, RepairableFormatError)
+        with self.assertRaises(HarnessError):
+            validate_structure(base, schema)
         with self.assertRaises(HarnessError):
             validate_structure({**base, "finding_dispositions": {"f1": good}}, envelope(review_schema([]), "t", "d"))
         work = {"task_id": "t", "dispatch_id": "d", "status": "completed", "summary": "s", "evidence": [],
@@ -78,9 +88,8 @@ class KeyedContractTests(unittest.TestCase):
         contract = envelope(with_keys(WORK, "repair_claims", rows(1)), "t", "d")
         validate_structure({**work, "repair_claims": {"f1": claim}}, contract)
         for value in ({"f1": claim, "f2": claim}, {}, {"f1": {"summary": "fixed"}}):
-            with self.subTest(claims=value), self.assertRaises(HarnessError) as raised:
+            with self.subTest(claims=value), self.assertRaises(HarnessError):
                 validate_structure({**work, "repair_claims": value}, contract)
-            self.assertNotIsInstance(raised.exception, RepairableFormatError)
 
     def test_worker_claims_are_rekeyed_onto_the_reviews_keys_by_source_and_position(self):
         def row(key, index):
@@ -104,7 +113,7 @@ class KeyedLifecycleTests(RepoCase):
         with (kwargs["cwd"] / "hello.py").open("a") as stream:
             stream.write(f"# candidate {sum(c['role'] == 'worker' for c in backend.calls)}\n")
 
-    def test_extra_disposition_key_is_a_structural_stop_that_keeps_the_returned_review(self):
+    def test_extra_disposition_key_is_invalid_and_redone_keeping_the_returned_review(self):
         def change(backend, kwargs, packet, result):
             if kwargs["kind"] != "review":
                 return
@@ -114,17 +123,17 @@ class KeyedLifecycleTests(RepoCase):
                 result["finding_dispositions"]["f9"] = {"status": "resolved", "evidence": ["advisory"]}
         backend = ScriptedBackend(change)
         engine = self.engine(backend)
-        with self.assertRaisesRegex(HarnessError, "missing or unexpected fields"):
+        with self.assertRaisesRegex(HarnessError, "连续两次无效：response.finding_dispositions"):
             engine.start("Implement greet", self.plan())
-        receipt = engine.run["review_receipts"]["reviewer:review:greet"]
-        self.assertIn("artifact_digest", receipt)
-        entry = next(d for d in engine.run["dispatches"] if d["id"] == receipt["dispatch_id"])
-        self.assertEqual(entry["status"], "failed")
+        self.assertNotIn("reviewer:review:greet", engine.run["review_receipts"])
+        reviews = [d for d in engine.run["dispatches"] if d.get("kind") == "review"]
+        self.assertEqual([d["status"] for d in reviews], ["completed", "invalid", "invalid"])
+        self.assertEqual(reviews[2]["retry_of"], reviews[1]["id"])
+        for entry in reviews[1:]:
+            returned = read_json(Path(entry["invalid_output"]["artifact"]))
+            self.assertIn("f9", returned["finding_dispositions"])
         self.assertNotIn("pending_acceptance", engine.run)
-        count = len(backend.calls)
-        with self.assertRaisesRegex(HarnessError, "missing or unexpected fields"):
-            self.engine(backend).resume(engine.run["id"])
-        self.assertEqual(len(backend.calls), count)
+        self.assertEqual(len(engine.run["review_history"]["greet"]), 1)
 
     def test_extra_repair_claim_key_rejects_the_worker_result(self):
         def change(backend, kwargs, packet, result):
@@ -135,11 +144,14 @@ class KeyedLifecycleTests(RepoCase):
                 write_json(kwargs["job"] / "response.json", result)
         backend = ScriptedBackend(change)
         engine = self.engine(backend)
-        with self.assertRaisesRegex(HarnessError, "missing or unexpected fields"):
+        # Every rework result with the extra key is invalid: each spends one attempt.
+        with self.assertRaisesRegex(HarnessError, "尝试次数上限"):
             engine.start("Implement greet", self.plan())
-        worker = [d for d in engine.run["dispatches"] if d["role"] == "worker"][-1]
-        self.assertEqual(worker["worker_receipt_consumed"], "result_rejected")
-        self.assertEqual(engine.run["attempts"], {"greet": 2})
+        workers = [d for d in engine.run["dispatches"] if d["role"] == "worker"]
+        self.assertEqual([(d["status"], d["worker_receipt_consumed"]) for d in workers[1:]],
+                         [("invalid", "result_rejected")] * (len(workers) - 1))
+        self.assertIn("missing or unexpected fields", workers[-1]["error"])
+        self.assertEqual(engine.run["attempts"], {"greet": self.config.data["runtime"]["max_attempts"]})
         self.assertNotIn("pending_task", engine.run)
 
     def test_field_test_shape_approves_with_exactly_the_required_keys(self):
@@ -163,8 +175,7 @@ class KeyedLifecycleTests(RepoCase):
                          [("f1", "A"), ("f2", "B"), ("f3", "C"), ("f4", "E")])
         last = result["review_history"]["greet"][-1]
         self.assertEqual(set(last["review"]["finding_dispositions"]), {"f1", "f2", "f3", "f4"})
-        self.assertEqual([identity(row) for row in last["required_findings"]],
-                         [identity(row) for row in reviews[2]["packet"]["required_findings"]])
+        self.assertEqual(last["required_findings"], complete_rows(reviews[2]["packet"]))
 
     def test_repeated_labels_are_independent_findings_and_approval_labels_may_repeat(self):
         def change(backend, kwargs, packet, result):
@@ -206,8 +217,7 @@ class KeyedLifecycleTests(RepoCase):
                 reviews = self.calls(backend, kind="review")
                 self.assertEqual([label for _, _, label in labelled(reviews[2]["packet"])], ["A", "B"])
                 for record, call in zip(result["review_history"]["greet"], reviews):
-                    self.assertEqual([identity(row) for row in record["required_findings"]],
-                                     [identity(row) for row in call["packet"].get("required_findings", [])])
+                    self.assertEqual(record["required_findings"], complete_rows(call["packet"]))
 
     def test_changed_copy_stops_before_any_worker_or_review_dispatch(self):
         self.config.data["runtime"]["max_attempts"] = 2
@@ -228,73 +238,6 @@ class KeyedLifecycleTests(RepoCase):
             self.engine(backend).resume(engine.run["id"])
         self.assertEqual(len(self.calls(backend, role="worker")), workers)
         self.assertEqual(len(self.calls(backend, role="reviewer")), reviews)
-
-    def test_worker_format_correction_maps_claims_through_its_own_packet(self):
-        def change(backend, kwargs, packet, result):
-            if kwargs["kind"] == "review" and len(self.calls(backend, kind="review")) == 1:
-                result.update(verdict="request_changes", findings=[finding()])
-            elif kwargs["role"] == "worker" and len(self.calls(backend, role="worker")) == 2:
-                result["summary"] = "x" * 32001
-                write_json(kwargs["job"] / "response.json", result)
-        backend = ScriptedBackend(change)
-        engine = self.engine(backend)
-        result = engine.start("Implement greet", self.plan())
-        self.assertEqual(result["status"], "completed")
-        correction = [d for d in result["dispatches"] if d["role"] == "worker"][-1]
-        self.assertIs(correction.get("format_correction"), True)
-        record = result["review_history"]["greet"][-1]
-        self.assertEqual(record["worker_source"]["dispatch_id"], correction["id"])
-        packet = read_json(Path(correction["worker_receipt"]["packet_artifact"]))
-        self.assertEqual([(row["key"], row["label"]) for row in packet["required_findings"]], [("f1", "edge-case")])
-        self.assertEqual([row["key"] for row in delivered_worker_findings(engine.context, "greet", correction["id"])],
-                         ["f1"])
-
-    def test_review_format_correction_keeps_keys_and_the_same_dispositions(self):
-        for change_disposition in (False, True):
-            with self.subTest(change_disposition=change_disposition):
-                self.setUp()
-                def change(backend, kwargs, packet, result):
-                    number = len(self.calls(backend, kind="review"))
-                    if kwargs["kind"] != "review":
-                        return
-                    if number == 1:
-                        result.update(verdict="request_changes", findings=[finding()])
-                    elif "format_correction" not in packet:
-                        result["summary"] = "x" * 4001
-                    elif change_disposition:
-                        result["finding_dispositions"]["f1"]["status"] = "not_checked"
-                backend = ScriptedBackend(change)
-                engine = self.engine(backend)
-                if change_disposition:
-                    with self.assertRaises(HarnessError):
-                        engine.start("Implement greet", self.plan())
-                    self.assertTrue(engine.run["review_corrections"]["reviewer:review:greet"]["failed"])
-                    continue
-                result = engine.start("Implement greet", self.plan())
-                self.assertEqual(result["status"], "completed")
-                original, corrected = self.calls(backend, kind="review")[1:]
-                self.assertEqual(labelled(original["packet"]), labelled(corrected["packet"]))
-                record = result["review_history"]["greet"][-1]
-                self.assertEqual(set(record["review"]["finding_dispositions"]), {"f1"})
-
-    def test_explicit_review_repair_validates_with_the_same_mapping(self):
-        def change(backend, kwargs, packet, result):
-            if kwargs["kind"] != "review":
-                return
-            if len(self.calls(backend, kind="review")) == 1:
-                result.update(verdict="request_changes", findings=[finding()])
-            elif "invalid_output_correction" not in packet:
-                result["approved_memory_keys"] = ["nonexistent"]
-        backend = ScriptedBackend(change)
-        engine = self.engine(backend)
-        with self.assertRaisesRegex(HarnessError, "不存在的记忆提案"):
-            engine.start("Implement greet", self.plan())
-        source = engine.run["review_receipts"]["reviewer:review:greet"]
-        result = self.engine(backend).resume(engine.run["id"], repair_invalid=source["dispatch_id"])
-        self.assertEqual(result["status"], "completed")
-        original, repaired = self.calls(backend, kind="review")[1:]
-        self.assertEqual(labelled(original["packet"]), labelled(repaired["packet"]))
-        self.assertEqual(set(result["review_history"]["greet"][-1]["review"]["finding_dispositions"]), {"f1"})
 
     def rework_round(self, second_worker):
         """First review rejects; the second worker returns a result that carries repair_claims."""
@@ -390,8 +333,7 @@ class FinalKeyedLifecycleTests(RepoCase):
         self.assertEqual(result["status"], "completed")
         first, second = result["final_history"]
         self.assertEqual(first["required_findings"], [])
-        self.assertEqual([identity(row) for row in second["required_findings"]],
-                         [identity(row) for row in self.finals(backend)[1]["packet"]["required_findings"]])
+        self.assertEqual(second["required_findings"], complete_rows(self.finals(backend)[1]["packet"]))
         self.assertEqual(second["required_findings"][0]["review_dispatch_id"], first["review_source"]["dispatch_id"])
         self.assertTrue(engine.services.finalization.final_review())
         second["required_findings"][0]["label"] = "rebound"
@@ -474,8 +416,7 @@ class TaskReviewInterruptionTests(RepoCase):
                 self.assertEqual(result["status"], "completed")
                 self.assertEqual(len([c for c in backend.calls if c["role"] == "worker"]), workers)
                 self.assertEqual(len(reviews()), 2)
-                self.assertEqual([identity(row) for row in reviews()[1]["packet"]["required_findings"]],
-                                 [identity(row) for row in mapping])
+                self.assertEqual(complete_rows(reviews()[1]["packet"]), mapping)
                 self.assertEqual(result["review_history"]["greet"][-1]["required_findings"], mapping)
 
 

@@ -70,8 +70,7 @@ class Scheduler(RuntimeService):
                 if (self.context.reverify_requested and pending["stage"] in ("pending", "request")
                         and final.get("status") == "verification_failed"
                         and self.context.run["final_attempts"] < self.context.config.data["runtime"]["max_final_attempts"]
-                        and not returned and receipt_key not in self.context.run["pending_format_corrections"]
-                        and not self.services.recovery.active_invalid_repair(receipt_key)
+                        and not returned
                         and snapshot_digest(self.context.snapshot()) == final.get("snapshot_digest")):
                     self.context.run.pop("pending_replan")
                     self.context.run["commander_receipts"].pop(receipt_key, None)

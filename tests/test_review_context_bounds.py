@@ -138,73 +138,35 @@ class BoundedReviewLifecycleTests(RepoCase):
         self.assertEqual(engine.run["accepted"], {})
         self.assertEqual(engine.run["review_history"]["greet"][0]["review"]["findings"], rejected["findings"])
 
-    def test_maximum_findings_with_bad_summary_repair_then_rework_with_full_evidence(self):
+    def test_maximum_findings_with_bad_summary_rework_with_full_evidence(self):
         rejected = maximum_review()
         sizes = []
-        returned_artifacts = []
 
-        def repair(backend, kwargs, packet, result):
+        def rework(backend, kwargs, packet, result):
             sizes.append(len(kwargs["prompt"]))
             count = sum(call["kind"] == "review" for call in backend.calls)
-            if kwargs["kind"] == "review" and count <= 2:
+            if kwargs["kind"] == "review" and count == 1:
+                # A binding rejection with an over-long summary: invalid, but still a veto.
                 result.update(copy.deepcopy(rejected))
-                if count == 1:
-                    result["summary"] = "x" * 4001
-                else:
-                    correction = packet["format_correction"]
-                    excerpt = correction["preserve_review"]
-                    self.assertEqual(identities(excerpt), identities(rejected))
-                    self.assertTrue(excerpt["details_truncated"])
-                    artifact = Path(excerpt["full_review_artifact"])
-                    original = read_json(artifact)
-                    returned_artifacts.append(artifact)
-                    self.assertEqual(original["findings"], rejected["findings"])
-                    self.assertEqual(len(original["summary"]), 4001)
-                    self.assertNotEqual(original["dispatch_id"], result["dispatch_id"])
-                    self.assertEqual(excerpt["review_content_sha256"], review_digest(original))
-                    self.assertEqual(engine.run["accepted"], {})
+                result["summary"] = "x" * 4001
             elif kwargs["role"] == "worker" and engine.run["attempts"]["greet"] == 2:
-                self.assert_full_evidence(packet["prior_reviews"][0]["review"], rejected)
+                self.assert_full_evidence(packet["prior_reviews"][0]["review"], {**rejected, "summary": "x" * 4001})
                 with (kwargs["cwd"] / "hello.py").open("a") as file:
-                    file.write("# repair after preserving the original rejection\n")
+                    file.write("# rework after the preserved rejection\n")
 
-        backend = ScriptedBackend(repair)
+        backend = ScriptedBackend(rework)
         engine = self.engine(backend)
         result = engine.start("Implement greet", self.plan())
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["attempts"], {"greet": 2})
-        self.assertEqual(sum(call["kind"] == "review" for call in backend.calls), 3)
-        self.assertEqual(len(returned_artifacts), 1)
-        self.assertEqual(read_json(returned_artifacts[0])["findings"], rejected["findings"])
-        self.assertEqual(result["review_history"]["greet"][0]["review"]["findings"], rejected["findings"])
-        self.assertEqual(result["format_repairs"]["reviewer:review:greet"], 1)
+        self.assertEqual(sum(call["kind"] == "review" for call in backend.calls), 2)
+        first = result["review_history"]["greet"][0]
+        self.assertEqual(first["status"], "invalid_rejected")
+        self.assertEqual(first["review"]["findings"], rejected["findings"])
+        returned = engine.directory / "dispatches" / first["dispatch_id"] / "returned-result.json"
+        self.assertEqual(len(read_json(returned)["summary"]), 4001)
+        self.assertFalse(any(d.get("retry_of") for d in result["dispatches"]))
         self.assertLessEqual(max(sizes), 34000)
-
-    def test_large_review_correction_cannot_change_evidence_beyond_excerpt(self):
-        rejected = maximum_review()
-        sizes = []
-
-        def tamper(backend, kwargs, packet, result):
-            sizes.append(len(kwargs["prompt"]))
-            if kwargs["kind"] != "review":
-                return
-            result.update(copy.deepcopy(rejected))
-            if sum(call["kind"] == "review" for call in backend.calls) == 1:
-                result["summary"] = "x" * 4001
-            else:
-                self.assertTrue(packet["format_correction"]["preserve_review"]["details_truncated"])
-                evidence = result["findings"][-1]["evidence"][-1]
-                result["findings"][-1]["evidence"][-1] = evidence[:-1] + "Z"
-
-        backend = ScriptedBackend(tamper)
-        engine = self.engine(backend)
-        with self.assertRaisesRegex(HarnessError, "不得改变 finding"):
-            engine.start("Implement greet", self.plan())
-        self.assertEqual(engine.run["accepted"], {})
-        self.assertEqual(engine.run["attempts"], {"greet": 1})
-        self.assertTrue(engine.run["review_corrections"]["reviewer:review:greet"]["failed"])
-        self.assertLessEqual(max(sizes), 34000)
-
 
 class BoundedReviewEvidenceTests(unittest.TestCase):
     def test_changed_truncated_tail_is_not_deduplicated_or_hidden_by_later_approval(self):

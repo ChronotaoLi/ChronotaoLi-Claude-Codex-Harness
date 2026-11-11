@@ -61,18 +61,22 @@ class ReviewReceiptWindowTests(RepoCase):
         artifact = self.interrupt_after_final_result(engine)
         evidence = artifact.read_bytes()
         calls = list(backend.calls)
-        for _ in range(2):
-            resumed = self.engine(backend)
-            with patch.object(resumed.hooks, "emit", wraps=resumed.hooks.emit) as hooks:
-                with self.assertRaises(HarnessError):
-                    resumed.resume(engine.run["id"])
-            final_hooks = [call for call in hooks.call_args_list
-                           if call.args[0] == "post_agent" and call.args[1].get("kind") == "final_review"]
-            self.assertEqual(final_hooks, [])
-            self.assertEqual(resumed.run["status"], "blocked")
-            self.assertEqual(resumed.run["final_history"][-1]["status"], "running")
-            self.assertEqual(backend.calls, calls)
-            self.assertEqual(artifact.read_bytes(), evidence)
+        resumed = self.engine(backend)
+        with patch.object(resumed.hooks, "emit", wraps=resumed.hooks.emit) as hooks:
+            # The cached result is judged invalid without a new call, then redone once.
+            with self.assertRaisesRegex(HarnessError, "连续两次无效"):
+                resumed.resume(engine.run["id"])
+        final_hooks = [call for call in hooks.call_args_list
+                       if call.args[0] == "post_agent" and call.args[1].get("kind") == "final_review"]
+        self.assertEqual(final_hooks, [])
+        self.assertEqual(resumed.run["status"], "blocked")
+        self.assertEqual(resumed.run["final_history"][-1]["status"], "running")
+        self.assertEqual(backend.calls[:len(calls)], calls)
+        self.assertEqual([call["kind"] for call in backend.calls[len(calls):]], ["final_review"])
+        finals = [d for d in resumed.run["dispatches"] if d.get("kind") == "final_review"]
+        self.assertEqual([d["status"] for d in finals], ["invalid", "invalid"])
+        self.assertEqual(finals[0]["invalid_output"]["artifact"], str(artifact))
+        self.assertEqual(artifact.read_bytes(), evidence)
 
     def fail_final_hook(self, engine):
         emit = engine.hooks.emit
@@ -194,3 +198,49 @@ class ReviewReceiptWindowTests(RepoCase):
         self.assertEqual(sum(result["attempts"].values()), 1)
         self.assertEqual(len(dispatch_ids), 4)
         self.assertEqual(len(dispatch_ids), len(set(dispatch_ids)))
+
+    def test_observed_malformed_result_after_crash_stays_bound_when_removed(self):
+        backend = ScriptedBackend()
+        engine = self.engine(backend)
+
+        def interrupt(path, value):
+            write_json(path, value)
+            if Path(path).name == "returned-result.json" and value.get("task_id") == "final":
+                Path(path).write_bytes(b"{")
+                raise KeyboardInterrupt()
+
+        with patch("harness.dispatch.write_json", side_effect=interrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                engine.start("Implement greet", read_json(ROOT / "examples/plan.json"))
+        key = "reviewer:final_review:final"
+        receipt = engine.run["review_receipts"][key]
+        self.assertNotIn("artifact_digest", receipt)
+        calls = len(backend.calls)
+        with self.assertRaisesRegex(HarnessError, "不是有效 JSON"):
+            self.engine(backend).resume(engine.run["id"])
+        saved = read_json(engine.directory / "state.json")
+        self.assertIn("artifact_digest", saved["review_receipts"][key])
+        Path(receipt["artifact"]).unlink()
+        with self.assertRaisesRegex(HarnessError, "缺失或无法读取"):
+            self.engine(backend).resume(engine.run["id"])
+        self.assertEqual(len(backend.calls), calls)
+        self.assertEqual(read_json(engine.directory / "state.json")["final_attempts"], 1)
+
+    def test_missing_review_receipt_updates_dispatch_and_runtime_error(self):
+        backend = ScriptedBackend()
+        engine = self.engine(backend)
+
+        def fail(event, payload, logs):
+            if event == "post_agent" and payload.get("kind") == "final_review":
+                raise HarnessError("hook unavailable")
+        with patch.object(engine.hooks, "emit", side_effect=fail):
+            with self.assertRaisesRegex(HarnessError, "hook unavailable"):
+                engine.start("Implement greet", self.plan())
+        source = engine.run["review_receipts"]["reviewer:final_review:final"]
+        Path(source["artifact"]).unlink()
+        resumed = self.engine(backend)
+        with self.assertRaisesRegex(HarnessError, "缺失或无法读取"):
+            resumed.resume(engine.run["id"])
+        self.assertIn("缺失或无法读取", resumed.run["last_runtime_error"]["error"])
+        entry = next(d for d in resumed.run["dispatches"] if d["id"] == source["dispatch_id"])
+        self.assertEqual(entry["error"], resumed.run["last_runtime_error"]["error"])

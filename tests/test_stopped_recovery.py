@@ -170,19 +170,27 @@ class StoppedRecoveryTests(RepoCase):
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["replan_attempts"], 2)
 
-    def test_structurally_invalid_rejection_is_preserved_on_resume(self):
+    def test_structurally_invalid_rejection_is_redone_not_preserved(self):
         def change(backend, kwargs, packet, result):
             if kwargs["kind"] == "final_review":
                 result.update(verdict="request_changes", findings=[finding()], extra="invalid field")
         backend = ScriptedBackend(change)
         engine = self.engine(backend)
-        with self.assertRaises(HarnessError):
+        # Without a valid structure the rejection cannot veto: it is redone once.
+        with self.assertRaisesRegex(HarnessError, "连续两次无效"):
             engine.start("Implement greet", self.plan())
+        finals = [d for d in engine.run["dispatches"] if d.get("kind") == "final_review"]
+        self.assertEqual([d["status"] for d in finals], ["invalid", "invalid"])
+        self.assertEqual(engine.run["final_history"][-1]["status"], "running")
+        self.assertNotIn("replan_stopped", engine.run)
         calls = copy.deepcopy(backend.calls)
-        for options in ({}, {"retry_stopped": "final"}, {"reverify": True}):
-            with self.assertRaises(HarnessError):
-                self.engine(backend).resume(engine.run["id"], **options)
-            self.assertEqual(backend.calls, calls)
+        # Nothing is stopped: --retry-stopped has no target and dispatches nothing.
+        with self.assertRaisesRegex(HarnessError, "retry-stopped"):
+            self.engine(backend).resume(engine.run["id"], retry_stopped="final")
+        self.assertEqual(backend.calls, calls)
+        with self.assertRaisesRegex(HarnessError, "连续两次无效"):
+            self.engine(backend).resume(engine.run["id"])
+        self.assertEqual([c["kind"] for c in backend.calls[len(calls):]], ["final_review", "final_review"])
 
     def test_final_stop_answer_replans_before_a_new_snapshot_can_be_reviewed(self):
         def change(backend, kwargs, packet, result):

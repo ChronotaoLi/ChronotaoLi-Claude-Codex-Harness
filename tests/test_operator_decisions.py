@@ -108,7 +108,7 @@ class OperatorDecisionTests(unittest.TestCase):
             engine.prepare_operator_decision(path)
         path = engine.response(request)
         for gate in ('pending_task', 'pending_acceptance', 'pending_post_accept', 'pending_replan',
-                     'pending_directive', 'review_receipts', 'commander_receipts', 'review_corrections'):
+                     'pending_directive', 'review_receipts', 'commander_receipts', 'worker_receipts'):
             engine.context.run[gate] = {'blocked': True}
             with self.assertRaises(HarnessError):
                 engine.prepare_operator_decision(path)

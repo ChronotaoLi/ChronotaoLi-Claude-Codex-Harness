@@ -91,13 +91,19 @@ class BlockedHandoffDiscardTests(RepoCase):
         self.assertEqual(engine.run['accepted'], {})
 
     def test_invalid_structure_or_format_still_rejects_without_exemption(self):
-        for requests in ([{'id': 'same', 'task_id': 'greet', 'question': 'Continue?', 'extra': True}],
-                         [{'id': 'bad id', 'task_id': 'greet', 'question': 'Continue?'}]):
+        # A structurally invalid blocked output goes to replanning as a task
+        # blocker; a readable environment blocker with a bounds error keeps its
+        # route. Neither registers checkpoints or earns an exemption.
+        for requests, route, calls in (
+                ([{'id': 'same', 'task_id': 'greet', 'question': 'Continue?', 'extra': True}], 'task', 2),
+                ([{'id': 'bad id', 'task_id': 'greet', 'question': 'Continue?'}], 'environment', 1)):
             with self.subTest(requests=requests):
                 engine, backend = self.blocked('environment', requests)
                 self.assertFalse(engine.run.get('task_checkpoints'))
                 self.assertFalse(any(d.get('attempt_exemption') for d in engine.run['dispatches']))
-                self.assertEqual(len(backend.calls), 1)
+                worker = next(d for d in engine.run['dispatches'] if d['role'] == 'worker')
+                self.assertEqual((worker['status'], worker['worker_outcome']), ('invalid_blocked', route + '_blocked'))
+                self.assertEqual(len(backend.calls), calls)
 
     def test_completed_duplicate_requests_remain_strict(self):
         def duplicate(backend, kwargs, packet, result):
@@ -105,7 +111,10 @@ class BlockedHandoffDiscardTests(RepoCase):
                 result['decision_requests'] = [{'id': 'same', 'task_id': 'greet', 'question': 'Continue?'}] * 2
         backend = ScriptedBackend(duplicate)
         engine = self.engine(backend)
-        with self.assertRaisesRegex(HarnessError, 'id 必须唯一'):
+        # Each duplicate-request result is an invalid output: one spent attempt, no stop.
+        with self.assertRaisesRegex(HarnessError, '尝试次数上限'):
             engine.start('Implement greet', read_json(ROOT / 'examples' / 'plan.json'))
         self.assertEqual(engine.run['accepted'], {})
-        self.assertEqual(len(backend.calls), 1)
+        workers = [d for d in engine.run['dispatches'] if d['role'] == 'worker']
+        self.assertEqual(len(workers), self.config.data['runtime']['max_attempts'])
+        self.assertTrue(all(w['status'] == 'invalid' and 'id 必须唯一' in w['error'] for w in workers))

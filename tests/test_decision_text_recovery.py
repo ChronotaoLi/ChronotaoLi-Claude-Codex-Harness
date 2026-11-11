@@ -81,38 +81,35 @@ class DecisionTextRecoveryTests(RepoCase):
                 self.assertTrue(any(d['role'] == 'verification' for d in completed['dispatches']))
                 self.assertTrue(any(c['kind'] == 'review' for c in backend.calls))
 
-    def test_invalid_handoff_text_and_target_retain_recovery_before_acceptance(self):
+    def test_invalid_handoff_text_and_target_spend_an_attempt_before_acceptance(self):
         for question, unrelated in (('Proceed\0?', False), ('Proceed?', True)):
             with self.subTest(unrelated=unrelated):
                 backend = self.backend(handoff=question)
                 engine = self.engine(backend)
-                with self.assertRaises(HarnessError):
-                    engine.start('Implement source and later work', self.plan(dependent=True, unrelated=unrelated))
-                state = self.saved(engine)
-                self.assertEqual(state['accepted'], {})
-                self.assertEqual(state['decision_requests'], [])
-                self.assertNotIn('pending_task', state)
-                recovery = state['worker_recovery']['greet']
-                self.assertTrue(recovery['error'])
-                self.assertEqual(recovery['dispatch_id'], state['dispatches'][-1]['id'])
-                self.assertEqual(state['dispatches'][-1]['status'], 'failed')
-                self.assertFalse(any(d['role'] == 'verification' for d in state['dispatches']))
-                calls = len(backend.calls)
                 original_change = backend.change
+                projected = []
 
                 def inspect_recovery(backend, kwargs, packet, returned):
                     original_change(backend, kwargs, packet, returned)
                     if packet.get('recovery'):
-                        self.assertEqual(self.saved(engine)['worker_recovery']['greet'], recovery)
+                        projected.append((kwargs['role'], packet['recovery'],
+                                          self.saved(engine)['worker_recovery']['greet']))
 
                 backend.change = inspect_recovery
-                result = self.engine(backend).resume(engine.run['id'])
+                result = engine.start('Implement source and later work', self.plan(dependent=True, unrelated=unrelated))
                 self.assertEqual(result['status'], 'completed')
-                resumed = backend.calls[calls:]
-                for role in ('commander', 'worker'):
-                    call = next(c for c in resumed if c['role'] == role)
-                    projected = call['packet']['recovery']
-                    self.assertEqual({key: projected[key] for key in recovery}, recovery)
+                self.assertEqual(result['decision_requests'], [])
+                first = next(d for d in result['dispatches'] if d['role'] == 'worker')
+                self.assertEqual((first['status'], first['worker_receipt_consumed']), ('invalid', 'result_rejected'))
+                self.assertTrue(first['error'])
+                self.assertEqual(result['attempts']['greet'], 2)
+                # The rejected candidate was never verified or reviewed.
+                self.assertEqual(sum(d['role'] == 'verification' and d['task_id'] == 'greet'
+                                     for d in result['dispatches']), 1)
+                self.assertEqual([role for role, _, _ in projected][:2], ['commander', 'worker'])
+                for _, packet_recovery, saved in projected[:2]:
+                    self.assertEqual(saved['dispatch_id'], first['id'])
+                    self.assertEqual({key: packet_recovery[key] for key in saved}, saved)
 
     def test_legacy_accepted_handoff_registers_gate_without_reaccepting(self):
         backend = self.backend(handoff='Proceed\0?')

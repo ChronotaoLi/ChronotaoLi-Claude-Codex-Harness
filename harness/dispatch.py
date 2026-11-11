@@ -1,4 +1,4 @@
-"""Own invocation preparation, budgets and bounded format-correction dispatches."""
+"""Own invocation preparation, budgets, and the bounded redo of invalid outputs."""
 from __future__ import annotations
 
 import hashlib
@@ -7,81 +7,58 @@ import uuid
 from copy import deepcopy
 from pathlib import Path
 
-from .adapters import provider_usage
+from .adapters import provider_usage, UndecodableOutput
 from .context import compose
 from .continuation import validate_continuation_rejection
-from .contracts import (
-    RepairableFormatError, validate_immutable_findings,
-)
-from .receipts import InvalidReviewRejection
+from .receipts import ERROR_EXCERPT_CHARS, InvalidOutput, InvalidReplanStop, InvalidReviewRejection
 from .input_projection import validate_dispatch_indexes as validate_input_dispatch_indexes
 from .path_evidence import validate_dispatch_indexes, validate_indexes
-from .recovery import snapshot_digest
+from .recovery import read_bound_bytes, snapshot_digest
 from .services import RuntimeService
 from .shared import validate_mcp
-from .util import group_alive, HarnessError, read_json, write_json
+from .util import group_alive, HarnessError, write_json
+
+MODEL_ROLES = ("commander", "worker", "reviewer")
+JUDGED = ("invalid", "invalid_rejected", "invalid_stopped", "invalid_blocked")
+
+
+def dispatch_key(entry):
+    return f"{entry.get('role')}:{entry.get('kind')}:{entry.get('task_id')}"
+
+
+def last_model_call(dispatches, before=None):
+    """The latest invoked commander, worker or reviewer entry (optionally before an index)."""
+    entries = dispatches if before is None else dispatches[:before]
+    return next((entry for entry in reversed(entries)
+                 if entry.get("role") in MODEL_ROLES and entry.get("invoked") is True), None)
 
 
 class Dispatcher(RuntimeService):
+    def redo_basis(self, key):
+        """Derive the previous invalid output and redo eligibility from the ledger.
+
+        Only the run's last model call counts: when it is an invalid output of
+        this same call without retry_of, this call is its one automatic redo.
+        When that invalid output was itself a redo, this is a new request
+        (a resume after the stop), still shown the previous invalid output.
+        """
+        last = last_model_call(self.context.run["dispatches"])
+        if last is None or dispatch_key(last) != key or last.get("status") != "invalid":
+            return None, None
+        source = last["invalid_output"]
+        read_bound_bytes(source, "无效输出")
+        previous = {"dispatch_id": last["id"], "artifact": source["artifact"],
+                    "artifact_digest": source["artifact_digest"],
+                    "error": str(last.get("error", ""))[:ERROR_EXCERPT_CHARS]}
+        return previous, (None if last.get("retry_of") else last["id"])
+
     def dispatch(self, role, kind, task_id, schema, packet, task=None):
-        # A format correction is a new process, never a provider-session resume.
         validate_dispatch_indexes(self.context.directory, self.context.run["dispatches"])
         validate_input_dispatch_indexes(self.context.directory, self.context.run["dispatches"])
         key = f"{role}:{kind}:{task_id}"
         if role == "worker" and key in self.context.run["worker_receipts"]:
-            try:
-                result = self.services.worker_receipts.finish(key, task)
-                if self.context.run["pending_format_corrections"].pop(key, None) is not None:
-                    self.context.save()
-                return result
-            except RepairableFormatError:
-                # Read back the referenced immutable input and verify its digest.
-                packet = self.services.worker_receipts.original_packet(key)
+            return self.services.worker_receipts.finish(key, task)
         packet = self.services.packets.runtime_packet(packet, role=role, kind=kind, task_id=task_id)
-        packet = self.services.recovery.invalid_repair_packet(key, packet)
-        previous_review = None
-        pending = self.context.run.setdefault("pending_format_corrections", {})
-        guards = self.context.run.setdefault("review_corrections", {})
-        guard = guards.get(key) if role == "reviewer" else None
-        candidate_digest = (snapshot_digest(self.context.snapshot())
-                            if guard or key in pending else None)
-        if key in pending:
-            if role == "commander" and not pending[key]["correction"].get("source"):
-                # Missing source evidence must fail before candidate invalidation.
-                self.services.recovery.commander_format_source(key, {"format_correction": pending[key]["correction"]})
-            correction_id = pending[key].get("dispatch_id")
-            returned = (correction_id and
-                        (self.context.directory / "dispatches" / correction_id / "returned-result.json").exists())
-            if role == "worker" and returned:
-                # Also closes the crash window after result write, before pending cleanup.
-                pending.pop(key)
-                self.context.save()
-            elif candidate_digest == pending[key]["snapshot_digest"]:
-                packet = {**packet, "format_correction": pending[key]["correction"]}
-            else:
-                pending.pop(key)
-                self.context.save()
-        if guard:
-            if candidate_digest != guard["snapshot_digest"]:
-                guards.pop(key)
-                pending.pop(key, None)
-                self.context.save()
-            else:
-                if guard.get("failed"):
-                    raise HarnessError("审阅格式修复违反原审阅结论；同一快照禁止重复抽取结论；请保留证据并 abandon")
-                repair = self.services.recovery.active_invalid_repair(key)
-                explicit_format = repair and repair.get("mode") == "format"
-                if guard.get("unrepairable"):
-                    raise HarnessError(f"审阅不可变字段格式无法修复；请保留证据并 abandon：{guard['error']}")
-                if guard.get("exhausted") and not explicit_format:
-                    original = self.services.receipts.read_review_correction(guard)
-                    raise HarnessError(f"审阅自动格式修正额度已用：{guard['error']}" +
-                                       self.services.recovery.format_repair_guidance(key, original))
-                previous_review = self.services.receipts.read_review_correction(guard)
-                previous_review = {k: v for k, v in previous_review.items() if k not in ("task_id", "dispatch_id")}
-                packet = {**packet, "format_correction": self.services.receipts.review_correction(guard, previous_review)}
-        if role == "commander":
-            self.services.recovery.commander_format_source(key, packet)
         while True:
             self.context.ensure_exited()
             receipts = self.context.run[{"commander": "commander_receipts", "worker": "worker_receipts"}.get(role, "review_receipts")]
@@ -96,114 +73,32 @@ class Dispatcher(RuntimeService):
                 if role == "worker" and key in receipts:
                     result = self.services.worker_receipts.finish(key, task)
                 elif role == "reviewer" and key in self.context.run["review_receipts"]:
-                    result = self.services.receipts.finish_review_receipt(key, schema, packet, previous_review)
+                    result = self.services.receipts.finish_review_receipt(key, schema)
                 elif role == "commander" and key in receipts:
                     result = self.services.receipts.finish_commander_receipt(key)
                 else:
-                    result = self.dispatch_once(role, kind, task_id, schema, packet, task, previous_review)
+                    previous, retry_of = (None, None) if role == "worker" else self.redo_basis(key)
+                    result = self.dispatch_once(role, kind, task_id, schema, packet, task,
+                                                retry_of=retry_of, previous_invalid=previous)
                 self.context.ensure_exited()
                 validate_dispatch_indexes(self.context.directory, self.context.run["dispatches"])
                 validate_input_dispatch_indexes(self.context.directory, self.context.run["dispatches"])
-                repair = self.services.recovery.active_invalid_repair(key)
-                if repair:
-                    repair.update(status="completed", corrected_dispatch_id=receipts[key]["dispatch_id"])
-                    self.context.save()
-                if pending.pop(key, None) is not None:
-                    self.context.save()
                 return result
-            except RepairableFormatError as error:
+            except UndecodableOutput as error:
+                if role == "worker":
+                    # The same classification and consumption as a resume after a
+                    # crash: an undecodable complete output is an invalid delivery.
+                    if self.services.worker_receipts.pending() is not None:
+                        raise
+                    return None
                 self.context.ensure_exited()
-                receipt = receipts.get(key)
-                if self.services.recovery.active_invalid_repair(key):
-                    self.services.receipts.record_receipt_error(receipt, error)
-                    raise HarnessError("显式输出修正仍不合法；保留已返回结果，不自动增加修正派发") from error
-                previous = (next(d for d in self.context.run["dispatches"] if d["id"] == receipt["dispatch_id"])
-                            if receipt else self.context.run["dispatches"][-1])
-                self.services.receipts.record_receipt_error(receipt, error)
-                returned = read_json(self.context.directory / "dispatches" / previous["id"] / "returned-result.json")
-                if role == "worker" and returned["status"] == "blocked":
-                    artifact = self.context.directory / "dispatches" / previous["id"] / "returned-result.json"
-                    self.context.run["feedback"] = {"task_id": task_id, "worker": returned,
-                                            "worker_artifact": str(artifact),
-                                            "worker_artifact_digest": hashlib.sha256(artifact.read_bytes()).hexdigest(),
-                                            "format_error": str(error)}
-                    if returned["blocker_kind"] == "task":
-                        self.context.run["pending_replan"] = {"stage": "pending",
-                            "trigger": deepcopy(self.context.run["feedback"])}
-                    self.services.worker_receipts.consume(key, "invalid_blocker")
-                    self.context.save()
-                    if returned["blocker_kind"] == "operator":
-                        self.services.workflow.synchronize_decision_requests()
-                    raise HarnessError(f"worker 已报告 {returned['blocker_kind']} blocker；保留格式错误证据，不自动重派") from error
-                if role == "commander" and kind == "replan" and returned["action"] == "stop":
-                    request = self.context.run["pending_replan"]
-                    self.services.planning.record_replan_stop(request["trigger"], returned, request["attempt"],
-                                            format_error=str(error),
-                                            returned_artifact=str(self.context.directory / "dispatches" / previous["id"] / "returned-result.json"))
-                    raise HarnessError("指挥已停止再规划；保留格式错误证据，不自动重派") from error
-                if role == "reviewer" and previous_review is None:
-                    previous_review = {k: v for k, v in returned.items() if k not in ("task_id", "dispatch_id")}
-                    artifact = self.context.directory / "dispatches" / previous["id"] / "returned-result.json"
-                    guard = {"artifact": str(artifact),
-                             "artifact_digest": receipt["artifact_digest"],
-                             "snapshot_digest": previous["snapshot_digest"], "error": str(error)}
-                    guards[key] = guard
-                    self.context.save()
-                if role == "reviewer":
-                    # Validate all immutable fields, even when the first reported
-                    # error was in the mutable summary or finding ID.
-                    try:
-                        validate_immutable_findings(previous_review["findings"])
-                    except RepairableFormatError as immutable_error:
-                        guard.update(unrepairable=True, error=str(immutable_error))
-                        self.context.save()
-                        raise HarnessError(f"审阅不可变字段格式无法修复；保留原始证据：{immutable_error}") from error
-                # The immutable original remains in the correction guard. A manual
-                # resume may retry its correction, but never redraw the verdict.
-                repairs = self.context.run.setdefault("format_repairs", {})
-                if repairs.get(key, 0):
-                    if role == "reviewer":
-                        guard.update(exhausted=True, error=str(error))
-                    pending.pop(key, None)
-                    if role == "worker":
-                        self.services.worker_receipts.reject(key, error, "format_exhausted")
-                        raise HarnessError(f"{error}；格式修复额度已用，resume 将执行新的普通 worker 尝试并消耗任务及派发预算") from error
-                    self.context.save()
-                    raise HarnessError(str(error) + self.services.recovery.format_repair_guidance(key, previous_review or returned)) from error
-                # Keep a returned invalid correction attached until the terminal
-                # guard is durable; an interruption must not turn it into a retry.
-                if role == "worker":
-                    if self.services.budgets.task_budget_used(task_id) >= self.context.config.data["runtime"]["max_attempts"]:
-                        raise HarnessError(f"{task_id} 已达尝试次数上限；格式修复也计入预算") from error
-                correction = {"error": str(error), "previous_dispatch": previous["id"],
-                              "artifact": str(self.context.directory / "dispatches" / previous["id"]),
-                              "instruction": "Correct the reported output format using the current task and files. Recheck the evidence. Return only this dispatch's IDs; do not relax acceptance or discard blocking findings."}
-                if role == "worker":
-                    correction["instruction"] += (
-                        " Broker checkpoint evidence must belong to this dispatch, including during format repair. "
-                        "Other allowed regular-file evidence remains usable. Omit optional checkpoints if necessary; "
-                        "repeat only authorized checks that are safe to repeat, never side effects just to obtain evidence. "
-                        "repair_claims keys follow this dispatch's required_findings and may differ from the previous result's keys.")
-                elif role == "reviewer":
-                    correction = self.services.receipts.review_correction(guard, previous_review)
-                elif role == "commander":
-                    correction["source"] = {field: receipt[field] for field in
-                                            ("artifact", "artifact_digest", "dispatch_id", "snapshot_digest")}
-                    correction["instruction"] = (
-                        "Correct only the reported text format using this dispatch's IDs. Read source.artifact. "
-                        "Preserve the original selected_task and action, or action, new_tasks and updates exactly. "
-                        "Do not change scope, acceptance or the selected revision operations.")
-                packet = {**packet, "format_correction": correction}
-                pending[key] = {"correction": correction,
-                                "snapshot_digest": snapshot_digest(self.context.snapshot())}
-                if receipt:
-                    if role == "worker":
-                        self.services.worker_receipts.consume(key, "format_correction")
-                    else:
-                        receipts.pop(key)
-                self.context.save()
-                self.context.event("output_format_repair", task_id=task_id, role=role, previous_dispatch=previous["id"])
-            except InvalidReviewRejection:
+                invalid = self.services.receipts.record_invalid(key, error, artifact=error.artifact)
+                if invalid.entry.get("retry_of"):
+                    raise self.stop_invalid(role, invalid) from error
+            except InvalidOutput as invalid:
+                if invalid.entry.get("retry_of"):
+                    raise self.stop_invalid(role, invalid) from invalid
+            except (InvalidReviewRejection, InvalidReplanStop):
                 raise
             except HarnessError as error:
                 # Also covers post-receipt process/index checks. Worker receipt
@@ -211,17 +106,24 @@ class Dispatcher(RuntimeService):
                 self.services.receipts.record_receipt_error(receipts.get(key), error)
                 raise
 
-    def dispatch_once(self, role, kind, task_id, schema, packet, task=None, previous_review=None):
+    @staticmethod
+    def stop_invalid(role, invalid):
+        return HarnessError(f"{role} 输出连续两次无效：{invalid}；原件 {invalid.entry['invalid_output']['artifact']}；"
+                            "普通 resume 重新请求，或 abandon")
+
+    def dispatch_once(self, role, kind, task_id, schema, packet, task=None, *, retry_of=None, previous_invalid=None):
         self.context.ensure_exited()
         if role == "worker":
             self.services.planning.require_task_commands([task_id])
-            # Includes automatic format corrections and retries after local
-            # preparation failure, before either invocation budget is consumed.
+            # Includes retries after local preparation failure, before either
+            # invocation budget is consumed.
             self.services.environment.check_environment(task_id)
             packet = self.services.packets.runtime_packet(packet, role=role, kind=kind, task_id=task_id)
         dispatch_id = str(uuid.uuid4())
         job = self.context.directory / "dispatches" / dispatch_id
         job.mkdir(parents=True)
+        if previous_invalid is not None:
+            packet = {**packet, "previous_invalid": previous_invalid}
         contract, required = self.services.packets.role_input(
             role=role, kind=kind, task_id=task_id, schema=schema,
             dispatch_id=dispatch_id, packet=packet, task=task)
@@ -232,9 +134,23 @@ class Dispatcher(RuntimeService):
         memories = self.context.memory.search(query, level=1, run_id=self.context.run["id"],
                                          diagnostics=memory_diagnostics)
         from .context import ContextCapacityError
+        hint_omitted = False
         try:
-            prompt, report = compose(required, memories, self.context.config.data["runtime"]["context_chars"],
-                                     memory_diagnostics=memory_diagnostics)
+            try:
+                prompt, report = compose(required, memories, self.context.config.data["runtime"]["context_chars"],
+                                         memory_diagnostics=memory_diagnostics)
+            except ContextCapacityError:
+                if previous_invalid is None:
+                    raise
+                # The hint must not decide whether the redo fits: drop it and
+                # compose once more; retry_of is still recorded.
+                packet = {key: value for key, value in packet.items() if key != "previous_invalid"}
+                contract, required = self.services.packets.role_input(
+                    role=role, kind=kind, task_id=task_id, schema=schema,
+                    dispatch_id=dispatch_id, packet=packet, task=task)
+                prompt, report = compose(required, memories, self.context.config.data["runtime"]["context_chars"],
+                                         memory_diagnostics=memory_diagnostics)
+                hint_omitted = True
         except ContextCapacityError as error:
             report = {**error.report, "request_id": self.context.run.get("pending_replan", {}).get("request_id")}
             write_json(job / "context-report.json", report)
@@ -313,9 +229,6 @@ class Dispatcher(RuntimeService):
                 raise HarnessError("continuation revision requires a fresh worker before other model calls")
             self.services.planning.validate_retained_candidate(before=before, worker_task=task_id if role == "worker" else None)
             self.services.budgets.validate_attempt_accounting()
-            self.services.recovery.validate_invalid_repair_source(f"{role}:{kind}:{task_id}", before)
-            if role == "commander":
-                self.services.recovery.commander_format_source(f"{role}:{kind}:{task_id}", packet, before)
             limit = self.context.config.data["runtime"]["max_agent_dispatches"]
             if self.context.run["agent_dispatches"] >= limit:
                 from .diagnostics import remaining_model_calls
@@ -329,7 +242,7 @@ class Dispatcher(RuntimeService):
             if role == "worker":
                 attempts = self.context.run["attempts"].get(task_id, 0)
                 if self.services.budgets.task_budget_used(task_id) >= self.context.config.data["runtime"]["max_attempts"]:
-                    raise HarnessError(f"{task_id} 已达尝试次数上限；格式修复也计入预算")
+                    raise HarnessError(f"{task_id} 已达尝试次数上限")
                 # Publish and verify the immutable packet and contract before any
                 # budget, receipt or invoked mutation; a failed write charges nothing.
                 inputs = self.services.worker_receipts.publish_inputs(entry, contract, required["packet"])
@@ -338,15 +251,10 @@ class Dispatcher(RuntimeService):
                 # local preparation keeps it; starting a process consumes it.
                 self.context.run.pop("pending_directive", None)
             self.context.run["agent_dispatches"] += 1
-            repair = self.services.recovery.active_invalid_repair(f"{role}:{kind}:{task_id}")
-            if repair:
-                entry["invalid_repair_source"] = repair["source"]["dispatch_id"]
-            if "format_correction" in packet:
-                entry["format_correction"] = True
-                key = f"{role}:{kind}:{task_id}"
-                self.context.run.setdefault("format_repairs", {})[key] = 1
-                if key in self.context.run["pending_format_corrections"]:
-                    self.context.run["pending_format_corrections"][key]["dispatch_id"] = dispatch_id
+            if retry_of is not None:
+                entry["retry_of"] = retry_of
+                if hint_omitted:
+                    entry["previous_invalid_omitted"] = True
             if role == "worker":
                 self.services.worker_receipts.intent(entry, inputs)
             if role == "reviewer":
@@ -392,17 +300,21 @@ class Dispatcher(RuntimeService):
                     "artifact": str(artifact), "artifact_digest": hashlib.sha256(artifact.read_bytes()).hexdigest(),
                     "dispatch_id": dispatch_id, "snapshot_digest": entry["snapshot_digest"]}
                 self.context.save()
-                return self.services.receipts.finish_review_receipt(key, schema, packet, previous_review)
+                return self.services.receipts.finish_review_receipt(key, schema)
             if role == "commander":
                 return self.services.receipts.finish_commander_receipt(f"{role}:{kind}:{task_id}")
-        except InvalidReviewRejection:
+        except (InvalidReviewRejection, InvalidOutput, InvalidReplanStop):
+            # Already judged: the entry carries its verdict, never "failed".
             raise
         except BaseException as error:
             invocation_error = error
             startup_interrupted = (isinstance(error, (KeyboardInterrupt, SystemExit))
                                    and entry["process_state"] == "starting" and entry["pgid"] is None)
-            entry["status"] = "failed"
-            entry["error"] = str(error)
+            if entry["status"] not in JUDGED:
+                # A judged delivery keeps its verdict (e.g. an invalid blocker's
+                # stop); only an unjudged failure becomes "failed".
+                entry["status"] = "failed"
+                entry["error"] = str(error)
             if role in ("reviewer", "commander"):
                 receipt = self.context.run["review_receipts" if role == "reviewer" else "commander_receipts"].get(f"{role}:{kind}:{task_id}")
                 capture = job / "terminal-capture.json"

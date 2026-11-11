@@ -103,7 +103,7 @@ def remaining_model_calls(run):
     bound = sum(remaining.values()) + final
     return {'lower_bound': bound, 'tasks': remaining, 'final_review': final,
             'message': (f'如果之后全部一次通过，至少还需 {bound} 次模型调用（下界：只计 worker、任务审阅与整体审阅，'
-                        '不含指挥调用、返工、格式修正与再规划）'),
+                        '不含指挥调用、返工、重做与再规划）'),
             'basis': 'recorded_stage_lower_bound; read-only, never changes a budget'}
 
 
@@ -162,15 +162,25 @@ def budget_explanation(run, work):
         # Historical display branch: schema 15 and earlier saved a run-wide
         # worker counter and limit; schema 16 and later have neither.
         shown['total_worker'] = budget(run.get('total_attempts'), 'max_total_attempts')
-    return {'dimensions': {'actual_worker_invocations': started,
-                'charged_worker_invocations': len(workers),
-                'process_start_unconfirmed': len(workers) - started,
-                'reviewed_worker_candidates': len(reviewed),
-                'unlinked_review_records': len(unlinked), 'failed_worker_invocations': failures,
-                'recorded_exemptions': exemptions,
-                'worker_format_corrections': sum(d.get('format_correction') is True for d in workers.values()),
-                'historical_invocation_unknown': sum(d.get('role') == 'worker' and 'invoked' not in d for d in unique.values()),
-                'duplicate_dispatch_ids': duplicate},
+    dimensions = {'actual_worker_invocations': started,
+                  'charged_worker_invocations': len(workers),
+                  'process_start_unconfirmed': len(workers) - started,
+                  'reviewed_worker_candidates': len(reviewed),
+                  'unlinked_review_records': len(unlinked), 'failed_worker_invocations': failures,
+                  'recorded_exemptions': exemptions,
+                  'historical_invocation_unknown': sum(d.get('role') == 'worker' and 'invoked' not in d for d in unique.values()),
+                  'duplicate_dispatch_ids': duplicate}
+    version = run.get('schema_version')
+    if type(version) is int and version >= 17:
+        invalid = dict.fromkeys(('commander', 'worker', 'reviewer'), 0)
+        for entry in unique.values():
+            if entry.get('status') == 'invalid' and entry.get('role') in invalid:
+                invalid[entry['role']] += 1
+        dimensions['invalid_outputs'] = invalid
+    else:
+        # Historical display branch: ledgers before 17 recorded format corrections.
+        dimensions['worker_format_corrections'] = sum(d.get('format_correction') is True for d in workers.values())
+    return {'dimensions': dimensions,
             'limits': shown,
             'evidence_basis': 'recorded_ledger_links_not_revalidated_artifacts',
             'acceptance_basis': 'accepted_tasks', 'recovery_command': 'status ' + str(run.get('id'))}

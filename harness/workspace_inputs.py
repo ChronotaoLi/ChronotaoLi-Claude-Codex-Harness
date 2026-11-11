@@ -25,7 +25,7 @@ from .util import (HarnessError, ensure_dispatches_exited, group_alive, lock,
 _RESERVED = {'.git', '.harness', '.codex', '.claude', 'agents.md', 'claude.md'}
 _PENDING = ('pending_task', 'pending_acceptance', 'pending_post_accept',
             'pending_replan', 'pending_directive', 'worker_recovery',
-            'retained_candidate', 'replan_stopped', 'pending_format_corrections', 'worker_receipts')
+            'retained_candidate', 'replan_stopped', 'worker_receipts')
 
 def _fail(message):
     raise HarnessError('workspace inputs: ' + message)

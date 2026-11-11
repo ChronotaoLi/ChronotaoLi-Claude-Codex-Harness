@@ -5,7 +5,7 @@ from pathlib import Path
 
 from harness import git
 from harness.adapters import DemoBackend
-from harness.contracts import WORK, validate, validate_structure, validate_work_semantics
+from harness.contracts import WORK, validate_work_bounds, validate_work_core
 from harness.util import HarnessError, read_json
 from test_harness import RepoCase, ROOT, interrupt_started_agent
 
@@ -30,10 +30,9 @@ def invalid_rejection(result):
 
 
 def validate_work_contract(result, schema=WORK):
-    """Check a worker result in the runtime's order (WorkerReceipts._finish)."""
-    validate_structure(result, schema)
-    validate_work_semantics(result)
-    validate(result, schema)
+    """Check a worker result's core contract as WorkerReceipts._finish judges it."""
+    validate_work_core(result, schema)
+    validate_work_bounds(result, schema)
     return result
 
 
@@ -259,15 +258,19 @@ class RuntimeChangesTests(RepoCase):
         change = next(event for event in events if event["event"] == "resume_config_relaxed")
         self.assertEqual(change["changes"]["context_chars"], {"old": old_budget, "new": old_budget + 100})
 
-    def test_unknown_memory_approval_stops_before_commit(self):
+    def test_unknown_memory_approval_is_discarded_and_the_task_is_accepted(self):
         def invalid(backend, kwargs, packet, result):
             if kwargs["kind"] == "review":
                 result["approved_memory_keys"] = ["invented.key"]
         engine = self.engine(ScriptedBackend(invalid))
-        with self.assertRaisesRegex(HarnessError, "不存在的记忆"):
-            engine.start("Implement greet", self.plan())
-        self.assertEqual(engine.run["accepted"], {})
-        self.assertEqual(git.head(engine.worktree), engine.run["base_commit"])
+        result = engine.start("Implement greet", self.plan())
+        self.assertEqual(result["status"], "completed")
+        self.assertIn("greet", result["accepted"])
+        self.assertNotEqual(git.head(engine.worktree), result["base_commit"])
+        self.assertNotIn("invented.key", [memory["key"] for memory in engine.memory.export()])
+        events = [json.loads(line) for line in (engine.directory / "events.jsonl").read_text().splitlines()]
+        self.assertIn(("greet", ["invented.key"]), [(e["task_id"], e.get("discarded_keys")) for e in events
+                                                    if e["event"] == "memory_proposals_discarded"])
 
     def test_schema_v1_resume_refuses_without_dispatch(self):
         engine = self.engine()

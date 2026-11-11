@@ -3,9 +3,9 @@ import json
 import unittest
 
 from harness.context import compact_checks, compact_feedback, compact_reviews, compose
-from harness.contracts import (PLAN, WORK, RepairableFormatError, apply_revision,
+from harness.contracts import (PLAN, WORK, ScopeExtensionRequired, apply_revision,
                                envelope, output_constraints, validate,
-                               validate_plan, validate_review, validate_review_correction)
+                               validate_plan, validate_review)
 from harness.util import HarnessError, dump
 from test_runtime_changes import validate_work_contract
 
@@ -50,12 +50,11 @@ class OutputContractTests(unittest.TestCase):
         self.assertEqual(validate_plan({"tasks": [long_task]}), [long_task])
 
     def test_exposed_plan_format_does_not_mask_scope_or_dag_failures(self):
-        for current in ({**task(), "description": "", "allowed_paths": ["../outside"]},
-                        {**task(), "skills": ["invalid_skill"], "depends_on": ["implement"]}):
+        for current, first in (({**task(), "description": "", "allowed_paths": ["../outside"]}, "描述不能为空"),
+                               ({**task(), "skills": ["invalid_skill"], "depends_on": ["implement"]}, "依赖")):
             with self.subTest(current=current):
-                with self.assertRaises(HarnessError) as raised:
+                with self.assertRaisesRegex(HarnessError, first):
                     validate_plan({"tasks": [current]})
-                self.assertNotIsInstance(raised.exception, RepairableFormatError)
 
     def test_exposed_constraints_follow_the_local_contract(self):
         schema = copy.deepcopy(WORK)
@@ -65,75 +64,33 @@ class OutputContractTests(unittest.TestCase):
         self.assertTrue(constraints["response.summary"]["non_blank"])
         self.assertTrue(constraints["response.proposed_memories[].source_paths"]["uniqueItems"])
         validate_work_contract({**work(), "summary": "x" * 32000})
-        with self.assertRaises(RepairableFormatError):
+        with self.assertRaisesRegex(HarnessError, "response.summary"):
             validate_work_contract({**work(), "summary": "x" * 32001})
 
     def test_hard_boundaries_take_priority_over_format_defects(self):
         schema = envelope(WORK, "implement", "dispatch-1")
         result = {"task_id": "implement", "dispatch_id": "dispatch-1", **work(),
                   "summary": "x" * 32001}
-        for changes in ({"dispatch_id": "other"}, {"extra": "unexpected"},
-                        {"blocker_kind": "forged"}, {"proposed_memories": [False]}):
+        for changes, first in (({"dispatch_id": "other"}, "dispatch_id"), ({"extra": "unexpected"}, "unexpected fields"),
+                               ({"blocker_kind": "forged"}, "blocker_kind"),
+                               ({"proposed_memories": [False]}, "proposed_memories")):
             with self.subTest(changes=changes):
-                with self.assertRaises(HarnessError) as raised:
+                # Structure is reported before the summary bound.
+                with self.assertRaisesRegex(HarnessError, first):
                     validate({**result, **changes}, schema)
-                self.assertNotIsInstance(raised.exception, RepairableFormatError)
 
     def test_worker_semantics_cannot_be_repaired_as_formatting(self):
         result = {**work(), "summary": "x" * 32001, "blocker_kind": "task"}
-        with self.assertRaises(HarnessError) as raised:
+        with self.assertRaisesRegex(HarnessError, "blocker_kind"):
             validate_work_contract(result)
-        self.assertNotIsInstance(raised.exception, RepairableFormatError)
 
-    def test_review_approvals_and_blocking_evidence_remain_hard_failures(self):
+    def test_review_approvals_are_optional_and_blocking_evidence_is_checked_first(self):
         result = {**review(), "summary": "x" * 4001}
-        for changes in ({"approved_memory_keys": ["unknown"]},
-                        {"findings": [{**finding(), "evidence": []}]}):
-            with self.subTest(changes=changes):
-                with self.assertRaises(HarnessError) as raised:
-                    validate_review({**result, **changes})
-                self.assertNotIsInstance(raised.exception, RepairableFormatError)
-
-    def test_only_schema_format_defects_are_repairable(self):
-        for result in ({**review(), "summary": " "},
-                       review([{**finding(), "id": "../invalid"}]),
-                       {**review(), "approved_memory_keys": ["known", "known"]},
-                       {**review(), "findings": [finding(str(i)) for i in range(31)]}):
-            with self.subTest(result=result), self.assertRaises(RepairableFormatError):
-                validate_review(result, ["known"])
-
-    def test_review_correction_preserves_rejection_and_every_finding(self):
-        previous = {**review([finding()]), "summary": "x" * 4001}
-        corrected = {**copy.deepcopy(previous), "summary": "A supported defect remains"}
-        validate_review(corrected)
-        self.assertEqual(validate_review_correction(previous, corrected), corrected)
-        variants = [{**corrected, "verdict": "approve"}, {**corrected, "findings": []},
-                    {**corrected, "approved_memory_keys": ["new-approval"]}]
-        for field, value in (("id", "different-id"), ("severity", "advisory"),
-                             ("category", "scope"), ("location", "src/other.py:1"),
-                             ("message", "Shortened claim"), ("evidence", ["Different evidence"])):
-            variants.append({**corrected, "findings": [{**finding(), field: value}]})
-        for current in variants:
-            with self.subTest(current=current), self.assertRaises(HarnessError):
-                validate_review_correction(previous, current)
-
-    def test_review_correction_can_fix_only_malformed_ids_and_duplicate_approvals(self):
-        previous = {**review([{**finding(), "id": "../malformed"}]),
-                    "approved_memory_keys": ["known", "known"]}
-        corrected = {**review([finding()]), "approved_memory_keys": ["known"]}
-        validate_review(corrected, ["known"])
-        validate_review_correction(previous, corrected)
-        with self.assertRaises(HarnessError):
-            validate_review_correction(previous, {**corrected, "approved_memory_keys": []})
-
-    def test_review_correction_cannot_shorten_evidence_or_reorder_findings(self):
-        previous = review([finding(), finding("second")])
-        with self.assertRaises(HarnessError):
-            validate_review_correction(previous, review(list(reversed(previous["findings"]))))
-        previous["findings"][0]["message"] = "x" * 4001
-        with self.assertRaises(HarnessError):
-            validate_review_correction(previous, review([finding(), finding("second")]))
-
+        # Unknown approvals are an optional product: only the summary bound is reported.
+        with self.assertRaisesRegex(HarnessError, "response.summary"):
+            validate_review({**result, "approved_memory_keys": ["unknown"]})
+        with self.assertRaisesRegex(HarnessError, "阻断 finding 必须有证据"):
+            validate_review({**result, "findings": [{**finding(), "evidence": []}]})
 
 class IncrementalRevisionTests(unittest.TestCase):
     def test_incremental_update_preserves_runtime_owned_fields_and_inputs(self):
@@ -191,19 +148,22 @@ class IncrementalRevisionTests(unittest.TestCase):
         with self.assertRaises(HarnessError):
             apply_revision(original, revision(action="stop", new_tasks=[task("extra")]), set())
 
-    def test_replan_format_error_cannot_hide_scope_cycle_or_stop_operation_errors(self):
+    def test_replan_bounds_error_cannot_hide_scope_cycle_or_stop_operation_errors(self):
         original = [task()]
-        for operation in (revision(action="stop", new_tasks=[task("extra")]),
-                          revision(new_tasks=[{**task("extra"), "allowed_paths": ["secrets/**"]}]),
-                          revision(updates=[{"id": "implement", "description": "Refined",
-                                             "add_depends_on": ["implement"]}])):
+        for operation, scope in ((revision(action="stop", new_tasks=[task("extra")]), False),
+                                 (revision(new_tasks=[{**task("extra"), "allowed_paths": ["secrets/**"]}]), True),
+                                 (revision(updates=[{"id": "implement", "description": "Refined",
+                                                     "add_depends_on": ["implement"]}]), False)):
             operation["reason"] = "x" * 4001
-            with self.subTest(operation=operation):
+            with self.subTest(operation=operation["action"], scope=scope):
                 with self.assertRaises(HarnessError) as raised:
                     apply_revision(original, operation, set())
-                self.assertNotIsInstance(raised.exception, RepairableFormatError)
-        with self.assertRaises(RepairableFormatError):
+                self.assertNotIn("response.reason", str(raised.exception))
+                # Only an unapproved scope can be resolved by an operator's grant.
+                self.assertEqual(isinstance(raised.exception, ScopeExtensionRequired), scope)
+        with self.assertRaisesRegex(HarnessError, "response.reason") as raised:
             apply_revision(original, revision(action="stop", reason="x" * 4001), set())
+        self.assertNotIsInstance(raised.exception, ScopeExtensionRequired)
 
 
 class ContextCompactionTests(unittest.TestCase):

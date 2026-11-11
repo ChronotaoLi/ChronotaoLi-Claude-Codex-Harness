@@ -8,7 +8,7 @@ import sys
 import uuid
 from unittest.mock import patch
 
-from harness.adapters import CLIBackend
+from harness.adapters import CLIBackend, UndecodableOutput
 from harness.cli import main
 from harness.runtime import Runtime
 from harness.shared import HookError, Hooks
@@ -92,16 +92,32 @@ class ErrorRepairsTests(RepoCase):
                 self.assertEqual(path.read_text(), raw)
 
     def test_claude_malformed_payload_cannot_escape_as_attribute_or_type_error(self):
-        for payload in ({"result": []}, {"structured_output": []}, {"structured_output": False},
-                        {"result": "broken"}, {"subtype": "error_max_turns", "result": "{}"}):
-            with self.subTest(payload=payload), self.assertRaises(HarnessError):
-                self.invoke_provider("claude", json.dumps(payload))
-            self.assertEqual(read_json(self.provider_job / "provider-result.json"), payload)
+        terminal = {"type": "result", "subtype": "success"}
+        for payload in ({**terminal, "result": []}, {**terminal, "structured_output": []},
+                        {**terminal, "structured_output": False}, {**terminal, "result": "broken"},
+                        {"result": "{}"}, {"type": "assistant", "structured_output": {}}):
+            with self.subTest(payload=payload):
+                # A complete terminal without an object result is an invalid delivery.
+                with self.assertRaises(UndecodableOutput):
+                    self.invoke_provider("claude", json.dumps(payload))
+                self.assertEqual(json.loads((self.provider_job / "process.stdout").read_text()), payload)
+                self.assertFalse((self.provider_job / "response.json").exists())
+                provider = self.provider_job / "provider-result.json"
+                if payload.get("type") == "result":
+                    self.assertEqual(read_json(provider), payload)
+                else:
+                    self.assertFalse(provider.exists())
+        error = {"type": "result", "subtype": "error_max_turns", "result": "{}"}
+        with self.assertRaises(HarnessError) as caught:
+            self.invoke_provider("claude", json.dumps(error))
+        self.assertNotIsInstance(caught.exception, UndecodableOutput)
+        self.assertEqual(read_json(self.provider_job / "provider-result.json"), error)
 
     def test_provider_success_preserves_exact_ids_without_fallback(self):
         value = {"task_id": "task-exact", "dispatch_id": "dispatch-exact", "summary": "accepted"}
         for cli in ("claude", "codex"):
-            raw = json.dumps({"structured_output": value} if cli == "claude" else value)
+            raw = json.dumps({"type": "result", "subtype": "success", "structured_output": value}
+                             if cli == "claude" else value)
             with self.subTest(cli=cli):
                 self.assertEqual(self.invoke_provider(cli, raw), value)
 
