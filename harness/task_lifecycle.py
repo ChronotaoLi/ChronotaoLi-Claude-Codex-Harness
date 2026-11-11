@@ -425,8 +425,7 @@ class TaskLifecycle(RuntimeService):
                   "recovery": worker_recovery_context(self.context.run, self.context.directory, tid),
                   "proposed_memories": proposals,
                   "decision_requests": deepcopy(pending["worker_result"].get("decision_requests", [])),
-                  "tool_constraints": self.services.packets.tool_constraints(),
-                  "instruction": "Independently inspect the actual diff, relevant code and acceptance. Prior findings are evidence to recheck, not a complete checklist. Separate blocking defects from advisory preferences. Approve only with no unresolved blocking findings; approve memory keys only when their claims and cited sources are independently supported. Your summary becomes the accepted task record: describe only independently verified outcomes and limits. An empty diff can pass only when current evidence already satisfies the task. Do not edit files."}, task=task)
+                  "tool_constraints": self.services.packets.tool_constraints()}, task=task)
         review_artifact = evidence.parent / "review.json"
         record = {"attempt": attempt, "review": review, "diff_artifact": str(evidence),
                   "verification": str(evidence.parent / "results.json"), "artifact": str(review_artifact),

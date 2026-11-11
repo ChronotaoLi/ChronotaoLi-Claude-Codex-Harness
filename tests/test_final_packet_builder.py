@@ -62,8 +62,10 @@ class FinalPacketBuilderTests(RepoCase):
                 expected["packet"]["diff_artifact"] = estimated["packet"]["diff_artifact"]
                 expected["packet"]["verification"] = estimated["packet"]["verification"]
                 self.assertEqual(estimated, expected)
-                self.assertEqual(estimated["packet"]["task_checkpoints"], [])
-                self.assertEqual(estimated["packet"]["checkpoint_history"], [])
+                # Final review takes the index only; no empty checkpoint lists.
+                self.assertFalse({"task_checkpoints", "checkpoint_history", "checkpoint_sources"}
+                                 & set(estimated["packet"]))
+                self.assertIn("checkpoint_index", estimated["packet"])
             packet = actual["packet"]
             self.assertTrue(Path(packet["diff_artifact"]).is_file())
             self.assertTrue(all(check["exit_code"] == 0 for check in packet["verification"]))

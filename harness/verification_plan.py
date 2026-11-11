@@ -102,11 +102,12 @@ def verification_role_view(plan, role):
     result["obligations"] = [{"task_id": o["task_id"], "acceptance_index": o["acceptance_index"]}
                              for o in result["obligations"]]
     result["role"] = role
-    result["instruction"] = (
-        "Use authorized focused self-checks as needed. Runtime executes every task gate and every final gate; "
-        "repeat a full suite only for an explicit diagnostic reason. Declarations grant no command permission."
-        if role == "worker" else
-        "Independently verify obligation coverage; evidence kinds and command mappings are declarations, not proof.")
+    if role != "reviewer":  # The reviewer skill carries the reviewer's coverage rule.
+        result["instruction"] = (
+            "Use authorized focused self-checks as needed. Runtime executes every task gate and every final gate; "
+            "repeat a full suite only for an explicit diagnostic reason. Declarations grant no command permission."
+            if role == "worker" else
+            "Independently verify obligation coverage; evidence kinds and command mappings are declarations, not proof.")
     return result
 
 

@@ -87,7 +87,7 @@ class DecisionCapacityTests(RepoCase):
         report = pending.services.packets.final_context_capacity()
         self.assertNotEqual(report['status'], 'required_overflow')
         projected = pending.services.progress.progress_packet({}, kind='final_review', task_id='final')
-        self.assertEqual(projected['task_checkpoints'], [])
+        self.assertNotIn('task_checkpoints', projected)
         self.assertEqual(projected['checkpoint_index']['count'], 14)
         self.assertEqual(pending.run['accepted'], accepted)
         rows = read_json(Path(projected['checkpoint_index']['artifact']))['checkpoints']

@@ -90,7 +90,10 @@ class ProgressTests(unittest.TestCase):
         self.assertEqual(packet['task_checkpoints'][0]['dispatch_id'], 'worker2')
         self.assertEqual(len(packet['checkpoint_history']), 1)
         self.assertTrue(Path(packet['checkpoint_history'][0]['artifact']).exists())
-        self.assertEqual(rt.progress_packet({}, task_id='other')['task_checkpoints'], [])
+        # No checkpoint applies to task other: only the index is carried.
+        unrelated = rt.progress_packet({}, task_id='other')
+        self.assertFalse({'task_checkpoints', 'checkpoint_history', 'checkpoint_sources'} & set(unrelated))
+        self.assertIn('checkpoint_index', unrelated)
 
     def test_cached_tampering_and_source_digest_required(self):
         result, source = self.record()
@@ -207,8 +210,7 @@ class ProgressTests(unittest.TestCase):
         rt = self.runtime
         rt.context.run['accepted'] = {'task': {}}
         packet = rt.progress_packet({}, task_id='final', kind='final_review')
-        self.assertEqual(packet['task_checkpoints'], [])
-        self.assertEqual(packet['checkpoint_history'], [])
+        self.assertFalse({'task_checkpoints', 'checkpoint_history', 'checkpoint_sources'} & set(packet))
         index = packet['checkpoint_index']
         raw = Path(index['artifact']).read_bytes()
         self.assertEqual(sha(raw), index['artifact_digest'])

@@ -186,7 +186,7 @@ python3 -m harness --repo /path/to/project cleanup-run RUN --remove
 
 新台账版本为 16，要求完整的 worker 接收意图、输出模式与配置快照，缺失时不补造旧默认值。台账只存摘要与引用：worker 接收意图记录派发目录中不可变的 `packet.json`、`schema.json` 的路径与 SHA256，续作、执行指导和续作拒绝行只记 `snapshot_digest`，完整快照在 `continuations/` 等目录的不可变文件里；这些文件被删除、修改或换成符号链接时 `resume` 停止并保留现场。版本 15 及更早不迁移、不执行：`resume`、`abandon`、`prepare-run` 拒绝旧台账；`status`、`watch`、`dashboard`、`permission-diagnostics` 仍可只读使用，`cleanup-run` 仍可在门禁通过后清理（工作树仅限终态）。共享规则变更也受资产摘要门禁约束。版本 16 已完成 run 的普通恢复返回保存结果；终态限制见[终态与历史台账](docs/recovery.md#终态与历史台账)。
 
-以下接口已删除：命令 `notify`、`inbox`、`ack` 与通知收件箱（已有的 `.harness/notifications/` 不再读写，可手工删除）；命令 `cleanup-verification` 与选项 `abandon --remove-worktree`（都改用 `cleanup-run`；旧台账的 `worktree_removed` 仍被识别）；`handoff.md`（只写 `handoff.json`）；hooks 事件名 `context_compacted`（改用 `context_prepared`）；配置键 `runtime.max_total_attempts`。
+以下接口已删除：命令 `notify`、`inbox`、`ack` 与通知收件箱（已有的 `.harness/notifications/` 不再读写，可手工删除）；命令 `cleanup-verification` 与选项 `abandon --remove-worktree`（都改用 `cleanup-run`；旧台账的 `worktree_removed` 仍被识别）；命令 `plan-readiness` 与 `examples/plan-readiness.json`（改为用 `status RUN --full` 审阅保存的计划，再 `resume RUN --approve-plan`）；`handoff.md`（只写 `handoff.json`）；hooks 事件名 `context_compacted`（改用 `context_prepared`）；配置键 `runtime.max_total_attempts`。
 
 ## 共用 skills / MCP / hooks
 
@@ -198,6 +198,8 @@ python3 -m harness --repo /path/to/project cleanup-run RUN --remove
 | `shared/skills/*/SKILL.md` | 角色工作方式与可选业务技能 |
 | [shared/mcp.json](shared/mcp.json) | 外部 MCP 服务的唯一配置源 |
 | [shared/hooks.json](shared/hooks.json) | 确定性的编排生命周期 hooks |
+
+RULES 与角色 skill 是协议说明的唯一来源，每次派发都注入；包里只放数据、索引和现场事实，不再重复环境、决定、检查点、权限和审阅的说明。某任务没有相关的环境更新、决定或检查点时，包里只带对应索引。指挥包另带 `workspace: {head, clean}`：当时的 `expected_head` 与工作树 `git status` 是否干净。
 
 角色 skill 自动注入一次；计划的 `skills` 选择额外技能，不需要时用 `[]`。其他技能先加载目录，再通过 `skill_read` 按需读取。旧计划引用角色 skill 仍合法且不会重复注入；不会自动安装整个 ECC 技能目录。
 

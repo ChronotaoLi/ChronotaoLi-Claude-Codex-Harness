@@ -145,7 +145,9 @@ class OperatorDecisionTests(unittest.TestCase):
         engine = self.engine
         request = engine.request()
         engine.record_operator_decision(engine.prepare_operator_decision(engine.response(request)))
-        self.assertEqual(engine.decision_packet({}, task_id='two')['operator_decisions'], [])
+        unrelated = engine.decision_packet({}, task_id='two')
+        self.assertNotIn('operator_decisions', unrelated)
+        self.assertIn('operator_decision_index', unrelated)
         packet = engine.decision_packet({}, task_id='one')['operator_decisions']
         self.assertEqual(packet[0]['response']['decision'], 'continue')
         self.assertEqual(packet[0]['source'], engine.source)

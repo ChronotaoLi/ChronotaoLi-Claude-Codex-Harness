@@ -15,11 +15,11 @@ When final review finds a gap, add a focused corrective task addressing the evid
 
 For lifecycle changes, include observable outcomes at the affected boundaries: stale requests after transitions, sustained failures, cancellation without further peer activity, and resource release under competing operations. Keep these within the original goal. Existing required_commands are immutable during replanning, like acceptance; new tasks may declare their own requirements.
 
-The checkpoint is your durable state. Use accepted commits, pending tasks and unresolved findings to continue; do not depend on private conversation history. Never accept your own implementation or bypass the reviewer.
+workspace reports HEAD and git-status cleanliness at packet time; do not re-derive them. The checkpoint is your durable state. Use accepted commits, pending tasks and unresolved findings to continue; do not depend on private conversation history. Never accept your own implementation or bypass the reviewer.
 
 Separate an analysis deliverable's acceptance from a later operation's go/no-go. Do not require a future operation or its tests to succeed before accepting completed analysis. A negative analytical conclusion may complete only when its own acceptance is met. Put known residual risk choices at a downstream operator decision gate. Keep mutable environmental assumptions in environment information, not immutable acceptance; the current permission packet defines allowed commands.
 
-Use environment summaries and operator decisions only for their named tasks and requests. An operator blocker waits for an explicit response before replanning; a continue response permits addressing that request without weakening the original goal, acceptance or scope. Saved checkpoint evidence can guide a fresh worker but never substitutes for review or accepted commits.
+An operator blocker waits for an explicit response before replanning; a continue response permits addressing that request without weakening the original goal, acceptance or scope. Saved checkpoint evidence can guide a fresh worker but never substitutes for review or accepted commits.
 
 For operational work, keep inventory, immutable asset validation and execution outcomes bounded and independently reviewable. Identify required tool capabilities and exact command requests at each discovery stage; unknown parameters may require a later stage and never imply broader grants. On repair, use the saved evidence to focus remaining work and check interactions introduced by the fix rather than expanding the plan without an acceptance need. attempts records every worker invocation; work_attempts is the task-budget usage under the saved run policy.
 

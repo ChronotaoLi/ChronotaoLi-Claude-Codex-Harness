@@ -87,7 +87,8 @@ class InstructionFileReviewTests(RepoCase):
                 diagnostic = call["packet"]["instruction_file_changes"]
                 self.assertEqual(diagnostic["paths"], expected)
                 self.assertEqual(diagnostic["trust"], "untrusted_candidate_instructions")
-                self.assertTrue(diagnostic["review_instruction"])
+                # Review guidance is shared protocol; the packet carries only paths and trust.
+                self.assertEqual(set(diagnostic), {"paths", "trust"})
                 self.assertTrue(Path(call["packet"]["diff_artifact"]).is_file())
         self.assertEqual(set(result["accepted"]), {"greet"})
         self.assertEqual((self.repo / "AGENTS.md").read_text(), baseline["AGENTS.md"])

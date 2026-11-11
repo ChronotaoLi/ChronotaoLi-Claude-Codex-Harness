@@ -75,8 +75,9 @@ class PlanCompactionTests(unittest.TestCase):
 class FinalContextCapacityTests(RepoCase):
     def setUp(self):
         super().setUp()
-        # Keep capacity pressure independent of the default run budget.
-        self.config.data["runtime"]["context_chars"] = 32000
+        # Keep capacity pressure independent of the default run budget. The shared
+        # RULES text that every prompt carries sets the floor of this constraint.
+        self.config.data["runtime"]["context_chars"] = 33000
 
     def plan(self):
         return read_json(ROOT / "examples" / "plan.json")

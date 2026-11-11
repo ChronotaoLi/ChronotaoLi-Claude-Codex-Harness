@@ -4,11 +4,10 @@ from __future__ import annotations
 import sys
 from copy import deepcopy
 
-from . import git_query
+from . import git, git_query
 from .command_server import command_id
 from .context import (
-    capacity_report, compact_checks, compact_plan, compact_reviews, FINAL_REVIEW_INSTRUCTION,
-    instruction_file_changes,
+    capacity_report, compact_checks, compact_plan, compact_reviews, instruction_file_changes,
 )
 from .contracts import envelope, output_constraints, REVIEW, review_output_constraints
 from .path_evidence import project_paths
@@ -56,7 +55,6 @@ class PacketBuilder(RuntimeService):
             "required_findings": required_findings(
                 self.context.run, "final", snapshot_digest(self.context.snapshot()),
                 whole_run=True, records=history) if any(item.get("review") for item in history) else [],
-            "instruction": FINAL_REVIEW_INSTRUCTION,
         }
 
     def role_input(self, *, role, kind, task_id, schema, dispatch_id, packet, task=None):
@@ -126,7 +124,7 @@ class PacketBuilder(RuntimeService):
         # Decisions are still fully validated and included in the estimate.
         # Answers can be revised and shared excerpts shrink as requests grow,
         # so their current projection cannot establish a hard future lower bound.
-        for field in ("operator_decisions", "operator_decision_index", "operator_decision_policy"):
+        for field in ("operator_decisions", "operator_decision_index"):
             required["packet"].pop(field, None)
         packet = projected["packet"]
         limits = self.context.config.data["runtime"]
@@ -167,15 +165,18 @@ class PacketBuilder(RuntimeService):
                                       "delete_tool": "mcp__harness_commands__delete_path",
                                       "worker_command_ids": [command_id(c) for c in self.context.config.data["permissions"]["worker_commands"]],
                                       "verification_command_ids": [command_id(c) for c in self.context.config.data["verification"]["commands"]]},
-                "file_tools": ["mcp__harness__json_check", "mcp__harness__file_sha256", "mcp__harness__file_diff"],
-                "permission_guidance": "Workers: use aligned command IDs, with no argument overrides. Each call executes anew and saves stdout/stderr. Shell syntax requires its own authorized argv. Use file tools for JSON, hashes and differences. Append readonly Bash paths after --. A denied command does not prove a path unreadable; use Read/Glob/Grep. Command grants do not expand task scope. Delete a tracked in-scope file with delete_path instead of rm; it removes no directories and moves nothing."}
+                "file_tools": ["mcp__harness__json_check", "mcp__harness__file_sha256", "mcp__harness__file_diff"]}
+
+    def workspace_facts(self):
+        """Live facts read together at packet time: the bound HEAD and whether `git status` is clean."""
+        return {"head": self.context.run["expected_head"],
+                "clean": git.clean(self.context.worktree, binding=self.context.run["worktree_binding"])}
 
     def runtime_packet(self, packet, *, role, kind, task_id):
+        if role == "commander":
+            packet = {**packet, "workspace": self.workspace_facts()}
         if role != "worker" and "tool_constraints" in packet:
             constraints = {k: v for k, v in packet["tool_constraints"].items() if k != "command_execution"}
-            constraints["permission_guidance"] = ("Command broker is worker-only. Use file tools for JSON, hashes and differences; "
-                "append readonly Bash paths after --. A denied command does not prove a path unreadable; use Read/Glob/Grep. "
-                "Command grants do not expand task scope.")
             packet = {**packet, "tool_constraints": constraints}
         elif role == "worker" and git_query.TOOL not in packet.get("tool_constraints", {}).get("file_tools", [git_query.TOOL]):
             # Workers run the queries; the tool's own MCP description carries the

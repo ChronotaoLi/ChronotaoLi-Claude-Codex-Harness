@@ -37,6 +37,8 @@
 | `operations.py`、`supervisor.py` | 操作记录；`supervise` |
 | `permission_diagnostics.py`、`permission_smoke.py`、`tool_smoke.py`、`stream_smoke.py` | 权限诊断；真实账号联调入口 |
 
+每次调用的输入由三部分组成：`shared/RULES.md` 与该角色的 skill（协议说明的唯一来源，包括各类索引的读法），以及包（`packet`）。包只放数据、索引和现场事实：环境更新、操作者决定和检查点在包里是有界摘录加 SHA256 绑定的索引，与本次任务无关时只带索引；包里不带环境、决定、检查点、权限或审阅的静态说明。worker 包的 `instruction` 是指挥写的指令，属于数据；指挥包另带 `workspace: {head, clean}`，在构造包时同时读取 `expected_head` 和工作树 `git status` 是否干净。
+
 `dispatches/<id>/` 保存一次调用的输入（worker 的 `packet.json`、`schema.json`）、输出、`returned-result.json`、`worker-seal.<SHA256>.json`、命令清单 `commands.json` 与 `commands/<call>/` 下的记录。
 
 ## 不变量

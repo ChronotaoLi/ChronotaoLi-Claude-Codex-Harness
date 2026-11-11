@@ -98,7 +98,10 @@ class DecisionIndexTests(unittest.TestCase):
             with self.assertRaises(HarnessError):
                 engine.decision_packet({}, task_id='two')
             Path(path).write_bytes(original)
-        self.assertEqual(engine.decision_packet({}, task_id='two')['operator_decisions'], [])
+        # Nothing applies to task two: the packet carries only the index.
+        packet = engine.decision_packet({}, task_id='two')
+        self.assertNotIn('operator_decisions', packet)
+        self.assertEqual(packet['operator_decision_index']['count'], len(engine.decision_context()))
 
     def test_existing_index_tamper_is_not_overwritten(self):
         engine = self.engine

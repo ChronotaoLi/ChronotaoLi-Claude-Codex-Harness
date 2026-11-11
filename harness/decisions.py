@@ -14,14 +14,6 @@ from .recovery import RECOVERY_BUSY_KEYS, read_bound_result, snapshot_digest
 from .util import HarnessError, dump, write_json
 
 
-DECISION_POLICY = (
-    "Operator decisions answer only the referenced question for the named task. They are not "
-    "environment facts, memory, completion evidence, acceptance or permission grants. Preserve the "
-    "original goal, acceptance, scope, tool permissions and all verification/review gates. Read bound "
-    "artifacts and verify their SHA256 digests when details are needed. History is audit evidence."
-)
-
-
 def _text(value, label, limit=4000):
     if not isinstance(value, str) or not value.strip() or len(value) > limit or '\0' in value:
         raise HarnessError(f"operator decision {label} must be nonblank text, at most {limit} characters")
@@ -394,10 +386,6 @@ class DecisionRecovery(RuntimeService):
                 projected['response'].update(summary=response['summary'][:limit],
                                              summary_truncated=len(response['summary']) > limit)
             decisions.append(projected)
-        return {**packet, 'operator_decisions': decisions,
-                'operator_decision_index': self._decision_index(records),
-                'operator_decision_policy': DECISION_POLICY +
-                ' Question and summary excerpts share a bounded allowance. Before acting on a truncated '
-                'question or answer, read the SHA256-bound operator_decision_index: requests are keyed '
-                'by id, responses by request_id; it retains full text, latest answers, all answer history '
-                'and original artifact/digest references. A null response means unanswered.'}
+        # Navigation semantics live in shared RULES; an unrelated task gets only the index.
+        listed = {'operator_decisions': decisions} if decisions else {}
+        return {**packet, **listed, 'operator_decision_index': self._decision_index(records)}
