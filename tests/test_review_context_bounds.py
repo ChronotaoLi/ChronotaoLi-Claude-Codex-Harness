@@ -3,7 +3,7 @@ import json
 from pathlib import Path
 import unittest
 
-from harness.context import compact_feedback, compact_reviews, review_digest
+from harness.context import compact_feedback, compact_reviews, review_digest, review_view
 from harness.contracts import validate_review
 from harness.util import HarnessError, dump, read_json
 from test_harness import RepoCase, ROOT
@@ -206,7 +206,9 @@ class BoundedReviewEvidenceTests(unittest.TestCase):
     def test_review_without_full_artifact_is_never_silently_truncated(self):
         review = maximum_review()
         compacted = compact_feedback({"review": review})
-        self.assertEqual(compacted["review"], review)
+        # Every finding and its evidence stay; only the memory approvals are not projected.
+        self.assertEqual(compacted["review"], review_view(review))
+        self.assertEqual(compacted["review"]["findings"], review["findings"])
         self.assertGreater(len(json.dumps(compacted)), 32000)
 
 

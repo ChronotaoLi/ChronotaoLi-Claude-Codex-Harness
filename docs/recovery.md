@@ -78,7 +78,7 @@
 | worker 的 blocked 输出无效（条目 `invalid_blocked`，反馈带 `output_error`） | 结构合法的 environment／operator 阻断按对应行处理（不给尝试豁免）；task 阻断与结构不可信的阻断自动进入再规划 | 对应出口 |
 | `… 请先核对并清理越界修改，再 resume` | 核对并清理范围外改动，不自动删除 | 普通 `resume` |
 | `<role> 输出连续两次无效：…；原件 PATH；普通 resume 重新请求，或 abandon` | 读原件与错误（派发条目的 `error`、`invalid_output`）；指挥计划超出 `max_tasks` 时可先提高它 | 普通 `resume`（新请求，最多再两次调用），或 `abandon RUN` |
-| `无效输出原始结果缺失或无法读取`、`无效输出原始结果已改变` | 上一次无效输出的原件被删改，派发前停止 | 恢复原字节后普通 `resume`，或 `abandon RUN` |
+| `无效输出原始结果缺失或无法读取`、`无效输出原始结果已改变` | 上一次无效输出的原件被删改（准备前，或本地准备与 `pre_agent` 期间），调用计费前停止 | 恢复原字节后普通 `resume`，或 `abandon RUN` |
 | `worktree HEAD 与检查点不同` | 核对是否有含 `Harness-Run`／`Harness-Task` 的提交（见下一节第 1 条）；不手工伪造接受 | 恢复可信现场后 `resume`，或 `abandon` |
 | 加载时核验的证据被删改（`worker packet artifact changed`、`worker schema artifact changed`、`evidence artifact disagrees with ledger` 等，见[证据损坏](#证据损坏)） | 恢复原字节；不改台账摘要。`abandon` 同样被拒绝 | 恢复后普通 `resume`；无法恢复时保留 run 目录原样，另开新 run |
 | 路径索引、输入索引或环境更新产物损坏（`path-indexes/`、`input-indexes/`、`environment/`） | 恢复原字节 | 恢复后普通 `resume`；无法恢复时可 `abandon RUN` |
@@ -176,12 +176,12 @@ python3 -m harness --config /path/to/harness.toml --repo /path/to/project resume
 
 ### 无效输出与自动重做
 
-没有通过契约的模型输出不是结果。运行时只从原件读否决：退出已确认、原件字节已绑定摘要、严格解码成对象（拒绝重复键与非有限数）、envelope 身份相符之后，审阅的 `request_changes`、blocking finding 或未 `resolved` 的必需项（核心结构合法时），指挥再规划的 `stop`（整份结构合法时），以及 worker 的 `blocked`，都保持约束力。
+没有通过契约的模型输出不是结果。运行时只从原件读否决：退出已确认、原件字节已绑定摘要、严格解码成对象（拒绝重复键与非有限数，含溢出的数值字面量）、envelope 身份相符之后，审阅的 `request_changes`、blocking finding 或未 `resolved` 的必需项（核心结构合法时），指挥再规划的 `stop`（整份结构合法时），以及 worker 的 `blocked`，都保持约束力。
 
 - **指挥与审阅**：读不出否决的无效输出（含结构非法的审阅、不可解码的供应商输出）在同一次保存里记为 `status=invalid`、错误与原件摘要（`invalid_output`），回执消费，然后自动重做一次。重做是新派发，计入 `max_agent_dispatches`，条目记 `retry_of`，包里带 `previous_invalid`（上一次无效输出的引用与前 2,000 字符的错误；带上它会超出上下文预算时不带，条目记 `previous_invalid_omitted`）。重做仍无效即停止；之后的普通 `resume` 发起新请求，同样有一次重做。是否重做只看整个 run 的最后一次模型调用，所以中断、或重做在本地准备时（额度、上下文、hook）停止，恢复后的那次调用仍是重做。
 - **带否决的无效输出**：审阅按拒绝返工（`invalid_rejected`），它的 blocking finding 成为下一轮必需项；指挥的 stop 照样停止（`invalid_stopped`，`replan_stopped.output_error` 记错误）；worker 的 blocked 见上表。整体审阅的拒绝写入整体记录后同一快照不再审阅；无否决的无效整体审阅不写结论，同一快照可以重做。
 - **worker**：无效输出（含解不出对象的完整输出）计一次工作尝试，回执消费，调度继续，受 `max_attempts` 约束。
-- **可选产物**：worker 的 `checkpoints`、`proposed_memories` 与审阅的 `approved_memory_keys` 不合格只丢弃自身，记 `checkpoints_discarded`、`memory_proposals_discarded`，结果照常处理。worker 的 `decision_requests` 不合格则整份结果无效。
+- **可选产物**：worker 的 `checkpoints`、`proposed_memories` 与审阅的 `approved_memory_keys` 不合格只丢弃自身，记 `checkpoints_discarded`、`memory_proposals_discarded`，结果照常处理；之后的上下文只带它们经过校验的投影（登记后的检查点、整批合法时的提案 key，不带记忆批准），原件保留原值。worker 的 `decision_requests` 不合格则整份结果无效。
 - **越出已批准范围的修订**不是无效输出：停止，回执保留，`--allow-scope` 后复核同一份修订。
 
 ### 整体验证与重验

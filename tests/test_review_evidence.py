@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 
 from harness import git
-from harness.context import compact_feedback, compact_reviews, review_digest
+from harness.context import compact_feedback, compact_reviews, review_digest, review_view
 from harness.util import read_json, write_json
 from test_harness import RepoCase, ROOT
 from test_runtime_changes import ScriptedBackend, finding
@@ -42,7 +42,8 @@ class ReviewEvidenceTests(unittest.TestCase):
             changed = copy.deepcopy(feedback)
             changed["review"]["findings"][0]["evidence"].append("Additional independent evidence")
             result = compact_feedback(changed, compacted)
-            self.assertEqual(result["review"], changed["review"])
+            # Later context carries the review without its memory approvals (they act at acceptance).
+            self.assertEqual(result["review"], review_view(changed["review"]))
             self.assertNotIn("review_in_prior_reviews", result)
 
             compacted_again = compact_reviews(compacted)

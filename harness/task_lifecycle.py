@@ -289,13 +289,14 @@ class TaskLifecycle(RuntimeService):
             feedback["worker"] = result
         # Inspect Git before any handoff field changes: an interruption inside it
         # must not leave a pending replan beside the unconsumed receipt.
-        self.services.workflow.record_worker_recovery(tid, entry["id"], artifact.parent, error)
+        recovery = self.services.workflow.worker_recovery(tid, entry["id"], artifact.parent, error)
         self.context.run["feedback"] = feedback
         if route == "task":
             self.context.run["pending_replan"] = {"stage": "pending", "trigger": deepcopy(feedback)}
         entry.update(status="invalid_blocked", error=str(error), worker_outcome=route + "_blocked")
         self.context.run["last_runtime_error"] = {"role": "worker", "kind": entry["kind"], "task_id": tid,
                                                   "error": str(error), "artifact": str(artifact.parent)}
+        self.context.run.setdefault("worker_recovery", {})[tid] = recovery
         self.services.worker_receipts.consume(key, "invalid_blocker")
         self.context.save()
         self.services.receipts.observe_invalid(entry)

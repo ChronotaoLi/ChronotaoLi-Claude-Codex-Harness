@@ -53,12 +53,12 @@
 
 **结论与证据**
 
-6. 已返回的结果不重抽：调用前的接收意图绑定原请求、候选快照和返回位置；恢复时先处理已返回的原件，缺失或被改即停止。有效的指挥与审阅结论，以及从原件可靠读出的否决事实，不因重做或 resume 消失。否决事实包括审阅的 `request_changes`、blocking finding、批准中未 `resolved` 的必需项，指挥再规划的 `stop`，以及 worker 的 `blocked`；可靠读出的公共前提是退出已确认、原件字节已绑定摘要、严格解码成对象（拒绝重复键与非有限数）、envelope 身份相符。审阅的否决另要求核心结构合法（拒绝要带着可编号的 findings 返工），指挥的 `stop` 另要求整份结果结构合法；不满足时按读不出否决处理。没有通过契约、也读不出否决的输出不是结果：原件保留，故障记在它的派发条目上，由同一角色的新进程重做（不变量 11）。
+6. 已返回的结果不重抽：调用前的接收意图绑定原请求、候选快照和返回位置；恢复时先处理已返回的原件，缺失或被改即停止。有效的指挥与审阅结论，以及从原件可靠读出的否决事实，不因重做或 resume 消失。否决事实包括审阅的 `request_changes`、blocking finding、批准中未 `resolved` 的必需项，指挥再规划的 `stop`，以及 worker 的 `blocked`；可靠读出的公共前提是退出已确认、原件字节已绑定摘要、严格解码成对象（拒绝重复键与非有限数，包括溢出成无穷大的数值字面量）、envelope 身份相符。运行时只写严格解码能读回的 JSON：要写出非有限数时停止，而不是写出自己读不回的原件。审阅的否决另要求核心结构合法（拒绝要带着可编号的 findings 返工），指挥的 `stop` 另要求整份结果结构合法；不满足时按读不出否决处理。没有通过契约、也读不出否决的输出不是结果：原件保留，故障记在它的派发条目上，由同一角色的新进程重做（不变量 11）。
 7. worker 结果先封存再交接：确认 worker 与命令子进程退出后，把结果、来源文件摘要、返回后候选、HEAD、Git 绑定和进程事实写成内容寻址的 `worker-seal.<SHA256>.json`，再做契约、范围、`post_agent` 与交接。未封存的原始输出不补绑恢复时的工作树。
-8. 无结果判定绑定原始证据：确认退出后，按 Claude 的 JSON 输出（`process.stdout`）和派发目录中的结果文件把来源判为 retryable、invalid、returned 或 unknown。retryable（没有输出，或完整的显式错误）与 invalid（输出完整，但严格解码不出对象结果）都允许新的计费尝试：判定、故障来源和回执消费同次保存，结局分别是 `provider_failure` 与 `result_rejected`。适配器当场遇到解不出的输出时，走与恢复相同的判定代码（适配器与判定共用一个解码函数），所以是否在判定保存之前中断不改变结局。returned（已有能解码成对象的结果但没有封存）或 unknown（与原始输出冲突、超过读取上限、读文件失败）时，判定与停止原因同次保存，回执保留，`--confirm-exited` 不能解开。判定记录所依据文件的 SHA256，证据删改后不能改判。
+8. 无结果判定绑定原始证据：确认退出后，按 Claude 的 JSON 输出（`process.stdout`）和派发目录中的结果文件把来源判为 retryable、invalid、returned 或 unknown。retryable（没有输出，或完整的显式错误）与 invalid（输出完整，但严格解码不出对象结果）都允许新的计费尝试：可能中断的步骤（分类、为恢复记录读取 Git）先完成，然后判定、判定证据、故障来源和回执消费同次保存，结局分别是 `provider_failure` 与 `result_rejected`；在此之前中断，条目与回执都保持判定前的样子。适配器当场遇到解不出的输出时，走与恢复相同的判定代码（适配器与判定共用一个解码函数），所以是否在判定保存之前中断不改变结局。returned（已有能解码成对象的结果但没有封存）或 unknown（与原始输出冲突、超过读取上限、读文件失败）时，判定与停止原因同次保存，回执保留，`--confirm-exited` 不能解开。判定记录所依据文件的 SHA256，证据删改后不能改判。
 9. 不可变证据先发布，再登记引用：packet、契约、封存、续作类记录、环境更新、决定和检查点先写成内容寻址或带 SHA256 的文件，再在台账存路径与摘要。文件写入失败时不登记引用；worker 输入写入失败时也不扣调用预算、不保存接收意图或 `invoked=true`，但此前保存的准备条目与随后的失败状态、诊断仍会落盘。未引用的遗留文件被忽略，同内容重试时复用。
 10. 台账对 worker 输入和续作类记录只存摘要与引用：接收意图存 `packet.json`、`schema.json` 的路径与 SHA256；续作、执行指导、续作拒绝行只存 `snapshot_digest`，整棵快照只在不可变文件里。引用文件缺失、被改或换成符号链接时，恢复停止并保留现场。
-11. 无效输出的重做有界。指挥或审阅的一次请求返回读不出否决的无效输出时，在同一次保存里记录错误与原件摘要（`status=invalid`、`invalid_output`）并消费回执，然后自动重做一次；是否重做由整个 run 最后一次模型调用推导（它是同一调用的无效输出且本身不是重做），重做条目记 `retry_of`，输入附上一份无效输出的引用与前 2,000 字符的错误（带上它超出上下文预算时去掉）。重做仍无效则停止；此后的普通 resume 发起新请求，规则相同。worker 的无效输出记为一次工作尝试，回执消费，调度继续，受 `max_attempts` 约束；blocked 的输出保持约束力：结构合法的 environment／operator／task 阻断按原路由，其余按 task 阻断进入再规划，都不给尝试豁免。所有重做都计入 `max_agent_dispatches`；证据损坏或退出未确认时不重做。worker 的 `checkpoints`、`proposed_memories` 与审阅的 `approved_memory_keys` 不参与判定，不合格只丢弃自身并记事件；`decision_requests` 不合格即为无效输出。越出已批准范围的修订不是无效输出：保留回执等待 `--allow-scope`。
+11. 无效输出的重做有界。指挥或审阅的一次请求返回读不出否决的无效输出时，在同一次保存里记录错误与原件摘要（`status=invalid`、`invalid_output`）并消费回执，然后自动重做一次；是否重做由整个 run 最后一次模型调用推导（它是同一调用的无效输出且本身不是重做），重做条目记 `retry_of`，输入附上一份无效输出的引用与前 2,000 字符的错误（带上它超出上下文预算时去掉）；这份原件在本地准备（含 `pre_agent`）之后、调用计费之前再按摘要核对一次，缺失或被改即按证据损坏停止。重做仍无效则停止；此后的普通 resume 发起新请求，规则相同。worker 的无效输出记为一次工作尝试，回执消费，调度继续，受 `max_attempts` 约束；blocked 的输出保持约束力：核心结构与语义都合法、只有界限不合格的 environment／operator／task 阻断按原路由，原结果进入 feedback；结构或语义不合法的 blocked 输出按 task 阻断进入再规划，feedback 不带原结果；都不给尝试豁免。所有重做都计入 `max_agent_dispatches`；证据损坏或退出未确认时不重做。worker 的 `checkpoints`、`proposed_memories` 与审阅的 `approved_memory_keys` 不参与判定，不合格只丢弃自身并记事件；后续上下文只用它们经过校验、有界的投影（检查点只以登记后的 `task_checkpoints` 出现，记忆提案只投影整批合法时的 key，记忆批准只在接受时起作用、不进入后续上下文），被丢弃的部分不投影，原件保留原值；`decision_requests` 不合格即为无效输出。越出已批准范围的修订不是无效输出：保留回执等待 `--allow-scope`。
 
 **接受**
 
@@ -90,7 +90,7 @@
 28. 旧版本台账不迁移、不执行：`resume`、`abandon`、`prepare-run` 只接受版本 17；版本 16 及更早仍可用只读与诊断入口（`status`、`watch`、`dashboard`、`permission-diagnostics`）和受门禁保护的 `cleanup-run`（版本 7–17，按各自形状核对；版本 15、16 的 worker 回执按其意图保存的输出模式、用当时的分类规则原样复核）；不补写旧默认值。resume 另核对共享资产摘要（不含 hook 脚本的依赖）和完整配置快照。
 29. hooks 至少一次：`post_agent` 只作用于通过契约校验的结果和 `invalid_rejected` 审阅（读不出否决的无效输出、指挥的无效 stop 与 worker 的无效阻断不运行它；worker 交接请求的目标在 `post_agent` 与检查点登记之后才检查，不合格时这份结果在 hook 之后才判为无效）；`pre_accept`、`post_accept`、`on_error` 执行前递增计数并用独立日志目录，中断后可能重复。配置出现 `context_compacted` 时报未知事件并提示改用 `context_prepared`。
 30. 必要输入超过 `context_chars` 时不调用模型、不扣额度，报告仍写入 `context-report.json`；可选记忆按整条加入剩余空间。成功派发的报告保留根与顶层字段尺寸及最大的 30 个嵌套字段并给出省略数，超限报告保留全部明细。
-31. 观察层（`status`、`watch`、`dashboard`、操作记录、`supervise` 回执）不写台账、不取 `run.lock`、不参与恢复。
+31. 观察层（`status`、`watch`、`dashboard`、操作记录、`supervise` 回执）不写台账、不取 `run.lock`、不参与恢复。观察网页仍保留已删除事件（`output_format_repair`、`invalid_output_repair_requested`、`worker_result_rejected`）的显示名，只用于显示旧台账里的事件；运行时不再写这些事件。
 
 **身份**
 
@@ -166,7 +166,7 @@
 | `context_capacity` | 整体审阅容量预估，变化才保存 | 不清除 | 必要下界超限时提前停止 |
 | `ignored_diagnostics` | 开始、worker 返回、验证结束 | 不清除 | 只是路径清单摘要 |
 
-`recovery.py` 的 `RECOVERY_BUSY_KEYS` 列出共用的十个待处理键，环境更新、续作拒绝、执行指导和操作者决定在其中任一有值时拒绝（见[恢复选项](recovery.md#恢复选项与互斥)）。`load_run` 在任何副作用前检查这些对象的类型、所引 dispatch 的角色与任务、`pending_task` 与 `pending_replan` 互斥，失败时不改写台账。
+`recovery.py` 的 `RECOVERY_BUSY_KEYS` 列出共用的八个待处理键，环境更新、续作拒绝、执行指导和操作者决定在其中任一有值时拒绝（见[恢复选项](recovery.md#恢复选项与互斥)）。`load_run` 在任何副作用前检查这些对象的类型、所引 dispatch 的角色与任务、`pending_task` 与 `pending_replan` 互斥，失败时不改写台账。
 
 清理状态不在台账里：`cleanup-run` 的删除意图与完成记录写在检出证据旁的 `cleanup.json` 和 run 目录的 `worktree-cleanup.json`，清理不改写台账（`--confirm-exited` 的退出确认除外）。已删除的 `abandon --remove-worktree` 曾写入 `pending_worktree_removal`、`worktree_removed`；新 run 不再写这两个键，`cleanup-run` 读旧台账时把它们当作已有的删除意图：工作树目录、Git 注册和管理目录都已消失时按已移除处理。
 

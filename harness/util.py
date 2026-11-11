@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import fcntl
 import json
+import math
 import os
 import signal
 import subprocess
@@ -36,7 +37,11 @@ def uid(prefix: str) -> str:
 
 
 def dump(value) -> str:
-    text = json.dumps(value, ensure_ascii=False, indent=2)
+    try:
+        # Never write what strict_json_loads would refuse to read back.
+        text = json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False)
+    except ValueError as error:
+        raise HarnessError(f"拒绝写出非有限数：严格 JSON 无法读回（{error}）") from error
     # Git paths may contain surrogateescaped filesystem bytes. Preserve their
     # exact identity in JSON while keeping ordinary Unicode readable.
     return text.encode("utf-8", errors="backslashreplace").decode("utf-8")
@@ -69,14 +74,24 @@ def _reject_constant(name):
     raise ValueError(f"non-finite JSON number: {name}")
 
 
-def strict_json_loads(raw):
-    """Decode model or provider JSON exactly: no duplicate keys, no NaN/Infinity.
+def _finite_float(text):
+    # An ordinary literal such as 1e999 overflows to infinity, at any depth.
+    value = float(text)
+    if not math.isfinite(value):
+        raise ValueError(f"non-finite JSON number: {text}")
+    return value
 
+
+def strict_json_loads(raw):
+    """Decode model or provider JSON exactly: no duplicate keys, no non-finite numbers.
+
+    NaN and Infinity literals and float literals that overflow are all refused.
     Raises ValueError (including JSONDecodeError), UnicodeError or RecursionError.
     """
     if isinstance(raw, (bytes, bytearray)):
         raw = bytes(raw).decode("utf-8")
-    return json.loads(raw, object_pairs_hook=_unique_pairs, parse_constant=_reject_constant)
+    return json.loads(raw, object_pairs_hook=_unique_pairs, parse_constant=_reject_constant,
+                      parse_float=_finite_float)
 
 
 @contextlib.contextmanager

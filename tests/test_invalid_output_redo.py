@@ -475,7 +475,7 @@ class WorkerInvalidOutputTests(RepoCase):
 
         backend = ScriptedBackend(change)
         engine = self.engine(backend)
-        record = engine.services.workflow.record_worker_recovery
+        record = engine.services.workflow.worker_recovery
         state = {"fired": False}
 
         def interrupt_once(*args, **kwargs):
@@ -484,7 +484,7 @@ class WorkerInvalidOutputTests(RepoCase):
                 state["fired"] = True
                 raise KeyboardInterrupt
             return record(*args, **kwargs)
-        with patch.object(engine.services.workflow, "record_worker_recovery", side_effect=interrupt_once):
+        with patch.object(engine.services.workflow, "worker_recovery", side_effect=interrupt_once):
             with self.assertRaises(KeyboardInterrupt):
                 engine.start("Implement greet", plan())
         saved = read_json(engine.directory / "state.json")
@@ -637,9 +637,13 @@ class EvidenceDamageTests(RepoCase):
         first = entries(engine.run, "reviewer", "review")[0]
         Path(first["invalid_output"]["artifact"]).write_text("{}")
         before = len(backend.calls)
+        dispatches = len(read_json(engine.directory / "state.json")["dispatches"])
+        resumed = self.engine(backend)
         with self.assertRaisesRegex(HarnessError, "无效输出原始结果已改变"):
-            self.engine(backend).resume(engine.run["id"])
+            resumed.resume(engine.run["id"])
         self.assertEqual(len(backend.calls), before)
+        # Damage found before preparation: no dispatch is prepared and no hook runs for it.
+        self.assertEqual(len(resumed.run["dispatches"]), dispatches)
 
 
 class OptionalProductTests(RepoCase):
@@ -917,6 +921,164 @@ class HistoryRecordTests(RepoCase):
         later = calls(backend, "reviewer", "review")[1]["packet"]
         self.assertNotIn("previous_invalid", later)
         self.assertFalse(later.get("required_findings"))
+
+
+class ReviewFindingRegressionTests(RepoCase):
+    """The four blocking findings of the independent B3 code review, one test each."""
+
+    def test_unsealed_invalid_judgment_is_published_in_one_save(self):
+        from harness.worker_receipts import WorkerReceipts
+        config, repo = self.config, self.repo
+        stub_provider_clis(self)
+
+        class Truncated(DemoBackend):
+            workers = 0
+
+            def invoke(self, **kwargs):
+                if kwargs["role"] != "worker":
+                    return super().invoke(**kwargs)
+                self.workers += 1
+                if self.workers > 1:
+                    return super().invoke(**kwargs)
+                cli = CLIBackend(config, repo / ".harness")
+                cli.command = lambda *args: [sys.executable, "-c",
+                                             'print(\'{"type":"result","subtype":"succ\', end="", flush=True)']
+                return cli.invoke(**{**kwargs, "model": {**kwargs["model"], "cli": "claude"}})
+
+        backend = Truncated()
+        engine = self.engine(backend)
+        original_reject, original_changed = WorkerReceipts.reject, git.changed
+        state = {"rejecting": False, "fired": False}
+
+        def reject(service, *args, **kwargs):
+            state["rejecting"] = True
+            try:
+                return original_reject(service, *args, **kwargs)
+            finally:
+                state["rejecting"] = False
+
+        def changed(*args, **kwargs):
+            # Interrupt the Git inspection of the recovery record that the verdict publishes.
+            if state["rejecting"] and not state["fired"]:
+                state["fired"] = True
+                raise KeyboardInterrupt
+            return original_changed(*args, **kwargs)
+        with patch.object(WorkerReceipts, "reject", reject), patch.object(git, "changed", side_effect=changed):
+            with self.assertRaises(KeyboardInterrupt):
+                engine.start("Implement greet", plan())
+        self.assertTrue(state["fired"])
+        saved = read_json(engine.directory / "state.json")
+        worker = entries(saved, "worker")[0]
+        # Nothing of the verdict is durable before its last interruptible step.
+        self.assertIn("worker:implement:greet", saved["worker_receipts"])
+        self.assertNotIn("worker_return_evidence", worker)
+        self.assertNotIn(worker["status"], ("invalid",))
+        self.assertNotIn("worker_receipt_consumed", worker)
+        run = self.engine(backend).resume(engine.run["id"])
+        self.assertEqual(run["status"], "completed")
+        first = entries(run, "worker")[0]
+        self.assertEqual((first["status"], first["worker_receipt_consumed"], first["worker_return_evidence"]["state"]),
+                         ("invalid", "result_rejected", "invalid"))
+        self.assertEqual(run["attempts"], {"greet": 2})
+
+    def test_discarded_optional_products_never_enter_later_context(self):
+        huge = "x" * 110000
+        revised = "Implement greet after the prerequisite is clarified"
+        cases = {
+            "review approval": lambda backend, kwargs, packet, result: (
+                kwargs["kind"] == "review" and len(calls(backend, "reviewer", "review")) == 1
+                and result.update(verdict="request_changes", findings=[finding()], approved_memory_keys=[huge])),
+            "worker proposal": lambda backend, kwargs, packet, result: (
+                kwargs["role"] == "worker" and kwargs["task"]["description"] != revised
+                and result.update(status="blocked", blocker_kind="task", blockers=["Clarify prerequisite"],
+                                  proposed_memories=[{"key": huge}])),
+        }
+        for name, damage in cases.items():
+            with self.subTest(case=name):
+                self.setUp()
+
+                def change(backend, kwargs, packet, result, damage=damage):
+                    damage(backend, kwargs, packet, result)
+                    if kwargs["kind"] == "replan":
+                        result.update(action="revise", reason="Clarified", new_tasks=[],
+                                      updates=[{"id": "greet", "description": revised, "add_depends_on": []}])
+
+                backend = ScriptedBackend(change)
+                engine = self.engine(backend)
+                run = engine.start("Implement greet", plan())
+                self.assertEqual(run["status"], "completed")
+                self.assertFalse(any(huge in json.dumps(call["packet"]) for call in backend.calls))
+                # The original file keeps the raw value.
+                first = entries(run, "reviewer" if name == "review approval" else "worker")[0]
+                returned = read_json(engine.directory / "dispatches" / first["id"] / "returned-result.json")
+                self.assertIn(huge, json.dumps(returned))
+
+    def test_previous_invalid_original_damaged_during_preparation_stops_before_the_call(self):
+        for damage in ("delete", "alter"):
+            with self.subTest(damage=damage):
+                self.setUp()
+
+                def change(backend, kwargs, packet, result):
+                    if kwargs["kind"] == "review" and len(calls(backend, "reviewer", "review")) == 1:
+                        result["summary"] = "x" * 4001
+
+                backend = ScriptedBackend(change)
+                engine = self.engine(backend)
+                emit = engine.hooks.emit
+
+                def hook(event, payload, logs, damage=damage):
+                    if event == "pre_agent" and payload.get("role") == "reviewer":
+                        invalid = [d for d in engine.run["dispatches"] if d.get("status") == "invalid"]
+                        if invalid:
+                            path = Path(invalid[-1]["invalid_output"]["artifact"])
+                            path.unlink() if damage == "delete" else path.write_text("{}")
+                    return emit(event, payload, logs)
+                with patch.object(engine.hooks, "emit", side_effect=hook):
+                    with self.assertRaisesRegex(HarnessError, "无效输出原始结果" + ("缺失" if damage == "delete" else "已改变")):
+                        engine.start("Implement greet", plan())
+                self.assertEqual(len(calls(backend, "reviewer", "review")), 1)
+                redo = entries(engine.run, "reviewer", "review")
+                self.assertEqual(len(redo), 1)
+                last = engine.run["dispatches"][-1]
+                self.assertEqual((last["role"], last["invoked"], last["status"]), ("reviewer", False, "failed"))
+                self.assertEqual(engine.run["agent_dispatches"], 2)  # the worker and the first review
+
+    def test_overflowing_number_is_an_ordinary_invalid_delivery(self):
+        from harness.util import dump, strict_json_loads
+        for raw in ('{"x":1e999}', '[[-1e400]]', '{"a":{"b":[1.5,2e308]}}'):
+            with self.subTest(raw=raw), self.assertRaises(ValueError):
+                strict_json_loads(raw)
+        with self.assertRaisesRegex(HarnessError, "非有限数"):
+            dump({"x": float("inf")})
+        stub_provider_clis(self)
+        config, repo = self.config, self.repo
+
+        class Overflow(DemoBackend):
+            reviews = 0
+
+            def invoke(self, **kwargs):
+                if kwargs["kind"] != "review":
+                    return super().invoke(**kwargs)
+                self.reviews += 1
+                result = super().invoke(**kwargs)
+                if self.reviews > 1:
+                    return result
+                # An optional product carries an overflowing literal through the real adapter.
+                terminal = json.dumps({"type": "result", "subtype": "success", "is_error": False,
+                                       "structured_output": {**result, "approved_memory_keys": ["OVERFLOW"]}})
+                terminal = terminal.replace('"OVERFLOW"', "1e999")
+                cli = CLIBackend(config, repo / ".harness")
+                cli.command = lambda *args: [sys.executable, "-c", f"import sys; sys.stdout.write({terminal!r})"]
+                return cli.invoke(**{**kwargs, "model": {**kwargs["model"], "cli": "claude"}})
+
+        backend = Overflow()
+        run = self.engine(backend).start("Implement greet", plan())
+        self.assertEqual(run["status"], "completed")
+        first, second = entries(run, "reviewer", "review")
+        self.assertEqual(first["status"], "invalid")
+        self.assertTrue(first["invalid_output"]["artifact"].endswith("process.stdout"))
+        self.assertIn("1e999", Path(first["invalid_output"]["artifact"]).read_text())
+        self.assertEqual(second["retry_of"], first["id"])
 
 
 class InterruptionTests(RepoCase):

@@ -250,9 +250,8 @@ class Planner(RuntimeService):
                  "instruction": "Apply the replan contract in role_skill to the bound trigger. Additional scope is limited to approved_scope. No file edits."})
         except InvalidReplanStop as stop:
             # A structurally valid stop is a veto even when its other checks fail.
-            stop.entry.update(status="invalid_stopped", error=str(stop))
-            self.record_replan_stop(trigger, stop.result, attempt, output_error=str(stop),
-                                    returned_artifact=stop.artifact)
+            self.record_replan_stop(trigger, stop.result, attempt, judged_entry=stop.entry,
+                                    output_error=str(stop), returned_artifact=stop.artifact)
             self.services.receipts.observe_invalid(stop.entry)
             raise HarnessError("指挥已停止再规划；输出另有错误，证据已保留，不自动重派") from stop
         artifact = self.context.directory / "plans" / f"replan-{attempt}.json"
@@ -278,17 +277,24 @@ class Planner(RuntimeService):
         self.context.save()
         self.apply_pending_revision()
 
-    def record_replan_stop(self, trigger, result, attempt, **diagnostics):
+    def record_replan_stop(self, trigger, result, attempt, *, judged_entry=None, **diagnostics):
+        """Save a stop; an invalid stop's entry verdict is published in the same save.
+
+        The artifact write and the source read come first: nothing in the
+        ledger changes before the last interruptible step.
+        """
         artifact = self.context.directory / "plans" / f"replan-{attempt}.json"
         write_json(artifact, {"trigger": trigger, "result": result, **diagnostics})
+        receipt = self.context.run["commander_receipts"].get("commander:replan:replanning")
+        source = ({"dispatch_id": receipt["dispatch_id"],
+                   "source_digest": hashlib.sha256(Path(receipt["artifact"]).read_bytes()).hexdigest()}
+                  if receipt else {})
+        if judged_entry is not None:
+            judged_entry.update(status="invalid_stopped", error=diagnostics["output_error"])
         self.context.run["replan_attempts"] = attempt
         self.context.run["replan_stopped"] = {"target": trigger.get("task_id") or "final",
             "trigger": deepcopy(trigger), "attempt": attempt, "artifact": str(artifact),
-            "reason": result["reason"], **diagnostics}
-        receipt = self.context.run["commander_receipts"].get("commander:replan:replanning")
-        if receipt:
-            self.context.run["replan_stopped"].update(dispatch_id=receipt["dispatch_id"],
-                                              source_digest=hashlib.sha256(Path(receipt["artifact"]).read_bytes()).hexdigest())
+            "reason": result["reason"], **diagnostics, **source}
         self.context.run.pop("pending_replan", None)
         self.context.run["commander_receipts"].pop("commander:replan:replanning", None)
         self.context.save()

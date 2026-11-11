@@ -4,7 +4,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from harness.context import WORKER_CONTEXT_CHARS, compact_feedback, compose
+from harness.context import WORKER_CONTEXT_CHARS, compact_feedback, compose, worker_view
 from harness.util import HarnessError, dump, read_json, write_json
 from test_harness import RepoCase, ROOT
 from test_runtime_changes import ScriptedBackend, validate_work_contract
@@ -182,7 +182,10 @@ class BoundedWorkerContextTests(unittest.TestCase):
         for source in ({}, {"worker_artifact": "/run/worker.json"}, {"worker_artifact_digest": "a" * 64}):
             with self.subTest(source=source):
                 compacted = compact_feedback({"worker": worker, **source})
-                self.assertEqual(compacted["worker"], worker)
+                # Core evidence stays whole; proposals are projected as the keys of a valid batch.
+                self.assertEqual(compacted["worker"], worker_view(worker))
+                self.assertEqual(compacted["worker"]["proposed_memory_keys"],
+                                 [proposal["key"] for proposal in worker["proposed_memories"]])
                 with self.assertRaisesRegex(HarnessError, "上下文"):
                     compose(compacted, [], 32000)
 

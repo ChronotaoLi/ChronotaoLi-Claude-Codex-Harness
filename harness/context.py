@@ -99,6 +99,49 @@ REVIEW_CONTEXT_CHARS = 9000
 WORKER_CONTEXT_CHARS = 9000
 
 
+def proposal_keys(worker):
+    """Keys of a worker's memory proposals, only when the whole batch is valid.
+
+    A malformed batch is discarded on its own (R8); its keys are not projected.
+    An earlier projection's keys are checked against the same bounds again.
+    """
+    from .contracts import PROPOSAL, PROPOSALS, validate
+    try:
+        if "proposed_memories" in worker:
+            validate(worker["proposed_memories"], PROPOSALS, "proposed_memories")
+            keys = [proposal["key"] for proposal in worker["proposed_memories"]]
+        else:
+            keys = worker.get("proposed_memory_keys", [])
+            validate(keys, {"type": "array", "items": PROPOSAL["properties"]["key"],
+                            "maxItems": PROPOSALS["maxItems"]}, "proposed_memory_keys")
+    except HarnessError:
+        return []
+    return list(keys) if len(keys) == len(set(keys)) else []
+
+
+def worker_view(worker):
+    """A worker result as later context may see it: no raw optional products.
+
+    Checkpoints reach later workers only as registered task_checkpoints;
+    memory proposals only as the keys of a valid batch. The returned-result
+    file keeps the raw values.
+    """
+    view = {key: deepcopy(value) for key, value in worker.items()
+            if key not in ("checkpoints", "proposed_memories", "proposed_memory_keys")}
+    if "proposed_memories" in worker or "proposed_memory_keys" in worker:
+        view["proposed_memory_keys"] = proposal_keys(worker)
+    return view
+
+
+def review_view(review):
+    """A review as later context may see it: memory approvals act only at acceptance.
+
+    Approvals are never projected; the review file keeps the raw value.
+    """
+    from .contracts import REVIEW_OPTIONAL
+    return {key: deepcopy(value) for key, value in review.items() if key not in REVIEW_OPTIONAL}
+
+
 def compact_worker(worker, artifact, budget=WORKER_CONTEXT_CHARS, *, digest=None):
     """Bound worker feedback, retaining retrieval and the actual blocker decision.
 
@@ -108,23 +151,20 @@ def compact_worker(worker, artifact, budget=WORKER_CONTEXT_CHARS, *, digest=None
     """
     artifact = artifact or worker.get("full_worker_artifact")
     digest = digest or worker.get("worker_artifact_sha256")
+    view = worker_view(worker)
     if not artifact or not digest:
-        return deepcopy(worker)
+        return view
     try:
         raw = Path(artifact).read_bytes()
     except OSError as error:
         raise HarnessError("worker 完整反馈产物缺失或无法读取；不能仅凭摘录继续") from error
     if hashlib.sha256(raw).hexdigest() != digest:
         raise HarnessError("worker 完整反馈产物已改变；不能仅凭摘录继续")
-    if "full_worker_artifact" in worker and len(dump(worker)) <= budget:
-        return deepcopy(worker)
+    if "full_worker_artifact" in worker and len(dump(view)) <= budget:
+        return view
     evidence = worker.get("evidence", [])
     blockers = worker.get("blockers", [])
-    proposals = worker.get("proposed_memories")
-    # Memory proposals are an optional product: malformed entries were discarded, not rejected.
-    proposal_keys = worker.get("proposed_memory_keys", [p["key"] for p in proposals
-                                                        if isinstance(p, dict) and isinstance(p.get("key"), str)]
-                                                    if isinstance(proposals, list) else [])
+    keys = view.get("proposed_memory_keys", [])
 
     def excerpt(size):
         result = {key: deepcopy(worker[key]) for key in ("task_id", "dispatch_id", "status", "blocker_kind")
@@ -133,8 +173,8 @@ def compact_worker(worker, artifact, budget=WORKER_CONTEXT_CHARS, *, digest=None
             full_worker_artifact=str(artifact), worker_artifact_sha256=digest,
             evidence_count=worker.get("evidence_count", len(evidence)),
             blocker_count=worker.get("blocker_count", len(blockers)),
-            proposed_memory_count=worker.get("proposed_memory_count", len(proposal_keys)),
-            proposed_memory_keys=deepcopy(proposal_keys),
+            proposed_memory_count=len(keys),
+            proposed_memory_keys=list(keys),
             summary=worker.get("summary", "")[:size],
             blockers=[value[:size] for value in blockers],
             evidence=[value[:size] for value in evidence],
@@ -170,9 +210,10 @@ def compact_review(review, artifact, budget=REVIEW_CONTEXT_CHARS, *, digest=None
     exceed the requested share. compose() then fails closed instead of hiding
     findings. This representation is input context, never an acceptance result.
     """
-    if not artifact or len(dump(review)) <= budget:
-        return deepcopy(review)
     digest = digest or review_digest(review)
+    review = review_view(review)
+    if not artifact or len(dump(review)) <= budget:
+        return review
 
     def excerpt(size):
         result = {key: deepcopy(value) for key, value in review.items()
@@ -250,7 +291,6 @@ def compact_reviews(history):
                 review["findings"] = unique
                 if item.get("artifact"):
                     review.pop("summary", None)
-                    review.pop("approved_memory_keys", None)
                 if repeated:
                     item["repeated_finding_ids"] = repeated
             item["review"] = compact_review(review, item.get("artifact"), review_budget, digest=digest)
@@ -264,6 +304,10 @@ def compact_feedback(feedback, prior_reviews=()):
     """Bound evidence recursively and avoid repeating supplied reviews."""
     known_reviews = [item.get("review") for item in prior_reviews if item.get("review")]
     known_digests = {review.get("review_content_sha256") or review_digest(review) for review in known_reviews}
+
+    def known(review):
+        # A supplied review may be its view (approvals omitted) or an excerpt bound to the raw digest.
+        return review_digest(review) in known_digests or review_digest(review_view(review)) in known_digests
 
     def worker_count(value):
         if isinstance(value, list):
@@ -287,7 +331,7 @@ def compact_feedback(feedback, prior_reviews=()):
             if key in ("verification", "verification_failures") and isinstance(child, list):
                 item[key] = compact_checks(child)
             elif key == "review" and isinstance(child, dict):
-                if (child.get("review_content_sha256") or review_digest(child)) in known_digests:
+                if child.get("review_content_sha256") in known_digests or known(child):
                     item["review_in_prior_reviews"] = True
                 else:
                     item[key] = compact_review(child, value.get("artifact"))

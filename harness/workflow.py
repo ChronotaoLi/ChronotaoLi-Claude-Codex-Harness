@@ -75,14 +75,19 @@ class Workflow(RuntimeService):
                      and r["kind"] in ("worker", "handoff")
                      and (r["response"] is None or r["response"]["decision"] == "stop")), None)
 
-    def record_worker_recovery(self, task_id, dispatch_id, job, error):
+    def worker_recovery(self, task_id, dispatch_id, job, error):
+        """Build a worker recovery record without changing the ledger.
+
+        It inspects Git, which can be interrupted: callers build it before they
+        change any entry, then publish it with the judgment it belongs to.
+        """
         recovery = {"role": "worker", "kind": "implement", "task_id": task_id, "dispatch_id": dispatch_id,
                     "error": str(error), "error_type": type(error).__name__, "artifact": str(job)}
         try:
             recovery["changed_files"] = git.changed(self.context.worktree, binding=self.context.run["worktree_binding"])
         except Exception as inspection_error:
             recovery["inspection_error"] = str(inspection_error)
-        self.context.run.setdefault("worker_recovery", {})[task_id] = recovery
+        return recovery
 
     @staticmethod
     def decision_required(request):

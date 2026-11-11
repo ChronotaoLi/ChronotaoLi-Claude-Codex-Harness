@@ -2,7 +2,7 @@ import copy
 import json
 import unittest
 
-from harness.context import compact_checks, compact_feedback, compact_reviews, compose
+from harness.context import compact_checks, compact_feedback, compact_reviews, compose, review_view
 from harness.contracts import (PLAN, WORK, ScopeExtensionRequired, apply_revision,
                                envelope, output_constraints, validate,
                                validate_plan, validate_review)
@@ -193,12 +193,13 @@ class ContextCompactionTests(unittest.TestCase):
                    {"attempt": 4, "review": {**review(), "verdict": "approve"}, "artifact": "review-4.json"}]
         original = copy.deepcopy(history)
         compacted = compact_reviews(history)
-        self.assertEqual(compacted[-1], history[-1])
+        self.assertEqual(compacted[-1], {**history[-1], "review": review_view(history[-1]["review"])})
         findings = [finding for item in compacted for finding in item["review"]["findings"]]
         self.assertCountEqual(findings, [first, changed])
         self.assertEqual([item["artifact"] for item in compacted], [item["artifact"] for item in history])
         self.assertEqual(history, original)
-        self.assertEqual(compact_reviews([history[0], history[0]]), [history[0]])
+        self.assertEqual(compact_reviews([history[0], history[0]]),
+                         [{**history[0], "review": review_view(history[0]["review"])}])
 
     def test_feedback_deduplicates_only_reviews_already_in_the_packet(self):
         result = review([finding()])
@@ -212,7 +213,7 @@ class ContextCompactionTests(unittest.TestCase):
         self.assertTrue(compacted["review_in_prior_reviews"])
         self.assertEqual(compacted["artifact"], "review.json")
         self.assertLessEqual(len(compacted["trigger"]["verification"][0]["stdout"]), 500)
-        self.assertEqual(compact_feedback(feedback)["review"], result)
+        self.assertEqual(compact_feedback(feedback)["review"], review_view(result))
         self.assertEqual(feedback, original)
 
 

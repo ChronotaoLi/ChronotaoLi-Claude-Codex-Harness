@@ -221,6 +221,11 @@ class Dispatcher(RuntimeService):
             validate_inputs(self.context.run, self.context.directory)
             validate_indexes(self.context.directory, path_evidence)
             validate_mcp(self.context.config, roles=(role,))
+            if previous_invalid is not None:
+                # The invalid original this call refers to (as a redo, or as the
+                # hint of a new request) must still be the bound bytes after
+                # local preparation; damage stops before the call is accounted.
+                read_bound_bytes(previous_invalid, "无效输出")
             before = self.context.snapshot()
             entry["snapshot_digest"] = snapshot_digest(before)
             rejection = validate_continuation_rejection(self.context, before,
@@ -310,25 +315,32 @@ class Dispatcher(RuntimeService):
             invocation_error = error
             startup_interrupted = (isinstance(error, (KeyboardInterrupt, SystemExit))
                                    and entry["process_state"] == "starting" and entry["pgid"] is None)
-            if entry["status"] not in JUDGED:
-                # A judged delivery keeps its verdict (e.g. an invalid blocker's
-                # stop); only an unjudged failure becomes "failed".
-                entry["status"] = "failed"
-                entry["error"] = str(error)
+            # Read and inspect first (Git, evidence digests); change the entry after.
+            recovery = (self.services.workflow.worker_recovery(task_id, dispatch_id, job, error)
+                        if role == "worker" and invoked else None)
+            bound = {}
+            receipt = None
             if role in ("reviewer", "commander"):
                 receipt = self.context.run["review_receipts" if role == "reviewer" else "commander_receipts"].get(f"{role}:{kind}:{task_id}")
                 capture = job / "terminal-capture.json"
                 if receipt and capture.exists():
                     if capture.is_file() and not capture.is_symlink():
-                        receipt["terminal_capture_digest"] = hashlib.sha256(capture.read_bytes()).hexdigest()
+                        bound["terminal_capture_digest"] = hashlib.sha256(capture.read_bytes()).hexdigest()
                     artifact = job / "returned-result.json"
                     if artifact.is_file() and not artifact.is_symlink():
-                        receipt["artifact_digest"] = hashlib.sha256(artifact.read_bytes()).hexdigest()
+                        bound["artifact_digest"] = hashlib.sha256(artifact.read_bytes()).hexdigest()
+            if entry["status"] not in JUDGED:
+                # A judged delivery keeps its verdict (e.g. an invalid blocker's
+                # stop); only an unjudged failure becomes "failed".
+                entry["status"] = "failed"
+                entry["error"] = str(error)
+            if receipt is not None:
+                receipt.update(bound)
             if not isinstance(error, (KeyboardInterrupt, SystemExit)):
                 self.context.run["last_runtime_error"] = {"role": role, "kind": kind, "task_id": task_id,
                                                  "error": str(error), "artifact": str(job)}
-            if role == "worker" and invoked:
-                self.services.workflow.record_worker_recovery(task_id, dispatch_id, job, error)
+            if recovery is not None:
+                self.context.run.setdefault("worker_recovery", {})[task_id] = recovery
             raise
         finally:
             if process_outcome is None:

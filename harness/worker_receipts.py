@@ -269,26 +269,28 @@ class WorkerReceipts(RuntimeService):
         entry = self.entry(receipt)
         if self.seal_path(receipt) is None:
             job = Path(receipt['artifact']).parent
+            # Classify first; the entry changes only when the verdict is published.
             evidence = entry.get('worker_return_evidence')
             if evidence is None:
                 evidence = inspect_return(job)
-                entry['worker_return_evidence'] = evidence
             else:
                 validate_return_evidence(job, evidence)
             if evidence['state'] == 'retryable':
                 error = HarnessError(entry.get('error') or 'Worker invocation requires a fresh attempt: ' + evidence['reason'])
                 # Classification, failure provenance and receipt retirement share
                 # one commit, including when a crash skipped dispatch.finally.
-                self.reject(key, error, 'provider_failure')
+                self.reject(key, error, 'provider_failure', evidence=evidence)
                 return None
             if evidence['state'] == 'invalid':
                 # A complete output that is not a decodable object result is an
                 # invalid delivery, whether or not the controller crashed first.
                 self.reject(key, HarnessError('worker output invalid: ' + evidence['reason']), 'result_rejected',
-                            status='invalid', invalid_output={
+                            status='invalid', evidence=evidence, invalid_output={
                                 'artifact': str(job / 'process.stdout'),
                                 'artifact_digest': evidence['sources']['process.stdout']})
                 return None
+            # The stop reason is saved with this evidence (pending's error handler).
+            entry['worker_return_evidence'] = evidence
             raise HarnessError('worker return interrupted before immutable seal; ' + evidence['reason'] +
                                '; preserve evidence; automatic retry forbidden')
         return key
@@ -376,38 +378,48 @@ class WorkerReceipts(RuntimeService):
             self.reject(key, judgment.error, 'result_rejected', status='invalid',
                         invalid_output={'artifact': receipt['artifact'], 'artifact_digest': receipt['artifact_digest']})
             return None
-        entry['worker_outcome'] = ('completed' if result['status'] == 'completed' else result['blocker_kind'] + '_blocked')
+        worker_outcome = 'completed' if result['status'] == 'completed' else result['blocker_kind'] + '_blocked'
         if 'post_hook_digest' not in receipt:
             receipt['hook_attempts'] = receipt.get('hook_attempts', 0) + 1
             self.context.save()
-            self.context.emit_hook('post_agent', {**entry, 'result': result}, path.parent / f"post-agent-{receipt['hook_attempts']}")
+            self.context.emit_hook('post_agent', {**entry, 'worker_outcome': worker_outcome, 'result': result},
+                                   path.parent / f"post-agent-{receipt['hook_attempts']}")
             if git.head(self.context.worktree, binding=self.context.run['worktree_binding']) != record['head']:
                 raise HarnessError('worker hook changed HEAD')
             git.check_scope(self.context.worktree, task['allowed_paths'], binding=self.context.run['worktree_binding'])
             receipt['post_hook_digest'] = snapshot_digest(self.context.snapshot())
             self.context.save()
-        entry['status'] = 'completed'
+        # The entry records its outcome only after the last interruptible step.
+        entry.update(worker_outcome=worker_outcome, status='completed')
         return {k: v for k, v in result.items() if k not in ('task_id', 'dispatch_id')}
 
-    def reject(self, key, error, reason, *, status='failed', invalid_output=None):
+    def reject(self, key, error, reason, *, status='failed', invalid_output=None, evidence=None):
         """Retire a deterministically rejected result without accepting it.
 
         An invalid output (status ``invalid``) is one spent work attempt: the
         receipt is consumed and scheduling continues within max_attempts.
+        Every interruptible step (the Git inspection of the recovery record)
+        comes first; the verdict, its return evidence, the recovery record and
+        the consumption are then published together in one save.
         """
         receipt = self.context.run['worker_receipts'][key]
         entry = self.entry(receipt)
-        entry.update(status=status, error=str(error))
-        if invalid_output is not None:
-            entry['invalid_output'] = invalid_output
         job = Path(receipt['artifact']).parent
-        self.context.run['last_runtime_error'] = {'role': 'worker', 'kind': entry['kind'],
-            'task_id': entry['task_id'], 'error': str(error), 'artifact': str(job)}
         previous = self.context.run.get('worker_recovery', {}).get(entry['task_id'])
+        recovery = None
         if reason != 'provider_failure' or not previous or previous.get('dispatch_id') != entry['id']:
             # A later classification must not replace an observed timeout or
             # cancellation with the generic recovery error used to retire it.
-            self.services.workflow.record_worker_recovery(entry['task_id'], entry['id'], job, error)
+            recovery = self.services.workflow.worker_recovery(entry['task_id'], entry['id'], job, error)
+        if evidence is not None:
+            entry['worker_return_evidence'] = evidence
+        entry.update(status=status, error=str(error))
+        if invalid_output is not None:
+            entry['invalid_output'] = invalid_output
+        self.context.run['last_runtime_error'] = {'role': 'worker', 'kind': entry['kind'],
+            'task_id': entry['task_id'], 'error': str(error), 'artifact': str(job)}
+        if recovery is not None:
+            self.context.run.setdefault('worker_recovery', {})[entry['task_id']] = recovery
         self.consume(key, reason)
         self.context.save()
         if status == 'invalid':
