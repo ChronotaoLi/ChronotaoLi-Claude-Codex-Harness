@@ -5,10 +5,9 @@ import tempfile
 import unittest
 
 from harness.context import WORKER_CONTEXT_CHARS, compact_feedback, compose
-from harness.contracts import validate_work
 from harness.util import HarnessError, dump, read_json, write_json
 from test_harness import RepoCase, ROOT
-from test_runtime_changes import ScriptedBackend
+from test_runtime_changes import ScriptedBackend, validate_work_contract
 
 
 def maximum_worker(blocker_kind="task"):
@@ -26,7 +25,7 @@ def maximum_worker(blocker_kind="task"):
              "source_paths": [f"source-{item}-" + "x" * 490 for item in range(10)]}
             for index in range(8)],
     }
-    validate_work(result)
+    validate_work_contract(result)
     return result
 
 

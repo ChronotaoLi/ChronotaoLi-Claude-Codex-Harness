@@ -431,3 +431,17 @@ def validate_worker_receipt_links(run, directory, shape=None):
         raise HarnessError('missing mandatory worker receipts')
     WorkerReceipts(SimpleNamespace(run=run, directory=Path(directory))).validate_links(
         receipt_shape(run) if shape is None else shape)
+
+
+def delivered_work_contract(run, directory, dispatch_id):
+    """The exact contract an invoked worker dispatch received, read back by digest.
+
+    Later checks of a sealed worker result (exemptions, continuations, environment
+    and decision sources, checkpoints) validate against this, never the static
+    WORK: a worker with required findings received runtime-keyed repair_claims.
+    """
+    entries = [e for e in run.get('dispatches', []) if isinstance(e, dict) and e.get('id') == dispatch_id]
+    if (len(entries) != 1 or entries[0].get('role') != 'worker' or entries[0].get('invoked') is not True
+            or not isinstance(entries[0].get('worker_receipt'), dict)):
+        raise HarnessError('worker dispatch lacks its delivered contract; preserve evidence')
+    return read_worker_input(directory, entries[0], entries[0]['worker_receipt'], 'schema')

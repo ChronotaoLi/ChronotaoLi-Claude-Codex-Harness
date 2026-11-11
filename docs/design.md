@@ -37,9 +37,9 @@
 | `operations.py`、`supervisor.py` | 操作记录；`supervise` |
 | `permission_diagnostics.py`、`permission_smoke.py`、`tool_smoke.py` | 权限诊断；真实账号联调入口 |
 
-每次调用的输入由三部分组成：`shared/RULES.md` 与该角色的 skill（协议说明，包括各类摘录与索引的读法），以及包（`packet`）。包放数据、索引和现场事实：环境更新、操作者决定和检查点在包里是有界摘录加 SHA256 绑定的索引，与本次任务无关时只带索引。环境、决定、检查点、执行指导、权限、审阅、路径索引、命令目录、问题进度和计划增量的说明不在包里。仍在包里的静态说明及其去向：指挥 plan／dispatch／replan 的 `instruction`、默认 worker 指令和续作拒绝后写入拒绝记录的 worker 指令（随指挥调用合并改写，B4）；格式修正与显式修正的 `instruction`（随无效输出规则统一删除，B3）；修复声明模板的 `policy` 与 `required_finding_source_policy`（随身份归运行时删除或改写，B2）。另有几个分类标签（`instruction_file_changes.trust`、`ignored_paths.coverage`、环境检查结果的 `coverage`）、`verification_plan.policy` 的布尔标记、操作者决定里替代非法问题的有界说明，以及提示词中可选记忆前的分隔标题，它们描述具体数据，不是协议说明。worker 包的 `instruction` 是指挥写的指令，属于数据；指挥包另带 `workspace: {head, clean}`，在构造包时同时读取 `expected_head` 和工作树 `git status` 是否干净。
+每次调用的输入由三部分组成：`shared/RULES.md` 与该角色的 skill（协议说明，包括各类摘录与索引的读法），以及包（`packet`）。包放数据、索引和现场事实：环境更新、操作者决定和检查点在包里是有界摘录加 SHA256 绑定的索引，与本次任务无关时只带索引。环境、决定、检查点、执行指导、权限、审阅、路径索引、命令目录、问题进度和计划增量的说明不在包里。仍在包里的静态说明及其去向：指挥 plan／dispatch／replan 的 `instruction`、默认 worker 指令和续作拒绝后写入拒绝记录的 worker 指令（随指挥调用合并改写，B4）；格式修正与显式修正的 `instruction`（随无效输出规则统一删除，B3）。必需问题各行的读法（键、来源审阅、原件中的序号、可重复的标签）在 RULES 里，包里只有 `required_findings` 与可选的 `required_finding_sources` 数据。另有几个分类标签（`instruction_file_changes.trust`、`ignored_paths.coverage`、环境检查结果的 `coverage`）、`verification_plan.policy` 的布尔标记、操作者决定里替代非法问题的有界说明，以及提示词中可选记忆前的分隔标题，它们描述具体数据，不是协议说明。worker 包的 `instruction` 是指挥写的指令，属于数据；指挥包另带 `workspace: {head, clean}`，在构造包时同时读取 `expected_head` 和工作树 `git status` 是否干净。
 
-`dispatches/<id>/` 保存一次调用的输入（worker 的 `packet.json`、`schema.json`）、输出、`returned-result.json`、`worker-seal.<SHA256>.json`、命令清单 `commands.json` 与 `commands/<call>/` 下的记录。
+`dispatches/<id>/` 保存一次调用的输入（worker 的 `packet.json`、`schema.json`；`packet.json` 的 `required_findings` 就是该 worker 的键到问题的对照）、输出、`returned-result.json`、`worker-seal.<SHA256>.json`、命令清单 `commands.json` 与 `commands/<call>/` 下的记录。
 
 ## 不变量
 
@@ -62,7 +62,7 @@
 
 **接受**
 
-12. 任务接受同时要求：合法结果声明完成且无 blocker；Git 绑定与 HEAD 未变，改动（含暂存区）在 `allowed_paths` 内；全部验证命令成功；新审阅实例批准、无 blocking finding、必需问题全部独立处置为 resolved；接受前快照等于审阅时快照。
+12. 任务接受同时要求：合法结果声明完成且无 blocker；任务的证据要求在候选中都是普通文件，由运行时检查并记录摘要，不取 worker 的声明；Git 绑定与 HEAD 未变，改动（含暂存区）在 `allowed_paths` 内；全部验证命令成功；新审阅实例批准、无 blocking finding，并且按固定键给出的必需问题处置全部为 resolved；接受前快照等于审阅时快照。必需问题由审阅历史在当前候选上推导：处置只在它的审阅快照等于该候选、且该审阅可用时关闭问题。
 13. `pre_accept` 前后都重新哈希完整快照（含暂存区），不用 mtime、size 或 Git 的未变判断；快照变化时旧批准持久标为失效，任务重新执行、验证和审阅。
 14. 提交与接受记录共用一道屏障：commit 后，`accepted`、`expected_head`、`pending_post_accept` 同次保存，同时清除 `pending_acceptance`、`current_task` 和反馈。commit 已落盘而台账未保存时，恢复因 HEAD 不符停止，不自动修复。
 15. 全部任务接受后重新验证，再由新审阅者审阅 base 到 HEAD 的完整 diff；最终快照不变才 `completed`。同一快照的整体拒绝不能靠 resume 重抽，只能由通过正常门禁的修正任务改变候选。
@@ -74,7 +74,7 @@
 
 19. 预算只增不减：`attempts`、`agent_dispatches`、`replan_attempts`、`final_attempts` 累计保存，resume 不清零。恢复只允许提高超时、上下文、轮数、各项上限与 `max_tasks`，以及追加精确 `worker_commands`。
 20. `max_attempts` 按每个任务的工作尝试计数：worker 调用数减去已完整校验、与反馈同次保存的 environment／operator 阻断（`attempt_exemption`），豁免在使用前复核原始结果。没有全 run 的 worker 尝试上限；再规划新增的任务各有自己的 `max_attempts`，全局由计入每次模型调用的 `max_agent_dispatches` 封顶。`max_tasks` 限制计划任务数。
-21. 观察投影不改变预算：`status` 的 `budget_explanation`、`remaining_model_calls`（下界）、`convergence`、`review_rounds` 只读已保存事实。
+21. 观察投影不改变预算：`status` 的 `budget_explanation`、`remaining_model_calls`（下界）、`convergence`、`review_rounds` 只读已保存事实。`convergence`、`review_rounds` 跨轮比较的是 finding 标签（审阅者写的 id），只作观察。
 
 **权限与工具**
 
@@ -91,6 +91,10 @@
 29. hooks 至少一次：`post_agent` 只作用于通过校验的结果和 `invalid_rejected` 审阅；`pre_accept`、`post_accept`、`on_error` 执行前递增计数并用独立日志目录，中断后可能重复。配置出现 `context_compacted` 时报未知事件并提示改用 `context_prepared`。
 30. 必要输入超过 `context_chars` 时不调用模型、不扣额度，报告仍写入 `context-report.json`；可选记忆按整条加入剩余空间。成功派发的报告保留根与顶层字段尺寸及最大的 30 个嵌套字段并给出省略数，超限报告保留全部明细。
 31. 观察层（`status`、`watch`、`dashboard`、操作记录、`supervise` 回执）不写台账、不取 `run.lock`、不参与恢复。
+
+**身份**
+
+32. 模型不回填运行时拥有的身份。必需问题的处置和 worker 的修复声明使用运行时按当次必需项生成的固定键 `f1…fN`：键全部必填、不许多余键；没有必需项时不出现该字段。审阅的键到来源的对照在派发前保存，审阅的重放与修正都用同一份：任务审阅在 `pending_task`，整体审阅在该次整体记录；worker 的结果只按它自己那次派发已发布的 `packet.json` 映射。审阅记录带一份对照副本；处置只经副本映射，副本必须逐行等于在同一历史前缀和同一候选上重算的清单。任务证据由运行时按计划检查。finding 的内部身份是（来源审阅 dispatch，原件中的序号），模型写的 id 只是标签，可以重复。envelope 的 `task_id`、`dispatch_id` 是单值枚举，照旧回填。
 
 ## 状态转换
 
@@ -123,11 +127,11 @@
 | `expected_head`、`accepted` | 任务接受 | 不清除 | 与 `pending_post_accept` 同次 | 工作树 HEAD 必须等于 `expected_head` |
 | `attempts`、`agent_dispatches` | 调用后端前 | 只增 | 与接收意图、`invoked` 同次 | 已记账的调用不退回 |
 | `replan_attempts` | 修订通过校验或保存 stop | 只增 | 与修订进入 validated、消费回执同次 | 失败的请求不计数 |
-| `final_attempts`、`final_history` | 新的整体尝试追加 `running` 记录，随后更新阶段与结论 | 不清除 | 尝试记录先于快照产物；失败或拒绝与 `feedback`、`pending_replan` 同次 | 同一快照：未完成则复用该尝试，已批准则完成，已拒绝则要求修正任务 |
+| `final_attempts`、`final_history` | 新的整体尝试追加 `running` 记录，随后更新阶段与结论；进入 reviewing 时与阶段同次写入该次审阅的对照 `required_findings`（在验证开始前算出） | 不清除 | 尝试记录先于快照产物；失败或拒绝与 `feedback`、`pending_replan` 同次 | 同一快照：未完成则复用该尝试，已批准则完成，已拒绝则要求修正任务 |
 | `dispatches` | 准备完成追加（`prepared`、`invoked=false`）；调用前 `starting`、`invoked=true`；启动记 pgid；结束记进程事实与用量 | 不清除 | 准备条目先于 `pre_agent` | 退出门禁读进程事实；`worker_receipt_consumed` 记 worker 回执结局 |
 | `feedback` | worker 阻断、审阅拒绝、验证或预检失败、候选变化、`pre_accept` 失败、整体失败、修订应用 | 接受、整体批准时置 null | 与引起它的转换同次 | 下一次指挥与 worker 的输入 |
-| `review_history` | 任务审阅结束；候选变化前把已返回审阅存为 invalidated | 不清除 | 与审阅后的阶段同次 | 返工输入、`review_rounds` 来源 |
-| `worker_receipts` | 调用前存意图（`invoking`、packet／契约引用）；封存后 `sealed`；`post_agent` 后记 `post_hook_digest` | 交接时消费 | 封存文件先于 `sealed`；消费与后续阶段同次 | 未封存：retryable 则消费并新开尝试，否则停止；封存文件已写而 `sealed` 未保存：找到并核验该文件后继续；已封存：复核后继续原门禁 |
+| `review_history` | 任务审阅结束；候选变化前把已返回审阅存为 invalidated；每条记录带派发时的对照副本 `required_findings` | 不清除 | 与审阅后的阶段同次 | 返工输入、`review_rounds` 来源；处置只经副本映射，副本与重算清单不符即停止 |
+| `worker_receipts` | 调用前存意图（`invoking`、packet／契约引用；worker 的必需问题对照在 `packet.json`）；封存后 `sealed`；`post_agent` 后记 `post_hook_digest` | 交接时消费 | 封存文件先于 `sealed`；消费与后续阶段同次 | 未封存：retryable 则消费并新开尝试，否则停止；封存文件已写而 `sealed` 未保存：找到并核验该文件后继续；已封存：复核后继续原门禁 |
 | `review_receipts` | 调用前存意图；返回后绑定 `artifact_digest` | 审阅结束；候选变化（先存原文）；无返回时重派前 | 结果文件先于摘要 | 有结果则校验同一结果；无结果才新派发并计费 |
 | `commander_receipts` | 调用前存意图（含原请求与摘要；再规划绑 `request_id`） | 首版计划、任务选择、修订或 stop 登记时同次移除 | 同上 | 校验同一结果，不重抽 |
 | `format_repairs` | 修正调用前 | 不清除 | 与该调用预算同次 | 额度不清零 |
@@ -151,7 +155,7 @@
 | --- | --- | --- | --- |
 | `current_task` | 选择任务；选择转再规划；保留候选的修订 | 接受、需归档的修订应用 | 有当前任务时只调度它 |
 | `pending_directive` | 指挥选择 `implement`（与回执消费同次）；续作拒绝 | worker 调用前与预算同次消费 | 本地准备失败时保留；恢复先核对快照 |
-| `pending_task` | worker 交接（`verifying`，与回执消费同次）；验证后 `reviewing` | 审阅结束（与 `review_history` 及后续阶段同次）；候选变化、预检或验证失败 | 同一快照复用已完成阶段 |
+| `pending_task` | worker 交接（`verifying`，与回执消费同次）；预检通过后与验证轮次同次保存审阅对照 `required_findings`；验证后 `reviewing` | 审阅结束（与 `review_history` 及后续阶段同次）；候选变化、预检或验证失败 | 同一快照复用已完成阶段；reviewing 阶段的审阅派发、重放和修正都只用保存的对照，缺少即停止 |
 | `pending_acceptance` | 审阅批准 | 接受登记或候选变化 | `pre_accept` 前递增 `hook_attempts`；快照未变只重试 hook |
 | `pending_post_accept` | 与接受同次 | 任务记忆、知识提案、`task_accepted`、`post_accept` 依次完成 | 每步完成即保存，记忆用稳定操作 ID 去重；完成前不派发后续任务 |
 | `pending_replan` | task 阻断、整体失败、指挥 `action=replan`、stop 被重开、空修正被接受 | 修订应用、保存 stop、允许的 `--reverify` 取消 | `pending` → `request` → `validated`；早于预算检查保存，提高预算后继续同一请求 |

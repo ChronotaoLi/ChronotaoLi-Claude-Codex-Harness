@@ -16,8 +16,10 @@ class FindingProgressIndexTests(unittest.TestCase):
             'review': {'findings': [dict(id=f'finding-{i}', severity='blocking', message='evidence ' * 500)
                                     for i in range(75)]}}, {
             'artifact': 'later-review.json', 'dispatch_id': 'later', 'snapshot_digest': 'candidate-2',
-            'review': {'findings': [], 'finding_dispositions': [dict(
-                review_dispatch_id='original', finding_id='finding-74', status='resolved', evidence=['checked'])]}}]}}
+            # The later review disposed one runtime key; its saved copy maps the key to the finding.
+            'required_findings': [dict(key='f1', review_dispatch_id='original', finding_index=74,
+                                       label='finding-74', artifact='full-review.json')],
+            'review': {'findings': [], 'finding_dispositions': {'f1': dict(status='resolved', evidence=['checked'])}}}]}}
 
     def test_summary_retrieves_every_row_and_candidate_scoped_disposition(self):
         with TemporaryDirectory() as directory:
@@ -68,40 +70,21 @@ class FindingProgressIndexTests(unittest.TestCase):
                     finding_progress_packet(run, 'task', root)
 
     def test_required_source_projection_preserves_every_reference_and_is_repeatable(self):
-        packet = {'required_findings': [dict(review_dispatch_id='review', finding_id=f'finding-{i}',
-                    original_finding_id='duplicate', finding_index=i, artifact='/private/' + 'original/' * 100 + 'review.json', status='open')
+        packet = {'required_findings': [dict(key=f'f{i + 1}', review_dispatch_id='review', finding_index=i,
+                    label='duplicate', artifact='/private/' + 'original/' * 100 + 'review.json')
                     for i in range(3)]}
-        packet['repair_claims'] = [dict(review_dispatch_id='review', finding_id=f'finding-{i}',
-                                       summary=f'Claim {i}', evidence_paths=['proof.txt']) for i in range(3)]
         projected = project_finding_sources(packet)
         self.assertEqual(projected['required_finding_sources'], {'review': {'artifact': packet['required_findings'][0]['artifact']}})
         for before, after in zip(packet['required_findings'], projected['required_findings']):
             self.assertEqual({**after, **projected['required_finding_sources'][after['review_dispatch_id']]}, before)
-        for before, after in zip(packet['repair_claims'], projected['repair_claims']):
-            row = projected['required_findings'][after['required_finding_index']]
-            restored = {k: v for k, v in after.items() if k != 'required_finding_index'}
-            restored.update(review_dispatch_id=row['review_dispatch_id'], finding_id=row['finding_id'])
-            self.assertEqual(restored, before)
         self.assertEqual(project_finding_sources(projected), projected)
         self.assertTrue(all('artifact' in row for row in packet['required_findings']))
         with self.assertRaises(HarnessError):
-            project_finding_sources({'required_findings': [{'review_dispatch_id': 'missing', 'finding_id': 'f'}]})
-
-    def test_duplicate_and_unknown_claims_are_retained(self):
-        known = dict(review_dispatch_id='review', finding_id='finding', summary='one', evidence_paths=['a'])
-        unknown = dict(review_dispatch_id='unknown', finding_id='other', summary='unknown', evidence_paths=['b'])
-        packet = {'required_findings': [dict(review_dispatch_id='review', finding_id='finding', artifact='/' + 'private-source/' * 100 + 'raw.json'),
-                    dict(review_dispatch_id='review', finding_id='second', artifact='/' + 'private-source/' * 100 + 'raw.json')],
-                  'repair_claims': [known, {**known, 'summary': 'two'}, unknown]}
-        projected = project_finding_sources(packet)
-        self.assertEqual(len(projected['repair_claims']), 3)
-        self.assertEqual([r['required_finding_index'] for r in projected['repair_claims'][:2]], [0, 0])
-        self.assertEqual([r['summary'] for r in projected['repair_claims']], ['one', 'two', 'unknown'])
-        self.assertEqual(projected['repair_claims'][2], unknown)
-        self.assertEqual(project_finding_sources(projected), projected)
+            project_finding_sources({'required_findings': [{'key': 'f1', 'review_dispatch_id': 'missing', 'finding_index': 0}]})
 
     def test_small_required_list_retains_cheaper_inline_form(self):
-        packet = {'required_findings': [dict(review_dispatch_id='review', finding_id='one', artifact='/raw.json')]}
+        packet = {'required_findings': [dict(key='f1', review_dispatch_id='review', finding_index=0,
+                                             label='one', artifact='/raw.json')]}
         self.assertEqual(project_finding_sources(packet), packet)
 
     def test_empty_progress_needs_no_artifact(self):

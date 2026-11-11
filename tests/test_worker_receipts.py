@@ -355,7 +355,7 @@ class WorkerReceiptTests(RepoCase):
                 if kwargs['role'] == 'worker':
                     self.workers += 1
                     self.asserted_contract = kwargs['schema']
-                    result['evidence_files'] = []
+                    result['unexpected_field'] = []
                     from harness.util import write_json
                     write_json(kwargs['job'] / 'response.json', result)
                 return result
@@ -363,7 +363,7 @@ class WorkerReceiptTests(RepoCase):
         engine = self.engine(backend)
         with self.assertRaises(HarnessError):
             engine.start('Implement greeting', self.plan())
-        self.assertNotIn('evidence_files', backend.asserted_contract['properties'])
+        self.assertNotIn('unexpected_field', backend.asserted_contract['properties'])
         receipt = engine.run['dispatches'][-1]['worker_receipt']
         # The ledger references the delivered contract; the file holds its body.
         self.assertNotIn('schema', receipt)

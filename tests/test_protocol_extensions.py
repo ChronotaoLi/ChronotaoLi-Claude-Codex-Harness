@@ -5,8 +5,9 @@ from types import SimpleNamespace
 from harness.services import Services
 
 from harness.adapters import provider_schema
-from harness.contracts import WORK, envelope, validate, validate_work
+from harness.contracts import WORK, envelope, validate
 from harness.util import HarnessError
+from test_runtime_changes import validate_work_contract
 
 
 class ProtocolExtensionTests(unittest.TestCase):
@@ -21,7 +22,7 @@ class ProtocolExtensionTests(unittest.TestCase):
 
     def test_old_worker_results_remain_valid_through_envelope_and_provider(self):
         result = self.result()
-        validate_work(result)
+        validate_work_contract(result)
         wrapped = dict(result, task_id='task', dispatch_id='dispatch')
         schema = envelope(WORK, 'task', 'dispatch')
         validate(wrapped, schema)
@@ -40,7 +41,7 @@ class ProtocolExtensionTests(unittest.TestCase):
     def test_optional_fields_are_strict_when_present(self):
         good = dict(self.result(), checkpoints=[self.checkpoint()],
                     decision_requests=[dict(id='risk', task_id='later', question='Proceed?')])
-        validate_work(good)
+        validate_work_contract(good)
         for mutation in [
                 lambda x: x['checkpoints'][0].update(extra=True),
                 lambda x: x['checkpoints'][0].update(max_age_seconds=True),
@@ -52,20 +53,20 @@ class ProtocolExtensionTests(unittest.TestCase):
             value = deepcopy(good)
             mutation(value)
             with self.subTest(value=value), self.assertRaises(HarnessError):
-                validate_work(value)
+                validate_work_contract(value)
 
         # A valid blocker survives inapplicable handoff declarations unchanged;
         # their registration and diagnostics belong to the lifecycle boundary.
         blocked = dict(deepcopy(good), status='blocked', blocker_kind='operator', blockers=['Choose'])
         original = deepcopy(blocked)
-        validate_work(blocked)
+        validate_work_contract(blocked)
         self.assertEqual(blocked, original)
 
     def test_volatile_zero_and_maximum_ttl_are_valid(self):
         for ttl in (0, 86400):
             checkpoint = self.checkpoint()
             checkpoint.update(freshness='volatile', max_age_seconds=ttl, inputs=[])
-            validate_work(dict(self.result(), checkpoints=[checkpoint]))
+            validate_work_contract(dict(self.result(), checkpoints=[checkpoint]))
 
     def test_handoff_targets_require_unaccepted_transitive_dependency(self):
         engine = SimpleNamespace()

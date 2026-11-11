@@ -10,6 +10,7 @@ from harness.continuation import (continuation_gate, packet, record_continuation
                                   record_execution_guidance, resolve_continuation)
 from harness.recovery import snapshot_digest
 from harness.util import HarnessError, write_json
+from test_harness import add_worker_dispatch
 
 
 class ContinuationTests(unittest.TestCase):
@@ -36,7 +37,7 @@ class ContinuationTests(unittest.TestCase):
         write_json(path, self.result)
         self.source = {'dispatch_id': dispatch, 'artifact': str(path),
                        'artifact_digest': hashlib.sha256(path.read_bytes()).hexdigest()}
-        self.context.run['dispatches'].append({'id': dispatch, 'role': 'worker', 'task_id': 'task', 'invoked': True})
+        add_worker_dispatch(self.context.run, self.context.directory, dispatch, 'task')
         return record_continuation(self.context, 'task', self.result, self.source, self.candidate)
 
     def test_exact_grant_gate_preserves_candidate_and_cumulative_budgets(self):

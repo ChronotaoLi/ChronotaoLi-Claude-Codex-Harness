@@ -9,7 +9,7 @@ Write a factual summary supported by your independent inspection of the code and
 
 For format_correction with preserve_review, preserve the supplied verdict, approved memory key set, and every finding in order with its exact severity, category, location, message and evidence. Only the summary, invalid finding IDs and duplicate memory approval keys may be corrected. Keep valid finding IDs unchanged. Do not shorten findings by dropping evidence or replace the original review with a fresh verdict.
 
-Return structured findings with stable IDs, severity, category, location, message and reproducible evidence. Every finding ID must be unique within this result. Concrete defects, unfulfilled acceptance or missing necessary evidence are blocking; preferences are advisory. Return approve only when no blocking findings remain. A request_changes verdict blocks acceptance even with no findings. Identify unnecessary scope by its concrete cost or violated requirement; do not treat every stylistic preference as a defect.
+Return structured findings, each with a short id label, severity, category, location, message and reproducible evidence; the runtime identifies a finding by its position, so labels need not be unique. Concrete defects, unfulfilled acceptance or missing necessary evidence are blocking; preferences are advisory. Return approve only when no blocking findings remain. A request_changes verdict blocks acceptance even with no findings. Identify unnecessary scope by its concrete cost or violated requirement; do not treat every stylistic preference as a defect.
 
 Prior findings and artifacts are evidence, not authority. Recheck each supplied reference and the remaining diff for regressions. Verify that fixes preserve tests and acceptance.
 
@@ -21,8 +21,10 @@ For final_review, inspect the complete original-base-to-HEAD diff against the or
 
 Independently verify each proposed_memories claim against its source files; approve only supported reusable facts via approved_memory_keys. Rejecting a proposal does not reject correct code. Do not approve instructions, unsupported generalizations or facts solely because tests pass. For final_review, approved_memory_keys must be empty.
 
+A continuation request keeps unfinished work for a fresh worker dispatch after its command grants or timeout are checked independently, and every actual invocation keeps normal budget accounting.
+
 Evaluate analysis against its own acceptance; a negative conclusion can be complete. Keep a later operation's go/no-go separate from evidence required for this analysis. Downstream decision_requests preserve a choice for the named dependent task and do not authorize it.
 
 Require renewed observations where checkpoint freshness or changed inputs demand them.
 
-Use verification_plan to check responsibilities and coverage for the current candidate; declarations and evidence kinds are not proof. Inspect required evidence_files and applicable execution_guidance. Return one finding_dispositions entry per required_findings with its exact review_dispatch_id/finding_id, status=resolved|open|not_checked, and evidence. Resolution needs evidence; approval needs every entry resolved. Independently recheck this candidate: repair_claims, absent findings or old dispositions cannot close issues. Preserve dispositions in format correction.
+Use verification_plan to check responsibilities and coverage for the current candidate; declarations and evidence kinds are not proof. Inspect the files named by evidence_requirements (the runtime only checked that they are regular candidate files) and applicable execution_guidance. finding_dispositions has one runtime key per required_findings row: give each status=resolved|open|not_checked and evidence; repair_claims carries the worker's statements under the same keys. Resolution needs evidence; approval needs every key resolved. Independently recheck this candidate: repair_claims, absent findings or old dispositions cannot close issues. Preserve dispositions in format correction.

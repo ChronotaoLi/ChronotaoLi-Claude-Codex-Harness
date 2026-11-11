@@ -159,9 +159,9 @@ python3 -m harness.dashboard --state /abs/project/.harness --port 8765
 
 run 列表 → run 详情 → 文件查看。列表按最近事件排序，以卡片显示台账状态、目标摘要、分支与最近事件时间，并汇总需要关注／进行中／已结束的数量。详情首屏只放判断所需的信息：目标摘要与状态标记；“需要处理”区（运行错误、摘要或台账读取失败、等待操作者决定、当前环境阻断、缺失命令授权、续作请求、再规划停止、返工提示、当前任务最近一次调用的错误，并附常用出口），没有问题时不显示该区；台账状态、已接受／总任务进度、当前任务、最近观测与待处理数量；任务列表与最近活动。长目标、决定问题和事件字段默认只显示有界摘要，“查看完整原文”展开后显示未截断的原文。预算与费用、调用记录（逐行展开查看进程、用量与产物文件链接）、事件日志、操作记录、运行信息（工作树、台账版本、操作记录、worker 结果计数、历史环境阻断等）和文件索引（可按路径筛选）收在标签页中，可用方向键、Home、End 切换；“如何理解这些状态”展开后给出台账与进程、完成与接受的区别。同一 run 的事件刷新和手动刷新保留当前标签、已展开项、文件筛选、页面与原文框／标签栏／表格的滚动位置以及键盘焦点（隐藏标签或收起项中的位置在再次显示时恢复；同一文件的刷新保留阅读位置）；切换到其他 run 或文件时恢复默认。文件查看显示文本尾部，默认 64 KiB，最大 1 MiB，可调整。详情默认开启“跟随运行变化”，收到原生文件通知后刷新；列表与文件查看使用刷新按钮，不定时轮询。连接断开会显示提示，手动刷新可重新订阅。界面为中文，跟随系统浅色／深色并适配窄屏；`status`（无 run ID）的列表与网页读同一份投影，stdout 字段不变。
 
-返工提示来自已有台账：未接受任务的有效工作尝试达到 3 次，或最近两次连续拒绝审阅出现相同 blocking finding ID 时提示；整体验收累计拒绝至少 2 次且最新结果尚未批准时也提示。`status RUN`、`watch RUN` 与详情中的 `convergence` 都是建议，不自动改变预算、范围、派发或接受条件；completed／abandoned 不显示返工警告。
+返工提示来自已有台账：未接受任务的有效工作尝试达到 3 次，或最近两次连续拒绝审阅出现相同的 blocking finding 标签（审阅者写的 id）时提示；整体验收累计拒绝至少 2 次且最新结果尚未批准时也提示。`status RUN`、`watch RUN` 与详情中的 `convergence` 都是建议，不自动改变预算、范围、派发或接受条件；completed／abandoned 不显示返工警告。
 
-审阅轮次投影 `review_rounds` 按任务列出 `review_history` 的每一轮（按记录顺序从 1 编号，含失效或结构非法的记录）：`attempt`、来源审阅 `review_dispatch_id`、候选 `snapshot_digest`、`verdict`，以及本轮首次出现的 blocking finding ID `new_blocking`（按审阅者原始 ID 字符串判断）。它只读、不调用模型，`cause` 固定为 `unknown`，不推断问题为何在后续轮次才出现。详情页在“运行信息”标签显示该表。
+审阅轮次投影 `review_rounds` 按任务列出 `review_history` 的每一轮（按记录顺序从 1 编号，含失效或结构非法的记录）：`attempt`、来源审阅 `review_dispatch_id`、候选 `snapshot_digest`、`verdict`，以及本轮首次出现的 blocking finding 标签 `new_blocking`（按审阅者写的 id 字符串判断；标签不是身份，同名不一定是同一个问题）。它只读、不调用模型，`cause` 固定为 `unknown`，不推断问题为何在后续轮次才出现。详情页在“运行信息”标签显示该表。
 
 预算区显示 `attempts_total`（各任务 `attempts` 之和；版本 16 起没有全 run worker 上限）、模型派发、再规划与整体验收的已用／上限，以及未终止 run 的 `remaining_model_calls`：“如果之后全部一次通过，至少还需 N 次模型调用”。N 按记录的阶段计算：已在待接受或任务审阅已开始的任务计 0，已有候选的计 1，其余未接受任务计 2，整体审阅计 1（全部已接受且同一 HEAD 已批准或整体审阅已开始时计 0）。N 是下界，不含指挥调用、返工、格式修正与再规划；`max_agent_dispatches` 用尽时停止信息里也给出它。版本 15 及更早的台账另显示保存的 `total_attempts` 与 `attempt_budget_policy`。
 
@@ -234,7 +234,7 @@ WORK 结果可以带可选的 `checkpoints`，每项为 `{id, summary, inputs, e
 ### 决定请求与审阅问题
 
 - 已满足本任务验收的 completed 结果可以附带最多 16 条 `decision_requests: [{id, task_id, question}]`，目标只能是传递依赖于本任务、尚未接受的任务；目标或问题不合法时本次尝试被拒绝，原因经 `worker_recovery` 交给后续调用。blocked 结果附带的 `decision_requests` 不登记，只写 `decision_requests_discarded` 事件和原结果摘要；该结果的 blocker、有效检查点和尝试豁免照常登记。
-- 审阅结果里的 finding ID 有重复或不符合 ID 格式时，这份审阅的所有 finding 都按原列表位置用 `finding-N`（N 从 1 起）作协议引用，同时保留 `original_finding_id` 与从 0 起的 `finding_index`。worker 的 `repair_claims` 和审阅者的 `finding_dispositions` 用原审阅 dispatch ID 加该引用关联；原始结果不改写，不要按非法的原 ID 猜测或合并问题。无效拒绝中的处置声明不能关闭旧问题。
+- finding 的内部身份是（来源审阅 dispatch，该审阅原件 `findings` 数组中从 0 起的序号 `finding_index`）；审阅者写的 id 只是标签 `label`，可以重复，也不做别名。每次派发收到的 `required_findings` 每行是 `{key, review_dispatch_id, finding_index, label, artifact}`，`key` 为运行时生成的 `f1…fN`；`artifact` 在更省字符时提到 `required_finding_sources[review_dispatch_id]`。审阅者的 `finding_dispositions` 与 worker 的 `repair_claims` 是以这些键为属性的固定对象，键全部必填、不许多余键，没有必需项时字段不出现。审阅包里的 `repair_claims` 已按（来源，序号）换成本次审阅的键，只含两边清单都有的问题。历史审阅的键只在它那次派发内有效，按该记录自带的 `required_findings` 副本解释。无效拒绝中的处置不能关闭旧问题；任务证据由运行时按 `evidence_requirements` 直接检查候选文件，worker 不再声明，预检失败时 `evidence_invalid.reason` 为 `missing`、`symlink`、`not_regular_file`、`outside_candidate`、`unsafe_path` 或 `unreadable`。
 
 ## 依赖副本清单
 

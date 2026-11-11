@@ -66,7 +66,8 @@ class ExplicitOutputRepairTests(RepoCase):
                 self.assertEqual(Path(source["artifact"]).read_bytes(), original)
                 self.assertEqual(result["invalid_repairs"][key]["status"], "completed")
 
-    def test_duplicate_advisory_ids_repair_keeps_findings_and_valid_memory_approval(self):
+    def test_unknown_memory_repair_keeps_duplicate_labelled_findings_and_valid_memory_approval(self):
+        # Repeated finding labels are valid; only the unknown memory approval needs repair.
         advice = [finding("advisory", "preference"), finding("advisory", "evidence")]
         advice[1]["message"] = "A separate advisory with its own evidence"
         def change(backend, kwargs, packet, result):
@@ -76,66 +77,73 @@ class ExplicitOutputRepairTests(RepoCase):
             if kwargs["kind"] == "review":
                 result.update(findings=copy.deepcopy(advice), approved_memory_keys=["greeting", "nonexistent"])
                 if "invalid_output_correction" in packet:
-                    result["findings"][1]["id"] = "separate-advice"
                     result["approved_memory_keys"] = ["greeting"]
         backend = ScriptedBackend(change)
         engine = self.engine(backend)
-        with self.assertRaisesRegex(HarnessError, "唯一"):
+        with self.assertRaisesRegex(HarnessError, "不存在的记忆提案"):
             engine.start("Implement greet", self.plan())
         source = engine.run["review_receipts"]["reviewer:review:greet"]
         result = self.engine(backend).resume(engine.run["id"], repair_invalid=source["dispatch_id"])
         self.assertEqual(result["status"], "completed")
         repaired = result["review_history"]["greet"][-1]["review"]
         self.assertEqual(repaired["approved_memory_keys"], ["greeting"])
-        self.assertEqual([f["message"] for f in repaired["findings"]], [f["message"] for f in advice])
+        self.assertEqual(repaired["findings"], advice)
         self.assertTrue(self.engine().memory.search("greet"))
 
     def test_invalid_dispositions_reject_repair_before_spending_even_with_other_errors(self):
+        # Dispositions exist only for required findings, so a first review of
+        # the same kind rejects; the approval that follows carries the defect.
+        cases = (("missing_evidence", "valid"), ("missing_evidence", "unknown_memory"),
+                 ("overlong_evidence", "unknown_memory"), ("overfull_evidence", "unknown_memory"))
         for kind in ("review", "final_review"):
-            for defect in ("duplicate", "missing_evidence", "overlong_evidence", "overfull_evidence"):
-                metadata_cases = (("unknown_memory", "duplicate_findings") if defect.startswith("over")
-                                  else ("valid", "unknown_memory", "duplicate_findings"))
-                for metadata in metadata_cases:
-                    with self.subTest(kind=kind, defect=defect, metadata=metadata):
-                        def change(backend, kwargs, packet, result):
-                            if kwargs["kind"] != kind:
-                                return
-                            disposition = {"review_dispatch_id": "prior-review", "finding_id": "edge-case",
-                                           "status": "resolved", "evidence": ["hello.py"]}
+            for defect, metadata in cases:
+                with self.subTest(kind=kind, defect=defect, metadata=metadata):
+                    def change(backend, kwargs, packet, result):
+                        number = sum(call["kind"] == kind for call in backend.calls)
+                        if kwargs["role"] == "worker":
+                            with (kwargs["cwd"] / "hello.py").open("a") as stream:
+                                stream.write(f"# change {sum(c['role'] == 'worker' for c in backend.calls)}\n")
+                        elif kwargs["kind"] == "replan":
+                            task = copy.deepcopy(packet["original_tasks"][0])
+                            task.update(id="correct", depends_on=["greet"])
+                            result.update(action="revise", reason="Resolve the final finding",
+                                          new_tasks=[task], updates=[])
+                        elif kwargs["kind"] == kind and number == 1:
+                            result.update(verdict="request_changes", findings=[finding()])
+                        elif kwargs["kind"] == kind:
+                            disposition = next(iter(result["finding_dispositions"].values()))
                             if defect == "missing_evidence":
                                 disposition["evidence"] = []
                             elif defect == "overlong_evidence":
                                 disposition["evidence"] = ["x" * 4001]
-                            elif defect == "overfull_evidence":
+                            else:
                                 disposition["evidence"] = ["hello.py"] * 21
-                            result["finding_dispositions"] = [disposition] * (2 if defect == "duplicate" else 1)
                             if metadata == "unknown_memory":
                                 result["approved_memory_keys"] = ["nonexistent"]
-                            elif metadata == "duplicate_findings":
-                                result["findings"] = [finding("advisory", "preference")] * 2
 
-                        backend = ScriptedBackend(change)
-                        engine = self.engine(backend)
-                        with self.assertRaises(HarnessError):
-                            engine.start("Implement greet", self.plan())
-                        key = f"reviewer:{kind}:{'greet' if kind == 'review' else 'final'}"
-                        source = copy.deepcopy(engine.run["review_receipts"][key])
-                        original = Path(source["artifact"]).read_bytes()
-                        calls = copy.deepcopy(backend.calls)
-                        budgets = {name: engine.run[name] for name in ("agent_dispatches", "attempts", "final_attempts")}
-                        for options in ({"repair_invalid": source["dispatch_id"]}, {}):
-                            with self.assertRaises(HarnessError) as caught:
-                                self.engine(backend).resume(engine.run["id"], **options)
-                            if options:
-                                self.assertIn("abandon", str(caught.exception))
-                            saved = read_json(engine.directory / "state.json")
-                            self.assertEqual(backend.calls, calls)
-                            self.assertEqual({name: saved[name] for name in budgets}, budgets)
-                            self.assertEqual(saved["invalid_repairs"], {})
-                            self.assertEqual(saved["review_receipts"][key]["dispatch_id"], source["dispatch_id"])
-                            self.assertEqual(Path(source["artifact"]).read_bytes(), original)
-                        self.engine(backend).abandon(engine.run["id"])
-                        self.assertEqual(read_json(engine.directory / "state.json")["status"], "abandoned")
+                    backend = ScriptedBackend(change)
+                    engine = self.engine(backend)
+                    with self.assertRaises(HarnessError):
+                        engine.start("Implement greet", self.plan())
+                    key = f"reviewer:{kind}:{'greet' if kind == 'review' else 'final'}"
+                    source = copy.deepcopy(engine.run["review_receipts"][key])
+                    self.assertEqual(len(read_json(Path(source["artifact"]))["finding_dispositions"]), 1)
+                    original = Path(source["artifact"]).read_bytes()
+                    calls = copy.deepcopy(backend.calls)
+                    budgets = {name: engine.run[name] for name in ("agent_dispatches", "attempts", "final_attempts")}
+                    for options in ({"repair_invalid": source["dispatch_id"]}, {}):
+                        with self.assertRaises(HarnessError) as caught:
+                            self.engine(backend).resume(engine.run["id"], **options)
+                        if options:
+                            self.assertIn("abandon", str(caught.exception))
+                        saved = read_json(engine.directory / "state.json")
+                        self.assertEqual(backend.calls, calls)
+                        self.assertEqual({name: saved[name] for name in budgets}, budgets)
+                        self.assertEqual(saved["invalid_repairs"], {})
+                        self.assertEqual(saved["review_receipts"][key]["dispatch_id"], source["dispatch_id"])
+                        self.assertEqual(Path(source["artifact"]).read_bytes(), original)
+                    self.engine(backend).abandon(engine.run["id"])
+                    self.assertEqual(read_json(engine.directory / "state.json")["status"], "abandoned")
 
     def test_invalid_correction_cannot_reroll_or_get_an_extra_format_attempt(self):
         for correction in (lambda r: r.update(summary="x" * 4001),

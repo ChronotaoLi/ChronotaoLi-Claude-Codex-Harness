@@ -3,7 +3,11 @@ from __future__ import annotations
 
 
 def _blocking(review):
-    """Blocking finding IDs in report order, without duplicates."""
+    """Blocking finding labels (the reviewer's ids) in report order, without duplicates.
+
+    Labels are compared across rounds only as an observation: a finding's
+    identity is its source review and position, and labels need not be unique.
+    """
     findings = review.get("findings", []) if isinstance(review, dict) else []
     if not isinstance(findings, list):
         return []
@@ -49,8 +53,8 @@ def review_rounds(run):
 
     A measurement over review_history in recorded order (round = 1-based record
     position, including invalidated or structurally invalid records): no model
-    call, no effect on acceptance, and no inferred cause. Identity is the
-    reviewer's original finding ID string. The candidate is named by its
+    call, no effect on acceptance, and no inferred cause. Findings are compared
+    by label, the reviewer's id, which is not an identity. The candidate is named by its
     recorded snapshot digest and the source by the review dispatch.
     """
     histories = run.get("review_history", {}) if isinstance(run, dict) else {}

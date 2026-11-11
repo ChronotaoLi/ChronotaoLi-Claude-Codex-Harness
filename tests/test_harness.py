@@ -37,6 +37,33 @@ def interrupt_started_agent(kwargs):
                 kwargs["job"] / "interrupted-process", on_start=interrupt)
 
 
+def add_worker_dispatch(run, directory, dispatch_id, task_id, *, required=(), **fields):
+    """Register a hand-built, invoked worker dispatch together with its delivered inputs.
+
+    Writes dispatches/<id>/packet.json and schema.json as publish_inputs would
+    and records the referencing receipt intent, so checks that read a sealed
+    result's delivered contract treat the fixture like a real dispatch.
+    """
+    import hashlib
+    from harness.contracts import with_keys
+    from harness.util import write_json
+    job = Path(directory) / "dispatches" / dispatch_id
+    rows = [dict(row) for row in required]
+    inputs = {}
+    for field, value in (("packet", {"required_findings": rows} if rows else {}),
+                         ("schema", envelope(with_keys(WORK, "repair_claims", rows), task_id, dispatch_id))):
+        path = job / f"{field}.json"
+        write_json(path, value)
+        inputs[field + "_artifact"] = str(path)
+        inputs[field + "_artifact_digest"] = hashlib.sha256(path.read_bytes()).hexdigest()
+    entry = {"id": dispatch_id, "role": "worker", "kind": "implement", "task_id": task_id, "invoked": True,
+             "worker_receipt": {"dispatch_id": dispatch_id, "artifact": str(job / "returned-result.json"),
+                                "seal": str(job / "worker-seal.json"), **inputs, "attempt": 1, "phase": "invoking"},
+             **fields}
+    run.setdefault("dispatches", []).append(entry)
+    return entry
+
+
 class RepoCase(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

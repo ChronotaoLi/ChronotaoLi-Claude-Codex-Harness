@@ -439,6 +439,35 @@ class ReferencedInputsCase(HistoryCase):
 class Schema16HistoryTests(ReferencedInputsCase, HistoricalCase):
     VERSION, MODE, ROW = 16, 'legacy_json', 'L5'
 
+    def test_old_review_and_worker_identity_shapes_are_not_read_by_observation(self):
+        # Ledger 16 disposed findings by (review_dispatch_id, finding_id) in arrays,
+        # bound worker-findings.json and carried evidence_files; observation reads
+        # none of them, so these shapes need no version branch.
+        state = read_json(self.path)
+        record = state['review_history']['greet'][-1]
+        record['review']['findings'] = [{'id': 'OLD-1', 'severity': 'blocking', 'category': 'defect',
+                                         'location': 'hello.py:1', 'message': 'old', 'evidence': ['e']}]
+        record['review']['finding_dispositions'] = [{'review_dispatch_id': 'earlier', 'finding_id': 'OLD-0',
+                                                     'status': 'resolved', 'evidence': ['checked']}]
+        worker = next(entry for entry in state['dispatches'] if entry['id'] == self.worker['id'])
+        worker['worker_findings'] = {'artifact': 'worker-findings.json', 'artifact_digest': '0' * 64}
+        state['feedback'] = {'task_id': 'greet', 'worker': {'evidence_files': [{'requirement_id': 'x'}]}}
+
+        def observed(run):
+            write_json(self.path, run)
+            detail = observe.run_detail(self.repo / '.harness', run['id'])
+            self.assertIsNone(detail['summary_error'])
+            return status_summary(run), detail['summary']['review_rounds']
+
+        summary, rounds = observed(state)
+        self.assertEqual(rounds, summary['review_rounds'])
+        self.assertEqual(summary['review_rounds']['tasks']['greet'][-1]['new_blocking'], ['OLD-1'])
+        changed = copy.deepcopy(state)
+        changed['review_history']['greet'][-1]['review']['finding_dispositions'] = 'unread'
+        next(entry for entry in changed['dispatches'] if entry['id'] == self.worker['id'])['worker_findings'] = 'unread'
+        changed['feedback']['worker']['evidence_files'] = 'unread'
+        self.assertEqual(observed(changed), (summary, rounds))
+
 
 class Schema16StreamHistoryTests(ReferencedInputsCase, HistoricalCase):
     VERSION, MODE, ROW = 16, 'stream_metadata_v1', 'S9'

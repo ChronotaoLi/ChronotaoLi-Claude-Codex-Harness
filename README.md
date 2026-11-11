@@ -82,7 +82,7 @@ python3 -m harness --config /absolute/path/harness.toml --repo /absolute/path/to
 
 模型计划的重复／超限声明保留结果并停止，普通恢复不重抽计划。显式修正与恢复边界见[非法结果的显式修正](docs/recovery.md#非法结果的显式修正)及[阻塞出口](docs/recovery.md#阻塞状态与操作者出口)。
 
-任务可另声明 `self_checks`（最多 32 条精确 argv）与 `evidence_requirements`（`id`、从 0 起的 `acceptance_index`、`kind`、仓库相对 `path`）。证据类型为 `static`、`simulation`、`host_integration` 或 `device`。角色收到 `verification_plan`，区分 worker 聚焦自检、全部正式任务门禁与最终门禁；自检不授权，也不替代正式验证。worker 无需默认重复全套门禁，仅在有明确诊断理由时重复。必需文件和修复声明先作来源／候选绑定预检，内容正确性仍由独立审阅核验。返工输入提供与本次实际问题清单绑定的声明草稿引用；空字段不是修复证明，候选路径与普通 evidence 中的外部日志引用保持分开。
+任务可另声明 `self_checks`（最多 32 条精确 argv）与 `evidence_requirements`（`id`、从 0 起的 `acceptance_index`、`kind`、仓库相对 `path`）。证据类型为 `static`、`simulation`、`host_integration` 或 `device`。角色收到 `verification_plan`，区分 worker 聚焦自检、全部正式任务门禁与最终门禁；自检不授权，也不替代正式验证。worker 无需默认重复全套门禁，仅在有明确诊断理由时重复。运行时按 `evidence_requirements` 直接检查候选中的文件并记录摘要，worker 不再声明证据；内容正确性仍由独立审阅核验。返工时，修复声明和审阅处置都使用运行时按本次必需问题生成的键 `f1…fN`，模型不回填来源与问题 ID；声明不证明修复，候选路径与普通 evidence 中的外部日志引用保持分开。
 
 worker 可用结构化续作请求正常交还控制权，等待精确命令授权或单次派发超时调整；满足条件后以全新派发继续原候选，累计调用和任务预算保留。`resume RUN --execution-guidance FILE` 可在安全待处理任务边界登记绑定来源与候选的操作约束；指导不授予命令权限。格式与适用边界见[续作与操作指导](docs/recovery.md#续作与操作指导)。
 
@@ -199,7 +199,7 @@ python3 -m harness --repo /path/to/project cleanup-run RUN --remove
 | [shared/mcp.json](shared/mcp.json) | 外部 MCP 服务的唯一配置源 |
 | [shared/hooks.json](shared/hooks.json) | 确定性的编排生命周期 hooks |
 
-协议说明放在 RULES 与角色 skill 里，每次派发都注入；包里放数据、索引和现场事实。环境更新、操作者决定、检查点、执行指导、权限、审阅、路径与命令索引、问题进度和计划增量的读法都只在 RULES 与技能里。仍留在包里的静态说明只有这几类，会随后续协议改动移除或改写：指挥 plan／dispatch／replan 的 `instruction`、不经指挥直接派发时的默认 worker 指令和续作拒绝后的 worker 指令、格式修正与显式修正的 `instruction`、修复声明模板的 `policy` 和 `required_finding_source_policy`。某任务没有相关的环境更新、决定或检查点时，包里只带对应索引。指挥包另带 `workspace: {head, clean}`：当时的 `expected_head` 与工作树 `git status` 是否干净。
+协议说明放在 RULES 与角色 skill 里，每次派发都注入；包里放数据、索引和现场事实。环境更新、操作者决定、检查点、执行指导、权限、审阅、路径与命令索引、问题进度和计划增量的读法都只在 RULES 与技能里。仍留在包里的静态说明只有这几类，会随后续协议改动移除或改写：指挥 plan／dispatch／replan 的 `instruction`、不经指挥直接派发时的默认 worker 指令和续作拒绝后的 worker 指令、格式修正与显式修正的 `instruction`。某任务没有相关的环境更新、决定或检查点时，包里只带对应索引。指挥包另带 `workspace: {head, clean}`：当时的 `expected_head` 与工作树 `git status` 是否干净。
 
 角色 skill 自动注入一次；计划的 `skills` 选择额外技能，不需要时用 `[]`。其他技能先加载目录，再通过 `skill_read` 按需读取。旧计划引用角色 skill 仍合法且不会重复注入；不会自动安装整个 ECC 技能目录。
 

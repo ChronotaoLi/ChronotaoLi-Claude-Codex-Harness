@@ -17,7 +17,6 @@ from .receipts import InvalidReviewRejection
 from .input_projection import validate_dispatch_indexes as validate_input_dispatch_indexes
 from .path_evidence import validate_dispatch_indexes, validate_indexes
 from .recovery import snapshot_digest
-from .review_progress import bind_worker_findings
 from .services import RuntimeService
 from .shared import validate_mcp
 from .util import group_alive, HarnessError, read_json, write_json
@@ -183,7 +182,8 @@ class Dispatcher(RuntimeService):
                     correction["instruction"] += (
                         " Broker checkpoint evidence must belong to this dispatch, including during format repair. "
                         "Other allowed regular-file evidence remains usable. Omit optional checkpoints if necessary; "
-                        "repeat only authorized checks that are safe to repeat, never side effects just to obtain evidence.")
+                        "repeat only authorized checks that are safe to repeat, never side effects just to obtain evidence. "
+                        "repair_claims keys follow this dispatch's required_findings and may differ from the previous result's keys.")
                 elif role == "reviewer":
                     correction = self.services.receipts.review_correction(guard, previous_review)
                 elif role == "commander":
@@ -257,7 +257,6 @@ class Dispatcher(RuntimeService):
         if role == "worker":
             (job / "commands").mkdir()
             entry["command_directory"] = str(job / "commands")
-            bind_worker_findings(self.context, entry, required["packet"])
         self.context.save()
         # Events observe the ledger; the saved invoked flag stays authoritative.
         self._observe("dispatch_prepared", task_id=task_id, dispatch_id=dispatch_id, role=role)

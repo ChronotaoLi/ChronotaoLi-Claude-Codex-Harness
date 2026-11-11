@@ -29,7 +29,8 @@ class ReviewRoundLifecycleTests(RepoCase):
                                   findings=[finding("OLD-001"), {**finding("NOTE-9"), "severity": "advisory"}])
                 elif len(reviews) == 2:
                     # The first round's issue is resolved while a new blocking one appears.
-                    self.assertEqual([row["finding_id"] for row in result["finding_dispositions"]], ["OLD-001"])
+                    self.assertEqual([row["label"] for row in packet["required_findings"]], ["OLD-001"])
+                    self.assertEqual(list(result["finding_dispositions"]), ["f1"])
                     result.update(verdict="request_changes", findings=[finding("NEW-002")])
         backend = ScriptedBackend(rounds)
         engine = self.engine(backend)

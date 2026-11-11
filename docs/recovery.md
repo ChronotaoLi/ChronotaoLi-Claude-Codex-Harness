@@ -178,7 +178,7 @@ python3 -m harness --config /path/to/harness.toml --repo /path/to/project resume
 
 ### 非法结果的显式修正
 
-`resume RUN --repair-invalid DISPATCH_ID` 只匹配当前未消费的指挥或审阅回执。适用：语义非法的计划或修订（含 `required_commands` 重复或超过 32 条）；verdict 为 approve、没有 blocking finding，但 finding ID 重复或批准了未知记忆 key 的审阅；自动格式修正额度已用、只有可变字段格式非法的指挥选择、修订或无阻断批准。每个角色、调用类型、任务整个 run 只授权一次，新派发计入预算。修正必须保留原结论：审阅保留 verdict 和全部 finding 内容，`finding_dispositions` 不可改；指挥保留任务选择或修订操作。合法结果、stop、拒绝或含 blocking 的审阅、改变原结论的修正都不适用；这些情况保留证据后 `abandon`。
+`resume RUN --repair-invalid DISPATCH_ID` 只匹配当前未消费的指挥或审阅回执。适用：语义非法的计划或修订（含 `required_commands` 重复或超过 32 条）；verdict 为 approve、没有 blocking finding，但批准了未知记忆 key 的审阅（finding ID 重复不再是错误）；自动格式修正额度已用、只有可变字段格式非法的指挥选择、修订或无阻断批准。每个角色、调用类型、任务整个 run 只授权一次，新派发计入预算。修正必须保留原结论：审阅保留 verdict 和全部 finding 内容，`finding_dispositions` 不可改，修正派发的处置键与原审阅相同（同一份保存的对照）；指挥保留任务选择或修订操作。合法结果、stop、拒绝或含 blocking 的审阅、改变原结论的修正都不适用；这些情况保留证据后 `abandon`。
 
 首次任务审阅若是拒绝（`request_changes` 或含 blocking），即使语义或格式非法，也按 `invalid_rejected` 保存原文并进入返工或整体修正规划，不需要操作者出口。
 
@@ -215,7 +215,7 @@ python3 -m harness --config /path/to/harness.toml --repo /path/to/project resume
 
 ### 证据损坏
 
-`load_run` 在 `resume` 和 `abandon` 做任何事之前核验以下证据的路径、类型与 SHA256：worker 派发的 `packet.json` 与 `schema.json`；`attempt_exemption` 引用的原始 worker 结果；`decisions/` 下的请求与答复；检查点 manifest 与批次文件；`continuations/`、`continuation-rejections/`、`execution-guidance/` 下的完整产物。其中任一缺失、被改或换成符号链接时，`resume` 与 `abandon` 都在写入前拒绝。出口只有两个：把原字节恢复回去后照常 `resume` 或 `abandon`；或者保留 run 目录与工作树原样，另开新 run。`status`、`watch`、`dashboard` 不经过这些核验，仍可查看。
+`load_run` 在 `resume` 和 `abandon` 做任何事之前核验以下证据的路径、类型与 SHA256：worker 派发的 `packet.json` 与 `schema.json`（`packet.json` 同时是该 worker 必需问题的键对照）；`attempt_exemption` 引用的原始 worker 结果；`decisions/` 下的请求与答复；检查点 manifest 与批次文件；`continuations/`、`continuation-rejections/`、`execution-guidance/` 下的完整产物。其中任一缺失、被改或换成符号链接时，`resume` 与 `abandon` 都在写入前拒绝。出口只有两个：把原字节恢复回去后照常 `resume` 或 `abandon`；或者保留 run 目录与工作树原样，另开新 run。`status`、`watch`、`dashboard` 不经过这些核验，仍可查看。
 
 路径索引（`path-indexes/`）、输入索引（`input-indexes/`）和环境更新产物（`environment/`）在 `resume` 预检、派发或接受前核验，不在加载时核验：它们损坏会阻止继续，但不阻止 `abandon`。
 

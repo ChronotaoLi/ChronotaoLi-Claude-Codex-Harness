@@ -8,11 +8,11 @@ import unittest
 
 from harness.adapters import provider_schema
 from harness.contracts import (DETAIL, REVIEW, WORK, RepairableFormatError, envelope, output_constraints,
-                               validate_review, validate_work)
+                               validate_review)
 from harness.context import WORKER_CONTEXT_CHARS
 from harness.util import dump, HarnessError, read_json, write_json
 from test_harness import RepoCase, ROOT
-from test_runtime_changes import ScriptedBackend
+from test_runtime_changes import ScriptedBackend, validate_work_contract
 
 
 def work(**fields):
@@ -26,15 +26,15 @@ def events(engine):
 
 class WorkerSummaryContractTests(unittest.TestCase):
     def test_summary_has_its_own_bound_while_shared_detail_fields_keep_theirs(self):
-        validate_work(work(summary="s" * 32000))
+        validate_work_contract(work(summary="s" * 32000))
         with self.assertRaises(RepairableFormatError) as raised:
-            validate_work(work(summary="s" * 32001))
+            validate_work_contract(work(summary="s" * 32001))
         self.assertEqual(raised.exception.path, "response.summary")
         with self.assertRaises(RepairableFormatError):
-            validate_work(work(summary=" " * 10))
+            validate_work_contract(work(summary=" " * 10))
         for field in ("evidence", "blockers"):
             with self.subTest(field=field), self.assertRaises(RepairableFormatError):
-                validate_work(work(**{field: ["e" * 4001]},
+                validate_work_contract(work(**{field: ["e" * 4001]},
                                    **({"status": "blocked", "blocker_kind": "task"} if field == "blockers" else {})))
         self.assertEqual(DETAIL["maxLength"], 4000)
         with self.assertRaises(RepairableFormatError):

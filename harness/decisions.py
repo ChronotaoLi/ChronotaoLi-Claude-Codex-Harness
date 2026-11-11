@@ -9,7 +9,8 @@ from os import PathLike
 from pathlib import Path
 import time
 
-from .contracts import WORK, REPLAN, envelope, validate_structure, validate_work_semantics
+from .contracts import REPLAN, envelope, validate_structure, validate_work_semantics
+from .worker_receipts import delivered_work_contract
 from .recovery import RECOVERY_BUSY_KEYS, read_bound_result, snapshot_digest
 from .util import HarnessError, dump, write_json
 
@@ -99,7 +100,7 @@ class DecisionRecovery(RuntimeService):
         if request['kind'] in ('worker', 'handoff'):
             if entry.get('role') != 'worker' or entry.get('kind') != 'implement' or entry.get('task_id') != request['source_task_id']:
                 raise HarnessError('decision worker source identity invalid')
-            validate_structure(result, envelope(WORK, request['source_task_id'], dispatch_id))
+            validate_structure(result, delivered_work_contract(self.context.run, self.context.directory, dispatch_id))
             validate_work_semantics(result)
             if request['kind'] == 'worker':
                 if (request['task_id'] != request['source_task_id'] or result['status'] != 'blocked'

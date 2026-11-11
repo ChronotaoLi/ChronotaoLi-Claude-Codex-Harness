@@ -13,7 +13,8 @@ from pathlib import Path
 import shutil
 import time
 
-from .contracts import WORK, envelope, validate_structure, validate_work_semantics
+from .contracts import validate_structure, validate_work_semantics
+from .worker_receipts import delivered_work_contract
 from .git_query import covers as git_query_covers
 from .recovery import RECOVERY_BUSY_KEYS, read_bound_result, snapshot_digest
 from .util import HarnessError, dump, write_json
@@ -249,7 +250,7 @@ class EnvironmentRecovery(RuntimeService):
                 or not isinstance(source.get("artifact_digest"), str)):
             raise HarnessError("环境阻断原始证据引用无效")
         result, _ = read_bound_result(source, "环境阻断")
-        validate_structure(result, envelope(WORK, task_id, dispatch_id))
+        validate_structure(result, delivered_work_contract(self.context.run, self.context.directory, dispatch_id))
         validate_work_semantics(result)
         if result["status"] != "blocked" or result["blocker_kind"] != "environment":
             raise HarnessError("环境更新必须绑定 worker 环境阻断结果")

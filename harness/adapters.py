@@ -393,23 +393,21 @@ class DemoBackend:
     """Explicit offline simulation, only used by the demo command and tests."""
     def invoke(self, *, role, model, cwd, job, schema, prompt, run_path, on_start, task=None, kind=None, on_outcome=None):
         ids = {k: schema["properties"][k]["enum"][0] for k in ("task_id", "dispatch_id")}
-        packet = json.JSONDecoder().raw_decode(prompt)[0].get("packet", {})
+        # Runtime-keyed fields are filled from the delivered contract's keys.
         if role == "worker":
             (cwd / "hello.py").write_text('def greet(name):\n    return f"Hello, {name}!"\n', encoding="utf-8")
             result = {"status": "completed", "summary": "Implemented greet", "evidence": ["hello.py"],
                       "blockers": [], "blocker_kind": "none", "proposed_memories": []}
             if "repair_claims" in schema["properties"]:
-                result["repair_claims"] = [{"review_dispatch_id": item["review_dispatch_id"],
-                    "finding_id": item["finding_id"], "summary": "Offline fixture reimplemented greet",
-                    "evidence_paths": ["hello.py"]} for item in packet.get("required_findings", [])]
+                result["repair_claims"] = {key: {"summary": "Offline fixture reimplemented greet",
+                    "evidence_paths": ["hello.py"]} for key in schema["properties"]["repair_claims"]["required"]}
         elif role == "reviewer":
             result = {"verdict": "approve", "summary": "Demo simulated review", "findings": [],
                       "approved_memory_keys": []}
             if "finding_dispositions" in schema["properties"]:
-                result["finding_dispositions"] = [{"review_dispatch_id": item["review_dispatch_id"],
-                    "finding_id": item["finding_id"], "status": "resolved",
+                result["finding_dispositions"] = {key: {"status": "resolved",
                     "evidence": ["Offline fixture reviewed the current greet implementation"]}
-                    for item in packet.get("required_findings", [])]
+                    for key in schema["properties"]["finding_dispositions"]["required"]}
         elif kind == "plan":
             result = {"tasks": [{"id": "greet", "title": "Implement greet", "description": "Implement greet(name) returning Hello, name!",
                                   "depends_on": [], "allowed_paths": ["hello.py"], "acceptance": ["test_greet passes"], "skills": []}]}

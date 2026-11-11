@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 from harness.util import HarnessError, write_json
 from test_progress_checkpoints import Runtime, sha
+from test_harness import add_worker_dispatch
 
 
 class CheckpointBatchTests(unittest.TestCase):
@@ -26,7 +27,8 @@ class CheckpointBatchTests(unittest.TestCase):
                   'summary': 'blocked', 'evidence': [], 'proposed_memories': [], 'checkpoints': items}
         path = rt.context.directory / 'dispatches' / 'worker1' / 'returned-result.json'
         write_json(path, {**result, 'task_id': 'task', 'dispatch_id': 'worker1'})
-        rt.context.run['dispatches'] = [{'id': 'worker1', 'task_id': 'task', 'role': 'worker', 'invoked_at': 100}]
+        rt.context.run['dispatches'] = []
+        add_worker_dispatch(rt.context.run, rt.context.directory, 'worker1', 'task', invoked_at=100)
         return result, {'artifact': str(path), 'artifact_digest': sha(path.read_bytes())}
 
     def record(self, result, source):
@@ -105,7 +107,7 @@ class CheckpointBatchTests(unittest.TestCase):
         old_row = copy.deepcopy(rt.context.run['task_checkpoints'][0])
         path = rt.context.directory / 'dispatches' / 'worker2' / 'returned-result.json'
         write_json(path, {**result, 'task_id': 'task', 'dispatch_id': 'worker2'})
-        rt.context.run['dispatches'].append({'id': 'worker2', 'task_id': 'task', 'role': 'worker', 'invoked_at': 200})
+        add_worker_dispatch(rt.context.run, rt.context.directory, 'worker2', 'task', invoked_at=200)
         source2 = {'artifact': str(path), 'artifact_digest': sha(path.read_bytes())}
         with patch('harness.progress.time.time', return_value=201):
             discarded = rt.record_checkpoints('task', 'worker2', result, source2)

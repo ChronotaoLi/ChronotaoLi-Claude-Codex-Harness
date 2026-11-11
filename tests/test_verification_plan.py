@@ -46,33 +46,33 @@ class VerificationPlanTests(unittest.TestCase):
     def test_missing_required_evidence_fails_even_without_formal_commands(self):
         with tempfile.TemporaryDirectory() as directory:
             task, worker, args = self.fixture(Path(directory))
-            worker["evidence_files"] = []
-            args["worker_artifact"].write_text(json.dumps(worker))
-            args["worker_artifact_digest"] = hashlib.sha256(args["worker_artifact"].read_bytes()).hexdigest()
+            (Path(directory) / "proof.txt").unlink()
             plan = build_verification_plan({"verification": {"commands": []}}, task)
             self.assertEqual(plan["checks"], [])
             report = candidate_preflight(task, worker, **args)
             self.assertFalse(report["passed"])
-            self.assertEqual(report["failures"][0]["code"], "evidence_reference_missing_or_duplicate")
+            self.assertEqual(report["failures"], [{"code": "evidence_invalid", "requirement_id": "proof",
+                                                   "path": "proof.txt", "reason": "missing"}])
 
     def test_progress_absence_and_worker_claim_do_not_close_findings(self):
         run = {"review_history": {"task": [
-            {"artifact": "first.json", "snapshot_digest": "candidate-1", "review": {
-                "dispatch_id": "review-1", "findings": [{"id": "F1", "severity": "blocking", "message": "gap"}]}},
-            {"artifact": "second.json", "snapshot_digest": "candidate-2", "review": {
-                "dispatch_id": "review-2", "findings": []}},
-        ]}, "feedback": {"worker": {"repair_claims": [{"finding_id": "F1"}]}}}
+            {"artifact": "first.json", "dispatch_id": "review-1", "snapshot_digest": "candidate-1", "review": {
+                "findings": [{"id": "F1", "severity": "blocking", "message": "gap"}]}},
+            {"artifact": "second.json", "dispatch_id": "review-2", "snapshot_digest": "candidate-2", "review": {
+                "findings": []}},
+        ]}, "feedback": {"worker": {"repair_claims": {"f1": {"summary": "fixed", "evidence_paths": []}}}}}
         row = finding_progress(run, "task")["findings"][0]
         self.assertEqual(row["status"], "open")
-        run["review_history"]["task"][-1]["review"]["finding_dispositions"] = [
-            {"review_dispatch_id": "review-1", "finding_id": "F1", "status": "resolved", "evidence": ["checked"]}]
+        later = run["review_history"]["task"][-1]
+        later["required_findings"] = [{"key": "f1", "review_dispatch_id": "review-1", "finding_index": 0,
+                                       "label": "F1", "artifact": "first.json"}]
+        later["review"]["finding_dispositions"] = {"f1": {"status": "resolved", "evidence": ["checked"]}}
         row = finding_progress(run, "task")["findings"][0]
         self.assertEqual(row["status"], "resolved")
         self.assertEqual(row["disposition_source"]["snapshot_digest"], "candidate-2")
         self.assertEqual(finding_progress(run, "task", limit=0)["omitted_count"], 1)
 
-    def test_progress_uses_shared_aliases_and_authenticated_source_precedence(self):
-        from harness.review_progress import finding_references
+    def test_progress_identifies_findings_by_source_and_position_with_repeated_labels(self):
         review = {"dispatch_id": "stale-body-id", "findings": [
             {"id": "bad/id", "severity": "blocking", "message": "first"},
             {"id": "bad/id", "severity": "blocking", "message": "second"}]}
@@ -82,16 +82,17 @@ class VerificationPlanTests(unittest.TestCase):
                                       "artifact_digest": "raw-digest", "snapshot_digest": "candidate-1"}}
         run = {"review_history": {"task": [original]}}
         rows = finding_progress(run, "task")["findings"]
-        self.assertEqual([r["finding_id"] for r in rows],
-                         [r["finding_id"] for _, r in finding_references(review)])
-        self.assertEqual([r["original_finding_id"] for r in rows], ["bad/id", "bad/id"])
-        self.assertEqual([r["finding_index"] for r in rows], [0, 1])
+        self.assertEqual([(r["label"], r["finding_index"]) for r in rows], [("bad/id", 0), ("bad/id", 1)])
         self.assertTrue(all(r["review_dispatch_id"] == "review-1" and r["artifact"] == "raw.json"
                             and r["source_artifact_digest"] == "raw-digest" for r in rows))
-        disposition = {"review_dispatch_id": "review-1", "finding_id": "finding-2",
-                       "status": "resolved", "evidence": ["checked second"]}
         later = {"dispatch_id": "review-2", "artifact": "later.json", "snapshot_digest": "candidate-2",
-                 "review": {"findings": [], "finding_dispositions": [disposition]}}
+                 "required_findings": [{"key": "f1", "review_dispatch_id": "review-1", "finding_index": 0,
+                                        "label": "bad/id", "artifact": "raw.json"},
+                                       {"key": "f2", "review_dispatch_id": "review-1", "finding_index": 1,
+                                        "label": "bad/id", "artifact": "raw.json"}],
+                 "review": {"findings": [], "finding_dispositions": {
+                     "f1": {"status": "open", "evidence": []},
+                     "f2": {"status": "resolved", "evidence": ["checked second"]}}}}
         run["review_history"]["task"].append(later)
         for diagnostics in ({"status": "invalid_rejected"}, {"disposition_errors": ["gap"]},
                             {"validation_error": "bad evidence"}, {"status": "invalidated"}):
@@ -103,11 +104,14 @@ class VerificationPlanTests(unittest.TestCase):
         self.assertEqual([r["status"] for r in rows], ["open", "resolved"])
         self.assertEqual(rows[1]["snapshot_digest"], "candidate-1")
         self.assertEqual(rows[1]["disposition_source"]["snapshot_digest"], "candidate-2")
+        # A key absent from the record's copy is never projected onto a finding.
+        later["required_findings"] = later["required_findings"][:1]
+        self.assertEqual([r["status"] for r in finding_progress(run, "task")["findings"]], ["open", "open"])
         # This standalone projection does not claim to verify source files.
         del original["review_source"]
         del original["dispatch_id"]
         del review["dispatch_id"]
-        self.assertTrue(all(r["status"] == "unknown" for r in finding_progress(run, "task")["findings"]))
+        self.assertTrue(all(r["status"] == "unknown" for r in finding_progress(run, "task")["findings"][:2]))
 
     def fixture(self, root):
         data = b"host evidence"
@@ -115,8 +119,8 @@ class VerificationPlanTests(unittest.TestCase):
         sha = hashlib.sha256(data).hexdigest()
         task = {"id": "task", "acceptance": ["host behavior"], "evidence_requirements": [
             {"id": "proof", "acceptance_index": 0, "kind": "host_integration", "path": "proof.txt"}]}
-        worker = {"task_id": "task", "dispatch_id": "worker-1", "evidence_files": [
-            {"requirement_id": "proof", "path": "proof.txt", "kind": "host_integration", "sha256": sha}]}
+        # The worker result declares no evidence; the runtime owns path, kind and digest.
+        worker = {"task_id": "task", "dispatch_id": "worker-1", "status": "completed"}
         source = root / "worker.json"
         source.write_text(json.dumps(worker))
         snapshot = {"head": "head", "index": "index", "files": {"proof.txt": "644:" + sha}}
@@ -130,17 +134,24 @@ class VerificationPlanTests(unittest.TestCase):
             task, worker, args = self.fixture(Path(directory))
             report = candidate_preflight(task, worker, **args)
             self.assertTrue(report["passed"])
+            self.assertEqual(report["evidence"], [{"requirement_id": "proof", "path": "proof.txt",
+                "sha256": hashlib.sha256(b"host evidence").hexdigest(), "kind": "host_integration",
+                "acceptance_index": 0}])
             self.assertEqual(report["semantic_coverage"], "requires independent review")
 
     def test_missing_mismatched_changed_and_unbound_evidence_fail(self):
-        for scenario in ("missing", "hash", "candidate", "source", "ignored", "symlink"):
+        for scenario, reason in (("missing", "missing"), ("hash", "outside_candidate"), ("ignored", "outside_candidate"),
+                                 ("symlink", "symlink"), ("parent_symlink", "symlink"),
+                                 ("directory", "not_regular_file"), ("unsafe", "unsafe_path"),
+                                 ("candidate", None), ("source", None)):
             with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 task, worker, args = self.fixture(root)
+                requirement = task["evidence_requirements"][0]
                 if scenario == "missing":
-                    worker["evidence_files"] = []
+                    (root / "proof.txt").unlink()
                 elif scenario == "hash":
-                    (root / "proof.txt").write_text("changed")
+                    (root / "proof.txt").write_text("changed after the snapshot")
                 elif scenario == "candidate":
                     args["current_snapshot"] = {**args["current_snapshot"], "head": "other"}
                 elif scenario == "source":
@@ -150,14 +161,29 @@ class VerificationPlanTests(unittest.TestCase):
                 elif scenario == "symlink":
                     (root / "proof.txt").rename(root / "other.txt")
                     (root / "proof.txt").symlink_to("other.txt")
-                self.assertFalse(candidate_preflight(task, worker, **args)["passed"])
+                elif scenario == "parent_symlink":
+                    (root / "real").mkdir()
+                    (root / "proof.txt").rename(root / "real" / "proof.txt")
+                    (root / "linked").symlink_to("real", target_is_directory=True)
+                    requirement["path"] = "linked/proof.txt"
+                elif scenario == "directory":
+                    (root / "proof.txt").unlink()
+                    (root / "proof.txt").mkdir()
+                elif scenario == "unsafe":
+                    requirement["path"] = "../proof.txt"
+                report = candidate_preflight(task, worker, **args)
+                self.assertFalse(report["passed"])
+                if reason:
+                    self.assertEqual([(f["code"], f["reason"]) for f in report["failures"]],
+                                     [("evidence_invalid", reason)])
 
     def test_no_requirements_needs_no_evidence_declaration(self):
         with tempfile.TemporaryDirectory() as directory:
             task, worker, args = self.fixture(Path(directory))
             task["evidence_requirements"] = []
-            self.assertTrue(candidate_preflight(task, worker, **args)["passed"])
-
+            report = candidate_preflight(task, worker, **args)
+            self.assertTrue(report["passed"])
+            self.assertEqual(report["evidence"], [])
 
 if __name__ == "__main__":
     unittest.main()

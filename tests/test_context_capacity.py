@@ -76,8 +76,9 @@ class FinalContextCapacityTests(RepoCase):
     def setUp(self):
         super().setUp()
         # Keep capacity pressure independent of the default run budget. The shared
-        # RULES text that every prompt carries sets the floor of this constraint.
-        self.config.data["runtime"]["context_chars"] = 33000
+        # RULES text that every prompt carries sets the floor of this constraint
+        # (B2 moved the required-finding reading rules there from the packets).
+        self.config.data["runtime"]["context_chars"] = 34000
 
     def plan(self):
         return read_json(ROOT / "examples" / "plan.json")

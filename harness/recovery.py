@@ -6,10 +6,11 @@ import hashlib
 import json
 from pathlib import Path
 
-from .contracts import (REVIEW, RepairableFormatError, apply_revision, envelope,
+from .contracts import (RepairableFormatError, apply_revision, envelope, review_schema,
                         review_approved, validate, validate_commander_format_correction,
                         validate_finding_dispositions, validate_immutable_findings, validate_review_correction,
                         validate_review_semantics, validate_structure)
+from .review_progress import active_review_findings
 from .util import HarnessError
 
 
@@ -190,7 +191,7 @@ class InvalidOutputRecovery(RuntimeService):
         if key.startswith("reviewer:"):
             correction.update(proposed_memory_keys=repair["proposed_keys"], instruction=(
                 "Read the original approval. Preserve its verdict and every finding's order, severity, category, "
-                "location, message and evidence exactly. Only repair duplicate/invalid finding IDs, reformat summary, "
+                "location, message and evidence exactly. Only repair invalid finding IDs, reformat summary, "
                 "deduplicate memory keys and remove keys absent from proposed_memory_keys. Preserve every originally "
                 "approved valid key; add no approvals. Use this dispatch's IDs. This is metadata correction, not a new review."))
         if repair.get("mode") == "format":
@@ -298,7 +299,8 @@ class InvalidOutputRecovery(RuntimeService):
             else:
                 raise HarnessError("原指挥结果合法；不能丢弃结果或绕过 hook 门禁")
         else:
-            validate_structure(result, envelope(REVIEW, entry["task_id"], dispatch_id))
+            schema = review_schema(active_review_findings(self.context.run, entry["kind"], entry["task_id"]))
+            validate_structure(result, envelope(schema, entry["task_id"], dispatch_id))
             if not review_approved(result):
                 raise HarnessError("拒绝或包含 blocking finding 的审阅不能通过 --repair-invalid 重抽")
             if entry["kind"] == "review":
@@ -315,7 +317,7 @@ class InvalidOutputRecovery(RuntimeService):
                     raise HarnessError("原审阅修正已违反结论或包含不可修正字段；不能追加修正")
                 original = {**deepcopy(guard), "dispatch_id": Path(guard["artifact"]).parent.name}
                 previous = self.read_format_source(key, original)
-                validate_structure(previous, envelope(REVIEW, entry["task_id"], original["dispatch_id"]))
+                validate_structure(previous, envelope(schema, entry["task_id"], original["dispatch_id"]))
                 if not review_approved(previous):
                     raise HarnessError("原审阅拒绝或包含 blocking finding；不能追加修正")
                 validate_immutable_findings(previous["findings"])
@@ -326,7 +328,7 @@ class InvalidOutputRecovery(RuntimeService):
                 if not self.context.run["format_repairs"].get(key):
                     raise HarnessError("格式修正自动额度尚未耗尽；请普通 resume")
                 try:
-                    validate(result, envelope(REVIEW, entry["task_id"], dispatch_id))
+                    validate(result, envelope(schema, entry["task_id"], dispatch_id))
                 except RepairableFormatError as error:
                     mode, validation_error = "format", str(error)
                 else:
@@ -339,8 +341,9 @@ class InvalidOutputRecovery(RuntimeService):
                 # repair and consume its single authorization/dispatch budget.
                 try:
                     validate_finding_dispositions(result)
-                    validate(result.get("finding_dispositions", []), REVIEW["properties"]["finding_dispositions"],
-                             "response.finding_dispositions")
+                    if "finding_dispositions" in result:
+                        validate(result["finding_dispositions"], schema["properties"]["finding_dispositions"],
+                                 "response.finding_dispositions")
                 except HarnessError as error:
                     raise HarnessError("审阅处置错误不能通过 --repair-invalid 修正；请保留证据并 abandon") from error
                 try:

@@ -7,13 +7,7 @@ from harness import git
 from harness.util import HarnessError, read_json, write_json
 from test_engine_repairs import RecordingBackend
 from test_harness import RepoCase, ROOT
-from test_runtime_changes import finding
-
-
-def duplicate_rejection(result):
-    first, second = finding(), finding()
-    second["message"] = "A separate defect sharing the same invalid ID"
-    result.update(verdict="request_changes", findings=[first, second])
+from test_runtime_changes import finding, invalid_rejection
 
 
 class InvalidReviewRecoveryTests(RepoCase):
@@ -32,7 +26,7 @@ class InvalidReviewRecoveryTests(RepoCase):
 
         def change(backend, kwargs, packet, result):
             if kwargs["kind"] == "final_review":
-                duplicate_rejection(result)
+                invalid_rejection(result)
 
         backend = RecordingBackend(change)
         engine = self.engine(backend)
@@ -41,7 +35,7 @@ class InvalidReviewRecoveryTests(RepoCase):
         record = engine.run["final_history"][-1]
         self.assertEqual(record["status"], "invalid_rejected")
         self.assertEqual(record["phase"], "finished")
-        self.assertIn("唯一", record["validation_error"])
+        self.assertIn("阻断 finding 必须有证据", record["validation_error"])
         self.assert_raw_evidence(record)
         self.assertEqual(engine.run["pending_replan"]["trigger"]["final_review"], record)
         calls = copy.deepcopy(backend.calls)
@@ -73,7 +67,7 @@ class InvalidReviewRecoveryTests(RepoCase):
     def test_invalid_task_rejection_reaches_worker_and_independent_review(self):
         def change(backend, kwargs, packet, result):
             if kwargs["kind"] == "review" and sum(c["kind"] == "review" for c in backend.calls) == 1:
-                duplicate_rejection(result)
+                invalid_rejection(result)
                 result["approved_memory_keys"] = ["unapproved"]
 
         backend = RecordingBackend(change)
@@ -98,7 +92,7 @@ class InvalidReviewRecoveryTests(RepoCase):
     def test_noop_final_correction_keeps_invalid_rejection_until_changed_fix(self):
         def change(backend, kwargs, packet, result):
             if kwargs["kind"] == "final_review" and sum(c["kind"] == "final_review" for c in backend.calls) == 1:
-                duplicate_rejection(result)
+                invalid_rejection(result)
             elif kwargs["kind"] == "replan":
                 number = sum(c["kind"] == "replan" for c in backend.calls)
                 task = copy.deepcopy(packet["original_tasks"][0])
@@ -140,7 +134,7 @@ class InvalidReviewRecoveryTests(RepoCase):
 
         def change(backend, kwargs, packet, result):
             if kwargs["kind"] == "final_review":
-                duplicate_rejection(result)
+                invalid_rejection(result)
 
         backend = RecordingBackend(change)
         engine = self.engine(backend)
@@ -163,7 +157,7 @@ class InvalidReviewRecoveryTests(RepoCase):
     def pending_invalid_task_review(self):
         def change(backend, kwargs, packet, result):
             if kwargs["kind"] == "review" and sum(c["kind"] == "review" for c in backend.calls) == 1:
-                duplicate_rejection(result)
+                invalid_rejection(result)
 
         backend = RecordingBackend(change)
         engine = self.engine(backend)
@@ -197,7 +191,7 @@ class InvalidReviewRecoveryTests(RepoCase):
         self.assertEqual(record["status"], "invalidated")
         self.assertEqual(record["artifact"], receipt["artifact"])
         self.assertEqual(record["artifact_digest"], receipt["artifact_digest"])
-        self.assertEqual(len(record["review"]["findings"]), 2)
+        self.assertEqual(len(record["review"]["findings"]), 1)
         worker = [c for c in backend.calls if c["role"] == "worker"][1]
         self.assertEqual(worker["packet"]["prior_reviews"][0]["review"]["findings"], record["review"]["findings"])
 

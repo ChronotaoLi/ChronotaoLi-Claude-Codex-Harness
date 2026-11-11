@@ -13,7 +13,7 @@ from pathlib import Path, PurePosixPath
 
 from .context import prompt_json
 from .recovery import snapshot_digest
-from .review_progress import finding_references, dispositions_usable
+from .review_progress import dispositions_usable
 from .util import HarnessError, dump, write_json
 
 
@@ -121,8 +121,9 @@ def candidate_preflight(task, worker_result, *, worktree, candidate_snapshot, cu
     """Return mechanical gaps before expensive gates; never returns acceptance.
 
     The caller supplies the already-owned candidate snapshot and original worker
-    artifact, not paths selected by the worker. Source bytes and declaration
-    identity are rechecked here, alongside ordinary file hashes.
+    artifact. Required evidence files come from the task's evidence_requirements:
+    each must be a regular, non-symlink file inside the candidate snapshot, and
+    its SHA256 is computed here; the worker declares nothing.
     """
     failures, checked = [], []
     digest = snapshot_digest(candidate_snapshot)
@@ -146,38 +147,36 @@ def candidate_preflight(task, worker_result, *, worktree, candidate_snapshot, cu
             raise ValueError("worker task mismatch")
     except (OSError, ValueError, TypeError) as error:
         failures.append({"code": "worker_source_invalid", "detail": str(error)})
-    declarations = worker_result.get("evidence_files", [])
-    requirements = task.get("evidence_requirements", [])
-    seen = set()
-    for requirement in requirements:
-        identity = requirement["id"]
-        rows = [row for row in declarations if row.get("requirement_id") == identity]
-        if identity in seen or len(rows) != 1:
-            failures.append({"code": "evidence_reference_missing_or_duplicate", "requirement_id": identity})
-            continue
-        seen.add(identity)
-        row = rows[0]
-        path = PurePosixPath(row["path"])
-        expected = requirement["path"]
+    for requirement in task.get("evidence_requirements", []):
+        identity, expected = requirement["id"], requirement["path"]
+        path = PurePosixPath(expected)
+        failure = {"code": "evidence_invalid", "requirement_id": identity, "path": expected}
         if (path.is_absolute() or ".." in path.parts or not path.parts
-                or any(p in {".git", ".harness", ".codex", ".claude"} for p in path.parts)
-                or row["path"] != expected or row["kind"] != requirement["kind"]):
-            failures.append({"code": "evidence_binding_mismatch", "requirement_id": identity})
+                or any(p in {".git", ".harness", ".codex", ".claude"} for p in path.parts)):
+            failures.append({**failure, "reason": "unsafe_path"})
             continue
-        file = Path(worktree) / path
+        root = Path(worktree)
+        file = root / path
         try:
-            if not _regular(file, Path(worktree)):
-                raise ValueError("evidence is not an ordinary file")
+            # The plan owns the path and kind; the runtime computes the digest.
+            if any((root / Path(*path.parts[:depth])).is_symlink() for depth in range(1, len(path.parts) + 1)):
+                failures.append({**failure, "reason": "symlink"})
+                continue
+            if not file.exists():
+                failures.append({**failure, "reason": "missing"})
+                continue
+            if not _regular(file, root):
+                failures.append({**failure, "reason": "not_regular_file"})
+                continue
             actual = hashlib.sha256(file.read_bytes()).hexdigest()
-            if actual != row["sha256"]:
-                raise ValueError("evidence hash mismatch")
             snapshot_value = current_snapshot.get("files", {}).get(str(path), "")
             if not snapshot_value.endswith(":" + actual) or snapshot_value.startswith(("link:", "deleted:")):
-                raise ValueError("evidence is outside candidate snapshot")
+                failures.append({**failure, "reason": "outside_candidate"})
+                continue
             checked.append({"requirement_id": identity, "path": str(path), "sha256": actual,
-                            "kind": row["kind"], "acceptance_index": requirement["acceptance_index"]})
-        except (OSError, ValueError) as error:
-            failures.append({"code": "evidence_invalid", "requirement_id": identity, "detail": str(error)})
+                            "kind": requirement["kind"], "acceptance_index": requirement["acceptance_index"]})
+        except OSError as error:
+            failures.append({**failure, "reason": "unreadable", "detail": str(error)})
     return {"version": 1, "passed": not failures, "candidate_digest": digest,
             "worker_source": {"artifact": str(source), "sha256": worker_artifact_digest},
             "evidence": checked, "failures": failures,
@@ -200,18 +199,22 @@ def finding_progress(run, task_id, *, limit=60):
             dispatch = source.get("dispatch_id") or record.get("dispatch_id") or review.get("dispatch_id")
             artifact = source.get("artifact") or record.get("artifact")
             candidate = source.get("snapshot_digest") or record.get("snapshot_digest")
-            for finding, reference in finding_references(review):
-                key = (tid, dispatch, reference["finding_id"], artifact if dispatch is None else None)
-                rows[key] = {"task_id": tid, "review_dispatch_id": dispatch, **reference,
+            for index, finding in enumerate(review.get("findings", [])):
+                key = (tid, dispatch, index, artifact if dispatch is None else None)
+                rows[key] = {"task_id": tid, "review_dispatch_id": dispatch, "finding_index": index,
+                    "label": finding.get("id"),
                     "severity": finding["severity"], "message": finding.get("message", ""),
                     "artifact": artifact, "source_artifact_digest": source.get("artifact_digest"),
                     "snapshot_digest": candidate,
                     "status": "open" if dispatch else "unknown", "disposition_source": None}
             if not dispositions_usable(record):
                 continue
-            for disposition in review.get("finding_dispositions", []):
-                key = (tid, disposition.get("review_dispatch_id"), disposition.get("finding_id"), None)
-                row = rows.get(key)
+            mapping = {item.get("key"): (item.get("review_dispatch_id"), item.get("finding_index"))
+                       for item in record.get("required_findings") or [] if isinstance(item, dict)}
+            for name, disposition in (review.get("finding_dispositions") or {}).items():
+                if name not in mapping:
+                    continue
+                row = rows.get((tid, *mapping[name], None))
                 if row is not None:
                     row["status"] = disposition["status"]
                     row["disposition_source"] = {"review_dispatch_id": dispatch, "artifact": artifact,
@@ -275,25 +278,8 @@ def project_finding_sources(packet):
         if dispatch not in sources:
             raise HarnessError('required finding source artifact missing')
         rows.append(row)
-    result = {**packet, 'required_findings': rows, 'required_finding_sources': sources,
-              'required_finding_source_policy': 'Every required_findings row remains binding. Retrieve its original '
-                  'review at required_finding_sources[review_dispatch_id].artifact; finding_id identifies the '
-                  'required reference, and original_finding_id/finding_index identify the original position when present.'}
-    if packet.get('repair_claims'):
-        indexes = {(row['review_dispatch_id'], row['finding_id']): index for index, row in enumerate(rows)}
-        claims = []
-        for original in packet['repair_claims']:
-            claim = deepcopy(original)
-            key = claim.get('review_dispatch_id'), claim.get('finding_id')
-            if key in indexes:
-                claim.pop('review_dispatch_id')
-                claim.pop('finding_id')
-                claim['required_finding_index'] = indexes[key]
-            claims.append(claim)
-        result['repair_claims'] = claims
-        result['required_finding_source_policy'] += (
-            ' A repair_claim with required_finding_index uses the review_dispatch_id and finding_id of '
-            'required_findings at that zero-based index; its summary and evidence_paths remain the worker claim.')
+    # How to read a row and its source table is shared protocol (RULES).
+    result = {**packet, 'required_findings': rows, 'required_finding_sources': sources}
     # Small packets need no reference scaffolding. Keep the inline form when
-    # adding a source table and reconstruction policy would cost more context.
+    # adding a source table would cost more context.
     return result if len(prompt_json(result)) < len(prompt_json(packet)) else packet

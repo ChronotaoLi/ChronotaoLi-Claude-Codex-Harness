@@ -11,7 +11,8 @@ from pathlib import Path
 import re
 import time
 
-from .contracts import WORK, envelope, validate_structure, validate_work_semantics
+from .contracts import validate_structure, validate_work_semantics
+from .worker_receipts import delivered_work_contract
 from .util import HarnessError, dump, write_json
 
 _SHA = re.compile(r"[0-9a-f]{64}\Z")
@@ -141,7 +142,7 @@ class ProgressRecovery(RuntimeService):
         if not any(d["id"] == dispatch_id and d["role"] == "worker" and d["task_id"] == task_id for d in self.context.run["dispatches"]):
             raise HarnessError("checkpoint source is not a known worker dispatch")
         checked = result if validate_declarations else {k: v for k, v in result.items() if k != "checkpoints"}
-        validate_structure(checked, envelope(WORK, task_id, dispatch_id))
+        validate_structure(checked, delivered_work_contract(self.context.run, self.context.directory, dispatch_id))
         validate_work_semantics(checked)
         if validate_declarations:
             validate_checkpoints(result.get("checkpoints", []))

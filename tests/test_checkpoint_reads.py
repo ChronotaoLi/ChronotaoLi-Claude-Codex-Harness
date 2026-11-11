@@ -10,6 +10,7 @@ from unittest.mock import patch
 import harness.progress as progress
 from harness.util import HarnessError, write_json
 from test_progress_checkpoints import Runtime, sha
+from test_harness import add_worker_dispatch
 
 
 class CheckpointReadTests(unittest.TestCase):
@@ -28,7 +29,8 @@ class CheckpointReadTests(unittest.TestCase):
                   'summary': 'blocked', 'evidence': [], 'proposed_memories': [], 'checkpoints': items}
         self.source = rt.context.directory / 'dispatches' / 'worker' / 'returned-result.json'
         write_json(self.source, {**result, 'task_id': 'task', 'dispatch_id': 'worker'})
-        rt.context.run['dispatches'] = [{'id': 'worker', 'task_id': 'task', 'role': 'worker', 'invoked_at': 100}]
+        rt.context.run['dispatches'] = []
+        add_worker_dispatch(rt.context.run, rt.context.directory, 'worker', 'task', invoked_at=100)
         rt.record_checkpoints('task', 'worker', result,
                               {'artifact': str(self.source), 'artifact_digest': sha(self.source.read_bytes())})
         self.manifests = [Path(row['artifact']) for row in rt.context.run['task_checkpoints']]
@@ -49,7 +51,9 @@ class CheckpointReadTests(unittest.TestCase):
             # Evidence bytes have no parsed representation; their hashes still
             # must be checked once per distinct private copy, including history.
             self.assertEqual(sum(call.args[0] == b'proof' for call in digests.call_args_list), len(self.evidence))
-            self.assertEqual(parses.call_count, 2 + len(self.manifests))
+            # The source result, its resolution, each manifest, and once the
+            # source dispatch's delivered contract (schema.json).
+            self.assertEqual(parses.call_count, 3 + len(self.manifests))
 
     def test_next_operation_rechecks_every_private_artifact(self):
         artifacts = [(self.source, 'original result changed'),

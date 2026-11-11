@@ -5,8 +5,9 @@ import unittest
 from harness.context import compact_checks, compact_feedback, compact_reviews, compose
 from harness.contracts import (PLAN, WORK, RepairableFormatError, apply_revision,
                                envelope, output_constraints, validate,
-                               validate_plan, validate_review, validate_review_correction, validate_work)
+                               validate_plan, validate_review, validate_review_correction)
 from harness.util import HarnessError, dump
+from test_runtime_changes import validate_work_contract
 
 
 def task(ident="implement", dependencies=None):
@@ -63,9 +64,9 @@ class OutputContractTests(unittest.TestCase):
         self.assertEqual(constraints["response.summary"]["maxLength"], 17)
         self.assertTrue(constraints["response.summary"]["non_blank"])
         self.assertTrue(constraints["response.proposed_memories[].source_paths"]["uniqueItems"])
-        validate_work({**work(), "summary": "x" * 32000})
+        validate_work_contract({**work(), "summary": "x" * 32000})
         with self.assertRaises(RepairableFormatError):
-            validate_work({**work(), "summary": "x" * 32001})
+            validate_work_contract({**work(), "summary": "x" * 32001})
 
     def test_hard_boundaries_take_priority_over_format_defects(self):
         schema = envelope(WORK, "implement", "dispatch-1")
@@ -81,13 +82,12 @@ class OutputContractTests(unittest.TestCase):
     def test_worker_semantics_cannot_be_repaired_as_formatting(self):
         result = {**work(), "summary": "x" * 32001, "blocker_kind": "task"}
         with self.assertRaises(HarnessError) as raised:
-            validate_work(result)
+            validate_work_contract(result)
         self.assertNotIsInstance(raised.exception, RepairableFormatError)
 
-    def test_review_approvals_and_finding_identity_remain_hard_failures(self):
+    def test_review_approvals_and_blocking_evidence_remain_hard_failures(self):
         result = {**review(), "summary": "x" * 4001}
         for changes in ({"approved_memory_keys": ["unknown"]},
-                        {"findings": [finding(), finding()]},
                         {"findings": [{**finding(), "evidence": []}]}):
             with self.subTest(changes=changes):
                 with self.assertRaises(HarnessError) as raised:

@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from harness.decisions import DecisionRecovery, read_decision
 from harness.util import HarnessError, write_json
 from harness.versions import RUN_SCHEMA_VERSION
+from test_harness import add_worker_dispatch
 
 
 class Fixture(DecisionRecovery):
@@ -157,7 +158,8 @@ class OperatorDecisionTests(unittest.TestCase):
     def test_worker_question_must_match_bound_blocker(self):
         engine = self.engine
         engine.context.run.pop('replan_stopped')
-        engine.context.run['dispatches'][0].update(role='worker', kind='implement', task_id='one')
+        entry = engine.context.run['dispatches'][0]
+        entry.update(add_worker_dispatch({}, engine.context.directory, entry['id'], 'one'))
         artifact = Path(engine.source['artifact'])
         write_json(artifact, {'task_id': 'one', 'dispatch_id': 'dispatch_one', 'status': 'blocked',
                              'summary': 'Need operator choice', 'evidence': [], 'blockers': ['Select the option'],
@@ -178,7 +180,8 @@ class OperatorDecisionTests(unittest.TestCase):
     def test_handoff_binds_exact_accepted_worker_and_dependency(self):
         engine = self.engine
         engine.context.run.pop('replan_stopped')
-        engine.context.run['dispatches'][0].update(role='worker', kind='implement', task_id='one')
+        entry = engine.context.run['dispatches'][0]
+        entry.update(add_worker_dispatch({}, engine.context.directory, entry['id'], 'one'))
         artifact = Path(engine.source['artifact'])
         requests = [{'id': 'choice', 'task_id': 'two', 'question': 'Proceed with dependent work?'}]
         write_json(artifact, {'task_id': 'one', 'dispatch_id': 'dispatch_one', 'status': 'completed',

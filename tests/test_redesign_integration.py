@@ -106,28 +106,27 @@ class RedesignIntegrationTests(RepoCase):
     def test_missing_required_evidence_stops_before_expensive_gate(self):
         plan = self.plan()
         plan["tasks"][0]["evidence_requirements"] = [
-            {"id": "implementation", "acceptance_index": 0, "kind": "static", "path": "hello.py"}]
+            {"id": "proof", "acceptance_index": 0, "kind": "static", "path": "proof.txt"}]
         self.config.data["runtime"]["max_attempts"] = 1
         backend = ScriptedBackend()
         engine = self.engine(backend)
         with self.assertRaises(HarnessError):
             engine.start("Implement greet", plan)
         self.assertFalse(any(d["role"] in ("verification", "reviewer") for d in engine.run["dispatches"]))
-        self.assertEqual(engine.run["feedback"]["preflight"]["failures"][0]["code"],
-                         "evidence_reference_missing_or_duplicate")
+        failure = engine.run["feedback"]["preflight"]["failures"][0]
+        self.assertEqual((failure["code"], failure["reason"], failure["path"]), ("evidence_invalid", "missing", "proof.txt"))
 
     def test_bound_evidence_keeps_full_task_and_final_checks(self):
         plan = self.plan()
         plan["tasks"][0]["evidence_requirements"] = [
             {"id": "implementation", "acceptance_index": 0, "kind": "static", "path": "hello.py"}]
-
-        def evidence(backend, kwargs, packet, result):
-            if kwargs["role"] == "worker":
-                result["evidence_files"] = [{"requirement_id": "implementation", "path": "hello.py",
-                    "kind": "static", "sha256": hashlib.sha256((kwargs["cwd"] / "hello.py").read_bytes()).hexdigest()}]
-        engine = self.engine(ScriptedBackend(evidence))
+        # The worker declares nothing; the runtime checks the planned file itself.
+        engine = self.engine(ScriptedBackend())
         result = engine.start("Implement greet", plan)
         self.assertEqual(result["status"], "completed")
+        preflight = read_json(engine.directory / "preflight" / "greet" / "1" / "result.json")
+        self.assertEqual(preflight["evidence"][0]["sha256"],
+                         hashlib.sha256((engine.worktree / "hello.py").read_bytes()).hexdigest())
         checks = [d for d in result["dispatches"] if d["role"] == "verification"]
         self.assertEqual([d["task_id"] for d in checks], ["greet", "final"])
         self.assertTrue(all(d["status"] == "completed" for d in checks))

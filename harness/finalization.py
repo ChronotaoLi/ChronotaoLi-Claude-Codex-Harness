@@ -43,7 +43,7 @@ class FinalAcceptance(RuntimeService):
                 validate_review_source(self.context.run, "final", item, kind="final_review", candidate_digest=digest)
                 required = required_findings(self.context.run, "final", digest, whole_run=True,
                                              records=history[:history.index(item)])
-                if disposition_gaps(item["review"], required):
+                if required != item.get("required_findings") or disposition_gaps(item["review"], required):
                     raise HarnessError("整体批准缺少历史阻断问题的独立解决处置；禁止完成 run")
         if any(item["status"] == "approved" for item in same_snapshot):
             # Approval is persisted only after all validation and snapshot gates.
@@ -84,6 +84,8 @@ class FinalAcceptance(RuntimeService):
             # The attempt and its recovery phase are durable before artifact I/O.
             write_json(snapshot_artifact, snapshot)
         if record["phase"] == "verifying":
+            # Computed before any record mutation: a capacity stop saves nothing half-done.
+            required = required_findings(self.context.run, "final", digest, whole_run=True, records=history[:-1])
             # Interrupted checks may have written partial evidence. Never overwrite it.
             rounds = record["verification_rounds"]
             verification_folder = folder / f"verification-{len(rounds) + 1}"
@@ -104,7 +106,7 @@ class FinalAcceptance(RuntimeService):
                     self.context.run["feedback"] = {"final_review": deepcopy(record)}
                     self.context.run["pending_replan"] = {"stage": "pending", "trigger": deepcopy(self.context.run["feedback"])}
             else:
-                record["phase"] = "reviewing"
+                record.update(phase="reviewing", required_findings=required)
             write_json(folder / "final.json", record)
             self.context.save()
         else:
@@ -113,11 +115,14 @@ class FinalAcceptance(RuntimeService):
             changed_paths = git.git(self.context.worktree, "diff", "--no-ext-diff", "--no-textconv",
                                     "--name-only", "--no-renames", "-z", self.context.run["base_commit"], "HEAD",
                                     binding=self.context.run["worktree_binding"]).split("\0")
-            required = required_findings(self.context.run, "final", digest, whole_run=True, records=history[:-1])
+            if "required_findings" not in record:
+                raise HarnessError("整体审阅缺少必需问题对照；保留证据")
+            required = record["required_findings"]
             review, diagnostics = self.services.receipts.dispatch_review("final_review", "final",
                      self.services.packets.final_review_packet(
                          checks=checks, diff_artifact=record["diff_artifact"],
-                         changed_paths=changed_paths, history=history[:-1]))
+                         changed_paths=changed_paths, history=history[:-1], required=required),
+                     required=required)
             record["review_source"] = bind_review_source(self.context, "final_review", "final", review, digest)
             disposition_errors = disposition_gaps(review, required)
             if disposition_errors:

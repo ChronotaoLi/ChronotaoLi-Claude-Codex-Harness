@@ -10,7 +10,7 @@ from . import git
 from .budgets import work_attempts
 from .context import compact_checks, compact_feedback, compact_reviews, instruction_file_changes
 from .contracts import (
-    envelope, REVIEW, review_approved, task_directive, validate_review, validate_structure, validate_work,
+    envelope, review_approved, review_schema, task_directive, validate_review, validate_structure,
     WORK,
 )
 from .memory import validate_proposals
@@ -21,7 +21,7 @@ from .recovery import invalidate_acceptance_review, snapshot_digest, worker_reco
 from .services import RuntimeService
 from .continuation import record_continuation
 from .review_progress import (
-    bind_review_source, validate_review_source, claim_gaps, disposition_gaps,
+    bind_review_source, validate_review_source, claim_gaps, claims_for_review, disposition_gaps,
     required_findings, delivered_worker_findings,
 )
 from .verification_plan import candidate_preflight
@@ -188,7 +188,6 @@ class TaskLifecycle(RuntimeService):
         candidate_digest = receipt.get("post_hook_digest")
         if not candidate_digest or snapshot_digest(self.context.snapshot()) != candidate_digest:
             raise HarnessError("worker candidate changed before handoff publication")
-        validate_work(result)
         attempt = self.context.run["worker_receipts"][key]["attempt"]
         paths = git.check_scope(self.context.worktree, task["allowed_paths"], binding=self.context.run["worktree_binding"])
         worker_dispatch = self.services.worker_receipts.entry(self.context.run["worker_receipts"][key])
@@ -319,8 +318,14 @@ class TaskLifecycle(RuntimeService):
                       "reason": "候选已变化；原结果仅作待复核证据，不构成当前候选的批准"}
             record["review_source"] = {"dispatch_id": dispatch_id, "artifact": str(artifact),
                 "artifact_digest": digest, "snapshot_digest": source["snapshot_digest"]}
+            # A returned review exists only in the reviewing stage, whose saved
+            # mapping produced its schema; never validate it against a default.
+            if "required_findings" not in pending:
+                raise HarnessError("审阅阶段缺少必需问题对照；保留证据")
+            record["required_findings"] = deepcopy(pending["required_findings"])
+            schema = review_schema(pending["required_findings"])
             try:
-                validate_structure(result, envelope(REVIEW, pending["task_id"], dispatch_id))
+                validate_structure(result, envelope(schema, pending["task_id"], dispatch_id))
             except HarnessError as error:
                 # Unattributable or malformed data remains inspectable, but is not
                 # presented as a structurally valid review of this task.
@@ -328,7 +333,7 @@ class TaskLifecycle(RuntimeService):
             else:
                 record["review"] = {k: v for k, v in result.items() if k not in ("task_id", "dispatch_id")}
                 try:
-                    validate_review(record["review"], [p["key"] for p in pending.get("proposals", [])])
+                    validate_review(record["review"], [p["key"] for p in pending.get("proposals", [])], schema)
                 except HarnessError as error:
                     record["validation_error"] = str(error)
             history.append(record)
@@ -370,7 +375,7 @@ class TaskLifecycle(RuntimeService):
                 candidate_snapshot=snapshot, current_snapshot=snapshot,
                 worker_artifact=pending["worker_artifact"],
                 worker_artifact_digest=pending["worker_artifact_digest"], worker_dispatch_id=worker_id)
-            preflight["failures"].extend(claim_gaps(full_result, delivered, snapshot, known=required))
+            preflight["failures"].extend(claim_gaps(full_result, delivered, snapshot))
             preflight["passed"] = not preflight["failures"]
             preflight_path = self.context.directory / "preflight" / tid / str(attempt) / "result.json"
             write_json(preflight_path, preflight)
@@ -414,25 +419,30 @@ class TaskLifecycle(RuntimeService):
         checks = read_json(Path(pending["verification"]))
         proposals = pending["proposals"]
         prior_reviews = pending["prior_reviews"]
+        if "required_findings" not in pending:
+            raise HarnessError("审阅阶段缺少必需问题对照；保留证据")
+        required = pending["required_findings"]
+        delivered = delivered_worker_findings(self.context, tid, Path(pending["worker_artifact"]).parent.name)
         review, diagnostics = self.services.receipts.dispatch_review("review", tid,
                  {"goal": self.context.run["goal"], "task": task, "base_commit": self.context.run["expected_head"], "changed_files": paths,
                   "instruction_file_changes": instruction_file_changes(paths),
                   "diff_artifact": str(evidence), "verification": compact_checks(checks),
                   "ignored_paths": deepcopy(self.context.run.get("ignored_diagnostics")),
                   "prior_reviews": prior_reviews,
-                  "required_findings": pending.get("required_findings", []),
-                  "repair_claims": pending["worker_result"].get("repair_claims", []),
+                  "required_findings": required,
+                  "repair_claims": claims_for_review(required, delivered, pending["worker_result"].get("repair_claims")),
                   "recovery": worker_recovery_context(self.context.run, self.context.directory, tid),
                   "proposed_memories": proposals,
                   "decision_requests": deepcopy(pending["worker_result"].get("decision_requests", [])),
-                  "tool_constraints": self.services.packets.tool_constraints()}, task=task)
+                  "tool_constraints": self.services.packets.tool_constraints()}, task=task, required=required)
         review_artifact = evidence.parent / "review.json"
         record = {"attempt": attempt, "review": review, "diff_artifact": str(evidence),
                   "verification": str(evidence.parent / "results.json"), "artifact": str(review_artifact),
-                  "snapshot_digest": reviewed_digest, "snapshot_artifact": str(snapshot_artifact), **diagnostics}
+                  "snapshot_digest": reviewed_digest, "snapshot_artifact": str(snapshot_artifact),
+                  "required_findings": deepcopy(required), **diagnostics}
         record["review_source"] = bind_review_source(self.context, "review", tid, review, reviewed_digest)
         record["dispatch_id"] = record["review_source"]["dispatch_id"]
-        disposition_errors = disposition_gaps(review, pending.get("required_findings", []))
+        disposition_errors = disposition_gaps(review, required)
         if disposition_errors:
             diagnostics = {**diagnostics, "disposition_errors": disposition_errors}
             record.update(diagnostics)

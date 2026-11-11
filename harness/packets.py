@@ -9,7 +9,7 @@ from .command_server import command_id
 from .context import (
     capacity_report, compact_checks, compact_plan, compact_reviews, instruction_file_changes,
 )
-from .contracts import envelope, output_constraints, REVIEW, review_output_constraints
+from .contracts import envelope, output_constraints, review_output_constraints, review_schema, with_keys
 from .path_evidence import project_paths
 from .input_projection import project_history, project_commands
 from .services import RuntimeService
@@ -17,7 +17,7 @@ from .shared import read_skill, skills_catalog
 from .util import HarnessError
 from .verification_plan import build_verification_plan, finding_progress_packet, project_finding_sources, verification_role_view, recent_costs
 from .continuation import packet as continuation_packet
-from .review_progress import required_findings, validate_review_source, worker_claim_template_reference
+from .review_progress import required_findings, validate_review_source
 from .recovery import snapshot_digest
 
 
@@ -33,7 +33,7 @@ class PacketBuilder(RuntimeService):
         return compact_plan(self.context.run["original_tasks"], self.context.run["tasks"])
 
     def final_review_packet(self, *, checks, diff_artifact, changed_paths,
-                            tasks=None, original_tasks=None, history=None):
+                            tasks=None, original_tasks=None, history=None, required=None):
         """Build the shared final-review evidence before runtime projections.
 
         Callers supply only the evidence available at their stage. Capacity
@@ -43,6 +43,11 @@ class PacketBuilder(RuntimeService):
         tasks = self.context.run["tasks"] if tasks is None else tasks
         original_tasks = self.context.run["original_tasks"] if original_tasks is None else original_tasks
         history = self.context.run.get("final_history", []) if history is None else history
+        if required is None:
+            # Capacity preflight; a final review passes its saved mapping instead.
+            required = required_findings(
+                self.context.run, "final", snapshot_digest(self.context.snapshot()),
+                whole_run=True, records=history) if any(item.get("review") for item in history) else []
         return {
             "goal": self.context.run["goal"], **compact_plan(original_tasks, tasks),
             "accepted": self.accepted_context(), "base_commit": self.context.run["base_commit"],
@@ -52,30 +57,18 @@ class PacketBuilder(RuntimeService):
             "ignored_paths": deepcopy(self.context.run.get("ignored_diagnostics")),
             "tool_constraints": self.tool_constraints(),
             "prior_reviews": compact_reviews([item for item in history if item["status"] != "running"]),
-            "required_findings": required_findings(
-                self.context.run, "final", snapshot_digest(self.context.snapshot()),
-                whole_run=True, records=history) if any(item.get("review") for item in history) else [],
+            "required_findings": required,
         }
 
     def role_input(self, *, role, kind, task_id, schema, dispatch_id, packet, task=None):
         """Construct the same mandatory role envelope for dispatch and estimates."""
         packet = project_paths(packet, self.context.directory)
         packet = project_commands(packet, self.context.directory)
-        schema = deepcopy(schema)
-        if role == "worker":
-            for field, needed in (("evidence_files", bool((task or {}).get("evidence_requirements"))),
-                                  ("repair_claims", bool(packet.get("required_findings")))):
-                if needed:
-                    pass  # Required for completed candidates by preflight; blocked workers can yield normally.
-                else:
-                    schema["properties"].pop(field, None)
-        elif role == "reviewer":
-            if not packet.get("required_findings"):
-                schema["properties"].pop("finding_dispositions", None)
-        if role == "worker":
-            template = worker_claim_template_reference(self.context, task_id, dispatch_id, packet)
-            if template is not None:
-                packet["repair_claims_template"] = template
+        # A worker's runtime-keyed repair_claims follow the required findings
+        # computed into this packet; a reviewer's schema arrives already keyed
+        # from its saved mapping (ResultReceipts.dispatch_review).
+        schema = (with_keys(schema, "repair_claims", packet.get("required_findings", []))
+                  if role == "worker" else deepcopy(schema))
         contract = envelope(schema, task_id, dispatch_id)
         required = {
             "role": role, "kind": kind, "task_id": task_id, "dispatch_id": dispatch_id,
@@ -118,7 +111,8 @@ class PacketBuilder(RuntimeService):
         packet = self.final_review_packet(checks=checks, diff_artifact="", changed_paths=[],
                                           tasks=tasks, original_tasks=original_tasks)
         packet = self.runtime_packet(packet, role="reviewer", kind="final_review", task_id="final")
-        _, required = self.role_input(role="reviewer", kind="final_review", task_id="final", schema=REVIEW,
+        _, required = self.role_input(role="reviewer", kind="final_review", task_id="final",
+                                     schema=review_schema(packet.get("required_findings", [])),
                                      dispatch_id=dispatch_id, packet=packet)
         projected = deepcopy(required)
         # Decisions are still fully validated and included in the estimate.

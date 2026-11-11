@@ -2,8 +2,9 @@ import copy
 import unittest
 
 from harness.contracts import (REPLAN, review_approved, validate, validate_review,
-                               validate_plan, validate_revision, validate_work)
+                               validate_plan, validate_revision)
 from harness.util import HarnessError
+from test_runtime_changes import validate_work_contract
 
 
 def task(ident="implement", depends_on=None):
@@ -116,10 +117,6 @@ class AcceptanceContractTests(unittest.TestCase):
             with self.subTest(changes=changes), self.assertRaises(HarnessError):
                 validate_review(review([problem]))
 
-    def test_finding_ids_must_be_unique(self):
-        with self.assertRaises(HarnessError):
-            validate_review(review([finding(), finding()]))
-
     def test_memory_approval_is_independent_and_keys_must_exist(self):
         accepted = review(approved_keys=["architecture.storage"])
         validate_review(accepted, proposed_keys=["architecture.storage"])
@@ -131,13 +128,13 @@ class AcceptanceContractTests(unittest.TestCase):
     def test_worker_blocker_classification_is_consistent(self):
         completed = {"status": "completed", "summary": "Complete", "evidence": [],
                      "blockers": [], "blocker_kind": "none", "proposed_memories": []}
-        validate_work(completed)
+        validate_work_contract(completed)
         for change in ({"blocker_kind": "task"}, {"blockers": ["Missing dependency"]},
                        {"status": "blocked"}):
             with self.subTest(change=change), self.assertRaises(HarnessError):
-                validate_work({**completed, **change})
+                validate_work_contract({**completed, **change})
         for kind in ("task", "environment"):
-            validate_work({**completed, "status": "blocked", "blockers": ["Dependency unavailable"],
+            validate_work_contract({**completed, "status": "blocked", "blockers": ["Dependency unavailable"],
                            "blocker_kind": kind})
 
     def test_worker_proposals_are_bounded_and_unique(self):
@@ -145,11 +142,11 @@ class AcceptanceContractTests(unittest.TestCase):
                     "source_paths": ["src/store.py"]}
         result = {"status": "completed", "summary": "Complete", "evidence": [],
                   "blockers": [], "blocker_kind": "none", "proposed_memories": [proposal]}
-        validate_work(result)
+        validate_work_contract(result)
         for proposals in ([proposal, proposal], [{**proposal, "content": "x" * 8001}],
                           [{**proposal, "key": "../operator"}], [{**proposal, "source_paths": []}]):
             with self.subTest(proposals=proposals), self.assertRaises(HarnessError):
-                validate_work({**result, "proposed_memories": proposals})
+                validate_work_contract({**result, "proposed_memories": proposals})
 
 
 if __name__ == "__main__":

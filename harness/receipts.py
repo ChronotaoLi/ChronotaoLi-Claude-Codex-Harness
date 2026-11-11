@@ -8,7 +8,7 @@ from pathlib import Path
 from . import git
 from .context import compact_review
 from .contracts import (
-    apply_revision, envelope, RepairableFormatError, REVIEW, review_approved, validate,
+    apply_revision, envelope, RepairableFormatError, review_approved, review_schema, validate,
     validate_approval_repair, validate_commander_format_correction, validate_immutable_findings,
     validate_review, validate_review_correction, validate_review_semantics, validate_structure,
 )
@@ -262,10 +262,12 @@ class ResultReceipts(RuntimeService):
             raise rejection
         return {k: v for k, v in result.items() if k not in ("task_id", "dispatch_id")}
 
-    def dispatch_review(self, kind, task_id, packet, task=None):
+    def dispatch_review(self, kind, task_id, packet, task=None, *, required):
+        """Dispatch one review whose runtime-keyed dispositions follow its saved mapping."""
+        schema = review_schema(required)
         try:
-            review = self.services.dispatch.dispatch("reviewer", kind, task_id, REVIEW, packet, task)
+            review = self.services.dispatch.dispatch("reviewer", kind, task_id, schema, packet, task)
         except InvalidReviewRejection as rejection:
             return rejection.review, rejection.diagnostics
-        validate_review(review, [p["key"] for p in packet.get("proposed_memories", [])])
+        validate_review(review, [p["key"] for p in packet.get("proposed_memories", [])], schema)
         return review, {}

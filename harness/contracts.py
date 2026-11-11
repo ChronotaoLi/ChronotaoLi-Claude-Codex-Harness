@@ -68,12 +68,8 @@ WORK["properties"].update(
     continuation_request=obj(kind={"type": "string", "enum": ["commands", "budget"]},
         commands=REQUIRED_COMMANDS,
         minimum_timeout_seconds={"type": "integer", "minimum": 0, "maximum": 86400}, reason=DETAIL),
-    evidence_files={"type": "array", "maxItems": 32, "items": obj(
-        requirement_id=SAFE_ID, path=FILE_EVIDENCE["properties"]["path"],
-        sha256=FILE_EVIDENCE["properties"]["sha256"], kind=EVIDENCE_KIND)},
-    repair_claims={"type": "array", "maxItems": 60, "items": obj(
-        review_dispatch_id=NONBLANK, finding_id=SAFE_ID, summary=DETAIL,
-        evidence_paths={"type": "array", "items": NONBLANK, "maxItems": 20})})
+)
+REPAIR_CLAIM = obj(summary=DETAIL, evidence_paths={"type": "array", "items": NONBLANK, "maxItems": 20})
 FINDING = obj(id=SAFE_ID,
               severity={"type": "string", "enum": ["blocking", "advisory"]},
               category={"type": "string", "enum": ["defect", "evidence", "scope", "preference"]},
@@ -81,10 +77,29 @@ FINDING = obj(id=SAFE_ID,
 REVIEW = obj(verdict={"type": "string", "enum": ["approve", "request_changes"]},
              summary=DETAIL, findings={"type": "array", "items": FINDING, "maxItems": 30},
              approved_memory_keys={"type": "array", "items": SAFE_ID, "maxItems": 8, "uniqueItems": True})
-REVIEW["properties"]["finding_dispositions"] = {
-    "type": "array", "maxItems": 60, "items": obj(
-        review_dispatch_id=NONBLANK, finding_id=SAFE_ID,
-        status={"type": "string", "enum": ["resolved", "open", "not_checked"]}, evidence=EVIDENCE)}
+DISPOSITION = obj(status={"type": "string", "enum": ["resolved", "open", "not_checked"]}, evidence=EVIDENCE)
+# Runtime-keyed fields: one runtime-generated key per required finding of this
+# dispatch, so a model can neither add, omit, repeat nor misattribute an entry.
+KEYED_ITEMS = {"finding_dispositions": DISPOSITION, "repair_claims": REPAIR_CLAIM}
+
+
+def fixed_keys(rows, item):
+    """An object whose properties are exactly the rows' keys, all required."""
+    keys = [row["key"] for row in rows]
+    return {"type": "object", "properties": {key: deepcopy(item) for key in keys},
+            "required": keys, "additionalProperties": False}
+
+
+def with_keys(schema, field, rows):
+    """Copy a contract and add its runtime-keyed field, absent when nothing is required."""
+    result = deepcopy(schema)
+    if rows:
+        result["properties"][field] = fixed_keys(rows, KEYED_ITEMS[field])
+    return result
+
+
+def review_schema(rows):
+    return with_keys(REVIEW, "finding_dispositions", rows)
 
 
 def envelope(schema, task_id, dispatch_id):
@@ -103,14 +118,22 @@ class RepairableFormatError(HarnessError):
 
 
 def output_constraints(schema, path="response"):
-    """Derive the local constraints omitted from the providers' schema subset."""
+    """Derive the local constraints omitted from the providers' schema subset.
+
+    An object whose properties (at least two) share one schema, such as a
+    runtime-keyed field, contributes a single ``.*`` path.
+    """
     fields = ("minLength", "maxLength", "pattern", "minItems", "maxItems", "uniqueItems", "minimum", "maximum")
     bounds = {key: deepcopy(schema[key]) for key in fields if key in schema}
     if schema.get("minLength", 0):
         bounds["non_blank"] = True
     result = [{"path": path, **bounds}] if bounds else []
-    for key, field in schema.get("properties", {}).items():
-        result.extend(output_constraints(field, f"{path}.{key}"))
+    values = list(schema.get("properties", {}).values())
+    if len(values) >= 2 and all(value == values[0] for value in values[1:]):
+        result.extend(output_constraints(values[0], f"{path}.*"))
+    else:
+        for key, field in schema.get("properties", {}).items():
+            result.extend(output_constraints(field, f"{path}.{key}"))
     if "items" in schema:
         result.extend(output_constraints(schema["items"], f"{path}[]"))
     return result
@@ -119,14 +142,12 @@ def output_constraints(schema, path="response"):
 def review_output_constraints(schema, proposed_keys=()):
     """Expose review semantics alongside the schema's ordinary format bounds.
 
-    ``uniqueBy`` names the field that must be unique across array items;
     ``subsetOf`` lists all permitted array values. The conditional rule applies
     independently to every finding, using JSON Schema's if/then structure.
     These input constraints do not extend either provider's wire schema.
     """
     result = output_constraints(schema)
     by_path = {constraint["path"]: constraint for constraint in result}
-    by_path["response.findings"]["uniqueBy"] = "id"
     approved = by_path["response.approved_memory_keys"]
     approved["subsetOf"] = list(dict.fromkeys(proposed_keys))
     if not approved["subsetOf"]:
@@ -203,13 +224,6 @@ def validate_work_semantics(result):
         if ((continuation["kind"] == "commands" and (not continuation["commands"] or continuation["minimum_timeout_seconds"] != 0))
                 or (continuation["kind"] == "budget" and (continuation["commands"] or continuation["minimum_timeout_seconds"] <= 0))):
             raise HarnessError("续作请求必须明确缺少的精确命令或所需的派发时间预算")
-    for field in ("repair_claims",):
-        references = [(r["review_dispatch_id"], r["finding_id"]) for r in result.get(field, [])]
-        if len(set(references)) != len(references):
-            raise HarnessError("修复声明不能重复引用同一来源问题")
-    evidence_ids = [item["requirement_id"] for item in result.get("evidence_files", [])]
-    if len(set(evidence_ids)) != len(evidence_ids):
-        raise HarnessError("任务证据声明 ID 不得重复")
     keys = [proposal["key"] for proposal in result["proposed_memories"]]
     if len(keys) != len(set(keys)):
         raise HarnessError("记忆提案 key 必须唯一")
@@ -224,18 +238,8 @@ def validate_work_semantics(result):
             raise HarnessError("worker decision_requests 的 id 必须唯一")
 
 
-def validate_work(result):
-    validate_structure(result, WORK)
-    validate_work_semantics(result)
-    _validate_format(result, WORK, "response")
-    return result
-
-
 def validate_review_semantics(result, proposed_keys=()):
     """Keep finding identity and memory approvals outside format correction."""
-    ids = [finding["id"] for finding in result["findings"]]
-    if len(ids) != len(set(ids)):
-        raise HarnessError("审阅 finding ID 必须唯一")
     for finding in result["findings"]:
         if finding["severity"] == "blocking":
             if finding["category"] == "preference" or not finding["evidence"]:
@@ -247,17 +251,14 @@ def validate_review_semantics(result, proposed_keys=()):
 
 def validate_finding_dispositions(result):
     """Check immutable dispositions independently of repairable approval metadata."""
-    refs = [(r["review_dispatch_id"], r["finding_id"]) for r in result.get("finding_dispositions", [])]
-    if len(set(refs)) != len(refs):
-        raise HarnessError("审阅处置不能重复引用同一来源问题")
-    if any(r["status"] == "resolved" and not r["evidence"] for r in result.get("finding_dispositions", [])):
+    if any(r["status"] == "resolved" and not r["evidence"] for r in (result.get("finding_dispositions") or {}).values()):
         raise HarnessError("解决问题的审阅处置必须包含核验依据")
 
 
-def validate_review(result, proposed_keys=()):
-    validate_structure(result, REVIEW)
+def validate_review(result, proposed_keys=(), schema=REVIEW):
+    validate_structure(result, schema)
     validate_review_semantics(result, proposed_keys)
-    _validate_format(result, REVIEW, "response")
+    _validate_format(result, schema, "response")
     return result
 
 
@@ -278,7 +279,7 @@ def validate_review_correction(previous, current):
     if (current["verdict"] != previous["verdict"]
             or set(current["approved_memory_keys"]) != set(previous["approved_memory_keys"])
             or len(current["findings"]) != len(previous["findings"])
-            or current.get("finding_dispositions", []) != previous.get("finding_dispositions", [])):
+            or current.get("finding_dispositions") != previous.get("finding_dispositions")):
         raise HarnessError("审阅格式修复不得改变结论、记忆批准或 findings 数量")
     fields = ("severity", "category", "location", "message", "evidence")
     for old, new in zip(previous["findings"], current["findings"]):
@@ -300,14 +301,13 @@ def validate_approval_repair(previous, current, proposed_keys):
     if (not review_approved(previous) or not review_approved(current)
             or set(current["approved_memory_keys"]) != permitted
             or len(previous["findings"]) != len(current["findings"])
-            or current.get("finding_dispositions", []) != previous.get("finding_dispositions", [])):
+            or current.get("finding_dispositions") != previous.get("finding_dispositions")):
         raise HarnessError("显式审阅修正必须保留批准结论、有效记忆批准和全部 findings")
-    ids = [finding["id"] for finding in previous["findings"]]
     for old, new in zip(previous["findings"], current["findings"]):
         if any(old[field] != new[field] for field in ("severity", "category", "location", "message", "evidence")):
             raise HarnessError("显式审阅修正不得改变 finding 内容、严重级别或顺序")
-        if ids.count(old["id"]) == 1 and re.fullmatch(SAFE_ID["pattern"], old["id"]) and new["id"] != old["id"]:
-            raise HarnessError("显式审阅修正不得改变已有合法且唯一的 finding ID")
+        if re.fullmatch(SAFE_ID["pattern"], old["id"]) and new["id"] != old["id"]:
+            raise HarnessError("显式审阅修正不得改变已有合法 finding ID")
 
 
 def validate_commander_format_correction(kind, previous, current):

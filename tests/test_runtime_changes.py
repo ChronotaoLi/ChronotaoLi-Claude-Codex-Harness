@@ -5,6 +5,7 @@ from pathlib import Path
 
 from harness import git
 from harness.adapters import DemoBackend
+from harness.contracts import WORK, validate, validate_structure, validate_work_semantics
 from harness.util import HarnessError, read_json
 from test_harness import RepoCase, ROOT, interrupt_started_agent
 
@@ -13,6 +14,27 @@ def finding(severity="blocking", category="defect"):
     return {"id": "edge-case", "severity": severity, "category": category,
             "location": "hello.py:1", "message": "Inspect the acceptance edge case",
             "evidence": ["test_hello.py requires the greeting"]}
+
+
+def finding_key(packet, label, index=None):
+    """The runtime key a dispatch received for the required finding with this label."""
+    rows = [row for row in packet["required_findings"]
+            if row["label"] == label and (index is None or row["finding_index"] == index)]
+    assert len(rows) == 1, rows
+    return rows[0]["key"]
+
+
+def invalid_rejection(result):
+    """An attributable but semantically invalid rejection: a blocking finding without evidence."""
+    result.update(verdict="request_changes", findings=[{**finding(), "evidence": []}])
+
+
+def validate_work_contract(result, schema=WORK):
+    """Check a worker result in the runtime's order (WorkerReceipts._finish)."""
+    validate_structure(result, schema)
+    validate_work_semantics(result)
+    validate(result, schema)
+    return result
 
 
 class ScriptedBackend(DemoBackend):

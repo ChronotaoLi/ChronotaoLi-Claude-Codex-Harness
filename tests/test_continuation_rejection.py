@@ -13,7 +13,7 @@ from harness import continuation
 from harness.cli import status_summary
 from harness.recovery import snapshot_digest
 from harness.util import HarnessError, read_json, write_json
-from test_harness import RepoCase, ROOT
+from test_harness import RepoCase, ROOT, add_worker_dispatch
 from test_runtime_changes import ScriptedBackend
 
 
@@ -39,7 +39,7 @@ class RejectionEvidenceTests(unittest.TestCase):
         write_json(source_path, self.result)
         self.source = {'dispatch_id': 'worker1', 'artifact': str(source_path),
                        'artifact_digest': hashlib.sha256(source_path.read_bytes()).hexdigest()}
-        self.context.run['dispatches'].append({'id': 'worker1', 'role': 'worker', 'task_id': 'task', 'invoked': True})
+        add_worker_dispatch(self.context.run, self.context.directory, 'worker1', 'task')
         self.row = continuation.record_continuation(self.context, 'task', self.result, self.source, self.candidate)
         self.value = {'continuation_id': self.row['id'], 'task_id': 'task', 'source_dispatch_id': 'worker1',
                       'source_snapshot_digest': snapshot_digest(self.candidate), 'reason': 'Use an alternative implementation.'}

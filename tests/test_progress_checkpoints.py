@@ -10,6 +10,7 @@ from unittest.mock import patch
 from harness.progress import ProgressRecovery
 from harness.util import HarnessError, write_json
 from harness.versions import RUN_SCHEMA_VERSION
+from test_harness import add_worker_dispatch
 
 
 def sha(raw):
@@ -52,7 +53,8 @@ class ProgressTests(unittest.TestCase):
                   'summary': 'blocked', 'evidence': [], 'proposed_memories': [], 'checkpoints': [item]}
         path = rt.context.directory / 'dispatches' / dispatch / 'returned-result.json'
         write_json(path, {**result, 'task_id': 'task', 'dispatch_id': dispatch})
-        rt.context.run['dispatches'].append({'id': dispatch, 'task_id': 'task', 'role': 'worker', 'invoked_at': time.time() if invoked_at == 'now' else invoked_at})
+        add_worker_dispatch(rt.context.run, rt.context.directory, dispatch, 'task',
+                            invoked_at=time.time() if invoked_at == 'now' else invoked_at)
         source = {'artifact': str(path), 'artifact_digest': sha(path.read_bytes())}
         self.last_discarded = rt.record_checkpoints('task', dispatch, result, source)
         return result, source
@@ -171,7 +173,7 @@ class ProgressTests(unittest.TestCase):
         source_path = rt.context.directory / 'dispatches' / 'worker2' / 'returned-result.json'
         write_json(source_path, {**result, 'task_id': 'task', 'dispatch_id': 'worker2'})
         source = {'artifact': str(source_path), 'artifact_digest': sha(source_path.read_bytes())}
-        rt.context.run['dispatches'].append({'id': 'worker2', 'task_id': 'task', 'role': 'worker'})
+        add_worker_dispatch(rt.context.run, rt.context.directory, 'worker2', 'task')
         discarded = rt.record_checkpoints('task', 'worker2', result, source)
         self.assertIn('reserved or unsafe', discarded[0]['reason'])
 
@@ -188,7 +190,7 @@ class ProgressTests(unittest.TestCase):
         source_path = rt.context.directory / 'dispatches' / 'worker1' / 'returned-result.json'
         write_json(source_path, {**result, 'task_id': 'task', 'dispatch_id': 'worker1'})
         source = {'artifact': str(source_path), 'artifact_digest': sha(source_path.read_bytes())}
-        rt.context.run['dispatches'].append({'id': 'worker1', 'task_id': 'task', 'role': 'worker'})
+        add_worker_dispatch(rt.context.run, rt.context.directory, 'worker1', 'task')
         rt.record_checkpoints('task', 'worker1', result, source)
         packet = rt.progress_packet({}, task_id='task')
         self.assertEqual(len(packet['task_checkpoints']), 16)

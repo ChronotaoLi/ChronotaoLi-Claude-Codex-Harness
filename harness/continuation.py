@@ -9,7 +9,8 @@ import json
 from pathlib import Path
 
 from . import git
-from .contracts import WORK, envelope, validate_structure, validate_work_semantics
+from .contracts import validate_structure, validate_work_semantics
+from .worker_receipts import delivered_work_contract
 from .git_query import covers as git_query_covers
 from .recovery import RECOVERY_BUSY_KEYS, read_bound_result, snapshot_digest
 from .util import HarnessError, dump, write_json
@@ -87,7 +88,7 @@ def _source(context, task_id, source):
     if any(p.is_symlink() for p in (source_path, *source_path.parents)) or not source_path.is_file():
         raise HarnessError('worker source must be a non-symlink file')
     result, _ = read_bound_result(source, 'continuation worker')
-    validate_structure(result, envelope(WORK, task_id, dispatch_id))
+    validate_structure(result, delivered_work_contract(context.run, context.directory, dispatch_id))
     validate_work_semantics(result)
     return result
 

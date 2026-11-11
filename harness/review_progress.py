@@ -1,21 +1,14 @@
-"""Source-addressed repair claims and independent dispositions, never inferred closure."""
+"""Runtime-keyed required findings, repair claims and dispositions; never inferred closure.
+
+A finding's identity is (source review dispatch, position in that review's
+findings); its model-written id is only a label. Each dispatch receives keys
+f1..fN for its required findings, and the key-to-source mapping is saved before
+the dispatch, so a model never writes an identity the runtime already owns.
+"""
+from copy import deepcopy
 from pathlib import PurePosixPath
-import hashlib
-import re
 
 from .util import HarnessError
-
-
-def finding_references(review):
-    """Map immutable original positions to unambiguous protocol references."""
-    findings = review.get("findings", [])
-    ids = [finding["id"] for finding in findings]
-    use_positions = (len(set(ids)) != len(ids) or any(
-        re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,95}", ident) is None
-        for ident in ids))
-    return [(finding, {"finding_id": f"finding-{index + 1}" if use_positions else finding["id"],
-                       "original_finding_id": finding["id"], "finding_index": index})
-            for index, finding in enumerate(findings)]
 
 
 def dispositions_usable(record):
@@ -25,15 +18,25 @@ def dispositions_usable(record):
 
 
 def _blocking_requirements(record):
-    references = finding_references(record["review"])
-    aliases = any(finding["id"] != reference["finding_id"] for finding, reference in references)
-    return [{"review_dispatch_id": record["review_source"]["dispatch_id"],
-             **(reference if aliases else {"finding_id": reference["finding_id"]}),
-             "artifact": record["review_source"]["artifact"], "status": "open"}
-            for finding, reference in references if finding.get("severity") == "blocking"]
+    source = record["review_source"]
+    return [{"review_dispatch_id": source["dispatch_id"], "finding_index": index,
+             "label": finding["id"], "artifact": source["artifact"]}
+            for index, finding in enumerate(record["review"].get("findings", []))
+            if finding.get("severity") == "blocking"]
+
+
+def _keyed(issues):
+    return [{"key": f"f{number}", **row} for number, row in enumerate(issues.values(), 1)]
 
 
 def required_findings(run, task_id, candidate_digest, *, whole_run=False, records=None):
+    """Open blocking findings for one candidate, keyed f1..fN in history order.
+
+    A usable record's resolved dispositions close findings only on the candidate
+    it reviewed, and only through its saved copy of the mapping its dispatch
+    received. That copy must equal, row by row, the list recomputed from the same
+    history prefix and candidate; any difference stops instead of guessing.
+    """
     issues = {}
     if records is None:
         records = run.get("final_history", []) if whole_run else run.get("review_history", {}).get(task_id, [])
@@ -43,137 +46,126 @@ def required_findings(run, task_id, candidate_digest, *, whole_run=False, record
                 raise HarnessError("历史审阅格式无效；必须保留并核对原始阻断证据")
             continue
         validate_review_source(run, task_id, record, kind="final_review" if whole_run else "review")
-        review = record["review"]
+        dispositions = record["review"].get("finding_dispositions")
+        closed = []
+        if (dispositions and record.get("snapshot_digest") == candidate_digest
+                and dispositions_usable(record)):
+            copy = record.get("required_findings")
+            if copy != _keyed(issues) or set(dispositions) != {row["key"] for row in copy}:
+                raise HarnessError("审阅处置与键对照不符；保留证据")
+            mapping = {row["key"]: (row["review_dispatch_id"], row["finding_index"]) for row in copy}
+            closed = [mapping[key] for key, row in dispositions.items() if row["status"] == "resolved"]
         for row in _blocking_requirements(record):
-            issues[(row["review_dispatch_id"], row["finding_id"])] = row
-        for disposition in review.get("finding_dispositions", []):
-            key = (disposition["review_dispatch_id"], disposition["finding_id"])
-            if (key in issues and disposition["status"] == "resolved"
-                    and record.get("snapshot_digest") == candidate_digest
-                    and dispositions_usable(record)):
-                issues.pop(key)
+            issues[(row["review_dispatch_id"], row["finding_index"])] = row
+        for reference in closed:
+            issues.pop(reference, None)
     if len(issues) > 60:
         raise HarnessError("待核验阻断问题超过单次审阅容量；保留全部来源，需调整任务计划")
-    return list(issues.values())
-
-
-def worker_findings_payload(task_id, dispatch_id, packet):
-    """Build the delivered identities and a draft that makes no repair claim."""
-    from copy import deepcopy
-    rows = deepcopy(packet.get("required_findings", []))
-    if len(rows) > 60:
-        raise HarnessError("worker 必需问题超过单次审阅容量；保留来源并调整计划")
-    sources = packet.get("required_finding_sources", {})
-    for row in rows:
-        if "artifact" not in row:
-            source = sources.get(row["review_dispatch_id"], {})
-            if not source.get("artifact"):
-                raise HarnessError("worker 必需问题缺少原始来源")
-            row["artifact"] = source["artifact"]
-    value = {"dispatch_id": dispatch_id, "task_id": task_id, "required_findings": rows}
-    if rows:
-        value["repair_claims_template"] = [
-            {"review_dispatch_id": row["review_dispatch_id"], "finding_id": row["finding_id"],
-             "summary": "", "evidence_paths": []} for row in rows]
-    return value
-
-
-def worker_claim_template_reference(context, task_id, dispatch_id, packet):
-    """Reference the exact sidecar that bind_worker_findings publishes before invoke."""
-    from .util import dump
-    value = worker_findings_payload(task_id, dispatch_id, packet)
-    if not value["required_findings"]:
-        return None
-    artifact = context.directory / "dispatches" / dispatch_id / "worker-findings.json"
-    return {"artifact": str(artifact),
-            "artifact_digest": hashlib.sha256((dump(value) + "\n").encode("utf-8")).hexdigest(),
-            "field": "repair_claims_template", "required_count": len(value["required_findings"]),
-            "policy": "Read the bound draft; complete every identity once within output_constraints. "
-                      "Empty fields prove no repair. evidence_paths name candidate-relative files; "
-                      "external logs belong in evidence. Independent review decides resolution."}
-
-
-def bind_worker_findings(context, entry, packet):
-    """Save the exact delivered obligations, before hooks can change the candidate."""
-    from .util import write_json
-    artifact = context.directory / "dispatches" / entry["id"] / "worker-findings.json"
-    value = worker_findings_payload(entry["task_id"], entry["id"], packet)
-    write_json(artifact, value)
-    entry["worker_findings"] = {"artifact": str(artifact),
-        "artifact_digest": hashlib.sha256(artifact.read_bytes()).hexdigest()}
+    return _keyed(issues)
 
 
 def delivered_worker_findings(context, task_id, dispatch_id):
-    """Authenticate delivered requirements independently of the post-hook snapshot."""
-    from .recovery import read_bound_result
+    """The required findings one worker dispatch received, read from its published packet.json.
+
+    The packet and contract are the files whose SHA256 the receipt intent saved
+    with invoked=true. Every row must name a blocking finding of an authenticated
+    review of this task, and the keys must equal the contract's repair_claims.
+    """
+    from .worker_receipts import read_worker_input
     entries = [d for d in context.run.get("dispatches", []) if d.get("id") == dispatch_id]
     if (len(entries) != 1 or entries[0].get("role") != "worker"
-            or entries[0].get("task_id") != task_id):
+            or entries[0].get("task_id") != task_id or entries[0].get("invoked") is not True):
         raise HarnessError("worker 必需问题的派发身份无效；保留证据")
-    binding = entries[0].get("worker_findings")
-    expected = context.directory / "dispatches" / dispatch_id / "worker-findings.json"
-    if (not isinstance(binding, dict) or binding.get("artifact") != str(expected)
-            or not binding.get("artifact_digest")):
-        raise HarnessError("worker 缺少实际交付的必需问题绑定；禁止推断清单，请保留证据后 abandon")
     try:
-        if any(p.is_symlink() for p in (expected, *expected.parents)):
-            raise ValueError("symbolic link")
-        value, _ = read_bound_result(binding, "worker 必需问题")
-        if (not isinstance(value, dict) or value.get("dispatch_id") != dispatch_id or value.get("task_id") != task_id):
-            raise ValueError("dispatch or task binding changed")
-        rows = value["required_findings"]
+        intent = entries[0].get("worker_receipt")
+        if not isinstance(intent, dict):
+            raise ValueError("missing worker intent")
+        packet = read_worker_input(context.directory, entries[0], intent, "packet")
+        schema = read_worker_input(context.directory, entries[0], intent, "schema")
+        rows = packet.get("required_findings", [])
+        sources = packet.get("required_finding_sources", {})
         if not isinstance(rows, list) or len(rows) > 60:
             raise ValueError("required findings capacity invalid")
-        references = set()
-        canonical_sources = {}
+        keys = [row["key"] for row in rows]
+        claims = schema["properties"].get("repair_claims")
+        if keys != [f"f{n}" for n in range(1, len(rows) + 1)] or (
+                claims["required"] if claims else []) != keys:
+            raise ValueError("delivered keys differ from delivered contract")
+        canonical = {}
         records = context.run.get("review_history", {}).get(task_id, [])
+        result, seen = [], set()
         for row in rows:
             source = row["review_dispatch_id"]
-            if source not in canonical_sources:
+            if source not in canonical:
                 matches = [r for r in records if (r.get("review_source") or {}).get("dispatch_id") == source]
                 if len(matches) != 1:
                     raise ValueError("review source missing or ambiguous")
                 validate_review_source(context.run, task_id, matches[0])
-                canonical_sources[source] = _blocking_requirements(matches[0])
-            key = (source, row["finding_id"])
-            if row not in canonical_sources[source] or key in references:
+                canonical[source] = {r["finding_index"]: r for r in _blocking_requirements(matches[0])}
+            original = canonical[source].get(row["finding_index"])
+            artifact = row.get("artifact", sources.get(source, {}).get("artifact"))
+            if (original is None or original["label"] != row["label"] or artifact != original["artifact"]
+                    or (source, row["finding_index"]) in seen):
                 raise ValueError("required finding differs from original source")
-            references.add(key)
-        return rows
-    except (OSError, ValueError, KeyError, TypeError) as error:
+            seen.add((source, row["finding_index"]))
+            result.append({"key": row["key"], **original})
+        return result
+    except (HarnessError, ValueError, KeyError, TypeError, AttributeError) as error:
         raise HarnessError("worker 实际交付的必需问题证据损坏；保留证据，禁止推断清单") from error
 
 
-def claim_gaps(result, required, snapshot, *, known=()):
-    claims = {(item["review_dispatch_id"], item["finding_id"]): item
-              for item in result.get("repair_claims", [])}
-    references = {(item["review_dispatch_id"], item["finding_id"]) for item in required}
-    known_references = references | {(item["review_dispatch_id"], item["finding_id"]) for item in known}
-    failures = [{"code": "repair_claim_missing", "review_dispatch_id": source, "finding_id": finding}
-                for source, finding in sorted(references - claims.keys())]
-    for key, claim in claims.items():
-        if key not in known_references:
-            failures.append({"code": "repair_claim_unknown_source", "reference": list(key)})
+def claim_gaps(result, delivered, snapshot):
+    """Mechanical repair-claim gaps; claims never close a finding."""
+    claims = result.get("repair_claims")
+    if delivered and claims is None:
+        return [{"code": "repair_claim_missing", "key": row["key"], "review_dispatch_id": row["review_dispatch_id"],
+                 "finding_index": row["finding_index"]} for row in delivered]
+    failures = []
+    for key, claim in (claims or {}).items():
         for path in claim["evidence_paths"]:
             parts = PurePosixPath(path).parts
             if (not parts or PurePosixPath(path).is_absolute() or ".." in parts
                     or any(p in (".git", ".harness", ".codex", ".claude") for p in parts)
                     or path not in snapshot.get("files", {})):
-                failures.append({"code": "repair_evidence_outside_candidate", "path": path})
+                failures.append({"code": "repair_evidence_outside_candidate", "key": key, "path": path})
     return failures
 
 
 def disposition_gaps(review, required):
-    rows = {(item["review_dispatch_id"], item["finding_id"]): item
-            for item in review.get("finding_dispositions", [])}
-    refs = {(item["review_dispatch_id"], item["finding_id"]) for item in required}
-    failures = [{"code": "finding_disposition_unknown", "reference": list(key)}
-                for key in rows.keys() - refs]
-    for key in refs:
-        row = rows.get(key)
-        if row is None or (review["verdict"] == "approve" and row["status"] != "resolved"):
-            failures.append({"code": "finding_not_independently_resolved", "reference": list(key)})
-    return failures
+    """Required keys left undisposed, or, for an approval, not resolved."""
+    dispositions = review.get("finding_dispositions") or {}
+    return [{"code": "finding_not_independently_resolved", "key": row["key"],
+             "review_dispatch_id": row["review_dispatch_id"], "finding_index": row["finding_index"]}
+            for row in required
+            if row["key"] not in dispositions
+            or (review["verdict"] == "approve" and dispositions[row["key"]]["status"] != "resolved")]
+
+
+def claims_for_review(required, delivered, claims):
+    """Re-key the worker's claims onto this review's keys by source and position."""
+    worker = {(row["review_dispatch_id"], row["finding_index"]): row["key"] for row in delivered}
+    result = {}
+    for row in required:
+        key = worker.get((row["review_dispatch_id"], row["finding_index"]))
+        if key is not None and key in (claims or {}):
+            result[row["key"]] = deepcopy(claims[key])
+    return result
+
+
+def active_review_findings(run, kind, task_id):
+    """The saved key mapping of the review currently in progress; never a default."""
+    if kind == "review":
+        pending = run.get("pending_task") or {}
+        if pending.get("task_id") != task_id or pending.get("stage") != "reviewing" or "required_findings" not in pending:
+            raise HarnessError("当前任务审阅缺少必需问题对照；保留证据")
+        return pending["required_findings"]
+    if kind != "final_review":
+        raise HarnessError("不支持此类审阅修正")
+    history = run.get("final_history") or []
+    record = history[-1] if history else {}
+    if record.get("status") != "running" or record.get("phase") != "reviewing" or "required_findings" not in record:
+        raise HarnessError("当前整体审阅缺少必需问题对照；保留证据")
+    return record["required_findings"]
 
 
 def validate_review_source(run, task_id, record, *, kind="review", candidate_digest=None):

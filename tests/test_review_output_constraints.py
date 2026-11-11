@@ -28,14 +28,13 @@ class ReviewOutputConstraintTests(unittest.TestCase):
             validate_review(result, proposed_keys)
         self.assertNotIsInstance(raised.exception, RepairableFormatError)
 
-    def test_finding_identity_is_unique_even_when_other_fields_differ(self):
+    def test_finding_labels_may_repeat_because_identity_is_position(self):
         bounds = self.constraints()["response.findings"]
-        self.assertEqual(bounds["uniqueBy"], "id")
+        self.assertNotIn("uniqueBy", bounds)
         self.assertEqual(bounds["maxItems"], 30)
         first = finding()
         second = finding(message="A different defect uses the same ID")
-        self.assert_semantic_rejection(review([first, second]))
-        validate_review(review([first, {**second, "id": "second-defect"}]))
+        validate_review(review([first, second]))
 
     def test_blocking_condition_preserves_advisory_without_evidence(self):
         constraint = self.constraints()["response.findings[]"]
