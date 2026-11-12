@@ -18,6 +18,7 @@ class Fixture(DecisionRecovery):
         self.context.save = lambda: self.save()
         self.context.event = lambda event, **fields: self.event(event, **fields)
         self.context.directory = Path(directory).resolve()
+        self.context.state = self.context.directory.parent / '.harness'
         self.events = []
         self.saves = 0
         self.context.run = {'id': 'run_test', 'schema_version': RUN_SCHEMA_VERSION, 'status': 'blocked',
@@ -183,7 +184,8 @@ class OperatorDecisionTests(unittest.TestCase):
         requests = [{'id': 'choice', 'task_id': 'two', 'question': 'Proceed with dependent work?'}]
         write_json(artifact, {'task_id': 'one', 'dispatch_id': 'dispatch_one', 'status': 'completed',
                              'summary': 'Completed source work', 'evidence': [], 'blockers': [],
-                             'blocker_kind': 'none', 'proposed_memories': [], 'decision_requests': requests})
+                             'blocker_kind': 'none', 'proposed_memories': [], 'decision_requests': requests,
+                             'commit_message': {'subject': 'Complete source work', 'body': ''}})
         engine.source['artifact_digest'] = hashlib.sha256(artifact.read_bytes()).hexdigest()
         engine.context.run['accepted']['one'] = {'worker_source': {**engine.source, 'dispatch_id': 'wrong'},
                                          'decision_requests': requests}

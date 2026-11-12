@@ -246,7 +246,8 @@ class EnvironmentRecovery(RuntimeService):
                 or not isinstance(source.get("artifact_digest"), str)):
             raise HarnessError("环境阻断原始证据引用无效")
         result, _ = read_bound_result(source, "环境阻断")
-        validate_work_core(result, delivered_work_contract(self.context.run, self.context.directory, dispatch_id))
+        validate_work_core(result, delivered_work_contract(self.context.run, self.context.directory, dispatch_id),
+                           self.context.state)
         if result["status"] != "blocked" or result["blocker_kind"] != "environment":
             raise HarnessError("环境更新必须绑定 worker 环境阻断结果")
         return result

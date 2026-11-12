@@ -102,7 +102,8 @@ class DecisionRecovery(RuntimeService):
         if request['kind'] in ('worker', 'handoff'):
             if entry.get('role') != 'worker' or entry.get('kind') != 'implement' or entry.get('task_id') != request['source_task_id']:
                 raise HarnessError('decision worker source identity invalid')
-            validate_work_core(result, delivered_work_contract(self.context.run, self.context.directory, dispatch_id))
+            validate_work_core(result, delivered_work_contract(self.context.run, self.context.directory, dispatch_id),
+                               self.context.state)
             if request['kind'] == 'worker':
                 if (request['task_id'] != request['source_task_id'] or result['status'] != 'blocked'
                         or result['blocker_kind'] != 'operator'

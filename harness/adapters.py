@@ -425,7 +425,8 @@ class DemoBackend:
         if role == "worker":
             (cwd / "hello.py").write_text('def greet(name):\n    return f"Hello, {name}!"\n', encoding="utf-8")
             result = {"status": "completed", "summary": "Implemented greet", "evidence": ["hello.py"],
-                      "blockers": [], "blocker_kind": "none", "proposed_memories": []}
+                      "blockers": [], "blocker_kind": "none", "proposed_memories": [],
+                      "commit_message": {"subject": "Add greet(name)", "body": "greet returns a Hello greeting."}}
             if "repair_claims" in schema["properties"]:
                 result["repair_claims"] = {key: {"summary": "Offline fixture reimplemented greet",
                     "evidence_paths": ["hello.py"]} for key in schema["properties"]["repair_claims"]["required"]}

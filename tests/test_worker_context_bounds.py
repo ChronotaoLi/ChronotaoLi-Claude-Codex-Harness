@@ -56,6 +56,8 @@ class BoundedWorkerLifecycleTests(RepoCase):
         def repair(backend, kwargs, packet, result):
             sizes.append(len(kwargs["prompt"]))
             if kwargs["role"] == "worker" and engine.run["attempts"]["greet"] == 1:
+                # A blocked worker writes no commit message (the demo's completed one is dropped).
+                result.pop("commit_message")
                 result.update(copy.deepcopy(blocked))
             elif trigger_kind(kwargs, packet) == "task" and packet["trigger"]["feedback"]:
                 self.assert_full_evidence(packet["trigger"]["feedback"]["worker"], blocked)
@@ -87,6 +89,7 @@ class BoundedWorkerLifecycleTests(RepoCase):
         def repair(backend, kwargs, packet, result):
             sizes.append(len(kwargs["prompt"]))
             if kwargs["role"] == "worker" and sum(c["role"] == "worker" for c in backend.calls) == 1:
+                result.pop("commit_message")
                 result.update(copy.deepcopy(blocked))
             elif kwargs["kind"] == "decide":
                 inspected.append("decide")
@@ -143,6 +146,7 @@ class BoundedWorkerLifecycleTests(RepoCase):
 
         def stop(backend, kwargs, packet, result):
             if kwargs["role"] == "worker":
+                result.pop("commit_message")
                 result.update(copy.deepcopy(blocked))
 
         backend = ScriptedBackend(stop)

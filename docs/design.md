@@ -37,7 +37,7 @@
 | `operations.py`、`supervisor.py` | 操作记录；`supervise` |
 | `permission_diagnostics.py`、`permission_smoke.py`、`tool_smoke.py` | 权限诊断；真实账号联调入口 |
 
-每次调用的输入由三部分组成：`shared/RULES.md` 与该角色的 skill（协议说明，包括各类摘录与索引的读法），以及包（`packet`）。包放数据、索引和现场事实：环境更新、操作者决定和检查点在包里是有界摘录加 SHA256 绑定的索引，与本次任务无关时只带索引。环境、决定、检查点、执行指导、权限、审阅、路径索引、命令目录、问题进度和计划增量的说明不在包里。包里没有剩下的静态协议说明：指挥包不带 `instruction`；不经指挥直接派发时 worker 包的 `instruction` 为 null，续作拒绝写入的指令只含操作者的理由，默认做法与修正被拒续作的做法写在 worker 技能里。必需问题各行的读法（键、来源审阅、原件中的序号、可重复的标签）在 RULES 里，包里只有 `required_findings` 与可选的 `required_finding_sources` 数据。另有几个分类标签（`instruction_file_changes.trust`、`ignored_paths.coverage`、环境检查结果的 `coverage`）、`verification_plan.policy` 的布尔标记、操作者决定里替代非法问题的有界说明，以及提示词中可选记忆前的分隔标题，它们描述具体数据，不是协议说明。worker 包的 `instruction` 是指挥写的指令，属于数据；指挥包另带 `workspace: {head, clean}`，在构造包时同时读取 `expected_head` 和工作树 `git status` 是否干净。
+每次调用的输入由三部分组成：`shared/RULES.md` 与该角色的 skill（协议说明，包括各类摘录与索引的读法），以及包（`packet`）。包放数据、索引和现场事实：环境更新、操作者决定和检查点在包里是有界摘录加 SHA256 绑定的索引，与本次任务无关时只带索引。环境、决定、检查点、执行指导、权限、审阅、路径索引、命令目录、问题进度和计划增量的说明不在包里。包里没有剩下的静态协议说明：指挥包不带 `instruction`；不经指挥直接派发时 worker 包的 `instruction` 为 null，续作拒绝写入的指令只含操作者的理由，默认做法与修正被拒续作的做法写在 worker 技能里。必需问题各行的读法（键、来源审阅、原件中的序号、可重复的标签）在 RULES 里，包里只有 `required_findings` 与可选的 `required_finding_sources` 数据。另有几个分类标签（`instruction_file_changes.trust`、`ignored_paths.coverage`、环境检查结果的 `coverage`）、`verification_plan.policy` 的布尔标记、操作者决定里替代非法问题的有界说明，以及提示词中可选记忆前的分隔标题，它们描述具体数据，不是协议说明。worker 包的 `instruction` 是指挥写的指令，任务审阅包的 `commit_message` 是从 worker 原件读出的消息，都属于数据；指挥包另带 `workspace: {head, clean}`，在构造包时同时读取 `expected_head` 和工作树 `git status` 是否干净。
 
 `dispatches/<id>/` 保存一次调用的输入（worker 的 `packet.json`、`schema.json`；`packet.json` 的 `required_findings` 就是该 worker 的键到问题的对照）、输出、`returned-result.json`、`worker-seal.<SHA256>.json`、命令清单 `commands.json` 与 `commands/<call>/` 下的记录。
 
@@ -58,17 +58,17 @@
 8. 无结果判定绑定原始证据：确认退出后，按 Claude 的 JSON 输出（`process.stdout`）和派发目录中的结果文件把来源判为 retryable、invalid、returned 或 unknown。retryable（没有输出，或完整的显式错误）与 invalid（输出完整，但严格解码不出对象结果）都允许新的计费尝试：可能中断的步骤（分类、为恢复记录读取 Git）先完成，然后判定、判定证据、故障来源和回执消费同次保存，结局分别是 `provider_failure` 与 `result_rejected`；在此之前中断，条目与回执都保持判定前的样子。适配器当场遇到解不出的输出时，走与恢复相同的判定代码（适配器与判定共用一个解码函数），所以是否在判定保存之前中断不改变结局。returned（已有能解码成对象的结果但没有封存）或 unknown（与原始输出冲突、超过读取上限、读文件失败）时，判定与停止原因同次保存，回执保留，`--confirm-exited` 不能解开。判定记录所依据文件的 SHA256，证据删改后不能改判。
 9. 不可变证据先发布，再登记引用：packet、契约、封存、续作类记录、环境更新、决定、检查点和计划先写成内容寻址或带 SHA256 的文件，再在台账存路径与摘要。计划写成 `plans/revision-N.json`（同字节复用，不同即停止），`plan_history` 与 `pending_revision` 只存修订号、路径与 SHA256。文件写入失败时不登记引用；worker 输入写入失败时也不扣调用预算、不保存接收意图或 `invoked=true`，但此前保存的准备条目与随后的失败状态、诊断仍会落盘。未引用的遗留文件被忽略，同内容重试时复用。
 10. 台账对 worker 输入和续作类记录只存摘要与引用：接收意图存 `packet.json`、`schema.json` 的路径与 SHA256；续作、执行指导、续作拒绝行只存 `snapshot_digest`，整棵快照只在不可变文件里。引用文件缺失、被改或换成符号链接时，恢复停止并保留现场。
-11. 无效输出的重做有界。指挥或审阅的一次请求返回读不出否决的无效输出时，在同一次保存里记录错误与原件摘要（`status=invalid`、`invalid_output`）并消费回执，然后自动重做一次；是否重做由整个 run 最后一次模型调用推导（它是同一调用的无效输出且本身不是重做），重做条目记 `retry_of`，输入附上一份无效输出的引用与前 2,000 字符的错误（带上它超出上下文预算时去掉）；这份原件在本地准备（含 `pre_agent`）之后、调用计费之前再按摘要核对一次，缺失或被改即按证据损坏停止。重做仍无效则停止；此后的普通 resume 发起新请求，规则相同。worker 的无效输出记为一次工作尝试，回执消费，调度继续，受 `max_attempts` 约束；blocked 的输出保持约束力：核心结构与语义都合法、只有界限不合格的 environment／operator／task 阻断按原路由，原结果进入 feedback；结构或语义不合法的 blocked 输出按 task 阻断交给指挥决定，feedback 不带原结果；都不给尝试豁免。所有重做都计入 `max_agent_dispatches`；证据损坏或退出未确认时不重做。worker 的 `checkpoints`、`proposed_memories` 与审阅的 `approved_memory_keys` 不参与判定，不合格只丢弃自身并记事件；后续上下文只用它们经过校验、有界的投影（检查点只以登记后的 `task_checkpoints` 出现，记忆提案只投影整批合法时的 key，记忆批准只在接受时起作用、不进入后续上下文），被丢弃的部分不投影，原件保留原值；`decision_requests` 不合格即为无效输出。例外：只因越出已批准范围而无效的指挥修订，在同一次保存里记录错误、越界模式（`out_of_scope_paths`）并消费回执后停止，不自动重做；之后的普通 resume（授权与否）是新请求。
+11. 无效输出的重做有界。指挥或审阅的一次请求返回读不出否决的无效输出时，在同一次保存里记录错误与原件摘要（`status=invalid`、`invalid_output`）并消费回执，然后自动重做一次；是否重做由整个 run 最后一次模型调用推导（它是同一调用的无效输出且本身不是重做），重做条目记 `retry_of`，输入附上一份无效输出的引用与前 2,000 字符的错误（带上它超出上下文预算时去掉）；这份原件在本地准备（含 `pre_agent`）之后、调用计费之前再按摘要核对一次，缺失或被改即按证据损坏停止。重做仍无效则停止；此后的普通 resume 发起新请求，规则相同。worker 的无效输出记为一次工作尝试，回执消费，调度继续，受 `max_attempts` 约束；blocked 的输出保持约束力：核心结构与语义都合法、只有界限不合格的 environment／operator／task 阻断按原路由，原结果进入 feedback；结构或语义不合法的 blocked 输出按 task 阻断交给指挥决定，feedback 不带原结果；都不给尝试豁免。所有重做都计入 `max_agent_dispatches`；证据损坏或退出未确认时不重做。blocked 结果不产生提交，它的 `commit_message` 在每个校验入口（判定与历史复核）都被去掉，不影响判定、路由与豁免，也不进入后续上下文，原件保留原值。worker 的 `checkpoints`、`proposed_memories` 与审阅的 `approved_memory_keys` 不参与判定，不合格只丢弃自身并记事件；后续上下文只用它们经过校验、有界的投影（检查点只以登记后的 `task_checkpoints` 出现，记忆提案只投影整批合法时的 key，记忆批准只在接受时起作用、不进入后续上下文），被丢弃的部分不投影，原件保留原值；`decision_requests` 不合格即为无效输出。例外：只因越出已批准范围而无效的指挥修订，在同一次保存里记录错误、越界模式（`out_of_scope_paths`）并消费回执后停止，不自动重做；之后的普通 resume（授权与否）是新请求。
 
 **接受**
 
 12. 任务接受同时要求：合法结果声明完成且无 blocker；任务的证据要求在候选中都是普通文件，由运行时检查并记录摘要，不取 worker 的声明；Git 绑定与 HEAD 未变，改动（含暂存区）在 `allowed_paths` 内；全部验证命令成功；新审阅实例批准、无 blocking finding，并且按固定键给出的必需问题处置全部为 resolved；接受前快照等于审阅时快照。必需问题由审阅历史在当前候选上推导：处置只在它的审阅快照等于该候选、且该审阅可用时关闭问题。
 13. `pre_accept` 前后都重新哈希完整快照（含暂存区），不用 mtime、size 或 Git 的未变判断；快照变化时旧批准持久标为失效，任务重新执行、验证和审阅。
-14. 提交与接受记录共用一道屏障：commit 后，`accepted`、`expected_head`、`pending_post_accept` 同次保存，同时清除 `pending_acceptance`、`current_task` 和反馈。commit 已落盘而台账未保存时，恢复因 HEAD 不符停止，不自动修复。
+14. 提交与接受记录共用一道屏障：commit 后，`accepted`、`expected_head`、`pending_post_accept` 同次保存，同时清除 `pending_acceptance`、`current_task` 和反馈。提交消息取自 worker 原件里的 `commit_message`，台账不另存副本：原件由 `pending_acceptance.worker_source` 指定，这个来源必须与批准该候选的审阅记录中的来源、工作尝试和快照一致；`pre_accept` 前后各按摘要读一次，来源不完整、缺失、被改或不一致即停止、不提交。运行时只追加 `Harness-Run`、`Harness-Task` 两行 trailer，以固定作者与提交者、UTF-8 编码、不签名、不运行仓库 hooks、`--cleanup=verbatim` 原样提交。没有改动时不提交。commit 已落盘而台账未保存时，恢复因 HEAD 不符停止，不自动修复。
 15. 全部任务接受后重新验证，再由新审阅者审阅 base 到 HEAD 的完整 diff；最终快照不变才 `completed`。同一快照的整体拒绝不能靠 resume 重抽，只能由通过正常门禁的修正任务改变候选；同一快照的拒绝或非超时验证失败在新的修订落地之前持续触发 `decide`，空修正被接受后不重抽整体审阅。
 16. Git 绑定在创建工作树后按实际解析结果保存（`.git`、gitdir 反向链接、公共目录、预期分支）；每个工作树 Git 命令显式指定 git-dir 与 work-tree 并剔除 `GIT_*` 环境变量，操作前后核验绑定。接受、归档、恢复、移除和记忆来源核验都使用它。
 17. `allowed_paths` 从仓库根匹配，`*`、`?`、字符集只作用于单段，独立 `**` 段跨层级；`.git`、`.harness`、`.codex`、`.claude` 在规划和接受时都被拒绝，工作树内的 `.harness` 一律拒绝；索引含 gitlink 的仓库在创建工作树前拒绝。
-18. 接受记录和任务记忆用审阅者的摘要；记忆提案须审阅者逐项批准才写入 `knowledge:`；记忆都是参考（`reference_only`），不授予权限或替代决定。
+18. 接受记录和任务记忆用审阅者的摘要；提交消息由 worker 撰写、审阅者审查，不进接受记录和任务记忆。任务审阅包里的消息在每次构造包时从 `pending_task` 绑定的 worker 原件按摘要读出，台账结果与原件不同即停止、不派发审阅。记忆提案须审阅者逐项批准才写入 `knowledge:`；记忆都是参考（`reference_only`），不授予权限或替代决定。
 
 **预算**
 
@@ -154,8 +154,8 @@
 | --- | --- | --- | --- |
 | `current_task` | `decide` 选择任务；修订发布（选中的任务） | 接受 | 有当前任务时只调度它；待派发指令的任务必须等于它 |
 | `pending_directive` | `decide` 的 implement（与回执消费同次）；修订发布（另带 `revision`）；续作拒绝 | worker 调用前与预算同次消费 | 本地准备失败时保留；派发前（`pre_agent` 之前与之后）核对任务、快照，修订来源的再与计划文件核对 |
-| `pending_task` | worker 交接（`verifying`，与回执消费同次）；预检通过后与验证轮次同次保存审阅对照 `required_findings`；验证后 `reviewing` | 审阅结束（与 `review_history` 及后续阶段同次）；候选变化、预检或验证失败 | 同一快照复用已完成阶段；reviewing 阶段的审阅派发、重放和重做都只用保存的对照，缺少即停止 |
-| `pending_acceptance` | 审阅批准 | 接受登记或候选变化 | `pre_accept` 前递增 `hook_attempts`；快照未变只重试 hook |
+| `pending_task` | worker 交接（`verifying`，与回执消费同次）；预检通过后与验证轮次同次保存审阅对照 `required_findings`；验证后 `reviewing` | 审阅结束（与 `review_history` 及后续阶段同次）；候选变化、预检或验证失败 | 同一快照复用已完成阶段；reviewing 阶段的审阅派发、重放和重做都只用保存的对照，缺少即停止；每次构造审阅包都按摘要读 worker 原件，`worker_result` 与原件不同即停止 |
+| `pending_acceptance` | 审阅批准（`worker_source` 与审阅记录的来源同次写入，不存提交消息） | 接受登记或候选变化 | `pre_accept` 前递增 `hook_attempts`；快照未变只重试 hook；hook 前后各核对一次 `worker_source` 与批准它的审阅记录一致并按摘要读原件取提交消息 |
 | `pending_post_accept` | 与接受同次 | 任务记忆、知识提案、`task_accepted`、`post_accept` 依次完成 | 每步完成即保存，记忆用稳定操作 ID 去重；完成前不派发后续任务 |
 | `pending_revision` | `decide` 的 revise 落地：计划文件先写，再与回执消费同次保存修订号、路径与 SHA256 | 修订发布 | 发布前复核文件与原件、重放修订；需要时归档、重置，再发布；其间任一点中断，普通 resume 从计划文件重来（见 recovery.md 的指挥提问、修订与范围） |
 | `pending_continuation` | 续作登记 | 条件满足或被拒绝时置 null | 条件未满足时停止并列出缺口 |

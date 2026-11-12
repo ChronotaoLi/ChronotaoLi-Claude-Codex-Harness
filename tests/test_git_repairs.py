@@ -8,6 +8,10 @@ from harness import git
 from harness.util import HarnessError, read_json, write_json
 
 
+# git.accept commits the reviewed worker's message; these checks only need some message.
+ACCEPT_MESSAGE = {"subject": "Accept reviewed change", "body": ""}
+
+
 class GitBoundaryRepairsTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -82,7 +86,7 @@ class GitBoundaryRepairsTests(unittest.TestCase):
         (self.repo / "renamed.py").rename(self.repo / "src/renamed.py")
         paths = git.check_scope(self.repo, ["src/*"])
         self.assertEqual(paths, ["src/renamed.py", "src/root.py"])
-        git.accept(self.repo, paths, "run_rename", "rename")
+        git.accept(self.repo, paths, "run_rename", "rename", ACCEPT_MESSAGE)
         self.assertTrue(git.clean(self.repo))
         self.assertFalse((self.repo / "src/root.py").exists())
         self.assertEqual((self.repo / "src/renamed.py").read_text(), "original\n")
@@ -109,7 +113,7 @@ class GitBoundaryRepairsTests(unittest.TestCase):
             "added": [], "modified": [], "deleted": [],
             "index_changed": True, "head_changed": False,
         })
-        git.accept(self.repo, git.changed(self.repo), "run_diagnostics", "diagnostics")
+        git.accept(self.repo, git.changed(self.repo), "run_diagnostics", "diagnostics", ACCEPT_MESSAGE)
         accepted = git.snapshot(self.repo)
         self.assertTrue(git.snapshot_changes(staged, accepted)["head_changed"])
 
@@ -125,7 +129,7 @@ class GitBoundaryRepairsTests(unittest.TestCase):
             "index_changed": False, "head_changed": False,
         })
         paths = git.check_scope(self.repo, ["src/**"])
-        git.accept(self.repo, paths, "run_directory", "directory")
+        git.accept(self.repo, paths, "run_directory", "directory", ACCEPT_MESSAGE)
         self.assertTrue(git.clean(self.repo))
         self.assertEqual(git.git(self.repo, "show", "HEAD:src/root.py/main.py"), "replacement module\n")
 
@@ -146,14 +150,14 @@ class GitBoundaryRepairsTests(unittest.TestCase):
             "index_changed": False, "head_changed": False,
         })
         paths = git.check_scope(self.repo, ["src/**"])
-        git.accept(self.repo, paths, "run_file", "file")
+        git.accept(self.repo, paths, "run_file", "file", ACCEPT_MESSAGE)
         self.assertTrue(git.clean(self.repo))
         self.assertEqual(git.git(self.repo, "show", "HEAD:src/nested"), "replacement file\n")
 
     def test_accept_uses_literal_filenames_instead_of_git_pathspec_wildcards(self):
         (self.repo / "literal*.txt").write_text("reviewed\n")
         (self.repo / "literal-secret.txt").write_text("not reviewed\n")
-        commit = git.accept(self.repo, ["literal*.txt"], "run_literal", "literal")
+        commit = git.accept(self.repo, ["literal*.txt"], "run_literal", "literal", ACCEPT_MESSAGE)
         self.assertEqual(git.git(self.repo, "show", f"{commit}:literal*.txt"), "reviewed\n")
         self.assertEqual(git.changed(self.repo), ["literal-secret.txt"])
 
@@ -165,7 +169,7 @@ class GitBoundaryRepairsTests(unittest.TestCase):
         path.unlink()
         paths = git.check_scope(self.repo, ["src/*"])
         self.assertEqual(paths, ["src/discarded.py"])
-        self.assertEqual(git.accept(self.repo, paths, "run_deleted", "deleted"), before)
+        self.assertEqual(git.accept(self.repo, paths, "run_deleted", "deleted", ACCEPT_MESSAGE), before)
         self.assertTrue(git.clean(self.repo))
 
     def test_accept_mixed_index_and_worktree_changes_commits_only_reviewed_contents(self):
@@ -180,7 +184,7 @@ class GitBoundaryRepairsTests(unittest.TestCase):
         (self.repo / "src/reviewed.py").write_text("reviewed new contents\n")
         (self.repo / "src/link").symlink_to("missing-target")
         paths = git.check_scope(self.repo, ["src/**"])
-        commit = git.accept(self.repo, paths, "run_mixed", "mixed")
+        commit = git.accept(self.repo, paths, "run_mixed", "mixed", ACCEPT_MESSAGE)
         self.assertEqual(git.git(self.repo, "show", f"{commit}:src/root.py"), "original\n")
         self.assertEqual(git.git(self.repo, "show", f"{commit}:src/reviewed.py"), "reviewed new contents\n")
         self.assertEqual(git.git(self.repo, "show", f"{commit}:src/link"), "missing-target")
@@ -210,7 +214,7 @@ class GitBoundaryRepairsTests(unittest.TestCase):
         saved = self.root / "snapshot.json"
         write_json(saved, snapshot)
         self.assertEqual(read_json(saved), snapshot)
-        git.accept(self.repo, paths, "run_bytes", "bytes")
+        git.accept(self.repo, paths, "run_bytes", "bytes", ACCEPT_MESSAGE)
         self.assertTrue(git.clean(self.repo))
         self.assertEqual(os.readlink(self.repo / "src/link"), target)
         tracked = git.git_bytes(self.repo, "ls-files", "-z").split(b"\0")
@@ -240,7 +244,7 @@ class GitBoundaryRepairsTests(unittest.TestCase):
         self.assertIn(b"new text \xfe", raw)
         self.assertIn(b"GIT binary patch", raw)
         self.assertIn("\ufffd", git.diff(self.repo))
-        git.accept(self.repo, git.changed(self.repo), "run_bytes", "bytes")
+        git.accept(self.repo, git.changed(self.repo), "run_bytes", "bytes", ACCEPT_MESSAGE)
         whole = git.range_diff_bytes(self.repo, base)
         self.assertIn(b"non-UTF8 \xff", whole)
         self.assertIn("\ufffd", git.range_diff(self.repo, base))

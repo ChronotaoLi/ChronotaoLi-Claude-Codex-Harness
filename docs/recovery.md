@@ -72,7 +72,7 @@
 | `… 请先核对并清理越界修改，再 resume` | 核对并清理范围外改动，不自动删除 | 普通 `resume` |
 | `<role> 输出连续两次无效：…；原件 PATH；普通 resume 重新请求，或 abandon` | 读原件与错误（派发条目的 `error`、`invalid_output`）；计划超出整体审阅的必要上下文同样是无效输出 | 普通 `resume`（新请求，最多再两次调用），或 `abandon RUN` |
 | `无效输出原始结果缺失或无法读取`、`无效输出原始结果已改变` | 上一次无效输出的原件被删改（准备前，或本地准备与 `pre_agent` 期间），调用计费前停止 | 恢复原字节后普通 `resume`，或 `abandon RUN` |
-| `worktree HEAD 与检查点不同` | 核对是否有含 `Harness-Run`／`Harness-Task` 的提交（见下一节第 1 条）；不手工伪造接受 | 恢复可信现场后 `resume`，或 `abandon` |
+| `worktree HEAD 与检查点不同` | 核对是否有含 `Harness-Run`／`Harness-Task` 的提交（见下一节第 1 条；读取命令见 [README](../README.md#对自己的项目执行任务)）；不手工伪造接受 | 恢复可信现场后 `resume`，或 `abandon` |
 | 加载时核验的证据被删改（`worker packet artifact changed`、`worker schema artifact changed`、`evidence artifact disagrees with ledger` 等，见[证据损坏](#证据损坏)） | 恢复原字节；不改台账摘要。`abandon` 同样被拒绝 | 恢复后普通 `resume`；无法恢复时保留 run 目录原样，另开新 run |
 | 路径索引、输入索引或环境更新产物损坏（`path-indexes/`、`input-indexes/`、`environment/`） | 恢复原字节 | 恢复后普通 `resume`；无法恢复时可 `abandon RUN` |
 | `待派发指令的代码快照已变化`、`修订保留候选的代码或暂存区已变化`、`待派发指令与已发布计划或候选不符`、`pending continuation candidate or task changed` | 恢复原快照或保留证据 | 普通 `resume` 或 `abandon` |
@@ -216,6 +216,8 @@ python3 -m harness --config /path/to/harness.toml --repo /path/to/project resume
 
 路径索引（`path-indexes/`）、输入索引（`input-indexes/`）和环境更新产物（`environment/`）在 `resume` 预检、派发或接受前核验，不在加载时核验：它们损坏会阻止继续，但不阻止 `abandon`。
 
+提交消息的来源在用到时核验，同样不阻止 `abandon`：构造任务审阅包前，`pending_task.worker_result` 与 worker 原件不同即停止“worker 结果台账与原件不同”，不派发审阅；接受时在 `pre_accept` 前后各核对一次，`pending_acceptance.worker_source` 不完整、与批准它的审阅记录的来源或工作尝试不符即停止“待接受的 worker 来源与批准它的审阅不符”，原件缺失或被改（包括被 `pre_accept` hook 改动）即停止，都不提交。出口是把台账或原件的原字节恢复回去后 `resume`，或者 `abandon`。
+
 ### 终态与历史台账
 
 `completed` run 的普通 `resume` 返回保存结果，不派发；修改选项被拒绝。
@@ -228,7 +230,7 @@ python3 -m harness --config /path/to/harness.toml --repo /path/to/project resume
 
 以下中断窗口需要操作者判断；运行时停止并保留现场，不提供改写台账的捷径。
 
-1. **Git commit 之后、接受台账保存之前被杀**：恢复因 HEAD 不符停止。核对含 `Harness-Run`／`Harness-Task` 的提交，再决定恢复现场或 `abandon`。
+1. **Git commit 之后、接受台账保存之前被杀**：恢复因 HEAD 不符停止，不会再提交一次。用 `git -c trailer.separators=: log --format='%H %(trailers:key=Harness-Task,valueonly)'` 核对含 `Harness-Run`／`Harness-Task` 的提交；它的消息就是 `pending_acceptance.worker_source` 指向的 worker 原件里的 `commit_message`。再决定恢复现场或 `abandon`。
 2. **接受时重建暂存区后、commit 之前中断**：暂存区摘要变化使旧批准失效，任务重新执行、验证、审阅并消耗一次工作尝试；预算用满时需先提高 `max_attempts`。
 3. **worker 已有能解码成对象的原始输出、封存之前中断**：不能把恢复时的工作树补绑为原候选，也不自动重派；与原始输出冲突、超过读取上限或读不出文件（判为 unknown）同样阻塞，`--confirm-exited` 不能解开。保留证据后 `abandon`。对象不合契约时也停在这里，而不中断时它会作为无效输出进入下一次尝试。输出解不出对象（截断、非 JSON、重复键、不是对象）不在此列：无论是否中断，都作为无效输出进入下一次尝试。
 4. **调用前台账保存失败**：可能留下已扣预算、`invoked=true` 的条目；恢复按可重试处理，多计一次尝试。

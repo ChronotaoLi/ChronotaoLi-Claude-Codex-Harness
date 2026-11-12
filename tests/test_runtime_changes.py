@@ -10,6 +10,10 @@ from harness.util import HarnessError, read_json
 from test_harness import RepoCase, ROOT, interrupt_started_agent
 
 
+# git.accept commits the reviewed worker's message; these checks only need some message.
+ACCEPT_MESSAGE = {"subject": "Accept reviewed change", "body": ""}
+
+
 def finding(severity="blocking", category="defect"):
     return {"id": "edge-case", "severity": severity, "category": category,
             "location": "hello.py:1", "message": "Inspect the acceptance edge case",
@@ -29,9 +33,9 @@ def invalid_rejection(result):
     result.update(verdict="request_changes", findings=[{**finding(), "evidence": []}])
 
 
-def validate_work_contract(result, schema=WORK):
+def validate_work_contract(result, schema=WORK, state_root=Path("/harness-test-state/.harness")):
     """Check a worker result's core contract as WorkerReceipts._finish judges it."""
-    validate_work_core(result, schema)
+    validate_work_core(result, schema, state_root)
     validate_work_bounds(result, schema)
     return result
 
@@ -463,7 +467,7 @@ class RuntimeChangesTests(RepoCase):
         git.git(self.repo, "add", "test_hello.py")
         (self.repo / "test_hello.py").write_text(original)
         (self.repo / "hello.py").write_text("# allowed\n")
-        commit = git.accept(self.repo, ["hello.py"], "run_test", "test")
+        commit = git.accept(self.repo, ["hello.py"], "run_test", "test", ACCEPT_MESSAGE)
         self.assertEqual(git.git(self.repo, "show", f"{commit}:test_hello.py"), original)
         self.assertEqual(git.git(self.repo, "show", f"{commit}:hello.py"), "# allowed\n")
 

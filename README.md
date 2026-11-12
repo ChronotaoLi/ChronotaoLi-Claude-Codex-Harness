@@ -103,9 +103,18 @@ python3 -m harness --config /path/to/harness.toml --repo /path/to/project resume
 
 所有更改在 `<目标项目>/.harness/worktrees/<run_id>` 的 `harness/<run_id>` 分支完成。每个通过检查和审阅的任务生成本地提交。成功输出分支和路径，便于查看 diff、merge 或 cherry-pick；最终集成由你操作。
 
+每个有改动的已接受任务恰好生成一个提交。提交消息由该任务的 worker 按目标仓库的提交规范撰写（`commit_message` 的主题与正文），经独立审阅审查；运行时按原样提交（`--cleanup=verbatim`），只在末尾追加 `Harness-Run`、`Harness-Task` 两行 trailer。作者与提交者固定为 `Personal Harness <harness@localhost>`，不签名，不运行仓库 hooks，提交编码固定为 UTF-8；运行时不推送、不合并、不改写历史。目标或仓库规则要求更多（签名、`Signed-off-by` trailer、指定作者、压缩提交、推送）时，指挥会向操作者提问，不会写成运行时做不到的验收项。
+
+外层脚本按 trailer 识别 Harness 提交，不要匹配主题（旧版本的主题 `harness: <task_id>` 已不再使用）。读取时固定 trailer 分隔符，并让 `interpret-trailers` 不把正文里的 `---` 行当作补丁分隔线：
+
+```bash
+git -c trailer.separators=: log --format='%H %(trailers:key=Harness-Task,valueonly)' harness/RUN
+git cat-file commit SHA | sed '1,/^$/d' | git -c trailer.separators=: interpret-trailers --parse --no-divider
+```
+
 ## 验收与隔离
 
-任务接受必须同时满足：合法 worker 结果声明完成、Git 绑定与 HEAD 未变、修改在允许范围内、所有验证成功、独立审阅批准且无 blocking findings、接受前文件快照仍一致。建议可以保留，`request_changes` 或任何阻断问题都不通过。审阅者读取实际 diff、验证日志和历轮问题的证据，不接收 worker 的私有推理；worker 自报完成不等于接受。
+任务接受必须同时满足：合法 worker 结果声明完成（含合规的 `commit_message`）、Git 绑定与 HEAD 未变、修改在允许范围内、所有验证成功、独立审阅批准且无 blocking findings、接受前文件快照仍一致。建议可以保留，`request_changes` 或任何阻断问题都不通过。审阅者读取实际 diff、验证日志和历轮问题的证据，不接收 worker 的私有推理；worker 自报完成不等于接受。
 
 全部任务接受并提交后重新运行验证，由新的审阅实例对照原始目标、原始任务约束和整条分支 diff 验收。整体拒绝须经正常修复任务门禁，不能靠反复恢复重抽审阅结论。记忆在任务接受后写入，知识提案还须逐项获批。
 
@@ -182,7 +191,7 @@ python3 -m harness --repo /path/to/project cleanup-run RUN --remove
 
 新台账版本为 17，要求完整的 worker 接收意图与配置快照，缺失时不补造旧默认值。台账只存摘要与引用：worker 接收意图记录派发目录中不可变的 `packet.json`、`schema.json` 的路径与 SHA256，续作、执行指导和续作拒绝行只记 `snapshot_digest`，完整快照在 `continuations/` 等目录的不可变文件里；这些文件被删除、修改或换成符号链接时 `resume` 停止并保留现场。版本 16 及更早不迁移、不执行：`resume`、`abandon`、`prepare-run` 拒绝旧台账；`status`、`watch`、`dashboard`、`permission-diagnostics` 仍可只读使用，`cleanup-run` 仍可在门禁通过后清理（工作树仅限终态）。共享规则变更也受资产摘要门禁约束。版本 17 已完成 run 的普通恢复返回保存结果；终态限制见[终态与历史台账](docs/recovery.md#终态与历史台账)。
 
-以下接口已删除：命令 `notify`、`inbox`、`ack` 与通知收件箱（已有的 `.harness/notifications/` 不再读写，可手工删除）；命令 `cleanup-verification` 与选项 `abandon --remove-worktree`（都改用 `cleanup-run`；旧台账的 `worktree_removed` 仍被识别）；命令 `plan-readiness` 与 `examples/plan-readiness.json`（改为用 `status RUN --full` 审阅保存的计划，再 `resume RUN --approve-plan`）；`handoff.md`（只写 `handoff.json`）；hooks 事件名 `context_compacted`（改用 `context_prepared`）；配置键 `runtime.max_total_attempts`；选项 `resume --repair-invalid` 与格式修正（无效输出改由新调用重做，见[无效输出与自动重做](docs/recovery.md#无效输出与自动重做)）；配置键 `runtime.claude_output_mode` 与联调入口 `python3 -m harness.stream_smoke`（流式元数据模式 `stream_metadata_v1` 已删除，Claude 只用 JSON 输出）；选项 `resume --retry-stopped` 与配置键 `runtime.max_replans`、`runtime.max_final_attempts`、`runtime.max_tasks`（指挥调用合并为 `decide`，停止改为提问，用 `--operator-decision` 回答）。
+以下接口已删除：固定提交主题 `harness: <task_id>`（改为 worker 撰写的消息，按 trailer 识别）；命令 `notify`、`inbox`、`ack` 与通知收件箱（已有的 `.harness/notifications/` 不再读写，可手工删除）；命令 `cleanup-verification` 与选项 `abandon --remove-worktree`（都改用 `cleanup-run`；旧台账的 `worktree_removed` 仍被识别）；命令 `plan-readiness` 与 `examples/plan-readiness.json`（改为用 `status RUN --full` 审阅保存的计划，再 `resume RUN --approve-plan`）；`handoff.md`（只写 `handoff.json`）；hooks 事件名 `context_compacted`（改用 `context_prepared`）；配置键 `runtime.max_total_attempts`；选项 `resume --repair-invalid` 与格式修正（无效输出改由新调用重做，见[无效输出与自动重做](docs/recovery.md#无效输出与自动重做)）；配置键 `runtime.claude_output_mode` 与联调入口 `python3 -m harness.stream_smoke`（流式元数据模式 `stream_metadata_v1` 已删除，Claude 只用 JSON 输出）；选项 `resume --retry-stopped` 与配置键 `runtime.max_replans`、`runtime.max_final_attempts`、`runtime.max_tasks`（指挥调用合并为 `decide`，停止改为提问，用 `--operator-decision` 回答）。
 
 ## 共用 skills / MCP / hooks
 
@@ -195,7 +204,7 @@ python3 -m harness --repo /path/to/project cleanup-run RUN --remove
 | [shared/mcp.json](shared/mcp.json) | 外部 MCP 服务的唯一配置源 |
 | [shared/hooks.json](shared/hooks.json) | 确定性的编排生命周期 hooks |
 
-协议说明放在 RULES 与角色 skill 里，每次派发都注入；包里放数据、索引和现场事实。环境更新、操作者决定、检查点、执行指导、权限、审阅、路径与命令索引、问题进度和计划增量的读法都只在 RULES 与技能里。包里不再有静态协议说明：指挥包不带 `instruction`；不经指挥直接派发时 worker 包的 `instruction` 为 null，续作拒绝写入的指令只含操作者的理由。重做时包里的 `previous_invalid` 只带上一次无效输出的引用与错误，是数据。某任务没有相关的环境更新、决定或检查点时，包里只带对应索引。指挥包另带 `workspace: {head, clean}`：当时的 `expected_head` 与工作树 `git status` 是否干净。
+协议说明放在 RULES 与角色 skill 里，每次派发都注入；包里放数据、索引和现场事实。环境更新、操作者决定、检查点、执行指导、权限、审阅、路径与命令索引、问题进度和计划增量的读法都只在 RULES 与技能里。包里不再有静态协议说明：指挥包不带 `instruction`；不经指挥直接派发时 worker 包的 `instruction` 为 null，续作拒绝写入的指令只含操作者的理由。重做时包里的 `previous_invalid` 只带上一次无效输出的引用与错误，是数据；任务审阅包的 `commit_message` 是从 worker 原件读出的数据。某任务没有相关的环境更新、决定或检查点时，包里只带对应索引。指挥包另带 `workspace: {head, clean}`：当时的 `expected_head` 与工作树 `git status` 是否干净。
 
 角色 skill 自动注入一次；计划的 `skills` 选择额外技能，不需要时用 `[]`。其他技能先加载目录，再通过 `skill_read` 按需读取。旧计划引用角色 skill 仍合法且不会重复注入；不会自动安装整个 ECC 技能目录。
 

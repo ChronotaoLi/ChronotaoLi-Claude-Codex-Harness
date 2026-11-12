@@ -20,7 +20,7 @@ class ContinuationTests(unittest.TestCase):
         self.root = Path(temporary.name).resolve()
         self.candidate = {'head': 'head', 'index': 'index', 'files': {'code': 'candidate'}}
         self.saved = []
-        self.context = SimpleNamespace(directory=self.root / 'run',
+        self.context = SimpleNamespace(directory=self.root / 'run', state=self.root / '.harness',
             run={'id': 'run', 'tasks': [{'id': 'task'}], 'accepted': {}, 'dispatches': [],
                  'current_task': 'task', 'status': 'blocked', 'attempts': {'task': 1}, 'rounds': 3},
             config={'runtime': {'agent_timeout_seconds': 30}, 'permissions': {'worker_commands': []},

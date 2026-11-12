@@ -18,7 +18,8 @@ def task(ident="implement", dependencies=None):
 
 def work():
     return {"status": "completed", "summary": "Implemented", "evidence": [],
-            "blockers": [], "blocker_kind": "none", "proposed_memories": []}
+            "blockers": [], "blocker_kind": "none", "proposed_memories": [],
+            "commit_message": {"subject": "Complete the task", "body": ""}}
 
 
 def finding(ident="missing-case", evidence="Empty input raises IndexError"):

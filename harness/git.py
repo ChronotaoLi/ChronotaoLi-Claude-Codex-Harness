@@ -439,7 +439,18 @@ def archive_and_reset(repo: Path, expected_head: str, archive: Path, owned_root:
     return str(archive)
 
 
-def accept(repo: Path, paths: list[str], run_id: str, task_id: str, *, binding=None):
+# accept pins this identity, the commit encoding and the cleanup mode on the command
+# line, so repository configuration cannot change the commit's author or bytes.
+COMMIT_IDENTITY = ("Personal Harness", "harness@localhost")
+
+
+def commit_message_text(message, run_id, task_id):
+    """The exact commit message: the worker's subject and body verbatim, then two runtime trailers."""
+    body = message["body"] + "\n\n" if message["body"] else ""
+    return f"{message['subject']}\n\n{body}Harness-Run: {run_id}\nHarness-Task: {task_id}\n"
+
+
+def accept(repo: Path, paths: list[str], run_id: str, task_id: str, message, *, binding=None):
     # The worker does not own the acceptance index. Rebuild it from the reviewed
     # worktree so hidden staged content can never enter the runtime's commit.
     git(repo, "reset", "--mixed", "HEAD", binding=binding)
@@ -452,7 +463,10 @@ def accept(repo: Path, paths: list[str], run_id: str, task_id: str, *, binding=N
     if stage:
         git(repo, "--literal-pathspecs", "add", "--", *stage, binding=binding)
     if git(repo, "diff", "--cached", "--name-only", "HEAD", binding=binding).strip():
-        git(repo, "-c", "user.name=Personal Harness", "-c", "user.email=harness@localhost",
-            "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false", "commit", "-m",
-            f"harness: {task_id}\n\nHarness-Run: {run_id}\nHarness-Task: {task_id}", binding=binding)
+        name, email = COMMIT_IDENTITY
+        identity = [option for role in ("user", "author", "committer")
+                    for option in ("-c", f"{role}.name={name}", "-c", f"{role}.email={email}")]
+        git(repo, *identity, "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false",
+            "-c", "i18n.commitEncoding=UTF-8", "commit", "--cleanup=verbatim",
+            "-m", commit_message_text(message, run_id, task_id), binding=binding)
     return head(repo, binding=binding)

@@ -134,7 +134,8 @@ class AcceptanceContractTests(unittest.TestCase):
 
     def test_worker_blocker_classification_is_consistent(self):
         completed = {"status": "completed", "summary": "Complete", "evidence": [],
-                     "blockers": [], "blocker_kind": "none", "proposed_memories": []}
+                     "blockers": [], "blocker_kind": "none", "proposed_memories": [],
+                     "commit_message": {"subject": "Complete the task", "body": ""}}
         validate_work_contract(completed)
         for change in ({"blocker_kind": "task"}, {"blockers": ["Missing dependency"]},
                        {"status": "blocked"}):
@@ -148,7 +149,8 @@ class AcceptanceContractTests(unittest.TestCase):
         proposal = {"key": "architecture.storage", "abstract": "Storage", "content": "SQLite",
                     "source_paths": ["src/store.py"]}
         result = {"status": "completed", "summary": "Complete", "evidence": [],
-                  "blockers": [], "blocker_kind": "none", "proposed_memories": [proposal]}
+                  "blockers": [], "blocker_kind": "none", "proposed_memories": [proposal],
+                  "commit_message": {"subject": "Complete the task", "body": ""}}
         validate_work_contract(result)
         with tempfile.TemporaryDirectory() as root:
             (Path(root) / "src").mkdir()

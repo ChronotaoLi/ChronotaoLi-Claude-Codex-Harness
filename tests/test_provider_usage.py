@@ -63,7 +63,8 @@ class FixtureCLIBackend(CLIBackend):
         result = {key: schema["properties"][key]["enum"][0] for key in ("task_id", "dispatch_id")}
         if role == "worker":
             result.update(status="completed", summary="Implemented greet", evidence=["hello.py"],
-                          blockers=[], blocker_kind="none", proposed_memories=[])
+                          blockers=[], blocker_kind="none", proposed_memories=[],
+                          commit_message={"subject": "Implement greet", "body": ""})
         else:
             result.update(verdict="approve", summary="Checked greeting", findings=[], approved_memory_keys=[])
         return [sys.executable, "-c", FIXTURE_PROCESS, role, model["cli"], str(job),

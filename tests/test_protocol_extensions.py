@@ -13,7 +13,8 @@ from test_runtime_changes import validate_work_contract
 class ProtocolExtensionTests(unittest.TestCase):
     def result(self):
         return dict(status='completed', summary='Done', evidence=['Observed'], blockers=[],
-                    blocker_kind='none', proposed_memories=[])
+                    blocker_kind='none', proposed_memories=[],
+                    commit_message={'subject': 'Record the observation', 'body': ''})
 
     def checkpoint(self):
         ref = dict(path='input.txt', sha256='a' * 64)
@@ -28,9 +29,13 @@ class ProtocolExtensionTests(unittest.TestCase):
         validate(wrapped, schema)
         wire = provider_schema(schema)
         self.assertNotIn('checkpoints', wire['required'])
+        # A completed result must carry it; the wire leaves it optional so a blocked result can omit it.
+        self.assertNotIn('commit_message', wire['required'])
+        with self.assertRaises(HarnessError):
+            validate_work_contract({k: v for k, v in result.items() if k != 'commit_message'})
         self.assertNotIn('decision_requests', wire['required'])
         validate(wrapped, wire)
-        for field in result:
+        for field in schema['required']:
             missing = deepcopy(wrapped)
             missing.pop(field)
             with self.subTest(field=field), self.assertRaises(HarnessError):

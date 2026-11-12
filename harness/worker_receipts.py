@@ -4,11 +4,12 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import stat
 
 from . import git
-from .contracts import judge_work
-from .recovery import snapshot_digest
+from .contracts import judge_work, validate_work_core
+from .recovery import read_bound_result, snapshot_digest
 from .services import RuntimeService
 from .util import HarnessError, dump, read_json, write_json
 from .worker_returns import inspect_return, validate_historical_return_evidence, validate_return_evidence
@@ -370,7 +371,7 @@ class WorkerReceipts(RuntimeService):
             self.reject(key, error, 'scope_rejected')
             raise
         # The delivered contract is read back from its immutable file and digest.
-        judgment = judge_work(result, self.delivered_contract(entry, entry['worker_receipt']))
+        judgment = judge_work(result, self.delivered_contract(entry, entry['worker_receipt']), self.context.state)
         if judgment.state == 'veto':
             # A blocked report stays binding; no post_agent, no exemption.
             return self.services.tasks.publish_invalid_blocker(task, key, result, judgment)
@@ -461,3 +462,29 @@ def delivered_work_contract(run, directory, dispatch_id):
             or not isinstance(entries[0].get('worker_receipt'), dict)):
         raise HarnessError('worker dispatch lacks its delivered contract; preserve evidence')
     return read_worker_input(directory, entries[0], entries[0]['worker_receipt'], 'schema')
+
+
+def read_worker_source(context, task_id, source):
+    """Authenticate a sealed worker result by its bound reference, then recheck its core contract.
+
+    The reference must be complete: an absent or malformed digest stops here,
+    so current bytes are never taken as bound. Returns the result with envelope.
+    """
+    if (not isinstance(source, dict) or set(source) != {'artifact', 'artifact_digest', 'dispatch_id'}
+            or not all(isinstance(source[key], str) for key in source)
+            or not re.fullmatch(r'[0-9a-f]{64}', source['artifact_digest'])):
+        raise HarnessError('worker source digest required')
+    dispatch_id = source['dispatch_id']
+    entries = [d for d in context.run['dispatches'] if d.get('id') == dispatch_id]
+    if (len(entries) != 1 or entries[0].get('role') != 'worker' or entries[0].get('kind') != 'implement'
+            or entries[0].get('task_id') != task_id or entries[0].get('invoked') is not True
+            or source['artifact'] != str(Path(context.directory) / 'dispatches' / dispatch_id / 'returned-result.json')):
+        raise HarnessError('worker source identity invalid')
+    path = Path(source['artifact'])
+    if any(p.is_symlink() for p in (path, *path.parents)) or not path.is_file():
+        raise HarnessError('worker source must be a non-symlink file')
+    result, _ = read_bound_result(source, 'worker ')
+    if not isinstance(result, dict) or result.get('task_id') != task_id or result.get('dispatch_id') != dispatch_id:
+        raise HarnessError('worker source identity invalid')
+    validate_work_core(result, delivered_work_contract(context.run, context.directory, dispatch_id), context.state)
+    return result

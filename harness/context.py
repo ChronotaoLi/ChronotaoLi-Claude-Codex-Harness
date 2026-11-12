@@ -123,11 +123,12 @@ def worker_view(worker):
     """A worker result as later context may see it: no raw optional products.
 
     Checkpoints reach later workers only as registered task_checkpoints;
-    memory proposals only as the keys of a valid batch. The returned-result
-    file keeps the raw values.
+    memory proposals only as the keys of a valid batch; a blocked result's
+    ignored commit message not at all. The returned-result file keeps the raw values.
     """
     view = {key: deepcopy(value) for key, value in worker.items()
-            if key not in ("checkpoints", "proposed_memories", "proposed_memory_keys")}
+            if key not in ("checkpoints", "proposed_memories", "proposed_memory_keys")
+            and not (key == "commit_message" and worker.get("status") == "blocked")}
     if "proposed_memories" in worker or "proposed_memory_keys" in worker:
         view["proposed_memory_keys"] = proposal_keys(worker)
     return view

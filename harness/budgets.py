@@ -74,7 +74,7 @@ class AttemptAccounting(RuntimeService):
             result, _ = read_bound_result(exemption, "任务尝试豁免")
             contract = delivered_work_contract(self.context.run, self.context.directory, dispatch_id)
             # The whole core contract, as when the exemption was granted.
-            validate_work_core(result, contract)
+            validate_work_core(result, contract, self.context.state)
             validate_work_bounds(result, contract)
             if (result["status"] != "blocked" or result["blocker_kind"] != exemption["blocker_kind"]
                     or entry.get("worker_outcome") != exemption["blocker_kind"] + "_blocked"):

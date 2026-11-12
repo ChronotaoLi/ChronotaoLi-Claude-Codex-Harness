@@ -1,6 +1,8 @@
 """Small, closed JSON-schema subset; every returned field is validated locally."""
 import json
+import os
 import re
+import unicodedata
 from copy import deepcopy
 from pathlib import PurePosixPath
 
@@ -77,7 +79,13 @@ WORK["properties"].update(
     continuation_request=obj(kind={"type": "string", "enum": ["commands", "budget"]},
         commands=REQUIRED_COMMANDS,
         minimum_timeout_seconds={"type": "integer", "minimum": 0, "maximum": 86400}, reason=DETAIL),
+    # Required for completed results (validate_work_semantics); a blocked result
+    # never commits, so its value is ignored by every check (work_core_value).
+    commit_message=obj(subject={"type": "string", "minLength": 1, "maxLength": 100},
+                       body={"type": "string", "maxLength": 4000}),
 )
+# Lines Git would read as the runtime's own trailers, in any case or spacing.
+TRAILER_LINE = re.compile(r"^[ \t]*harness-(run|task)[ \t]*:", re.IGNORECASE | re.MULTILINE)
 REPAIR_CLAIM = obj(summary=DETAIL, evidence_paths={"type": "array", "items": NONBLANK, "maxItems": 20})
 FINDING = obj(id=SAFE_ID,
               severity={"type": "string", "enum": ["blocking", "advisory"]},
@@ -133,6 +141,14 @@ def core_schema(schema, optional):
 def core_value(value, optional):
     """An output copy without its optional products; non-objects are returned unchanged."""
     return {k: v for k, v in value.items() if k not in optional} if isinstance(value, dict) else value
+
+
+def work_core_value(result):
+    """The worker result every check sees: no optional products, and no commit message when blocked."""
+    core = core_value(result, WORK_OPTIONAL)
+    if isinstance(core, dict) and core.get("status") == "blocked":
+        core.pop("commit_message", None)
+    return core
 
 
 def envelope(schema, task_id, dispatch_id):
@@ -245,9 +261,26 @@ def validate(value, schema, path="response"):
     _validate_format(value, schema, path)
 
 
-def validate_work_semantics(result):
+def validate_commit_message(message, state_root):
+    """The deterministic part of a completed result's commit message; the reviewer judges the rest."""
+    roots = {str(state_root), os.path.realpath(state_root)}
+    for field, allowed in (("subject", ""), ("body", "\n\t")):
+        text = message[field]
+        if any(unicodedata.category(char) in ("Cc", "Cs") and char not in allowed for char in text):
+            raise HarnessError(f"commit_message.{field} 含不允许的控制字符或代理码点")
+        if TRAILER_LINE.search(text):
+            raise HarnessError(f"commit_message.{field} 不得含 Harness-Run／Harness-Task 行")
+        if any(root in text for root in roots):
+            raise HarnessError(f"commit_message.{field} 不得含运行状态目录路径")
+
+
+def validate_work_semantics(result, state_root):
     """Check worker completion, blocker and continuation consistency after structural validation."""
     completed = result["status"] == "completed"
+    if completed:
+        if "commit_message" not in result:
+            raise HarnessError("completed 结果必须有 commit_message")
+        validate_commit_message(result["commit_message"], state_root)
     if completed != (result["blocker_kind"] == "none") or completed != (not result["blockers"]):
         raise HarnessError("worker 状态、blocker_kind 与 blockers 不一致")
     continuation = result.get("continuation_request")
@@ -304,16 +337,16 @@ def review_veto(result):
             or any(item["status"] != "resolved" for item in (result.get("finding_dispositions") or {}).values()))
 
 
-def validate_work_core(result, schema):
-    """Structure and semantics of a worker result, without its optional products."""
-    core = core_value(result, WORK_OPTIONAL)
+def validate_work_core(result, schema, state_root):
+    """Structure and semantics of a worker result's core (work_core_value)."""
+    core = work_core_value(result)
     validate_structure(core, core_schema(schema, WORK_OPTIONAL))
-    validate_work_semantics(core)
+    validate_work_semantics(core, state_root)
 
 
 def validate_work_bounds(result, schema):
-    """Length, count, pattern and range bounds of a worker result, without its optional products."""
-    _validate_format(core_value(result, WORK_OPTIONAL), core_schema(schema, WORK_OPTIONAL), "response")
+    """Length, count, pattern and range bounds of a worker result's core (work_core_value)."""
+    _validate_format(work_core_value(result), core_schema(schema, WORK_OPTIONAL), "response")
 
 
 class Judgment:
@@ -348,14 +381,14 @@ def judge_review(result, schema):
     return Judgment("valid")
 
 
-def judge_work(result, schema):
+def judge_work(result, schema, state_root):
     """Classify a sealed worker result; handoff targets are checked later, at publication.
 
     A blocked result keeps its veto: a readable environment, operator or task
     blocker keeps its route; any other blocked output is routed as a task blocker.
     """
     try:
-        validate_work_core(result, schema)
+        validate_work_core(result, schema, state_root)
     except HarnessError as error:
         if isinstance(result, dict) and result.get("status") == "blocked" and _envelope_matches(result, schema):
             return Judgment("veto", error, "task", readable=False)

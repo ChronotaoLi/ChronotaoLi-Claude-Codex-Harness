@@ -39,7 +39,7 @@ class BoundedReviewLifecycleTests(RepoCase):
         super().setUp()
         # Exercise bounded retrieval under an explicitly constrained budget. A review
         # excerpt fills its fixed share, and shared RULES text sets the rest of the floor.
-        self.config.data["runtime"]["context_chars"] = 34000
+        self.config.data["runtime"]["context_chars"] = 35000
 
     def plan(self):
         return read_json(ROOT / "examples" / "plan.json")
@@ -78,7 +78,7 @@ class BoundedReviewLifecycleTests(RepoCase):
             elif kwargs["kind"] == "review" and count == 2:
                 self.assert_full_evidence(packet["prior_reviews"][0]["review"], rejected)
 
-        self.assertEqual(self.config.data["runtime"]["context_chars"], 34000)
+        self.assertEqual(self.config.data["runtime"]["context_chars"], 35000)
         backend = ScriptedBackend(repair)
         engine = self.engine(backend)
         result = engine.start("Implement greet", self.plan())
@@ -87,7 +87,7 @@ class BoundedReviewLifecycleTests(RepoCase):
         self.assertEqual(result["review_history"]["greet"][0]["review"]["findings"], rejected["findings"])
         self.assertEqual(sum(call["kind"] == "review" for call in backend.calls), 2)
         self.assertEqual(inspected, ["decide"])
-        self.assertLessEqual(max(sizes), 34000)
+        self.assertLessEqual(max(sizes), 35000)
         dispatches = [item["id"] for item in result["dispatches"] if item["role"] in ("worker", "reviewer")]
         self.assertEqual(len(dispatches), len(set(dispatches)))
 
@@ -112,7 +112,7 @@ class BoundedReviewLifecycleTests(RepoCase):
             elif kwargs["kind"] == "final_review" and final_count == 2:
                 self.assert_full_evidence(packet["prior_reviews"][0]["review"], rejected)
 
-        self.assertEqual(self.config.data["runtime"]["context_chars"], 34000)
+        self.assertEqual(self.config.data["runtime"]["context_chars"], 35000)
         backend = ScriptedBackend(repair)
         engine = self.engine(backend)
         result = engine.start("Implement greet", self.plan())
@@ -124,7 +124,7 @@ class BoundedReviewLifecycleTests(RepoCase):
         self.assertEqual(first["review"]["findings"], rejected["findings"])
         self.assertEqual((first["status"], second["status"]), ("rejected", "approved"))
         self.assertNotEqual(first["snapshot_digest"], second["snapshot_digest"])
-        self.assertLessEqual(max(sizes), 34000)
+        self.assertLessEqual(max(sizes), 35000)
 
     def test_large_review_with_approve_and_blocking_findings_still_cannot_accept(self):
         rejected = maximum_review()
@@ -169,7 +169,7 @@ class BoundedReviewLifecycleTests(RepoCase):
         returned = engine.directory / "dispatches" / first["dispatch_id"] / "returned-result.json"
         self.assertEqual(len(read_json(returned)["summary"]), 4001)
         self.assertFalse(any(d.get("retry_of") for d in result["dispatches"]))
-        self.assertLessEqual(max(sizes), 34000)
+        self.assertLessEqual(max(sizes), 35000)
 
 class BoundedReviewEvidenceTests(unittest.TestCase):
     def test_changed_truncated_tail_is_not_deduplicated_or_hidden_by_later_approval(self):

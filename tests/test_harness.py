@@ -311,7 +311,8 @@ class RuntimeTests(RepoCase):
                     assert "greet" in packet["dependencies"]
                     (kwargs["cwd"] / "usage.txt").write_text("Use greet(name)")
                     return {**ids, "status": "completed", "summary": "Documented greet", "evidence": ["usage.txt"],
-                            "blockers": [], "blocker_kind": "none", "proposed_memories": []}
+                            "blockers": [], "blocker_kind": "none", "proposed_memories": [],
+                            "commit_message": {"subject": "Document greet", "body": ""}}
                 return super().invoke(**kwargs)
         plan = read_json(ROOT / "examples/plan.json")
         plan["tasks"].append({"id": "document", "title": "Document greet", "description": "Document greet in usage.txt",

@@ -143,7 +143,8 @@ class ProgressRecovery(RuntimeService):
             raise HarnessError("checkpoint source is not a known worker dispatch")
         # The core contract excludes checkpoints and memory proposals; declared
         # checkpoints are checked on their own only when they are being relied on.
-        validate_work_core(result, delivered_work_contract(self.context.run, self.context.directory, dispatch_id))
+        validate_work_core(result, delivered_work_contract(self.context.run, self.context.directory, dispatch_id),
+                           self.context.state)
         if validate_declarations:
             validate_checkpoints(result.get("checkpoints", []))
         if _validation is not None:

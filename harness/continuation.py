@@ -9,8 +9,7 @@ import json
 from pathlib import Path
 
 from . import git
-from .contracts import validate_work_core
-from .worker_receipts import delivered_work_contract
+from .worker_receipts import read_worker_source
 from .git_query import covers as git_query_covers
 from .recovery import RECOVERY_BUSY_KEYS, read_bound_result, snapshot_digest
 from .util import HarnessError, dump, write_json
@@ -75,23 +74,6 @@ def _complete(context, category, row):
     return record
 
 
-def _source(context, task_id, source):
-    if not isinstance(source, dict) or not source.get('artifact_digest'):
-        raise HarnessError('worker source digest required')
-    dispatch_id = source.get('dispatch_id')
-    entries = [d for d in context.run['dispatches'] if d['id'] == dispatch_id]
-    if (len(entries) != 1 or entries[0].get('role') != 'worker'
-            or entries[0].get('task_id') != task_id or entries[0].get('invoked', True) is not True
-            or source.get('artifact') != str(Path(context.directory) / 'dispatches' / dispatch_id / 'returned-result.json')):
-        raise HarnessError('worker source identity invalid')
-    source_path = Path(source['artifact'])
-    if any(p.is_symlink() for p in (source_path, *source_path.parents)) or not source_path.is_file():
-        raise HarnessError('worker source must be a non-symlink file')
-    result, _ = read_bound_result(source, 'continuation worker')
-    validate_work_core(result, delivered_work_contract(context.run, context.directory, dispatch_id))
-    return result
-
-
 def _records(context, category, key):
     records = context.run.get(key, [])
     if not isinstance(records, list):
@@ -106,7 +88,7 @@ def _records(context, category, key):
             raise HarnessError('evidence artifact disagrees with ledger')
         if row.get('task_id') not in {t['id'] for t in context.run['tasks']}:
             raise HarnessError('evidence target task unknown')
-        result = _source(context, row['task_id'], row['source'])
+        result = read_worker_source(context, row['task_id'], row['source'])
         if category == 'execution-guidance':
             value = row.get('input')
             if (not isinstance(value, dict) or set(value) != {'task_id', 'source_dispatch_id', 'source_snapshot_digest', 'summary'}
@@ -125,7 +107,7 @@ def _records(context, category, key):
 def record_continuation(context, task_id, result, worker_source, snapshot, *, save=True):
     history = _records(context, 'continuations', 'continuation_history')
     rejections, _ = _rejections(context, history)
-    stored = _source(context, task_id, worker_source)
+    stored = read_worker_source(context, task_id, worker_source)
     content = lambda value: {k: v for k, v in value.items() if k not in ('task_id', 'dispatch_id')}
     if content(stored) != content(result) or result.get('status') != 'blocked' or result.get('blocker_kind') != 'continuation' or not result.get('continuation_request'):
         raise HarnessError('continuation must bind the original blocked worker result')
@@ -364,7 +346,7 @@ def record_execution_guidance(context, path, current_snapshot=None):
         links.append({'dispatch_id': value['source_dispatch_id'], 'artifact': feedback.get('worker_artifact'), 'artifact_digest': feedback.get('worker_artifact_digest')})
     if source not in links:
         raise HarnessError('execution guidance source lacks authoritative binding')
-    _source(context, task_id, source)
+    read_worker_source(context, task_id, source)
     position = next(i for i, d in enumerate(context.run['dispatches']) if d['id'] == source['dispatch_id'])
     if any(d.get('invoked', True) for d in context.run['dispatches'][position + 1:]):
         raise HarnessError('execution guidance source superseded')

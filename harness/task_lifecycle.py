@@ -23,6 +23,7 @@ from .review_progress import (
 )
 from .verification_plan import candidate_preflight
 from .verification import checks_passed
+from .worker_receipts import read_worker_source
 from .shared import HookError
 from .util import dump, HarnessError, read_json, write_json
 
@@ -407,6 +408,7 @@ class TaskLifecycle(RuntimeService):
             raise HarnessError("审阅阶段缺少必需问题对照；保留证据")
         required = pending["required_findings"]
         delivered = delivered_worker_findings(self.context, tid, Path(pending["worker_artifact"]).parent.name)
+        message = self.review_worker_message(pending)
         review, diagnostics = self.services.receipts.dispatch_review("review", tid,
                  {"goal": self.context.run["goal"], "task": task, "base_commit": self.context.run["expected_head"], "changed_files": paths,
                   "instruction_file_changes": instruction_file_changes(paths),
@@ -418,6 +420,7 @@ class TaskLifecycle(RuntimeService):
                   "recovery": worker_recovery_context(self.context.run, self.context.directory, tid),
                   "proposed_memories": proposals,
                   "decision_requests": deepcopy(pending["worker_result"].get("decision_requests", [])),
+                  "commit_message": message,
                   "tool_constraints": self.services.packets.tool_constraints()}, task=task, required=required)
         review_artifact = evidence.parent / "review.json"
         record = {"attempt": attempt, "review": review, "diff_artifact": str(evidence),
@@ -446,6 +449,46 @@ class TaskLifecycle(RuntimeService):
             self.context.event("review_rejected", task_id=tid)
             return False
         return self.accept_pending()
+
+    def review_worker_message(self, pending):
+        """The commit message a task review sees, read from the sealed original of this phase.
+
+        Every packet build rereads the original by its bound digest and requires
+        the ledger's worker result to equal it, so a resumed review cannot be
+        shown a message other than the one acceptance will commit.
+        """
+        artifact = pending.get("worker_artifact")
+        source = {"artifact": artifact, "artifact_digest": pending.get("worker_artifact_digest"),
+                  "dispatch_id": Path(artifact).parent.name if isinstance(artifact, str) else None}
+        original = read_worker_source(self.context, pending["task_id"], source)
+        if ({k: v for k, v in original.items() if k not in ("task_id", "dispatch_id")} != pending["worker_result"]
+                or original["status"] != "completed"):
+            raise HarnessError("worker 结果台账与原件不同；保留现场")
+        return deepcopy(original["commit_message"])
+
+    def approved_worker_message(self, pending):
+        """The commit message of the worker result that the approving review bound.
+
+        pending_acceptance.worker_source must equal the source of the review record
+        that approved this candidate, for the same work attempt; the original is
+        then read by its digest. Runs before and after the pre_accept hook.
+        """
+        tid, source = pending["task_id"], pending.get("worker_source")
+        records = [record for record in self.context.run["review_history"].get(tid, [])
+                   if record.get("review_source") == pending.get("review_source")]
+        entries = [entry for entry in self.context.run["dispatches"]
+                   if isinstance(source, dict) and entry.get("id") == source.get("dispatch_id")]
+        if (len(records) != 1 or records[0].get("status") == "invalidated"
+                or records[0].get("worker_source") != source
+                or records[0].get("artifact") != pending.get("review_artifact")
+                or records[0].get("attempt") != pending.get("attempt")
+                or records[0].get("snapshot_digest") != pending.get("snapshot_digest")
+                or len(entries) != 1 or (entries[0].get("worker_receipt") or {}).get("attempt") != pending.get("attempt")):
+            raise HarnessError("待接受的 worker 来源与批准它的审阅不符；保留现场")
+        original = read_worker_source(self.context, tid, source)
+        if original["status"] != "completed":
+            raise HarnessError("待接受的 worker 来源与批准它的审阅不符；保留现场")
+        return original["commit_message"]
 
     def approved_memory_keys(self, task_id, review, proposals):
         """Keep only approvals of this candidate's proposals; discard the rest on their own (R8)."""
@@ -556,6 +599,8 @@ class TaskLifecycle(RuntimeService):
                                                              pending["files"])[0])
         except HarnessError as error:
             raise HarnessError(f"任务记忆记录不合格；未提交：{error}") from error
+        # Refuse a broken worker source before running the hook; recheck after it.
+        self.approved_worker_message(pending)
         pending["hook_attempts"] = pending.get("hook_attempts", 0) + 1
         logs = self.context.directory / "hooks" / f"{tid}-{attempt}" / f"pre_accept-{pending['hook_attempts']}"
         self.context.save()
@@ -574,7 +619,9 @@ class TaskLifecycle(RuntimeService):
         validate_input_dispatch_indexes(self.context.directory, self.context.run["dispatches"])
         paths = git.check_scope(self.context.worktree, task["allowed_paths"], binding=self.context.run["worktree_binding"])
         validate_review_source(self.context.run, tid, pending, candidate_digest=pending["snapshot_digest"])
-        commit = git.accept(self.context.worktree, paths, self.context.run["id"], tid, binding=self.context.run["worktree_binding"])
+        message = self.approved_worker_message(pending)
+        commit = git.accept(self.context.worktree, paths, self.context.run["id"], tid, message,
+                            binding=self.context.run["worktree_binding"])
         accepted = {"commit": commit, "summary": pending["review"]["summary"], "summary_source": "reviewer",
                     "files": paths, "verification": pending["verification"], "review": pending["review"],
                     "review_artifact": pending["review_artifact"] ,

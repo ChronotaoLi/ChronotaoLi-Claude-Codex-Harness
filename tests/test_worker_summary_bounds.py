@@ -17,7 +17,8 @@ from test_runtime_changes import ScriptedBackend, validate_work_contract, revise
 
 def work(**fields):
     return {"status": "completed", "summary": "done", "evidence": ["hello.py"], "blockers": [],
-            "blocker_kind": "none", "proposed_memories": [], **fields}
+            "blocker_kind": "none", "proposed_memories": [],
+            "commit_message": {"subject": "Implement greet", "body": ""}, **fields}
 
 
 def events(engine):
