@@ -68,7 +68,7 @@
 | worker 调用失败，退出已确认且原始证据判为可重试 | 修复原因 | 普通 `resume`（新的计费尝试） |
 | `worker return interrupted before immutable seal; …; automatic retry forbidden` | 封存之前中断，输出能解码成对象结果（returned），或证据冲突、超过读取上限、读不出文件（unknown）；解不出对象的输出不会停在这里 | `abandon RUN` |
 | worker 输出无效（结构、语义、界限、交接目标非法，或解不出对象结果） | 不停止：计一次工作尝试、回执结局 `result_rejected`，下一次尝试经指挥选择；只在同一任务达到 `max_attempts` 时以尝试上限停止 | 提高 `runtime.max_attempts` 后普通 `resume`，或 `abandon` |
-| worker 的 blocked 输出无效（条目 `invalid_blocked`，反馈带 `output_error`） | environment／operator 阻断只在核心结构与语义都合法、仅界限检查失败时按对应行处理（不给尝试豁免）；task 阻断，以及结构或语义不合法的阻断（例如 `blocker_kind=operator` 而 `blockers` 为空），都按 task 阻断交给指挥决定，反馈不带原结果，不登记决定请求 | 对应出口 |
+| worker 的 blocked 输出无效（条目 `invalid_blocked`，反馈带 `output_error`） | 核心结构与语义都合法、只有界限检查失败的阻断保留原路由，原结果进入反馈的 `worker`：environment／operator 按对应行处理，task 交给指挥决定；结构或语义不合法的阻断（例如 `blocker_kind=operator` 而 `blockers` 为空）一律按 task 阻断交给指挥决定，反馈不带原结果，不登记决定请求；都不给尝试豁免 | 对应出口 |
 | `… 请先核对并清理越界修改，再 resume` | 核对并清理范围外改动，不自动删除 | 普通 `resume` |
 | `<role> 输出连续两次无效：…；原件 PATH；普通 resume 重新请求，或 abandon` | 读原件与错误（派发条目的 `error`、`invalid_output`）；计划超出整体审阅的必要上下文同样是无效输出 | 普通 `resume`（新请求，最多再两次调用），或 `abandon RUN` |
 | `无效输出原始结果缺失或无法读取`、`无效输出原始结果已改变` | 上一次无效输出的原件被删改（准备前，或本地准备与 `pre_agent` 期间），调用计费前停止 | 恢复原字节后普通 `resume`，或 `abandon RUN` |

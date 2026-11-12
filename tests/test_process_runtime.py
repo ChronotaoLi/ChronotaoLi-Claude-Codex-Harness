@@ -201,31 +201,70 @@ class ProcessRuntimeTests(unittest.TestCase):
                 with contextlib.suppress(ProcessLookupError):
                     os.kill(int(child_file.read_text()), signal.SIGKILL)
 
-    def zombie_only_group(self, hold):
-        """Leader script leaving its group with one zombie that a parent outside
-        the group reaps after `hold` seconds. XNU answers killpg(pgid, 0) with
-        EPERM for such a group, as it does while launchd reaps an orphan."""
-        marker = str(self.root / 'zombie-holder')
-        holder = ('import os,subprocess,sys,time\n'
-                  'z=subprocess.Popen([sys.executable,"-c","pass"])\n'
-                  'while subprocess.run(["ps","-o","stat=","-p",str(z.pid)],capture_output=True,'
-                  'text=True).stdout.strip()[:1]!="Z": time.sleep(.01)\n'
-                  'os.setpgid(0,0)\n'
-                  f'open({marker!r},"w").write(str(os.getpid()))\n'
-                  f'time.sleep({hold})\nz.wait()\n')
-        def release():
-            if Path(marker).exists():
-                with contextlib.suppress(ProcessLookupError, ValueError):
-                    os.kill(int(Path(marker).read_text()), signal.SIGKILL)
-        self.addCleanup(release)
-        return ('import os,subprocess,sys,time\n'
-                f'subprocess.Popen([sys.executable,"-c",{holder!r}])\n'
-                f'while not os.path.exists({marker!r}): time.sleep(.01)\n')
+    # A holder process outside the leader's group owns one zombie of that group:
+    # it confirms the zombie without reaping it (waitid WNOWAIT; libc through
+    # ctypes where Python lacks os.waitid, as on macOS before 3.13), leaves the
+    # group, reports ready, and reaps only after the test releases it. XNU answers
+    # killpg(pgid, 0) with EPERM for such a group, as while launchd reaps an orphan.
+    HOLDER = """
+import ctypes, os, subprocess, sys, time
+ready, release, hold = sys.argv[1], sys.argv[2], float(sys.argv[3])
+zombie = subprocess.Popen([sys.executable, "-c", "pass"])
+if hasattr(os, "waitid"):
+    os.waitid(os.P_PID, zombie.pid, os.WEXITED | os.WNOWAIT)
+else:
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.waitid(1, zombie.pid, ctypes.create_string_buffer(256), os.WEXITED | os.WNOWAIT) != 0:
+        sys.exit("zombie holder: waitid failed, errno %d" % ctypes.get_errno())
+os.setpgid(0, 0)
+with open(ready + ".tmp", "w") as handle:
+    handle.write(str(os.getpid()))
+os.replace(ready + ".tmp", ready)
+deadline = time.monotonic() + 60
+while not os.path.exists(release) and time.monotonic() < deadline:
+    time.sleep(.01)
+time.sleep(hold)
+zombie.wait()
+"""
+    LEADER = """
+import os, subprocess, sys, time
+subprocess.Popen([sys.executable, "-c", sys.argv[1], *sys.argv[2:]])
+deadline = time.monotonic() + 20
+while not os.path.exists(sys.argv[2]):
+    if time.monotonic() > deadline:
+        sys.exit("zombie holder not ready within 20 s")
+    time.sleep(.01)
+"""
+
+    def zombie_only_group(self, *, reap_after_observation, hold=.4):
+        """The leader argv, and a killpg wrapper that releases the holder once the
+        supervisor first observes the group (when reap_after_observation)."""
+        ready, release = self.root / 'zombie-ready', self.root / 'zombie-release'
+        def stop_holder():
+            with contextlib.suppress(OSError, ValueError):
+                os.kill(int(ready.read_text()), signal.SIGKILL)
+        self.addCleanup(stop_holder)
+        original = os.killpg
+        def observe(pgid, sig):
+            try:
+                return original(pgid, sig)
+            finally:
+                if sig == 0 and reap_after_observation:
+                    release.touch()
+        argv = [sys.executable, '-c', self.LEADER, self.HOLDER, str(ready), str(release), str(hold)]
+        return argv, observe
+
+    def stderr(self):
+        path = self.log.with_suffix('.stderr')
+        return path.read_text() if path.exists() else ''
 
     def test_zombie_only_group_drains_until_reaped(self):
+        argv, observe = self.zombie_only_group(reap_after_observation=True)
         started = time.monotonic()
         outcomes = []
-        self.assertEqual(self.invoke(self.zombie_only_group(.4), on_outcome=outcomes.append), 0)
+        with patch('harness.process_runtime.os.killpg', side_effect=observe):
+            code = run_process(argv, self.root, self.log, on_outcome=outcomes.append)
+        self.assertEqual(code, 0, self.stderr())
         # The group vanished only when its zombie was reaped, never earlier.
         self.assertGreaterEqual(time.monotonic() - started, .4)
         outcome = outcomes[-1]
@@ -235,10 +274,11 @@ class ProcessRuntimeTests(unittest.TestCase):
         self.assertEqual(outcome.cleanup_actions, ['poll_leader', 'drain_descendants'])
 
     def test_zombie_only_group_beyond_drain_window_is_not_exit(self):
+        argv, _ = self.zombie_only_group(reap_after_observation=False)
         with self.assertRaises(HarnessError) as caught:
-            self.invoke(self.zombie_only_group(30), cleanup_deadline=time.monotonic() + 1)
+            run_process(argv, self.root, self.log, cleanup_deadline=time.monotonic() + 1)
         outcome = caught.exception.outcome
-        self.assertEqual(outcome.exit_code, 0)
+        self.assertEqual(outcome.exit_code, 0, self.stderr())
         self.assertFalse(outcome.exit_confirmed)
         self.assertFalse(outcome.evidence_complete)
         self.assertIn('drain_descendants', outcome.cleanup_actions)
