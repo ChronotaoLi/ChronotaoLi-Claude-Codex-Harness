@@ -549,7 +549,7 @@ Python 3.11.17 在 `7adcf9d` 上执行 18 个重点模块，233 项全部通过�
 
 ## 协议层重做验证（2026-11-11，台账 v17）
 
-本节记录分支 `protocol-redo-2026-11-10`（起点 `bc94b6f`）的离线验证结果。按根因消除实测暴露的停止与多余调用，分步提交：
+本节记录分支 `protocol-redo-2026-11-10`（起点 `bc94b6f`）的离线验证结果，以及 2026-11-12 在提交 `4ba919a` 上执行的真实账号联调结果（见本节“真实账号联调”）。按根因消除实测暴露的停止与多余调用，分步提交：
 
 | 步 | 提交 | 内容 |
 | --- | --- | --- |
@@ -618,16 +618,40 @@ Python 3.11.17 执行这次重做新增和大改的 14 个模块，255 项全部
 
 按 2026-11-10 实测的 7 次再规划序列（四个链式任务：两次审阅拒绝、两次 worker task 阻断、三次向操作者提问）用脚本后端各重放一次，旧代码是 B4 之前的三种指挥调用（`max_replans` 设为 20，否则多一次额度停止），新代码是 B4；脚本在每次停止后作答并恢复。两次都以 `completed` 结束，中途各停 3 次（旧代码是指挥的 stop，B4 是 ask 登记的决定请求）；指挥调用 14 → 8（旧：plan 1、dispatch 6、replan 7；新：`decide` 8），总调用 29 → 23，worker 8 次、任务审阅 6 次、整体审阅 1 次两边相同（`probes/B4-replay-old-base.log`、`probes/B4-replay-new-B4.log`）。这是离线重放，不是真实模型的证据。
 
-### 没有做的
+### 真实账号联调（2026-11-12）
 
-真实账号联调没有运行。下列六项（方案 5.5）都没有执行，离线结果不证明其中任何一项，合入 `master` 之前需要完成：
+在提交 `4ba919a` 上执行：Python 3.15.2，Claude Code 2.1.322，codex-cli 0.167.1；模型与 effort 取 `harness.toml` 的原样配置（指挥 `gpt-6-astra` 或 `claude-fable-5-2`，worker `claude-opus-5-5`，审阅 `gpt-6.1-sol`，均为 high）。共 44 次真实模型调用，每次都是新进程和新的 `dispatch_id`。除两个 smoke 探针在仓库的 `.harness/` 下留证外，其余都在临时 Git 仓库里运行，夹具与 `harness smoke` 相同（一个 `test_hello.py`，验证命令是真实的 unittest）。脚本、结果和各 run 的台账副本保存在 `.harness/validation/protocol-redo-real-20261112/`。
 
-1. Codex 严格模式（审阅者 `gpt-6.1-sol`）是否接受固定键 `finding_dispositions`（1、5、60 个键），输出是否符合契约。
-2. Claude worker 的 `--json-schema` 是否接受固定键 `repair_claims`（1 个和 60 个键，argv 约 15 KB）与 `commit_message`。
-3. `decide` 的六字段 schema 在两种指挥下的表现：astra（Codex 严格模式）与 fable（`claude-fable-5-2`，经 `--json-schema`）各一次。
-4. 单一输出模式（`legacy_json`）下：worker 超时判为可重试、普通 resume 开始新尝试；权限拒绝能从终态 JSON 取证。
-5. 两种指挥各跑一次 `python3 -m harness smoke`：小任务全链路，确认 worker 写的提交消息原样落盘并带 trailer。
-6. 一次真实的提问往返（用需要操作者选择的目标）。
+方案 5.5 的六项全部通过：
+
+| 项 | 做法 | 结果 |
+| --- | --- | --- |
+| 1 固定键 `finding_dispositions`（Codex 严格模式） | 用运行时的 `review_schema` 生成 1、5、60 个键的契约，经 `CLIBackend.invoke` 调用 `gpt-6.1-sol` | 三次都被接受，返回的键与要求逐一相同并通过契约校验；60 个键时发给供应商的 schema 为 36,066 字节，用时 29.6 秒 |
+| 2 固定键 `repair_claims` 与 `commit_message`（Claude `--json-schema`） | 用 `with_keys(WORK, "repair_claims", …)` 生成 1、60 个键的契约，调用 `claude-opus-5-5`；只测供应商是否接受 schema，命令行取适配器的只读角色 | 两次都被接受，键逐一相同；中文主题与多行正文原样返回；60 个键时 argv 为 16,838 字节 |
+| 3 `decide` 六字段契约 | 同一契约对 `gpt-6-astra`（严格模式）和 `claude-fable-5-2`（`--json-schema`）各调用一次 | 两次都返回合格的 `ask` |
+| 4 单一输出模式下的超时与权限拒绝 | 超时：预写计划，`agent_timeout_seconds` 设为 10，真实 worker 被切断后把时限改为 900 再普通 `resume`。权限拒绝：一次真实调用，要求模型执行一条未授权的 Bash 命令 | 超时：run 以 `blocked` 停止（1 次尝试、1 次调用）；恢复时原调用判为 `retryable`，回执按 `provider_failure` 消费，随后指挥决定、新的 worker 尝试、任务审阅、整体审阅，run 完成（2 次尝试、5 次调用）。权限拒绝：`--output-format json` 的终态 JSON 带一条 `permission_denials`（Bash 与命令原文），`invocation_diagnostics` 投影出同一个 tool ID，文件没有被创建 |
+| 5 两种指挥各一次 `python3 -m harness smoke` | `--commander astra`、`--commander fable` | 两次都以 `completed` 结束，各 4 次调用（`decide`、worker、任务审阅、整体审阅），台账版本 17。提交消息是 worker 原件的主题与正文，末尾是 `Harness-Run`、`Harness-Task` 两行 trailer，按 trailer 能读出 run 与任务；作者与提交者都是 `Personal Harness <harness@localhost>` |
+| 6 提问往返 | 目标写明问候语的措辞由操作者选择、先问再做；指挥为 `gpt-6-astra` | 第一次 `decide` 返回 `ask`，登记为 `final` 的决定请求，run 停止（1 次调用、0 个任务）；`resume --operator-decision`（continue）之后规划、实现、任务审阅、整体审阅，run 完成（共 5 次调用） |
+
+另在仓库根目录用默认限制各执行一次真实的 `python3 -m harness.tool_smoke` 与 `python3 -m harness.permission_smoke`（`claude-opus-5-5`）：26 项与 19 项检查全部通过，分别 15 轮、12 轮，CLI 报告的估算费用为 0.2230154 与 0.158113 美元（不是账户账单）。这两个探针自己用 stream-json 取证，与运行时的输出模式无关。
+
+清单之外补了两条流程。各自的第一次 worker 返回由脚本给出，只用来制造起始条件；其余调用全部真实，驱动只用普通 `resume` 和文档写明的出口：
+
+- **审阅拒绝后返工**（6 次调用，5 次真实）：脚本给出的首个候选漏掉验收里的“`name` 不是 str 时抛 TypeError”。`gpt-6.1-sol` 返回 `request_changes` 和一条 blocking finding；`gpt-6-astra` 的 `decide` 返回 `implement`；第二次 worker 的契约要求 `repair_claims` 的键为 `f1`，返回的键正是 `f1`；第二轮审阅的契约要求 `finding_dispositions` 的键为 `f1`，返回 `f1` 为 `resolved`、结论 `approve`；整体审阅通过，run 完成（2 次尝试）。提交消息来自第二次 worker 的原件，不是首个候选的消息。
+- **worker 的 task 阻断后指挥修订**（12 次调用，11 次真实）：预写计划把任务限定在 `greeting.py`，而测试导入 `hello`；脚本给出的首次返回是 `blocked`／`task`。指挥先返回 `ask`，请求把 `hello.py` 加入已批准范围。用操作者决定回答“同意”后，指挥的 `revise` 因新增 `hello.py` 被判为越出已批准范围：派发条目记为 `invalid`，`out_of_scope_paths` 为 `["hello.py"]`，run 停止，没有自动重做。之后一次普通 `resume` 和一次重复的操作者决定都得到新的 `ask`，问题里写出了 `resume … --allow-scope 'hello.py'`。按这个出口授权后 `approved_scope` 保存为 `["hello.py"]`，run 仍停在未答复的请求上；再用 `--operator-decision` 答复，指挥的 `revise` 落地为计划第 1 版（新增前置任务 `implement_hello`，原任务改为依赖它）。随后前置任务的 worker 与审阅、`decide`（`implement`）、原任务的 worker 与审阅（无改动，不产生提交）、整体审阅依次通过，run 完成，分支上只有一个新提交。
+
+联调中观察到、没有处理的两件事：
+
+- 六个完成的 run 里有五个，worker 写的提交消息正文末尾带一行 `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`。规则没有禁止，审阅者放行；它与运行时的 trailer 之间隔一个空行，不影响两行 trailer 的读取。
+- 指挥的 `ask` 实际是范围请求时，停止信息只提示 `--operator-decision`。操作者照提示作答不能扩大范围，要等修订被判越界才看到 `--allow-scope`，多花一次指挥调用；两个选项不能合用，授权和答复要分两次 `resume`。
+
+真实联调没有覆盖的：
+
+- `claude-fable-5-2` 作指挥只执行了规划（smoke）和契约探针，没有用它跑修订或提问往返。
+- 60 个键只在契约探针里出现；真实 run 里的必需问题最多 1 条。
+- 指挥或审阅返回读不出否决的无效输出之后的自动重做，以及 worker 输出截断，没有在真实调用中出现，证据仍只有离线测试。
+- 这些机制没有用真实模型执行：检查点、记忆提案、续作请求、环境更新、全新验证检出，以及三个以上任务的依赖链。
+- 以上都是小夹具上的流程核对，不是实测。停止数、调用数和指挥调用占比相对 2026-11-10 实测的变化，要到下一次实测才有数据。
 
 ### 已知事项
 
