@@ -130,7 +130,8 @@ class CheckpointSemanticsTests(RepoCase):
                 self.assertEqual(len(result['environment_updates']), 1)
                 workers = [d for d in result['dispatches'] if d['role'] == 'worker']
                 self.assertNotEqual(workers[0]['id'], workers[1]['id'])
-                self.assertTrue(all(c['packet']['feedback']['checkpoints_discarded'] ==
+                self.assertTrue(all((c['packet']['trigger']['feedback'] if c['role'] == 'commander'
+                                     else c['packet']['feedback'])['checkpoints_discarded'] ==
                                     before['feedback']['checkpoints_discarded']
                                     for c in backend.calls[1:] if c['role'] in ('worker', 'commander')))
 

@@ -60,7 +60,7 @@ class DispatchAccountingTests(RepoCase):
         result = self.engine(backend).resume(saved["id"])
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["attempts"], {"greet": 1})
-        self.assertFalse(any(call["kind"] == "dispatch" for call in backend.calls))
+        self.assertFalse(any(call["role"] == "commander" for call in backend.calls))
 
     def test_snapshot_failure_finishes_prepared_dispatch_without_accounting(self):
         backend = RecordingBackend()

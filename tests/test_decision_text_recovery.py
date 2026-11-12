@@ -8,7 +8,7 @@ from harness.decisions import decision_question
 from harness.util import HarnessError, read_json, write_json
 from harness.versions import RUN_SCHEMA_VERSION
 from test_harness import ROOT, RepoCase
-from test_runtime_changes import ScriptedBackend
+from test_runtime_changes import ScriptedBackend, decided, trigger_kind
 
 
 class DecisionTextRecoveryTests(RepoCase):
@@ -91,8 +91,9 @@ class DecisionTextRecoveryTests(RepoCase):
 
                 def inspect_recovery(backend, kwargs, packet, returned):
                     original_change(backend, kwargs, packet, returned)
-                    if packet.get('recovery'):
-                        projected.append((kwargs['role'], packet['recovery'],
+                    recovery = packet.get('recovery') or (packet.get('trigger') or {}).get('recovery')
+                    if recovery:
+                        projected.append((kwargs['role'], recovery,
                                           self.saved(engine)['worker_recovery']['greet']))
 
                 backend.change = inspect_recovery
@@ -212,18 +213,23 @@ class DecisionTextRecoveryTests(RepoCase):
         self.assertEqual(decision_question('Proceed?', 'worker'), 'Proceed?')
         self.assertEqual(decision_question('Proceed?', 'handoff'), 'Proceed?')
 
-    def test_commander_stop_with_nul_retains_explicit_retry_exit(self):
+    def test_commander_question_with_nul_registers_a_bounded_notice(self):
         def stop(backend, kwargs, packet, result):
             if kwargs['role'] == 'worker':
                 result.update(status='blocked', blocker_kind='task', blockers=['Need a prerequisite'])
-            elif kwargs['kind'] == 'replan':
-                result.update(action='stop', reason='Need operator choice\0', new_tasks=[], updates=[])
+            elif trigger_kind(kwargs, packet) == 'task':
+                decided(result, 'ask', reason='Need operator choice\0')
         backend = ScriptedBackend(stop)
         engine = self.engine(backend)
-        with self.assertRaises(HarnessError):
+        with self.assertRaisesRegex(HarnessError, '等待操作者决定'):
             engine.start('Implement greet', self.plan())
-        self.assertTrue(self.saved(engine)['replan_stopped'])
+        request = self.saved(engine)['decision_requests'][-1]
+        self.assertEqual(request['kind'], 'commander')
+        self.assertNotIn('\0', request['question'])
+        self.assertIn('Read the bound original result', request['question'])
+        entry = next(d for d in self.saved(engine)['dispatches'] if d['role'] == 'commander')
+        self.assertEqual(entry['status'], 'invalid_asked')
         calls = len(backend.calls)
-        with self.assertRaisesRegex(HarnessError, '--retry-stopped greet'):
+        with self.assertRaisesRegex(HarnessError, '--operator-decision'):
             self.engine(backend).resume(engine.run['id'])
         self.assertEqual(len(backend.calls), calls)

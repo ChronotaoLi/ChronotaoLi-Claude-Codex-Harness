@@ -54,6 +54,8 @@ class RejectionEvidenceTests(unittest.TestCase):
         rejection = self.reject()
         self.assertIsNone(self.context.run['pending_continuation'])
         self.assertTrue(self.context.run['pending_directive'])
+        # The directive carries the operator's reason only; how to revise is in the worker skill.
+        self.assertEqual(self.context.run['pending_directive']['directive']['instruction'], self.value['reason'])
         self.assertEqual(len(self.context.run['continuation_rejections']), 1)
         self.assertEqual(self.saved[-1]['continuation_rejections'], self.context.run['continuation_rejections'])
         self.assertIsNone(self.saved[-1]['pending_continuation'])
@@ -308,7 +310,7 @@ class RejectionLifecycleTests(RepoCase):
         engine, backend, path, _, _ = self.waiting()
         options = ({'execution_guidance': path}, {'environment_update': path},
                    {'operator_decision': [path]}, {'reverify': True},
-                   {'retry_stopped': 'greet'}, {'allow_scope': ['extra/**']})
+                   {'allow_scope': ['extra/**']})
         before = (engine.directory / 'state.json').read_bytes()
         for extra in options:
             with self.subTest(extra=extra), self.assertRaises(HarnessError):

@@ -12,7 +12,7 @@ from .util import HarnessError, strict_json_loads
 # Shared pending lifecycle gates; each recovery entry keeps its own extra checks.
 RECOVERY_BUSY_KEYS = (
     "pending_task", "pending_acceptance", "pending_post_accept",
-    "pending_replan", "pending_directive", "review_receipts",
+    "pending_revision", "pending_directive", "review_receipts",
     "worker_receipts", "commander_receipts",
 )
 

@@ -15,7 +15,8 @@ from harness.memory import Memory
 from harness.util import HarnessError, read_json, write_json
 from test_engine_repairs import RecordingBackend
 from test_harness import RepoCase, ROOT
-from test_runtime_changes import ScriptedBackend, finding, finding_key
+from test_runtime_changes import ScriptedBackend, decided, finding, finding_key, trigger_kind
+from test_runtime_changes import revised as revised_
 from test_worker_return_recovery import stub_provider_clis
 
 REVIEW_KEY = "reviewer:review:greet"
@@ -28,6 +29,16 @@ def plan():
 def calls(backend, role=None, kind=None):
     return [call for call in backend.calls
             if (role is None or call["role"] == role) and (kind is None or call["kind"] == kind)]
+
+
+def decides(backend, trigger=None):
+    return [call for call in backend.calls if call["role"] == "commander"
+            and (trigger is None or call["packet"]["trigger"]["kind"] == trigger)]
+
+
+def worker_task_blocker(packet):
+    feedback = packet["trigger"].get("feedback") or {}
+    return (feedback.get("worker") or {}).get("blocker_kind") == "task" or "output_error" in feedback
 
 
 def entries(run, role, kind=None):
@@ -208,15 +219,13 @@ class ReviewRedoTests(RepoCase):
 
 class FinalReviewRedoTests(RepoCase):
     def test_invalid_final_rejection_keeps_the_snapshot(self):
-        self.config.data["runtime"]["max_replans"] = 0
-
         def change(backend, kwargs, packet, result):
             if kwargs["kind"] == "final_review":
                 result.update(verdict="request_changes", findings=[finding()], summary="x" * 4001)
 
         backend = ScriptedBackend(change)
         engine = self.engine(backend)
-        with self.assertRaisesRegex(HarnessError, "重新规划次数"):
+        with self.assertRaisesRegex(HarnessError, "等待操作者决定：task_id=final"):
             engine.start("Implement greet", plan())
         record = engine.run["final_history"][-1]
         self.assertEqual(record["status"], "invalid_rejected")
@@ -254,13 +263,13 @@ class FinalReviewRedoTests(RepoCase):
 class CommanderRedoTests(RepoCase):
     def test_invalid_plan_is_redone(self):
         def change(backend, kwargs, packet, result):
-            if kwargs["kind"] == "plan" and len(calls(backend, "commander", "plan")) == 1:
-                result["tasks"].append(copy.deepcopy(result["tasks"][0]))
+            if trigger_kind(kwargs, packet) == "plan" and len(decides(backend, "plan")) == 1:
+                result["new_tasks"].append(copy.deepcopy(result["new_tasks"][0]))
 
         backend = ScriptedBackend(change)
         run = self.engine(backend).start("Implement greet")
         self.assertEqual(run["status"], "completed")
-        plans = entries(run, "commander", "plan")
+        plans = entries(run, "commander", "decide")
         self.assertEqual([entry["status"] for entry in plans], ["invalid", "completed"])
         self.assertEqual(plans[1]["retry_of"], plans[0]["id"])
         self.assertEqual(len(run["original_tasks"]), 1)
@@ -269,7 +278,7 @@ class CommanderRedoTests(RepoCase):
         def change(backend, kwargs, packet, result):
             if kwargs["role"] == "worker" and len(calls(backend, "worker")) == 1:
                 result.update(status="blocked", blocker_kind="environment", blockers=["Docker stopped"])
-            if kwargs["kind"] == "dispatch" and len(calls(backend, "commander", "dispatch")) == 1:
+            if kwargs["role"] == "commander" and len(decides(backend)) == 1:
                 result["instruction"] = "x" * 4001
 
         backend = ScriptedBackend(change)
@@ -282,86 +291,115 @@ class CommanderRedoTests(RepoCase):
                             "summary": "Docker restarted"})
         run = self.engine(backend).resume(engine.run["id"], environment_update=update)
         self.assertEqual(run["status"], "completed")
-        selections = entries(run, "commander", "dispatch")
+        selections = entries(run, "commander", "decide")
         self.assertEqual([entry["status"] for entry in selections], ["invalid", "completed"])
         self.assertEqual(selections[1]["retry_of"], selections[0]["id"])
         self.assertEqual(len(entries(run, "worker")), 2)
 
 
-class ReplanStopTests(RepoCase):
+class CommanderDecisionTests(RepoCase):
     def block_once(self, backend, kwargs, result):
         if kwargs["role"] == "worker" and len(calls(backend, "worker")) == 1:
             result.update(status="blocked", blocker_kind="task", blockers=["Clarify prerequisite"])
 
-    def test_structurally_valid_stop_is_a_veto_even_when_invalid(self):
-        for case in ("tasks_with_stop", "long_reason"):
+    def test_ask_is_a_veto_even_when_invalid(self):
+        for case in ("operations_with_ask", "long_question"):
             with self.subTest(case=case):
                 def change(backend, kwargs, packet, result, case=case):
                     self.block_once(backend, kwargs, result)
-                    if kwargs["kind"] == "replan":
-                        if case == "tasks_with_stop":
+                    if trigger_kind(kwargs, packet) == "task":
+                        if case == "operations_with_ask":
                             task = copy.deepcopy(packet["original_tasks"][0])
                             task.update(id="extra")
-                            result.update(action="stop", reason="Operator must decide", new_tasks=[task], updates=[])
+                            decided(result, "ask", reason="Operator must decide", new_tasks=[task])
                         else:
-                            result.update(action="stop", reason="r" * 4001, new_tasks=[], updates=[])
+                            decided(result, "ask", reason="r" * 4001)
 
                 backend = ScriptedBackend(change)
                 engine = self.engine(backend)
-                with self.assertRaisesRegex(HarnessError, "指挥已停止再规划"):
+                with self.assertRaisesRegex(HarnessError, "等待操作者决定：task_id=greet"):
                     engine.start("Implement greet", plan())
-                replans = entries(engine.run, "commander", "replan")
-                self.assertEqual(len(replans), 1)
-                self.assertEqual(replans[0]["status"], "invalid_stopped")
-                stopped = engine.run["replan_stopped"]
-                self.assertIn("output_error", stopped)
-                requests = [r for r in engine.run["decision_requests"] if r["kind"] == "replan_stop"]
-                self.assertEqual(len(requests), 1 if case == "tasks_with_stop" else 0)
+                asked = entries(engine.run, "commander", "decide")
+                self.assertEqual(len(asked), 1)
+                self.assertEqual(asked[0]["status"], "invalid_asked")
+                self.assertTrue(asked[0]["error"])
+                requests = [r for r in engine.run["decision_requests"] if r["kind"] == "commander"]
+                self.assertEqual(len(requests), 1)
+                self.assertEqual(requests[0]["source"]["dispatch_id"], asked[0]["id"])
                 before = len(backend.calls)
-                with self.assertRaises(HarnessError):
+                with self.assertRaisesRegex(HarnessError, "等待操作者决定"):
                     self.engine(backend).resume(engine.run["id"])
                 self.assertEqual(len(backend.calls), before)
 
     def test_invalid_revision_is_redone(self):
         def change(backend, kwargs, packet, result):
             self.block_once(backend, kwargs, result)
-            if kwargs["kind"] == "replan":
-                number = len(calls(backend, "commander", "replan"))
-                description = "" if number == 1 else "Implement greet after clarification"
-                result.update(action="revise", reason="Clarified", new_tasks=[],
-                              updates=[{"id": "greet", "description": description, "add_depends_on": []}])
+            if trigger_kind(kwargs, packet) == "task" and worker_task_blocker(packet):
+                description = "" if len(decides(backend)) == 1 else "Implement greet after clarification"
+                revised_(result, packet, "Clarified", updates=[{"id": "greet", "description": description, "add_depends_on": []}])
 
         backend = ScriptedBackend(change)
         run = self.engine(backend).start("Implement greet", plan())
         self.assertEqual(run["status"], "completed")
-        replans = entries(run, "commander", "replan")
+        replans = entries(run, "commander", "decide")
         self.assertEqual([entry["status"] for entry in replans], ["invalid", "completed"])
-        self.assertEqual(run["replan_attempts"], 1)
+        self.assertEqual(replans[1]["retry_of"], replans[0]["id"])
+        self.assertEqual(len(run["plan_history"]), 2)
 
-    def test_out_of_scope_revision_keeps_its_receipt_for_scope_authority(self):
+    def test_out_of_scope_revision_stops_without_redo_and_resume_is_a_new_decision(self):
         def change(backend, kwargs, packet, result):
             self.block_once(backend, kwargs, result)
-            if kwargs["kind"] == "replan":
+            if trigger_kind(kwargs, packet) == "task" and worker_task_blocker(packet):
                 task = copy.deepcopy(packet["original_tasks"][0])
                 task.update(id="prepare", allowed_paths=["hello.py", "support.txt"])
-                result.update(action="revise", reason="Add prerequisite", new_tasks=[task],
-                              updates=[{"id": "greet", "description": packet["original_tasks"][0]["description"],
-                                        "add_depends_on": ["prepare"]}])
+                revised_(result, packet, "Add prerequisite", new_tasks=[task], selected="prepare",
+                        updates=[{"id": "greet", "description": packet["original_tasks"][0]["description"],
+                                  "add_depends_on": ["prepare"]}])
 
         backend = ScriptedBackend(change)
         engine = self.engine(backend)
-        with self.assertRaisesRegex(HarnessError, "文件范围"):
+        with self.assertRaisesRegex(HarnessError, r'指挥修订越出已批准的文件范围：\["support.txt"\].*--allow-scope'):
             engine.start("Implement greet", plan())
-        receipt = engine.run["commander_receipts"]["commander:replan:replanning"]
-        self.assertNotEqual(entries(engine.run, "commander", "replan")[0]["status"], "invalid")
-        before = len(backend.calls)
-        with self.assertRaisesRegex(HarnessError, "文件范围"):
+        saved = read_json(engine.directory / "state.json")
+        self.assertNotIn("commander:decide:run", saved["commander_receipts"])
+        first = entries(saved, "commander", "decide")
+        self.assertEqual(len(first), 1)
+        self.assertEqual((first[0]["status"], first[0]["out_of_scope_paths"]), ("invalid", ["support.txt"]))
+        # Without authority an ordinary resume is a new decision, not a redo.
+        with self.assertRaisesRegex(HarnessError, "越出已批准的文件范围"):
             self.engine(backend).resume(engine.run["id"])
-        self.assertEqual(len(backend.calls), before)
+        second = entries(read_json(engine.directory / "state.json"), "commander", "decide")
+        self.assertEqual(len(second), 2)
+        self.assertNotIn("retry_of", second[1])
         run = self.engine(backend).resume(engine.run["id"], allow_scope=["support.txt"])
         self.assertEqual(run["status"], "completed")
-        self.assertEqual(len(entries(run, "commander", "replan")), 1)
-        self.assertEqual(entries(run, "commander", "replan")[0]["id"], receipt["dispatch_id"])
+        third = entries(run, "commander", "decide")
+        # The authorized revision lands; the original task is then selected by one more decide.
+        self.assertEqual([entry["status"] for entry in third], ["invalid", "invalid", "completed", "completed"])
+        self.assertNotIn("retry_of", third[2])
+        packet = decides(backend)[2]["packet"]
+        self.assertEqual(packet["previous_invalid"]["dispatch_id"], third[1]["id"])
+        self.assertEqual(packet["approved_scope"], ["support.txt"])
+
+    def test_out_of_scope_revision_with_another_defect_is_redone(self):
+        def change(backend, kwargs, packet, result):
+            self.block_once(backend, kwargs, result)
+            if trigger_kind(kwargs, packet) == "task" and worker_task_blocker(packet):
+                if "previous_invalid" in packet:
+                    revised_(result, packet, "Clarified", updates=[{"id": "greet", "description": "Clarified greet",
+                                                                   "add_depends_on": []}])
+                    return
+                task = copy.deepcopy(packet["original_tasks"][0])
+                task.update(id="prepare", allowed_paths=["support.txt"], skills=["no-such-skill"])
+                revised_(result, packet, "Add prerequisite", new_tasks=[task], selected="prepare")
+
+        backend = ScriptedBackend(change)
+        run = self.engine(backend).start("Implement greet", plan())
+        self.assertEqual(run["status"], "completed")
+        decisions = entries(run, "commander", "decide")
+        self.assertEqual([entry["status"] for entry in decisions], ["invalid", "completed"])
+        self.assertNotIn("out_of_scope_paths", decisions[0])
+        self.assertEqual(decisions[1]["retry_of"], decisions[0]["id"])
 
 
 class WorkerInvalidOutputTests(RepoCase):
@@ -386,7 +424,7 @@ class WorkerInvalidOutputTests(RepoCase):
                 self.assertEqual((first["status"], first["worker_receipt_consumed"]), ("invalid", "result_rejected"))
                 self.assertIn("invalid_output", first)
                 order = [(call["role"], call["kind"]) for call in backend.calls]
-                self.assertEqual(order[:3], [("worker", "implement"), ("commander", "dispatch"), ("worker", "implement")])
+                self.assertEqual(order[:3], [("worker", "implement"), ("commander", "decide"), ("worker", "implement")])
                 workers = [request for request in backend.requests if request["role"] == "worker"]
                 self.assertNotEqual(workers[0]["dispatch_id"], workers[1]["dispatch_id"])
                 self.assertEqual(workers[1]["model"], self.config.role("worker", run["commander"]))
@@ -430,7 +468,7 @@ class WorkerInvalidOutputTests(RepoCase):
                 else:
                     self.assertEqual([r["kind"] for r in engine.run["decision_requests"]], ["worker"])
 
-    def test_task_blockers_and_unreadable_blockers_go_to_replanning(self):
+    def test_task_blockers_and_unreadable_blockers_go_to_the_commander(self):
         cases = {
             "task with long blocker": lambda result: result.update(status="blocked", blocker_kind="task",
                                                                    blockers=["b" * 4001]),
@@ -445,19 +483,22 @@ class WorkerInvalidOutputTests(RepoCase):
                 def change(backend, kwargs, packet, result, damage=damage):
                     if kwargs["role"] == "worker" and len(calls(backend, "worker")) == 1:
                         damage(result)
+                    if trigger_kind(kwargs, packet) == "task" and "output_error" in (packet["trigger"]["feedback"] or {}):
+                        decided(result, "ask", reason="The worker could not report its blocker; how to proceed?")
 
                 backend = ScriptedBackend(change)
                 engine = self.engine(backend)
-                with self.assertRaisesRegex(HarnessError, "指挥停止重新规划"):
+                with self.assertRaisesRegex(HarnessError, "等待操作者决定：task_id=greet"):
                     engine.start("Implement greet", plan())
-                self.assertEqual(len(calls(backend, "commander", "replan")), 1)
-                trigger = engine.run["replan_stopped"]["trigger"]
+                self.assertEqual(len(decides(backend)), 1)
+                trigger = decides(backend)[0]["packet"]["trigger"]["feedback"]
                 self.assertIn("output_error", trigger)
                 worker = entries(engine.run, "worker")[0]
                 self.assertEqual((worker["status"], worker["worker_outcome"]), ("invalid_blocked", "task_blocked"))
                 if name != "task with long blocker":
-                    self.assertEqual(set(trigger), {"task_id", "attempt", "snapshot_digest", "worker_artifact",
-                                                    "worker_artifact_digest", "output_error"})
+                    self.assertNotIn("worker", trigger)
+                    self.assertEqual(trigger["worker_artifact"], str(engine.directory / "dispatches" / worker["id"]
+                                                                     / "returned-result.json"))
                     self.assertFalse([r for r in engine.run["decision_requests"] if r["kind"] == "worker"])
                     from harness.cli import status_summary
                     self.assertNotIn("last_environment_blocker", status_summary(engine.run))
@@ -469,9 +510,8 @@ class WorkerInvalidOutputTests(RepoCase):
         def change(backend, kwargs, packet, result):
             if kwargs["role"] == "worker" and kwargs["task"]["description"] != revised:
                 result.update(status="blocked", blocker_kind="task", blockers=["b" * 4001])
-            if kwargs["kind"] == "replan":
-                result.update(action="revise", reason="Clarified", new_tasks=[],
-                              updates=[{"id": "greet", "description": revised, "add_depends_on": []}])
+            if trigger_kind(kwargs, packet) == "task" and worker_task_blocker(packet):
+                revised_(result, packet, "Clarified", updates=[{"id": "greet", "description": revised, "add_depends_on": []}])
 
         backend = ScriptedBackend(change)
         engine = self.engine(backend)
@@ -489,12 +529,12 @@ class WorkerInvalidOutputTests(RepoCase):
                 engine.start("Implement greet", plan())
         saved = read_json(engine.directory / "state.json")
         self.assertIn("worker:implement:greet", saved["worker_receipts"])
-        self.assertNotIn("pending_replan", saved)
+        self.assertIsNone(saved["feedback"])
         run = self.engine(backend).resume(engine.run["id"])
         self.assertEqual(run["status"], "completed")
         first = entries(run, "worker")[0]
         self.assertEqual((first["status"], first["worker_outcome"]), ("invalid_blocked", "task_blocked"))
-        self.assertEqual(len(calls(backend, "commander", "replan")), 1)
+        self.assertEqual(len(decides(backend)), 1)
         self.assertEqual(len(calls(backend, "worker")), 2)
 
 
@@ -768,12 +808,12 @@ class RedoBoundaryTests(RepoCase):
         return change
 
     def test_dispatch_budget_exhausted_at_the_first_invalid_output(self):
-        for kind in ("review", "dispatch"):
+        for kind in ("review", "decide"):
             with self.subTest(kind=kind):
                 self.setUp()
 
                 def change(backend, kwargs, packet, result, kind=kind):
-                    if kind == "dispatch" and kwargs["role"] == "worker" and len(calls(backend, "worker")) == 1:
+                    if kind == "decide" and kwargs["role"] == "worker" and len(calls(backend, "worker")) == 1:
                         result["summary"] = "x" * 32001
                     if kwargs["kind"] == kind and len(calls(backend, kwargs["role"], kind)) == 1:
                         if kind == "review":
@@ -793,7 +833,7 @@ class RedoBoundaryTests(RepoCase):
                 attempts = dict(engine.run["attempts"])
                 spent = engine.run["agent_dispatches"]
                 self.assertEqual(spent, 2)
-                self.assertNotIn(f"{role}:{kind}:" + ("greet" if kind == "review" else "dispatching"),
+                self.assertNotIn(f"{role}:{kind}:" + ("greet" if kind == "review" else "run"),
                                  engine.run["review_receipts" if kind == "review" else "commander_receipts"])
                 self.config.data["runtime"]["max_agent_dispatches"] = 200
                 run = self.engine(backend).resume(engine.run["id"])
@@ -999,9 +1039,8 @@ class ReviewFindingRegressionTests(RepoCase):
 
                 def change(backend, kwargs, packet, result, damage=damage):
                     damage(backend, kwargs, packet, result)
-                    if kwargs["kind"] == "replan":
-                        result.update(action="revise", reason="Clarified", new_tasks=[],
-                                      updates=[{"id": "greet", "description": revised, "add_depends_on": []}])
+                    if trigger_kind(kwargs, packet) == "task" and worker_task_blocker(packet):
+                        revised_(result, packet, "Clarified", updates=[{"id": "greet", "description": revised, "add_depends_on": []}])
 
                 backend = ScriptedBackend(change)
                 engine = self.engine(backend)

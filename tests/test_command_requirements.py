@@ -10,7 +10,7 @@ from harness.runtime import Runtime
 from harness.requirements import missing_commands
 from harness.util import HarnessError, read_json
 from test_harness import ROOT, RepoCase
-from test_runtime_changes import ScriptedBackend
+from test_runtime_changes import ScriptedBackend, revised, trigger_kind
 
 
 class CommandRequirementsTests(RepoCase):
@@ -99,20 +99,20 @@ class CommandRequirementsTests(RepoCase):
 
     def test_model_plan_is_saved_without_replanning_to_avoid_missing_grant(self):
         def declare(backend, kwargs, packet, result):
-            if kwargs['kind'] == 'plan':
-                result['tasks'][0]['required_commands'] = [self.command]
+            if trigger_kind(kwargs, packet) == 'plan':
+                result['new_tasks'][0]['required_commands'] = [self.command]
         backend = ScriptedBackend(declare)
         engine = self.engine(backend)
         with self.assertRaises(HarnessError):
             engine.start('Implement greet')
         with self.assertRaises(HarnessError):
             self.engine(backend).resume(engine.run['id'])
-        self.assertEqual([call['kind'] for call in backend.calls], ['plan'])
+        self.assertEqual([call['kind'] for call in backend.calls], ['decide'])
         self.assertEqual(sum(self.saved(engine)['attempts'].values()), 0)
         self.config.data['permissions']['worker_commands'].append(self.command)
         result = self.engine(backend).resume(engine.run['id'])
         self.assertEqual(result['status'], 'completed')
-        self.assertEqual(sum(call['kind'] == 'plan' for call in backend.calls), 1)
+        self.assertEqual(sum(call['kind'] == 'decide' for call in backend.calls), 1)
         self.assertEqual(result['original_tasks'][0]['required_commands'], [self.command])
 
     def command_repair_cases(self):
@@ -120,14 +120,14 @@ class CommandRequirementsTests(RepoCase):
         commands = [['required-tool', 'run', str(i)] for i in range(33)]
         yield 'too_many', commands, commands[:32]
 
-    def assert_command_redo(self, result, backend, kind):
+    def assert_command_redo(self, result, backend):
         """The invalid declaration is kept as evidence and redone once automatically."""
         self.assertEqual(result['status'], 'completed')
-        first, second = [d for d in result['dispatches'] if d.get('kind') == kind]
+        first, second = [d for d in result['dispatches'] if d.get('kind') == 'decide'][:2]
         self.assertEqual((first['status'], second['status']), ('invalid', 'completed'))
         self.assertEqual(second['retry_of'], first['id'])
         self.assertTrue(Path(first['invalid_output']['artifact']).is_file())
-        calls = [call for call in backend.calls if call['kind'] == kind]
+        calls = [call for call in backend.calls if call['kind'] == 'decide']
         self.assertNotIn('previous_invalid', calls[0]['packet'])
         self.assertEqual(calls[1]['packet']['previous_invalid']['dispatch_id'], first['id'])
 
@@ -136,13 +136,13 @@ class CommandRequirementsTests(RepoCase):
             with self.subTest(mode=mode):
                 self.config.data['permissions']['worker_commands'] = copy.deepcopy(corrected)
                 def declare(backend, kwargs, packet, result):
-                    if kwargs['kind'] == 'plan':
+                    if trigger_kind(kwargs, packet) == 'plan':
                         commands = corrected if 'previous_invalid' in packet else invalid
-                        result['tasks'][0]['required_commands'] = copy.deepcopy(commands)
+                        result['new_tasks'][0]['required_commands'] = copy.deepcopy(commands)
 
                 backend = ScriptedBackend(declare)
                 result = self.engine(backend).start('Implement greet')
-                self.assert_command_redo(result, backend, 'plan')
+                self.assert_command_redo(result, backend)
                 self.assertEqual(result['original_tasks'][0]['required_commands'], corrected)
                 self.assertEqual(result['tasks'], result['original_tasks'])
                 self.assertEqual(result['attempts'], {'greet': 1})
@@ -157,28 +157,27 @@ class CommandRequirementsTests(RepoCase):
                     def declare(backend, kwargs, packet, result):
                         if kwargs['role'] == 'worker' and sum(call['role'] == 'worker' for call in backend.calls) == 1:
                             result.update(status='blocked', blocker_kind='task', blockers=['Need prerequisite'])
-                        if kwargs['kind'] == 'replan':
+                        if trigger_kind(kwargs, packet) == 'task' and packet['trigger']['feedback']:
                             repairing = 'previous_invalid' in packet
                             commands = corrected if repairing else invalid
                             original = copy.deepcopy(plan['tasks'][0])
-                            result.update(action='revise',
-                                reason='x' * 4001 if long_reason and not repairing else 'Prepare prerequisite',
-                                new_tasks=[{**original, 'id': 'prep', 'required_commands': copy.deepcopy(commands)}],
-                                updates=[{'id': original['id'], 'description': original['description'],
-                                          'add_depends_on': ['prep']}])
+                            revised(result, packet, 'x' * 4001 if long_reason and not repairing else 'Prepare prerequisite',
+                                    new_tasks=[{**original, 'id': 'prep', 'required_commands': copy.deepcopy(commands)}],
+                                    updates=[{'id': original['id'], 'description': original['description'],
+                                              'add_depends_on': ['prep']}], selected='prep')
 
                     backend = ScriptedBackend(declare)
                     result = self.engine(backend).start('Implement greet', plan)
-                    self.assert_command_redo(result, backend, 'replan')
+                    self.assert_command_redo(result, backend)
                     self.assertEqual(result['original_tasks'], plan['tasks'])
                     self.assertEqual(result['tasks'][1]['required_commands'], corrected)
                     self.assertEqual(list(result['accepted']), ['prep', 'greet'])
                     self.assertEqual(result['attempts'], {'greet': 2, 'prep': 1})
                     self.assertEqual(sum(result['attempts'].values()), 3)
-                    self.assertEqual(result['replan_attempts'], 1)
-                    # Blocker feedback and the greet retry each require selection.
-                    self.assertEqual(sum(call['kind'] == 'dispatch' for call in backend.calls), 2)
-                    self.assertEqual(result['agent_dispatches'], 10)
+                    self.assertEqual(len(result['plan_history']), 2)
+                    # The blocker needs one decide (invalid, then redone); the greet retry one more.
+                    self.assertEqual(sum(call['kind'] == 'decide' for call in backend.calls), 3)
+                    self.assertEqual(result['agent_dispatches'], 9)
 
     def test_selected_directive_survives_worker_preparation_failure(self):
         backend = ScriptedBackend()
@@ -197,11 +196,11 @@ class CommandRequirementsTests(RepoCase):
         directive = saved['pending_directive']['directive']
         self.assertEqual(saved['current_task'], directive['selected_task'])
         self.assertEqual(sum(saved['attempts'].values()), 0)
-        self.assertEqual([call['kind'] for call in backend.calls], ['dispatch'])
+        self.assertEqual([call['kind'] for call in backend.calls], ['decide'])
         result = self.engine(backend).resume(saved['id'], step=True)
         self.assertEqual(set(result['accepted']), {directive['selected_task']})
         self.assertNotIn('pending_directive', result)
-        self.assertEqual(sum(call['kind'] == 'dispatch' for call in backend.calls), 1)
+        self.assertEqual(sum(call['kind'] == 'decide' for call in backend.calls), 1)
         worker = next(call for call in backend.calls if call['role'] == 'worker')
         self.assertEqual(worker['packet']['instruction'], directive['instruction'])
 
@@ -292,14 +291,14 @@ class ProviderWireSchemaTests(RepoCase):
         engine = Runtime(self.config, self.repo, backend=backend)
         self.assertEqual(engine.start('Implement greet')['status'], 'completed')
         codex = [(kind, schema) for role, kind, cli, schema in backend.wire if cli == 'codex']
-        self.assertIn('plan', [kind for kind, _ in codex])
+        self.assertIn('decide', [kind for kind, _ in codex])
         self.assertIn('final_review', [kind for kind, _ in codex])
         for kind, schema in codex:
             for node in self.objects(schema):
                 with self.subTest(kind=kind, keys=sorted(node['properties'])):
                     self.assertEqual(sorted(node['required']), sorted(node['properties']))
-        plan = next(schema for kind, schema in codex if kind == 'plan')
-        self.assertIn('required_commands', plan['properties']['tasks']['items']['required'])
+        plan = next(schema for kind, schema in codex if kind == 'decide')
+        self.assertIn('required_commands', plan['properties']['new_tasks']['items']['required'])
         # The demo plan omits the field; local validation still accepts it.
         self.assertNotIn('required_commands', engine.run['original_tasks'][0])
         worker = [schema for role, _, cli, schema in backend.wire if role == 'worker']

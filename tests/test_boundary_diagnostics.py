@@ -209,7 +209,7 @@ class BoundaryDiagnosticsTests(unittest.TestCase):
         with self.assertRaisesRegex(HarnessError, "受保护"):
             resumed.resume(engine.run["id"])
         self.assertEqual(len(resumed.run["dispatches"]), dispatch_count)
-        self.assertEqual(resumed.run["final_attempts"], 1)
+        self.assertEqual(len(resumed.run["final_history"]), 1)
 
     def test_final_reviewer_private_state_cannot_complete_or_reroll(self):
         class HiddenFinalBackend(DemoBackend):

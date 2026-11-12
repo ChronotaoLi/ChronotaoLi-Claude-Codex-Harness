@@ -29,8 +29,6 @@ class ReviewReceiptWindowTests(RepoCase):
         return artifact
 
     def test_rejection_written_before_receipt_save_is_revalidated_without_reroll(self):
-        self.config.data["runtime"]["max_replans"] = 0
-
         def reject_first(backend, kwargs, packet, result):
             if kwargs["kind"] == "final_review" and sum(call["kind"] == "final_review" for call in backend.calls) == 1:
                 result.update(verdict="request_changes", findings=[finding()])
@@ -41,13 +39,15 @@ class ReviewReceiptWindowTests(RepoCase):
         evidence = artifact.read_bytes()
         calls = list(backend.calls)
         resumed = self.engine(backend)
-        with self.assertRaises(HarnessError):
+        with self.assertRaisesRegex(HarnessError, "等待操作者决定：task_id=final"):
             resumed.resume(engine.run["id"])
-        self.assertEqual(backend.calls, calls)
+        # The written rejection is revalidated, not redrawn; the next call is the decision.
+        self.assertEqual([c["kind"] for c in backend.calls[len(calls):]], ["decide"])
         self.assertEqual(resumed.run["final_history"][-1]["status"], "rejected")
-        self.assertEqual(resumed.run["final_attempts"], 1)
+        self.assertEqual(len(resumed.run["final_history"]), 1)
         self.assertEqual(artifact.read_bytes(), evidence)
-        with self.assertRaisesRegex(HarnessError, "同一代码快照"):
+        calls = list(backend.calls)
+        with self.assertRaisesRegex(HarnessError, "等待操作者决定"):
             self.engine(backend).resume(engine.run["id"], reverify=True)
         self.assertEqual(backend.calls, calls)
 
@@ -101,7 +101,7 @@ class ReviewReceiptWindowTests(RepoCase):
         with patch.object(resumed.hooks, "emit", wraps=resumed.hooks.emit) as hooks:
             result = resumed.resume(engine.run["id"])
         self.assertEqual(result["status"], "completed")
-        self.assertEqual(result["final_attempts"], 1)
+        self.assertEqual(len(result["final_history"]), 1)
         self.assertEqual(backend.calls, calls)
         self.assertEqual(artifact.read_bytes(), evidence)
         final_hooks = [call for call in hooks.call_args_list
@@ -163,7 +163,7 @@ class ReviewReceiptWindowTests(RepoCase):
         self.assertNotEqual(resumed.run["final_history"][-1]["status"], "approved")
 
     def test_reviewer_service_retries_are_bounded_and_explicit_budget_increase_recovers(self):
-        self.config.data["runtime"].update(max_agent_dispatches=5, max_final_attempts=1, max_attempts=1)
+        self.config.data["runtime"].update(max_agent_dispatches=5, max_attempts=1)
         available = False
         dispatch_ids = []
 
@@ -187,14 +187,14 @@ class ReviewReceiptWindowTests(RepoCase):
         self.assertEqual(backend.calls, calls)
         saved = read_json(engine.directory / "state.json")
         self.assertEqual(saved["agent_dispatches"], 5)
-        self.assertEqual(saved["final_attempts"], 1)
+        self.assertEqual(len(saved["final_history"]), 1)
         self.assertEqual(sum(saved["attempts"].values()), 1)
         available = True
         self.config.data["runtime"]["max_agent_dispatches"] = 6
         result = self.engine(backend).resume(engine.run["id"])
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["agent_dispatches"], 6)
-        self.assertEqual(result["final_attempts"], 1)
+        self.assertEqual(len(result["final_history"]), 1)
         self.assertEqual(sum(result["attempts"].values()), 1)
         self.assertEqual(len(dispatch_ids), 4)
         self.assertEqual(len(dispatch_ids), len(set(dispatch_ids)))
@@ -224,7 +224,7 @@ class ReviewReceiptWindowTests(RepoCase):
         with self.assertRaisesRegex(HarnessError, "缺失或无法读取"):
             self.engine(backend).resume(engine.run["id"])
         self.assertEqual(len(backend.calls), calls)
-        self.assertEqual(read_json(engine.directory / "state.json")["final_attempts"], 1)
+        self.assertEqual(len(read_json(engine.directory / "state.json")["final_history"]), 1)
 
     def test_missing_review_receipt_updates_dispatch_and_runtime_error(self):
         backend = ScriptedBackend()

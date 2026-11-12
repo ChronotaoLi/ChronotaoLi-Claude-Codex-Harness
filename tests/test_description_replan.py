@@ -1,12 +1,13 @@
 """Description refinement retains one owned candidate across durable boundaries."""
 import copy
+import hashlib
 from pathlib import Path
 from unittest.mock import patch
 
 from harness import git
 from harness.util import HarnessError, read_json, write_json
 from test_harness import ROOT, RepoCase
-from test_runtime_changes import ScriptedBackend, finding
+from test_runtime_changes import ScriptedBackend, finding, revised, trigger_kind
 
 
 STAGED = 'def greet(name):\n    return f"Hello, {name}!"\n# retained staged candidate\n'
@@ -27,11 +28,10 @@ class DescriptionBackend(ScriptedBackend):
             if self.worker_ids and not self.prerequisite:
                 self.case.assertEqual(kwargs["task"]["id"], "greet")
                 self.case.assert_candidate(kwargs["cwd"])
-                self.case.assertNotIn("retained_candidate", state)
+                self.case.assertNotIn("pending_directive", state)
                 self.case.assertEqual(state["current_task"], "greet")
                 entry = next(d for d in state["dispatches"] if d["id"] == kwargs["job"].name)
                 self.case.assertIs(entry["invoked"], True)
-                self.case.assertEqual(entry["retained_candidate_revision"], len(state["plan_history"]) - 1)
                 self.retained_seen.append(sum(state["attempts"].values()))
             if self.worker_ids and self.prerequisite and kwargs["task"]["id"] == "prepare":
                 self.case.assertFalse((kwargs["cwd"] / "hello.py").exists())
@@ -54,11 +54,7 @@ class DescriptionBackend(ScriptedBackend):
         if self.rejected and kwargs["kind"] == "review" and sum(
                 call["kind"] == "review" for call in self.calls) == 1:
             result.update(verdict="request_changes", findings=[finding()])
-        if self.rejected and kwargs["kind"] == "dispatch" and any(
-                call["kind"] == "review" for call in self.calls) and not any(
-                call["kind"] == "replan" for call in self.calls):
-            result.update(action="replan", instruction="Refine this task without changing its acceptance")
-        if kwargs["kind"] == "replan":
+        if trigger_kind(kwargs, packet) == "task" and packet["trigger"]["feedback"] and len(packet.get("accepted", {})) == 0:
             updates = [{"id": "greet", "description": "Refined execution detail for the same greeting acceptance",
                         "add_depends_on": ["prepare"] if self.prerequisite else []}]
             new_tasks = []
@@ -66,7 +62,9 @@ class DescriptionBackend(ScriptedBackend):
                 prerequisite = copy.deepcopy(self.case.plan()["tasks"][0])
                 prerequisite.update(id="prepare", title="Prepare the greeting prerequisite")
                 new_tasks.append(prerequisite)
-            result.update(action="revise", reason="Clarify execution detail", new_tasks=new_tasks, updates=updates)
+            revised(result, packet, "Clarify execution detail", new_tasks=new_tasks, updates=updates,
+                    selected="prepare" if self.prerequisite else "greet",
+                    instruction="Refine this task without changing its acceptance")
 
 
 class DescriptionReplanTests(RepoCase):
@@ -86,27 +84,40 @@ class DescriptionReplanTests(RepoCase):
         self.assertIn("notes.txt", git.git(worktree, "ls-files", "--others", "--exclude-standard"))
 
     def assert_no_archive(self, engine):
-        self.assertEqual(list((engine.directory / "recovery").glob("replan-*")), [])
+        self.assertEqual(list((engine.directory / "recovery").glob("revision-*")), [])
 
-    def interrupted(self, boundary="validated", *, rejected=False, two_ready=False):
+    def interrupted(self, boundary="pending", *, rejected=False, two_ready=False):
+        """Stop after the revision landed (pending) or after it was published."""
         backend = DescriptionBackend(self, rejected=rejected)
         engine = self.engine(backend)
-        if boundary == "validated":
-            interruption = patch.object(engine.services.planning, "apply_pending_revision", side_effect=KeyboardInterrupt())
+        planning = engine.services.planning
+        if boundary == "pending":
+            interruption = patch.object(planning, "apply_pending_revision", side_effect=KeyboardInterrupt())
         else:
-            original = engine.services.planning.record_plan
+            original = planning.apply_pending_revision
 
-            def record(*args, **kwargs):
-                original(*args, **kwargs)
-                if kwargs.get("finish_replan"):
-                    raise KeyboardInterrupt()
-
-            interruption = patch.object(engine.services.planning, "record_plan", side_effect=record)
+            def publish():
+                original()
+                raise KeyboardInterrupt()
+            interruption = patch.object(planning, "apply_pending_revision", side_effect=publish)
         with interruption, self.assertRaises(KeyboardInterrupt):
             engine.start("Implement greeting", self.plan(two_ready=two_ready))
         self.assert_candidate(engine.worktree)
         self.assert_no_archive(engine)
         return engine, backend
+
+    def plan_file(self, engine, revision=1):
+        return read_json(engine.directory / "plans" / f"revision-{revision}.json")
+
+    def assert_stops_without_reset_or_calls(self, engine, backend, pattern=""):
+        calls = copy.deepcopy(backend.calls)
+        resumed = self.engine(backend)
+        with patch("harness.planning.git.archive_and_reset") as archive, self.assertRaisesRegex(HarnessError, pattern):
+            resumed.resume(engine.run["id"])
+        archive.assert_not_called()
+        self.assertEqual(backend.calls, calls)
+        self.assert_no_archive(engine)
+        return resumed
 
     def test_two_ready_tasks_keep_candidate_bound_to_its_original_task(self):
         backend = DescriptionBackend(self)
@@ -120,7 +131,7 @@ class DescriptionReplanTests(RepoCase):
         self.assertEqual(len(set(backend.worker_ids)), 2)
         self.assertEqual(result["tasks"][1], original["tasks"][1])
         self.assertEqual(result["original_tasks"], original["tasks"])
-        self.assertNotIn("retained_candidate", result)
+        self.assertNotIn("pending_directive", result)
         self.assert_no_archive(engine)
 
     def test_rejected_candidate_gets_fresh_verification_and_review(self):
@@ -129,7 +140,8 @@ class DescriptionReplanTests(RepoCase):
         result = engine.start("Implement greeting", self.plan())
         self.assertEqual(result["status"], "completed")
         self.assertEqual(sum(result["attempts"].values()), 2)
-        self.assertEqual(result["replan_attempts"], 1)
+        self.assertEqual(len(result["plan_history"]), 2)
+        self.assertEqual(self.plan_file(engine)["candidate"], "retain")
         reviews = result["review_history"]["greet"]
         self.assertEqual([item["review"]["verdict"] for item in reviews], ["request_changes", "approve"])
         self.assertNotEqual(reviews[0]["artifact"], reviews[1]["artifact"])
@@ -140,29 +152,43 @@ class DescriptionReplanTests(RepoCase):
         self.assertIn("fresh worker edit", (engine.worktree / "hello.py").read_text())
         self.assert_no_archive(engine)
 
-    def test_interruption_before_application_reuses_validated_revision(self):
+    def test_interruption_before_publication_reuses_landed_revision(self):
         engine, backend = self.interrupted()
-        pending = read_json(engine.directory / "state.json")["pending_replan"]
-        self.assertEqual(pending["stage"], "validated")
-        self.assertEqual(pending["candidate_policy"], "retain")
-        self.assertEqual(pending["retained_candidate"]["task_id"], "greet")
+        saved = read_json(engine.directory / "state.json")
+        pending = saved["pending_revision"]
+        self.assertEqual(set(pending), {"revision", "artifact", "artifact_digest"})
+        self.assertEqual(pending["revision"], 1)
+        self.assertNotIn("commander:decide:run", saved["commander_receipts"])
+        content = self.plan_file(engine)
+        self.assertEqual(content["candidate"], "retain")
+        self.assertEqual(content["directive"]["selected_task"], "greet")
         result = self.engine(backend).resume(engine.run["id"])
         self.assertEqual(result["status"], "completed")
-        self.assertEqual(sum(call["kind"] == "replan" for call in backend.calls), 1)
+        self.assertEqual(sum(call["role"] == "commander" for call in backend.calls), 1)
         self.assertEqual(result["attempts"], {"greet": 2})
         self.assertEqual(backend.retained_seen, [2])
         self.assert_no_archive(engine)
 
-    def test_interruption_after_record_plan_keeps_guard_and_current_task(self):
-        engine, backend = self.interrupted("applied", two_ready=True)
+    def test_published_revision_binds_directive_task_and_retained_snapshot(self):
+        engine, backend = self.interrupted("published", two_ready=True)
         saved = read_json(engine.directory / "state.json")
-        self.assertNotIn("pending_replan", saved)
+        content = self.plan_file(engine)
+        self.assertNotIn("pending_revision", saved)
+        self.assertEqual(saved["plan_history"][-1], {"revision": 1, "artifact": content and str(
+            engine.directory / "plans" / "revision-1.json"), "artifact_digest": saved["plan_history"][-1]["artifact_digest"]})
+        self.assertEqual(set(saved["plan_history"][-1]), {"revision", "artifact", "artifact_digest"})
         self.assertEqual(saved["current_task"], "greet")
-        self.assertEqual(saved["retained_candidate"], saved["plan_history"][-1]["retained_candidate"])
+        self.assertEqual(saved["pending_directive"], {"directive": content["directive"],
+                                                      "snapshot_digest": content["snapshot_digest"], "revision": 1})
+        self.assertEqual(saved["tasks"], content["tasks"])
         result = self.engine(backend).resume(engine.run["id"], step=True)
         self.assertEqual(set(result["accepted"]), {"greet"})
         self.assertEqual(sum(result["attempts"].values()), 2)
-        self.assertEqual(sum(call["kind"] == "replan" for call in backend.calls), 1)
+        # One decide selected among two ready tasks, one revised after the blocker.
+        self.assertEqual(sum(call["role"] == "commander" for call in backend.calls), 2)
+        # The next model call after the revision was the retained task's worker.
+        roles = [call["role"] for call in backend.calls]
+        self.assertEqual(roles[len(roles) - roles[::-1].index("commander")], "worker")
         self.assert_no_archive(engine)
 
     def test_changed_bytes_index_or_untracked_file_stop_without_reset_or_calls(self):
@@ -178,90 +204,88 @@ class DescriptionReplanTests(RepoCase):
                 else:
                     (engine.worktree / "extra.txt").write_text("An additional in-scope untracked file\n")
                 snapshot = engine.context.snapshot()
-                calls = copy.deepcopy(backend.calls)
-                resumed = self.engine(backend)
-                with patch("harness.planning.git.archive_and_reset") as archive, self.assertRaises(HarnessError):
-                    resumed.resume(engine.run["id"])
-                archive.assert_not_called()
+                resumed = self.assert_stops_without_reset_or_calls(engine, backend, "修订保留候选的代码或暂存区已变化")
                 self.assertEqual(resumed.context.snapshot(), snapshot)
-                self.assertEqual(backend.calls, calls)
-                self.assert_no_archive(engine)
+                self.assertIn("pending_revision", read_json(engine.directory / "state.json"))
 
-    def test_applied_guard_rejects_later_candidate_mutation_before_dispatch(self):
-        engine, backend = self.interrupted("applied")
+    def test_published_guard_rejects_later_candidate_mutation_before_dispatch(self):
+        engine, backend = self.interrupted("published")
         (engine.worktree / "notes.txt").unlink()
-        calls = copy.deepcopy(backend.calls)
-        with patch("harness.planning.git.archive_and_reset") as archive, self.assertRaises(HarnessError):
-            self.engine(backend).resume(engine.run["id"])
-        archive.assert_not_called()
-        self.assertEqual(backend.calls, calls)
+        self.assert_stops_without_reset_or_calls(engine, backend, "待派发指令的代码快照已变化")
         self.assertEqual((engine.worktree / "hello.py").read_text(), CANDIDATE)
-        self.assert_no_archive(engine)
 
-    def test_missing_or_changed_bound_replan_result_stops_without_new_calls(self):
-        for change in ("missing", "changed"):
-            with self.subTest(change=change):
-                engine, backend = self.interrupted("applied")
-                guard = read_json(engine.directory / "state.json")["retained_candidate"]
-                artifact = Path(guard["artifact"])
+    def test_missing_or_changed_plan_or_original_stops_without_new_calls(self):
+        for boundary, target, change in (("pending", "plan", "changed"), ("pending", "plan", "missing"),
+                                         ("pending", "original", "changed"), ("published", "plan", "changed"),
+                                         ("published", "plan", "missing")):
+            with self.subTest(boundary=boundary, target=target, change=change):
+                engine, backend = self.interrupted(boundary)
+                content = self.plan_file(engine)
+                artifact = (engine.directory / "plans" / "revision-1.json" if target == "plan"
+                            else Path(content["source"]["artifact"]))
                 if change == "missing":
                     artifact.unlink()
                 else:
                     artifact.write_bytes(artifact.read_bytes() + b"\n")
-                calls = copy.deepcopy(backend.calls)
-                with patch("harness.planning.git.archive_and_reset") as archive, self.assertRaises(HarnessError):
-                    self.engine(backend).resume(engine.run["id"])
-                archive.assert_not_called()
-                self.assertEqual(backend.calls, calls)
+                self.assert_stops_without_reset_or_calls(engine, backend)
                 self.assert_candidate(engine.worktree)
 
-    def test_guard_reconstructs_original_revision_and_rejects_task_rebinding(self):
-        for change in ("description", "acceptance", "scope", "current_task", "guard"):
+    def test_pending_revision_replays_original_against_ledger_before_any_reset(self):
+        for change in ("acceptance", "current_task", "plan_directive"):
             with self.subTest(change=change):
-                engine, backend = self.interrupted("applied", two_ready=True)
+                engine, backend = self.interrupted(two_ready=True)
                 saved = read_json(engine.directory / "state.json")
-                if change == "guard":
-                    saved.pop("retained_candidate")
+                if change == "acceptance":
+                    saved["tasks"][0]["acceptance"].append("An acceptance the revision never saw")
+                elif change == "current_task":
+                    saved["current_task"] = None
+                write_json(engine.directory / "state.json", saved)
+                if change == "plan_directive":
+                    # A file that is consistent with its own digest but not with the original.
+                    path = engine.directory / "plans" / "revision-1.json"
+                    content = read_json(path)
+                    content["directive"]["instruction"] = "A different instruction"
+                    write_json(path, content)
+                    saved["pending_revision"]["artifact_digest"] = hashlib.sha256(path.read_bytes()).hexdigest()
+                    write_json(engine.directory / "state.json", saved)
+                self.assert_stops_without_reset_or_calls(engine, backend)
+                self.assert_candidate(engine.worktree)
+
+    def test_published_directive_rejects_ledger_tampering_and_task_rebinding(self):
+        for change in ("description", "acceptance", "scope", "current_task", "directive"):
+            with self.subTest(change=change):
+                engine, backend = self.interrupted("published", two_ready=True)
+                saved = read_json(engine.directory / "state.json")
+                if change == "directive":
+                    saved.pop("pending_directive")
                 elif change == "current_task":
                     saved["current_task"] = "other"
+                elif change == "description":
+                    saved["tasks"][0]["description"] = "A different description absent from the original revision"
+                elif change == "scope":
+                    saved["tasks"][0]["allowed_paths"] = ["hello.py"]
                 else:
-                    for tasks in (saved["tasks"], saved["plan_history"][-1]["tasks"]):
-                        if change == "description":
-                            tasks[0]["description"] = "A different description absent from the original replan"
-                        elif change == "scope":
-                            tasks[0]["allowed_paths"] = ["hello.py"]
-                        else:
-                            tasks[0]["acceptance"].append("An unexplained acceptance change")
-                    if change == "scope":
-                        saved["plan_history"][0]["tasks"][0]["allowed_paths"] = ["hello.py"]
+                    saved["tasks"][0]["acceptance"].append("An unexplained acceptance change")
                 write_json(engine.directory / "state.json", saved)
-                calls = copy.deepcopy(backend.calls)
-                with patch("harness.planning.git.archive_and_reset") as archive, self.assertRaises(HarnessError):
-                    self.engine(backend).resume(engine.run["id"])
-                archive.assert_not_called()
-                self.assertEqual(backend.calls, calls)
+                self.assert_stops_without_reset_or_calls(engine, backend)
                 self.assert_candidate(engine.worktree)
 
     def test_head_or_git_binding_change_stops_without_archiving_candidate(self):
         for change in ("head", "binding"):
             with self.subTest(change=change):
-                engine, backend = self.interrupted("applied")
+                engine, backend = self.interrupted()
                 if change == "head":
                     git.git(engine.worktree, "-c", "user.name=Test", "-c", "user.email=test@localhost",
                             "-c", "commit.gpgsign=false", "commit", "--only", "--allow-empty", "-m", "external commit")
                 else:
                     gitfile = engine.worktree / ".git"
                     gitfile.write_bytes(gitfile.read_bytes() + b"\n")
-                calls = copy.deepcopy(backend.calls)
-                with patch("harness.planning.git.archive_and_reset") as archive, self.assertRaises(HarnessError):
-                    self.engine(backend).resume(engine.run["id"])
-                archive.assert_not_called()
-                self.assertEqual(backend.calls, calls)
+                self.assert_stops_without_reset_or_calls(engine, backend)
                 self.assertEqual((engine.worktree / "hello.py").read_text(), CANDIDATE)
                 self.assertEqual((engine.worktree / "notes.txt").read_text(), NOTES)
 
-    def test_pre_agent_preparation_failure_keeps_guard_and_invocation_budgets(self):
-        engine, backend = self.interrupted("applied")
+    def test_pre_agent_preparation_failure_keeps_directive_and_invocation_budgets(self):
+        engine, backend = self.interrupted("published")
         saved = read_json(engine.directory / "state.json")
         resumed = self.engine(backend)
 
@@ -273,12 +297,10 @@ class DescriptionReplanTests(RepoCase):
                 HarnessError, "local worker preparation"):
             resumed.resume(engine.run["id"])
         after = read_json(engine.directory / "state.json")
-        self.assertEqual(after["retained_candidate"], saved["retained_candidate"])
-        for key in ("attempts",):
-            self.assertEqual(after[key], saved[key])
-        self.assertEqual(after["agent_dispatches"], saved["agent_dispatches"] + 1)
+        self.assertEqual(after["pending_directive"], saved["pending_directive"])
+        self.assertEqual(after["attempts"], saved["attempts"])
+        self.assertEqual(after["agent_dispatches"], saved["agent_dispatches"])
         self.assertEqual(backend.calls[-1]["role"], "commander")
-        self.assertEqual(backend.calls[-1]["kind"], "dispatch")
         self.assertEqual(after["agent_dispatches"], sum(d.get("invoked", True) for d in after["dispatches"]
                                                       if d["role"] in ("worker", "reviewer", "commander")))
         self.assertEqual(len(backend.worker_ids), 1)
@@ -286,26 +308,57 @@ class DescriptionReplanTests(RepoCase):
         result = self.engine(backend).resume(engine.run["id"])
         self.assertEqual(result["status"], "completed")
         self.assertEqual(backend.retained_seen, [2])
-        self.assertNotIn("retained_candidate", result)
+        self.assertNotIn("pending_directive", result)
 
-    def test_validated_revision_without_candidate_policy_preserves_candidate_and_stops(self):
-        engine, backend = self.interrupted()
-        snapshot = engine.context.snapshot()
-        saved = read_json(engine.directory / "state.json")
-        saved["pending_replan"].pop("candidate_policy")
-        saved["pending_replan"].pop("retained_candidate")
-        write_json(engine.directory / "state.json", saved)
-        calls = copy.deepcopy(backend.calls)
-        resumed = self.engine(backend)
-        with patch("harness.planning.git.archive_and_reset") as archive, self.assertRaisesRegex(
-                HarnessError, "候选保留策略缺失"):
-            resumed.resume(engine.run["id"])
-        archive.assert_not_called()
-        self.assertEqual(backend.calls, calls)
-        self.assertEqual(resumed.context.snapshot(), snapshot)
-        self.assert_candidate(resumed.worktree)
-        self.assert_no_archive(resumed)
-        self.assertEqual(read_json(resumed.directory / "state.json")["pending_replan"], saved["pending_replan"])
+    def test_pre_agent_hook_cannot_replace_retained_candidate(self):
+        for target in ("bytes", "index"):
+            with self.subTest(target=target):
+                engine, backend = self.interrupted("published")
+                saved = read_json(engine.directory / "state.json")
+                resumed = self.engine(backend)
+                emit = resumed.hooks.emit
+
+                def mutate(event, payload, logs):
+                    if event == "pre_agent" and payload["role"] == "worker":
+                        if target == "bytes":
+                            (resumed.worktree / "hello.py").write_text(CANDIDATE + "# hook edit\n")
+                        else:
+                            git.git(resumed.worktree, "add", "hello.py")
+                    return emit(event, payload, logs)
+                with patch.object(resumed.hooks, "emit", side_effect=mutate), self.assertRaisesRegex(
+                        HarnessError, "待派发指令与已发布计划或候选不符"):
+                    resumed.resume(engine.run["id"])
+                after = read_json(engine.directory / "state.json")
+                self.assertEqual(after["pending_directive"], saved["pending_directive"])
+                self.assertEqual((after["attempts"], after["agent_dispatches"]), (saved["attempts"], saved["agent_dispatches"]))
+                entry = after["dispatches"][-1]
+                self.assertEqual((entry["role"], entry["invoked"]), ("worker", False))
+                self.assertEqual(len(backend.worker_ids), 1)
+                # Restoring the bound candidate lets the same directive dispatch.
+                if target == "bytes":
+                    (engine.worktree / "hello.py").write_text(CANDIDATE)
+                else:
+                    git.git(engine.worktree, "reset", "-q", "hello.py")
+                    git.git(engine.worktree, "add", "hello.py")
+                    (engine.worktree / "hello.py").write_text(STAGED)
+                    git.git(engine.worktree, "add", "hello.py")
+                    (engine.worktree / "hello.py").write_text(CANDIDATE)
+                result = self.engine(backend).resume(engine.run["id"])
+                self.assertEqual(result["status"], "completed")
+
+    def test_implement_directive_still_lets_pre_agent_hook_edit_candidate(self):
+        # Contrast: only retained and rejection directives lock the candidate after pre_agent.
+        engine = self.engine(ScriptedBackend())
+        emit = engine.hooks.emit
+
+        def mutate(event, payload, logs):
+            if event == "pre_agent" and payload["role"] == "worker":
+                (engine.worktree / "notes.txt").write_text("prepared by hook\n")
+            return emit(event, payload, logs)
+        with patch.object(engine.hooks, "emit", side_effect=mutate):
+            result = engine.start("Implement greeting", self.plan(two_ready=True), step=True)
+        self.assertEqual(result["status"], "paused")
+        self.assertEqual(set(result["accepted"]), {"greet"})
 
     def test_new_prerequisite_still_archives_candidate_before_other_task(self):
         backend = DescriptionBackend(self, prerequisite=True)
@@ -313,7 +366,9 @@ class DescriptionReplanTests(RepoCase):
         result = engine.start("Implement greeting", self.plan())
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["attempts"], {"greet": 2, "prepare": 1})
-        archive = engine.directory / "recovery" / "replan-1"
+        archive = engine.directory / "recovery" / "revision-1"
         self.assertEqual((archive / "files" / "hello.py").read_text(), CANDIDATE)
         self.assertEqual((archive / "files" / "notes.txt").read_text(), NOTES)
-        self.assertNotIn("retained_candidate", result)
+        content = self.plan_file(engine)
+        self.assertEqual(content["candidate"], "archive")
+        self.assertNotIn("pending_directive", result)

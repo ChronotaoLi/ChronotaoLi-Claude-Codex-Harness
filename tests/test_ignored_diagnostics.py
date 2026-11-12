@@ -38,7 +38,7 @@ class IgnoredDiagnosticRecoveryTests(RepoCase):
         self.assertEqual(read_json(engine.directory / "ignored-baseline.json"), baseline)
         inventory = read_json(Path(result["ignored_diagnostics"]["artifact"]))
         self.assertIn("ignored-helper", inventory["added"])
-        self.assertEqual(sum(call["kind"] == "plan" for call in backend.calls), 1)
+        self.assertEqual(sum(call["kind"] == "decide" for call in backend.calls), 1)
         self.assertEqual(sum(result["attempts"].values()), 1)
 
     def test_initial_inventory_artifact_write_failure_keeps_durable_baseline(self):

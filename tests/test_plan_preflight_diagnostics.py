@@ -8,7 +8,7 @@ from harness import git
 from harness.cleanup import cleanup_run
 from harness.util import HarnessError, read_json
 from test_harness import ROOT, RepoCase
-from test_runtime_changes import ScriptedBackend
+from test_runtime_changes import ScriptedBackend, current_tasks, trigger_kind, revised as revised_
 
 
 class PlanPreflightDiagnosticsTests(RepoCase):
@@ -34,7 +34,7 @@ class PlanPreflightDiagnosticsTests(RepoCase):
             self.assertEqual(backend.calls, [])
         result = engine.start("Implement greet", self.plan())
         self.assertEqual(result["status"], "completed")
-        self.assertFalse(any(call["kind"] == "plan" for call in backend.calls))
+        self.assertFalse(any(call["role"] == "commander" for call in backend.calls))
 
     def test_broad_scope_is_audited_without_relaxing_protected_paths(self):
         plan = self.plan()
@@ -67,13 +67,22 @@ class PlanPreflightDiagnosticsTests(RepoCase):
     def test_revised_plan_warns_only_for_new_broad_task_scope(self):
         plan = self.plan()
         plan["tasks"][0]["allowed_paths"] = ["**/*"]
-        engine = self.engine()
-        engine.start("Implement greet", plan, pause_after_plan=True)
-        revised = copy.deepcopy(plan["tasks"])
-        revised[0]["description"] += " with clarification"
-        engine.services.planning.record_plan(revised, "Refine description")
-        added = {**copy.deepcopy(revised[0]), "id": "followup"}
-        engine.services.planning.record_plan([*revised, added], "Add followup")
+
+        def change(backend, kwargs, packet, result):
+            if kwargs["role"] == "worker" and sum(c["role"] == "worker" for c in backend.calls) <= 2:
+                result.update(status="blocked", blocker_kind="task", blockers=["Clarify"], summary="Clarify")
+            elif trigger_kind(kwargs, packet) == "task" and packet["trigger"]["feedback"]:
+                greet = current_tasks(packet)[0]
+                if sum(c["kind"] == "decide" for c in backend.calls) == 1:
+                    revised_(result, packet, "Refine description", selected="greet",
+                             updates=[{"id": "greet", "description": greet["description"] + " with clarification",
+                                       "add_depends_on": []}])
+                else:
+                    revised_(result, packet, "Add followup", selected="followup",
+                             new_tasks=[{**copy.deepcopy(greet), "id": "followup"}])
+        engine = self.engine(ScriptedBackend(change))
+        result = engine.start("Implement greet", plan)
+        self.assertEqual(result["status"], "completed")
         events = [json.loads(line) for line in (engine.directory / "events.jsonl").read_text().splitlines()]
         warnings = [event for event in events if event["event"] == "broad_scope_warning"]
         self.assertEqual([event["revision"] for event in warnings], [0, 2])
@@ -100,7 +109,7 @@ class PlanPreflightDiagnosticsTests(RepoCase):
         result = self.engine(backend).resume(saved["id"])
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["original_tasks"], plan["tasks"])
-        self.assertFalse(any(call["kind"] == "plan" for call in backend.calls))
+        self.assertFalse(any(call["role"] == "commander" for call in backend.calls))
 
     def test_removal_diagnostic_lists_bounded_paths_and_preserves_all_files(self):
         engine = self.engine()

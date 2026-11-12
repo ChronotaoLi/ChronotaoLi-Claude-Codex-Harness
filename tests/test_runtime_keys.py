@@ -10,12 +10,12 @@ import unittest
 from unittest.mock import patch
 
 from harness.adapters import provider_schema
-from harness.contracts import (PLAN, REPLAN, REVIEW, WORK, envelope, output_constraints,
+from harness.contracts import (DECIDE, PLAN, REVIEW, WORK, envelope, output_constraints,
                                review_schema, validate_structure, with_keys)
 from harness.review_progress import claims_for_review, delivered_worker_findings
 from harness.util import HarnessError, read_json, write_json
 from test_harness import RepoCase, ROOT
-from test_runtime_changes import ScriptedBackend, finding, finding_key
+from test_runtime_changes import ScriptedBackend, finding, finding_key, revised, trigger_kind
 
 
 def rows(count):
@@ -62,7 +62,7 @@ class KeyedContractTests(unittest.TestCase):
         self.assertIn("response.finding_dispositions.*.evidence", paths(3))
         self.assertFalse(any(".f2" in path for path in paths(3)))
         self.assertEqual(len(paths(3)), len(paths(60)))
-        for schema in (PLAN, REPLAN, WORK, REVIEW, envelope(WORK, "t", "d")):
+        for schema in (PLAN, DECIDE, WORK, REVIEW, envelope(WORK, "t", "d")):
             self.assertFalse(any(".*" in item["path"] for item in output_constraints(schema)))
 
     def test_extra_missing_or_misshapen_keys_are_structural_errors(self):
@@ -314,10 +314,10 @@ class FinalKeyedLifecycleTests(RepoCase):
             number = sum(c["kind"] == "final_review" for c in backend.calls)
             if kwargs["kind"] == "final_review" and number == 1:
                 result.update(verdict="request_changes", findings=[finding()])
-            elif kwargs["kind"] == "replan":
+            elif trigger_kind(kwargs, packet) == "final" and number == 1:
                 task = copy.deepcopy(packet["original_tasks"][0])
                 task.update(id="correct", depends_on=["greet"])
-                result.update(action="revise", reason="Resolve final blocking finding", new_tasks=[task], updates=[])
+                revised(result, packet, "Resolve final blocking finding", new_tasks=[task])
             elif kwargs["role"] == "worker" and kwargs["task"]["id"] == "correct":
                 with (kwargs["cwd"] / "hello.py").open("a") as stream:
                     stream.write("# Independently reviewed final correction\n")

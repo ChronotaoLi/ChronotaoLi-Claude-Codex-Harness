@@ -7,17 +7,17 @@ from harness.context import ContextCapacityError
 from harness.packets import PacketBuilder
 from harness.util import HarnessError, read_json
 from test_harness import RepoCase, ROOT
-from test_runtime_changes import ScriptedBackend
+from test_runtime_changes import ScriptedBackend, revised, trigger_kind
 
 
 class ContextProjectionLifecycleTests(RepoCase):
-    def test_replan_overflow_keeps_request_and_budgets_then_resumes_same_request(self):
+    def test_decide_overflow_keeps_budgets_and_the_derived_decision_after_more_context(self):
         def change(backend, kwargs, packet, result):
             if kwargs['role'] == 'worker' and sum(c['role'] == 'worker' for c in backend.calls) == 1:
                 result.update(status='blocked', blocker_kind='task', blockers=['Clarify implementation'],
                               summary='Retain this candidate and refine its description')
-            elif kwargs['kind'] == 'replan':
-                result.update(action='revise', reason='Clarify implementation', new_tasks=[],
+            elif trigger_kind(kwargs, packet) == 'task' and packet['trigger']['feedback']:
+                revised(result, packet, 'Clarify implementation',
                     updates=[{'id': 'greet', 'description': 'Implement the same greeting with clarified detail', 'add_depends_on': []}])
         backend = ScriptedBackend(change)
         engine = self.engine(backend)
@@ -26,11 +26,11 @@ class ContextProjectionLifecycleTests(RepoCase):
         requests = []
         def oversized(builder, **kwargs):
             contract, required = original(builder, **kwargs)
-            if kwargs['kind'] == 'replan':
+            if kwargs['kind'] == 'decide':
                 required['packet']['overflow_fixture'] = 'x' * 110000
                 before.append({key: deepcopy(builder.context.run.get(key)) for key in
-                    ('attempts', 'agent_dispatches', 'replan_attempts', 'dispatches')})
-                requests.append(deepcopy(builder.context.run['pending_replan']))
+                    ('attempts', 'agent_dispatches', 'dispatches', 'feedback')})
+                requests.append(deepcopy(kwargs['packet']['trigger']))
             return contract, required
         with patch.object(PacketBuilder, 'role_input', oversized):
             with self.assertRaises(ContextCapacityError):
@@ -38,18 +38,18 @@ class ContextProjectionLifecycleTests(RepoCase):
             state = read_json(engine.directory / 'state.json')
             for key, value in before[-1].items():
                 self.assertEqual(state.get(key), value, key)
-            request = deepcopy(state['pending_replan'])
             report_path = Path(state['last_runtime_error']['context_report'])
             report = read_json(report_path)
-            self.assertEqual(report['kind'], 'replan')
-            self.assertEqual(report['request_id'], request['request_id'])
+            self.assertEqual(report['kind'], 'decide')
             self.assertGreater(report['required_chars'], report['budget_chars'])
-            self.assertFalse(any(c['kind'] == 'replan' for c in backend.calls))
+            self.assertFalse(any(c['kind'] == 'decide' for c in backend.calls))
             self.config.data['runtime']['context_chars'] = 200000
             result = self.engine(backend).resume(engine.run['id'])
         self.assertEqual(result['status'], 'completed')
-        self.assertEqual(requests[0]['request_id'], requests[1]['request_id'])
-        self.assertEqual(sum(c['kind'] == 'replan' for c in backend.calls), 1)
+        # The same decision is derived again: the next model call is the decide, not the worker.
+        self.assertEqual(requests[0]['feedback'], requests[1]['feedback'])
+        self.assertEqual([c['kind'] for c in backend.calls[:3]], ['implement', 'decide', 'implement'])
+        self.assertEqual(sum(c['kind'] == 'decide' for c in backend.calls), 1)
         self.assertEqual(sum(result['attempts'].values()), 2)
 
     def test_saved_command_index_tamper_blocks_recovery_before_any_model_call(self):

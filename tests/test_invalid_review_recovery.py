@@ -8,7 +8,7 @@ from harness import git
 from harness.util import HarnessError, read_json, write_json
 from test_engine_repairs import RecordingBackend
 from test_harness import RepoCase, ROOT
-from test_runtime_changes import finding, invalid_rejection
+from test_runtime_changes import finding, invalid_rejection, revised, trigger_kind
 
 
 class InvalidReviewRecoveryTests(RepoCase):
@@ -23,33 +23,31 @@ class InvalidReviewRecoveryTests(RepoCase):
         self.assertEqual(result["findings"], record["review"]["findings"])
 
     def test_invalid_final_rejection_persists_without_same_snapshot_reroll(self):
-        self.config.data["runtime"]["max_replans"] = 0
-
         def change(backend, kwargs, packet, result):
             if kwargs["kind"] == "final_review":
                 invalid_rejection(result)
 
         backend = RecordingBackend(change)
         engine = self.engine(backend)
-        with self.assertRaisesRegex(HarnessError, "重新规划次数"):
+        # The demo commander asks about the rejection; it is never re-reviewed.
+        with self.assertRaisesRegex(HarnessError, "等待操作者决定：task_id=final"):
             engine.start("Implement greet", self.plan())
         record = engine.run["final_history"][-1]
         self.assertEqual(record["status"], "invalid_rejected")
         self.assertEqual(record["phase"], "finished")
         self.assertIn("阻断 finding 必须有证据", record["validation_error"])
         self.assert_raw_evidence(record)
-        self.assertEqual(engine.run["pending_replan"]["trigger"]["final_review"], record)
+        seen = [c for c in backend.calls if c["kind"] == "decide"][-1]["packet"]["trigger"]["final_review"]
+        self.assertEqual((seen["status"], seen["attempt"]), (record["status"], record["attempt"]))
         calls = copy.deepcopy(backend.calls)
         for options in ({}, {"reverify": True}):
             resumed = self.engine(backend)
             with self.assertRaises(HarnessError):
                 resumed.resume(engine.run["id"], **options)
-            self.assertEqual(resumed.run["final_attempts"], 1)
+            self.assertEqual(len(resumed.run["final_history"]), 1)
             self.assertEqual(backend.calls, calls)
 
     def test_approve_with_invalid_blocking_finding_is_still_rejection(self):
-        self.config.data["runtime"]["max_replans"] = 0
-
         def change(backend, kwargs, packet, result):
             if kwargs["kind"] == "final_review":
                 result.update(verdict="approve", findings=[{**finding(), "evidence": []}],
@@ -94,11 +92,11 @@ class InvalidReviewRecoveryTests(RepoCase):
         def change(backend, kwargs, packet, result):
             if kwargs["kind"] == "final_review" and sum(c["kind"] == "final_review" for c in backend.calls) == 1:
                 invalid_rejection(result)
-            elif kwargs["kind"] == "replan":
-                number = sum(c["kind"] == "replan" for c in backend.calls)
+            elif trigger_kind(kwargs, packet) == "final":
+                number = sum(c["kind"] == "decide" for c in backend.calls)
                 task = copy.deepcopy(packet["original_tasks"][0])
                 task.update(id=f"correct{number}", depends_on=["greet"])
-                result.update(action="revise", reason="Resolve recorded findings", new_tasks=[task], updates=[])
+                revised(result, packet, "Resolve recorded findings", new_tasks=[task])
             elif kwargs["role"] == "worker" and kwargs["task"]["id"] == "correct2":
                 with (kwargs["cwd"] / "hello.py").open("a") as output:
                     output.write("# Independently reviewed correction\n")
@@ -109,7 +107,7 @@ class InvalidReviewRecoveryTests(RepoCase):
         self.assertEqual(result["status"], "completed")
         self.assertEqual([r["status"] for r in result["final_history"]], ["invalid_rejected", "approved"])
         self.assertEqual(sum(c["kind"] == "final_review" for c in backend.calls), 2)
-        self.assertEqual(sum(c["kind"] == "replan" for c in backend.calls), 2)
+        self.assertEqual(sum(c["kind"] == "decide" for c in backend.calls), 2)
         accepted = result["accepted"]
         self.assertEqual(accepted["greet"]["commit"], accepted["correct1"]["commit"])
         self.assertNotEqual(accepted["greet"]["commit"], accepted["correct2"]["commit"])
@@ -131,8 +129,6 @@ class InvalidReviewRecoveryTests(RepoCase):
         self.assertEqual([(e["task_id"], e["discarded_keys"]) for e in discarded], [("final", ["nonexistent"])])
 
     def test_returned_invalid_rejection_survives_receipt_write_interruption(self):
-        self.config.data["runtime"]["max_replans"] = 0
-
         def change(backend, kwargs, packet, result):
             if kwargs["kind"] == "final_review":
                 invalid_rejection(result)
@@ -149,9 +145,10 @@ class InvalidReviewRecoveryTests(RepoCase):
             engine.start("Implement greet", self.plan())
         calls = copy.deepcopy(backend.calls)
         resumed = self.engine(backend)
-        with self.assertRaisesRegex(HarnessError, "重新规划次数"):
+        with self.assertRaisesRegex(HarnessError, "等待操作者决定：task_id=final"):
             resumed.resume(engine.run["id"])
-        self.assertEqual(backend.calls, calls)
+        # The returned rejection is replayed, not redrawn; only the decision is new.
+        self.assertEqual([c["kind"] for c in backend.calls[len(calls):]], ["decide"])
         self.assertEqual(resumed.run["final_history"][-1]["status"], "invalid_rejected")
         self.assert_raw_evidence(resumed.run["final_history"][-1])
 
@@ -174,7 +171,6 @@ class InvalidReviewRecoveryTests(RepoCase):
 
     def test_invalid_rejection_hook_recovery_reuses_result_before_rework(self):
         engine, backend = self.pending_invalid_task_review()
-        self.config.data["runtime"]["max_attempts"] = 3
         resumed = self.engine(backend)
         result = resumed.resume(engine.run["id"])
         self.assertEqual(result["status"], "completed")

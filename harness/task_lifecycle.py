@@ -7,10 +7,10 @@ from copy import deepcopy
 from pathlib import Path
 
 from . import git
-from .budgets import work_attempts
 from .context import compact_checks, compact_feedback, compact_reviews, instruction_file_changes
-from .contracts import envelope, judge_review, review_approved, review_schema, task_directive, WORK
+from .contracts import envelope, judge_review, review_approved, review_schema, WORK
 from .memory import Memory, validate_proposals
+from .planning import attempt_limit_error
 from .input_projection import validate_dispatch_indexes as validate_input_dispatch_indexes
 from .path_evidence import validate_dispatch_indexes
 from .progress import CheckpointDeclarationError
@@ -99,59 +99,15 @@ class TaskLifecycle(RuntimeService):
                 stream.write("\n")
         self.context.event(event, event_id=event_id, **fields)
 
-    def task_attempt(self, ready):
-        runtime = self.context
-        current = self.context.run.get("current_task")
-        if current:
-            task = next(t for t in self.context.run["tasks"] if t["id"] == current)
-            self.check_task_scope(task)
-        if current and self.services.budgets.task_budget_used(current) >= self.context.config.data["runtime"]["max_attempts"]:
-            raise HarnessError(f"{current} 已达尝试次数上限")
-        # A task's prerequisites must not prevent selecting other ready work.
-        # The selected worker is checked again before its invocation is counted.
-        if current:
-            self.services.environment.check_environment(current)
-        saved_directive = self.context.run.get("pending_directive")
-        pristine = len(ready) == 1 and not self.context.run.get("feedback") and not self.context.run["attempts"].get(ready[0]["id"])
-        if saved_directive:
-            if snapshot_digest(self.context.snapshot()) != saved_directive["snapshot_digest"]:
-                raise HarnessError("待派发指令的代码快照已变化；请核对并恢复原快照")
-            directive = saved_directive["directive"]
-        elif pristine:
-            directive = {"selected_task": ready[0]["id"], "action": "implement",
-                         "instruction": "Implement this task within its complete stated scope and acceptance. Inspect dependency evidence and follow the supplied tool and verification constraints."}
-        else:
-            schema = task_directive(t["id"] for t in ready)
-            directive = self.services.dispatch.dispatch("commander", "dispatch", "dispatching", schema,
-                        {"goal": self.context.run["goal"], "ready": ready, "accepted": self.services.packets.accepted_context(),
-                         "feedback": compact_feedback(self.context.run.get("feedback")), "attempts": self.context.run["attempts"],
-                         "work_attempts": work_attempts(self.context.run),
-                         "recovery": worker_recovery_context(self.context.run, self.context.directory, current) if current in {t["id"] for t in ready} else None,
-                         "tool_constraints": self.services.packets.tool_constraints(),
-                         "instruction": "Select one ready task and return action=implement for a feasible implementation or repair. Return action=replan when feedback exposes missing prerequisites or acceptance that cannot be met within current scope and decisions; explain the unmet requirement in instruction. Replanning can stop without another worker. Retain the original acceptance: completing a report of unresolved failures is not completing the task."}, task=ready[0])
-        task = next(t for t in ready if t["id"] == directive["selected_task"])
+    def task_attempt(self, task, directive, saved):
+        """Start one worker for a saved directive or a direct dispatch (instruction None)."""
         tid = task["id"]
-        if directive["action"] == "replan":
-            receipt = self.context.run["commander_receipts"]["commander:dispatch:dispatching"]
-            trigger = {"task_id": tid, "feedback": deepcopy(self.context.run.get("feedback")),
-                       "coordination": {**{key: receipt[key] for key in
-                           ("artifact", "artifact_digest", "dispatch_id", "snapshot_digest")},
-                           "instruction": directive["instruction"]}}
-            # Consume the selection and publish its successor in one save. Resume
-            # must replan even if the next call's budget or preparation fails.
-            self.context.run["current_task"] = tid
-            self.context.run["pending_replan"] = {"stage": "pending", "trigger": trigger}
-            self.context.run["commander_receipts"].pop("commander:dispatch:dispatching")
-            self.context.run.pop("pending_directive", None)
-            self.context.save()
-            return False
-        if self.services.budgets.task_budget_used(tid) >= self.context.config.data["runtime"]["max_attempts"]:
-            raise HarnessError(f"{tid} 已达尝试次数上限")
+        limit = self.context.config.data["runtime"]["max_attempts"]
+        if self.services.budgets.task_budget_used(tid) >= limit:
+            raise attempt_limit_error(tid, limit)
+        if saved:
+            self.services.planning.check_directive(tid, self.context.snapshot())
         self.context.run["current_task"] = tid
-        if not saved_directive and not pristine:
-            receipt = self.context.run["commander_receipts"].pop("commander:dispatch:dispatching")
-            self.context.run["pending_directive"] = {"directive": deepcopy(directive),
-                                             "snapshot_digest": receipt["snapshot_digest"]}
         self.context.save()
         self.context.checkpoint()
         prior_reviews = compact_reviews(self.context.run["review_history"].get(tid, []))
@@ -248,8 +204,6 @@ class TaskLifecycle(RuntimeService):
             self.services.budgets.record_attempt_exemption(worker_dispatch, result, worker_source)
             if checkpoints_discarded is not None:
                 self.context.run["feedback"]["checkpoints_discarded"] = checkpoints_discarded
-            if result["blocker_kind"] == "task":
-                self.context.run["pending_replan"] = {"stage": "pending", "trigger": deepcopy(self.context.run["feedback"])}
             self.services.worker_receipts.consume(key, result["blocker_kind"] + "_blocked")
             self.context.save()
             if result["blocker_kind"] == "operator":
@@ -273,8 +227,9 @@ class TaskLifecycle(RuntimeService):
         """Keep an invalid blocked report binding: feedback, route and consumption in one save.
 
         A readable environment, operator or task blocker keeps its route with the
-        original result in feedback; any other blocked output goes to replanning
-        as a task blocker, without a ``worker`` entry. Neither earns an exemption.
+        original result in feedback; any other blocked output is a task blocker
+        without a ``worker`` entry, so the next step derives a commander decide.
+        Neither earns an exemption.
         """
         tid = task["id"]
         receipt = self.context.run["worker_receipts"][key]
@@ -288,11 +243,9 @@ class TaskLifecycle(RuntimeService):
         if judgment.readable and route == result.get("blocker_kind"):
             feedback["worker"] = result
         # Inspect Git before any handoff field changes: an interruption inside it
-        # must not leave a pending replan beside the unconsumed receipt.
+        # must not leave new feedback beside the unconsumed receipt.
         recovery = self.services.workflow.worker_recovery(tid, entry["id"], artifact.parent, error)
         self.context.run["feedback"] = feedback
-        if route == "task":
-            self.context.run["pending_replan"] = {"stage": "pending", "trigger": deepcopy(feedback)}
         entry.update(status="invalid_blocked", error=str(error), worker_outcome=route + "_blocked")
         self.context.run["last_runtime_error"] = {"role": "worker", "kind": entry["kind"], "task_id": tid,
                                                   "error": str(error), "artifact": str(artifact.parent)}

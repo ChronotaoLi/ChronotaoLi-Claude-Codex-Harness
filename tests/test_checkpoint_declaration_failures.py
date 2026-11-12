@@ -83,7 +83,7 @@ class CheckpointDeclarationFailureTests(RepoCase):
         self.assertEqual(result['status'], 'completed')
         commander = next(c for c in backend.calls if c['role'] == 'commander')
         workers = [c for c in backend.calls if c['role'] == 'worker']
-        self.assertEqual(commander['packet']['feedback']['checkpoints_discarded'], diagnostic)
+        self.assertEqual(commander['packet']['trigger']['feedback']['checkpoints_discarded'], diagnostic)
         self.assertEqual(workers[1]['packet']['feedback']['checkpoints_discarded'], diagnostic)
         dispatches = [d for d in result['dispatches'] if d['role'] == 'worker']
         self.assertNotEqual(dispatches[0]['id'], dispatches[1]['id'])

@@ -7,7 +7,7 @@ from copy import deepcopy
 from . import git, git_query
 from .command_server import command_id
 from .context import (
-    capacity_report, compact_checks, compact_plan, compact_reviews, instruction_file_changes,
+    capacity_report, compact_checks, compact_plan, compact_reviews, field_size_report, instruction_file_changes,
 )
 from .contracts import envelope, output_constraints, review_output_constraints, review_schema, with_keys
 from .path_evidence import project_paths
@@ -134,13 +134,20 @@ class PacketBuilder(RuntimeService):
                     "summary_truncated": False, "verification": str(folder / "results.json"),
                     "details": str(folder / "review.json"),
                 }
-        final_suffix = f"{max(limits['max_final_attempts'], self.context.run.get('final_attempts', 0) + 1)}-{dispatch_id}"
+        # A generous attempt number for the projected artifact path length: no
+        # separate final-attempt limit exists, so use the larger of the dispatch
+        # limit and the next recorded attempt.
+        final_suffix = f"{max(limits['max_agent_dispatches'], len(self.context.run.get('final_history', [])) + 1)}-{dispatch_id}"
         final_folder = self.context.directory / "verification" / "final" / final_suffix
         packet["diff_artifact"] = str(final_folder / "change.diff")
         for index, check in enumerate(packet["verification"]):
             check.update(stdout="x" * 250, stderr="x" * 250,
                          log=str(final_folder / f"check-{index}"), output_truncated=True)
         report = capacity_report(required, projected, limits["context_chars"])
+        # The three largest required packet fields name what an oversized plan must shrink.
+        sizes = [row for row in field_size_report(required["packet"]) if len(row["path"]) == 1]
+        report["largest_fields"] = [{"field": str(row["path"][0]), "chars": row["chars"]}
+                                    for row in sorted(sizes, key=lambda row: -row["chars"])[:3]]
         report["assumptions"] = {
             "pending_summary_chars": 600, "verification_output_chars_per_command": 500,
             "verification_commands": len(checks), "tasks": len(tasks),
@@ -232,8 +239,9 @@ class PacketBuilder(RuntimeService):
             self.context.save()
             self.context.event("final_context_preflight", report=report)
         if report["status"] == "required_overflow":
+            fields = "、".join(f"{row['field']} {row['chars']}" for row in report["largest_fields"])
             raise HarnessError(f"计划的整体审阅必要上下文 {report['required_chars']} 字符超过预算 "
-                               f"{report['budget_chars']}；请增加 context_chars 后恢复，尚未派发 worker")
+                               f"{report['budget_chars']}；最大的字段：{fields}；请增加 context_chars 后恢复，尚未派发 worker")
         if report["status"] == "projected_overflow":
             print(f"[harness] 整体审阅预计上下文 {report['projected_chars']} 字符，超过预算 "
                   f"{report['budget_chars']}；建议提前增加 context_chars。此估计不保证后续历史容量。", file=sys.stderr, flush=True)

@@ -103,7 +103,7 @@ class RunContext:
                    "accepted": self.run["accepted"], "pending": [t for t in self.run["tasks"] if t["id"] not in self.run["accepted"]],
                    "feedback": self.run.get("feedback"), "expected_head": self.run["expected_head"],
                    "original_tasks": self.run["original_tasks"], "base_commit": self.run["base_commit"],
-                   "attempts": deepcopy(self.run["attempts"]), "replan_attempts": self.run["replan_attempts"],
+                   "attempts": deepcopy(self.run["attempts"]),
                    "work_attempts": work_attempts(self.run),
                    "final_history": self.run["final_history"], "plan_revision": len(self.run["plan_history"]),
                    "environment_updates": deepcopy(self.run.get("environment_updates", [])),

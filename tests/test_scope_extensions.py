@@ -1,7 +1,6 @@
 import copy
 import json
 import unittest
-from pathlib import Path
 from unittest.mock import patch
 
 from harness.contracts import apply_revision, validate_revision
@@ -53,58 +52,11 @@ class ScopeExtensionRecoveryTests(RepoCase):
         if kwargs["role"] == "worker":
             result.update(status="blocked", blocker_kind="task", blockers=["Need a prerequisite"])
 
-    def test_scope_approval_recovers_same_returned_replan_without_redraw(self):
-        def revise(backend, kwargs, packet, result):
-            if kwargs["role"] == "worker" and len([c for c in backend.calls if c["role"] == "worker"]) == 1:
-                self.block_worker(backend, kwargs, packet, result)
-            elif kwargs["kind"] == "replan":
-                self.assertEqual(packet["approved_scope"], [])
-                result.update(expanded_revision(packet["original_tasks"][0]))
-            elif kwargs["role"] == "worker" and kwargs["task"]["id"] == "prepare":
-                (kwargs["cwd"] / "support.txt").write_text("Required prerequisite\n")
-
-        backend = ScriptedBackend(revise)
-        engine = self.engine(backend)
-        plan = self.plan()
-        with self.assertRaisesRegex(HarnessError, "文件范围"):
-            engine.start("Implement greeting with prerequisite", plan)
-        receipt = copy.deepcopy(engine.run["commander_receipts"]["commander:replan:replanning"])
-        artifact = Path(receipt["artifact"])
-        original_result = artifact.read_bytes()
-        calls = copy.deepcopy(backend.calls)
-        self.assertEqual(engine.run["replan_attempts"], 0)
-        with self.assertRaisesRegex(HarnessError, "文件范围"):
-            self.engine(backend).resume(engine.run["id"])
-        self.assertEqual(backend.calls, calls)
-
-        operator = self.engine(backend)
-        operator.load_run(engine.run["id"])
-        operator.services.planning.approve_scope_extensions(["support.txt", "support.txt"])
-        operator.services.planning.approve_scope_extensions(["support.txt"])
-        self.assertEqual(operator.run["approved_scope"], ["support.txt"])
-        self.assertEqual(operator.run["original_tasks"], plan["tasks"])
-        self.assertEqual(operator.run["tasks"], plan["tasks"])
-        self.assertEqual(operator.run["commander_receipts"]["commander:replan:replanning"], receipt)
-        self.assertEqual(len([e for e in self.events(operator) if e["event"] == "scope_extension_approved"]), 1)
-
-        result = self.engine(backend).resume(engine.run["id"])
-        self.assertEqual(result["status"], "completed")
-        self.assertEqual(result["original_tasks"], plan["tasks"])
-        self.assertEqual(result["tasks"][0]["allowed_paths"], plan["tasks"][0]["allowed_paths"])
-        self.assertEqual(result["tasks"][0]["acceptance"], plan["tasks"][0]["acceptance"])
-        self.assertEqual(result["attempts"], {"greet": 2, "prepare": 1})
-        self.assertEqual(result["replan_attempts"], 1)
-        self.assertEqual(len([call for call in backend.calls if call["kind"] == "replan"]), 1)
-        self.assertEqual(artifact.read_bytes(), original_result)
-        self.assertEqual((Path(result["worktree"]) / "support.txt").read_text(), "Required prerequisite\n")
-        self.assertFalse((self.repo / "support.txt").exists())
-
-    def test_invalid_batch_is_atomic_and_scope_approval_does_not_restart_stop(self):
+    def test_invalid_batch_is_atomic_and_scope_approval_does_not_answer_the_question(self):
         backend = ScriptedBackend(self.block_worker)
         engine = self.engine(backend)
-        with self.assertRaisesRegex(HarnessError, "停止重新规划"):
+        with self.assertRaisesRegex(HarnessError, "等待操作者决定"):
             engine.start("Implement greeting", self.plan())
-        stopped = copy.deepcopy(engine.run["replan_stopped"])
         before = copy.deepcopy(engine.run)
         events_before = self.events(engine)
         for pattern in (".git/config", ".harness/**", ".codex/**", ".claude/**", "../outside",
@@ -114,54 +66,54 @@ class ScopeExtensionRecoveryTests(RepoCase):
             self.assertEqual(engine.run, before)
             self.assertEqual(self.events(engine), events_before)
         engine.services.planning.approve_scope_extensions(["support.txt"])
-        self.assertEqual(engine.run["replan_stopped"], stopped)
-        self.assertNotIn("pending_replan", engine.run)
+        engine.services.planning.approve_scope_extensions(["support.txt", "support.txt"])
+        self.assertEqual(engine.run["decision_requests"], before["decision_requests"])
+        self.assertEqual(len([e for e in self.events(engine) if e["event"] == "scope_extension_approved"]), 1)
         calls = copy.deepcopy(backend.calls)
         resumed = self.engine(backend)
-        with self.assertRaisesRegex(HarnessError, "停止重新规划"):
+        with self.assertRaisesRegex(HarnessError, "等待操作者决定"):
             resumed.resume(engine.run["id"])
         self.assertEqual(backend.calls, calls)
-        self.assertEqual(resumed.run["replan_stopped"], stopped)
         self.assertEqual(resumed.run["approved_scope"], ["support.txt"])
 
         def inspect_authority(backend, kwargs, packet, result):
-            if kwargs["kind"] == "replan":
+            if kwargs["role"] == "commander":
                 self.assertEqual(packet["approved_scope"], ["support.txt"])
 
         retry_backend = ScriptedBackend(inspect_authority)
         state_path = engine.directory / "state.json"
-        before_retry = read_json(state_path)
-        request = before_retry["decision_requests"][-1]
-        with self.assertRaisesRegex(HarnessError, "--operator-decision"):
-            self.engine(retry_backend).resume(engine.run["id"], retry_stopped="greet")
-        self.assertEqual(retry_backend.calls, [])
-        self.assertEqual(read_json(state_path), before_retry)
-        answer = self.repo / "continue-replan.json"
+        request = read_json(state_path)["decision_requests"][-1]
+        answer = self.repo / "continue-decision.json"
         write_json(answer, {"schema_version": 1, "request_id": request["id"], "task_id": "greet",
-                            "decision": "continue", "summary": "Retry the original planning request with approved scope"})
-        with self.assertRaisesRegex(HarnessError, "停止重新规划"):
+                            "decision": "continue", "summary": "Decide again with the approved scope"})
+        with self.assertRaisesRegex(HarnessError, "等待操作者决定"):
             self.engine(retry_backend).resume(engine.run["id"], operator_decision=answer)
-        self.assertEqual([call["kind"] for call in retry_backend.calls], ["replan"])
+        self.assertEqual([call["kind"] for call in retry_backend.calls], ["decide"])
         self.assertNotEqual(read_json(state_path)["decision_requests"][-1]["id"], request["id"])
 
-    def test_scope_approval_requires_an_unvalidated_or_stopped_replan(self):
+    def test_scope_approval_requires_an_open_run_without_a_returned_decision(self):
         engine = self.engine()
         engine.start("Implement greeting", self.plan(), pause_after_plan=True)
-        with self.assertRaisesRegex(HarnessError, "尚未校验"):
-            engine.services.planning.approve_scope_extensions(["support.txt"])
+        engine.services.planning.approve_scope_extensions(["support.txt"])
+        self.assertEqual(engine.run["approved_scope"], ["support.txt"])
+        completed = self.engine().start("Implement greeting", self.plan())
+        done = self.engine()
+        done.load_run(completed["id"])
+        with self.assertRaisesRegex(HarnessError, "仅用于未完成的 run"):
+            done.services.planning.approve_scope_extensions(["support.txt"])
 
-        def revise(backend, kwargs, packet, result):
-            self.block_worker(backend, kwargs, packet, result)
-            if kwargs["kind"] == "replan":
-                result.update(expanded_revision(packet["original_tasks"][0], "hello.py"))
+        engine = self.engine(ScriptedBackend(self.block_worker))
+        emit = engine.hooks.emit
 
-        engine = self.engine(ScriptedBackend(revise))
-        with patch.object(engine.services.planning, "apply_pending_revision", side_effect=HarnessError("paused before apply")):
-            with self.assertRaisesRegex(HarnessError, "paused before apply"):
-                engine.start("Implement greeting", self.plan())
-        self.assertEqual(engine.run["pending_replan"]["stage"], "validated")
+        def fail(event, payload, logs):
+            if event == "post_agent" and payload.get("kind") == "decide":
+                raise HarnessError("question hook unavailable")
+            return emit(event, payload, logs)
+        with patch.object(engine.hooks, "emit", side_effect=fail), self.assertRaisesRegex(HarnessError, "question hook"):
+            engine.start("Implement greeting", self.plan())
+        self.assertIn("commander:decide:run", engine.run["commander_receipts"])
         before = copy.deepcopy(engine.run)
-        with self.assertRaisesRegex(HarnessError, "尚未校验"):
+        with self.assertRaisesRegex(HarnessError, "已返回、尚未处理的指挥决定"):
             engine.services.planning.approve_scope_extensions(["support.txt"])
         self.assertEqual(engine.run, before)
 
@@ -179,7 +131,7 @@ class ScopeExtensionRecoveryTests(RepoCase):
         code, engines, error = CLIControlsTests.invoke(
             self, ["resume", engine.run["id"], "--allow-scope", "support.txt"], backend)
         self.assertEqual(code, 1)
-        self.assertIn("停止重新规划", error)
+        self.assertIn("等待操作者决定", error)
         self.assertEqual(engines[0].run["approved_scope"], ["support.txt"])
         self.assertEqual(backend.calls, calls)
 

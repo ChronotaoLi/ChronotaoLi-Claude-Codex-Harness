@@ -13,7 +13,7 @@
 - 先看 `status RUN`：它给出状态、错误首行、预算（`budgets`、`budget_explanation`、`remaining_model_calls`）、worker 结局计数 `worker_outcomes`、待答决定 `pending_decisions`、续作 `continuation`、缺失命令 `missing_command_requirements`、最近环境阻断 `last_environment_blocker`、返工提示 `convergence` 和审阅轮次 `review_rounds`。`status RUN --full` 输出完整台账。
 - 每个出口都沿用同一 run 的累计预算、证据和接受条件。读得出的拒绝、停止和阻断不会被丢弃；读不出否决的无效输出不是结果，由新调用重做（见[无效输出与自动重做](#无效输出与自动重做)）。同一快照上重复 `resume` 只会得到同样的停止，或消耗新的调用。
 - 出口可以是继续，也可以是保留现场后 `abandon`。`abandon` 与 `resume` 一样先经过 `load_run`：加载时核验的证据（见[证据损坏](#证据损坏)）被删改时，两者都被拒绝。
-- `resume` 使用与 `run` 相同的 `--config`。恢复时只能提高 `agent_timeout_seconds`、`verify_timeout_seconds`、`context_chars`、`claude_max_turns`（及各角色实际生效的 `claude_max_turns_by_role`）、`max_attempts`、`max_final_attempts`、`max_replans`、`max_agent_dispatches`、`max_tasks`，或在 `permissions.worker_commands` 追加精确 argv；其他配置、模型和共享资产必须与创建时一致。
+- `resume` 使用与 `run` 相同的 `--config`。恢复时只能提高 `agent_timeout_seconds`、`verify_timeout_seconds`、`context_chars`、`claude_max_turns`（及各角色实际生效的 `claude_max_turns_by_role`）、`max_attempts`、`max_agent_dispatches`，或在 `permissions.worker_commands` 追加精确 argv；其他配置、模型和共享资产必须与创建时一致。
 - 恢复先确认旧进程退出、核对 Git 绑定与 HEAD，再做其他事；这些检查失败时不写入任何恢复输入。
 - 外层自动化会话的权限边界见[外层 agent 操作说明](operations.md#外层-agent-操作说明)：新增权限、预算或需求选择要向用户请求。
 
@@ -28,20 +28,18 @@
 | `--operator-decision FILE` | 回答决定请求，可重复，整批校验 |
 | `--execution-guidance FILE` | 登记绑定任务与候选的执行约束 |
 | `--reject-continuation FILE` | 拒绝当前续作请求，交给同一任务的新 worker 修正 |
-| `--retry-stopped TASK_ID\|final` | 重开没有可用决定请求的历史指挥停止 |
-| `--allow-scope PATTERN` | 为待再规划的新任务追加可选范围，可重复 |
-| `--reverify` | 本次恢复首次进入整体验收时重验失败快照 |
+| `--allow-scope PATTERN` | 为之后的修订追加可选范围，可重复；run 未完成、未放弃且没有已返回而未落地的指挥决定时可用 |
+| `--reverify` | 本次恢复首次进入整体验收时重验失败快照；已返回的指挥决定存在时拒绝 |
 | `--operation-id ID` | 指定操作记录 ID |
 
 互斥规则（违反时在任何写入前拒绝）：
 
 - `--reject-continuation`、`--execution-guidance` 不能与其他修改选项合用（`--confirm-exited`、`--step`、`--approve-plan` 除外）。
-- `--operator-decision` 不能与 `--environment-update`、`--reverify`、`--retry-stopped`、`--allow-scope` 合用。
-- `--environment-update` 不能与 `--reverify`、`--retry-stopped`、`--allow-scope` 合用。
-- `--reverify` 不能与 `--retry-stopped` 合用。
+- `--operator-decision` 不能与 `--environment-update`、`--reverify`、`--allow-scope` 合用。
+- `--environment-update` 不能与 `--reverify`、`--allow-scope` 合用。
 - 已完成的 run 拒绝 `--confirm-exited`、`--allow-scope`、`--environment-update`、`--operator-decision`、`--execution-guidance`、`--reject-continuation`；普通 `resume` 返回保存结果。已放弃的 run 拒绝 `resume`。
 
-环境更新、操作者决定、执行指导和续作拒绝只在安全边界接受：以下待处理键都为空——`pending_task`、`pending_acceptance`、`pending_post_accept`、`pending_replan`、`pending_directive`、`worker_receipts`、`review_receipts`、`commander_receipts`；环境更新与续作拒绝还要求没有 `replan_stopped`。
+环境更新、操作者决定、执行指导和续作拒绝只在安全边界接受：以下待处理键都为空——`pending_task`、`pending_acceptance`、`pending_post_accept`、`pending_revision`、`pending_directive`、`worker_receipts`、`review_receipts`、`commander_receipts`。
 
 ## 阻塞状态与操作者出口
 
@@ -56,33 +54,30 @@
 | `等待续作条件：{'kind': 'budget', …}` | 把 `agent_timeout_seconds` 提高到请求下限，或拒绝续作 | 同上 |
 | `worker 环境受阻：…（已截断…）。完整 worker 结果：PATH（SHA256 …）` | 读完整结果；修复环境；命令被拒时追加精确 argv | 普通 `resume`，或 `resume RUN --environment-update FILE` |
 | `环境前置检查未通过` | 让检查条件成立（本次没有启动 worker、没有扣尝试） | 普通 `resume` |
-| `等待操作者决定：task_id=… request_id=…` | 从 `pending_decisions` 读问题与来源，做出选择 | `resume RUN --operator-decision FILE` |
+| `等待操作者决定：task_id=… request_id=…` | 从 `pending_decisions` 读问题与来源，做出选择；指挥提问（种类 `commander`）也是这一行，未答或答 stop 时不调度任何模型 | `resume RUN --operator-decision FILE` |
 | 提交多个决定时中断，之后出现 `immutable decision artifact conflict` | 用原来的文件、按原来的顺序重新提交 | `resume RUN --operator-decision FILE1 --operator-decision FILE2 …`（同一顺序） |
 | `操作者已决定停止：request_id=…` | 要继续就对同一请求提交新的 continue | `resume RUN --operator-decision FILE` |
-| `指挥停止重新规划：…` | 有有效请求时回答它；没有可用请求的历史停止才显式重试 | `--operator-decision FILE`；或 `--retry-stopped TASK_ID`／`final` |
-| 再规划修订需要新的文件范围（`新增任务必须复用既有文件范围…`） | 核对后授权模式。回执保留，授权后复核同一份修订；不授权时每次 resume 得到同一停止，在指挥调用合并（B4）之前没有继续的出口 | `resume RUN --allow-scope 'PATTERN'`；不授权时 `abandon RUN` |
-| `… 已达尝试次数上限` | 先看 `convergence` 与审阅轮次判断是否值得继续；必要时提高 `runtime.max_attempts` | 普通 `resume` |
-| `已达 run 模型派发次数上限（已用 N，上限 M）；如果之后全部一次通过，至少还需 K 次模型调用（下界…）` | 按至少 K 次的余量提高 `max_agent_dispatches`；K 不含指挥调用、返工、重做与再规划 | 普通 `resume` |
-| `已达重新规划次数上限` | 提高 `max_replans` | 普通 `resume` |
-| `整体审阅已达尝试次数上限` | 提高 `max_final_attempts` | 普通 `resume` |
-| `任务必要上下文 N 字符超过预算 M` | 提高 `context_chars`，或通过再规划拆小任务；看 dispatch 的 `context-report.json` | 普通 `resume` |
+| `指挥修订越出已批准的文件范围：[…]` | 核对模式后授权，或不授权让指挥重新决定；两种情况下一次都是新的指挥决定，旧修订不复用 | `resume RUN --allow-scope 'PATTERN'`，或普通 `resume` |
+| `… 已达尝试次数上限（runtime.max_attempts 当前值 N）` | 先看 `convergence` 与审阅轮次判断是否值得继续；必要时提高 `runtime.max_attempts` | 普通 `resume` |
+| `已达 run 模型派发次数上限（已用 N，上限 M）；如果之后全部一次通过，至少还需 K 次模型调用（下界…）` | 按至少 K 次的余量提高 `max_agent_dispatches`；K 不含指挥决定、返工与重做 | 普通 `resume` |
+| `任务必要上下文 N 字符超过预算 M` | 提高 `context_chars`，或让指挥修订拆小任务；看 dispatch 的 `context-report.json` | 普通 `resume` |
 | worker 超时或轮数用尽（计入一次工作尝试） | 核对候选进展，再决定提高 `agent_timeout_seconds` 或 `claude_max_turns_by_role` | 普通 `resume` |
 | `整体验证超时` | 修复环境或提高 `verify_timeout_seconds` | 普通 `resume`（同一快照重验） |
-| `同一代码快照的整体验证曾失败` | 确认环境已修复 | `resume RUN --reverify` |
-| `整体审阅已拒绝同一代码快照` | 等待修正规划；不能重抽 | 普通 `resume` 进入修正规划 |
 | `旧 dispatch … 的进程组仍存在` 或 `无法确认旧 dispatch … 已退出` | 核实该进程及其命令子进程已退出，不终止无关进程 | `resume RUN --confirm-exited ID`；终态 run 用 `cleanup-run` 的同名选项 |
 | `Cannot confirm command process exited: …` | 同上；用父 dispatch ID 确认 | 同上 |
 | worker 调用失败，退出已确认且原始证据判为可重试 | 修复原因 | 普通 `resume`（新的计费尝试） |
 | `worker return interrupted before immutable seal; …; automatic retry forbidden` | 封存之前中断，输出能解码成对象结果（returned），或证据冲突、超过读取上限、读不出文件（unknown）；解不出对象的输出不会停在这里 | `abandon RUN` |
 | worker 输出无效（结构、语义、界限、交接目标非法，或解不出对象结果） | 不停止：计一次工作尝试、回执结局 `result_rejected`，下一次尝试经指挥选择；只在同一任务达到 `max_attempts` 时以尝试上限停止 | 提高 `runtime.max_attempts` 后普通 `resume`，或 `abandon` |
-| worker 的 blocked 输出无效（条目 `invalid_blocked`，反馈带 `output_error`） | 结构合法的 environment／operator 阻断按对应行处理（不给尝试豁免）；task 阻断与结构不可信的阻断自动进入再规划 | 对应出口 |
+| worker 的 blocked 输出无效（条目 `invalid_blocked`，反馈带 `output_error`） | 结构合法的 environment／operator 阻断按对应行处理（不给尝试豁免）；task 阻断与结构不可信的阻断交给指挥决定 | 对应出口 |
 | `… 请先核对并清理越界修改，再 resume` | 核对并清理范围外改动，不自动删除 | 普通 `resume` |
-| `<role> 输出连续两次无效：…；原件 PATH；普通 resume 重新请求，或 abandon` | 读原件与错误（派发条目的 `error`、`invalid_output`）；指挥计划超出 `max_tasks` 时可先提高它 | 普通 `resume`（新请求，最多再两次调用），或 `abandon RUN` |
+| `<role> 输出连续两次无效：…；原件 PATH；普通 resume 重新请求，或 abandon` | 读原件与错误（派发条目的 `error`、`invalid_output`）；计划超出整体审阅的必要上下文同样是无效输出 | 普通 `resume`（新请求，最多再两次调用），或 `abandon RUN` |
 | `无效输出原始结果缺失或无法读取`、`无效输出原始结果已改变` | 上一次无效输出的原件被删改（准备前，或本地准备与 `pre_agent` 期间），调用计费前停止 | 恢复原字节后普通 `resume`，或 `abandon RUN` |
 | `worktree HEAD 与检查点不同` | 核对是否有含 `Harness-Run`／`Harness-Task` 的提交（见下一节第 1 条）；不手工伪造接受 | 恢复可信现场后 `resume`，或 `abandon` |
 | 加载时核验的证据被删改（`worker packet artifact changed`、`worker schema artifact changed`、`evidence artifact disagrees with ledger` 等，见[证据损坏](#证据损坏)） | 恢复原字节；不改台账摘要。`abandon` 同样被拒绝 | 恢复后普通 `resume`；无法恢复时保留 run 目录原样，另开新 run |
 | 路径索引、输入索引或环境更新产物损坏（`path-indexes/`、`input-indexes/`、`environment/`） | 恢复原字节 | 恢复后普通 `resume`；无法恢复时可 `abandon RUN` |
-| `待派发指令的代码快照已变化`、`再规划保留候选的代码或暂存区已变化`、`pending continuation candidate or task changed` | 恢复原快照或保留证据 | 普通 `resume` 或 `abandon` |
+| `待派发指令的代码快照已变化`、`修订保留候选的代码或暂存区已变化`、`待派发指令与已发布计划或候选不符`、`pending continuation candidate or task changed` | 恢复原快照或保留证据 | 普通 `resume` 或 `abandon` |
+| `计划的整体审阅必要上下文 N 字符超过预算 M`（供给计划） | 提高 `context_chars`；模型给出的过大计划不停在这里，按无效输出重做 | 普通 `resume` |
+| `应用修订前 HEAD 与已校验计划不符`、`待应用的计划文件缺失或无法读取`、`…已改变` | 恢复原 HEAD 或计划文件的原字节 | 普通 `resume`，或 `abandon RUN` |
 | `共享规则、skills、MCP 或 hooks 已改变` | 恢复原版本的共享资产 | 普通 `resume` |
 | `配置已改变：…` | 恢复不可放宽的配置值 | 普通 `resume` |
 | `缺少已保存的 worktree Git 绑定` | 启动在绑定保存前中断；核对后手工 `git worktree remove` 并删除 `harness/<run>` 分支 | `abandon RUN` 后重新 `run` |
@@ -93,7 +88,7 @@
 
 ### 计划批准与分步
 
-`run "目标" --pause-after-plan` 保存计划后进入 `awaiting_approval`。普通 `resume` 不会批准；`resume RUN --approve-plan` 批准后继续，可与 `--step` 合用。`--step` 最多接受一个任务后进入 `paused`，最后一个任务之后仍执行整体验收。批准不授予命令权限。
+`run "目标" --pause-after-plan` 保存计划后进入 `awaiting_approval`。普通 `resume` 不会批准；`resume RUN --approve-plan` 批准后继续，可与 `--step` 合用。规划阶段的指挥提问先于计划批准，`--approve-plan` 不回答提问。`--step` 最多接受一个任务后进入 `paused`，最后一个任务之后仍执行整体验收。批准不授予命令权限。
 
 ### 命令授权与前置命令
 
@@ -150,7 +145,7 @@ python3 -m harness --config /path/to/harness.toml --repo /path/to/project resume
 
 ### 操作者决定
 
-worker 返回 `blocker_kind=operator`、指挥停止，或已接受任务为下游任务留下 `decision_requests` 时，`status RUN` 的 `pending_decisions` 列出请求。回答：
+worker 返回 `blocker_kind=operator`、指挥提问，或已接受任务为下游任务留下 `decision_requests` 时，`status RUN` 的 `pending_decisions` 列出请求。回答：
 
 ```bash
 python3 -m harness --config /path/to/harness.toml --repo /path/to/project resume RUN --operator-decision /absolute/path/decision.json --step
@@ -160,33 +155,33 @@ python3 -m harness --config /path/to/harness.toml --repo /path/to/project resume
 {"schema_version": 1, "request_id": "request_id_from_status", "task_id": "target_task", "decision": "continue", "summary": "操作者的明确选择及理由"}
 ```
 
-输入最多 64 KiB、只含上述字段，`summary` 非空、最多 4,000 字符，`decision` 为 `continue` 或 `stop`。可重复指定多个文件：整批先校验，重复 ID 或任一非法、过期答复使整批拒绝；通过后全部答复文件先写入 `decisions/`，再一次保存。每条答复的序号按参数顺序分配并写进它的不可变文件，所以预写中途被中断后，必须用原来的文件、按原来的顺序重试：已写出的文件会被复用；换了顺序，序号与已写文件不一致，恢复以 `immutable decision artifact conflict` 停止，按原顺序重交即可继续。任一 `stop` 使本次恢复保存整批后停止，不派发模型。下游请求的答复在目标任务的下一次模型调用前可修订；worker 与指挥停止的答复在任何后续模型调用后过期。决定不改变目标、范围、命令授权、验收或预算。问题文本空白、含 NUL 或过长时，请求里是有界说明与转义摘录，必须读 `source` 绑定的原文后再答。
+输入最多 64 KiB、只含上述字段，`summary` 非空、最多 4,000 字符，`decision` 为 `continue` 或 `stop`。可重复指定多个文件：整批先校验，重复 ID 或任一非法、过期答复使整批拒绝；通过后全部答复文件先写入 `decisions/`，再一次保存。每条答复的序号按参数顺序分配并写进它的不可变文件，所以预写中途被中断后，必须用原来的文件、按原来的顺序重试：已写出的文件会被复用；换了顺序，序号与已写文件不一致，恢复以 `immutable decision artifact conflict` 停止，按原顺序重交即可继续。任一 `stop` 使本次恢复保存整批后停止，不派发模型。下游请求的答复在目标任务的下一次模型调用前可修订；worker 阻断与指挥提问的答复在任何后续模型调用后过期；指挥提问的回答作为 `operator_answer` 进入下一次指挥决定。决定不改变目标、范围、命令授权、验收或预算。问题文本空白、含 NUL 或过长时，请求里是有界说明与转义摘录，必须读 `source` 绑定的原文后再答。
 
-### 指挥停止、再规划与范围
+### 指挥提问、修订与范围
 
-指挥的 stop 连同原因和证据持久保存，普通 `resume` 不重新派发。已登记且有效的停止请求必须用 `--operator-decision` 回答 continue，继续原规划请求；`--retry-stopped TASK_ID`（整体阶段为 `final`）只用于没有可用决定请求的历史停止，且在调用与计数前检查。两者都受累计再规划与派发预算约束。
+指挥的 `ask` 登记一条种类 `commander` 的决定请求并停止（有当前任务时目标是它，否则是 `final`）。这条请求未答或答 stop 时不调度任何模型，与目标无关；用 `--operator-decision` 回答 continue 后，下一次指挥决定带上 `operator_answer`。回答不授予范围、不降低验收，也不增加预算。规划、任务和整体三个阶段都可能提问。
 
-`--allow-scope PATTERN` 只在再规划请求尚未校验（`pending`、`request`）或已停止时可用：先校验整批模式，再写审计事件并保存去重后的 `approved_scope`。它只扩大新任务可选的范围，不修改既有任务。停止状态不因授权解除。
+修订越出已批准范围、其余全部合格时，派发条目记为无效（`out_of_scope_paths` 列出越界模式），回执消费后停止，不自动重做。`--allow-scope PATTERN` 在 run 未完成、未放弃、没有已返回而未落地的指挥决定时可用：先校验整批模式，再写审计事件并保存去重后的 `approved_scope`，然后照常继续；它只扩大之后的修订可选的范围，不修改既有任务。授权与否，之后的普通 `resume` 都是新的指挥决定，旧修订不复用。
 
-再规划只能保留既有任务 ID、追加前置任务、细化未接受任务的说明和依赖；已接受任务不变。只改当前任务说明时保留候选，交给同一任务的新 worker；其他修订先把未接受修改归档到 `recovery/`，再恢复工作树到已接受提交。
+修订只能保留既有任务 ID、追加前置任务、细化未接受任务的说明和依赖；已接受任务不变。修订先写成不可变的 `plans/revision-N.json`，与回执消费同次登记引用；发布前按摘要复核文件、读回原件重放修订、核对 HEAD。只改当前任务说明且仍选它时保留候选，交给同一任务的新 worker；其他修订先把未接受修改归档到 `recovery/revision-N`，再恢复工作树到已接受提交，然后计划版本、`tasks`、`current_task` 与下一条指令同次发布。归档与重置之间任一点被中断，普通 `resume` 都从计划文件重来，无需操作者介入。
 
 ### 验收不可达
 
-当前范围或已答决定排除了满足某条验收所需的工作时，worker 应返回 `blocked/task` 指明验收项和边界，指挥可直接 `action=replan`，无可行修订时 stop。`continue` 不豁免验收，增加预算也不是解决不可达条件的证据。操作者可回答 stop，核对已接受提交后从 run 分支手动集成需要的部分，再 `abandon RUN`；未接受的候选不算已交付，run 不会标为 completed。
+当前范围或已答决定排除了满足某条验收所需的工作时，worker 应返回 `blocked/task` 指明验收项和边界，指挥可修订，无可行修订时提问。`continue` 不豁免验收，增加预算也不是解决不可达条件的证据。操作者可回答 stop，核对已接受提交后从 run 分支手动集成需要的部分，再 `abandon RUN`；未接受的候选不算已交付，run 不会标为 completed。
 
 ### 无效输出与自动重做
 
-没有通过契约的模型输出不是结果。运行时只从原件读否决：退出已确认、原件字节已绑定摘要、严格解码成对象（拒绝重复键与非有限数，含溢出的数值字面量）、envelope 身份相符之后，审阅的 `request_changes`、blocking finding 或未 `resolved` 的必需项（核心结构合法时），指挥再规划的 `stop`（整份结构合法时），以及 worker 的 `blocked`，都保持约束力。
+没有通过契约的模型输出不是结果。运行时只从原件读否决：退出已确认、原件字节已绑定摘要、严格解码成对象（拒绝重复键与非有限数，含溢出的数值字面量）、envelope 身份相符之后，审阅的 `request_changes`、blocking finding 或未 `resolved` 的必需项（核心结构合法时），指挥的 `ask`（`action` 为 ask 即可），以及 worker 的 `blocked`，都保持约束力。
 
 - **指挥与审阅**：读不出否决的无效输出（含结构非法的审阅、不可解码的供应商输出）在同一次保存里记为 `status=invalid`、错误与原件摘要（`invalid_output`），回执消费，然后自动重做一次。重做是新派发，计入 `max_agent_dispatches`，条目记 `retry_of`，包里带 `previous_invalid`（上一次无效输出的引用与前 2,000 字符的错误；带上它会超出上下文预算时不带，条目记 `previous_invalid_omitted`）。重做仍无效即停止；之后的普通 `resume` 发起新请求，同样有一次重做。是否重做只看整个 run 的最后一次模型调用，所以中断、或重做在本地准备时（额度、上下文、hook）停止，恢复后的那次调用仍是重做。
-- **带否决的无效输出**：审阅按拒绝返工（`invalid_rejected`），它的 blocking finding 成为下一轮必需项；指挥的 stop 照样停止（`invalid_stopped`，`replan_stopped.output_error` 记错误）；worker 的 blocked 见上表。整体审阅的拒绝写入整体记录后同一快照不再审阅；无否决的无效整体审阅不写结论，同一快照可以重做。
+- **带否决的无效输出**：审阅按拒绝返工（`invalid_rejected`），它的 blocking finding 成为下一轮必需项；指挥的 ask 照样登记提问并停止（`invalid_asked`，条目记错误）；worker 的 blocked 见上表。整体审阅的拒绝写入整体记录后同一快照不再审阅；无否决的无效整体审阅不写结论，同一快照可以重做。
 - **worker**：无效输出（含解不出对象的完整输出）计一次工作尝试，回执消费，调度继续，受 `max_attempts` 约束。
 - **可选产物**：worker 的 `checkpoints`、`proposed_memories` 与审阅的 `approved_memory_keys` 不合格只丢弃自身，记 `checkpoints_discarded`、`memory_proposals_discarded`，结果照常处理；之后的上下文只带它们经过校验的投影（登记后的检查点、整批合法时的提案 key，不带记忆批准），原件保留原值。worker 的 `decision_requests` 不合格则整份结果无效。
-- **越出已批准范围的修订**不是无效输出：停止，回执保留，`--allow-scope` 后复核同一份修订。
+- **只因越出已批准范围而无效的修订**：记为无效并停止，不自动重做（见上节）。
 
 ### 整体验证与重验
 
-全部任务接受后，整体验证失败时：全部失败项都是超时则停在当前尝试，修复环境或提高 `verify_timeout_seconds` 后普通 `resume` 在同一快照重验；普通非零退出进入修正规划，同一快照重验须显式 `--reverify`。`--reverify` 只在本次恢复首次进入整体验收时生效，消耗新的最终尝试，保留原失败记录；整体验收预算允许时才取消尚未返回指挥结果的验证失败再规划请求。已接受的修正任务未改变失败快照时，运行时直接请求新的修正规划，不重跑相同代码。
+全部任务接受后，整体验证失败时：全部失败项都是超时则停在当前尝试，修复环境或提高 `verify_timeout_seconds` 后普通 `resume` 在同一快照重验；普通非零退出交给指挥决定，同一快照重验须显式 `--reverify`。`--reverify` 只在本次恢复首次进入整体验收时生效，开始新的整体尝试，保留原失败记录；已返回而未落地的指挥决定存在时拒绝（先普通 `resume`），从未返回的决定意图在核实退出后丢弃，已扣的预算不退回。整体拒绝或验证失败之后，在新的修订落地之前每次都是指挥决定；已接受的修正任务未改变失败快照时，指挥再决定，不重抽整体审阅、不重跑相同代码。
 
 开启 `verification.fresh_checkout` 时，整体验证在系统临时目录的全新 detached worktree 中执行；准备失败或中断后，普通 `resume` 在另一个新检出重试当前最终尝试。验证中产生未忽略的新文件时，核对后可在 `git rev-parse --git-common-dir` 指向的公共目录的 `info/exclude` 中加入精确模式，再恢复；不要用宽泛模式掩盖待交付代码。
 

@@ -6,10 +6,7 @@ import json
 from pathlib import Path
 
 from . import git
-from .contracts import (
-    apply_revision, envelope, judge_review, review_schema, ScopeExtensionRequired, validate,
-    validate_structure,
-)
+from .contracts import envelope, judge_review, review_schema, ScopeExtensionRequired, validate
 from .recovery import read_bound_bytes, read_bound_result, snapshot_digest
 from .services import RuntimeService
 from .util import HarnessError, read_json, strict_json_loads
@@ -31,14 +28,19 @@ class InvalidOutput(HarnessError):
         self.entry = entry
 
 
-class InvalidReplanStop(HarnessError):
-    """A structurally valid commander stop whose other checks failed; its receipt stays."""
+class ScopeStop(HarnessError):
+    """A revision whose only defect is new scope: recorded invalid, consumed, never redrawn."""
 
-    def __init__(self, entry, result, error, artifact):
+    def __init__(self, entry, error):
         super().__init__(str(error))
         self.entry = entry
-        self.result = {k: v for k, v in result.items() if k not in ("task_id", "dispatch_id")}
-        self.artifact = artifact
+
+
+class Decision:
+    """A judged decide result: its payload, a revision's tasks, and an ask's veto error."""
+
+    def __init__(self, payload, proposed=None, veto=None):
+        self.payload, self.proposed, self.veto = payload, proposed, veto
 
 
 class InvalidReviewRejection(HarnessError):
@@ -135,7 +137,23 @@ class ResultReceipts(RuntimeService):
             "task_id": entry["task_id"], "error": str(error), "artifact": str(Path(receipt["artifact"]).parent)}
         self.context.save()
 
-    def record_invalid(self, key, error, *, artifact=None):
+    def discard_unreturned(self, key):
+        """Drop a commander or review intent that never returned; a returned result never is.
+
+        The spent dispatch budget and the dispatch entry stay as they are.
+        """
+        receipts = self.context.run["commander_receipts" if key.startswith("commander:") else "review_receipts"]
+        receipt = receipts.get(key)
+        if receipt is None:
+            return
+        if "artifact_digest" in receipt or Path(receipt["artifact"]).exists():
+            raise HarnessError("已有返回、尚未处理的结果；先普通 resume，不能丢弃")
+        self.context.ensure_exited()
+        self.validate_terminal_capture(receipt)
+        receipts.pop(key)
+        self.context.save()
+
+    def record_invalid(self, key, error, *, artifact=None, out_of_scope_paths=None):
         """Record an output without a readable veto and consume its receipt in one save."""
         field = "commander_receipts" if key.startswith("commander:") else "review_receipts"
         receipt = self.context.run[field][key]
@@ -146,6 +164,9 @@ class ResultReceipts(RuntimeService):
             # An undecodable provider file: bind the bytes the judgment read.
             source = {"artifact": str(artifact), "artifact_digest": hashlib.sha256(Path(artifact).read_bytes()).hexdigest()}
         entry.update(status="invalid", error=str(error), invalid_output=source)
+        if out_of_scope_paths is not None:
+            # Never auto-redone: the redo rule treats it like a redo already spent.
+            entry["out_of_scope_paths"] = list(out_of_scope_paths)
         self.context.run["last_runtime_error"] = {"role": entry["role"], "kind": entry["kind"],
             "task_id": entry["task_id"], "error": str(error), "artifact": str(Path(receipt["artifact"]).parent)}
         self.context.run[field].pop(key)
@@ -163,7 +184,12 @@ class ResultReceipts(RuntimeService):
             pass
 
     def finish_commander_receipt(self, key):
-        """Judge the original request's result, then run its hook gate when valid."""
+        """Judge the original decide result, then run its hook gate when valid.
+
+        ``ask`` is a veto read after the common preconditions only (exit
+        confirmed, bytes bound, strict object, envelope identity): any other
+        defect is recorded with the question, never redone.
+        """
         receipt = self.context.run["commander_receipts"][key]
         self.validate_terminal_capture(receipt)
         entry = next(d for d in self.context.run["dispatches"] if d["id"] == receipt["dispatch_id"])
@@ -171,8 +197,6 @@ class ResultReceipts(RuntimeService):
             raise HarnessError("指挥结果的派发身份与接收记录不符")
         if snapshot_digest(receipt["request"]) != receipt["request_digest"]:
             raise HarnessError("指挥原始请求已改变；保留证据，禁止重新抽取结论")
-        if entry["kind"] == "replan" and receipt["request_id"] != self.context.run["pending_replan"]["request_id"]:
-            raise HarnessError("指挥结果不属于当前再规划请求")
         artifact = Path(receipt["artifact"])
         raw, _ = read_bound_bytes(receipt, "指挥", bind=self.context.save)
         if (git.head(self.context.worktree, binding=self.context.run["worktree_binding"]) != self.context.run["expected_head"]
@@ -184,29 +208,29 @@ class ResultReceipts(RuntimeService):
             raise HarnessError("指挥原始结果不是有效 JSON；保留证据，禁止重新抽取结论") from error
         self.context.ensure_exited()
         contract = envelope(receipt["request"]["schema"], entry["task_id"], entry["id"])
-        try:
-            validate_structure(result, contract)
-        except HarnessError as error:
-            raise self.record_invalid(key, error) from error
-        payload = {k: v for k, v in result.items() if k not in ("task_id", "dispatch_id")}
-        # Only a structurally valid stop is a readable veto (B4's ask must not inherit this).
-        stop = entry["kind"] == "replan" and result["action"] == "stop"
-        try:
-            if entry["kind"] == "plan":
-                self.services.planning.validate_tasks(payload)
-            elif entry["kind"] == "replan":
-                tasks = apply_revision(self.context.run["tasks"], payload, self.context.run["accepted"],
-                                       self.context.config.data["runtime"]["max_tasks"],
-                                       additional_allowed_paths=self.context.run.get("approved_scope", []))
-                self.services.planning.validate_tasks({"tasks": tasks})
-            validate(result, contract)
-        except ScopeExtensionRequired:
-            # Operator scope authority, not a redo: the receipt stays for --allow-scope.
-            raise
-        except HarnessError as error:
-            if stop:
-                raise InvalidReplanStop(entry, result, error, str(artifact)) from error
-            raise self.record_invalid(key, error) from error
+        packet = receipt["request"]["packet"]
+        if (isinstance(result, dict) and result.get("action") == "ask"
+                and result.get("task_id") == entry["task_id"] and result.get("dispatch_id") == entry["id"]):
+            payload = {k: v for k, v in result.items() if k not in ("task_id", "dispatch_id")}
+            try:
+                validate(result, contract)
+                self.services.planning.check_decision(payload, packet)
+            except HarnessError as error:
+                # The landing save records invalid_asked with this error.
+                return Decision(payload, veto=str(error))
+        else:
+            payload = {k: v for k, v in result.items() if k not in ("task_id", "dispatch_id")} if isinstance(result, dict) else None
+            try:
+                validate(result, contract)
+                action, proposed = self.services.planning.check_decision(payload, packet)
+            except ScopeExtensionRequired as error:
+                message = (f"指挥修订越出已批准的文件范围：{json.dumps(error.patterns, ensure_ascii=False)}；"
+                           "核对后可用 resume RUN --allow-scope 'PATTERN' 授权；授权与否，普通 resume 都发起新的指挥决定；"
+                           f"原件 {artifact}")
+                invalid = self.record_invalid(key, message, out_of_scope_paths=error.patterns)
+                raise ScopeStop(invalid.entry, message) from error
+            except HarnessError as error:
+                raise self.record_invalid(key, error) from error
         if not receipt.get("hook_completed"):
             receipt["hook_attempts"] = receipt.get("hook_attempts", 0) + 1
             self.context.save()
@@ -219,7 +243,9 @@ class ResultReceipts(RuntimeService):
         entry["status"] = "completed"
         entry.pop("error", None)
         self.context.save()
-        return payload
+        if payload["action"] == "ask":
+            return Decision(payload)
+        return Decision(payload, proposed)
 
     def finish_review_receipt(self, key, schema):
         """Judge a returned review without treating unvalidated JSON as approval."""

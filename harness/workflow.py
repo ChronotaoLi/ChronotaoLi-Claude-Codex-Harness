@@ -56,13 +56,6 @@ class Workflow(RuntimeService):
                       "dispatch_id": Path(feedback["worker_artifact"]).parent.name}
             self.services.decisions.register_decision_request(feedback["task_id"], feedback["task_id"], "worker", source,
                                            "\n".join(worker["blockers"]))
-        stopped = self.context.run.get("replan_stopped")
-        if (stopped and stopped.get("dispatch_id") and stopped["reason"].strip()
-                and len(stopped["reason"]) <= 4000 and "\0" not in stopped["reason"]):
-            artifact = self.context.directory / "dispatches" / stopped["dispatch_id"] / "returned-result.json"
-            source = {"artifact": str(artifact), "artifact_digest": stopped["source_digest"],
-                      "dispatch_id": stopped["dispatch_id"]}
-            self.services.decisions.register_decision_request(stopped["target"], "replanning", "replan_stop", source, stopped["reason"])
         if not self.context.run.get("pending_post_accept"):
             for tid, accepted in self.context.run["accepted"].items():
                 for request in accepted.get("decision_requests", []):
@@ -74,6 +67,32 @@ class Workflow(RuntimeService):
         return next((r for r in self.services.decisions.decision_context() if r["task_id"] == task_id
                      and r["kind"] in ("worker", "handoff")
                      and (r["response"] is None or r["response"]["decision"] == "stop")), None)
+
+    def commander_gate(self):
+        """The latest commander question while it is unanswered or answered stop.
+
+        It blocks every model call, whatever its target. A model call after
+        the question (or after its latest answer) retires it.
+        """
+        dispatches = self.context.run["dispatches"]
+        for request in reversed(self.services.decisions.decision_context()):
+            if request["kind"] != "commander":
+                continue
+            response = request["response"]
+            boundary = response["dispatch_count"] if response else request["dispatch_count"]
+            if any(d.get("invoked", True) for d in dispatches[boundary:]):
+                return None
+            return request if response is None or response["decision"] == "stop" else None
+        return None
+
+    def require_commander_answer(self):
+        request = self.commander_gate()
+        if request is None:
+            return
+        if request["response"] is None:
+            raise self.decision_required(request)
+        raise HarnessError(f"操作者已决定停止：request_id={request['id']}；"
+                           "请使用 --operator-decision 显式更新为 continue")
 
     def worker_recovery(self, task_id, dispatch_id, job, error):
         """Build a worker recovery record without changing the ledger.

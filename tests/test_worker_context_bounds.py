@@ -7,7 +7,7 @@ import unittest
 from harness.context import WORKER_CONTEXT_CHARS, compact_feedback, compose, worker_view
 from harness.util import HarnessError, dump, read_json, write_json
 from test_harness import RepoCase, ROOT
-from test_runtime_changes import ScriptedBackend, validate_work_contract
+from test_runtime_changes import ScriptedBackend, validate_work_contract, revised, trigger_kind
 
 
 def maximum_worker(blocker_kind="task"):
@@ -48,7 +48,7 @@ class BoundedWorkerLifecycleTests(RepoCase):
         self.assertEqual({key: value for key, value in raw.items() if key not in ("task_id", "dispatch_id")}, original)
         self.assertLessEqual(len(dump(excerpt)), WORKER_CONTEXT_CHARS)
 
-    def test_maximum_task_blocker_reaches_replan_and_fresh_worker_under_default_budget(self):
+    def test_maximum_task_blocker_reaches_decide_and_fresh_worker_under_default_budget(self):
         blocked = maximum_worker()
         sizes = []
         inspected = []
@@ -57,14 +57,15 @@ class BoundedWorkerLifecycleTests(RepoCase):
             sizes.append(len(kwargs["prompt"]))
             if kwargs["role"] == "worker" and engine.run["attempts"]["greet"] == 1:
                 result.update(copy.deepcopy(blocked))
-            elif kwargs["kind"] == "replan":
-                self.assert_full_evidence(packet["trigger"]["worker"], blocked)
-                inspected.append("replan")
-                result.update(action="revise", reason="Resolve prerequisite explicitly",
-                              new_tasks=[], updates=[{"id": "greet", "description": "Implement greet after checking prerequisites",
-                                                       "add_depends_on": []}])
-            elif kwargs["kind"] == "dispatch" or kwargs["role"] == "worker":
-                self.assert_full_evidence(packet["feedback"]["trigger"]["worker"], blocked)
+            elif trigger_kind(kwargs, packet) == "task" and packet["trigger"]["feedback"]:
+                self.assert_full_evidence(packet["trigger"]["feedback"]["worker"], blocked)
+                inspected.append("commander")
+                revised(result, packet, "Resolve prerequisite explicitly",
+                        updates=[{"id": "greet", "description": "Implement greet after checking prerequisites",
+                                  "add_depends_on": []}])
+            elif kwargs["role"] == "worker":
+                # The published revision's feedback carries the decision's trigger.
+                self.assert_full_evidence(packet["feedback"]["trigger"]["feedback"]["worker"], blocked)
                 inspected.append(kwargs["role"])
             elif kwargs["role"] == "reviewer":
                 self.assertNotIn("worker", packet)
@@ -75,18 +76,23 @@ class BoundedWorkerLifecycleTests(RepoCase):
         result = engine.start("Implement greet", self.plan())
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["attempts"], {"greet": 2})
-        self.assertEqual(inspected, ["replan", "commander", "worker"])
+        self.assertEqual(inspected, ["commander", "worker"])
         self.assertLessEqual(max(sizes), 32000)
 
     def test_maximum_environment_blocker_survives_resume_and_stays_out_of_review(self):
         blocked = maximum_worker("environment")
         sizes = []
+        inspected = []
 
         def repair(backend, kwargs, packet, result):
             sizes.append(len(kwargs["prompt"]))
             if kwargs["role"] == "worker" and sum(c["role"] == "worker" for c in backend.calls) == 1:
                 result.update(copy.deepcopy(blocked))
-            elif kwargs["kind"] == "dispatch" or kwargs["role"] == "worker":
+            elif kwargs["kind"] == "decide":
+                inspected.append("decide")
+                self.assert_full_evidence(packet["trigger"]["feedback"]["worker"], blocked)
+            elif kwargs["role"] == "worker":
+                inspected.append("worker")
                 self.assert_full_evidence(packet["feedback"]["worker"], blocked)
             elif kwargs["role"] == "reviewer":
                 self.assertNotIn("worker_artifact", dump(packet))
@@ -100,6 +106,8 @@ class BoundedWorkerLifecycleTests(RepoCase):
         result = self.engine(backend).resume(engine.run["id"])
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["attempts"], {"greet": 2})
+        # The environment update leads to one decide and the next worker, both with the full blocker.
+        self.assertEqual(inspected, ["decide", "worker"])
         self.assertLessEqual(max(sizes), 32000)
 
     def test_next_attempt_source_and_full_proposals_are_retained_for_independent_review(self):

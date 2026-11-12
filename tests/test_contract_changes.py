@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from harness.contracts import (REPLAN, review_approved, validate, validate_review,
+from harness.contracts import (DECIDE, review_approved, validate, validate_decision, validate_review,
                                validate_plan, validate_revision)
 from harness.memory import validate_proposals
 from harness.util import HarnessError
@@ -84,14 +84,16 @@ class RevisionContractTests(unittest.TestCase):
         with self.assertRaisesRegex(HarnessError, "有效变更"):
             validate_revision(original, list(reversed(original)), set())
         with self.assertRaises(HarnessError):
-            validate_revision(original, original + [task("three")], set(), max_tasks=2)
-        with self.assertRaises(HarnessError):
             validate_revision(original, original + [task("three")], {"missing"})
 
-    def test_stop_contract_retains_explicit_reason(self):
-        validate({"action": "stop", "reason": "External credentials are unavailable", "new_tasks": [], "updates": []}, REPLAN)
-        with self.assertRaises(HarnessError):
-            validate({"action": "stop", "reason": "", "new_tasks": [], "updates": []}, REPLAN)
+    def test_ask_contract_retains_explicit_question(self):
+        ask = {"action": "ask", "selected_task": "", "instruction": "", "reason": "External credentials are unavailable",
+               "new_tasks": [], "updates": []}
+        validate(ask, DECIDE)
+        self.assertEqual(validate_decision(ask, tasks=[task()], accepted={}, ready=["one"]), ("ask", None))
+        for change in ({"reason": ""}, {"reason": " \n"}, {"selected_task": "one"}, {"new_tasks": [task("two")]}):
+            with self.subTest(change=change), self.assertRaises(HarnessError):
+                validate_decision({**ask, **change}, tasks=[task()], accepted={}, ready=["one"])
 
     def test_blank_acceptance_and_scope_do_not_create_obligations(self):
         for field in ("acceptance", "allowed_paths"):

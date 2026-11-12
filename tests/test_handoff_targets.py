@@ -83,7 +83,7 @@ class HandoffProjectionTests(RepoCase):
         seen = {}
 
         def retain_check(backend, kwargs, packet, result):
-            if kwargs['kind'] == 'dispatch' and not seen:
+            if kwargs['kind'] == 'decide' and not seen:
                 # Before the next attempt: the rejected output was never verified,
                 # reviewed or accepted, and its checkpoint is retained.
                 saved = self.saved(engine)

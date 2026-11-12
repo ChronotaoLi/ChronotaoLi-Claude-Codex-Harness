@@ -178,7 +178,7 @@ class WorkerReceipts(RuntimeService):
         receipts = self.context.run['worker_receipts']
         if not isinstance(receipts, dict) or len(receipts) > 1:
             raise HarnessError('invalid/conflicting worker receipts')
-        if receipts and any(self.context.run.get(field) for field in ('pending_task', 'pending_acceptance', 'pending_post_accept', 'pending_continuation', 'pending_replan', 'review_receipts', 'commander_receipts')):
+        if receipts and any(self.context.run.get(field) for field in ('pending_task', 'pending_acceptance', 'pending_post_accept', 'pending_continuation', 'pending_revision', 'review_receipts', 'commander_receipts')):
             raise HarnessError('active worker receipt conflicts with another handoff')
         for entry in self.context.run['dispatches']:
             if not isinstance(entry, dict):

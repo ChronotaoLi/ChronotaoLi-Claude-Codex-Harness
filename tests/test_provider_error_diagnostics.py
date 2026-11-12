@@ -116,7 +116,7 @@ class DiagnosticFixtureBackend(FixtureCLIBackend):
             return super().command(role, model, cwd, job, schema, run_path)
         self.calls.append({"role": role, "model": copy.deepcopy(model), "dispatch_id": job.name})
         result = {key: schema["properties"][key]["enum"][0] for key in ("task_id", "dispatch_id")}
-        result.update(selected_task="greet", action="implement", instruction="Complete greet")
+        result.update(selected_task="greet", action="implement", instruction="Complete greet", reason="", new_tasks=[], updates=[])
         return [sys.executable, "-c", FIXTURE_PROCESS, role, model["cli"], str(job), "{}", json.dumps(result)]
 
 

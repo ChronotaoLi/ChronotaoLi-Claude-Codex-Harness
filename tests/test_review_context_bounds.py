@@ -7,7 +7,7 @@ from harness.context import compact_feedback, compact_reviews, review_digest, re
 from harness.contracts import validate_review
 from harness.util import HarnessError, dump, read_json
 from test_harness import RepoCase, ROOT
-from test_runtime_changes import ScriptedBackend
+from test_runtime_changes import ScriptedBackend, revised, trigger_kind
 
 
 def maximum_review():
@@ -59,14 +59,16 @@ class BoundedReviewLifecycleTests(RepoCase):
     def test_maximum_task_rejection_reaches_rework_and_review_with_constrained_context(self):
         rejected = maximum_review()
         sizes = []
+        inspected = []
 
         def repair(backend, kwargs, packet, result):
             sizes.append(len(kwargs["prompt"]))
             count = sum(call["kind"] == "review" for call in backend.calls)
             if kwargs["kind"] == "review" and count == 1:
                 result.update(copy.deepcopy(rejected))
-            elif kwargs["kind"] == "dispatch":
-                self.assert_full_evidence(packet["feedback"]["review"], rejected)
+            elif kwargs["kind"] == "decide":
+                inspected.append("decide")
+                self.assert_full_evidence(packet["trigger"]["feedback"]["review"], rejected)
                 self.assertEqual(engine.run["accepted"], {})
             elif kwargs["role"] == "worker" and engine.run["attempts"]["greet"] == 2:
                 self.assert_full_evidence(packet["prior_reviews"][0]["review"], rejected)
@@ -84,11 +86,12 @@ class BoundedReviewLifecycleTests(RepoCase):
         self.assertEqual(result["attempts"], {"greet": 2})
         self.assertEqual(result["review_history"]["greet"][0]["review"]["findings"], rejected["findings"])
         self.assertEqual(sum(call["kind"] == "review" for call in backend.calls), 2)
+        self.assertEqual(inspected, ["decide"])
         self.assertLessEqual(max(sizes), 34000)
         dispatches = [item["id"] for item in result["dispatches"] if item["role"] in ("worker", "reviewer")]
         self.assertEqual(len(dispatches), len(set(dispatches)))
 
-    def test_maximum_final_rejection_reaches_replan_and_new_final_review(self):
+    def test_maximum_final_rejection_reaches_decide_and_new_final_review(self):
         rejected = maximum_review()
         sizes = []
 
@@ -97,12 +100,12 @@ class BoundedReviewLifecycleTests(RepoCase):
             final_count = sum(call["kind"] == "final_review" for call in backend.calls)
             if kwargs["kind"] == "final_review" and final_count == 1:
                 result.update(copy.deepcopy(rejected))
-            elif kwargs["kind"] == "replan":
+            elif trigger_kind(kwargs, packet) == "final":
                 self.assert_full_evidence(packet["trigger"]["final_review"]["review"], rejected)
                 self.assertEqual(engine.run["status"], "running")
                 task = copy.deepcopy(packet["original_tasks"][0])
                 task.update(id="correct", description="Resolve every final finding", depends_on=["greet"])
-                result.update(action="revise", reason="Resolve the saved final findings", new_tasks=[task], updates=[])
+                revised(result, packet, "Resolve the saved final findings", new_tasks=[task])
             elif kwargs["role"] == "worker" and kwargs["task"]["id"] == "correct":
                 with (kwargs["cwd"] / "hello.py").open("a") as file:
                     file.write("# whole-run correction independently reviewed\n")
@@ -114,8 +117,8 @@ class BoundedReviewLifecycleTests(RepoCase):
         engine = self.engine(backend)
         result = engine.start("Implement greet", self.plan())
         self.assertEqual(result["status"], "completed")
-        self.assertEqual(result["replan_attempts"], 1)
-        self.assertEqual(result["final_attempts"], 2)
+        self.assertEqual(len(result["plan_history"]), 2)
+        self.assertEqual(len(result["final_history"]), 2)
         self.assertEqual(set(result["accepted"]), {"greet", "correct"})
         first, second = result["final_history"]
         self.assertEqual(first["review"]["findings"], rejected["findings"])

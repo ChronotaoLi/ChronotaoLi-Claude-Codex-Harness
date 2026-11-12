@@ -6,7 +6,7 @@ from harness import git
 from harness.util import HarnessError, ProcessTimeout, read_json, run_process
 from test_engine_repairs import RecordingBackend
 from test_harness import RepoCase, ROOT, interrupt_started_agent
-from test_runtime_changes import finding
+from test_runtime_changes import finding, revised, trigger_kind
 
 
 class TaskStageRecoveryTests(RepoCase):
@@ -137,7 +137,7 @@ class TaskStageRecoveryTests(RepoCase):
 
     def test_planning_cli_failure_does_not_pollute_worker_feedback_or_force_dispatch_commander(self):
         def unavailable_once(backend, kwargs, packet, result):
-            if kwargs["kind"] == "plan" and sum(call["kind"] == "plan" for call in backend.calls) == 1:
+            if trigger_kind(kwargs, packet) == "plan" and len(backend.calls) == 1:
                 raise HarnessError("Planning service unavailable")
 
         backend = RecordingBackend(unavailable_once)
@@ -149,8 +149,8 @@ class TaskStageRecoveryTests(RepoCase):
         result = self.engine(backend).resume(engine.run["id"])
         self.assertEqual(result["status"], "completed")
         self.assertEqual(sum(result["attempts"].values()), 1)
-        self.assertEqual(sum(call["kind"] == "plan" for call in backend.calls), 2)
-        self.assertFalse(any(call["kind"] == "dispatch" for call in backend.calls))
+        decides = [call["packet"]["trigger"]["kind"] for call in backend.calls if call["kind"] == "decide"]
+        self.assertEqual(decides, ["plan", "plan"])
         worker = next(call for call in backend.calls if call["role"] == "worker")
         self.assertIsNone(worker["packet"]["feedback"])
         self.assertEqual(result["agent_dispatches"], len(backend.requests))
@@ -159,27 +159,25 @@ class TaskStageRecoveryTests(RepoCase):
         def fail_replan(backend, kwargs, packet, result):
             if kwargs["role"] == "worker":
                 result.update(status="blocked", blocker_kind="task", blockers=["Need prerequisite"], summary="Needs preparation")
-            elif kwargs["kind"] == "replan":
+            elif trigger_kind(kwargs, packet) == "task":
                 if mode == "cli":
                     raise HarnessError("Replanning service unavailable")
                 task = deepcopy(packet["original_tasks"][0])
                 task.update(id="prepare", skills=["missing-business-skill"])
-                result.update(action="revise", reason="Add prerequisite", new_tasks=[task], updates=[{
+                revised(result, packet, "Add prerequisite", new_tasks=[task], selected="prepare", updates=[{
                     "id": "greet", "description": packet["original_tasks"][0]["description"],
                     "add_depends_on": ["prepare"]}])
 
-        self.config.data["runtime"]["max_replans"] = 1
         self.config.data["runtime"]["max_agent_dispatches"] = 3
         backend = RecordingBackend(fail_replan)
         engine = self.engine(backend)
         error = "service unavailable" if mode == "cli" else "不存在的 skill"
         with self.assertRaisesRegex(HarnessError, error):
             engine.start("Implement greet", self.plan())
-        self.assertEqual(engine.run["replan_attempts"], 0)
+        self.assertEqual(len(engine.run["plan_history"]), 1)
         resumed = self.engine(backend)
         with self.assertRaisesRegex(HarnessError, error):
             resumed.resume(engine.run["id"])
-        self.assertEqual(resumed.run["replan_attempts"], 0)
         expected_dispatches = 3 if mode == "cli" else 2
         self.assertEqual(resumed.run["agent_dispatches"], expected_dispatches)
         self.assertEqual(resumed.run["tasks"], self.plan()["tasks"])
@@ -189,35 +187,33 @@ class TaskStageRecoveryTests(RepoCase):
         with self.assertRaisesRegex(HarnessError, "模型派发次数上限" if mode == "cli" else error):
             again.resume(engine.run["id"])
         self.assertEqual(again.run["agent_dispatches"], expected_dispatches)
-        self.assertEqual(again.run["replan_attempts"], 0)
+        self.assertEqual(len(again.run["plan_history"]), 1)
         self.assertEqual(again.run["attempts"], {"greet": 1})
         self.assertEqual(backend.calls, calls)
         self.assertEqual(len({request["dispatch_id"] for request in backend.requests}), expected_dispatches)
 
-    def test_replan_cli_failures_preserve_revision_budget_but_consume_dispatch_budget(self):
+    def test_decide_cli_failures_consume_only_the_dispatch_budget(self):
         self.assert_replan_failure_budget("cli")
 
     def test_replan_unknown_skill_is_redone_within_the_dispatch_budget(self):
         def unknown_skill(backend, kwargs, packet, result):
             if kwargs["role"] == "worker":
                 result.update(status="blocked", blocker_kind="task", blockers=["Need prerequisite"], summary="Needs preparation")
-            elif kwargs["kind"] == "replan":
+            elif trigger_kind(kwargs, packet) == "task":
                 task = deepcopy(packet["original_tasks"][0])
                 task.update(id="prepare", skills=["missing-business-skill"])
-                result.update(action="revise", reason="Add prerequisite", new_tasks=[task], updates=[{
+                revised(result, packet, "Add prerequisite", new_tasks=[task], selected="prepare", updates=[{
                     "id": "greet", "description": packet["original_tasks"][0]["description"],
                     "add_depends_on": ["prepare"]}])
 
-        self.config.data["runtime"]["max_replans"] = 1
         self.config.data["runtime"]["max_agent_dispatches"] = 3
         backend = RecordingBackend(unknown_skill)
         engine = self.engine(backend)
         with self.assertRaisesRegex(HarnessError, "连续两次无效：.*不存在的 skill"):
             engine.start("Implement greet", self.plan())
-        replans = [d for d in engine.run["dispatches"] if d.get("kind") == "replan"]
+        replans = [d for d in engine.run["dispatches"] if d.get("kind") == "decide"]
         self.assertEqual([d["status"] for d in replans], ["invalid", "invalid"])
         self.assertEqual(replans[1]["retry_of"], replans[0]["id"])
-        self.assertEqual(engine.run["replan_attempts"], 0)
         self.assertEqual(engine.run["agent_dispatches"], 3)
         self.assertEqual(engine.run["tasks"], self.plan()["tasks"])
         self.assertEqual(len(engine.run["plan_history"]), 1)
@@ -227,40 +223,41 @@ class TaskStageRecoveryTests(RepoCase):
         with self.assertRaisesRegex(HarnessError, "模型派发次数上限"):
             again.resume(engine.run["id"])
         self.assertEqual(again.run["agent_dispatches"], 3)
-        self.assertEqual(again.run["replan_attempts"], 0)
+        self.assertEqual(len(again.run["plan_history"]), 1)
         self.assertEqual(again.run["attempts"], {"greet": 1})
         self.assertEqual(backend.calls, calls)
         self.assertEqual(len({request["dispatch_id"] for request in backend.requests}), 3)
 
-    def test_increasing_replan_budget_resumes_corrective_planning_without_rerolling_rejection(self):
+    def test_increasing_dispatch_budget_resumes_corrective_decision_without_rerolling_rejection(self):
         def corrective(backend, kwargs, packet, result):
             if kwargs["kind"] == "final_review" and sum(call["kind"] == "final_review" for call in backend.calls) == 1:
                 result.update(verdict="request_changes", findings=[finding()])
-            elif kwargs["kind"] == "replan":
+            elif trigger_kind(kwargs, packet) == "final":
                 task = deepcopy(packet["original_tasks"][0])
                 task.update(id="correct", title="Fix final review finding", depends_on=["greet"])
-                result.update(action="revise", reason="Address the saved rejection", new_tasks=[task], updates=[])
+                revised(result, packet, "Address the saved rejection", new_tasks=[task])
             elif kwargs["role"] == "worker" and kwargs["task"]["id"] == "correct":
                 with (kwargs["cwd"] / "hello.py").open("a") as output:
                     output.write("# independently reviewed correction\n")
 
-        self.config.data["runtime"]["max_replans"] = 0
+        # worker, task review and final review use the whole budget; the decision cannot start.
+        self.config.data["runtime"]["max_agent_dispatches"] = 3
         backend = RecordingBackend(corrective)
         engine = self.engine(backend)
-        with self.assertRaisesRegex(HarnessError, "重新规划次数"):
+        with self.assertRaisesRegex(HarnessError, "模型派发次数上限"):
             engine.start("Implement greet", self.plan())
-        self.assertEqual(engine.run["pending_replan"]["trigger"]["final_review"]["status"], "rejected")
+        self.assertEqual(engine.run["final_history"][-1]["status"], "rejected")
         calls = list(backend.calls)
-        with self.assertRaisesRegex(HarnessError, "重新规划次数"):
+        with self.assertRaisesRegex(HarnessError, "模型派发次数上限"):
             self.engine(backend).resume(engine.run["id"])
         self.assertEqual(backend.calls, calls)
-        self.config.data["runtime"]["max_replans"] = 1
+        self.config.data["runtime"]["max_agent_dispatches"] = 200
         result = self.engine(backend).resume(engine.run["id"])
         self.assertEqual(result["status"], "completed")
-        self.assertEqual(result["replan_attempts"], 1)
+        self.assertEqual(len(result["plan_history"]), 2)
         self.assertEqual(set(result["accepted"]), {"greet", "correct"})
         self.assertEqual([record["status"] for record in result["final_history"]], ["rejected", "approved"])
         self.assertNotEqual(result["final_history"][0]["head"], result["final_history"][1]["head"])
         resumed_calls = backend.calls[len(calls):]
-        self.assertEqual(resumed_calls[0]["kind"], "replan")
+        self.assertEqual((resumed_calls[0]["kind"], resumed_calls[0]["packet"]["trigger"]["kind"]), ("decide", "final"))
         self.assertEqual(sum(call["kind"] == "final_review" for call in resumed_calls), 1)

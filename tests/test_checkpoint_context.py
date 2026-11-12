@@ -78,5 +78,5 @@ class CheckpointContextTests(RepoCase):
         self.assertFalse({'task_checkpoints', 'checkpoint_history', 'checkpoint_sources'} & set(final))
         self.assertEqual(read_json(Path(final['checkpoint_index']['artifact']))['checkpoints'], result['task_checkpoints'])
         self.assertEqual(final['checkpoint_index']['count'], 16)
-        self.assertEqual(result['final_attempts'], 1)
+        self.assertEqual(len(result['final_history']), 1)
         self.assert_prompts_fit(engine)

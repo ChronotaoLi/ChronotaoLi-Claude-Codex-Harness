@@ -28,7 +28,7 @@ class ResumeConfigurationTests(unittest.TestCase):
         data = copy.deepcopy(self.config.data)
         del data["runtime"]["max_agent_dispatches"]
         self.assertEqual(normalized(data)["runtime"]["max_agent_dispatches"], 200)
-        for key in ("max_replans", "max_agent_dispatches"):
+        for key in ("max_attempts", "max_agent_dispatches"):
             config = copy.deepcopy(self.config)
             old = config.data["runtime"][key]
             config.data["runtime"][key] = old + 1

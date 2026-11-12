@@ -13,7 +13,7 @@ class SnapshotEfficiencyTests(RepoCase):
             result = engine.start("Implement greet", read_json(ROOT / "examples" / "plan.json"))
         self.assertEqual(result["status"], "completed")
         self.assertEqual(sum(result["attempts"].values()), 1)
-        self.assertEqual(result["final_attempts"], 1)
+        self.assertEqual(len(result["final_history"]), 1)
         # Durable worker return, replay, hook and publication guards add four
         # net reads; none may reuse a snapshot across those boundaries.
         self.assertLessEqual(snapshots.call_count, 19)
@@ -36,7 +36,7 @@ class SnapshotEfficiencyTests(RepoCase):
 
     def test_blank_commander_instruction_needs_new_dispatch_before_worker(self):
         def change(backend, kwargs, packet, result):
-            if kwargs["kind"] == "dispatch" and "previous_invalid" not in packet:
+            if kwargs["kind"] == "decide" and "previous_invalid" not in packet:
                 result["instruction"] = " "
 
         plan = read_json(ROOT / "examples" / "plan.json")
@@ -45,10 +45,12 @@ class SnapshotEfficiencyTests(RepoCase):
         engine = self.engine(backend)
         result = engine.start("Implement greet", plan)
         self.assertEqual(result["status"], "completed")
-        self.assertEqual([c["kind"] for c in backend.calls[:3]], ["dispatch", "dispatch", "implement"])
+        self.assertEqual([c["kind"] for c in backend.calls[:3]], ["decide", "decide", "implement"])
         workers = [c for c in backend.calls if c["role"] == "worker"]
-        self.assertTrue(all(c["packet"]["instruction"].strip() for c in workers))
+        # The decided worker gets the redone instruction; a later pristine task has none.
+        self.assertTrue(workers[0]["packet"]["instruction"].strip())
+        self.assertTrue(all(c["packet"]["instruction"] is None for c in workers[1:]))
         calls = [d["id"] for d in result["dispatches"] if d["role"] == "commander"]
         self.assertEqual(len(calls), len(set(calls)))
-        selections = [d for d in result["dispatches"] if d.get("kind") == "dispatch"]
+        selections = [d for d in result["dispatches"] if d.get("kind") == "decide"]
         self.assertEqual((selections[0]["status"], selections[1]["retry_of"]), ("invalid", selections[0]["id"]))

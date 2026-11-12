@@ -38,7 +38,7 @@ class OperationalControlsTests(RepoCase):
                 self.assertEqual(state["budgets"]["attempts_total"], 0)
                 self.assertFalse({"total_attempts", "attempt_budget_policy"} & set(state["budgets"]))
 
-    def test_cli_explicit_stop_retry_and_abandon_preserve_engine_behavior(self):
+    def test_cli_question_answer_and_abandon_preserve_engine_behavior(self):
         def blocker(backend, kwargs, packet, result):
             if kwargs["role"] == "worker":
                 result.update(status="blocked", blockers=["Needs prerequisite"], blocker_kind="task")
@@ -52,21 +52,24 @@ class OperationalControlsTests(RepoCase):
         self.assertEqual(code, 1)
         self.assertEqual(len(backend.calls), calls)
         state_path = engine.directory / "state.json"
-        before_retry = read_json(state_path)
-        request = before_retry["decision_requests"][-1]
-        code, _, errors = self.invoke(["resume", engine.run["id"], "--retry-stopped", "greet"], Runtime=factory)
+        before = read_json(state_path)
+        request = before["decision_requests"][-1]
+        self.assertEqual(request["kind"], "commander")
+        code, _, errors = self.invoke(["resume", engine.run["id"]], Runtime=factory)
         self.assertEqual(code, 1)
         self.assertIn(request["id"], errors)
         self.assertIn("--operator-decision", errors)
         self.assertEqual(len(backend.calls), calls)
-        self.assertEqual(read_json(state_path), before_retry)
-        answer = self.repo / "continue-replan.json"
+        after = read_json(state_path)
+        for key in ("attempts", "agent_dispatches", "dispatches", "decision_requests", "operator_decisions", "plan_history"):
+            self.assertEqual(after[key], before[key], key)
+        answer = self.repo / "continue-decision.json"
         write_json(answer, {"schema_version": 1, "request_id": request["id"], "task_id": "greet",
-                            "decision": "continue", "summary": "Explicitly retry the saved planning request"})
+                            "decision": "continue", "summary": "Decide again with this answer"})
         code, _, _ = self.invoke(["resume", engine.run["id"], "--operator-decision", str(answer)], Runtime=factory)
-        self.assertEqual(code, 1)  # The simulated commander explicitly stops again.
+        self.assertEqual(code, 1)  # The demo commander asks again.
         self.assertEqual(len(backend.calls), calls + 1)
-        self.assertEqual(backend.calls[-1]["kind"], "replan")
+        self.assertEqual(backend.calls[-1]["kind"], "decide")
         self.assertNotEqual(read_json(state_path)["decision_requests"][-1]["id"], request["id"])
         code, _, errors = self.invoke(["abandon", engine.run["id"]], Runtime=factory)
         self.assertEqual(code, 0, errors)

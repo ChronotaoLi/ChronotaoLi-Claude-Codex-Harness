@@ -68,11 +68,13 @@ class FreshVerificationTests(RepoCase):
 
     def test_ignored_worker_helper_passes_task_but_fails_fresh_final_verification(self):
         self.need_ignored_helper()
-        self.config.data["runtime"]["max_replans"] = 0
         backend = ScriptedBackend(self.helper_worker)
         engine = self.engine(backend)
-        with self.assertRaisesRegex(HarnessError, "整体验证未通过"):
+        # The failure is decided by the commander; the demo commander asks.
+        with self.assertRaisesRegex(HarnessError, "等待操作者决定：task_id=final"):
             engine.start("Implement greet", self.plan())
+        trigger = [c for c in backend.calls if c["kind"] == "decide"][-1]["packet"]["trigger"]
+        self.assertEqual(trigger["final_review"]["status"], "verification_failed")
         self.assertEqual(set(engine.run["accepted"]), {"greet"})
         self.assertEqual(engine.run["status"], "blocked")
         self.assertEqual(engine.run["final_history"][-1]["status"], "verification_failed")
@@ -132,7 +134,6 @@ class FreshVerificationTests(RepoCase):
         marker = Path(external.name) / "environment-ready"
         self.config.data["verification"]["setup_commands"] = [[sys.executable, "-c",
             f"from pathlib import Path; assert Path({str(marker)!r}).exists(), 'environment unavailable'"]]
-        self.config.data["runtime"]["max_final_attempts"] = 1
         self.config.data["runtime"]["max_attempts"] = 1
         backend = ScriptedBackend()
         engine = self.engine(backend)
@@ -141,12 +142,12 @@ class FreshVerificationTests(RepoCase):
         first_artifact = self.checkout_artifacts(engine)[0]
         first = read_json(first_artifact)
         self.assertEqual(first["status"], "setup_failed")
-        self.assertEqual(engine.run["final_attempts"], 1)
+        self.assertEqual(len(engine.run["final_history"]), 1)
         self.assertEqual(engine.run["final_history"][-1]["phase"], "verifying")
         marker.write_text("ready")
         result = self.engine(backend).resume(engine.run["id"])
         self.assertEqual(result["status"], "completed")
-        self.assertEqual(result["final_attempts"], 1)
+        self.assertEqual(len(result["final_history"]), 1)
         self.assertEqual(sum(result["attempts"].values()), 1)
         self.assertEqual(sum(call["role"] == "worker" for call in backend.calls), 1)
         artifacts = self.checkout_artifacts(engine)
@@ -172,7 +173,7 @@ class FreshVerificationTests(RepoCase):
         self.assertEqual(engine.run["final_history"][-1]["phase"], "reviewing")
         result = self.engine(backend).resume(engine.run["id"])
         self.assertEqual(result["status"], "completed")
-        self.assertEqual(result["final_attempts"], 1)
+        self.assertEqual(len(result["final_history"]), 1)
         self.assertEqual(sum(result["attempts"].values()), 1)
         self.assertEqual(self.final_checks(result), before)
         self.assertEqual(self.checkout_artifacts(engine), artifacts)
@@ -186,7 +187,6 @@ class FreshVerificationTests(RepoCase):
             [sys.executable, "-c", f"from pathlib import Path; assert Path({str(ready)!r}).exists()"],
             [sys.executable, "-c", f"from pathlib import Path; Path({str(sentinel)!r}).write_text(str(Path.cwd()))"],
         ]
-        self.config.data["runtime"]["max_final_attempts"] = 1
         backend = ScriptedBackend()
         engine = self.engine(backend)
         with self.assertRaisesRegex(HarnessError, "依赖准备失败"):
@@ -201,7 +201,7 @@ class FreshVerificationTests(RepoCase):
         ready.write_text("ready")
         result = self.engine(backend).resume(engine.run["id"])
         self.assertEqual(result["status"], "completed")
-        self.assertEqual(result["final_attempts"], 1)
+        self.assertEqual(len(result["final_history"]), 1)
         self.assertEqual(sum(result["attempts"].values()), 1)
         second_checkout = read_json(self.checkout_artifacts(engine)[1])["worktree"]
         self.assertNotEqual(first_checkout, second_checkout)

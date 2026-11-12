@@ -5,7 +5,7 @@ from copy import deepcopy
 from pathlib import Path
 
 from . import git
-from .context import compact_checks
+from .context import compact_checks, compact_feedback
 from .contracts import review_approved
 from .recovery import snapshot_digest
 from .review_progress import bind_review_source, validate_review_source, required_findings, disposition_gaps
@@ -14,7 +14,28 @@ from .verification import checks_failed
 from .util import HarnessError, read_json, write_json
 
 
+def same_snapshot_record(history, digest, head):
+    """The latest whole-run record for this exact snapshot, if any."""
+    return next((item for item in reversed(history)
+                 if item["snapshot_digest"] == digest and item["head"] == head), None)
+
+
+def needs_decision(record, reverify):
+    """A same-snapshot rejection, or a non-timeout failure not being re-verified, needs a decide."""
+    if record is None:
+        return False
+    if record["status"] in ("rejected", "invalid_rejected"):
+        return True
+    return record["status"] == "verification_failed" and record["failure_kind"] != "timeout" and not reverify
+
+
 class FinalAcceptance(RuntimeService):
+    def trigger(self, record):
+        """The derived final-stage decision input; nothing persistent marks it."""
+        return {"kind": "final",
+                "final_review": compact_feedback({"final_review": deepcopy(record)})["final_review"],
+                "accepted_since": sorted(set(self.context.run["accepted"]) - set(record["accepted_tasks"]))}
+
     def final_review(self, *, reverify=False):
         # Consume the resume flag on first entry, including new snapshots and
         # unfinished attempts that do not need an explicit retry.
@@ -32,11 +53,7 @@ class FinalAcceptance(RuntimeService):
         rejected = next((item for item in reversed(same_snapshot)
                          if item["status"] in ("rejected", "invalid_rejected")), None)
         if rejected:
-            # A corrective task can validly accept an empty diff. Its acceptance
-            # does not erase the earlier rejection; ask for another bounded plan
-            # once per newly accepted correction, without calling the reviewer.
-            if self.replan_unchanged_corrections(rejected):
-                return False
+            # The scheduler routes this snapshot to a decide; the review is never redrawn.
             raise HarnessError("整体审阅已拒绝同一代码快照；必须先通过修正任务，不能恢复后重复抽取审阅")
         for item in same_snapshot:
             if item["status"] == "approved":
@@ -52,15 +69,12 @@ class FinalAcceptance(RuntimeService):
         if not record or record["status"] != "running":
             if record and record["status"] == "verification_failed" and record["failure_kind"] != "timeout":
                 if not reverify:
-                    if self.replan_unchanged_corrections(record):
-                        return False
                     raise HarnessError("同一代码快照的整体验证曾失败；修复环境后使用 resume --reverify 显式重验")
-            if self.context.run["final_attempts"] >= self.context.config.data["runtime"]["max_final_attempts"]:
-                raise HarnessError("整体审阅已达尝试次数上限")
-            if record and record["status"] == "verification_failed" and record["failure_kind"] != "timeout":
+                # An explicit re-verification replaces a decide that never
+                # returned; a returned one was refused before any write.
+                self.services.receipts.discard_unreturned("commander:decide:run")
                 self.context.event("final_reverification_requested", previous_attempt=record["attempt"])
-            self.context.run["final_attempts"] += 1
-            attempt = self.context.run["final_attempts"]
+            attempt = len(history) + 1
             folder = self.services.verification.verification_directory("final", attempt, whole_run=True)
             snapshot_artifact = folder / "snapshot.json"
             record = {"attempt": attempt, "head": self.context.run["expected_head"], "snapshot_digest": digest,
@@ -104,7 +118,6 @@ class FinalAcceptance(RuntimeService):
                               verification_failures=compact_checks(checks))
                 if record["failure_kind"] != "timeout":
                     self.context.run["feedback"] = {"final_review": deepcopy(record)}
-                    self.context.run["pending_replan"] = {"stage": "pending", "trigger": deepcopy(self.context.run["feedback"])}
             else:
                 record.update(phase="reviewing", required_findings=required)
             write_json(folder / "final.json", record)
@@ -139,7 +152,6 @@ class FinalAcceptance(RuntimeService):
                 self.context.run["feedback"] = None
             else:
                 self.context.run["feedback"] = {"final_review": deepcopy(record)}
-                self.context.run["pending_replan"] = {"stage": "pending", "trigger": deepcopy(self.context.run["feedback"])}
         write_json(folder / "final.json", record)
         self.context.save()
         if record["status"] == "approved":
@@ -154,17 +166,3 @@ class FinalAcceptance(RuntimeService):
         else:
             self.context.event("final_review_rejected", attempt=attempt)
         return False
-
-    def replan_unchanged_corrections(self, record):
-        """Empty corrections do not erase a failed verification or review."""
-        handled = set(record.get("noop_corrections_handled", []))
-        corrections = set(self.context.run["accepted"]) - set(record["accepted_tasks"]) - handled
-        if not corrections:
-            return False
-        record["noop_corrections_handled"] = sorted(handled | corrections)
-        trigger = {"final_review": deepcopy(record), "unchanged_corrections": sorted(corrections),
-                   "reason": "已接受的修正任务未改变未通过整体验收的代码快照，需要新的修正计划"}
-        self.context.run["feedback"] = deepcopy(trigger)
-        self.context.run["pending_replan"] = {"stage": "pending", "trigger": trigger}
-        self.context.save()
-        return True

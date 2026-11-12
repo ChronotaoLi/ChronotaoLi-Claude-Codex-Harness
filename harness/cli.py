@@ -78,7 +78,6 @@ def demo(config, live=False, commander="astra"):
     config.data["verification"]["commands"] = [[sys.executable, "-m", "unittest", "-v"]]
     config.data["runtime"]["agent_timeout_seconds"] = 180 if live else 1200
     config.data["runtime"]["max_attempts"] = 1 if live else 3
-    config.data["runtime"]["max_final_attempts"] = 1 if live else 3
     print(f"[harness] {'LIVE SMOKE' if live else 'OFFLINE DEMO'} repo={root}", file=sys.stderr, flush=True)
     result = Runtime(config, root, backend=None if live else DemoBackend(), commander=commander).start(
         "Implement greet(name) in hello.py, returning 'Hello, {name}!'. Keep the existing test unchanged.")
@@ -135,12 +134,14 @@ def status_work_attempts(run):
 
 
 def status_summary(run):
+    # replan_stopped exists only in schema 16 and earlier ledgers (historical display).
     if not isinstance(run.get("accepted", {}), dict) or not isinstance(run.get("replan_stopped", {}), dict):
         raise HarnessError("运行台账 accepted 或 replan_stopped 字段无效；使用 status --full 查看原始内容")
     result = {key: run.get(key) for key in ("id", "status", "goal", "branch", "worktree", "current_task")}
     result["accepted_tasks"] = list(run.get("accepted", {}))
-    result["budgets"] = {key: run.get(key) for key in
-                         ("attempts", "agent_dispatches", "replan_attempts", "final_attempts")}
+    result["budgets"] = {key: run.get(key) for key in ("attempts", "agent_dispatches")}
+    # Historical display branch: schema 16 and earlier saved two more counters.
+    result["budgets"].update({key: run[key] for key in ("replan_attempts", "final_attempts") if key in run})
     result["budgets"]["work_attempts"] = status_work_attempts(run)
     # Every worker invocation, summed from the validated per-task counters.
     result["budgets"]["attempts_total"] = attempts_total(run)
@@ -321,7 +322,7 @@ def operation_arguments(args):
         return {"goal": args.goal, "plan": str(args.plan) if args.plan is not None else None,
                 "commander": args.commander, "pause_after_plan": args.pause_after_plan, "step": args.step}
     return {"run_id": args.run_id, "approve_plan": args.approve_plan, "step": args.step,
-            "reverify": args.reverify, "retry_stopped": args.retry_stopped,
+            "reverify": args.reverify,
             "confirm_exited": list(args.confirm_exited or ()),
             "environment_update": str(args.environment_update) if args.environment_update is not None else None,
             "operator_decision": [str(path) for path in args.operator_decision or ()],
@@ -331,7 +332,7 @@ def operation_arguments(args):
 
 
 def resume_options(args):
-    options = {"retry_stopped": args.retry_stopped} if args.retry_stopped is not None else {}
+    options = {}
     if args.confirm_exited:
         options["confirm_exited"] = args.confirm_exited
     if args.environment_update is not None:
@@ -424,8 +425,7 @@ def _main(argv=None):
     resume.add_argument("--operation-id", metavar="ID", help="本次操作记录的 ID；默认自动生成，已存在则拒绝")
     resume.add_argument("--approve-plan", action="store_true", help="批准等待确认的计划并继续")
     resume.add_argument("--step", action="store_true", help="最多接受一个任务后暂停")
-    resume.add_argument("--reverify", action="store_true", help="仅在本次恢复首次整体验收时重验失败快照；不重抽审阅结论，与 --retry-stopped 互斥")
-    resume.add_argument("--retry-stopped", metavar="TASK_ID|final", help="显式重试已被指挥停止的规划请求，仍受累计预算约束")
+    resume.add_argument("--reverify", action="store_true", help="仅在本次恢复首次整体验收时重验失败快照；不重抽审阅结论；已返回的指挥决定存在时拒绝")
     resume.add_argument("--confirm-exited", action="append", metavar="DISPATCH_ID",
                         help="确认指定旧 dispatch 已退出并记录证据；可重复指定")
     resume.add_argument("--environment-update", type=Path, metavar="FILE",
@@ -437,7 +437,7 @@ def _main(argv=None):
     resume.add_argument("--operator-decision", type=Path, action="append", metavar="FILE",
                         help="回答 status 中的操作者决策请求；可重复指定，整批校验保存后继续，不跳过验收或授予命令权限")
     resume.add_argument("--allow-scope", action="append", metavar="PATTERN",
-                        help="为待再规划显式授权新增文件范围模式；可重复指定，不改变原任务范围")
+                        help="为之后的指挥修订授权新增文件范围模式；可重复指定，不改变原任务范围")
     status = sub.add_parser("status")
     status.add_argument("run_id", nargs="?")
     status.add_argument("--full", action="store_true", help="输出完整运行台账")

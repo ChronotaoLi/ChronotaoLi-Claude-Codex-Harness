@@ -12,7 +12,7 @@ from harness.task_lifecycle import TaskLifecycle
 from harness.util import HarnessError, read_json
 from test_engine_repairs import RecordingBackend
 from test_harness import RepoCase, ROOT
-from test_runtime_changes import finding
+from test_runtime_changes import finding, revised, trigger_kind
 
 
 class FindingIdentityTests(unittest.TestCase):
@@ -142,10 +142,10 @@ class FinalFindingLifecycleTests(RepoCase):
             number = sum(c['kind'] == 'final_review' for c in backend.calls)
             if kwargs['kind'] == 'final_review' and number == 1:
                 result.update(verdict='request_changes', findings=[finding()])
-            elif kwargs['kind'] == 'replan':
+            elif trigger_kind(kwargs, packet) == 'final' and number == 1:
                 task = copy.deepcopy(packet['original_tasks'][0])
                 task.update(id='correct', depends_on=['greet'])
-                result.update(action='revise', reason='Resolve final blocking finding', new_tasks=[task], updates=[])
+                revised(result, packet, 'Resolve final blocking finding', new_tasks=[task])
             elif kwargs['role'] == 'worker' and kwargs['task']['id'] == 'correct':
                 with (kwargs['cwd'] / 'hello.py').open('a') as stream:
                     stream.write('# Independently reviewed final correction\n')
@@ -159,7 +159,6 @@ class FinalFindingLifecycleTests(RepoCase):
         return RecordingBackend(change)
 
     def test_missing_final_disposition_is_redone_before_completion(self):
-        self.config.data['runtime']['max_replans'] = 1
         backend = self.backend(omit_dispositions=True)
         engine = self.engine(backend)
         run = engine.start('Implement greet', read_json(ROOT / 'examples/plan.json'))
@@ -179,7 +178,6 @@ class FinalFindingLifecycleTests(RepoCase):
         self.assertEqual(packets[2]['previous_invalid']['dispatch_id'], finals[1]['id'])
 
     def test_open_final_disposition_cannot_complete(self):
-        self.config.data['runtime']['max_replans'] = 1
         engine = self.engine(self.backend(disposition_status='open'))
         with self.assertRaises(HarnessError):
             engine.start('Implement greet', read_json(ROOT / 'examples/plan.json'))

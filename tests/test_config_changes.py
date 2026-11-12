@@ -33,11 +33,11 @@ class ConfigChangesTests(unittest.TestCase):
     def test_new_configuration_gets_defaults_but_incomplete_saved_snapshot_is_rejected(self):
         del self.data["permissions"]
         del self.data["memory"]
-        del self.data["runtime"]["max_final_attempts"]
-        del self.data["runtime"]["max_replans"]
+        del self.data["runtime"]["max_attempts"]
+        del self.data["runtime"]["max_agent_dispatches"]
         config = self.load()
-        self.assertEqual(config.data["runtime"]["max_final_attempts"], 3)
-        self.assertEqual(config.data["runtime"]["max_replans"], 2)
+        self.assertEqual(config.data["runtime"]["max_attempts"], 5)
+        self.assertEqual(config.data["runtime"]["max_agent_dispatches"], 200)
         self.assertEqual(config.data["permissions"]["worker_commands"], [])
         self.assertEqual(config.data["memory"], {"task_ttl_days": 180, "knowledge_ttl_days": 180})
         before = copy.deepcopy(self.data)
@@ -50,6 +50,9 @@ class ConfigChangesTests(unittest.TestCase):
     REMOVED = {
         "max_total_attempts": (60, ("runtime.max_attempts", "runtime.max_agent_dispatches")),
         "claude_output_mode": ("legacy_json", ("JSON 输出", "stream_metadata_v1 已删除")),
+        "max_replans": (2, ("runtime.max_agent_dispatches",)),
+        "max_final_attempts": (3, ("runtime.max_agent_dispatches",)),
+        "max_tasks": (20, ("runtime.context_chars",)),
     }
 
     def test_removed_keys_are_rejected_with_their_replacements(self):
@@ -107,14 +110,10 @@ class ConfigChangesTests(unittest.TestCase):
             if key == "claude_max_turns_by_role":
                 continue
             for value in (True, False, -1, 0):
-                if key == "max_replans" and type(value) is int and value == 0:
-                    continue
                 data = copy.deepcopy(self.data)
                 data["runtime"][key] = value
                 with self.subTest(key=key, value=value), self.assertRaises(HarnessError):
                     self.load(data)
-        self.data["runtime"]["max_replans"] = 0
-        self.assertEqual(self.load().data["runtime"]["max_replans"], 0)
 
     def test_memory_ttl_allows_disabled_expiry_but_rejects_invalid_values(self):
         self.data["memory"] = {"task_ttl_days": 0, "knowledge_ttl_days": 0}

@@ -168,7 +168,7 @@ class OperationRecordTests(OperationCase):
         self.assertEqual((record["kind"], record["status"], record["run_id"], record["exit_status"],
                           record["result_status"]), ("resume", "finished", run_id, 0, "completed"))
         self.assertEqual(record["arguments"], {
-            "run_id": run_id, "approve_plan": True, "step": False, "reverify": False, "retry_stopped": None,
+            "run_id": run_id, "approve_plan": True, "step": False, "reverify": False,
             "confirm_exited": [], "environment_update": None,
             "operator_decision": [], "execution_guidance": None, "reject_continuation": None, "allow_scope": []})
         self.assertIsInstance(record["run_linked_at"], float)

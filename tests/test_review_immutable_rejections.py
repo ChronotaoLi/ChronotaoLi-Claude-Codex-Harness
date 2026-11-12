@@ -63,8 +63,7 @@ class ImmutableRejectionTests(RepoCase):
         self.assertEqual(rejected_hooks[0]["result"], originals[0])
         self.assert_no_corrections(engine, backend)
 
-    def test_overfull_final_findings_persist_replan_without_redrawing_same_snapshot(self):
-        self.config.data["runtime"]["max_replans"] = 0
+    def test_overfull_final_findings_reach_the_decision_without_redrawing_same_snapshot(self):
         originals = []
 
         def reject(backend, kwargs, packet, result):
@@ -76,13 +75,14 @@ class ImmutableRejectionTests(RepoCase):
         backend = RecordingBackend(reject)
         engine = self.engine(backend)
         with patch.object(engine.hooks, "emit", wraps=engine.hooks.emit) as hooks:
-            with self.assertRaisesRegex(HarnessError, "重新规划次数"):
+            with self.assertRaisesRegex(HarnessError, "等待操作者决定：task_id=final"):
                 engine.start("Implement greet", self.plan())
         record = engine.run["final_history"][-1]
         self.assertEqual(record["status"], "invalid_rejected")
         self.assertEqual(record["phase"], "finished")
         self.assert_evidence(record, originals[0])
-        self.assertEqual(engine.run["pending_replan"]["trigger"]["final_review"], record)
+        seen = [call for call in backend.calls if call["kind"] == "decide"][-1]["packet"]["trigger"]["final_review"]
+        self.assertEqual((seen["status"], seen["attempt"]), (record["status"], record["attempt"]))
         rejected_hooks = [call.args[1] for call in hooks.call_args_list
                           if call.args[0] == "post_agent" and call.args[1].get("status") == "invalid_rejected"]
         self.assertEqual(len(rejected_hooks), 1)
@@ -93,7 +93,7 @@ class ImmutableRejectionTests(RepoCase):
             with self.assertRaises(HarnessError):
                 resumed.resume(engine.run["id"], **options)
             self.assertEqual(backend.calls, calls)
-            self.assertEqual(resumed.run["final_attempts"], 1)
+            self.assertEqual(len(resumed.run["final_history"]), 1)
         self.assert_no_corrections(engine, backend)
 
     def test_approve_with_oversized_blocking_evidence_is_rejected(self):

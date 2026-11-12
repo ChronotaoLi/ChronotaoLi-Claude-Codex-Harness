@@ -139,7 +139,7 @@ class TerminalCaptureRecoveryTests(RepoCase):
 
     def test_commander_plan_replays_original_with_exhausted_dispatch_budget(self):
         self.config.data["runtime"]["max_agent_dispatches"] = 1
-        backend = self.backend("plan", provider="codex")
+        backend = self.backend("decide", provider="codex")
         engine = self.start_failed(backend, plan=False, pause_after_plan=True)
         backend.release()
         result = self.engine(backend).resume(engine.run["id"])
@@ -171,11 +171,11 @@ class TerminalCaptureRecoveryTests(RepoCase):
         self.assertEqual(len(backend.calls), calls)
         self.assertFalse(engine.run["accepted"])
 
-    def test_commander_stop_remains_stop_on_repeated_resume(self):
+    def test_commander_question_remains_on_repeated_resume(self):
         def blocked(backend, kwargs, packet, result):
             if kwargs["role"] == "worker":
                 result.update(status="blocked", blocker_kind="task", blockers=["Need a prerequisite"])
-        backend = self.backend("replan", change=blocked)
+        backend = self.backend("decide", change=blocked)
         engine = self.start_failed(backend)
         backend.release()
         calls = len(backend.calls)
@@ -184,8 +184,8 @@ class TerminalCaptureRecoveryTests(RepoCase):
                 self.engine(backend).resume(engine.run["id"])
             self.assertEqual(len(backend.calls), calls)
         saved = read_json(engine.directory / "state.json")
-        self.assertIn("replan_stopped", saved)
-        self.assertEqual(saved["replan_attempts"], 1)
+        self.assertEqual([r["kind"] for r in saved["decision_requests"]], ["commander"])
+        self.assertEqual(sum(d["kind"] == "decide" for d in saved["dispatches"]), 1)
 
     def test_missing_tampered_terminal_or_changed_candidate_never_rerolls(self):
         backend = self.backend(change=self.reject)

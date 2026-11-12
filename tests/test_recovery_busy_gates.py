@@ -21,11 +21,3 @@ class RecoveryBusyGateTests(RepoCase):
             self.assertIsNotNone(prepare())
         self.assertEqual(engine.run, before)
         self.assertEqual({str(p): p.read_bytes() for p in engine.directory.rglob('*') if p.is_file()}, files)
-
-    def test_environment_replan_stopped_rejects_valid_source(self):
-        engine, backend, path, _ = self.environment()
-        # No subsequent invocation: this must be rejected by the busy gate.
-        self.assertIsNotNone(engine.services.environment.prepare_environment_update(path))
-        engine.run['replan_stopped'] = {'target': 'greet'}
-        self.assert_preparation(engine.context, lambda: engine.services.environment.prepare_environment_update(path), True)
-        self.assertEqual(len(backend.calls), 1)

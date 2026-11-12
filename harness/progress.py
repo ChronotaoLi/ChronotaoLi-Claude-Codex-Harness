@@ -439,10 +439,12 @@ class ProgressRecovery(RuntimeService):
         task = packet.get("task", {})
         task_id = task_id or packet.get("task_id") or (task.get("id") if isinstance(task, dict) else None)
         trigger = packet.get("trigger")
-        if task_id in (None, "replanning") and isinstance(trigger, dict):
-            task_id = trigger.get("task_id")
-        relevant = {t["id"] for t in packet.get("ready", [])} if kind == "dispatch" or "ready" in packet else None
-        if relevant is None and task_id and task_id not in ("final", "dispatching", "replanning"):
+        relevant = None
+        if kind == "decide":
+            # A task decision sees its ready tasks; plan and final decisions only the index.
+            relevant = (set(trigger.get("ready", [])) if isinstance(trigger, dict) and trigger.get("kind") == "task"
+                        else set())
+        if relevant is None and task_id and task_id not in ("final", "run"):
             relevant = {task_id}
         if kind == "final_review" or task_id == "final":
             # Final review runs only after every task is accepted. Its capacity

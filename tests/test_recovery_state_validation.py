@@ -97,18 +97,21 @@ class RecoveryStateValidationTests(RepoCase):
 
     def test_optional_state_types_stop_before_dispatch_or_ledger_write(self):
         self.blocked_review()
-        for field in ("pending_task", "pending_acceptance", "pending_post_accept", "pending_replan",
-                      "pending_directive", "worker_recovery", "replan_stopped"):
+        for field in ("pending_task", "pending_acceptance", "pending_post_accept", "pending_revision",
+                      "pending_directive", "worker_recovery"):
             for value in ([], None, "invalid"):
                 with self.subTest(field=field, value=value):
                     state = copy.deepcopy(self.saved)
                     state[field] = value
                     self.assert_stops_before_resume(state)
 
-    def test_conflicting_task_and_replan_preserve_candidate(self):
+    def test_conflicting_task_and_revision_preserve_candidate(self):
         self.blocked_review()
         state = copy.deepcopy(self.saved)
-        state["pending_replan"] = {"stage": "pending", "trigger": {"task_id": "greet"}}
+        # A well-formed reference: only its coexistence with the task stage is wrong.
+        state["pending_revision"] = {"revision": 1, "artifact": str(self.engine_before.directory / "plans" / "revision-1.json"),
+                                     "artifact_digest": "0" * 64}
+        self.assertIn("pending_task", state)
         candidate = (self.engine_before.worktree / "hello.py").read_bytes()
         self.assert_stops_before_resume(state)
         self.assertEqual((self.engine_before.worktree / "hello.py").read_bytes(), candidate)
@@ -122,7 +125,7 @@ class RecoveryStateValidationTests(RepoCase):
                 state["review_receipts"][self.key]["dispatch_id"] = ident
                 self.assert_stops_before_resume(state)
         state = copy.deepcopy(self.saved)
-        state["commander_receipts"]["commander:plan:planning"] = self.receipt
+        state["commander_receipts"]["commander:decide:run"] = self.receipt
         self.assert_stops_before_resume(state)
         state = copy.deepcopy(self.saved)
         state["dispatches"].append(copy.deepcopy(state["dispatches"][-1]))

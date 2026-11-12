@@ -165,21 +165,6 @@ class ErrorRepairsTests(RepoCase):
             self.assertEqual(caught.exception.timeout, timeout if name == "timeout" else None)
             self.assertTrue(caught.exception.log.with_suffix(".stderr").exists())
 
-    def test_final_attempt_budget_is_independent_and_can_increase_on_resume(self):
-        snapshot = copy.deepcopy(self.config.data)
-        del snapshot["runtime"]["max_final_attempts"]
-        with self.assertRaisesRegex(HarnessError, '配置快照字段缺失'):
-            self.config.resume_changes(snapshot)
-        self.assertNotIn('max_final_attempts', snapshot['runtime'])
-        snapshot = copy.deepcopy(self.config.data)
-        self.assertEqual(self.config.resume_changes(snapshot), {})
-        self.config.data["runtime"]["max_final_attempts"] = 4
-        self.assertEqual(self.config.resume_changes(snapshot), {"max_final_attempts": {"old": 3, "new": 4}})
-        self.assertEqual(self.config.data["runtime"]["max_attempts"], 3)
-        self.config.data["runtime"]["max_final_attempts"] = 2
-        with self.assertRaises(HarnessError):
-            self.config.resume_changes(snapshot)
-
     def test_status_retains_healthy_runs_when_other_state_is_damaged(self):
         runs = self.repo / ".harness" / "runs"
         good = {"id": "run_good", "status": "completed", "goal": "done", "branch": "harness/run_good"}

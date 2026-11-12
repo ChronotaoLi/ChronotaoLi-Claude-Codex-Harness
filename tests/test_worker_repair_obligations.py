@@ -48,7 +48,7 @@ class WorkerRepairObligationsTests(RepoCase):
         return backend, schemas
 
     def assert_completed(self, engine, result, backend):
-        self.assertEqual(self.config.data["runtime"]["max_attempts"], 3)
+        self.assertEqual(self.config.data["runtime"]["max_attempts"], 5)
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["attempts"], {"greet": 3})
         self.assertEqual(sum(call["role"] == "worker" for call in backend.calls), 3)

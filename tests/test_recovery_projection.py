@@ -5,7 +5,12 @@ from harness.recovery import worker_recovery_context
 from harness.util import HarnessError, ProcessTimeout, dump, read_json
 from test_engine_repairs import RecordingBackend
 from test_harness import RepoCase, ROOT
-from test_runtime_changes import finding
+from test_runtime_changes import finding, revised, trigger_kind
+
+
+def recovery_of(call):
+    """The recovery projection a call received: a decide carries it in its trigger."""
+    return call["packet"]["trigger"]["recovery"] if call["role"] == "commander" else call["packet"]["recovery"]
 
 
 class RecoveryProjectionTests(RepoCase):
@@ -42,11 +47,11 @@ class RecoveryProjectionTests(RepoCase):
         engine, backend, original = self.interrupted_rework()
         workers = [entry for entry in engine.run["dispatches"] if entry["role"] == "worker"]
         history = engine.run["review_history"]["greet"][-1]
-        calls = [call for call in backend.calls if call["kind"] == "dispatch" or call["role"] == "worker"]
+        calls = [call for call in backend.calls if call["kind"] == "decide" or call["role"] == "worker"]
         # The second commander selection and third worker both repair the saved
         # rejection, while still retaining the first invocation's timeout.
         for call in calls[-2:]:
-            recovery = call["packet"]["recovery"]
+            recovery = recovery_of(call)
             self.assertEqual({key: recovery[key] for key in original}, original)
             self.assertEqual(recovery["relation"], "earlier_worker_failure")
             self.assertEqual(recovery["source"]["dispatch_id"], workers[0]["id"])
@@ -98,7 +103,7 @@ class RecoveryProjectionTests(RepoCase):
         successors = backend.calls[-4:-2]
         self.assertEqual([call["role"] for call in successors], ["commander", "worker"])
         for call in successors:
-            self.assertEqual(call["packet"]["recovery"]["source"]["dispatch_id"], failed["dispatch_id"])
+            self.assertEqual(recovery_of(call)["source"]["dispatch_id"], failed["dispatch_id"])
 
     def test_pending_review_uses_saved_worker_and_formal_verification(self):
         def interrupt(backend, kwargs, packet):
@@ -132,12 +137,11 @@ class RecoveryProjectionTests(RepoCase):
                 raise ProcessTimeout(1, kwargs["job"] / "cli")
 
         def change(backend, kwargs, packet, result):
-            if replan and kwargs["kind"] == "dispatch" and (packet.get("feedback") or {}).get("acceptance"):
-                result.update(action="replan", instruction="Clarify implementation details before retrying")
-            elif kwargs["kind"] == "replan":
-                result.update(action="revise", reason="Clarify implementation details", new_tasks=[],
-                              updates=[{"id": "greet", "description": "Implement and independently verify the greeting",
-                                        "add_depends_on": []}])
+            if replan and trigger_kind(kwargs, packet) == "task" and (packet["trigger"]["feedback"] or {}).get("acceptance"):
+                revised(result, packet, "Clarify implementation details", selected="greet",
+                        instruction="Clarify implementation details before retrying",
+                        updates=[{"id": "greet", "description": "Implement and independently verify the greeting",
+                                  "add_depends_on": []}])
 
         backend = RecordingBackend(change)
         backend.before_result = interrupt
@@ -167,15 +171,13 @@ class RecoveryProjectionTests(RepoCase):
             # evidence, but the corresponding history record lacked a marker.
             self.assertFalse(engine.services.tasks.accept_pending())
             engine.run["review_history"]["greet"][-1].pop("status")
-            engine.run["pending_replan"] = {"stage": "pending", "trigger": {
-                "task_id": "greet", "feedback": deepcopy(engine.run["feedback"])}}
             engine.context.save()
         resumed = self.engine(backend)
         with self.assertRaises(ProcessTimeout):
             resumed.resume(engine.run["id"])
         for call in backend.calls[-2:]:
             self.assertIn(call["role"], ("commander", "worker"))
-            latest = call["packet"]["recovery"]["latest"]
+            latest = recovery_of(call)["latest"]
             self.assertEqual(latest["worker"]["attempt"], 2)
             self.assertEqual(latest["verification"]["status"], "invalidated")
             self.assertEqual(latest["verification"]["artifact"], record["verification"])
@@ -189,9 +191,9 @@ class RecoveryProjectionTests(RepoCase):
         self.assertEqual(resumed.run["accepted"], {})
         self.assertEqual(resumed.run["attempts"], {"greet": 3})
         if replan:
-            self.assertEqual(resumed.run["replan_attempts"], 1)
+            self.assertEqual(len(resumed.run["plan_history"]), 2)
             self.assertNotIn("acceptance", resumed.run["feedback"])
-            self.assertIn("retained_candidate", resumed.run["plan_history"][-1])
+            self.assertEqual(read_json(Path(resumed.run["plan_history"][-1]["artifact"]))["candidate"], "retain")
 
     def test_changed_pending_acceptance_invalidates_projected_approval(self):
         self.assert_changed_approval_projection()
@@ -199,7 +201,7 @@ class RecoveryProjectionTests(RepoCase):
     def test_invalidated_approval_stays_invalid_after_description_replan(self):
         self.assert_changed_approval_projection(replan=True)
 
-    def test_legacy_invalidated_approval_is_normalized_before_pending_replan(self):
+    def test_legacy_invalidated_approval_is_normalized_before_the_decide(self):
         self.assert_changed_approval_projection(replan=True, legacy=True)
 
     def test_missing_invocation_evidence_is_rejected_without_inventing_recovery_state(self):

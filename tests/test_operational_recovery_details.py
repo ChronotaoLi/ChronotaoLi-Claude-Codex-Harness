@@ -18,7 +18,7 @@ class OperationalRecoveryDetailsTests(RepoCase):
             overview="invoice serialization", detail="invoice serialization", source="operator")
         result = engine.start("Implement planned features", plan, step=True)
         self.assertEqual(result["status"], "paused")
-        dispatch = next(request for request in backend.requests if request["kind"] == "dispatch")
+        dispatch = next(request for request in backend.requests if request["kind"] == "decide")
         report = read_json(dispatch["job"] / "context-report.json")
         self.assertIn(memory_id, report["memory_ids"])
 

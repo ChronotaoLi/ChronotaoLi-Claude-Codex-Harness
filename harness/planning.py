@@ -1,27 +1,43 @@
-"""Own plan history and pending/stopped replanning; preserve original task obligations."""
+"""Own the single commander decision, plan history and revision publication.
+
+The immutable plan file ``plans/revision-N.json`` is the only authority for a
+revision's execution fields (candidate policy, directive, source, bound HEAD and
+snapshot). The ledger keeps references and digests, plus the directive copy that
+every worker dispatch reads; that copy is compared with the file before use.
+"""
 from __future__ import annotations
 
 import hashlib
 import json
 import sys
-import uuid
 from copy import deepcopy
 from pathlib import Path
 
 from . import git
 from .budgets import work_attempts
 from .context import compact_feedback
-from .contracts import apply_revision, envelope, REPLAN, task_directive, validate, validate_plan
-from .recovery import read_bound_result, snapshot_digest
+from .contracts import apply_revision, DECIDE, validate_decision, validate_plan
+from .recovery import read_bound_result, snapshot_digest, worker_recovery_context
 from .requirements import missing_commands
 from .services import RuntimeService
 from .shared import skills_catalog
-from .util import HarnessError, uid, write_json
+from .util import dump, HarnessError, strict_json_loads, uid, write_json
+
+DECIDE_KEY = "commander:decide:run"
+
+
+def attempt_limit_error(task_id, limit):
+    return HarnessError(f"{task_id} 已达尝试次数上限（runtime.max_attempts 当前值 {limit}）；"
+                        "先看 status 的 convergence 与审阅轮次，必要时提高 runtime.max_attempts 后普通 resume")
+
+
+def directive_mismatch():
+    return HarnessError("待派发指令与已发布计划或候选不符；保留现场，未启动 worker、未扣预算")
 
 
 class Planner(RuntimeService):
     def validate_tasks(self, plan):
-        tasks = validate_plan(plan, self.context.config.data["runtime"]["max_tasks"])
+        tasks = validate_plan(plan)
         available = {item["name"] for item in skills_catalog(self.context.config.asset("skills"))}
         for task in tasks:
             unknown = set(task["skills"]) - available
@@ -52,8 +68,12 @@ class Planner(RuntimeService):
                                + "；在 permissions.worker_commands 追加这些精确 argv 后普通 resume；"
                                  "计划批准不授予命令权限，本检查不消耗 worker 尝试或模型派发额度")
 
+    def decide_returned(self):
+        receipt = self.context.run["commander_receipts"].get(DECIDE_KEY)
+        return bool(receipt and ("artifact_digest" in receipt or Path(receipt["artifact"]).exists()))
+
     def approve_scope_extensions(self, patterns):
-        """Record explicit operator authority for new tasks in a pending replan."""
+        """Record explicit operator authority for new tasks of a later decide request."""
         patterns = list(patterns)
         for pattern in patterns:
             if not isinstance(pattern, str):
@@ -61,11 +81,8 @@ class Planner(RuntimeService):
             git.validate_scope_pattern(pattern)
         if not patterns:
             return
-        pending = self.context.run.get("pending_replan")
-        if (self.context.run["status"] in ("completed", "abandoned")
-                or not ((pending and pending["stage"] in ("pending", "request"))
-                        or self.context.run.get("replan_stopped"))):
-            raise HarnessError("--allow-scope 仅用于尚未校验的待再规划或已停止的再规划")
+        if self.context.run["status"] in ("completed", "abandoned") or self.decide_returned():
+            raise HarnessError("--allow-scope 仅用于未完成的 run，且不能有已返回、尚未处理的指挥决定；先普通 resume")
         approved = self.context.run.get("approved_scope", [])
         added = [pattern for pattern in dict.fromkeys(patterns) if pattern not in approved]
         if not added:
@@ -76,250 +93,327 @@ class Planner(RuntimeService):
         self.context.run["approved_scope"] = combined
         self.context.save()
 
-    def record_plan(self, tasks, reason, trigger=None, *, finish_replan=False):
-        revision = len(self.context.run["plan_history"])
-        previous = {(task["id"], pattern) for record in self.context.run["plan_history"]
-                    for task in record["tasks"] for pattern in task["allowed_paths"]}
+    # ---- the decide request -------------------------------------------------
+    def gated_tasks(self):
+        return {t["id"] for t in self.context.run["tasks"]
+                if self.services.workflow.task_decision_gate(t["id"]) is not None}
+
+    def capacity_check(self, tasks, original_tasks=None):
+        report = self.services.packets.final_context_capacity(tasks, original_tasks)
+        if report["status"] == "required_overflow":
+            fields = "、".join(f"{row['field']} {row['chars']}" for row in report.get("largest_fields", []))
+            raise HarnessError(f"计划的整体审阅必要上下文 {report['required_chars']} 字符超过预算 "
+                               f"{report['budget_chars']}" + (f"；最大的字段：{fields}" if fields else "")
+                               + "；请减少或合并任务")
+        return report
+
+    def check_decision(self, payload, request_packet):
+        """Branch rules against the request's own ready list and the current ledger."""
+        trigger = request_packet.get("trigger", {}) if isinstance(request_packet, dict) else {}
+        return validate_decision(
+            payload, tasks=self.context.run["tasks"], accepted=self.context.run["accepted"],
+            ready=trigger.get("ready", []), gated=self.gated_tasks(),
+            approved_scope=self.context.run.get("approved_scope", []),
+            validate_tasks=self.validate_tasks,
+            capacity=lambda tasks, original: self.capacity_check(tasks, original))
+
+    def operator_answer(self):
+        """The latest continue answer to a commander question, until a decide lands."""
+        dispatches = self.context.run["dispatches"]
+        for request in reversed(self.services.decisions.decision_context()):
+            if request["kind"] != "commander":
+                continue
+            response = request["response"]
+            if not response or response["decision"] != "continue":
+                return None
+            if any(d.get("role") == "commander" and d.get("kind") == "decide"
+                   and d.get("status") in ("completed", "invalid_asked")
+                   for d in dispatches[response["dispatch_count"]:]):
+                return None
+            return {"request_id": request["id"], "task_id": request["task_id"], "question": request["question"],
+                    "decision": response["decision"], "summary": response["summary"],
+                    "artifact": response["artifact"], "artifact_digest": response["artifact_digest"]}
+        return None
+
+    def task_trigger(self, ready):
+        run = self.context.run
+        current = run.get("current_task")
+        ids = [t["id"] for t in ready]
+        return {"kind": "task", "ready": ids, "current_task": current,
+                "feedback": compact_feedback(run.get("feedback")),
+                "recovery": (worker_recovery_context(run, self.context.directory, current)
+                             if current in ids else None)}
+
+    def decide_packet(self, trigger):
+        run = self.context.run
+        packet = {"goal": run["goal"], "trigger": deepcopy(trigger),
+                  "accepted": self.services.packets.accepted_context(),
+                  "attempts": deepcopy(run["attempts"]), "work_attempts": work_attempts(run),
+                  "approved_scope": deepcopy(run.get("approved_scope", [])),
+                  "tool_constraints": self.services.packets.tool_constraints()}
+        if run["tasks"]:
+            packet.update(self.services.packets.plan_context())
+        answer = self.operator_answer()
+        if answer:
+            packet["operator_answer"] = answer
+        return packet
+
+    def decide(self, trigger):
+        """One commander call; its result lands as a directive, a revision or a question."""
+        decision = self.services.dispatch.dispatch("commander", "decide", "run", DECIDE, self.decide_packet(trigger))
+        action = decision.payload["action"]
+        if action == "ask":
+            return self.land_ask(decision)
+        if action == "implement":
+            return self.land_implement(decision)
+        if not self.context.run["tasks"]:
+            return self.land_initial_plan(decision)
+        return self.land_revision(decision)
+
+    # ---- landing: one save each, after every interruptible step ---------------
+    def land_implement(self, decision):
+        run = self.context.run
+        receipt = run["commander_receipts"][DECIDE_KEY]
+        payload = decision.payload
+        run["current_task"] = payload["selected_task"]
+        run["pending_directive"] = {"directive": {"selected_task": payload["selected_task"], "action": "implement",
+                                                  "instruction": payload["instruction"]},
+                                    "snapshot_digest": receipt["snapshot_digest"]}
+        run["commander_receipts"].pop(DECIDE_KEY)
+        self.context.save()
+        return False
+
+    def land_ask(self, decision):
+        receipt = self.context.run["commander_receipts"][DECIDE_KEY]
+        trigger = receipt["request"]["packet"].get("trigger", {})
+        target = trigger.get("current_task") if trigger.get("kind") == "task" and trigger.get("current_task") else "final"
+        source = {"artifact": receipt["artifact"], "artifact_digest": receipt["artifact_digest"],
+                  "dispatch_id": receipt["dispatch_id"]}
+        request = self.services.decisions.register_decision_request(
+            target, "run", "commander", source, decision.payload.get("reason"),
+            consume=(DECIDE_KEY, decision.veto))
+        raise self.services.workflow.decision_required(request)
+
+    @staticmethod
+    def source(receipt):
+        return {"dispatch_id": receipt["dispatch_id"], "artifact": receipt["artifact"],
+                "artifact_digest": receipt["artifact_digest"]}
+
+    def write_plan(self, revision, content):
+        """Immutable plan file: identical bytes are reused, different bytes stop."""
+        artifact = self.context.directory / "plans" / f"revision-{revision}.json"
+        raw = (dump(content) + "\n").encode("utf-8")
+        if artifact.exists() or artifact.is_symlink():
+            if artifact.is_symlink() or artifact.read_bytes() != raw:
+                raise HarnessError(f"计划文件已存在且内容不同；保留现场：{artifact}")
+        else:
+            write_json(artifact, content)
+            if artifact.read_bytes() != raw:
+                raise HarnessError("计划文件写入后内容不符；保留现场")
+        return {"revision": revision, "artifact": str(artifact), "artifact_digest": hashlib.sha256(raw).hexdigest()}
+
+    def read_plan(self, reference, label="计划文件"):
+        try:
+            raw = Path(reference["artifact"]).read_bytes()
+        except OSError as error:
+            raise HarnessError(f"{label}缺失或无法读取；保留现场") from error
+        if hashlib.sha256(raw).hexdigest() != reference["artifact_digest"]:
+            raise HarnessError(f"{label}已改变；保留现场")
+        try:
+            content = strict_json_loads(raw)
+        except (ValueError, UnicodeError, RecursionError) as error:
+            raise HarnessError(f"{label}不是有效 JSON；保留现场") from error
+        if not isinstance(content, dict) or content.get("revision") != reference["revision"]:
+            raise HarnessError(f"{label}与台账引用不符；保留现场")
+        return content
+
+    def land_initial_plan(self, decision):
+        receipt = self.context.run["commander_receipts"][DECIDE_KEY]
+        tasks = self.validate_tasks({"tasks": decision.payload["new_tasks"]})
+        return self.record_plan(tasks, decision.payload["reason"], source=self.source(receipt))
+
+    def record_plan(self, tasks, reason, *, source=None):
+        """Publish the first plan: the file first, then original_tasks, tasks and history together."""
+        run = self.context.run
+        reference = self.write_plan(0, {"revision": 0, "reason": reason, "tasks": tasks, "source": source})
+        run["original_tasks"] = deepcopy(tasks)
+        run["tasks"] = deepcopy(tasks)
+        run["plan_history"] = [reference]
+        run["commander_receipts"].pop(DECIDE_KEY, None)
+        self.context.save()
+        self.warn_broad([], tasks, 0)
+        self.report_command_requirements()
+        return False
+
+    def warn_broad(self, previous_tasks, tasks, revision):
+        # Tasks and their scopes are never removed or changed by a revision, so
+        # the previous plan already holds every earlier version's patterns.
+        previous = {(task["id"], pattern) for task in previous_tasks for pattern in task["allowed_paths"]}
         broad = [{"task_id": task["id"], "pattern": pattern} for task in tasks
                  for pattern in dict.fromkeys(task["allowed_paths"])
                  if (task["id"], pattern) not in previous and git.repository_wide_scope(pattern)]
-        artifact = self.context.directory / "plans" / f"revision-{revision}.json"
-        record = {"revision": revision, "reason": reason, "trigger": trigger,
-                  "tasks": deepcopy(tasks), "artifact": str(artifact)}
-        retained = (self.context.run.get("pending_replan", {}).get("retained_candidate")
-                    if finish_replan else None)
-        if retained:
-            record["retained_candidate"] = deepcopy(retained)
-        write_json(artifact, record)
-        self.context.run["plan_history"].append(record)
-        self.context.run["tasks"] = deepcopy(tasks)
-        if revision == 0:
-            self.context.run["commander_receipts"].pop("commander:plan:planning", None)
-        if finish_replan:
-            self.context.run["current_task"] = retained["task_id"] if retained else None
-            if retained:
-                self.context.run["retained_candidate"] = deepcopy(retained)
-            else:
-                self.context.run.pop("retained_candidate", None)
-            self.context.run.pop("pending_replan", None)
-        self.context.save()
         if broad:
             self.context.event("broad_scope_warning", revision=revision, scopes=broad)
             print("[harness] 警告：任务范围覆盖全仓库，受保护路径仍禁止修改："
                   + json.dumps(broad, ensure_ascii=True), file=sys.stderr, flush=True)
-        self.report_command_requirements()
 
-    def description_revision_task(self, previous, tasks, trigger):
+    def description_revision_task(self, previous, tasks, current):
         """Recognize only an actual description change to the current task."""
-        tid = trigger.get("task_id")
-        if (not tid or tid != self.context.run.get("current_task") or tid in self.context.run["accepted"]
-                or trigger.get("final_review") or len(previous) != len(tasks)):
+        if not current or current in self.context.run["accepted"] or len(previous) != len(tasks):
             return None
         changed = []
         for old, new in zip(previous, tasks):
             if old != new:
-                if (old["id"] != tid or new.get("id") != tid
+                if (old["id"] != current or new.get("id") != current
                         or {k: v for k, v in old.items() if k != "description"}
                         != {k: v for k, v in new.items() if k != "description"}):
                     return None
                 changed.append(new)
         return changed[0] if len(changed) == 1 else None
 
-    def validate_retained_candidate(self, *, pending=None, before=None, worker_task=None):
-        """Keep a saved candidate bound to its task until a fresh worker starts.
+    def retained(self, tasks, directive):
+        current = self.context.run.get("current_task")
+        return bool(self.description_revision_task(self.context.run["tasks"], tasks, current)
+                    and directive["selected_task"] == current)
 
-        In particular, an unexplained change is not permission to archive/reset.
-        """
-        owner = self.context.run if pending is None else pending
-        if pending is not None and pending.get("candidate_policy") != "retain":
-            if pending.get("candidate_policy") != "archive" or "retained_candidate" in pending:
-                raise HarnessError("再规划候选保留策略缺失；保留现场")
-            return
-        guard = owner.get("retained_candidate")
-        if guard is None and pending is None:
-            history = self.context.run.get("plan_history", [])
-            retained = history[-1].get("retained_candidate") if history else None
-            if retained and not any(
-                    entry.get("role") == "worker" and entry.get("task_id") == retained["task_id"]
-                    and entry.get("invoked") is True
-                    and entry.get("retained_candidate_revision") == retained["plan_revision"]
-                    for entry in self.context.run["dispatches"]):
-                raise HarnessError("再规划候选保留依据缺失且未交给 worker；保留现场")
-            return
-        if (not isinstance(guard, dict)
-                or any(not isinstance(guard.get(k), str) or not guard[k] for k in
-                       ("task_id", "head", "snapshot_digest", "artifact", "artifact_digest", "dispatch_id"))
-                or type(guard.get("plan_revision")) is not int):
-            raise HarnessError("再规划候选保留依据缺失或无效；保留现场")
-        revision = guard["plan_revision"]
-        history = self.context.run["plan_history"]
-        if revision < 1 or revision != len(history) - (1 if pending is None else 0):
-            raise HarnessError("再规划候选与计划版本不符；保留现场")
-        previous = history[revision - 1]["tasks"]
-        target = pending if pending is not None else history[revision]
-        if pending is None and target.get("retained_candidate") != guard:
-            raise HarnessError("再规划候选与计划记录不符；保留现场")
-        tasks, trigger = target["tasks"], target["trigger"]
-        task = self.description_revision_task(previous, tasks, trigger)
-        if (not task or task["id"] != guard["task_id"]
-                or self.context.run["tasks"] != (previous if pending is not None else tasks)
-                or self.context.run.get("pending_task") or self.context.run.get("pending_acceptance")
-                or worker_task is not None and worker_task != guard["task_id"]):
-            raise HarnessError("再规划候选与当前任务或说明修订不符；保留现场")
-        entry = next((d for d in self.context.run["dispatches"] if d["id"] == guard["dispatch_id"]), None)
-        if (not entry or (entry["role"], entry["kind"], entry["task_id"]) !=
-                ("commander", "replan", "replanning") or not entry.get("invoked", True)
-                or entry.get("snapshot_digest") != guard["snapshot_digest"]
-                or guard["artifact"] != str(self.context.directory / "dispatches" / entry["id"] / "returned-result.json")):
-            raise HarnessError("再规划候选与原派发不符；保留现场")
-        result, _ = read_bound_result(guard, "再规划候选依据的")
-        validate(result, envelope(REPLAN, "replanning", guard["dispatch_id"]))
-        payload = {key: value for key, value in result.items() if key not in ("task_id", "dispatch_id")}
-        if (result["action"] != "revise" or apply_revision(previous, payload, self.context.run["accepted"],
-                self.context.config.data["runtime"]["max_tasks"],
-                additional_allowed_paths=self.context.run.get("approved_scope", [])) != tasks):
-            raise HarnessError("再规划候选与原计划结果不符；保留现场")
-        candidate = self.context.snapshot() if before is None else before
-        if (guard["head"] != self.context.run["expected_head"] or candidate["head"] != guard["head"]
-                or snapshot_digest(candidate) != guard["snapshot_digest"]):
-            raise HarnessError("再规划保留候选的代码或暂存区已变化；保留现场，禁止归档重置")
-        self.services.tasks.check_task_scope(task)
-
-    def validate_replan_selection(self, trigger):
-        """Recheck the immutable selection that routed this task to replanning."""
-        if trigger.get("coordination"):
-            source = trigger["coordination"]
-            if (not isinstance(source, dict)
-                    or any(not isinstance(source.get(key), str) or not source[key] for key in
-                           ("artifact", "artifact_digest", "dispatch_id", "snapshot_digest", "instruction"))):
-                raise HarnessError("再规划选择来源无效；保留证据")
-            entry = next((d for d in self.context.run["dispatches"] if d["id"] == source.get("dispatch_id")), None)
-            if (not entry or (entry["role"], entry["kind"], entry["task_id"]) !=
-                    ("commander", "dispatch", "dispatching") or not entry.get("invoked", True)
-                    or source.get("artifact") != str(self.context.directory / "dispatches" / entry["id"] / "returned-result.json")
-                    or entry.get("snapshot_digest") != source["snapshot_digest"]
-                    or snapshot_digest(self.context.snapshot()) != source["snapshot_digest"]):
-                raise HarnessError("再规划选择的来源或代码快照已变化；保留原选择和证据")
-            result, _ = read_bound_result(source, "再规划选择")
-            validate(result, envelope(task_directive([trigger["task_id"]]), "dispatching", source["dispatch_id"]))
-            if result.get("action") != "replan" or result["instruction"] != source["instruction"]:
-                raise HarnessError("再规划选择与原指挥结果不符；保留原选择和证据")
-
-    def replan(self, trigger):
-        pending = self.context.run.get("pending_replan")
-        if pending and pending["stage"] == "validated":
-            return self.apply_pending_revision()
-        self.validate_replan_selection(trigger)
-        # Persist the route before any budget guard. Increasing a budget must
-        # continue this request, never rerun the worker that reported the blocker.
-        if not pending:
-            self.context.run["pending_replan"] = {"stage": "pending", "trigger": deepcopy(trigger)}
-            self.context.save()
-        final = trigger.get("final_review")
-        if final:
-            if not git.clean(self.context.worktree, binding=self.context.run["worktree_binding"]):
-                raise HarnessError("整体审阅要求干净的已接受提交；请核对并清理未接受修改")
-            if snapshot_digest(self.context.snapshot()) != final["snapshot_digest"]:
-                raise HarnessError("待再规划的整体审阅快照已变化；请核对检查点")
-        tid = trigger.get("task_id")
-        if tid and self.services.budgets.task_budget_used(tid) >= self.context.config.data["runtime"]["max_attempts"]:
-            raise HarnessError(f"{tid} 已达尝试次数上限；不通过重新命名任务绕过预算")
-        if final and self.context.run["final_attempts"] >= self.context.config.data["runtime"]["max_final_attempts"]:
-            raise HarnessError("整体审阅已达尝试次数上限；不再派发修正任务")
-        if self.context.run["replan_attempts"] >= self.context.config.data["runtime"]["max_replans"]:
-            prefix = ""
-            if final and final["status"] in ("rejected", "invalid_rejected"):
-                prefix = "整体审阅已拒绝同一代码快照；修正计划"
-            elif final and final["status"] == "verification_failed":
-                prefix = "整体验证未通过；可显式使用 resume --reverify 重验，修正计划"
-            raise HarnessError(prefix + "已达重新规划次数上限；可增大 max_replans 后恢复，反馈与证据已保留")
-        attempt = self.context.run["replan_attempts"] + 1
-        self.context.run["pending_replan"] = {"stage": "request", "trigger": deepcopy(trigger), "attempt": attempt,
-            "request_id": self.context.run["pending_replan"].get("request_id") or str(uuid.uuid4())}
+    def land_revision(self, decision):
+        run = self.context.run
+        receipt = run["commander_receipts"][DECIDE_KEY]
+        payload = decision.payload
+        tasks = decision.proposed
+        directive = {"selected_task": payload["selected_task"], "action": "implement",
+                     "instruction": payload["instruction"]}
+        revision = len(run["plan_history"])
+        reference = self.write_plan(revision, {
+            "revision": revision, "reason": payload["reason"], "trigger": receipt["request"]["packet"].get("trigger"),
+            "tasks": tasks, "source": self.source(receipt), "head": run["expected_head"],
+            "snapshot_digest": receipt["snapshot_digest"],
+            "candidate": "retain" if self.retained(tasks, directive) else "archive", "directive": directive})
+        run["pending_revision"] = reference
+        run["commander_receipts"].pop(DECIDE_KEY)
         self.context.save()
-        from .receipts import InvalidReplanStop
-        try:
-            result = self.services.dispatch.dispatch("commander", "replan", "replanning", REPLAN,
-                {"goal": self.context.run["goal"], **self.services.packets.plan_context(),
-                 "accepted": self.services.packets.accepted_context(), "trigger": compact_feedback(trigger),
-                 "approved_scope": deepcopy(self.context.run.get("approved_scope", [])),
-                 "attempts": self.context.run["attempts"], "work_attempts": work_attempts(self.context.run),
-                 "max_tasks": self.context.config.data["runtime"]["max_tasks"],
-                 "remaining_replans": self.context.config.data["runtime"]["max_replans"] - attempt,
-                 "tool_constraints": self.services.packets.tool_constraints(),
-                 "instruction": "Apply the replan contract in role_skill to the bound trigger. Additional scope is limited to approved_scope. No file edits."})
-        except InvalidReplanStop as stop:
-            # A structurally valid stop is a veto even when its other checks fail.
-            self.record_replan_stop(trigger, stop.result, attempt, judged_entry=stop.entry,
-                                    output_error=str(stop), returned_artifact=stop.artifact)
-            self.services.receipts.observe_invalid(stop.entry)
-            raise HarnessError("指挥已停止再规划；输出另有错误，证据已保留，不自动重派") from stop
-        artifact = self.context.directory / "plans" / f"replan-{attempt}.json"
-        write_json(artifact, {"trigger": trigger, "result": result})
-        tasks = apply_revision(self.context.run["tasks"], result, self.context.run["accepted"],
-                               self.context.config.data["runtime"]["max_tasks"],
-                               additional_allowed_paths=self.context.run.get("approved_scope", []))
-        self.validate_tasks({"tasks": tasks})
-        if result["action"] == "stop":
-            self.record_replan_stop(trigger, result, attempt)
-            raise HarnessError(f"指挥停止重新规划：{result['reason']}")
-        self.context.run["pending_replan"].update(stage="validated", tasks=tasks, reason=result["reason"],
-                                          artifact=str(artifact), head=self.context.run["expected_head"], candidate_policy="archive")
-        if self.description_revision_task(self.context.run["tasks"], tasks, trigger):
-            receipt = self.context.run["commander_receipts"]["commander:replan:replanning"]
-            guard = {key: receipt[key] for key in
-                     ("artifact", "artifact_digest", "dispatch_id", "snapshot_digest")}
-            guard.update(task_id=trigger["task_id"], head=self.context.run["expected_head"],
-                         plan_revision=len(self.context.run["plan_history"]))
-            self.context.run["pending_replan"].update(candidate_policy="retain", retained_candidate=guard)
-        self.context.run["replan_attempts"] = attempt
-        self.context.run["commander_receipts"].pop("commander:replan:replanning", None)
-        self.context.save()
-        self.apply_pending_revision()
+        return self.apply_pending_revision()
 
-    def record_replan_stop(self, trigger, result, attempt, *, judged_entry=None, **diagnostics):
-        """Save a stop; an invalid stop's entry verdict is published in the same save.
-
-        The artifact write and the source read come first: nothing in the
-        ledger changes before the last interruptible step.
-        """
-        artifact = self.context.directory / "plans" / f"replan-{attempt}.json"
-        write_json(artifact, {"trigger": trigger, "result": result, **diagnostics})
-        receipt = self.context.run["commander_receipts"].get("commander:replan:replanning")
-        source = ({"dispatch_id": receipt["dispatch_id"],
-                   "source_digest": hashlib.sha256(Path(receipt["artifact"]).read_bytes()).hexdigest()}
-                  if receipt else {})
-        if judged_entry is not None:
-            judged_entry.update(status="invalid_stopped", error=diagnostics["output_error"])
-        self.context.run["replan_attempts"] = attempt
-        self.context.run["replan_stopped"] = {"target": trigger.get("task_id") or "final",
-            "trigger": deepcopy(trigger), "attempt": attempt, "artifact": str(artifact),
-            "reason": result["reason"], **diagnostics, **source}
-        self.context.run.pop("pending_replan", None)
-        self.context.run["commander_receipts"].pop("commander:replan:replanning", None)
-        self.context.save()
-        self.services.workflow.synchronize_decision_requests()
+    # ---- publication ---------------------------------------------------------
+    def check_revision_file(self, pending):
+        """Before any archive, reset or publish: the file, its source and a replay agree."""
+        run = self.context.run
+        if pending.get("revision") != len(run["plan_history"]):
+            raise HarnessError("待应用修订与计划版本不符；保留现场")
+        content = self.read_plan(pending, "待应用的计划文件")
+        source = content.get("source")
+        if not isinstance(source, dict) or set(source) != {"dispatch_id", "artifact", "artifact_digest"}:
+            raise HarnessError("待应用修订的来源无效；保留现场")
+        entries = [d for d in run["dispatches"] if d.get("id") == source["dispatch_id"]]
+        if (len(entries) != 1 or (entries[0].get("role"), entries[0].get("kind"), entries[0].get("task_id"))
+                != ("commander", "decide", "run") or entries[0].get("invoked") is not True
+                or source["artifact"] != str(self.context.directory / "dispatches" / source["dispatch_id"] / "returned-result.json")):
+            raise HarnessError("待应用修订的来源派发不符；保留现场")
+        result, _ = read_bound_result(source, "待应用修订的")
+        if (not isinstance(result, dict) or result.get("task_id") != "run"
+                or result.get("dispatch_id") != source["dispatch_id"] or result.get("action") != "revise"):
+            raise HarnessError("待应用修订的原件不是这次修订；保留现场")
+        tasks = apply_revision(run["tasks"], result, run["accepted"],
+                               additional_allowed_paths=run.get("approved_scope", []), scope_violations=[])
+        directive = {"selected_task": result.get("selected_task"), "action": "implement",
+                     "instruction": result.get("instruction")}
+        if (content.get("tasks") != tasks or content.get("directive") != directive
+                or content.get("candidate") != ("retain" if self.retained(tasks, directive) else "archive")):
+            raise HarnessError("待应用的计划文件与原件和当前台账不符；保留现场")
+        head = git.head(self.context.worktree, binding=run["worktree_binding"])
+        if content.get("head") != run["expected_head"] or head != run["expected_head"]:
+            raise HarnessError("应用修订前 HEAD 与已校验计划不符；保留现场")
+        return content
 
     def apply_pending_revision(self):
-        pending = self.context.run["pending_replan"]
-        if self.context.run["expected_head"] != pending["head"] or git.head(self.context.worktree, binding=self.context.run["worktree_binding"]) != pending["head"]:
-            raise HarnessError("应用再规划前 HEAD 与已校验计划不符；保留现场")
-        self.services.packets.preflight_final_context(pending["tasks"], self.context.run["original_tasks"])
+        run = self.context.run
+        pending = run["pending_revision"]
+        content = self.check_revision_file(pending)
         self.context.ensure_exited()
-        self.validate_retained_candidate()
-        self.validate_retained_candidate(pending=pending)
-        retain = pending.get("candidate_policy") == "retain"
-        # A new prerequisite may own another scope. Never carry the blocked task's edits into it.
-        if not retain and not git.clean(self.context.worktree, binding=self.context.run["worktree_binding"]):
-            folder = self.context.directory / "recovery" / f"replan-{pending['attempt']}"
-            if folder.exists():
-                folder = folder.with_name(folder.name + "-" + uid("retry"))
-            archive = git.archive_and_reset(self.context.worktree, self.context.run["expected_head"],
-                                            folder, self.context.state / "worktrees", binding=self.context.run["worktree_binding"])
-            self.context.event("replan_edits_archived", task_id=pending["trigger"].get("task_id"), artifact=archive)
-        self.context.run["feedback"] = {"replan": pending["artifact"], "trigger": compact_feedback(pending["trigger"])}
-        if not retain:
-            self.context.run.pop("worker_recovery", None)
-        self.record_plan(pending["tasks"], pending["reason"], pending["trigger"], finish_replan=True)
+        directive = content["directive"]
+        task = next(t for t in content["tasks"] if t["id"] == directive["selected_task"])
+        archive = None
+        if content["candidate"] == "retain":
+            if snapshot_digest(self.context.snapshot()) != content["snapshot_digest"]:
+                raise HarnessError("修订保留候选的代码或暂存区已变化；保留现场，禁止归档重置")
+            self.services.tasks.check_task_scope(task)
+            bound = content["snapshot_digest"]
+        else:
+            # A new prerequisite may own another scope. Never carry the blocked
+            # task's edits into it: copy them out, then reset.
+            if not git.clean(self.context.worktree, binding=run["worktree_binding"]):
+                folder = self.context.directory / "recovery" / f"revision-{pending['revision']}"
+                if folder.exists():
+                    folder = folder.with_name(folder.name + "-" + uid("retry"))
+                archive = git.archive_and_reset(self.context.worktree, run["expected_head"],
+                                                folder, self.context.state / "worktrees", binding=run["worktree_binding"])
+            bound = snapshot_digest(self.context.snapshot())
+        previous = run["tasks"]
+        run["plan_history"].append({key: pending[key] for key in ("revision", "artifact", "artifact_digest")})
+        run["tasks"] = deepcopy(content["tasks"])
+        run["current_task"] = directive["selected_task"]
+        run["pending_directive"] = {"directive": deepcopy(directive), "snapshot_digest": bound,
+                                    "revision": pending["revision"]}
+        run["feedback"] = {"revision": pending["revision"], "plan_artifact": pending["artifact"],
+                           "trigger": deepcopy(content.get("trigger"))}
+        if content["candidate"] != "retain":
+            run.pop("worker_recovery", None)
+        run.pop("pending_revision")
+        self.context.save()
+        if archive is not None:
+            self.context.event("replan_edits_archived", task_id=directive["selected_task"], artifact=archive)
+        self.warn_broad(previous, content["tasks"], pending["revision"])
+        self.report_command_requirements()
         self.context.checkpoint()
-        self.context.event("plan_revised", revision=len(self.context.run["plan_history"]) - 1)
+        self.context.event("plan_revised", revision=pending["revision"])
+        return False
+
+    # ---- the saved directive before a worker starts ----------------------------
+    def check_directive(self, task_id, snapshot, *, prepared=False):
+        """Bind the saved directive to its task, its published plan and its candidate.
+
+        Called before ``pre_agent`` with the current snapshot, and again after
+        local preparation (``prepared``) with the snapshot the invocation binds,
+        before the directive or any budget is consumed.
+        """
+        run = self.context.run
+        saved = run.get("pending_directive")
+        if not saved:
+            return
+        directive = saved["directive"]
+        if directive.get("selected_task") != task_id or run.get("current_task") != task_id:
+            raise directive_mismatch()
+        retain = False
+        if "revision" in saved:
+            history = run["plan_history"]
+            if saved["revision"] != len(history) - 1 or saved["revision"] < 1:
+                raise directive_mismatch()
+            content = self.read_plan(history[saved["revision"]])
+            if content.get("directive") != directive or content.get("tasks") != run["tasks"]:
+                raise directive_mismatch()
+            retain = content.get("candidate") == "retain"
+            if retain and content.get("snapshot_digest") != saved["snapshot_digest"]:
+                raise directive_mismatch()
+        if not prepared:
+            if snapshot_digest(snapshot) != saved["snapshot_digest"]:
+                raise HarnessError("待派发指令的代码快照已变化；请核对并恢复原快照")
+        elif retain and snapshot_digest(snapshot) != saved["snapshot_digest"]:
+            # A retained candidate is the one the revision bound; a preparation
+            # hook must not replace it. Ordinary directives keep current behavior.
+            raise directive_mismatch()
+
+    def published_directive_missing(self):
+        """A published revision whose directive vanished before any model call."""
+        run = self.context.run
+        feedback = run.get("feedback")
+        history = run["plan_history"]
+        if (run.get("pending_directive") or not isinstance(feedback, dict)
+                or feedback.get("revision") != len(history) - 1 or len(history) < 2):
+            return False
+        content = self.read_plan(history[-1])
+        source = (content.get("source") or {}).get("dispatch_id")
+        position = next((i for i, d in enumerate(run["dispatches"]) if d.get("id") == source), None)
+        if position is None:
+            return True
+        return not any(d.get("role") in ("commander", "worker", "reviewer") and d.get("invoked") is True
+                       for d in run["dispatches"][position + 1:])

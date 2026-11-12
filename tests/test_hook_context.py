@@ -7,7 +7,7 @@ import tempfile
 from harness.shared import HookError, Hooks
 from harness.util import read_json, write_json
 from test_harness import RepoCase
-from test_runtime_changes import ScriptedBackend
+from test_runtime_changes import ScriptedBackend, trigger_kind
 
 
 HOOK_SCRIPT = """
@@ -90,8 +90,8 @@ class HookContextTests(RepoCase):
         write_json(self.block, {'event': 'pre_accept', 'task_id': 'greet'})
 
         def two_tasks(backend, kwargs, packet, result):
-            if kwargs['kind'] == 'plan':
-                result['tasks'].append({'id': 'document', 'title': 'Document greet',
+            if trigger_kind(kwargs, packet) == 'plan':
+                result['new_tasks'].append({'id': 'document', 'title': 'Document greet',
                     'description': 'Document greet in usage.txt', 'depends_on': ['greet'],
                     'allowed_paths': ['usage.txt'], 'acceptance': ['usage.txt explains greet'], 'skills': []})
             if kwargs['role'] == 'worker' and kwargs['task']['id'] == 'document':

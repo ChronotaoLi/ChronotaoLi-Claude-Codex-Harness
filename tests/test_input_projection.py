@@ -18,13 +18,13 @@ class InputProjectionTests(unittest.TestCase):
         self.root = Path(tmp.name).resolve()
 
     def test_exact_accounting_includes_parent_overhead_without_values(self):
-        value = {'role': 'commander', 'kind': 'replan', 'task_id': 't',
+        value = {'role': 'commander', 'kind': 'decide', 'task_id': 'run',
                  'packet': {'goal': 'secret\\"雪', 'commands': [['private-argv']]}}
         with self.assertRaises(ContextCapacityError) as caught:
             compose(value, [], 2)
         report = caught.exception.report
         self.assertEqual(report['required_chars'], len(prompt_json(value)))
-        self.assertEqual(report['kind'], 'replan')
+        self.assertEqual(report['kind'], 'decide')
         self.assertNotIn('secret', json.dumps(report))
         self.assertNotIn('private-argv', json.dumps(report))
         rows = {tuple(r['path']): r for r in report['field_sizes']}

@@ -9,7 +9,7 @@ from harness.context import compact_plan, prompt_json
 from harness.contracts import apply_revision
 from harness.util import HarnessError, dump, read_json
 from test_harness import RepoCase, ROOT
-from test_runtime_changes import ScriptedBackend, finding
+from test_runtime_changes import ScriptedBackend, finding, revised, trigger_kind
 
 
 def reconstruct(packet):
@@ -189,18 +189,21 @@ class FinalContextCapacityTests(RepoCase):
         self.assertEqual(evidence["review"]["summary"], result["accepted"]["greet"]["summary"])
         self.assertNotIn(str(engine.directory / "state.json"), dump(packet["accepted"]))
 
-    def test_final_review_after_replan_keeps_original_obligations_only_once(self):
+    def test_final_review_after_revision_keeps_original_obligations_only_once(self):
+        # The decide prompt carries the 13.5K original plan (34.5K here); the final
+        # prompt (about 29.4K) must fit and the duplicated plan (about 43K) must not.
+        self.config.data["runtime"]["context_chars"] = 36000
         final_inputs = []
         def corrective(backend, kwargs, packet, result):
             if kwargs["kind"] == "final_review":
                 final_inputs.append(json.loads(kwargs["prompt"].split("\n\nREFERENCE MEMORY")[0]))
             if kwargs["kind"] == "final_review" and sum(c["kind"] == "final_review" for c in backend.calls) == 1:
                 result.update(verdict="request_changes", findings=[finding()])
-            elif kwargs["kind"] == "replan":
+            elif trigger_kind(kwargs, packet) == "final":
                 task = copy.deepcopy(packet["original_tasks"][0])
                 task.update(id="correct", title="Correct final issue", description="Resolve the final finding",
                             depends_on=["greet"])
-                result.update(action="revise", reason="Resolve finding", new_tasks=[task], updates=[])
+                revised(result, packet, "Resolve finding", new_tasks=[task])
             elif kwargs["role"] == "worker" and kwargs["task"]["id"] == "correct":
                 with (kwargs["cwd"] / "hello.py").open("a") as file:
                     file.write("# corrected integration\n")

@@ -44,7 +44,7 @@ class EnvironmentProjectionTests(unittest.TestCase):
                 artifact=str(path), artifact_digest=hashlib.sha256(path.read_bytes()).hexdigest()))
         return row
 
-    def test_task_ready_replan_and_final_scope_preserve_contract(self):
+    def test_task_ready_decide_and_final_scope_preserve_contract(self):
         self.add('a', 'Only a remains read only')
         self.add('b', 'Dependency ready')
         self.add('a', 'New a facts')
@@ -52,10 +52,11 @@ class EnvironmentProjectionTests(unittest.TestCase):
                 ({'task_id': 'a', 'role': 'worker'}, {}, ['a']),
                 ({'task_id': 'b', 'role': 'reviewer'}, {}, ['b']),
                 ({}, {'task': {'id': 'a'}}, ['a']),
-                ({'kind': 'dispatch'}, {'ready': [{'id': 'b'}]}, ['b']),
-                ({'kind': 'replan'}, {'trigger': {'task_id': 'a'}}, ['a']),
+                ({'kind': 'decide'}, {'trigger': {'kind': 'task', 'ready': ['b']}}, ['b']),
+                ({'kind': 'decide'}, {'trigger': {'kind': 'task', 'ready': ['a']}}, ['a']),
                 ({'kind': 'final_review'}, {}, ['b', 'a']),
-                ({'kind': 'replan'}, {'trigger': {'task_id': 'final'}}, ['b', 'a'])]:
+                ({'kind': 'decide'}, {'trigger': {'kind': 'final'}}, ['b', 'a']),
+                ({'kind': 'decide'}, {'trigger': {'kind': 'plan'}}, ['b', 'a'])]:
             packet.update(acceptance=['must pass'], tool_constraints={'permissions': []}, blockers=['unresolved'])
             result = self.env.environment_packet(packet, **kwargs)
             self.assertEqual([r['task_id'] for r in result['environment_updates']], expected)

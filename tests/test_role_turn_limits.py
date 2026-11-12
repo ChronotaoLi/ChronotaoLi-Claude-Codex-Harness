@@ -127,7 +127,7 @@ class BudgetFixtureBackend(FixtureCLIBackend):
         if role != "commander":
             return super().command(role, model, cwd, job, schema, run_path)
         result = {key: schema["properties"][key]["enum"][0] for key in ("task_id", "dispatch_id")}
-        result.update(selected_task="greet", action="implement", instruction="Finish the original task")
+        result.update(selected_task="greet", action="implement", instruction="Finish the original task", reason="", new_tasks=[], updates=[])
         return [sys.executable, "-c", FIXTURE_PROCESS, role, model["cli"], str(job), "{}", json.dumps(result)]
 
 

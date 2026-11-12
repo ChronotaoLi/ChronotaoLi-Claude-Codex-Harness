@@ -12,7 +12,7 @@ from harness.contracts import (DETAIL, REVIEW, WORK, envelope, output_constraint
 from harness.context import WORKER_CONTEXT_CHARS
 from harness.util import dump, HarnessError, read_json, write_json
 from test_harness import RepoCase, ROOT
-from test_runtime_changes import ScriptedBackend, validate_work_contract
+from test_runtime_changes import ScriptedBackend, validate_work_contract, revised, trigger_kind
 
 
 def work(**fields):
@@ -90,11 +90,11 @@ class WorkerSummaryLifecycleTests(RepoCase):
                     if kwargs["role"] == "worker" and engine.run["attempts"]["greet"] == 1:
                         result.update(status="blocked", blocker_kind="task", summary=summary,
                                       blockers=["A prerequisite is missing"])
-                    elif kwargs["kind"] == "replan":
-                        seen.append(packet["trigger"]["worker"])
-                        result.update(action="revise", reason="Clarify prerequisite", new_tasks=[],
-                                      updates=[{"id": "greet", "description": "Implement greet with the prerequisite",
-                                                "add_depends_on": []}])
+                    elif trigger_kind(kwargs, packet) == "task" and packet["trigger"]["feedback"]:
+                        seen.append(packet["trigger"]["feedback"]["worker"])
+                        revised(result, packet, "Clarify prerequisite",
+                                updates=[{"id": "greet", "description": "Implement greet with the prerequisite",
+                                          "add_depends_on": []}])
                 backend = ScriptedBackend(blocked_first)
                 engine = self.engine(backend)
                 result = engine.start("Implement greet", self.plan())

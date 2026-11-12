@@ -186,15 +186,11 @@ class EnvironmentRecovery(RuntimeService):
         if task_id is None:
             task_id = packet.get("task_id") or (task.get("id") if isinstance(task, dict) else None)
         if kind == "final_review" or task_id == "final" or (
-                kind == "replan" and isinstance(trigger, dict) and trigger.get("task_id") == "final"):
+                kind == "decide" and (not isinstance(trigger, dict) or trigger.get("kind") != "task")):
             relevant = {record["task_id"] for record in records}
-        elif kind == "dispatch" or "ready" in packet:
-            relevant = {item["id"] for item in packet.get("ready", [])}
-        elif kind == "replan" and isinstance(trigger, dict) and trigger.get("task_id"):
-            relevant = {trigger["task_id"]}
-        elif kind == "replan" and not task_id:
-            relevant = {record["task_id"] for record in records}
-        elif task_id and task_id not in ("final", "dispatching", "replanning"):
+        elif kind == "decide":
+            relevant = set(trigger.get("ready", []))
+        elif task_id and task_id not in ("final", "run"):
             relevant = {task_id}
         elif isinstance(trigger, dict) and trigger.get("task_id"):
             relevant = {trigger["task_id"]}
@@ -268,7 +264,7 @@ class EnvironmentRecovery(RuntimeService):
         if (self.context.run.get("current_task") != task_id
                 or task_id in self.context.run["accepted"] or feedback.get("task_id") != task_id):
             raise HarnessError("--environment-update 仅用于当前未接受任务的环境阻断")
-        busy = (*RECOVERY_BUSY_KEYS, "replan_stopped")
+        busy = RECOVERY_BUSY_KEYS
         if any(self.context.run.get(key) for key in busy):
             raise HarnessError("已有待处理阶段、指令、receipt 或修正；不能用环境更新替换原请求")
         matches = [i for i, d in enumerate(self.context.run["dispatches"])

@@ -5,7 +5,7 @@ import json
 from harness.util import HarnessError, read_json, write_json
 from test_checkpoint_lifecycle import digest
 from test_harness import ROOT, RepoCase
-from test_runtime_changes import ScriptedBackend
+from test_runtime_changes import ScriptedBackend, decided, trigger_kind
 
 
 class BlockedHandoffDiscardTests(RepoCase):
@@ -21,6 +21,8 @@ class BlockedHandoffDiscardTests(RepoCase):
                                   'inputs': [{'path': 'hello.py', 'sha256': digest(kwargs['cwd'] / 'hello.py')}],
                                   'evidence': [{'path': str(evidence), 'sha256': digest(evidence)}],
                                   'freshness': 'content', 'max_age_seconds': 0}])
+            if trigger_kind(kwargs, packet) == 'task' and 'output_error' in (packet['trigger']['feedback'] or {}):
+                decided(result, 'ask', reason='The blocked output could not be read; how should greet proceed?')
         backend = ScriptedBackend(first_block)
         engine = self.engine(backend)
         with self.assertRaises(HarnessError):
@@ -91,7 +93,7 @@ class BlockedHandoffDiscardTests(RepoCase):
         self.assertEqual(engine.run['accepted'], {})
 
     def test_invalid_structure_or_format_still_rejects_without_exemption(self):
-        # A structurally invalid blocked output goes to replanning as a task
+        # A structurally invalid blocked output goes to the commander as a task
         # blocker; a readable environment blocker with a bounds error keeps its
         # route. Neither registers checkpoints or earns an exemption.
         for requests, route, calls in (

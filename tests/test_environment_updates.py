@@ -10,7 +10,7 @@ from harness.cli import status_summary
 from harness.util import HarnessError, read_json, write_json
 from harness.versions import RUN_SCHEMA_VERSION
 from test_harness import ROOT, RepoCase
-from test_runtime_changes import ScriptedBackend
+from test_runtime_changes import ScriptedBackend, revised, trigger_kind
 
 
 class EnvironmentUpdateTests(RepoCase):
@@ -55,27 +55,28 @@ class EnvironmentUpdateTests(RepoCase):
         def add_ready_work(backend, kwargs, packet, result):
             if kwargs['role'] == 'worker' and sum(c['role'] == 'worker' for c in backend.calls) == 2:
                 result.update(status='blocked', blocker_kind='task', blockers=['Additional work is required'])
-            elif kwargs['kind'] == 'replan':
+            elif trigger_kind(kwargs, packet) == 'task' and (packet['trigger']['feedback'] or {}).get('worker', {}).get('blocker_kind') == 'task':
                 task = copy.deepcopy(packet['original_tasks'][0])
                 task.update(id='other', title='Additional independent work')
-                result.update(action='revise', reason='Add independent work', new_tasks=[task], updates=[])
-            elif kwargs['kind'] == 'dispatch' and len(packet['ready']) > 1:
-                result.update(selected_task=selected_task, instruction='Use this saved selection after recovery')
+                revised(result, packet, 'Add independent work', new_tasks=[task], selected=selected_task,
+                        instruction='Use this saved selection after recovery')
 
         backend.change = add_ready_work
         resumed = self.engine(backend)
         task_attempt = resumed.services.tasks.task_attempt
 
-        def interrupt_after_replan(ready):
-            if len(ready) > 1:
+        def interrupt_after_revision(task, directive, saved):
+            if len(resumed.run['tasks']) > 1:
                 raise KeyboardInterrupt()
-            return task_attempt(ready)
+            return task_attempt(task, directive, saved)
 
-        with patch.object(resumed.services.tasks, 'task_attempt', side_effect=interrupt_after_replan):
+        with patch.object(resumed.services.tasks, 'task_attempt', side_effect=interrupt_after_revision):
             with self.assertRaises(KeyboardInterrupt):
                 resumed.resume(engine.run['id'], environment_update=path)
         saved = self.saved(engine)
-        self.assertIsNone(saved['current_task'])
+        # The revision published its selection with the plan.
+        self.assertEqual(saved['current_task'], selected_task)
+        self.assertEqual(saved['pending_directive']['directive']['selected_task'], selected_task)
         self.assertEqual([task['id'] for task in saved['tasks']], ['greet', 'other'])
         self.assertTrue(all(not task['depends_on'] for task in saved['tasks']))
         marker.unlink()
@@ -99,10 +100,9 @@ class EnvironmentUpdateTests(RepoCase):
         with self.assertRaises(HarnessError):
             self.engine(backend).resume(engine.run['id'], step=True)
         saved = self.saved(engine)
-        self.assertEqual([(call['role'], call['kind']) for call in backend.calls[calls:]], [('commander', 'dispatch')])
-        for key in ('attempts',):
+        self.assertEqual(backend.calls[calls:], [])
+        for key in ('attempts', 'agent_dispatches'):
             self.assertEqual(saved[key], before[key])
-        self.assertEqual(saved['agent_dispatches'], before['agent_dispatches'] + 1)
         self.assertFalse(saved['environment_checks'][-1]['passed'])
         directive = saved['pending_directive']
         self.assertEqual(directive['directive']['selected_task'], 'greet')
@@ -300,7 +300,7 @@ class EnvironmentUpdateTests(RepoCase):
 
     def test_conflicting_recovery_options_reject_before_dispatch(self):
         engine, backend, path, value = self.blocked()
-        for options in ({'reverify': True}, {'retry_stopped': 'greet'},
+        for options in ({'reverify': True},
                         {'allow_scope': ['extra.py']}):
             with self.subTest(options=options), self.assertRaises(HarnessError):
                 self.engine(backend).resume(engine.run['id'], environment_update=path, **options)

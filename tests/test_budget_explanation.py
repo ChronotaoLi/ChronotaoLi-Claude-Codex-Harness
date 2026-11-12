@@ -10,13 +10,13 @@ class BudgetExplanationTests(unittest.TestCase):
                     'status': 'completed' if i < 3 else 'failed',
                     'diagnostics': {'failure_class': 'provider_reported'}} for i in range(5)]
         workers[-1]['format_correction'] = True  # a field older ledgers wrote; 17 ignores it
-        invalid = [{'id': 'c1', 'role': 'commander', 'task_id': 'dispatching', 'invoked': True, 'status': 'invalid'},
+        invalid = [{'id': 'c1', 'role': 'commander', 'kind': 'decide', 'task_id': 'run', 'invoked': True, 'status': 'invalid'},
                    {'id': 'r1', 'role': 'reviewer', 'task_id': 'x', 'invoked': True, 'status': 'invalid'}]
         records = [{'artifact': 'review'+str(i), 'worker_source': {'dispatch_id': 'd'+str(i),
                     'artifact_digest': 'a'*64}} for i in range(3)]
         run = {'id': 'run_a', 'dispatches': workers + [workers[-1]] + invalid,
                'review_history': {'x': records + [records[-1]]}, 'schema_version': RUN_SCHEMA_VERSION,
-               'agent_dispatches': 8, 'final_attempts': 0, 'replan_attempts': 0,
+               'agent_dispatches': 8,
                'config_snapshot': {'runtime': {'max_attempts': 5, 'max_agent_dispatches': 20}}}
         original = copy.deepcopy(run)
         report = budget_explanation(run, {'x': 5})
@@ -32,7 +32,7 @@ class BudgetExplanationTests(unittest.TestCase):
         self.assertEqual(report['limits']['agent_dispatches'], {'used': 8, 'limit': 20, 'remaining': 12})
         self.assertEqual(run, original)
         # A ledger 16 still shows the format corrections it recorded, as saved.
-        historical = {**copy.deepcopy(run), 'schema_version': 16}
+        historical = {**copy.deepcopy(run), 'schema_version': 16, 'final_attempts': 0, 'replan_attempts': 0}
         dimensions = budget_explanation(historical, {'x': 5})['dimensions']
         self.assertEqual(dimensions['worker_format_corrections'], 1)
         self.assertNotIn('invalid_outputs', dimensions)

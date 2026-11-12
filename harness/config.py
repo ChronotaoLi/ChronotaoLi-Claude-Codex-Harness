@@ -10,9 +10,8 @@ from .util import HarnessError
 DEFAULTS = {
     "runtime": {
         "agent_timeout_seconds": 3600, "verify_timeout_seconds": 300,
-        "max_attempts": 3, "max_final_attempts": 3, "max_replans": 2,
-        "max_agent_dispatches": 200,
-        "max_tasks": 20, "context_chars": 100000, "claude_max_turns": 50,
+        "max_attempts": 5, "max_agent_dispatches": 200,
+        "context_chars": 100000, "claude_max_turns": 50,
         "claude_max_turns_by_role": {},
     },
     "permissions": {"worker_commands": []},
@@ -21,8 +20,7 @@ DEFAULTS = {
 }
 RESUME_INCREASES = (
     "agent_timeout_seconds", "verify_timeout_seconds", "context_chars",
-    "claude_max_turns", "max_attempts", "max_final_attempts",
-    "max_replans", "max_agent_dispatches", "max_tasks",
+    "claude_max_turns", "max_attempts", "max_agent_dispatches",
 )
 # Deleted keys stay unknown; the error names what to delete and what replaces it.
 # Apart from read-only checks of historical ledgers, this hint is the only
@@ -32,6 +30,9 @@ REMOVED_KEYS = {
                                   "整个 run 的模型调用上限是 runtime.max_agent_dispatches",
     "runtime.claude_output_mode": "请删除 runtime.claude_output_mode：Claude 只使用 JSON 输出（原 legacy_json），"
                                   "流式元数据模式 stream_metadata_v1 已删除",
+    "runtime.max_replans": "请删除 runtime.max_replans：修订没有单独额度，每次指挥决定都计入 runtime.max_agent_dispatches",
+    "runtime.max_final_attempts": "请删除 runtime.max_final_attempts：整体尝试没有单独额度，模型调用由 runtime.max_agent_dispatches 封顶",
+    "runtime.max_tasks": "请删除 runtime.max_tasks：计划大小由整体审阅的必要上下文（runtime.context_chars）约束",
 }
 DISPATCH_ROLES = ("commander", "worker", "reviewer")
 
@@ -132,9 +133,7 @@ class Config:
             if key == "claude_max_turns_by_role":
                 continue
             value = data["runtime"][key]
-            if type(value) is not int or value < 0 or (key != "max_replans" and value == 0):
-                if key == "max_replans":
-                    raise HarnessError(f"runtime.{key} 必须为非负整数")
+            if type(value) is not int or value <= 0:
                 raise HarnessError(f"runtime.{key} 必须为正整数")
         limits = data["runtime"].get("claude_max_turns_by_role", {})
         if not isinstance(limits, dict):
@@ -199,7 +198,7 @@ class Config:
         if added:
             changes["worker_commands"] = {"old": old_commands, "new": new_commands, "added": added}
         if previous != current:
-            raise HarnessError("配置已改变：恢复只允许增大超时、上下文、轮数、任务数和尝试预算或追加精确 worker 命令；其他配置必须保持一致")
+            raise HarnessError("配置已改变：恢复只允许增大超时、上下文、轮数、尝试与派发预算或追加精确 worker 命令；其他配置必须保持一致")
         return changes
 
     @staticmethod

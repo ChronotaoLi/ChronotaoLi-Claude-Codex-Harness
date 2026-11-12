@@ -22,13 +22,10 @@ effort = "high"
 agent_timeout_seconds = 3600
 verify_timeout_seconds = 300
 # 每个任务的 worker 工作尝试上限；已校验的环境或操作者阻断不计入。
-max_attempts = 3
-max_final_attempts = 3
-# 整个 run 的模型调用总数（指挥、worker、审阅、格式修正都计入），通常远多于任务数。
+max_attempts = 5
+# 整个 run 的模型调用总数（指挥决定、worker、审阅与无效输出的重做都计入），通常远多于任务数。
+# 修订次数、整体尝试次数和计划任务数没有单独的上限；计划大小由整体审阅的必要上下文约束。
 max_agent_dispatches = 200
-max_replans = 2
-# 计划中的任务数上限，不是调用数。
-max_tasks = 20
 context_chars = 100000
 claude_max_turns = 50
 # 单次 Claude 派发的轮数保护，不是任务工具总次数；未列角色沿用上面的值。

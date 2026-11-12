@@ -9,7 +9,7 @@ from os import PathLike
 from pathlib import Path
 import time
 
-from .contracts import REPLAN, envelope, validate_structure, validate_work_core
+from .contracts import validate_work_core
 from .worker_receipts import delivered_work_contract
 from .recovery import RECOVERY_BUSY_KEYS, read_bound_result, snapshot_digest
 from .util import HarnessError, dump, write_json
@@ -36,14 +36,16 @@ def decision_question(question, kind):
     try:
         _text(question, 'question', limit)
     except HarnessError:
-        if not isinstance(question, str) or kind not in ('worker', 'handoff'):
+        if kind not in ('worker', 'handoff', 'commander') or (kind != 'commander' and not isinstance(question, str)):
             raise
         # A non-BMP character expands to twelve ASCII bytes in JSON. Keeping
         # at most 200 source characters leaves room within the 4000-char gate.
-        excerpt = json.dumps(question[:200], ensure_ascii=True)
+        # A commander question may not even be a string: excerpt its JSON.
+        excerpt = (json.dumps(question[:200], ensure_ascii=True) if isinstance(question, str)
+                   else json.dumps(question, ensure_ascii=True)[:200])
         return (
             "Operator decision required. The original question is blank, contains NUL, "
-            f"or exceeds {limit} characters. Read the bound original worker result "
+            f"or exceeds {limit} characters. Read the bound original result "
             "before deciding whether this task may continue. This notice does not "
             "approve any operation or change tool permissions. "
             f"Original question excerpt (JSON-escaped, at most 200 characters): {excerpt}"
@@ -123,12 +125,14 @@ class DecisionRecovery(RuntimeService):
                         pending.extend(tasks[ident]['depends_on'])
                 if request['source_task_id'] not in seen:
                     raise HarnessError('handoff target must depend on source task')
-        elif request['kind'] == 'replan_stop':
-            if entry.get('role') != 'commander' or entry.get('kind') != 'replan' or entry.get('task_id') != request['source_task_id']:
-                raise HarnessError('decision replan source identity invalid')
-            validate_structure(result, envelope(REPLAN, request['source_task_id'], dispatch_id))
-            if result['action'] != 'stop' or result['reason'] != request['question']:
-                raise HarnessError('decision source is not commander stop')
+        elif request['kind'] == 'commander':
+            # An ask is a veto read from its identity and action alone.
+            if entry.get('role') != 'commander' or entry.get('kind') != 'decide' or entry.get('task_id') != request['source_task_id']:
+                raise HarnessError('decision commander source identity invalid')
+            if (not isinstance(result, dict) or result.get('task_id') != request['source_task_id']
+                    or result.get('dispatch_id') != dispatch_id or result.get('action') != 'ask'
+                    or decision_question(result.get('reason'), 'commander') != request['question']):
+                raise HarnessError('decision source is not commander ask')
         else:
             raise HarnessError('unknown decision request kind')
         return result
@@ -154,7 +158,12 @@ class DecisionRecovery(RuntimeService):
         self.context.event(category, **{k: v for k, v in row.items() if k != 'run_id'})
         return row
 
-    def register_decision_request(self, task_id, source_task_id, kind, source, question, request_key=''):
+    def register_decision_request(self, task_id, source_task_id, kind, source, question, request_key='', consume=None):
+        """Register one request; ``consume=(key, veto)`` lands a commander ask in the same save.
+
+        Every check and the request file come first; the row, the receipt
+        removal and the dispatch entry's verdict are published together.
+        """
         self.decision_context()
         question = decision_question(question, kind)
         _text(question, 'question', 80019 if kind == 'worker' else 4000)
@@ -169,6 +178,8 @@ class DecisionRecovery(RuntimeService):
         record['id'] = self._decision_identity(record)
         for old in self.context.run.get('decision_requests', []):
             if old['id'] == record['id']:
+                if consume is not None and consume[0] in self.context.run['commander_receipts']:
+                    raise HarnessError('commander question registered but its receipt remains; preserve evidence')
                 return deepcopy(old)
         if task_id in self.context.run['accepted']:
             raise HarnessError('decision target already accepted')
@@ -178,12 +189,7 @@ class DecisionRecovery(RuntimeService):
                     or feedback.get('worker_artifact') != source['artifact']
                     or feedback.get('worker_artifact_digest') != source['artifact_digest']):
                 raise HarnessError('operator request does not match current worker feedback')
-        if kind == 'replan_stop':
-            stopped = self.context.run.get('replan_stopped') or {}
-            if (stopped.get('target') != task_id or stopped.get('reason') != question
-                    or stopped.get('dispatch_id') != source['dispatch_id']):
-                raise HarnessError('operator request does not match stopped replan')
-        if kind in ('worker', 'replan_stop'):
+        if kind in ('worker', 'commander'):
             position = next(i for i, d in enumerate(self.context.run['dispatches']) if d['id'] == source['dispatch_id'])
             if any(d.get('invoked', True) for d in self.context.run['dispatches'][position + 1:]):
                 raise HarnessError('cannot register stale decision source after model invocation')
@@ -191,9 +197,22 @@ class DecisionRecovery(RuntimeService):
             raise HarnessError('terminal run cannot request decisions')
         record.update(sequence=len(self.context.run.get('decision_requests', [])) + 1,
                       dispatch_count=len(self.context.run['dispatches']), recorded_at=time.time())
+        receipt = None
+        if consume is not None:
+            receipt = self.context.run['commander_receipts'][consume[0]]
+            if receipt['dispatch_id'] != source['dispatch_id']:
+                raise HarnessError('commander question does not match its receipt')
         row = self._decision_artifact(record, 'operator_decision_requested')
         self.context.run['decision_requests'].append(row)
+        if consume is not None:
+            key, veto = consume
+            self.context.run['commander_receipts'].pop(key)
+            entry = next(d for d in self.context.run['dispatches'] if d['id'] == receipt['dispatch_id'])
+            if veto is not None:
+                entry.update(status='invalid_asked', error=veto)
         self.context.save()
+        if consume is not None and consume[1] is not None:
+            self.services.receipts.observe_invalid(entry)
         return deepcopy(row)
 
     def decision_context(self):
@@ -263,11 +282,6 @@ class DecisionRecovery(RuntimeService):
         active = [key for key in RECOVERY_BUSY_KEYS if self.context.run.get(key)]
         if active:
             raise HarnessError('pending lifecycle gates reject operator decisions: ' + ', '.join(active))
-        stopped = self.context.run.get('replan_stopped')
-        if stopped and (request['kind'] != 'replan_stop' or stopped.get('target') != request['task_id']
-                        or stopped.get('reason') != request['question']
-                        or stopped.get('dispatch_id') != request['source']['dispatch_id']):
-            raise HarnessError('operator decision does not match stopped replan')
         boundary = request['response']['dispatch_count'] if request['response'] else request['dispatch_count']
         if any(d.get('invoked', True) and (request['kind'] != 'handoff'
                    or d.get('task_id') == request['task_id'])
@@ -363,9 +377,7 @@ class DecisionRecovery(RuntimeService):
             return packet
         task = packet.get('task', {})
         task_id = task_id or packet.get('task_id') or (task.get('id') if isinstance(task, dict) else None)
-        relevant = None if kind in ('replan', 'final_review') or task_id == 'final' else {task_id}
-        if kind == 'dispatch':
-            relevant = {t['id'] for t in packet.get('ready', [])}
+        relevant = None if kind in ('decide', 'final_review') or task_id == 'final' else {task_id}
         selected = [r for r in records if relevant is None or r['task_id'] in relevant]
         # Share an excerpt allowance instead of multiplying full questions and
         # 4000-character answers by the number of decisions. Choices and IDs

@@ -36,6 +36,46 @@ def validate_work_contract(result, schema=WORK):
     return result
 
 
+DECIDE_EMPTY = {"selected_task": "", "instruction": "", "reason": "", "new_tasks": [], "updates": []}
+
+
+def trigger_kind(kwargs, packet):
+    """'plan', 'task' or 'final' for the commander's decide call; None for other roles."""
+    return packet["trigger"]["kind"] if kwargs["role"] == "commander" else None
+
+
+def decided(result, action, **fields):
+    """Replace a decide result with one action; fields the action does not use stay empty."""
+    for field in ("action", *DECIDE_EMPTY):
+        result.pop(field, None)
+    result.update(DECIDE_EMPTY, action=action, **fields)
+    return result
+
+
+def revised(result, packet, reason, new_tasks=(), updates=(), selected=None, instruction="Continue with the revised plan"):
+    """A revise result; by default it selects the first new task whose dependencies are accepted,
+    else the current task, else the first ready task."""
+    trigger = packet["trigger"]
+    if selected is None:
+        accepted = set(packet.get("accepted", {}))
+        fresh = [t["id"] for t in new_tasks if set(t["depends_on"]) <= accepted]
+        selected = fresh[0] if fresh else (trigger.get("current_task") or (trigger.get("ready") or [""])[0])
+    return decided(result, "revise", reason=reason, new_tasks=list(new_tasks), updates=list(updates),
+                   selected_task=selected, instruction=instruction)
+
+
+def current_tasks(packet):
+    """Rebuild the current plan from a decide packet's compact plan context (RULES' delta reading)."""
+    tasks = copy.deepcopy(packet[packet.get("tasks_ref", packet.get("tasks_base_ref"))])
+    by_id = {task["id"]: task for task in tasks}
+    for update in packet.get("tasks_delta", {}).get("updates", []):
+        if "description" in update:
+            by_id[update["id"]]["description"] = update["description"]
+        by_id[update["id"]]["depends_on"].extend(update.get("add_depends_on", []))
+    tasks.extend(copy.deepcopy(packet.get("tasks_delta", {}).get("new_tasks", [])))
+    return tasks
+
+
 class ScriptedBackend(DemoBackend):
     def __init__(self, change=None):
         self.change = change
@@ -83,28 +123,33 @@ class RuntimeChangesTests(RepoCase):
             if kwargs["kind"] == "final_review":
                 result.update(verdict="request_changes", findings=[finding()])
         backend = ScriptedBackend(reject_final)
-        self.config.data["runtime"]["max_replans"] = 0
         engine = self.engine(backend)
-        with self.assertRaisesRegex(HarnessError, "重新规划次数"):
+        # The demo commander asks after a whole-run rejection; the rejection is never re-reviewed.
+        with self.assertRaisesRegex(HarnessError, "等待操作者决定：task_id=final"):
             engine.start("Implement greet", self.plan())
         self.assertEqual(len(engine.run["accepted"]), 1)
         count = len(engine.run["dispatches"])
-        with self.assertRaisesRegex(HarnessError, "同一代码快照"):
+        with self.assertRaisesRegex(HarnessError, "等待操作者决定：task_id=final"):
             self.engine(backend).resume(engine.run["id"])
         self.assertEqual(len(read_json(engine.directory / "state.json")["dispatches"]), count)
+        self.assertEqual(sum(c["kind"] == "final_review" for c in backend.calls), 1)
         (engine.worktree / "hello.py").write_text('def greet(name):\n    return f"Hello, {name}!"\n# unreviewed\n')
+        run = read_json(engine.directory / "state.json")
+        request = run["decision_requests"][-1]
+        answer = self.repo.parent / "continue.json"
+        answer.write_text(json.dumps({"schema_version": 1, "request_id": request["id"], "task_id": "final",
+                                      "decision": "continue", "summary": "Proceed with the edited tree."}))
         with self.assertRaisesRegex(HarnessError, "干净的已接受提交"):
-            self.engine(backend).resume(engine.run["id"])
+            self.engine(backend).resume(engine.run["id"], operator_decision=[str(answer)])
 
     def test_final_rejection_adds_corrective_task_without_weakening_original(self):
         def corrective(backend, kwargs, packet, result):
             if kwargs["kind"] == "final_review" and sum(c["kind"] == "final_review" for c in backend.calls) == 1:
                 result.update(verdict="request_changes", findings=[finding()])
-            if kwargs["kind"] == "replan":
-                tasks = copy.deepcopy(packet.get("tasks", packet["original_tasks"]))
-                task = copy.deepcopy(tasks[0])
+            if trigger_kind(kwargs, packet) == "final":
+                task = copy.deepcopy(current_tasks(packet)[0])
                 task.update(id="correct", title="Correct edge case", description="Correct the final finding", depends_on=["greet"])
-                result.update(action="revise", reason="Address final review finding", new_tasks=[task], updates=[])
+                revised(result, packet, "Address final review finding", new_tasks=[task])
             if kwargs["role"] == "worker" and kwargs["task"]["id"] == "correct":
                 with (kwargs["cwd"] / "hello.py").open("a") as file:
                     file.write("# correction independently reviewed\n")
@@ -115,27 +160,29 @@ class RuntimeChangesTests(RepoCase):
         self.assertEqual(set(result["accepted"]), {"greet", "correct"})
         self.assertEqual(result["original_tasks"], self.plan()["tasks"])
         self.assertEqual(result["tasks"][0], self.plan()["tasks"][0])
-        self.assertEqual(result["replan_attempts"], 1)
-        self.assertEqual(result["final_attempts"], 2)
+        self.assertEqual(len(result["plan_history"]), 2)
         self.assertEqual([item["status"] for item in result["final_history"]], ["rejected", "approved"])
         self.assertEqual(sum(result["attempts"].values()), 2)
         self.assertNotEqual(result["final_history"][0]["head"], result["final_history"][1]["head"])
 
     def test_noop_corrective_task_does_not_get_fresh_final_verdict(self):
-        self.config.data["runtime"]["max_replans"] = 1
         def no_change(backend, kwargs, packet, result):
             if kwargs["kind"] == "final_review":
                 result.update(verdict="request_changes", findings=[finding()])
-            elif kwargs["kind"] == "replan":
-                task = copy.deepcopy(packet.get("tasks", packet["original_tasks"])[0])
+            elif trigger_kind(kwargs, packet) == "final" and not packet["trigger"]["accepted_since"]:
+                task = copy.deepcopy(current_tasks(packet)[0])
                 task.update(id="correct", depends_on=["greet"])
-                result.update(action="revise", reason="Fix finding", new_tasks=[task], updates=[])
-        engine = self.engine(ScriptedBackend(no_change))
-        with self.assertRaisesRegex(HarnessError, "同一代码快照"):
+                revised(result, packet, "Fix finding", new_tasks=[task])
+            elif trigger_kind(kwargs, packet) == "final":
+                decided(result, "ask", reason="The correction changed nothing; how should the finding be handled?")
+        backend = ScriptedBackend(no_change)
+        engine = self.engine(backend)
+        with self.assertRaisesRegex(HarnessError, "等待操作者决定：task_id=final"):
             engine.start("Implement greet", self.plan())
-        self.assertEqual(engine.run["final_attempts"], 1)
+        self.assertEqual(len(engine.run["final_history"]), 1)
         self.assertEqual(len(engine.run["accepted"]), 2)
-        self.assertEqual(engine.run["pending_replan"]["trigger"]["unchanged_corrections"], ["correct"])
+        self.assertEqual(sum(c["kind"] == "final_review" for c in backend.calls), 1)
+        self.assertEqual(backend.calls[-1]["packet"]["trigger"]["accepted_since"], ["correct"])
 
     def test_final_readonly_mutation_never_completes(self):
         def mutate(backend, kwargs, packet, result):
@@ -184,12 +231,12 @@ class RuntimeChangesTests(RepoCase):
             if kwargs["role"] == "worker" and kwargs["task"]["id"] == "greet" and sum(c["role"] == "worker" for c in backend.calls) == 1:
                 (kwargs["cwd"] / "hello.py").write_text("partial blocked implementation\n")
                 result.update(status="blocked", blocker_kind="task", blockers=["Need prerequisite"], summary="Missing prerequisite")
-            elif kwargs["kind"] == "replan":
-                original = copy.deepcopy(packet.get("tasks", packet["original_tasks"])[0])
+            elif trigger_kind(kwargs, packet) == "task" and packet["trigger"]["feedback"]:
+                original = copy.deepcopy(current_tasks(packet)[0])
                 prerequisite_task = copy.deepcopy(original)
                 prerequisite_task.update(id="prepare", title="Prepare prerequisite")
-                result.update(action="revise", reason="Prepare prerequisite before original task", new_tasks=[prerequisite_task],
-                              updates=[{"id": original["id"], "description": original["description"], "add_depends_on": ["prepare"]}])
+                revised(result, packet, "Prepare prerequisite before original task", new_tasks=[prerequisite_task],
+                        updates=[{"id": original["id"], "description": original["description"], "add_depends_on": ["prepare"]}])
             elif kwargs["role"] == "worker" and kwargs["task"]["id"] == "prepare":
                 # DemoBackend already generated a valid file; inspect the archived original separately.
                 with (kwargs["cwd"] / "hello.py").open("a") as file:
@@ -198,7 +245,7 @@ class RuntimeChangesTests(RepoCase):
         result = engine.start("Implement greet", self.plan())
         self.assertEqual(result["attempts"], {"greet": 2, "prepare": 1})
         self.assertEqual(sum(result["attempts"].values()), 3)
-        archive = engine.directory / "recovery" / "replan-1"
+        archive = engine.directory / "recovery" / "revision-1"
         self.assertEqual((archive / "files" / "hello.py").read_text(), "partial blocked implementation\n")
         self.assertEqual(read_json(archive / "restored.json")["head"], result["base_commit"])
         self.assertEqual(git.head(self.repo), result["base_commit"])
@@ -215,8 +262,8 @@ class RuntimeChangesTests(RepoCase):
             engine = self.engine(backend)
             with self.subTest(mode=mode), self.assertRaises(HarnessError):
                 engine.start("Implement greet", self.plan())
-            self.assertEqual(engine.run["replan_attempts"], 0)
-            self.assertFalse(any(call["kind"] == "replan" for call in backend.calls))
+            self.assertEqual(len(engine.run["plan_history"]), 1)
+            self.assertFalse(any(call["role"] == "commander" for call in backend.calls))
 
     def test_exhausted_attempt_and_dispatch_budgets_stop_before_replan(self):
         def blocked(backend, kwargs, packet, result):
@@ -224,9 +271,9 @@ class RuntimeChangesTests(RepoCase):
                 result.update(status="blocked", blocker_kind="task", blockers=["Need prerequisite"], summary="Blocked")
         self.config.data["runtime"]["max_attempts"] = 1
         engine = self.engine(ScriptedBackend(blocked))
-        with self.assertRaisesRegex(HarnessError, "重新命名任务"):
+        with self.assertRaisesRegex(HarnessError, r"runtime\.max_attempts 当前值 1"):
             engine.start("Implement greet", self.plan())
-        self.assertEqual(engine.run["replan_attempts"], 0)
+        self.assertEqual(len(engine.run["plan_history"]), 1)
         # The run-wide limit is the model dispatch budget; it still precedes replanning.
         self.config.data["runtime"]["max_attempts"] = 3
         self.config.data["runtime"]["max_agent_dispatches"] = 1
@@ -235,9 +282,10 @@ class RuntimeChangesTests(RepoCase):
         with self.assertRaisesRegex(HarnessError, "模型派发次数上限"):
             engine.start("Implement greet", self.plan())
         self.assertEqual(sum(engine.run["attempts"].values()), 1)
-        self.assertEqual(engine.run["replan_attempts"], 0)
-        self.assertEqual(engine.run["pending_replan"]["stage"], "request")
-        self.assertFalse(any(call["kind"] == "replan" for call in backend.calls))
+        # The decision need is derived from the saved blocker, not from a pending flag.
+        self.assertEqual(engine.run["feedback"]["worker"]["blocker_kind"], "task")
+        self.assertNotIn("commander:decide:run", engine.run["commander_receipts"])
+        self.assertFalse(any(call["role"] == "commander" for call in backend.calls))
 
     def test_resume_budget_increase_preserves_attempts_and_logs_change(self):
         def interrupt(backend, kwargs, packet):
@@ -281,54 +329,60 @@ class RuntimeChangesTests(RepoCase):
             self.engine().resume(result["id"], approve_plan=True)
         self.assertEqual(engine.run["dispatches"], [])
 
-    def test_task_named_final_has_separate_verification_artifacts(self):
+    def test_task_artifacts_are_separate_from_final_artifacts_and_final_is_reserved(self):
         plan = self.plan()
-        plan["tasks"][0]["id"] = "final"
-        engine = self.engine()
-        result = engine.start("Implement greet", plan)
-        task_diff = Path(result["accepted"]["final"]["verification"]).parent / "change.diff"
+        for reserved in ("final", "run"):
+            plan["tasks"][0]["id"] = reserved
+            with self.subTest(reserved=reserved), self.assertRaisesRegex(HarnessError, "保留名"):
+                self.engine().start("Implement greet", plan)
+        self.assertFalse((self.repo / ".harness" / "runs").exists() and any((self.repo / ".harness" / "runs").iterdir()))
+        result = self.engine().start("Implement greet", self.plan())
+        task_diff = Path(result["accepted"]["greet"]["verification"]).parent / "change.diff"
         final_diff = Path(result["final_history"][-1]["diff_artifact"])
         self.assertNotEqual(task_diff, final_diff)
-        self.assertIn("tasks/final/1", str(task_diff))
+        self.assertIn("tasks/greet/1", str(task_diff))
         self.assertTrue(task_diff.exists())
         self.assertTrue(final_diff.exists())
 
-    def test_resume_continues_interrupted_replan_without_rerolling_final_review(self):
-        def interrupt_replan(backend, kwargs, packet, result):
+    def test_resume_continues_interrupted_decide_without_rerolling_final_review(self):
+        def reject(backend, kwargs, packet, result):
             if kwargs["kind"] == "final_review":
                 result.update(verdict="request_changes", findings=[finding()])
-            elif kwargs["kind"] == "replan":
+        def interrupt_decide(backend, kwargs, packet):
+            if kwargs["role"] == "commander":
                 interrupt_started_agent(kwargs)
-        engine = self.engine(ScriptedBackend(interrupt_replan))
+        first = ScriptedBackend(reject)
+        first.before_result = interrupt_decide
+        engine = self.engine(first)
         with self.assertRaises(KeyboardInterrupt):
             engine.start("Implement greet", self.plan())
-        self.assertIn("pending_replan", engine.run)
+        self.assertIn("commander:decide:run", engine.run["commander_receipts"])
         def continue_replan(backend, kwargs, packet, result):
-            if kwargs["kind"] == "replan":
-                task = copy.deepcopy(packet.get("tasks", packet["original_tasks"])[0])
+            if trigger_kind(kwargs, packet) == "final":
+                task = copy.deepcopy(current_tasks(packet)[0])
                 task.update(id="correct", depends_on=["greet"])
-                result.update(action="revise", reason="Fix the recorded final finding", new_tasks=[task], updates=[])
+                revised(result, packet, "Fix the recorded final finding", new_tasks=[task])
             elif kwargs["role"] == "worker":
                 with (kwargs["cwd"] / "hello.py").open("a") as file:
                     file.write("# reviewed correction\n")
         backend = ScriptedBackend(continue_replan)
         resumed = self.engine(backend).resume(engine.run["id"])
         self.assertEqual(resumed["status"], "completed")
-        self.assertEqual(backend.calls[0]["kind"], "replan")
-        self.assertEqual(resumed["final_attempts"], 2)
-        self.assertEqual(resumed["replan_attempts"], 1)
-        self.assertNotIn("pending_replan", resumed)
+        self.assertEqual((backend.calls[0]["kind"], backend.calls[0]["packet"]["trigger"]["kind"]), ("decide", "final"))
+        self.assertEqual(len(resumed["final_history"]), 2)
+        self.assertEqual(len(resumed["plan_history"]), 2)
+        self.assertNotIn("pending_revision", resumed)
 
-    def test_applied_revision_checkpoint_clears_old_task_cursor(self):
+    def test_published_revision_checkpoint_moves_task_cursor_to_selection(self):
         def revise(backend, kwargs, packet, result):
             if kwargs["role"] == "worker":
                 result.update(status="blocked", blocker_kind="task", blockers=["Need preparation"], summary="Need preparation")
-            elif kwargs["kind"] == "replan":
-                task = copy.deepcopy(packet.get("tasks", packet["original_tasks"])[0])
+            elif trigger_kind(kwargs, packet) == "task":
+                task = copy.deepcopy(current_tasks(packet)[0])
                 prerequisite = copy.deepcopy(task)
                 prerequisite["id"] = "prepare"
-                result.update(action="revise", reason="Add preparation", new_tasks=[prerequisite],
-                              updates=[{"id": task["id"], "description": task["description"], "add_depends_on": ["prepare"]}])
+                revised(result, packet, "Add preparation", new_tasks=[prerequisite],
+                        updates=[{"id": task["id"], "description": task["description"], "add_depends_on": ["prepare"]}])
         engine = self.engine(ScriptedBackend(revise))
         save = engine.context.save
         def interrupt_after_application():
@@ -339,8 +393,10 @@ class RuntimeChangesTests(RepoCase):
         with self.assertRaises(KeyboardInterrupt):
             engine.start("Implement greet", self.plan())
         persisted = read_json(engine.directory / "state.json")
-        self.assertIsNone(persisted["current_task"])
-        self.assertNotIn("pending_replan", persisted)
+        # The published revision moved the cursor to the selected prerequisite.
+        self.assertEqual(persisted["current_task"], "prepare")
+        self.assertEqual(persisted["pending_directive"]["directive"]["selected_task"], "prepare")
+        self.assertNotIn("pending_revision", persisted)
         result = self.engine().resume(engine.run["id"])
         self.assertEqual(result["status"], "completed")
         self.assertEqual(set(result["accepted"]), {"prepare", "greet"})
@@ -360,7 +416,7 @@ class RuntimeChangesTests(RepoCase):
 
     def test_approval_cannot_preapprove_plan_generated_after_interruption(self):
         def interrupt(backend, kwargs, packet, result):
-            if kwargs["kind"] == "plan":
+            if trigger_kind(kwargs, packet) == "plan":
                 interrupt_started_agent(kwargs)
         engine = self.engine(ScriptedBackend(interrupt))
         with self.assertRaises(KeyboardInterrupt):
@@ -370,7 +426,7 @@ class RuntimeChangesTests(RepoCase):
         result = self.engine(backend).resume(engine.run["id"], approve_plan=True)
         self.assertEqual(result["status"], "awaiting_approval")
         self.assertFalse(result["plan_approved"])
-        self.assertEqual([call["kind"] for call in backend.calls], ["plan"])
+        self.assertEqual([call["kind"] for call in backend.calls], ["decide"])
         result = self.engine().resume(result["id"], approve_plan=True)
         self.assertEqual(result["status"], "completed")
 

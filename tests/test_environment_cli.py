@@ -83,9 +83,9 @@ class EnvironmentCLITests(unittest.TestCase):
         later.update(invoked=True, process_state="starting")
         self.assertTrue(status_summary(run)["last_environment_blocker"]["stale"])
 
-    def test_later_commander_selection_makes_blocker_historical_without_worker(self):
+    def test_later_commander_decision_makes_blocker_historical_without_worker(self):
         run = self.fixture()
-        run["dispatches"].append({"role": "commander", "kind": "dispatch", "invoked": True})
+        run["dispatches"].append({"role": "commander", "kind": "decide", "task_id": "run", "invoked": True})
         self.assertTrue(status_summary(run)["last_environment_blocker"]["stale"])
 
     def test_invalid_or_absent_attempt_is_not_inferred(self):

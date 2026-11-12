@@ -700,6 +700,8 @@ class Observer:
 
     @staticmethod
     def _budgets(run):
+        # replan_attempts and final_attempts exist only in schema 16 and earlier
+        # ledgers (historical display); they stay null for schema 17.
         budgets = {key: _integer(run.get(key)) for key in
                    ("agent_dispatches", "replan_attempts", "final_attempts")}
         attempts = run.get("attempts")
@@ -716,6 +718,7 @@ class Observer:
         snapshot = run.get("config_snapshot")
         runtime = snapshot.get("runtime") if isinstance(snapshot, dict) else None
         runtime = runtime if isinstance(runtime, dict) else {}
+        # max_total_attempts, max_replans and max_final_attempts: older snapshots only.
         budgets["limits"] = {key: _integer(runtime.get(key)) for key in
                              ("max_attempts", "max_total_attempts", "max_agent_dispatches", "max_replans",
                               "max_final_attempts", "agent_timeout_seconds")}

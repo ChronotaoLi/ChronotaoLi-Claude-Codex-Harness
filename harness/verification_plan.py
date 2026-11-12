@@ -190,7 +190,7 @@ def finding_progress(run, task_id, *, limit=60):
     Missing source identity stays unknown rather than inventing a global ID.
     """
     task_ids = [task_id] if task_id in run.get("review_history", {}) else (
-        list(run.get("review_history", {})) if task_id in {"plan", "planning", "replanning", "dispatching", "final", "commander"} else [task_id])
+        list(run.get("review_history", {})) if task_id in {"run", "final", "commander"} else [task_id])
     rows = {}
     for tid in task_ids:
         for record in run.get("review_history", {}).get(tid, []):

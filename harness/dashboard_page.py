@@ -812,7 +812,7 @@ APP_JS = r""""use strict";
         cont.state === "revision_pending" ? null : notice("满足请求（追加精确授权或调整超时）后普通 resume 继续；需要先修正时可拒绝该请求。", "hint"),
         cont.state === "revision_pending" ? null : resumeHint(data.id, "--reject-continuation FILE")]);
     }
-    if (summary.replan_stopped) {
+    if (summary.replan_stopped) {  // schema 16 and earlier only
       var stopped = summary.replan_stopped;
       add("warn", "指挥停止再规划", [line("item-sub", "范围 " + show(stopped.target)),
         longText("replan:reason", stopped.reason, TEXT_EXCERPT), line("item-sub", "产物 ", mono(stopped.artifact))]);
@@ -1251,8 +1251,11 @@ APP_JS = r""""use strict";
       meters.appendChild(total);
     }
     meters.appendChild(budgetMeter("模型派发", b.agent_dispatches, limits.max_agent_dispatches));
-    meters.appendChild(budgetMeter("再规划", b.replan_attempts, limits.max_replans));
-    meters.appendChild(budgetMeter("整体验收", b.final_attempts, limits.max_final_attempts));
+    // Replan and final-attempt counters exist only in schema 16 and earlier ledgers.
+    if (typeof b.replan_attempts === "number") {
+      meters.appendChild(budgetMeter("再规划（历史台账）", b.replan_attempts, limits.max_replans));
+      meters.appendChild(budgetMeter("整体验收（历史台账）", b.final_attempts, limits.max_final_attempts));
+    }
     panel.appendChild(meters);
     var remaining = summary.remaining_model_calls;
     if (remaining && typeof remaining.message === "string") {

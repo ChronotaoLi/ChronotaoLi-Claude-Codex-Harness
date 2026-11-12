@@ -436,14 +436,22 @@ class DemoBackend:
                 result["finding_dispositions"] = {key: {"status": "resolved",
                     "evidence": ["Offline fixture reviewed the current greet implementation"]}
                     for key in schema["properties"]["finding_dispositions"]["required"]}
-        elif kind == "plan":
-            result = {"tasks": [{"id": "greet", "title": "Implement greet", "description": "Implement greet(name) returning Hello, name!",
-                                  "depends_on": [], "allowed_paths": ["hello.py"], "acceptance": ["test_greet passes"], "skills": []}]}
-        elif kind == "replan":
-            result = {"action": "stop", "reason": "Demo cannot replan a failed task automatically", "new_tasks": [], "updates": []}
         else:
-            result = {"selected_task": task["id"], "action": "implement",
-                      "instruction": "Complete this one task and satisfy its acceptance criteria."}
+            # One commander call: plan when there are no tasks, ask when a task
+            # blocker or a failed whole run needs an operator, else implement.
+            trigger = json.JSONDecoder().raw_decode(prompt)[0].get("packet", {}).get("trigger", {})
+            empty = {"selected_task": "", "instruction": "", "reason": "", "new_tasks": [], "updates": []}
+            feedback = trigger.get("feedback") if isinstance(trigger.get("feedback"), dict) else {}
+            worker = feedback.get("worker") if isinstance(feedback.get("worker"), dict) else {}
+            if trigger.get("kind") == "plan":
+                result = {**empty, "action": "revise", "reason": "Demo plan", "new_tasks": [
+                    {"id": "greet", "title": "Implement greet", "description": "Implement greet(name) returning Hello, name!",
+                     "depends_on": [], "allowed_paths": ["hello.py"], "acceptance": ["test_greet passes"], "skills": []}]}
+            elif trigger.get("kind") == "final" or worker.get("blocker_kind") == "task":
+                result = {**empty, "action": "ask", "reason": "Demo cannot revise a failed task automatically"}
+            else:
+                result = {**empty, "action": "implement", "selected_task": trigger["ready"][0],
+                          "instruction": "Complete this one task and satisfy its acceptance criteria."}
         value = {**ids, **result}
         write_json(job / "response.json", value)
         (job / "prompt.txt").write_text(prompt, encoding="utf-8")

@@ -8,7 +8,7 @@ from unittest.mock import patch
 from harness.context import capacity_report
 from harness.util import read_json
 from test_harness import ROOT, RepoCase
-from test_runtime_changes import ScriptedBackend, finding
+from test_runtime_changes import ScriptedBackend, finding, revised, trigger_kind
 
 
 class FinalPacketBuilderTests(RepoCase):
@@ -42,11 +42,11 @@ class FinalPacketBuilderTests(RepoCase):
                 observed.append((actual, *captured[0]))
                 if len(observed) == 1:
                     result.update(verdict="request_changes", findings=[finding()])
-            elif kwargs["kind"] == "replan":
+            elif trigger_kind(kwargs, packet) == "final":
                 task = copy.deepcopy(packet["original_tasks"][0])
                 task.update(id="correct", title="Correct final finding",
                             description="Resolve the final review finding", depends_on=["greet"])
-                result.update(action="revise", reason="Correct the rejected result", new_tasks=[task], updates=[])
+                revised(result, packet, "Correct the rejected result", new_tasks=[task])
 
         backend = ScriptedBackend(change)
         engine = self.engine(backend)

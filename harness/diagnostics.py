@@ -103,7 +103,7 @@ def remaining_model_calls(run):
     bound = sum(remaining.values()) + final
     return {'lower_bound': bound, 'tasks': remaining, 'final_review': final,
             'message': (f'如果之后全部一次通过，至少还需 {bound} 次模型调用（下界：只计 worker、任务审阅与整体审阅，'
-                        '不含指挥调用、返工、重做与再规划）'),
+                        '不含指挥决定、返工与重做）'),
             'basis': 'recorded_stage_lower_bound; read-only, never changes a budget'}
 
 
@@ -155,9 +155,12 @@ def budget_explanation(run, work):
         return {'used': used, 'limit': limit, 'remaining': max(0, limit-used) if valid else None}
     started = sum(type(d.get('pgid')) is int and d['pgid'] > 0 for d in workers.values())
     shown = {'task_work': {tid: budget(count, 'max_attempts') for tid, count in work.items()},
-             'agent_dispatches': budget(run.get('agent_dispatches'), 'max_agent_dispatches'),
-             'replans': budget(run.get('replan_attempts'), 'max_replans'),
-             'final_attempts': budget(run.get('final_attempts'), 'max_final_attempts')}
+             'agent_dispatches': budget(run.get('agent_dispatches'), 'max_agent_dispatches')}
+    if 'replan_attempts' in run:
+        # Historical display branch: schema 16 and earlier saved replan and
+        # final-attempt counters with their own limits; schema 17 has neither.
+        shown.update(replans=budget(run.get('replan_attempts'), 'max_replans'),
+                     final_attempts=budget(run.get('final_attempts'), 'max_final_attempts'))
     if 'total_attempts' in run:
         # Historical display branch: schema 15 and earlier saved a run-wide
         # worker counter and limit; schema 16 and later have neither.

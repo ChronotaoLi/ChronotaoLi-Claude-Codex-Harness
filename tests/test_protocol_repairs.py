@@ -3,8 +3,8 @@ import json
 import unittest
 
 from harness.context import compact_checks, compact_feedback, compact_reviews, compose, review_view
-from harness.contracts import (PLAN, WORK, ScopeExtensionRequired, apply_revision,
-                               envelope, output_constraints, validate,
+from harness.contracts import (DECIDE, PLAN, WORK, ScopeExtensionRequired, apply_revision,
+                               envelope, output_constraints, validate, validate_decision,
                                validate_plan, validate_review)
 from harness.util import HarnessError, dump
 from test_runtime_changes import validate_work_contract
@@ -137,33 +137,28 @@ class IncrementalRevisionTests(unittest.TestCase):
                                              "add_depends_on": []}])):
             with self.subTest(operation=operation), self.assertRaises(HarnessError):
                 apply_revision(original, operation, set())
-        with self.assertRaises(HarnessError):
-            apply_revision(original, revision(new_tasks=[task("extra")]), set(), max_tasks=1)
 
-    def test_stop_has_no_operations_and_returns_an_independent_snapshot(self):
+    def test_scope_authority_is_needed_only_when_scope_is_the_only_defect(self):
         original = [task()]
-        stopped = apply_revision(original, revision(action="stop"), set())
-        self.assertEqual(stopped, original)
-        self.assertIsNot(stopped[0], original[0])
-        with self.assertRaises(HarnessError):
-            apply_revision(original, revision(action="stop", new_tasks=[task("extra")]), set())
+        outside = {**task("extra"), "allowed_paths": ["secrets/**"]}
 
-    def test_replan_bounds_error_cannot_hide_scope_cycle_or_stop_operation_errors(self):
-        original = [task()]
-        for operation, scope in ((revision(action="stop", new_tasks=[task("extra")]), False),
-                                 (revision(new_tasks=[{**task("extra"), "allowed_paths": ["secrets/**"]}]), True),
-                                 (revision(updates=[{"id": "implement", "description": "Refined",
-                                                     "add_depends_on": ["implement"]}]), False)):
-            operation["reason"] = "x" * 4001
-            with self.subTest(operation=operation["action"], scope=scope):
+        def check(**changes):
+            operation = {"action": "revise", "selected_task": "implement", "instruction": "Continue",
+                         "reason": "Add the missing prerequisite", "new_tasks": [], "updates": [], **changes}
+            validate(operation, DECIDE)
+            return validate_decision(operation, tasks=original, accepted=set(), ready=["implement"])
+        with self.assertRaises(ScopeExtensionRequired) as raised:
+            check(new_tasks=[outside])
+        self.assertEqual(raised.exception.patterns, ["secrets/**"])
+        for changes in ({"reason": "x" * 4001},
+                        {"updates": [{"id": "implement", "description": "Refined", "add_depends_on": ["implement"]}]},
+                        {"selected_task": "missing"},
+                        {"new_tasks": [{**outside, "id": "final"}]}):
+            with self.subTest(changes=list(changes)):
                 with self.assertRaises(HarnessError) as raised:
-                    apply_revision(original, operation, set())
-                self.assertNotIn("response.reason", str(raised.exception))
-                # Only an unapproved scope can be resolved by an operator's grant.
-                self.assertEqual(isinstance(raised.exception, ScopeExtensionRequired), scope)
-        with self.assertRaisesRegex(HarnessError, "response.reason") as raised:
-            apply_revision(original, revision(action="stop", reason="x" * 4001), set())
-        self.assertNotIsInstance(raised.exception, ScopeExtensionRequired)
+                    check(**{"new_tasks": [outside], **changes})
+                # Another defect makes it an ordinary invalid output, redone once.
+                self.assertNotIsInstance(raised.exception, ScopeExtensionRequired)
 
 
 class ContextCompactionTests(unittest.TestCase):

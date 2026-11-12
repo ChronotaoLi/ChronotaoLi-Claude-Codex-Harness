@@ -1,4 +1,5 @@
 import copy
+import json
 import sys
 from pathlib import Path
 from unittest.mock import patch
@@ -6,14 +7,14 @@ from unittest.mock import patch
 from harness.process_runtime import ProcessOutcome
 from harness.util import HarnessError, read_json, run_process
 from test_harness import ROOT, RepoCase
-from test_runtime_changes import ScriptedBackend, finding
+from test_runtime_changes import ScriptedBackend, decided, finding, revised, trigger_kind
 
 
 class ReviewRecoveryRegressionTests(RepoCase):
     def plan(self):
         return read_json(ROOT / "examples" / "plan.json")
 
-    def assert_blocker_replans_after_budget_increase(self, limit, initial):
+    def assert_blocker_decides_after_budget_increase(self, limit, initial):
         self.config.data["runtime"][limit] = initial
 
         def blocked(backend, kwargs, packet, result):
@@ -26,11 +27,11 @@ class ReviewRecoveryRegressionTests(RepoCase):
         with self.assertRaises(HarnessError):
             engine.start("Implement greet", self.plan())
         saved = read_json(engine.directory / "state.json")
-        trigger = saved["pending_replan"]["trigger"]
-        self.assertEqual(trigger["task_id"], "greet")
-        self.assertEqual(trigger["worker"]["blocker_kind"], "task")
+        # Nothing persistent marks the decision; the saved blocker derives it.
+        feedback = saved["feedback"]
+        self.assertEqual(feedback["task_id"], "greet")
+        self.assertEqual(feedback["worker"]["blocker_kind"], "task")
         self.assertEqual(saved["attempts"], {"greet": 1})
-        self.assertEqual(sum(saved["attempts"].values()), 1)
         calls = copy.deepcopy(backend.calls)
         with self.assertRaises(HarnessError):
             self.engine(backend).resume(saved["id"])
@@ -38,24 +39,21 @@ class ReviewRecoveryRegressionTests(RepoCase):
 
         self.config.data["runtime"][limit] = initial + 1
         resumed = self.engine(backend)
-        # The demo commander's stop makes the first resumed operation observable.
-        with self.assertRaises(HarnessError):
+        # The demo commander's question makes the first resumed operation observable.
+        with self.assertRaisesRegex(HarnessError, "等待操作者决定"):
             resumed.resume(saved["id"])
         self.assertEqual([(call["role"], call["kind"]) for call in backend.calls[len(calls):]],
-                         [("commander", "replan")])
+                         [("commander", "decide")])
+        seen = backend.calls[len(calls)]["packet"]["trigger"]["feedback"]["worker"]
+        self.assertEqual((seen["blocker_kind"], seen["blockers"]), ("task", feedback["worker"]["blockers"]))
         self.assertEqual(resumed.run["attempts"], saved["attempts"])
-        self.assertEqual(sum(resumed.run["attempts"].values()), sum(saved["attempts"].values()))
-        self.assertEqual(resumed.run["replan_attempts"], 1)
-        self.assertEqual(resumed.run["replan_stopped"]["trigger"], trigger)
+        self.assertEqual(resumed.run["decision_requests"][-1]["kind"], "commander")
 
-    def test_last_task_attempt_preserves_replanning_intent(self):
-        self.assert_blocker_replans_after_budget_increase("max_attempts", 1)
+    def test_last_task_attempt_preserves_the_derived_decision(self):
+        self.assert_blocker_decides_after_budget_increase("max_attempts", 1)
 
-    def test_exhausted_dispatches_preserve_replanning_intent(self):
-        self.assert_blocker_replans_after_budget_increase("max_agent_dispatches", 1)
-
-    def test_exhausted_replans_preserve_task_blocker_intent(self):
-        self.assert_blocker_replans_after_budget_increase("max_replans", 0)
+    def test_exhausted_dispatches_preserve_the_derived_decision(self):
+        self.assert_blocker_decides_after_budget_increase("max_agent_dispatches", 1)
 
     def test_second_invalid_review_summary_stops_after_one_redo(self):
         def long_summary(backend, kwargs, packet, result):
@@ -80,45 +78,44 @@ class ReviewRecoveryRegressionTests(RepoCase):
         self.assertEqual(after["agent_dispatches"], saved["agent_dispatches"] + 2)
         self.assertEqual(after["attempts"], saved["attempts"])
 
-    def test_blank_reason_stop_is_persistent_counted_and_explicitly_retryable(self):
-        def stop_once(backend, kwargs, packet, result):
+    def test_blank_question_still_registers_and_the_answer_reaches_the_next_decide(self):
+        def ask_once(backend, kwargs, packet, result):
             if kwargs["role"] == "worker" and sum(c["role"] == "worker" for c in backend.calls) == 1:
                 result.update(status="blocked", blocker_kind="task", blockers=["Clarify the prerequisite"])
-            if kwargs["kind"] == "replan":
-                if sum(c["kind"] == "replan" for c in backend.calls) == 1:
-                    result.update(action="stop", reason=" ", new_tasks=[], updates=[])
+            if trigger_kind(kwargs, packet) == "task" and packet["trigger"]["feedback"]:
+                if "operator_answer" not in packet:
+                    decided(result, "ask", reason=" ")
                 else:
-                    result.update(action="revise", reason="Use the clarified implementation approach", new_tasks=[],
-                                  updates=[{"id": "greet", "description": "Implement the clarified greeting behavior",
-                                            "add_depends_on": []}])
+                    revised(result, packet, "Use the clarified implementation approach",
+                            updates=[{"id": "greet", "description": "Implement the clarified greeting behavior",
+                                      "add_depends_on": []}])
 
-        backend = ScriptedBackend(stop_once)
+        backend = ScriptedBackend(ask_once)
         engine = self.engine(backend)
-        with self.assertRaises(HarnessError):
+        with self.assertRaisesRegex(HarnessError, "等待操作者决定：task_id=greet"):
             engine.start("Implement greet", self.plan())
         saved = read_json(engine.directory / "state.json")
-        stopped = saved["replan_stopped"]
-        self.assertEqual(stopped["target"], "greet")
-        self.assertEqual(stopped["reason"], " ")
-        self.assertTrue(Path(stopped["artifact"]).is_file())
-        evidence = Path(stopped["artifact"]).read_bytes()
-        self.assertEqual(saved["replan_attempts"], 1)
-        # A structurally valid stop is a veto even with a blank reason (J11b).
-        self.assertIn("response.reason", stopped["output_error"])
-        replan = next(d for d in saved["dispatches"] if d.get("kind") == "replan")
-        self.assertEqual(replan["status"], "invalid_stopped")
+        asked = next(d for d in saved["dispatches"] if d.get("kind") == "decide")
+        # An ask is a veto even with a blank question; the request carries a bounded notice.
+        self.assertEqual(asked["status"], "invalid_asked")
+        self.assertIn("reason", asked["error"])
+        request = saved["decision_requests"][-1]
+        self.assertIn("Read the bound original result", request["question"])
+        evidence = Path(request["source"]["artifact"]).read_bytes()
         calls = copy.deepcopy(backend.calls)
         for _ in range(2):
-            with self.assertRaises(HarnessError):
+            with self.assertRaisesRegex(HarnessError, "等待操作者决定"):
                 self.engine(backend).resume(saved["id"])
             self.assertEqual(backend.calls, calls)
-            self.assertEqual(read_json(engine.directory / "state.json")["replan_attempts"], 1)
-        result = self.engine(backend).resume(saved["id"], retry_stopped="greet")
-        self.assertEqual(backend.calls[len(calls)]["kind"], "replan")
+        answer = self.repo / "answer.json"
+        answer.write_text(json.dumps({"schema_version": 1, "request_id": request["id"], "task_id": "greet",
+                                                    "decision": "continue", "summary": "Use the documented interface"}))
+        result = self.engine(backend).resume(saved["id"], operator_decision=[str(answer)])
+        self.assertEqual(backend.calls[len(calls)]["kind"], "decide")
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["attempts"], {"greet": 2})
-        self.assertEqual(result["replan_attempts"], 2)
-        self.assertEqual(Path(stopped["artifact"]).read_bytes(), evidence)
+        self.assertEqual(len(result["plan_history"]), 2)
+        self.assertEqual(Path(request["source"]["artifact"]).read_bytes(), evidence)
 
     def test_failed_worker_recovery_reaches_same_task_without_leaking_to_next_task(self):
         def interrupted_edit(backend, kwargs, packet):
@@ -139,11 +136,12 @@ class ReviewRecoveryRegressionTests(RepoCase):
         result = self.engine(backend).resume(engine.run["id"])
         self.assertEqual(result["status"], "completed")
         same_task = [call for call in backend.calls[1:]
-                     if call["task_id"] == "greet" or call["kind"] == "dispatch"]
+                     if call["task_id"] == "greet" or call["kind"] == "decide"]
         self.assertTrue(any(call["role"] == "worker" for call in same_task))
         self.assertTrue(any(call["role"] == "commander" for call in same_task))
         for call in same_task:
-            recovery = call["packet"]["recovery"]
+            recovery = call["packet"]["trigger" if call["role"] == "commander" else "recovery"]
+            recovery = recovery["recovery"] if call["role"] == "commander" else recovery
             self.assertEqual(recovery["task_id"], "greet")
             self.assertEqual(recovery["kind"], "implement")
             self.assertEqual(recovery["artifact"], failure["artifact"])
@@ -207,14 +205,14 @@ class ReviewRecoveryRegressionTests(RepoCase):
         self.assertEqual(set(outputs.values()), {b"hook attempt 1\n", b"hook attempt 2\n"})
         self.assertTrue(all(outputs[path] == content for path, content in before.items()))
 
-    def test_noop_final_verification_correction_replans_without_reverification(self):
+    def test_noop_final_verification_correction_decides_again_without_reverification(self):
         def correct_in_second_task(backend, kwargs, packet, result):
-            if kwargs["kind"] == "replan":
-                number = sum(call["kind"] == "replan" for call in backend.calls)
+            if trigger_kind(kwargs, packet) == "final":
+                number = sum(call["kind"] == "decide" for call in backend.calls)
                 task = copy.deepcopy(packet["original_tasks"][0])
                 task.update(id=f"correct{number}", depends_on=["greet"],
                             description="Address the final integration failure")
-                result.update(action="revise", reason="Resolve the integration failure", new_tasks=[task], updates=[])
+                revised(result, packet, "Resolve the integration failure", new_tasks=[task])
             elif kwargs["role"] == "worker" and kwargs["task"]["id"] == "correct2":
                 with (kwargs["cwd"] / "hello.py").open("a") as output:
                     output.write("# integration correction\n")
@@ -234,12 +232,11 @@ class ReviewRecoveryRegressionTests(RepoCase):
         with patch("harness.verification.run_process", side_effect=final_gate):
             result = engine.start("Implement greet", self.plan())
         self.assertEqual(result["status"], "completed")
-        replans = [call for call in backend.calls if call["kind"] == "replan"]
+        replans = [call for call in backend.calls if call["kind"] == "decide"]
         self.assertEqual(len(replans), 2)
-        self.assertEqual(replans[1]["packet"]["trigger"]["unchanged_corrections"], ["correct1"])
+        self.assertEqual(replans[1]["packet"]["trigger"]["accepted_since"], ["correct1"])
         self.assertEqual(result["accepted"]["greet"]["commit"], result["accepted"]["correct1"]["commit"])
         self.assertNotEqual(result["accepted"]["greet"]["commit"], result["accepted"]["correct2"]["commit"])
-        self.assertEqual(result["final_attempts"], 2)
         self.assertEqual([record["status"] for record in result["final_history"]], ["verification_failed", "approved"])
         self.assertEqual(sum(call["kind"] == "final_review" for call in backend.calls), 1)
         failed = result["final_history"][0]

@@ -67,7 +67,7 @@ class PacketProtocolTests(RepoCase):
         def change(backend, kwargs, packet, result):
             if kwargs["role"] == "commander":
                 # The same instant the provider would see: ledger HEAD, Git HEAD and status.
-                observed.append((kwargs["kind"], packet["workspace"], read_json(kwargs["run_path"])["expected_head"],
+                observed.append((packet["trigger"]["kind"], packet["workspace"], read_json(kwargs["run_path"])["expected_head"],
                                  git.head(kwargs["cwd"]), git.git(kwargs["cwd"], "status", "--porcelain")))
             if kwargs["role"] == "worker" and sum(c["role"] == "worker" for c in backend.calls) == 1:
                 result.update(status="blocked", blocker_kind="environment", blockers=["Service unavailable"],
@@ -82,29 +82,28 @@ class PacketProtocolTests(RepoCase):
             engine.start("Implement greet")  # No supplied plan: the commander plans.
         result = self.engine(backend).resume(engine.run["id"], environment_update=self.update(engine))
         self.assertEqual(result["status"], "completed")
-        self.assertEqual([kind for kind, *_ in observed], ["plan", "dispatch"])
+        self.assertEqual([kind for kind, *_ in observed], ["plan", "task"])
         for kind, workspace, ledger_head, git_head, status in observed:
             with self.subTest(kind=kind):
                 self.assertEqual(set(workspace), {"head", "clean"})
                 self.assertEqual(workspace["head"], ledger_head)
                 self.assertEqual(workspace["head"], git_head)
                 self.assertIs(workspace["clean"], status == "")
-        # Planning saw a clean tree; the retained blocked candidate makes the later dispatch dirty.
+        # Planning saw a clean tree; the retained blocked candidate makes the later decision dirty.
         self.assertEqual([workspace["clean"] for _, workspace, *_ in observed], [True, False])
         self.assertFalse(any("workspace" in call["packet"] for call in backend.calls if call["role"] != "commander"))
         worker = [call["packet"] for call in backend.calls if call["role"] == "worker"][1]
         self.assertTrue({"environment_updates", "environment_index", "task_checkpoints", "checkpoint_index"} <= set(worker))
         self.assert_data_only(backend.calls)
 
-    def test_replan_packet_carries_workspace_saved_in_its_commander_receipt(self):
-        receipt_keys = {"plan": "planning", "dispatch": "dispatching", "replan": "replanning"}
+    def test_decide_packet_carries_workspace_saved_in_its_commander_receipt(self):
         observed = []
 
         def change(backend, kwargs, packet, result):
             if kwargs["role"] == "commander":
                 state = read_json(kwargs["run_path"])
-                receipt = state["commander_receipts"][f"commander:{kwargs['kind']}:{receipt_keys[kwargs['kind']]}"]
-                observed.append((kwargs["kind"], packet["workspace"], receipt["request"]["packet"]["workspace"],
+                receipt = state["commander_receipts"]["commander:decide:run"]
+                observed.append((packet["trigger"]["kind"], packet["workspace"], receipt["request"]["packet"]["workspace"],
                                  state["expected_head"], git.git(kwargs["cwd"], "status", "--porcelain")))
             if kwargs["role"] == "worker" and sum(c["role"] == "worker" for c in backend.calls) == 1:
                 result.update(status="blocked", blocker_kind="task", blockers=["Missing prerequisite"])
@@ -112,12 +111,12 @@ class PacketProtocolTests(RepoCase):
         backend = ScriptedBackend(change)
         engine = self.engine(backend)
         with self.assertRaises(HarnessError):
-            engine.start("Implement greet", self.plan())  # The offline replan stops the run.
-        self.assertEqual([kind for kind, *_ in observed], ["replan"])
+            engine.start("Implement greet", self.plan())  # The demo commander asks and stops the run.
+        self.assertEqual([kind for kind, *_ in observed], ["task"])
         _, workspace, saved, ledger_head, status = observed[0]
         self.assertEqual(workspace, saved)
         self.assertEqual(workspace["head"], ledger_head)
-        # The blocked candidate is retained for replanning, so the tree is dirty.
+        # The blocked candidate is retained for the decision, so the tree is dirty.
         self.assertIs(workspace["clean"], status == "")
         self.assertIs(workspace["clean"], False)
 

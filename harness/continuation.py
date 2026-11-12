@@ -284,8 +284,7 @@ def _rejections(context, history=None):
         row = active[0]
         if (context.run.get('current_task') != row['task_id'] or row['task_id'] in context.run['accepted']
                 or context.run.get('pending_continuation') is not None or directive != _revision_directive(row)
-                or any(context.run.get(key) for key in RECOVERY_BUSY_KEYS if key != 'pending_directive')
-                or context.run.get('replan_stopped')):
+                or any(context.run.get(key) for key in RECOVERY_BUSY_KEYS if key != 'pending_directive')):
             raise HarnessError('continuation revision task or directive changed')
     elif 'continuation_rejection_id' in directive:
         raise HarnessError('continuation revision directive lacks active evidence')
@@ -316,7 +315,7 @@ def record_continuation_rejection(context, path, current_snapshot=None):
             raise HarnessError('continuation rejection conflicts with prior input or was already consumed')
         validate_continuation_rejection(context, current_snapshot)
         return deepcopy(old)
-    if active or any(context.run.get(key) for key in RECOVERY_BUSY_KEYS) or context.run.get('replan_stopped'):
+    if active or any(context.run.get(key) for key in RECOVERY_BUSY_KEYS):
         raise HarnessError('continuation rejection requires a safe pending task boundary')
     pending = context.run.get('pending_continuation')
     row = next((row for row in history if row['id'] == pending), None)
@@ -331,13 +330,9 @@ def record_continuation_rejection(context, path, current_snapshot=None):
     record = dict(run_id=context.run['id'], sequence=len(records) + 1,
                   continuation_id=pending, input=value,
                   **{key: deepcopy(original[key]) for key in ('task_id', 'source', 'snapshot', 'snapshot_digest')})
-    # Freeze the actual instruction with the evidence. Recovery must not depend
-    # on the current runtime's prompt wording when the instruction was issued.
-    record['directive'] = {'selected_task': row['task_id'], 'action': 'implement',
-        'instruction': 'Revise the retained candidate following the operator rejection. '
-                       'The rejected continuation is no longer a prerequisite. '
-                       'Use only existing permissions; request any new exact commands separately. '
-                       'Preserve the original task scope and acceptance. Reason: ' + value['reason']}
+    # The directive carries data only: the operator's reason. How to revise a
+    # rejected continuation is protocol, stated in the worker skill.
+    record['directive'] = {'selected_task': row['task_id'], 'action': 'implement', 'instruction': value['reason']}
     rejection = _write(context, 'continuation-rejections', record)
     context.run['continuation_rejections'] = [*records, rejection]
     context.run['pending_continuation'] = None

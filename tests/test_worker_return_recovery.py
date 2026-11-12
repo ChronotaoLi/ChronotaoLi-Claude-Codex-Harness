@@ -149,13 +149,14 @@ class WorkerReturnRecoveryTests(RepoCase):
         # Each semantic rejection spends one attempt; scheduling continues to the limit.
         with self.assertRaisesRegex(HarnessError, '尝试次数上限'):
             engine.start('Implement greet', self.plan())
-        self.assertEqual(engine.run['attempts']['greet'], 3)
+        limit = self.config.data['runtime']['max_attempts']
+        self.assertEqual(engine.run['attempts']['greet'], limit)
         self.assertFalse(engine.run['worker_receipts'])
         self.assertFalse(engine.run['accepted'])
         with self.assertRaisesRegex(HarnessError, '尝试次数上限'):
             engine.resume(engine.run['id'])
         workers = [d for d in engine.run['dispatches'] if d['role'] == 'worker']
-        self.assertEqual(len(workers), 3)
+        self.assertEqual(len(workers), limit)
         self.assertTrue(all(d['worker_receipt_consumed'] == 'result_rejected' and d['status'] == 'invalid'
                             and '不一致' in d['error'] for d in workers))
         self.assertEqual(engine.run['worker_recovery']['greet']['dispatch_id'], workers[-1]['id'])

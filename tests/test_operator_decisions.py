@@ -23,14 +23,13 @@ class Fixture(DecisionRecovery):
         self.context.run = {'id': 'run_test', 'schema_version': RUN_SCHEMA_VERSION, 'status': 'blocked',
                     'tasks': [{'id': 'one', 'depends_on': []}, {'id': 'two', 'depends_on': ['one']}],
                     'accepted': {}, 'dispatches': [{'id': 'dispatch_one', 'role': 'commander',
-                    'kind': 'replan', 'task_id': 'replanning', 'invoked': True}],
-                    'decision_requests': [], 'operator_decisions': []}
+                    'kind': 'decide', 'task_id': 'run', 'invoked': True}],
+                    'decision_requests': [], 'operator_decisions': [], 'commander_receipts': {}}
         source = self.context.directory / 'dispatches' / 'dispatch_one' / 'returned-result.json'
-        write_json(source, {'task_id': 'replanning', 'dispatch_id': 'dispatch_one', 'action': 'stop',
-                            'reason': 'Choose whether to continue', 'new_tasks': [], 'updates': []})
+        write_json(source, {'task_id': 'run', 'dispatch_id': 'dispatch_one', 'action': 'ask', 'selected_task': '',
+                            'instruction': '', 'reason': 'Choose whether to continue', 'new_tasks': [], 'updates': []})
         self.source = {'artifact': str(source), 'artifact_digest': hashlib.sha256(source.read_bytes()).hexdigest(),
                        'dispatch_id': 'dispatch_one'}
-        self.context.run['replan_stopped'] = {'target': 'one', 'reason': 'Choose whether to continue', 'dispatch_id': 'dispatch_one'}
 
     def save(self):
         self.saves += 1
@@ -39,7 +38,7 @@ class Fixture(DecisionRecovery):
         self.events.append((event, data))
 
     def request(self, target='one'):
-        return self.register_decision_request(target, 'replanning', 'replan_stop', self.source,
+        return self.register_decision_request(target, 'run', 'commander', self.source,
                                               'Choose whether to continue')
 
     def response(self, request, decision='continue', summary='Proceed within original scope'):
@@ -107,7 +106,7 @@ class OperatorDecisionTests(unittest.TestCase):
         with self.assertRaises(HarnessError):
             engine.prepare_operator_decision(path)
         path = engine.response(request)
-        for gate in ('pending_task', 'pending_acceptance', 'pending_post_accept', 'pending_replan',
+        for gate in ('pending_task', 'pending_acceptance', 'pending_post_accept', 'pending_revision',
                      'pending_directive', 'review_receipts', 'commander_receipts', 'worker_receipts'):
             engine.context.run[gate] = {'blocked': True}
             with self.assertRaises(HarnessError):
@@ -153,11 +152,10 @@ class OperatorDecisionTests(unittest.TestCase):
         packet = engine.decision_packet({}, task_id='one')['operator_decisions']
         self.assertEqual(packet[0]['response']['decision'], 'continue')
         self.assertEqual(packet[0]['source'], engine.source)
-        self.assertEqual(len(engine.decision_packet({}, kind='replan')['operator_decisions']), 1)
+        self.assertEqual(len(engine.decision_packet({}, kind='decide')['operator_decisions']), 1)
 
     def test_worker_question_must_match_bound_blocker(self):
         engine = self.engine
-        engine.context.run.pop('replan_stopped')
         entry = engine.context.run['dispatches'][0]
         entry.update(add_worker_dispatch({}, engine.context.directory, entry['id'], 'one'))
         artifact = Path(engine.source['artifact'])
@@ -179,7 +177,6 @@ class OperatorDecisionTests(unittest.TestCase):
 
     def test_handoff_binds_exact_accepted_worker_and_dependency(self):
         engine = self.engine
-        engine.context.run.pop('replan_stopped')
         entry = engine.context.run['dispatches'][0]
         entry.update(add_worker_dispatch({}, engine.context.directory, entry['id'], 'one'))
         artifact = Path(engine.source['artifact'])
@@ -201,15 +198,17 @@ class OperatorDecisionTests(unittest.TestCase):
         with self.assertRaises(HarnessError):
             engine.prepare_operator_decision(engine.response(request, 'stop'))
 
-    def test_registration_requires_current_stop_but_existing_request_survives_advance(self):
+    def test_registration_requires_current_question_but_existing_request_survives_advance(self):
         engine = self.engine
-        engine.context.run['replan_stopped']['dispatch_id'] = 'other'
-        with self.assertRaises(HarnessError):
+        engine.context.run['dispatches'].append({'id': 'later', 'invoked': True})
+        with self.assertRaisesRegex(HarnessError, 'stale decision source'):
             engine.request()
         self.assertFalse(engine.context.run['decision_requests'])
-        engine.context.run['replan_stopped']['dispatch_id'] = 'dispatch_one'
+        engine.context.run['dispatches'].pop()
+        for question in ('A different question', ''):
+            with self.assertRaises(HarnessError):
+                engine.register_decision_request('one', 'run', 'commander', engine.source, question)
         request = engine.request()
-        engine.context.run.pop('replan_stopped')
         engine.context.run['dispatches'].append({'id': 'later', 'invoked': True})
         engine.context.run['accepted']['one'] = {'commit': 'later-accepted'}
         self.assertEqual(engine.request()['id'], request['id'])

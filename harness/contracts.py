@@ -1,4 +1,5 @@
 """Small, closed JSON-schema subset; every returned field is validated locally."""
+import json
 import re
 from copy import deepcopy
 from pathlib import PurePosixPath
@@ -46,9 +47,17 @@ TASK["properties"]["evidence_requirements"] = {
         kind=EVIDENCE_KIND, path={"type": "string", "minLength": 1, "maxLength": 4096})}
 PLAN = obj(tasks={"type": "array", "items": TASK, "minItems": 1})
 TASK_UPDATE = obj(id=TASK_ID, description=NONBLANK, add_depends_on=DEPENDENCIES)
-REPLAN = obj(action={"type": "string", "enum": ["revise", "stop"]},
-             reason=DETAIL, new_tasks={"type": "array", "items": TASK},
+# The one commander call. Every field is required; a field the action does not
+# use is an empty string or array. Branch rules are local (validate_decision),
+# never a provider-side union.
+OPTIONAL_TEXT = {"type": "string", "maxLength": 4000}
+DECIDE = obj(action={"type": "string", "enum": ["implement", "revise", "ask"]},
+             selected_task={"type": "string", "maxLength": 64}, instruction=OPTIONAL_TEXT,
+             reason=OPTIONAL_TEXT, new_tasks={"type": "array", "items": TASK},
              updates={"type": "array", "items": TASK_UPDATE})
+# "final" is the whole-run decision target and final-review task; "run" is the
+# decide call's task ID. Neither may name a planned task.
+RESERVED_TASK_IDS = ("final", "run")
 WORK = obj(status={"type": "string", "enum": ["completed", "blocked"]},
            summary=WORK_SUMMARY, evidence=EVIDENCE, blockers=EVIDENCE,
            blocker_kind={"type": "string", "enum": ["none", "task", "environment", "operator", "continuation"]},
@@ -134,7 +143,12 @@ def envelope(schema, task_id, dispatch_id):
 
 
 class ScopeExtensionRequired(HarnessError):
-    """A revision adds a task outside approved scope; operator authority decides, not a redo."""
+    """A revision's only defect is new scope; operator authority decides, never a redo."""
+
+    def __init__(self, patterns):
+        self.patterns = list(patterns)
+        super().__init__("新增任务必须复用既有文件范围或操作者显式批准的范围，不得自行扩大范围："
+                         + json.dumps(self.patterns, ensure_ascii=False))
 
 
 def output_constraints(schema, path="response"):
@@ -356,12 +370,6 @@ def judge_work(result, schema):
     return Judgment("valid")
 
 
-def task_directive(task_ids):
-    """A selection must name its route; a missing action is a contract error."""
-    return obj(selected_task={"type": "string", "enum": list(task_ids)}, instruction=DETAIL,
-               action={"type": "string", "enum": ["implement", "replan"]})
-
-
 def validate_required_commands(task):
     result = []
     for field in ("required_commands", "self_checks"):
@@ -373,12 +381,15 @@ def validate_required_commands(task):
     return result
 
 
-def validate_plan(plan, max_tasks=20):
+def validate_plan(plan):
     validate_structure(plan, PLAN)
     tasks = plan["tasks"]
     ids = [t["id"] for t in tasks]
-    if not tasks or len(tasks) > max_tasks or len(set(ids)) != len(ids):
-        raise HarnessError("计划必须有 1..max_tasks 个任务，且 ID 唯一")
+    if not tasks or len(set(ids)) != len(ids):
+        raise HarnessError("计划必须至少有 1 个任务，且 ID 唯一")
+    reserved = sorted(set(ids) & set(RESERVED_TASK_IDS))
+    if reserved:
+        raise HarnessError(f"任务 ID 不得使用保留名：{reserved}")
     for task in tasks:
         commands = task.get("required_commands", [])
         validate_commands(commands, "task.required_commands")
@@ -425,47 +436,48 @@ def validate_plan(plan, max_tasks=20):
     return tasks
 
 
-def apply_revision(current_tasks, result, accepted_ids, max_tasks=20, *, additional_allowed_paths=()):
-    """Apply only explicit additions and brief updates to runtime-owned tasks."""
-    validate_structure(result, REPLAN)
-    validate_plan({"tasks": current_tasks}, max_tasks)
+def apply_revision(current_tasks, result, accepted_ids, *, additional_allowed_paths=(), scope_violations=None):
+    """Apply only explicit additions and brief updates to runtime-owned tasks.
+
+    ``result`` carries ``new_tasks`` and ``updates`` (a decide payload). New scope
+    raises ScopeExtensionRequired after every other check, or, when a list is
+    given, is collected there so the caller can finish its own checks first.
+    """
+    # Only these two fields are operations; their shape is checked here too, so a
+    # replay of a saved original cannot apply fields the contract never allowed.
+    for field in ("new_tasks", "updates"):
+        validate_structure(result.get(field), DECIDE["properties"][field], f"response.{field}")
+    validate_plan({"tasks": current_tasks})
     accepted = set(accepted_ids)
     current = {task["id"]: task for task in current_tasks}
     if not accepted <= current.keys():
-        raise HarnessError("再规划引用未知已接受任务")
-    if result["action"] == "stop":
-        if result["new_tasks"] or result["updates"]:
-            raise HarnessError("停止再规划时不得包含新增任务或更新")
-        _validate_format(result, REPLAN, "response")
-        return deepcopy(current_tasks)
+        raise HarnessError("修订引用未知已接受任务")
     proposed = deepcopy(current_tasks)
     by_id = {task["id"]: task for task in proposed}
     updated = set()
     for update in result["updates"]:
         ident = update["id"]
         if ident not in current or ident in accepted or ident in updated:
-            raise HarnessError("再规划只能更新未接受的既有任务，且每个任务仅更新一次")
+            raise HarnessError("修订只能更新未接受的既有任务，且每个任务仅更新一次")
         updated.add(ident)
         by_id[ident]["description"] = update["description"]
         for dependency in update["add_depends_on"]:
             if dependency not in by_id[ident]["depends_on"]:
                 by_id[ident]["depends_on"].append(dependency)
     proposed.extend(deepcopy(result["new_tasks"]))
-    tasks = validate_revision(current_tasks, proposed, accepted, max_tasks,
-                              additional_allowed_paths=additional_allowed_paths)
-    _validate_format(result, REPLAN, "response")
-    return tasks
+    return validate_revision(current_tasks, proposed, accepted, additional_allowed_paths=additional_allowed_paths,
+                             scope_violations=scope_violations)
 
 
-def validate_revision(current_tasks, proposed_tasks, accepted_ids, max_tasks=20, *, additional_allowed_paths=()):
+def validate_revision(current_tasks, proposed_tasks, accepted_ids, *, additional_allowed_paths=(), scope_violations=None):
     """Allow bounded refinement while retaining every original obligation."""
-    validate_plan({"tasks": current_tasks}, max_tasks)
-    tasks = validate_plan({"tasks": proposed_tasks}, max_tasks)
+    validate_plan({"tasks": current_tasks})
+    tasks = validate_plan({"tasks": proposed_tasks})
     current = {task["id"]: task for task in current_tasks}
     proposed = {task["id"]: task for task in tasks}
     accepted = set(accepted_ids)
     if not accepted <= current.keys() or not current.keys() <= proposed.keys():
-        raise HarnessError("再规划不得移除既有任务或引用未知已接受任务")
+        raise HarnessError("修订不得移除既有任务或引用未知已接受任务")
     scope = {path for task in current_tasks for path in task["allowed_paths"]}
     for path in additional_allowed_paths:
         if not isinstance(path, str):
@@ -475,19 +487,82 @@ def validate_revision(current_tasks, proposed_tasks, accepted_ids, max_tasks=20,
     for ident, old in current.items():
         new = proposed[ident]
         if ident in accepted and new != old:
-            raise HarnessError("再规划不得修改已接受任务")
+            raise HarnessError("修订不得修改已接受任务")
         if old["acceptance"] != new["acceptance"] or old["allowed_paths"] != new["allowed_paths"]:
-            raise HarnessError("再规划不得改变既有验收条件或文件范围")
+            raise HarnessError("修订不得改变既有验收条件或文件范围")
         if old.get("required_commands", []) != new.get("required_commands", []):
-            raise HarnessError("再规划不得改变既有任务的 required_commands")
+            raise HarnessError("修订不得改变既有任务的 required_commands")
         for field in ("self_checks", "evidence_requirements"):
             if old.get(field, []) != new.get(field, []):
-                raise HarnessError(f"再规划不得改变既有任务的 {field}")
+                raise HarnessError(f"修订不得改变既有任务的 {field}")
         if not set(old["depends_on"]) <= set(new["depends_on"]):
-            raise HarnessError("再规划不得移除既有依赖")
-    for ident in proposed.keys() - current.keys():
-        if not set(proposed[ident]["allowed_paths"]) <= scope:
-            raise ScopeExtensionRequired("新增任务必须复用既有文件范围或操作者显式批准的范围，不得自行扩大范围")
+            raise HarnessError("修订不得移除既有依赖")
     if proposed == current:
-        raise HarnessError("再规划没有产生有效变更")
+        raise HarnessError("修订没有产生有效变更")
+    outside = list(dict.fromkeys(path for task in tasks if task["id"] not in current
+                                 for path in task["allowed_paths"] if path not in scope))
+    if outside:
+        if scope_violations is None:
+            raise ScopeExtensionRequired(outside)
+        scope_violations.extend(outside)
     return tasks
+
+
+def _blank(value):
+    return not isinstance(value, str) or not value.strip() or "\0" in value
+
+
+def validate_decision(result, *, tasks, accepted, ready, gated=(), approved_scope=(),
+                      validate_tasks=None, capacity=None):
+    """Branch rules of one structurally valid, in-bounds decide payload.
+
+    Returns (action, proposed_tasks). ``ready`` is the request's own ready list;
+    a revise selects from its revised DAG. New scope is checked last: it stops
+    for operator authority only when it is the revision's only defect.
+    """
+    action = result["action"]
+    if action == "ask":
+        if result["selected_task"] or result["instruction"] or result["new_tasks"] or result["updates"]:
+            raise HarnessError("ask 的 selected_task、instruction、new_tasks、updates 必须为空")
+        if _blank(result["reason"]):
+            raise HarnessError("ask 的 reason 必须是非空问题")
+        return action, None
+    if action == "implement":
+        if not tasks:
+            raise HarnessError("初始规划只能 revise 或 ask")
+        # reason is free text here: recorded with the original, never used.
+        if result["new_tasks"] or result["updates"]:
+            raise HarnessError("implement 的 new_tasks、updates 必须为空")
+        if _blank(result["instruction"]):
+            raise HarnessError("implement 必须给出非空 instruction")
+        if result["selected_task"] not in list(ready):
+            raise HarnessError("implement 的 selected_task 必须是当前就绪任务")
+        return action, None
+    if _blank(result["reason"]):
+        raise HarnessError("revise 必须给出非空 reason")
+    if not tasks:
+        if result["selected_task"] or result["instruction"] or result["updates"]:
+            raise HarnessError("初始规划的 revise 不带 selected_task、instruction 或 updates")
+        proposed = validate_plan({"tasks": result["new_tasks"]})
+        if validate_tasks is not None:
+            validate_tasks({"tasks": proposed})
+        if capacity is not None:
+            capacity(proposed, proposed)
+        return action, proposed
+    if _blank(result["instruction"]):
+        raise HarnessError("revise 必须同时给出非空 instruction")
+    outside = []
+    proposed = apply_revision(tasks, result, accepted, additional_allowed_paths=approved_scope,
+                              scope_violations=outside)
+    if validate_tasks is not None:
+        validate_tasks({"tasks": proposed})
+    done = set(accepted)
+    revised_ready = [t["id"] for t in proposed if t["id"] not in done
+                     and set(t["depends_on"]) <= done and t["id"] not in set(gated)]
+    if result["selected_task"] not in revised_ready:
+        raise HarnessError("revise 的 selected_task 必须是修订后计划中的就绪任务")
+    if capacity is not None:
+        capacity(proposed, None)
+    if outside:
+        raise ScopeExtensionRequired(outside)
+    return action, proposed

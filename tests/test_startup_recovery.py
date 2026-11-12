@@ -71,9 +71,9 @@ class StartupRecoveryTests(RepoCase):
         self.assertEqual(result["tasks"], plan["tasks"])
         self.assertEqual(result["original_tasks"], plan["tasks"])
         self.assertEqual(len(result["plan_history"]), 1)
-        self.assertEqual(result["plan_history"][0]["tasks"], plan["tasks"])
+        self.assertEqual(set(result["plan_history"][0]), {"revision", "artifact", "artifact_digest"})
         self.assertEqual(read_json(Path(result["plan_history"][0]["artifact"]))["tasks"], plan["tasks"])
-        self.assertFalse(any(call["kind"] == "plan" for call in backend.calls))
+        self.assertFalse(any(call["role"] == "commander" for call in backend.calls))
 
     def test_supplied_multitask_plan_recovers_after_binding_and_diagnostic_saves(self):
         for stage in ("binding", "diagnostics"):
@@ -154,7 +154,7 @@ class StartupRecoveryTests(RepoCase):
         self.assertEqual(saved["original_tasks"], [])
         result = self.engine(backend).resume(saved["id"])
         self.assertEqual(result["status"], "completed")
-        self.assertEqual(sum(call["kind"] == "plan" for call in backend.calls), 1)
+        self.assertEqual(sum(call["kind"] == "decide" for call in backend.calls), 1)
         self.assertEqual(len(result["plan_history"]), 1)
 
     def test_model_plan_artifact_write_failure_reuses_and_revalidates_receipt(self):
@@ -163,12 +163,13 @@ class StartupRecoveryTests(RepoCase):
                 backend = RecordingBackend()
                 engine = self.engine(backend)
                 saved = self.fail_plan_artifact(engine)
-                self.assertTrue(saved["original_tasks"])
-                receipt = saved["commander_receipts"]["commander:plan:planning"]
+                # The model plan, its first version and the receipt land in one save.
+                self.assertEqual(saved["original_tasks"], [])
+                receipt = saved["commander_receipts"]["commander:decide:run"]
                 artifact = Path(receipt["artifact"])
                 if mode == "changed_result":
                     value = read_json(artifact)
-                    value["tasks"][0]["acceptance"].append("Changed after receipt validation")
+                    value["new_tasks"][0]["acceptance"].append("Changed after receipt validation")
                     write_json(artifact, value)
                 elif mode == "missing_result":
                     artifact.unlink()
@@ -178,7 +179,8 @@ class StartupRecoveryTests(RepoCase):
                 if mode == "intact":
                     result = self.engine(backend).resume(saved["id"])
                     self.assertEqual(result["status"], "awaiting_approval")
-                    self.assertEqual(result["tasks"], saved["original_tasks"])
+                    self.assertEqual(result["tasks"], read_json(artifact)["new_tasks"])
+                    self.assertEqual(result["original_tasks"], result["tasks"])
                     self.assertEqual(len(result["plan_history"]), 1)
                     self.assertEqual(result["commander_receipts"], {})
                 else:
@@ -189,7 +191,7 @@ class StartupRecoveryTests(RepoCase):
                     self.assertEqual(result["plan_history"], [])
                     self.assertEqual(result["commander_receipts"], saved["commander_receipts"])
                 self.assertEqual(backend.calls, calls)
-                self.assertEqual(sum(call["kind"] == "plan" for call in backend.calls), 1)
+                self.assertEqual(sum(call["kind"] == "decide" for call in backend.calls), 1)
 
     def assert_unbound_resume_rejected(self, engine, backend):
         saved = self.saved(engine)

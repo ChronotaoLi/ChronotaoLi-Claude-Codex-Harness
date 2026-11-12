@@ -41,7 +41,6 @@ class RunLifecycle(RuntimeService):
                     "config_path": str(self.context.config.path), "config_snapshot": deepcopy(self.context.config.data),
                     "asset_digest": asset_digest(self.context.config), "base_commit": git.head(self.context.repo),
                     "original_tasks": deepcopy(supplied_tasks),
-                    "replan_attempts": 0, "final_attempts": 0,
                     "review_history": {}, "final_history": [], "plan_history": [],
                     "worker_receipts": {}, "review_receipts": {}, "commander_receipts": {},
                     "approved_scope": [],
@@ -113,8 +112,7 @@ class RunLifecycle(RuntimeService):
                     "worker_receipts": dict, "commander_receipts": dict, "worktree_binding": dict, "ignored_baseline": list,
                     "approved_scope": list,
                     "final_history": list, "plan_history": list,
-                    "agent_dispatches": int, "final_attempts": int,
-                    "replan_attempts": int, "plan_approval_required": bool, "plan_approved": bool,
+                    "agent_dispatches": int, "plan_approval_required": bool, "plan_approved": bool,
                     "environment_updates": list, "environment_checks": list,
                     "decision_requests": list, "operator_decisions": list, "task_checkpoints": list, "checkpoint_batches": list,
                     "continuation_history": list, "execution_guidance": list, "store_revision": int}
@@ -152,12 +150,32 @@ class RunLifecycle(RuntimeService):
                 fail(field)
             return value
 
-        for field in ("pending_task", "pending_acceptance", "pending_post_accept", "pending_replan",
-                      "pending_directive", "worker_recovery", "replan_stopped", "retained_candidate"):
+        for field in ("pending_task", "pending_acceptance", "pending_post_accept", "pending_revision",
+                      "pending_directive", "worker_recovery"):
             if field in self.context.run:
                 mapping(self.context.run[field], field)
-        if "pending_task" in self.context.run and "pending_replan" in self.context.run:
-            fail("pending_task 与 pending_replan 不能同时存在")
+        if "pending_revision" in self.context.run and (
+                any(field in self.context.run for field in ("pending_task", "pending_acceptance",
+                                                            "pending_post_accept", "pending_directive"))
+                or "commander:decide:run" in self.context.run["commander_receipts"]):
+            fail("pending_revision 不能与任务阶段、待派发指令或指挥决定回执同时存在")
+
+        def plan_reference(value, field, revision):
+            value = mapping(value, field)
+            digest = value.get("artifact_digest")
+            if (set(value) != {"revision", "artifact", "artifact_digest"} or value.get("revision") != revision
+                    or value.get("artifact") != str(self.context.directory / "plans" / f"revision-{revision}.json")
+                    or not isinstance(digest, str) or len(digest) != 64
+                    or any(c not in "0123456789abcdef" for c in digest)):
+                fail(field + " 必须只含修订号、计划文件路径与 SHA256")
+
+        history = self.context.run["plan_history"]
+        for index, row in enumerate(history):
+            plan_reference(row, f"plan_history[{index}]", index)
+        if bool(history) != bool(self.context.run["tasks"]):
+            fail("plan_history 与 tasks 必须同时为空或同时非空")
+        if "pending_revision" in self.context.run:
+            plan_reference(self.context.run["pending_revision"], "pending_revision", len(history))
 
         task_ids = set()
         for index, task in enumerate(self.context.run["tasks"]):
@@ -180,6 +198,14 @@ class RunLifecycle(RuntimeService):
             task_reference(payload.get("task_id"), field + ".task_id")
         if self.context.run.get("current_task") is not None:
             task_reference(self.context.run["current_task"], "current_task")
+        directive = self.context.run.get("pending_directive")
+        if directive is not None:
+            selected = mapping(directive.get("directive"), "pending_directive.directive").get("selected_task")
+            if selected != self.context.run.get("current_task"):
+                fail("pending_directive 的任务必须等于 current_task")
+            if "revision" in directive and (type(directive["revision"]) is not int
+                                            or directive["revision"] != len(self.context.run["plan_history"]) - 1):
+                fail("pending_directive.revision 必须指向最后一个计划版本")
 
         dispatches = {}
         for entry in self.context.run["dispatches"]:
@@ -226,6 +252,7 @@ class RunLifecycle(RuntimeService):
             if (previous is None or previous.get("id") != entry["retry_of"]
                     or f"{previous.get('role')}:{previous.get('kind')}:{previous.get('task_id')}" != key
                     or previous.get("status") != "invalid" or "retry_of" in previous
+                    or "out_of_scope_paths" in previous
                     or entry.get("role") not in ("commander", "reviewer")):
                 fail("dispatches.retry_of 必须指向它之前最后一次模型调用，且那是同一调用、未重做过的无效输出")
             if entry.get("invoked") is True:
@@ -234,14 +261,6 @@ class RunLifecycle(RuntimeService):
                 retried.add(entry["retry_of"])
         for tid, recovery in self.context.run.get("worker_recovery", {}).items():
             source(recovery, f"worker:implement:{tid}", "worker_recovery." + tid)
-        owners = [("retained_candidate", self.context.run)]
-        if "pending_replan" in self.context.run:
-            owners.append(("pending_replan.retained_candidate", self.context.run["pending_replan"]))
-        for field, owner in owners:
-            if "retained_candidate" in owner or owner.get("candidate_policy") == "retain":
-                guard = mapping(owner.get("retained_candidate"), field)
-                task_reference(guard.get("task_id"), field + ".task_id")
-                source(guard, "commander:replan:replanning", field)
 
     def abandon(self, ident, *, confirm_exited=()):
         """Mark an unfinished run abandoned; the worktree is removed only by cleanup-run."""
@@ -260,7 +279,7 @@ class RunLifecycle(RuntimeService):
                 self.context.event("run_abandoned")
             return self.context.run
 
-    def resume(self, ident, *, step=False, approve_plan=False, reverify=False, retry_stopped=None, confirm_exited=(),
+    def resume(self, ident, *, step=False, approve_plan=False, reverify=False, confirm_exited=(),
                allow_scope=(), environment_update=None, operator_decision=None,
                execution_guidance=None, reject_continuation=None):
         runtime = self.context
@@ -275,19 +294,19 @@ class RunLifecycle(RuntimeService):
                     raise HarnessError("恢复修改选项仅用于未完成的 run（含 --reject-continuation 与 --execution-guidance）")
                 return self.context.run
             if reject_continuation is not None and (operator_decision is not None or environment_update is not None
-                    or execution_guidance is not None or reverify or retry_stopped is not None
-                    or allow_scope):
-                raise HarnessError("--reject-continuation 不能与决定、环境更新、执行指导、重验、重规划或扩展范围合用")
+                    or execution_guidance is not None or reverify or allow_scope):
+                raise HarnessError("--reject-continuation 不能与决定、环境更新、执行指导、重验或扩展范围合用")
             if execution_guidance is not None and (operator_decision is not None or environment_update is not None
-                    or reverify or retry_stopped is not None or allow_scope):
-                raise HarnessError("--execution-guidance 不能与决定、环境更新、重验、重规划或扩展范围合用")
-            if operator_decision is not None and (environment_update is not None or reverify or retry_stopped is not None
-                                                   or allow_scope):
-                raise HarnessError("--operator-decision 不能与环境更新、重验、重试停止或扩展范围合用")
-            if environment_update is not None and (reverify or retry_stopped is not None or allow_scope):
-                raise HarnessError("--environment-update 不能与 --reverify、--retry-stopped 或 --allow-scope 合用")
-            if reverify and retry_stopped is not None:
-                raise HarnessError("--reverify 不能与 --retry-stopped 合用")
+                    or reverify or allow_scope):
+                raise HarnessError("--execution-guidance 不能与决定、环境更新、重验或扩展范围合用")
+            if operator_decision is not None and (environment_update is not None or reverify or allow_scope):
+                raise HarnessError("--operator-decision 不能与环境更新、重验或扩展范围合用")
+            if environment_update is not None and (reverify or allow_scope):
+                raise HarnessError("--environment-update 不能与 --reverify 或 --allow-scope 合用")
+            # Checked before any write, including an exit confirmation: a returned
+            # decision is never discarded by re-verification.
+            if reverify and self.services.planning.decide_returned():
+                raise HarnessError("--reverify 不能用于已返回、尚未处理的指挥决定；先普通 resume")
             self.context.reverify_requested = reverify
             changes = self.context.config.resume_changes(self.context.run["config_snapshot"])
             if self.context.run.get("asset_digest") != asset_digest(self.context.config):
@@ -310,32 +329,6 @@ class RunLifecycle(RuntimeService):
             update = self.services.environment.prepare_environment_update(environment_update) if environment_update is not None else None
             decision_values, decisions = (self.services.decisions.prepare_operator_decisions(operator_decision)
                                           if operator_decision is not None else ([], []))
-            if retry_stopped is not None:
-                stopped = self.context.run.get("replan_stopped")
-                if not stopped or stopped["target"] != retry_stopped:
-                    raise HarnessError("--retry-stopped 必须匹配已停止的任务 ID，或 final")
-                # Recover registration if interruption followed the saved stop.
-                # Retry must not erase an unanswered, attributable decision gate.
-                source_position = next((i for i, d in enumerate(self.context.run["dispatches"])
-                                        if d.get("id") == stopped.get("dispatch_id")), None)
-                if stopped.get("source_digest") and (source_position is None or not any(
-                        d.get("invoked", True) for d in self.context.run["dispatches"][source_position + 1:])):
-                    self.services.workflow.synchronize_decision_requests()
-                for request in self.services.decisions.decision_context():
-                    if (request["kind"] != "replan_stop" or request["task_id"] != stopped["target"]
-                            or request["question"] != stopped["reason"]
-                            or request["source"]["dispatch_id"] != stopped.get("dispatch_id")
-                            or stopped.get("source_digest") not in (None, request["source"]["artifact_digest"])):
-                        continue
-                    response = request["response"]
-                    boundary = response["dispatch_count"] if response else request["dispatch_count"]
-                    if any(d.get("invoked", True) for d in self.context.run["dispatches"][boundary:]):
-                        continue
-                    if response is None:
-                        raise self.services.workflow.decision_required(request)
-                    if response["decision"] == "stop":
-                        raise HarnessError(f"操作者已决定停止：request_id={request['id']}；"
-                                           "请使用 --operator-decision 显式更新为 continue")
             if allow_scope:
                 self.services.planning.approve_scope_extensions(allow_scope)
             self.services.decisions.record_operator_decisions(decisions)
@@ -344,24 +337,6 @@ class RunLifecycle(RuntimeService):
                     error = HarnessError("操作者决定停止；决定与原证据已保存，未派发模型")
                     self.services.workflow.stop(error)
                     raise error
-                answered_ids = {value["request_id"] for value in decision_values}
-                request = next((r for r in self.services.decisions.decision_context()
-                                if r["id"] in answered_ids and r["kind"] == "replan_stop"), None)
-                if request is not None and self.context.run.get("replan_stopped"):
-                    if self.context.run["replan_stopped"].get("dispatch_id") != request["source"]["dispatch_id"]:
-                        raise HarnessError("操作者决定不能重开另一次指挥停止；请回答当前请求")
-                    stopped = self.context.run.pop("replan_stopped")
-                    self.context.run["pending_replan"] = {"stage": "request", "trigger": deepcopy(stopped["trigger"])}
-                    self.context.save()
-                    self.context.event("stopped_replan_decision_applied", request_id=request["id"], artifact=stopped["artifact"])
-            if retry_stopped is not None:
-                stopped = self.context.run.get("replan_stopped")
-                # Reopen the saved planning request, not another attempt by the
-                # already blocked worker. Preserve the original stop as evidence.
-                self.context.run["pending_replan"] = {"stage": "request", "trigger": deepcopy(stopped["trigger"])}
-                self.context.run.pop("replan_stopped")
-                self.context.save()
-                self.context.event("stopped_replan_retry_requested", target=retry_stopped, artifact=stopped["artifact"])
             self.context.memory.repo = self.context.worktree
             self.context.memory.binding = self.context.run["worktree_binding"]
             if changes:

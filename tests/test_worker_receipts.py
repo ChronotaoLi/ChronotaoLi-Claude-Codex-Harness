@@ -214,7 +214,7 @@ class WorkerReceiptTests(RepoCase):
                 with patch.object(engine.services.tasks, 'publish_worker_result', side_effect=KeyboardInterrupt):
                     with self.assertRaises(KeyboardInterrupt):
                         engine.start('Implement greeting', self.plan())
-                # Replay only the worker handoff; task replanning remains separate.
+                # Replay only the worker handoff; the commander's decision remains separate.
                 try:
                     engine.services.tasks.replay_worker()
                 except HarnessError:
@@ -230,7 +230,9 @@ class WorkerReceiptTests(RepoCase):
                     self.assertEqual(len(engine.run['continuation_history']), 1)
                     self.assertTrue(engine.run['pending_continuation'])
                 if kind == 'task':
-                    self.assertIn('pending_replan', engine.run)
+                    # Nothing persistent marks the decision: the saved blocker derives it.
+                    self.assertEqual(engine.run['feedback']['worker']['blocker_kind'], 'task')
+                    self.assertNotIn('commander:decide:run', engine.run['commander_receipts'])
 
     def test_checkpoint_registration_replay_preserves_original_freshness_origin(self):
         import hashlib

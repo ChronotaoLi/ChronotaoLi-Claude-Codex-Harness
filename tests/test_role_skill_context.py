@@ -52,7 +52,7 @@ class RoleSkillContextTests(RepoCase):
         engine = self.engine()
         result = engine.start("Implement greet")
         self.assertEqual(result["status"], "completed")
-        plan_prompt = next(p for e, p in self.prompts(engine) if e["kind"] == "plan")
+        plan_prompt = next(p for e, p in self.prompts(engine) if e["kind"] == "decide" and p["packet"]["trigger"]["kind"] == "plan")
         self.assertEqual([s["name"] for s in plan_prompt["available_skills"]], ["project-checks"])
         self.assertEqual({s["name"] for s in skills_catalog(self.skills)},
                          {"harness-worker", "harness-commander", "harness-reviewer", "project-checks"})

@@ -129,7 +129,7 @@ class DecisionLifecycleTests(RepoCase):
         engine, backend = self.blocked()
         before = self.saved(engine)
         self.assertEqual([c['role'] for c in backend.calls], ['worker'])
-        self.assertEqual(before['replan_attempts'], 0)
+        self.assertEqual(len(before['plan_history']), 1)
         for _ in range(2):
             with self.assertRaises(HarnessError):
                 self.engine(backend).resume(engine.run['id'])
@@ -272,7 +272,7 @@ class DecisionLifecycleTests(RepoCase):
         engine, backend = self.blocked()
         path = self.response(engine)
         before = (engine.directory / 'state.json').read_bytes()
-        for options in ({'environment_update': path}, {'retry_stopped': 'greet'}, {'reverify': True},
+        for options in ({'environment_update': path}, {'reverify': True},
                         {'allow_scope': ['extra.py']}):
             with self.subTest(options=options), self.assertRaises(HarnessError):
                 self.engine(backend).resume(engine.run['id'], operator_decision=path, **options)
@@ -349,7 +349,7 @@ class DecisionLifecycleTests(RepoCase):
         self.assertEqual(len(state['decision_requests']), 1)
         self.assertEqual(len(backend.calls), calls)
 
-    def test_replan_stop_continue_replans_without_rerolling_rejected_final_review(self):
+    def test_final_question_answer_decides_again_without_rerolling_rejected_final_review(self):
         def reject_then_stop(backend, kwargs, packet, result):
             if kwargs['kind'] == 'final_review':
                 result.update(verdict='request_changes', findings=[finding()])
@@ -358,17 +358,18 @@ class DecisionLifecycleTests(RepoCase):
         with self.assertRaises(HarnessError):
             engine.start('Implement greet', self.plan())
         saved = self.saved(engine)
-        self.assertEqual(saved['decision_requests'][0]['kind'], 'replan_stop')
+        self.assertEqual(saved['decision_requests'][0]['kind'], 'commander')
         calls = len(backend.calls)
         with self.assertRaises(HarnessError):
             self.engine(backend).resume(engine.run['id'], operator_decision=self.response(engine))
-        self.assertEqual([c['kind'] for c in backend.calls[calls:]], ['replan'])
+        self.assertEqual([c['kind'] for c in backend.calls[calls:]], ['decide'])
+        self.assertIn('operator_answer', backend.calls[-1]['packet'])
         self.assertEqual(sum(c['kind'] == 'final_review' for c in backend.calls), 1)
         state = self.saved(engine)
-        self.assertEqual(state['final_attempts'], 1)
-        self.assertEqual(state['replan_attempts'], 2)
+        self.assertEqual(len(state['final_history']), 1)
+        self.assertEqual(len(state['plan_history']), 1)
         self.assertEqual(state['accepted'], saved['accepted'])
-        # The old answer names the earlier commander result, not this new stop.
+        # The old answer names the earlier commander question, not this new one.
         snapshot = (engine.directory / 'state.json').read_bytes()
         calls = len(backend.calls)
         old_request = saved['decision_requests'][0]

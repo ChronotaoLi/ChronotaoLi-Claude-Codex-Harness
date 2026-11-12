@@ -10,16 +10,17 @@ from pathlib import Path
 from .adapters import provider_usage, UndecodableOutput
 from .context import compose
 from .continuation import validate_continuation_rejection
-from .receipts import ERROR_EXCERPT_CHARS, InvalidOutput, InvalidReplanStop, InvalidReviewRejection
+from .receipts import ERROR_EXCERPT_CHARS, InvalidOutput, InvalidReviewRejection, ScopeStop
 from .input_projection import validate_dispatch_indexes as validate_input_dispatch_indexes
 from .path_evidence import validate_dispatch_indexes, validate_indexes
+from .planning import attempt_limit_error
 from .recovery import read_bound_bytes, snapshot_digest
 from .services import RuntimeService
 from .shared import validate_mcp
 from .util import group_alive, HarnessError, write_json
 
 MODEL_ROLES = ("commander", "worker", "reviewer")
-JUDGED = ("invalid", "invalid_rejected", "invalid_stopped", "invalid_blocked")
+JUDGED = ("invalid", "invalid_rejected", "invalid_asked", "invalid_blocked")
 
 
 def dispatch_key(entry):
@@ -39,8 +40,9 @@ class Dispatcher(RuntimeService):
 
         Only the run's last model call counts: when it is an invalid output of
         this same call without retry_of, this call is its one automatic redo.
-        When that invalid output was itself a redo, this is a new request
-        (a resume after the stop), still shown the previous invalid output.
+        When that invalid output was itself a redo, or a revision stopped only
+        for scope authority (never redone), this is a new request (a resume
+        after the stop), still shown the previous invalid output.
         """
         last = last_model_call(self.context.run["dispatches"])
         if last is None or dispatch_key(last) != key or last.get("status") != "invalid":
@@ -50,7 +52,7 @@ class Dispatcher(RuntimeService):
         previous = {"dispatch_id": last["id"], "artifact": source["artifact"],
                     "artifact_digest": source["artifact_digest"],
                     "error": str(last.get("error", ""))[:ERROR_EXCERPT_CHARS]}
-        return previous, (None if last.get("retry_of") else last["id"])
+        return previous, (None if last.get("retry_of") or "out_of_scope_paths" in last else last["id"])
 
     def dispatch(self, role, kind, task_id, schema, packet, task=None):
         validate_dispatch_indexes(self.context.directory, self.context.run["dispatches"])
@@ -64,11 +66,9 @@ class Dispatcher(RuntimeService):
             receipts = self.context.run[{"commander": "commander_receipts", "worker": "worker_receipts"}.get(role, "review_receipts")]
             receipt = receipts.get(key)
             if role != "worker" and receipt and "artifact_digest" not in receipt and not Path(receipt["artifact"]).exists():
-                self.services.receipts.validate_terminal_capture(receipt)
                 # Intent was saved before invoke; the provider never returned a
                 # usable result. Retrying still consumes a fresh dispatch budget.
-                receipts.pop(key)
-                self.context.save()
+                self.services.receipts.discard_unreturned(key)
             try:
                 if role == "worker" and key in receipts:
                     result = self.services.worker_receipts.finish(key, task)
@@ -98,7 +98,7 @@ class Dispatcher(RuntimeService):
             except InvalidOutput as invalid:
                 if invalid.entry.get("retry_of"):
                     raise self.stop_invalid(role, invalid) from invalid
-            except (InvalidReviewRejection, InvalidReplanStop):
+            except (InvalidReviewRejection, ScopeStop):
                 raise
             except HarnessError as error:
                 # Also covers post-receipt process/index checks. Worker receipt
@@ -128,8 +128,10 @@ class Dispatcher(RuntimeService):
             role=role, kind=kind, task_id=task_id, schema=schema,
             dispatch_id=dispatch_id, packet=packet, task=task)
         query = (task["title"] + " " + task["description"]) if task else self.context.run["goal"]
-        if role == "commander" and kind == "dispatch":
-            query = self.context.run["goal"] + " " + " ".join(t["title"] for t in packet["ready"])
+        if role == "commander":
+            ready = set(packet.get("trigger", {}).get("ready", []))
+            query = self.context.run["goal"] + " " + " ".join(
+                t["title"] for t in self.context.run["tasks"] if t["id"] in ready)
         memory_diagnostics = {}
         memories = self.context.memory.search(query, level=1, run_id=self.context.run["id"],
                                          diagnostics=memory_diagnostics)
@@ -152,7 +154,7 @@ class Dispatcher(RuntimeService):
                                          memory_diagnostics=memory_diagnostics)
                 hint_omitted = True
         except ContextCapacityError as error:
-            report = {**error.report, "request_id": self.context.run.get("pending_replan", {}).get("request_id")}
+            report = {**error.report, "request_id": None}
             write_json(job / "context-report.json", report)
             self.context.run["last_runtime_error"] = {"role": role, "kind": kind, "task_id": task_id,
                 "error": str(error), "artifact": str(job), "context_report": str(job / "context-report.json"),
@@ -232,7 +234,12 @@ class Dispatcher(RuntimeService):
                                                        worker_task=task_id if role == "worker" else None)
             if rejection and role != "worker":
                 raise HarnessError("continuation revision requires a fresh worker before other model calls")
-            self.services.planning.validate_retained_candidate(before=before, worker_task=task_id if role == "worker" else None)
+            if self.context.run.get("pending_directive"):
+                if role != "worker":
+                    raise HarnessError("待派发指令存在时不得派发其他模型调用；保留现场")
+                # After every local preparation step (pre_agent included) and
+                # before the directive or any budget is consumed.
+                self.services.planning.check_directive(task_id, before, prepared=True)
             self.services.budgets.validate_attempt_accounting()
             limit = self.context.config.data["runtime"]["max_agent_dispatches"]
             if self.context.run["agent_dispatches"] >= limit:
@@ -247,7 +254,7 @@ class Dispatcher(RuntimeService):
             if role == "worker":
                 attempts = self.context.run["attempts"].get(task_id, 0)
                 if self.services.budgets.task_budget_used(task_id) >= self.context.config.data["runtime"]["max_attempts"]:
-                    raise HarnessError(f"{task_id} 已达尝试次数上限")
+                    raise attempt_limit_error(task_id, self.context.config.data["runtime"]["max_attempts"])
                 # Publish and verify the immutable packet and contract before any
                 # budget, receipt or invoked mutation; a failed write charges nothing.
                 inputs = self.services.worker_receipts.publish_inputs(entry, contract, required["packet"])
@@ -274,15 +281,12 @@ class Dispatcher(RuntimeService):
                     "artifact": str(job / "returned-result.json"), "dispatch_id": dispatch_id,
                     "snapshot_digest": entry["snapshot_digest"],
                     "request": request, "request_digest": snapshot_digest(request),
-                    "request_id": (self.context.run["pending_replan"]["request_id"] if kind == "replan"
-                                   else dispatch_id)}
+                    "request_id": dispatch_id}
             entry["process_state"] = "starting"
             entry["invoked"] = True
             entry["invoked_at"] = time.time()
             if rejection:
                 entry["continuation_rejection_id"] = rejection["id"]
-            if role == "worker" and self.context.run.get("retained_candidate"):
-                entry["retained_candidate_revision"] = self.context.run.pop("retained_candidate")["plan_revision"]
             self.context.save()
             invoked = True
             # Only after the durable invoked=True; a failed append never blocks the call.
@@ -308,7 +312,7 @@ class Dispatcher(RuntimeService):
                 return self.services.receipts.finish_review_receipt(key, schema)
             if role == "commander":
                 return self.services.receipts.finish_commander_receipt(f"{role}:{kind}:{task_id}")
-        except (InvalidReviewRejection, InvalidOutput, InvalidReplanStop):
+        except (InvalidReviewRejection, InvalidOutput, ScopeStop):
             # Already judged: the entry carries its verdict, never "failed".
             raise
         except BaseException as error:
