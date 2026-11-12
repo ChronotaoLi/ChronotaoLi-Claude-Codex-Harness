@@ -37,10 +37,12 @@ class ScopeStop(HarnessError):
 
 
 class Decision:
-    """A judged decide result: its payload, a revision's tasks, and an ask's veto error."""
+    """A judged decide result: its payload, a revision's tasks, an ask's veto error,
+    and whether the candidate or HEAD changed during the call (recorded with an ask)."""
 
-    def __init__(self, payload, proposed=None, veto=None):
+    def __init__(self, payload, proposed=None, veto=None, candidate_changed=False):
         self.payload, self.proposed, self.veto = payload, proposed, veto
+        self.candidate_changed = candidate_changed
 
 
 class InvalidReviewRejection(HarnessError):
@@ -188,7 +190,10 @@ class ResultReceipts(RuntimeService):
 
         ``ask`` is a veto read after the common preconditions only (exit
         confirmed, bytes bound, strict object, envelope identity): any other
-        defect is recorded with the question, never redone.
+        defect is recorded with the question, never redone. Recognising it does
+        not depend on the candidate gate either: a changed candidate or HEAD is
+        recorded with the question, which grants that candidate nothing. Every
+        other decision needs the bound snapshot and HEAD before it is judged.
         """
         receipt = self.context.run["commander_receipts"][key]
         self.validate_terminal_capture(receipt)
@@ -199,9 +204,6 @@ class ResultReceipts(RuntimeService):
             raise HarnessError("指挥原始请求已改变；保留证据，禁止重新抽取结论")
         artifact = Path(receipt["artifact"])
         raw, _ = read_bound_bytes(receipt, "指挥", bind=self.context.save)
-        if (git.head(self.context.worktree, binding=self.context.run["worktree_binding"]) != self.context.run["expected_head"]
-                or snapshot_digest(self.context.snapshot()) != receipt["snapshot_digest"]):
-            raise HarnessError("指挥或 hook 修改了代码/HEAD；原指挥结果不能用于当前快照")
         try:
             result = strict_json_loads(raw)
         except (ValueError, UnicodeError, RecursionError) as error:
@@ -209,15 +211,18 @@ class ResultReceipts(RuntimeService):
         self.context.ensure_exited()
         contract = envelope(receipt["request"]["schema"], entry["task_id"], entry["id"])
         packet = receipt["request"]["packet"]
-        if (isinstance(result, dict) and result.get("action") == "ask"
-                and result.get("task_id") == entry["task_id"] and result.get("dispatch_id") == entry["id"]):
+        asked = (isinstance(result, dict) and result.get("action") == "ask"
+                 and result.get("task_id") == entry["task_id"] and result.get("dispatch_id") == entry["id"])
+        if not asked and self.candidate_changed(receipt):
+            raise HarnessError("指挥或 hook 修改了代码/HEAD；原指挥结果不能用于当前快照")
+        if asked:
             payload = {k: v for k, v in result.items() if k not in ("task_id", "dispatch_id")}
             try:
                 validate(result, contract)
                 self.services.planning.check_decision(payload, packet)
             except HarnessError as error:
-                # The landing save records invalid_asked with this error.
-                return Decision(payload, veto=str(error))
+                # The landing save records invalid_asked with this error; no hook runs.
+                return Decision(payload, veto=str(error), candidate_changed=self.candidate_changed(receipt))
         else:
             payload = {k: v for k, v in result.items() if k not in ("task_id", "dispatch_id")} if isinstance(result, dict) else None
             try:
@@ -236,16 +241,38 @@ class ResultReceipts(RuntimeService):
             self.context.save()
             self.context.emit_hook("post_agent", {**entry, "status": "completed", "result": result},
                             artifact.parent / f"post-agent-{receipt['hook_attempts']}")
-            if (git.head(self.context.worktree, binding=self.context.run["worktree_binding"]) != self.context.run["expected_head"]
-                    or snapshot_digest(self.context.snapshot()) != receipt["snapshot_digest"]):
+            if not asked and self.candidate_changed(receipt):
                 raise HarnessError("commander hook 修改了代码/HEAD；已停止，保留现场")
             receipt["hook_completed"] = True
         entry["status"] = "completed"
         entry.pop("error", None)
         self.context.save()
-        if payload["action"] == "ask":
-            return Decision(payload)
+        if asked:
+            # Read after the hook, before the landing save that records it.
+            return Decision(payload, candidate_changed=self.candidate_changed(receipt))
         return Decision(payload, proposed)
+
+    def returned_ask(self, key):
+        """Whether the returned, unlanded original names an ask for this very call.
+
+        A read-only look at envelope identity and action only; landing it runs
+        every common precondition again (exit, binding, strict decoding).
+        """
+        receipt = self.context.run["commander_receipts"].get(key)
+        if receipt is None:
+            return False
+        try:
+            raw = Path(receipt["artifact"]).read_bytes()
+            result = strict_json_loads(raw)
+        except (OSError, ValueError, UnicodeError, RecursionError):
+            return False
+        return (isinstance(result, dict) and result.get("action") == "ask"
+                and result.get("task_id") == key.rsplit(":", 1)[1] and result.get("dispatch_id") == receipt["dispatch_id"])
+
+    def candidate_changed(self, receipt):
+        """Whether HEAD or the candidate snapshot differs from the one the call was bound to."""
+        return (git.head(self.context.worktree, binding=self.context.run["worktree_binding"]) != self.context.run["expected_head"]
+                or snapshot_digest(self.context.snapshot()) != receipt["snapshot_digest"])
 
     def finish_review_receipt(self, key, schema):
         """Judge a returned review without treating unvalidated JSON as approval."""

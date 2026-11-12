@@ -30,6 +30,8 @@ class Scheduler(RuntimeService):
             resolve_continuation(self.context)
 
     def next_step(self, *, step=False, accepted_this_call=0):
+        # Every step derives from the plan: its published files are the authority.
+        self.services.planning.verify_plan_authority()
         result = self._next_step(step=step, accepted_this_call=accepted_this_call)
         if (DECIDE_KEY in self.context.run["commander_receipts"] and result.kind in ADVANCING
                 and not (result.kind == "final_review" and self.context.reverify_requested)):
@@ -158,6 +160,7 @@ class Scheduler(RuntimeService):
                         break
                 else:
                     raise HarnessError(f"调度推导出未知步骤：{action.kind}")
+            self.services.planning.verify_plan_authority()
             self.context.run["status"] = "completed"
             self.context.save()
             self.context.checkpoint()

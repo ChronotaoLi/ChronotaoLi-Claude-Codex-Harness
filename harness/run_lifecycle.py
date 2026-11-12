@@ -312,6 +312,9 @@ class RunLifecycle(RuntimeService):
             if self.context.run.get("asset_digest") != asset_digest(self.context.config):
                 raise HarnessError("共享规则、skills、MCP 或 hooks 已改变；请恢复原版本后继续")
             self.services.environment.environment_context()
+            # The published plan is the authority: checked before any write of
+            # this resume, the audited exit confirmation included.
+            self.services.planning.verify_plan_authority()
             self.context.confirm_exited(confirm_exited)
             self.context.ensure_exited()
             if not self.context.run["worktree_binding"]:
@@ -320,6 +323,13 @@ class RunLifecycle(RuntimeService):
                                    "若工作树或分支已创建，请核对后手工清理")
             validate_dispatch_indexes(self.context.directory, self.context.run["dispatches"])
             validate_input_dispatch_indexes(self.context.directory, self.context.run["dispatches"])
+            # A returned ask lands on the common preconditions alone, before the
+            # HEAD gate below; the run then stops at the question.
+            try:
+                self.services.planning.land_returned_ask()
+            except BaseException as error:
+                self.services.workflow.stop(error)
+                raise
             if git.head(self.context.worktree, binding=self.context.run["worktree_binding"]) != self.context.run["expected_head"]:
                 raise HarnessError("worktree HEAD 与检查点不同；请先核对提交，不自动重放")
             from .workspace_inputs import validate_inputs

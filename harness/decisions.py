@@ -160,7 +160,7 @@ class DecisionRecovery(RuntimeService):
         return row
 
     def register_decision_request(self, task_id, source_task_id, kind, source, question, request_key='', consume=None):
-        """Register one request; ``consume=(key, veto)`` lands a commander ask in the same save.
+        """Register one request; ``consume=(key, veto, entry_marks)`` lands a commander ask in the same save.
 
         Every check and the request file come first; the row, the receipt
         removal and the dispatch entry's verdict are published together.
@@ -206,11 +206,12 @@ class DecisionRecovery(RuntimeService):
         row = self._decision_artifact(record, 'operator_decision_requested')
         self.context.run['decision_requests'].append(row)
         if consume is not None:
-            key, veto = consume
+            key, veto, marks = consume
             self.context.run['commander_receipts'].pop(key)
             entry = next(d for d in self.context.run['dispatches'] if d['id'] == receipt['dispatch_id'])
             if veto is not None:
                 entry.update(status='invalid_asked', error=veto)
+            entry.update(marks or {})
         self.context.save()
         if consume is not None and consume[1] is not None:
             self.services.receipts.observe_invalid(entry)

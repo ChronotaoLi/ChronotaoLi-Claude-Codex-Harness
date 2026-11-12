@@ -189,10 +189,28 @@ class Planner(RuntimeService):
         target = trigger.get("current_task") if trigger.get("kind") == "task" and trigger.get("current_task") else "final"
         source = {"artifact": receipt["artifact"], "artifact_digest": receipt["artifact_digest"],
                   "dispatch_id": receipt["dispatch_id"]}
+        changed = {"candidate_changed": True} if decision.candidate_changed else None
         request = self.services.decisions.register_decision_request(
             target, "run", "commander", source, decision.payload.get("reason"),
-            consume=(DECIDE_KEY, decision.veto))
-        raise self.services.workflow.decision_required(request)
+            consume=(DECIDE_KEY, decision.veto, changed))
+        error = self.services.workflow.decision_required(request)
+        if changed:
+            # Reported, never granted: later steps check their own snapshot and HEAD.
+            self.context.event("commander_candidate_changed", dispatch_id=receipt["dispatch_id"], request_id=request["id"])
+            error = HarnessError(f"{error}；指挥调用期间候选代码或 HEAD 已改变（派发条目 candidate_changed），"
+                                 "提问照常登记、不认可这些改动，回答前请核对工作树")
+        raise error
+
+    def land_returned_ask(self):
+        """Finish and register a returned, unlanded ask before any execution gate.
+
+        Its hook and registration need only the common preconditions, not the
+        bound HEAD or candidate; the run then stops at the question and every
+        execution step keeps its own HEAD and snapshot gates.
+        """
+        if not self.decide_returned() or not self.services.receipts.returned_ask(DECIDE_KEY):
+            return
+        self.land_ask(self.services.receipts.finish_commander_receipt(DECIDE_KEY))
 
     @staticmethod
     def source(receipt):
@@ -361,7 +379,7 @@ class Planner(RuntimeService):
         run.pop("pending_revision")
         self.context.save()
         if archive is not None:
-            self.context.event("replan_edits_archived", task_id=directive["selected_task"], artifact=archive)
+            self.context.event("revision_edits_archived", task_id=directive["selected_task"], artifact=archive)
         self.warn_broad(previous, content["tasks"], pending["revision"])
         self.report_command_requirements()
         self.context.checkpoint()
@@ -401,6 +419,20 @@ class Planner(RuntimeService):
             # A retained candidate is the one the revision bound; a preparation
             # hook must not replace it. Ordinary directives keep current behavior.
             raise directive_mismatch()
+
+    def verify_plan_authority(self):
+        """Every published plan version is intact, and the ledger's mirrors equal their files.
+
+        ``plan_history`` holds references only; ``tasks`` mirrors the latest
+        version and ``original_tasks`` revision 0. A missing, changed or
+        diverging file stops before anything uses the plan. Older versions are
+        verified too: they are the bound history each later revision replayed.
+        """
+        run = self.context.run
+        history = run["plan_history"]
+        contents = [self.read_plan(row, f"已发布的计划文件（revision-{row['revision']}）") for row in history]
+        if history and (contents[-1].get("tasks") != run["tasks"] or contents[0].get("tasks") != run["original_tasks"]):
+            raise HarnessError("台账任务表与已发布的计划文件不符；保留现场，恢复计划文件或台账的原字节")
 
     def published_directive_missing(self):
         """A published revision whose directive vanished before any model call."""

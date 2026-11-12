@@ -77,7 +77,7 @@
 | 路径索引、输入索引或环境更新产物损坏（`path-indexes/`、`input-indexes/`、`environment/`） | 恢复原字节 | 恢复后普通 `resume`；无法恢复时可 `abandon RUN` |
 | `待派发指令的代码快照已变化`、`修订保留候选的代码或暂存区已变化`、`待派发指令与已发布计划或候选不符`、`pending continuation candidate or task changed` | 恢复原快照或保留证据 | 普通 `resume` 或 `abandon` |
 | `计划的整体审阅必要上下文 N 字符超过预算 M`（供给计划） | 提高 `context_chars`；模型给出的过大计划不停在这里，按无效输出重做 | 普通 `resume` |
-| `应用修订前 HEAD 与已校验计划不符`、`待应用的计划文件缺失或无法读取`、`…已改变` | 恢复原 HEAD 或计划文件的原字节 | 普通 `resume`，或 `abandon RUN` |
+| `应用修订前 HEAD 与已校验计划不符`、`待应用的计划文件缺失或无法读取`、`…已改变`、`已发布的计划文件（revision-N）缺失或无法读取`、`…已改变`、`台账任务表与已发布的计划文件不符` | 恢复原 HEAD 或计划文件的原字节 | 普通 `resume`，或 `abandon RUN` |
 | `共享规则、skills、MCP 或 hooks 已改变` | 恢复原版本的共享资产 | 普通 `resume` |
 | `配置已改变：…` | 恢复不可放宽的配置值 | 普通 `resume` |
 | `缺少已保存的 worktree Git 绑定` | 启动在绑定保存前中断；核对后手工 `git worktree remove` 并删除 `harness/<run>` 分支 | `abandon RUN` 后重新 `run` |
@@ -161,6 +161,8 @@ python3 -m harness --config /path/to/harness.toml --repo /path/to/project resume
 
 指挥的 `ask` 登记一条种类 `commander` 的决定请求并停止（有当前任务时目标是它，否则是 `final`）。这条请求未答或答 stop 时不调度任何模型，与目标无关；用 `--operator-decision` 回答 continue 后，下一次指挥决定带上 `operator_answer`。回答不授予范围、不降低验收，也不增加预算。规划、任务和整体三个阶段都可能提问。
 
+提问的识别只要求公共前提（退出已确认、原件已绑定摘要、严格解码成对象、envelope 身份相符），不要求调用期间候选代码与 HEAD 未变：变了也照常登记，派发条目记 `candidate_changed` 并写事件 `commander_candidate_changed`，停止信息提示先核对工作树；登记不认可这些改动，之后的派发、验证与接受各自核对快照与 HEAD。其他决定（implement、revise）在候选或 HEAD 变化时不判定，停止并保留回执，恢复原状后普通 `resume`。合格的提问先运行 `post_agent`，再在一次保存里登记请求并消费回执；hook 失败时回执保留、请求尚未登记，修复 hook 后普通 `resume` 对同一原件重跑 hook（日志目录按次递增）再登记。已返回而未登记的提问（登记前中断或 hook 失败）在普通 `resume` 的 HEAD 门禁之前完成 hook 与登记，HEAD 或候选已变也一样；之后的回答登记与执行仍要先过 HEAD 门禁，HEAD 不同时须先核对并恢复。不合格的提问不运行 hook，直接登记。
+
 修订越出已批准范围、其余全部合格时，派发条目记为无效（`out_of_scope_paths` 列出越界模式），回执消费后停止，不自动重做。`--allow-scope PATTERN` 在 run 未完成、未放弃、没有已返回而未落地的指挥决定时可用：先校验整批模式，再写审计事件并保存去重后的 `approved_scope`，然后照常继续；它只扩大之后的修订可选的范围，不修改既有任务。授权与否，之后的普通 `resume` 都是新的指挥决定，旧修订不复用。
 
 修订只能保留既有任务 ID、追加前置任务、细化未接受任务的说明和依赖；已接受任务不变。修订先写成不可变的 `plans/revision-N.json`，与回执消费同次登记引用；发布前按摘要复核文件、读回原件重放修订、核对 HEAD。只改当前任务说明且仍选它时保留候选，交给同一任务的新 worker；其他修订先把未接受修改归档到 `recovery/revision-N`，再恢复工作树到已接受提交，然后计划版本、`tasks`、`current_task` 与下一条指令同次发布。归档与重置之间任一点被中断，普通 `resume` 都从计划文件重来，无需操作者介入。
@@ -217,6 +219,8 @@ python3 -m harness --config /path/to/harness.toml --repo /path/to/project resume
 路径索引（`path-indexes/`）、输入索引（`input-indexes/`）和环境更新产物（`environment/`）在 `resume` 预检、派发或接受前核验，不在加载时核验：它们损坏会阻止继续，但不阻止 `abandon`。
 
 提交消息的来源在用到时核验，同样不阻止 `abandon`：构造任务审阅包前，`pending_task.worker_result` 与 worker 原件不同即停止“worker 结果台账与原件不同”，不派发审阅；接受时在 `pre_accept` 前后各核对一次，`pending_acceptance.worker_source` 不完整、与批准它的审阅记录的来源或工作尝试不符即停止“待接受的 worker 来源与批准它的审阅不符”，原件缺失或被改（包括被 `pre_accept` hook 改动）即停止，都不提交。出口是把台账或原件的原字节恢复回去后 `resume`，或者 `abandon`。
+
+已发布的计划文件（`plans/revision-N.json`，`plan_history` 的每一行）同样不在加载时核验，只在三处核对：`resume` 的任何写入之前（含 `--confirm-exited` 的审计写入，因此也先于批准计划和重放 worker 回执）、每次推导下一步之前、标记完成之前；逐个核对它们存在、摘要与台账一致、修订号相符，并要求最新版本的任务表等于 `tasks`、`revision-0` 的任务表等于 `original_tasks`。缺失、被改或不一致即停止，不调用模型；恢复原字节后普通 `resume`，无法恢复时 `abandon`（`abandon` 与 `cleanup-run` 不需要计划文件，它们自己的 `--confirm-exited` 照常可用）。不覆盖的情形：worker 运行期间被删改的计划文件要到下一步才发现，那时该任务的验证、审阅与接受可能已经完成；`prepare-run` 与 `status` 等只读入口不核对，之后的 `resume` 会拒绝。每次核对的耗时随计划历史的总大小增长：实测每版约 40 KB 时，200 版约 19 ms，1,000 版约 102 ms。
 
 ### 终态与历史台账
 

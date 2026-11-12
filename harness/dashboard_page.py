@@ -256,6 +256,8 @@ APP_JS = r""""use strict";
     review_rejected: "审阅要求修改", verification_failed: "验证失败", worker_result_rejected: "worker 结果被拒绝",
     run_completed: "运行完成", run_paused: "运行暂停", run_stopped: "运行停止", run_abandoned: "运行已放弃",
     plan_awaiting_approval: "计划等待批准", plan_approved: "计划已批准", plan_revised: "计划已修订",
+    revision_edits_archived: "修订前已归档未接受修改", commander_candidate_changed: "指挥调用期间候选已变化",
+    replan_edits_archived: "再规划前已归档未接受修改（旧台账）",
     final_verification_failed: "整体验证失败", final_review_rejected: "整体审阅拒绝",
     final_reverification_requested: "请求重新整体验证", environment_update_recorded: "登记环境更新",
     environment_checked: "环境检查", command_requirements_checked: "命令授权检查",
