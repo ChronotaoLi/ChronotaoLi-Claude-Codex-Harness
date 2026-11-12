@@ -201,6 +201,49 @@ class ProcessRuntimeTests(unittest.TestCase):
                 with contextlib.suppress(ProcessLookupError):
                     os.kill(int(child_file.read_text()), signal.SIGKILL)
 
+    def zombie_only_group(self, hold):
+        """Leader script leaving its group with one zombie that a parent outside
+        the group reaps after `hold` seconds. XNU answers killpg(pgid, 0) with
+        EPERM for such a group, as it does while launchd reaps an orphan."""
+        marker = str(self.root / 'zombie-holder')
+        holder = ('import os,subprocess,sys,time\n'
+                  'z=subprocess.Popen([sys.executable,"-c","pass"])\n'
+                  'while subprocess.run(["ps","-o","stat=","-p",str(z.pid)],capture_output=True,'
+                  'text=True).stdout.strip()[:1]!="Z": time.sleep(.01)\n'
+                  'os.setpgid(0,0)\n'
+                  f'open({marker!r},"w").write(str(os.getpid()))\n'
+                  f'time.sleep({hold})\nz.wait()\n')
+        def release():
+            if Path(marker).exists():
+                with contextlib.suppress(ProcessLookupError, ValueError):
+                    os.kill(int(Path(marker).read_text()), signal.SIGKILL)
+        self.addCleanup(release)
+        return ('import os,subprocess,sys,time\n'
+                f'subprocess.Popen([sys.executable,"-c",{holder!r}])\n'
+                f'while not os.path.exists({marker!r}): time.sleep(.01)\n')
+
+    def test_zombie_only_group_drains_until_reaped(self):
+        started = time.monotonic()
+        outcomes = []
+        self.assertEqual(self.invoke(self.zombie_only_group(.4), on_outcome=outcomes.append), 0)
+        # The group vanished only when its zombie was reaped, never earlier.
+        self.assertGreaterEqual(time.monotonic() - started, .4)
+        outcome = outcomes[-1]
+        self.assertTrue(outcome.exit_confirmed)
+        self.assertTrue(outcome.evidence_complete)
+        self.assertEqual(outcome.cleanup_errors, [])
+        self.assertEqual(outcome.cleanup_actions, ['poll_leader', 'drain_descendants'])
+
+    def test_zombie_only_group_beyond_drain_window_is_not_exit(self):
+        with self.assertRaises(HarnessError) as caught:
+            self.invoke(self.zombie_only_group(30), cleanup_deadline=time.monotonic() + 1)
+        outcome = caught.exception.outcome
+        self.assertEqual(outcome.exit_code, 0)
+        self.assertFalse(outcome.exit_confirmed)
+        self.assertFalse(outcome.evidence_complete)
+        self.assertIn('drain_descendants', outcome.cleanup_actions)
+        self.assertNotIn('sigterm', outcome.cleanup_actions)
+
     def test_intent_failure_prevents_start(self):
         with patch('harness.util.write_json', side_effect=OSError('intent fault')), \
                 patch('harness.util.subprocess.Popen') as popen:

@@ -546,3 +546,93 @@ Python 3.11.17 在 `7adcf9d` 上执行 18 个重点模块，233 项全部通过�
 上述流程验证使用模拟模型响应与真实本地 Git／子进程。另在提交 `3a24948` 的仓库根目录执行了一次真实账号的 `python3 -m harness.tool_smoke --config harness.toml --repo .`，使用默认限制（超时 180 秒、最多 20 轮、预算参数 1 美元）：以配置的 worker 模型 `claude-opus-5-5` 进行一次真实调用，Claude Code 2.1.322，供应商 subtype 为 success，15 轮，CLI 报告的估算费用 0.2162736 美元（不是账户账单）。26 项检查全部通过，包括：broker 的 `list_commands`、精确 argv 与显式管道 argv，以及未知命令 ID 和额外 argv 均被拒绝；文件工具的 SHA256、合法与非法 JSON、外部文件 diff；`git_query` 的 `ls-tree` 与 `hash-object` 成功，一条表外 argv 被拒绝；`delete_path` 删除了范围内的已跟踪文件，拒绝范围外的已跟踪文件且该文件保留；模型只调用了要求的工具；恰好两个命令进程，每次删除调用一条记录；结束后准备目录为空。证据在被忽略的私有目录 `.harness/tool-smoke/c61e36cfa40b43b284f08a331c2cf974/`。这次联调只覆盖一个 CLI 版本和一个有界夹具；`delete_path` 没有在并发改名下测试；它直接驱动工具，不经过完整的 run 派发路径，所以版本 16 下先发布 worker packet 与契约文件、再调用真实 Claude CLI 的顺序仍只有桩测试覆盖。未运行真实账号的 `python3 -m harness smoke`、`harness.permission_smoke`、`harness.stream_smoke`。离线结果不证明这次联调覆盖范围以外的真实模型调用可用。
 
 延期到下一次实测核对的指标（不作为本次提交的门禁）：因只读 Git 命令导致的停止数，以及 worker 格式修正派发数，目标都为 0；停止总数（基线 5）、模型调用数（基线 52）和 commander 调用占比（基线 27%）与基线对比。
+
+## 协议层重做验证（2026-11-11，台账 v17）
+
+本节记录分支 `protocol-redo-2026-11-10`（起点 `bc94b6f`）的离线验证结果。按根因消除实测暴露的停止与多余调用，分步提交：
+
+| 步 | 提交 | 内容 |
+| --- | --- | --- |
+| A | `dd630fc`、`eb47175`、`759eacb`、`0da4f58` | 清理只留 `cleanup-run` 一个入口；删除 plan-readiness；包里的协议说明搬进 RULES 与技能，包只放数据和现场事实；阶段 A 审阅修复 |
+| B1 | `930b705` | 删除 stream 输出模式，台账 16 → 17；版本 16 及更早的台账不迁移、不执行，只读入口与清理仍可用 |
+| B2 | `434adc5` | 身份归运行时：必需问题用运行时生成的固定键 `f1…fN`，审阅记录带派发时的对照副本 |
+| B3 | `b243a10`、`6384771` | 无效输出一条规则：读不出否决的输出不是结果，指挥与审阅自动重做一次，worker 计一次工作尝试；可选产物分开失败域 |
+| B4 | `c597d94`、`8afb65b` | 指挥只有一种调用 `decide`（implement、revise、ask）和两个预算（`max_attempts`、`max_agent_dispatches`）；计划文件是执行字段的唯一权威，在 resume、每次推导下一步和完成之前核验 |
+| B5 | `1406cd3` | 提交消息由 worker 撰写、审阅者审查，运行时按 `worker_source` 指向的原件原样提交 |
+| B6 | 本节所在提交 | macOS 上进程组排空误判的修复；两条 blocked 提交消息回归用例；文档对代码审阅的十处更正，另补两处说明（排空观察以“进程组不存在”为准；自动重做调用后被中断时恢复的是新请求）；最终中断矩阵 |
+
+运行时 `wc -l harness/*.py`：基线 17,929 行，B1 后 17,315，B3 后 17,301，B4 后 17,699，最终 17,707 行（净减 222 行）。测试：基线 1,396 项，最终 1,428 项。
+
+### 套件
+
+全部改动完成后的最终代码，机器上没有其他负载：
+
+| 运行 | 收集 | 执行 | 通过 | 失败 | 跳过 | 用时 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 基线 `bc94b6f`，`python3 tests/run_shards.py --shards 4`，Python 3.15.2 | 1,396 | 1,396 | 1,395 | 0 | 1 | 557.1 秒 |
+| 最终，`python3 tests/run_shards.py --shards 4`，Python 3.15.2 | 1,428 | 1,428 | 1,427 | 0 | 1 | 670.3 秒 |
+| 最终，单进程参考 `python3 -m unittest discover -s tests`，Python 3.15.2 | 1,428 | 1,428 | 1,427 | 0 | 1 | 1,890.1 秒 |
+
+跳过的一项仍是本机文件系统拒绝非 UTF-8 文件名的 `test_git_repairs…test_non_utf8_paths_and_link_targets_survive_snapshot_and_acceptance`。
+
+Python 3.11.17 执行这次重做新增和大改的 14 个模块，255 项全部通过，609.7 秒：`PYTHONPATH=tests python3.11 -m unittest test_runtime_keys test_invalid_output_redo test_decide test_decide_recovery test_commander_ask_decisions test_commit_message test_ledger_history test_worker_return_recovery test_verification_cleanup test_run_cleanup test_packet_protocol test_process_runtime test_terminal_capture_recovery test_command_admission`。没有在 Python 3.11 上执行完整套件。`python3 -m compileall -q harness tests` 与 `git diff --check` 通过。
+
+### 各步验证
+
+| 步 | 变异检查 | 中断矩阵 | 独立审阅 |
+| --- | --- | --- | --- |
+| A | — | — | Fable：代码审阅 1 条阻断（工作树回执已 `removed` 后，分支被删或台账被 `--confirm-exited` 改写就永久报 `blocked`）、5 条建议，修复后确认通过（另 3 条建议并入 B2） |
+| B1 | 6 个，全部被入库用例杀死 | 2 条流程 921 点，失败 0，未完成的点都在文档窗口 1、3、6 | Fable：规格 2 条阻断、10 条建议，修订后实现；代码审阅通过，0 阻断、6 条建议（其中 5 条落实） |
+| B2 | 12 种（16 个变体），全部杀死 | 2 条流程 2,050 点，失败 0 | Fable 规格审阅 2 条阻断、12 条建议；gpt-6.1-sol 代码审阅通过，0 阻断、2 条建议（并入 B3） |
+| B3 | 24 个；修复后 29 个，全部杀死 | 抽样 1,672 点，发现并修复一个真实缺陷（无效的 task 阻断先写 `pending_replan` 再读 Git），修后失败 0；无效输出注入 42 点失败 0；无封存的无效 worker 流程逐点 544 点失败 0（同一流程在 `b243a10` 上有 9 个 Git 点失败） | Fable 规格审阅 3 条阻断、12 条建议；gpt-6.1-sol 代码审阅 4 条阻断（无封存判定不原子、已丢弃的可选产物仍被投影、`previous_invalid` 只校验一次、数值溢出写出读不回的原件）、3 条建议，修复后确认通过 |
+| B4 | 24 个；两次修复另 9 个、2 个，全部杀死 | 落地、归档／重置／发布、提问落地三个窗口逐点 642 次注入失败 0；窗口外抽样 442 次注入 43 次未完成，归入文档窗口 1、3、6 与探针限制（确认审阅抽查 7 个，归因成立） | gpt-6.1-sol：规格 3 条阻断、5 条建议；代码 2 条阻断（计划文件只在部分时机核验；候选变化时合法提问登记不上）、3 条建议；确认审阅发现恢复路径仍漏一处（HEAD 变化后已返回的提问到不了登记），`8afb65b` 修复，最终审阅确认 |
+| B5 | 19 个，全部杀死 | 接受路径逐点 98 点，失败 0 | gpt-6.1-sol：规格 3 条阻断、4 条建议；代码审阅通过，0 阻断、3 条建议（并入 B6） |
+| B6 | 2 个（历史复核绕开核心投影），均被新用例杀死 | 见下节 | gpt-6.1-sol 文档对代码审阅：确认 `8afb65b` 的修复无新问题；文档 2 条阻断、8 条建议，全部按代码更正文档（只改了一处停止信息的文字）；三项机械核对通过（执行路径上没有已删除的名字；`--help` 与 README、operations.md 一致；新台账 42 个顶层键与 design.md 状态表一致） |
+
+阶段 A、B1 和 B1–B3 的规格由 Fable 审阅；B2 起的代码审阅和 B4、B5 的规格审阅由 `gpt-6.1-sol` 审阅，每轮新进程。审阅原文在被忽略的 `.harness/design-proposals/2026-11-10-execution/reviews/`，各步探针与结果在同目录的 `probes/`。
+
+### 最终中断矩阵
+
+在最终代码（`8afb65b` 加 B6 改动）上跑合并的中断矩阵：9 条流程，真实 Git 与验证进程，模拟模型按包与候选内容作答（不按调用次数），默认预算（`max_attempts` 5、`max_agent_dispatches` 200），`claude`／`codex` 都换成记录调用的桩，真实调用 0 次。注入：对 `pathlib.Path.replace`（每次 `write_json` 与台账保存）、Git 的 `subprocess.run`、事件追加分别在第 N 次调用处抛 `KeyboardInterrupt`，计数与注入贯穿 start 和之后每次 resume。恢复只用普通 resume 和文档写明的出口：`--confirm-exited`、指挥提问答 continue、文档写明的多一次尝试后提高 `max_attempts`、清理停止信息点名的越界文件。
+
+五个窗口逐点注入：`decide` 三种结果的落地（判定、hook 与 implement／revise／ask／首版计划的落地保存）；归档／重置／发布；worker 判定的发布（含无封存的输出）；审阅判定与重做的记账（判定、无效输出记账、审阅记录发布、每次重做派发）；从批准保存到接受台账保存。窗口外每 6 个调用抽 1 个。
+
+| 流程 | 点数 | `decide` 落地 | 归档／重置／发布 | worker 判定发布 | 审阅判定与重做 | 批准到接受 | 窗口外抽样 | 窗口 1 停止 | 窗口 3 停止 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 两个任务一次通过 | 451 | 28 | — | 164 | 93 | 98 | 70 | 8 | 4 |
+| 审阅拒绝 A、B → 返工 → A resolved、B open（三轮）→ 第 5 次尝试批准，`max_attempts` 用满 | 918 | 112 | — | 410 | 177 | 49 | 171 | 4 | 12 |
+| worker 报 task 阻断 → 修订保留候选 → worker | 394 | 54 | 25 | 173 | 65 | 49 | 54 | 4 | 4 |
+| worker 报 task 阻断 → 修订需归档 → 前置任务 → worker | 660 | 132 | 75 | 255 | 93 | 98 | 84 | 8 | 6 |
+| worker 报 task 阻断 → `decide` 提问 → 答 continue → 修订 → worker | 421 | 72 | 25 | 173 | 65 | 49 | 63 | 4 | 5 |
+| 规划阶段提问 → 答 continue → 首版计划 | 293 | 47 | — | 82 | 65 | 49 | 51 | 4 | 2 |
+| 整体审阅拒绝 → 修正任务 → 批准 | 532 | 56 | 18 | 164 | 133 | 98 | 83 | 8 | 4 |
+| 指挥、审阅各一次无效输出（自动重做），worker 一次无效输出（下一次尝试） | 597 | 71 | — | 199 | 175 | 98 | 85 | 8 | 6 |
+| worker 输出截断（经真实 `CLIBackend` 适配层，本地进程输出） | 288 | 28 | — | 93 | 65 | 49 | 54 | 4 | 3 |
+| 合计 | 4,554 | 600 | 143 | 1,713 | 931 | 637 | 715 | 52 | 46 |
+
+一个点可以同时落在两个窗口（例如修订落地与发布），窗口列之和因此大于窗口点数 3,839。4,554 个点全部通过：4,456 个走到 `completed`，其余 98 个停在文档写明的窗口，每个都按台账核实——窗口 1 的 52 个点都有 `pending_acceptance`，HEAD 的父提交等于 `expected_head`，HEAD 带该任务的 `Harness-Task`，消息等于 `pending_acceptance.worker_source` 指向的原件（代表：两个任务流程中接受窗口里的 Git `symbolic-ref` 调用被中断后，resume 报“worktree HEAD 与检查点不同”）；窗口 3 的 46 个点都留有未封存的 worker 回执（代表：worker 返回、封存之前的 Git 调用被中断，resume 报“worker return interrupted before immutable seal; worker result exists without a candidate seal”），都在窗口外的抽样点上。逐点核对：已登记的拒绝、整体拒绝、提问和 worker 阻断在每一次台账保存之间都没有消失，完成时不少于未注入时；每个任务至多一个 `Harness-Task` 提交，消息逐字节等于绑定的 worker 原件；每次台账保存之间各任务 `attempts` 与 `agent_dispatches` 都不减少；每条审阅与整体审阅记录的 `required_findings` 对照副本逐行等于审阅者收到的包；计划文件与台账一致；被注入的调用与未注入时的第 N 次调用相同。
+
+多出的模型请求（不带 `retry_of` 的调用；每个请求可另有一次自动重做）只有三种来源，都是文档写明的：先前的调用没有留下结果（回执“无结果才新派发并计费”，recovery 窗口 4、11；被中断的自动重做按无返回处理，恢复后是带自己一次重做的新请求）；接受窗口里重建暂存区后、commit 之前被中断的返工（窗口 2，每次多一次 `decide`、worker 和审阅）；可重试的 worker 尝试之后的那次 `decide`。窗口 2 的返工与可重试尝试使 `max_attempts` 用满的流程有 7 个点按文档提高了 `max_attempts`；1 个点停在“任务越界修改”（中断落在模拟 worker 已写入演示文件、尚未删除之间），按出口表清理点名的文件后普通 resume 完成。没有发现运行时缺陷。另有一版只用 3 次尝试的审阅拒绝流程，577 个点全部通过。判定按请求计数，描述中的内容哈希做了归一。脚本与结果在 `probes/B6-matrix*`，两次运行共 4,864 秒。
+
+### 实测序列的离线重放
+
+按 2026-11-10 实测的 7 次再规划序列，用脚本后端在 `bc94b6f` 与 B4 代码上各重放一次：指挥调用 14 → 8，总调用 29 → 23，两次都停在同一个待操作者回答的问题。这是离线重放，不是真实模型的证据。
+
+### 没有做的
+
+真实账号联调没有运行。下列六项（方案 5.5）都没有执行，离线结果不证明其中任何一项，合入 `master` 之前需要完成：
+
+1. Codex 严格模式（审阅者 `gpt-6.1-sol`）是否接受固定键 `finding_dispositions`（1、5、60 个键），输出是否符合契约。
+2. Claude worker 的 `--json-schema` 是否接受固定键 `repair_claims`（1 个和 60 个键，argv 约 15 KB）与 `commit_message`。
+3. `decide` 的六字段 schema 在两种指挥下的表现：astra（Codex 严格模式）与 fable（`claude-fable-5-2`，经 `--json-schema`）各一次。
+4. 单一输出模式（`legacy_json`）下：worker 超时判为可重试、普通 resume 开始新尝试；权限拒绝能从终态 JSON 取证。
+5. 两种指挥各跑一次 `python3 -m harness smoke`：小任务全链路，确认 worker 写的提交消息原样落盘并带 trailer。
+6. 一次真实的提问往返（用需要操作者选择的目标）。
+
+### 已知事项
+
+- 为容纳搬进 RULES／技能的协议文字和每次 `decide` 携带的完整计划，几处固定上下文预算的测试夹具被调高：33,000 → 34,000 → 35,000，另有两处到 36,000；默认预算 100,000 未变。B5 那次调整的实测：同一用例在父提交需要 33,718 字符，B5 需要 34,636。
+- 没有环境更新、决定或检查点数据的普通 run，提示词比基线略长（阶段 A 结束时测量：指挥规划约 +1,026 字符，worker 约 +588 字符）；带这些数据的 run 变短。
+- “整体审阅必要输入不增加”有一个例外：历史里有一份正好 30 条、标签取满的被拒整体审阅时，多约 870 字符。
+- 计划文件只在 resume、每次推导下一步和标记完成之前核验；worker 运行期间被删改的计划文件要到下一步才发现。
+- 两个排空计时用例的不稳定（基线 `bc94b6f` 起就存在）是运行时的误判，已修复：macOS 的 `killpg(pgid, 0)` 在进程组里只剩等待 launchd 回收的僵尸进程时返回 EPERM，而不是 ESRCH；领导进程退出、短命后代刚退出时，监督把这次 EPERM 记成清理错误，排空提前结束、退出确认失败，派发或命令被判为证据不完整而停止。真实的 hook、验证命令或 worker 命令带一个短命后代时同样会遇到。修复后排空期间的 EPERM 算作进程组仍存在、继续观察，只有窗口结束时的查询仍被拒绝才记为清理错误（[设计不变量](design.md#不变量) 4）。修复前在空闲机器上各单独运行 30 次：`test_terminal_capture_recovery…hook_descendants_finish_normally` 失败 1 次，`test_command_admission…drain_allows_following_commands` 失败 2 次；同一 argv 直接调用 `run_process` 300 次，4 次未确认退出，全部是 `observe_group` 的 EPERM。修复后两个用例各连续 100 次通过，直接调用 300 次全部确认退出。`test_process_runtime` 新增两个用真实僵尸进程组稳定复现的用例（组外父进程持有组内僵尸进程一段时间后回收）：窗口内回收时确认退出且不早于回收返回，超出窗口时不算退出；两者在修复前的代码上每次都失败。

@@ -48,7 +48,7 @@
 1. 每次 worker、reviewer 和指挥调用都是新进程、新 `dispatch_id`，无效输出的重做也是新调用；Claude 用 `--no-session-persistence`，Codex 用 `--ephemeral`，原生子 agent 关闭，不恢复供应商会话。模型 ID、供应商和 effort 按配置原样使用，同一 run 内不变，出错不换模型。
 2. 调用身份与预算先于进程启动保存：本地准备（上下文、`pre_agent`、MCP、快照、额度检查）成功后，`attempts`、`agent_dispatches`、接收意图和 `invoked=true` 同一次保存，然后才调用后端。本地准备失败不扣额度，后端失败照常计数。
 3. 退出未确认就不继续：恢复、放弃和清理要求父 dispatch 及其每个命令子进程都有退出证据；`starting` 或缺 pgid 且未确认的记录阻塞。`--confirm-exited` 是审计过的操作者断言，不补造退出码、输出或成功。
-4. 领导进程正常退出后，同组后代最多观察 2 秒，仍未退出就停止消费结果，不向身份不明的进程组发信号。
+4. 领导进程正常退出后，同组后代最多观察 2 秒，仍未退出就停止消费结果，不向身份不明的进程组发信号。只有进程组查询报告“不存在”才算后代已退出；组内只剩等待回收的僵尸进程时（macOS 对此返回 EPERM）算作仍存在、继续观察，窗口结束时的查询仍被拒绝才记为清理错误。
 5. 台账的 `invoked` 是调用事实的权威。事件 `dispatch_prepared`（预算检查前）、`dispatch_started`（`invoked=true` 保存后）和带 `invoked` 的 `dispatch_finished` 只是尽力而为的观察：追加失败不阻止调用，崩溃可能缺事件且不补发；按 `dispatch_id` 去重，费用只按台账统计。
 
 **结论与证据**
@@ -125,13 +125,13 @@
 | `config_snapshot` | 首次保存；resume 接受合法放宽后替换 | 不清除 | 先写 `resume_config_relaxed` 再保存 | 与当前配置比较，只许放宽 |
 | `status` | 见上表 | — | 先保存再运行 hook | 终态拒绝修改选项 |
 | `worktree_binding`、`ignored_baseline` | 首次保存为空；`git worktree add` 后第二次保存填入 | 不清除 | 第一次保存在创建工作树前 | 绑定为空时 resume 拒绝，只能 `abandon` |
-| `original_tasks` | 供给计划在首次保存；模型计划与首版计划同次 | 不变 | 早于 `tasks` | `tasks` 为空时：有供给计划则重新校验并登记同一计划，否则推导出规划的 `decide`（回执已返回则重放同一原件） |
+| `original_tasks` | 供给计划在首次保存；模型计划与首版计划同次 | 不变 | 供给计划的副本早于 `tasks` 登记；模型写的首版计划与 `tasks`、`plan_history` 同次保存 | `tasks` 为空时：有供给计划则重新校验并登记同一计划，否则推导出规划的 `decide`（回执已返回则重放同一原件） |
 | `tasks`、`plan_history` | 首版计划登记；修订发布 | 不清除 | 先写 `plans/revision-N.json`；`plan_history` 每行只存修订号、路径与 SHA256；修订发布与 `current_task`、`pending_directive`、`feedback` 同次 | 按计划版本继续；修订的执行字段只在计划文件里 |
 | `plan_approval_required`、`plan_approved` | 创建时；`--approve-plan` | 不变 | 先写 `plan_approved` 再保存 | 普通 resume 不批准 |
 | `expected_head`、`accepted` | 任务接受 | 不清除 | 与 `pending_post_accept` 同次 | 工作树 HEAD 必须等于 `expected_head` |
 | `attempts`、`agent_dispatches` | 调用后端前 | 只增 | 与接收意图、`invoked` 同次 | 已记账的调用不退回 |
 | `final_history` | 新的整体尝试追加 `running` 记录（尝试号是 `len(final_history)+1`），随后更新阶段与结论；进入 reviewing 时与阶段同次写入该次审阅的对照 `required_findings`（在验证开始前算出） | 不清除 | 尝试记录先于快照产物；失败或拒绝与 `feedback` 同次 | 同一快照：未完成则复用该尝试，已批准则完成，已拒绝或非超时验证失败则推导出整体阶段的 `decide` |
-| `dispatches` | 准备完成追加（`prepared`、`invoked=false`）；调用前 `starting`、`invoked=true`，重做另记 `retry_of`（去掉了提示时记 `previous_invalid_omitted`）；启动记 pgid；结束记进程事实与用量；读不出否决的无效输出记 `status=invalid`、错误与 `invalid_output`，否决类记 `invalid_rejected`、`invalid_asked` 或 `invalid_blocked`；只因越界而无效的修订另记 `out_of_scope_paths` | 不清除 | 准备条目先于 `pre_agent`；`retry_of` 与预算同次；`invalid` 与回执消费同次 | 退出门禁读进程事实；`worker_receipt_consumed` 记 worker 回执结局；`retry_of` 必须指向它之前最后一次模型调用 |
+| `dispatches` | 准备完成追加（`status=running`、`process_state=prepared`、`invoked=false`）；调用前 `process_state=starting`、`invoked=true`，重做另记 `retry_of`（去掉了提示时记 `previous_invalid_omitted`）；启动记 pgid；结束记进程事实与用量；读不出否决的无效输出记 `status=invalid`、错误与 `invalid_output`，否决类记 `invalid_rejected`、`invalid_asked` 或 `invalid_blocked`；只因越界而无效的修订另记 `out_of_scope_paths`；调用期间候选或 HEAD 已变的提问另记 `candidate_changed` | 不清除 | 准备条目先于 `pre_agent`；`retry_of` 与预算同次；`invalid` 与回执消费同次；`candidate_changed`（与 `invalid_asked`）和提问登记、回执消费同次 | 退出门禁读进程事实；`worker_receipt_consumed` 记 worker 回执结局；`retry_of` 必须指向它之前最后一次模型调用 |
 | `feedback` | worker 阻断（含无效阻断，带 `output_error`；结构不可信时没有 `worker`）、审阅拒绝、验证或预检失败、候选变化、`pre_accept` 失败、整体失败、修订发布 | 接受、整体批准时置 null | 与引起它的转换同次 | 下一次指挥与 worker 的输入 |
 | `review_history` | 任务审阅结束；候选变化前把已返回审阅存为 invalidated；每条记录带派发时的对照副本 `required_findings` | 不清除 | 与审阅后的阶段同次 | 返工输入、`review_rounds` 来源；处置只经副本映射，副本与重算清单不符即停止 |
 | `worker_receipts` | 调用前存意图（`invoking`、packet／契约引用；worker 的必需问题对照在 `packet.json`）；封存后 `sealed`；`post_agent` 后记 `post_hook_digest` | 交接时消费 | 封存文件先于 `sealed`；消费与后续阶段同次 | 未封存：retryable 或 invalid（不可解码的输出，结局 `result_rejected`）则消费并新开尝试，否则停止；封存文件已写而 `sealed` 未保存：找到并核验该文件后继续；已封存：复核后继续原门禁 |
@@ -152,7 +152,7 @@
 
 | 键 | 设置 | 清除 | 持久化顺序与恢复 |
 | --- | --- | --- | --- |
-| `current_task` | `decide` 选择任务；修订发布（选中的任务） | 接受 | 有当前任务时只调度它；待派发指令的任务必须等于它 |
+| `current_task` | `decide` 选择任务；修订发布（选中的任务）；直接派发 worker 时（本地准备之前） | 接受 | 有当前任务时只调度它；待派发指令的任务必须等于它 |
 | `pending_directive` | `decide` 的 implement（与回执消费同次）；修订发布（另带 `revision`）；续作拒绝 | worker 调用前与预算同次消费 | 本地准备失败时保留；派发前（`pre_agent` 之前与之后）核对任务、快照，修订来源的再与计划文件核对 |
 | `pending_task` | worker 交接（`verifying`，与回执消费同次）；预检通过后与验证轮次同次保存审阅对照 `required_findings`；验证后 `reviewing` | 审阅结束（与 `review_history` 及后续阶段同次）；候选变化、预检或验证失败 | 同一快照复用已完成阶段；reviewing 阶段的审阅派发、重放和重做都只用保存的对照，缺少即停止；每次构造审阅包都按摘要读 worker 原件，`worker_result` 与原件不同即停止 |
 | `pending_acceptance` | 审阅批准（`worker_source` 与审阅记录的来源同次写入，不存提交消息） | 接受登记或候选变化 | `pre_accept` 前递增 `hook_attempts`；快照未变只重试 hook；hook 前后各核对一次 `worker_source` 与批准它的审阅记录一致并按摘要读原件取提交消息 |

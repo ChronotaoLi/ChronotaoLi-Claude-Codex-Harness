@@ -350,7 +350,7 @@ class ContextCapacityError(HarnessError):
     """A failed preparation with a content-free, exact size diagnostic."""
     def __init__(self, report):
         self.report = report
-        super().__init__(f"任务必要上下文 {report['required_chars']} 字符超过预算 {report['budget_chars']}；请拆小任务或增加 context_chars")
+        super().__init__(f"任务必要上下文 {report['required_chars']} 字符超过预算 {report['budget_chars']}；提高 context_chars 后普通 resume；无法提高时保留现场后 abandon，用拆小任务的计划另开新 run")
 
 
 def field_size_report(value):

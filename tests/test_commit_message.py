@@ -13,6 +13,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from harness import git
+from harness.budgets import work_attempts
 from harness.contracts import WORK, judge_work
 from harness.git import commit_message_text
 from harness.shared import HookError
@@ -358,6 +359,58 @@ class BlockedMessageTests(RepoCase):
         engine, backend, entry = self.blocked("operator", {"subject": ""})
         self.assertIn("attempt_exemption", entry)
         self.assertTrue(engine.run["decision_requests"])
+
+    # Null, an object missing `body`, and a body over the bound.
+    INVALID_MESSAGES = {"null": None, "missing body": {"subject": "Fix greet"},
+                        "oversized body": message("x", "y" * 5000)}
+
+    def recover(self, kind, value):
+        """Block on `kind` with `value` as commit_message, then take the documented exit."""
+        self.setUp()
+        engine, backend, entry = self.blocked(kind, value)
+        options = {}
+        if kind == "environment":
+            options["environment_update"] = self.repo / "operator-update.json"
+            write_json(options["environment_update"], {
+                "schema_version": 1, "task_id": "greet", "blocker_dispatch_id": entry["id"],
+                "summary": "Dependency installed", "checks": []})
+        else:
+            calls = len(backend.calls)
+            with self.assertRaises(HarnessError):
+                self.engine(backend).resume(engine.run["id"])
+            self.assertEqual(len(backend.calls), calls)
+            request = engine.run["decision_requests"][0]
+            options["operator_decision"] = self.repo / "answer.json"
+            write_json(options["operator_decision"], {
+                "schema_version": 1, "request_id": request["id"], "task_id": "greet",
+                "decision": "continue", "summary": "Proceed"})
+        result = self.engine(backend).resume(engine.run["id"], **options)
+        self.assertEqual(result["status"], "completed")
+        source = next(item for item in result["dispatches"] if item["id"] == entry["id"])
+        self.assertEqual(source["worker_outcome"], f"{kind}_blocked")
+        self.assertEqual(source["attempt_exemption"], entry["attempt_exemption"])
+        self.assertEqual(result["attempts"], {"greet": 2})
+        self.assertEqual(work_attempts(result), {"greet": 1})
+        for call in backend.calls:
+            if call["role"] == "commander":
+                self.assertNotIn("commit_message", json.dumps(call["packet"]))
+        return result, [(call["role"], call["kind"], (call["packet"].get("trigger") or {}).get("kind"))
+                        for call in backend.calls]
+
+    def assert_history_recheck_ignores_the_message(self, kind):
+        reference, route = self.recover(kind, message("Fix greet"))
+        for label, value in self.INVALID_MESSAGES.items():
+            with self.subTest(message=label):
+                result, observed = self.recover(kind, value)
+                self.assertEqual(observed, route)
+                for key in ("environment_updates", "operator_decisions"):
+                    self.assertEqual(len(result.get(key, [])), len(reference.get(key, [])))
+
+    def test_environment_update_recovery_rechecks_the_blocker_whatever_its_message(self):
+        self.assert_history_recheck_ignores_the_message("environment")
+
+    def test_operator_answer_recovery_rechecks_the_blocker_whatever_its_message(self):
+        self.assert_history_recheck_ignores_the_message("operator")
 
     def test_task_blocker_with_an_oversized_message_reaches_the_commander_without_it(self):
         engine, backend, entry = self.blocked("task", message("x", "y" * 5000))

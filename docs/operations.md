@@ -185,7 +185,7 @@ run 列表 → run 详情 → 文件查看。列表按最近事件排序，以�
 
 `invoked=true` 在进程启动前写入，不证明 CLI 已启动或供应商已收到请求；`process_state=starting` 另标“启动未确认”，不覆盖上述分类。
 
-事件日志里的派发事件：`dispatch_prepared` 在本地准备保存后、预算检查前写入；`dispatch_started` 在台账保存 `invoked=true` 之后写入；`dispatch_finished` 带 `invoked`、`status` 和 `provider_usage`。正常完成的 run 中 `dispatch_started` 条数等于 `agent_dispatches`。事件是尽力而为的观察：写入失败不影响调用，崩溃可能缺一条，恢复不补发。计数与费用以台账为准。版本 15 及更早的 run 中，不带 `invoked` 字段的 `dispatch_started` 写于预算检查前，不表示已调用。
+事件日志里的派发事件：`dispatch_prepared` 在本地准备保存后、预算检查前写入；`dispatch_started` 在台账保存 `invoked=true` 之后写入；`dispatch_finished` 带 `invoked`、`status` 和 `provider_usage`。事件追加没有丢失时，`dispatch_started` 条数等于 `agent_dispatches`；追加失败会被吞掉，run 照常完成而少一条事件。事件是尽力而为的观察：写入失败不影响调用，崩溃可能缺一条，恢复不补发。计数与费用以台账为准。版本 15 及更早的 run 中，不带 `invoked` 字段的 `dispatch_started` 写于预算检查前，不表示已调用。
 
 ### 费用
 

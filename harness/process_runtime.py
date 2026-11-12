@@ -129,12 +129,20 @@ class ProcessSupervisor:
             self.outcome.cleanup_errors.append(failure(step, error))
             return None
 
-    def _observe(self):
+    def _observe(self, *, final=True):
         try:
             os.killpg(self.process.pid, 0)
             return True
         except ProcessLookupError:
             return False
+        except PermissionError as error:
+            # XNU answers EPERM while every remaining member is a zombie awaiting
+            # its new parent's reap. That is presence, never exit; keep observing
+            # and treat only a denial at the final observation as a fault.
+            if not final:
+                return True
+            self.outcome.cleanup_errors.append(failure("observe_group", error))
+            return None
         except BaseException as error:
             if not isinstance(error, (Exception, KeyboardInterrupt, SystemExit)):
                 self.fatal = self.fatal or error
@@ -202,7 +210,7 @@ class ProcessSupervisor:
             code = self._attempt("poll_leader", p.poll)
             if code is not None:
                 out.exit_code = code
-            group_present = self._observe()
+            group_present = self._observe(final=False)
             if code is not None and primary is None and group_present is True:
                 # A normal CLI may close its MCP pipes just before its children
                 # exit. Observe their drain, but never signal after reaping the
@@ -210,7 +218,7 @@ class ProcessSupervisor:
                 drain_end = min(time.monotonic() + 2, self.cleanup_deadline
                                 if self.cleanup_deadline is not None else float("inf"))
                 def drain():
-                    while self._observe() is True and time.monotonic() < drain_end:
+                    while self._observe(final=False) is True and time.monotonic() < drain_end:
                         time.sleep(min(.01, max(0, drain_end - time.monotonic())))
                 self._attempt("drain_descendants", drain)
             if code is None:
