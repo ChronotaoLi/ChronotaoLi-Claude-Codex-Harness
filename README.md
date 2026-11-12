@@ -103,7 +103,7 @@ python3 -m harness --config /path/to/harness.toml --repo /path/to/project resume
 
 所有更改在 `<目标项目>/.harness/worktrees/<run_id>` 的 `harness/<run_id>` 分支完成。每个通过检查和审阅的任务生成本地提交。成功输出分支和路径，便于查看 diff、merge 或 cherry-pick；最终集成由你操作。
 
-每个有改动的已接受任务恰好生成一个提交。提交消息由该任务的 worker 按目标仓库的提交规范撰写（`commit_message` 的主题与正文），经独立审阅审查；运行时按原样提交（`--cleanup=verbatim`），只在末尾追加 `Harness-Run`、`Harness-Task` 两行 trailer。作者与提交者固定为 `Personal Harness <harness@localhost>`，不签名，不运行仓库 hooks，提交编码固定为 UTF-8；运行时不推送、不合并、不改写历史。目标或仓库规则要求更多（签名、`Signed-off-by` trailer、指定作者、压缩提交、推送）时，指挥会向操作者提问，不会写成运行时做不到的验收项。
+每个有改动的已接受任务恰好生成一个提交。提交消息由该任务的 worker 按目标仓库的提交规范撰写（`commit_message` 的主题与正文），经独立审阅审查；除非仓库规范要求，消息里不加 `Co-Authored-By` 之类的署名行，多出的署名行由审阅者按阻断问题退回；运行时按原样提交（`--cleanup=verbatim`），只在末尾追加 `Harness-Run`、`Harness-Task` 两行 trailer。作者与提交者固定为 `Personal Harness <harness@localhost>`，不签名，不运行仓库 hooks，提交编码固定为 UTF-8；运行时不推送、不合并、不改写历史。目标或仓库规则要求更多（签名、`Signed-off-by` trailer、指定作者、压缩提交、推送）时，指挥会向操作者提问，不会写成运行时做不到的验收项。
 
 外层脚本按 trailer 识别 Harness 提交，不要匹配主题（旧版本的主题 `harness: <task_id>` 已不再使用）。读取时固定 trailer 分隔符，并让 `interpret-trailers` 不把正文里的 `---` 行当作补丁分隔线：
 

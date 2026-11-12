@@ -640,10 +640,10 @@ Python 3.11.17 执行这次重做新增和大改的 14 个模块，255 项全部
 - **审阅拒绝后返工**（6 次调用，5 次真实）：脚本给出的首个候选漏掉验收里的“`name` 不是 str 时抛 TypeError”。`gpt-6.1-sol` 返回 `request_changes` 和一条 blocking finding；`gpt-6-astra` 的 `decide` 返回 `implement`；第二次 worker 的契约要求 `repair_claims` 的键为 `f1`，返回的键正是 `f1`；第二轮审阅的契约要求 `finding_dispositions` 的键为 `f1`，返回 `f1` 为 `resolved`、结论 `approve`；整体审阅通过，run 完成（2 次尝试）。提交消息来自第二次 worker 的原件，不是首个候选的消息。
 - **worker 的 task 阻断后指挥修订**（12 次调用，11 次真实）：预写计划把任务限定在 `greeting.py`，而测试导入 `hello`；脚本给出的首次返回是 `blocked`／`task`。指挥先返回 `ask`，请求把 `hello.py` 加入已批准范围。用操作者决定回答“同意”后，指挥的 `revise` 因新增 `hello.py` 被判为越出已批准范围：派发条目记为 `invalid`，`out_of_scope_paths` 为 `["hello.py"]`，run 停止，没有自动重做。之后一次普通 `resume` 和一次重复的操作者决定都得到新的 `ask`，问题里写出了 `resume … --allow-scope 'hello.py'`。按这个出口授权后 `approved_scope` 保存为 `["hello.py"]`，run 仍停在未答复的请求上；再用 `--operator-decision` 答复，指挥的 `revise` 落地为计划第 1 版（新增前置任务 `implement_hello`，原任务改为依赖它）。随后前置任务的 worker 与审阅、`decide`（`implement`）、原任务的 worker 与审阅（无改动，不产生提交）、整体审阅依次通过，run 完成，分支上只有一个新提交。
 
-联调中观察到、没有处理的两件事：
+联调中观察到的两件事：
 
-- 六个完成的 run 里有五个，worker 写的提交消息正文末尾带一行 `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`。规则没有禁止，审阅者放行；它与运行时的 trailer 之间隔一个空行，不影响两行 trailer 的读取。
-- 指挥的 `ask` 实际是范围请求时，停止信息只提示 `--operator-decision`。操作者照提示作答不能扩大范围，要等修订被判越界才看到 `--allow-scope`，多花一次指挥调用；两个选项不能合用，授权和答复要分两次 `resume`。
+- 六个完成的 run 里有五个，worker 写的提交消息正文末尾带一行 `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`；当时规则没有禁止，审阅者放行。已处理：worker 技能规定除非目标仓库的规范要求，消息里不加署名行；审阅技能把规范没有要求的署名行列为阻断问题。改动后用同一夹具和预写计划跑了三次真实 run（各为 worker、任务审阅、整体审阅，共 9 次调用），三条提交消息都没有署名行，审阅均批准。带这项改动的四分片套件：1,428 项收集并执行，1,427 项通过、1 项跳过，695.2 秒。
+- 未处理：指挥的 `ask` 实际是范围请求时，停止信息只提示 `--operator-decision`。操作者照提示作答不能扩大范围，要等修订被判越界才看到 `--allow-scope`，多花一次指挥调用；两个选项不能合用，授权和答复要分两次 `resume`。
 
 真实联调没有覆盖的：
 

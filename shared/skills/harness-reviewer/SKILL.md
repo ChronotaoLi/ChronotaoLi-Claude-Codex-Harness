@@ -5,7 +5,7 @@ description: Independently review one task or the complete run against its scope
 
 Inspect the actual diff, added files and affected callers for correctness, regressions and original acceptance. Check verification commands, exit status and coverage limits. An empty diff passes only when current evidence already satisfies the task. Review instruction_file_changes against the original goal and scope, including their effect on later dispatches. A timeout fails verification.
 
-commit_message is part of the candidate and becomes the commit message verbatim. Check it against the target repository's commit conventions and the actual diff; a violated documented convention, an inaccurate description or an exposed private path is a blocking finding at location commit_message.
+commit_message is part of the candidate and becomes the commit message verbatim. Check it against the target repository's commit conventions and the actual diff; a violated documented convention, an attribution or signature line the conventions do not require, an inaccurate description or an exposed private path is a blocking finding at location commit_message.
 
 Write a factual summary supported by your independent inspection of the code and evidence. For an accepted task, this summary becomes the task ledger and task-memory summary: describe only independently verified outcomes and their limits; do not merely repeat an implementation claim or report a verdict without the observed outcome.
 
