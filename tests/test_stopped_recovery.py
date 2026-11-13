@@ -250,19 +250,6 @@ class StoppedRecoveryTests(RepoCase):
         self.assertEqual(cleanup_run(self.repo, engine.run["id"], remove=True)["worktree"]["status"], "blocked")
         self.assertTrue((cache / "unsaved").exists())
 
-    def test_interrupted_removal_by_the_deleted_abandon_option_is_finished_by_cleanup(self):
-        engine = self.engine()
-        engine.start("Implement greet", self.plan(), pause_after_plan=True)
-        self.engine().abandon(engine.run["id"])
-        # The state abandon --remove-worktree left when interrupted after Git removal.
-        git.git(self.repo, "worktree", "remove", str(engine.worktree))
-        saved = read_json(engine.directory / "state.json")
-        write_json(engine.directory / "state.json", {**saved, "pending_worktree_removal": True})
-        self.assertEqual(cleanup_run(self.repo, engine.run["id"])["worktree"]["status"], "absent")
-        self.assertEqual(cleanup_run(self.repo, engine.run["id"], remove=True)["worktree"]["status"], "removed")
-        self.assertEqual(read_json(engine.directory / "worktree-cleanup.json")["status"], "removed")
-        self.assertEqual(git.git(self.repo, "rev-parse", saved["branch"]).strip(), saved["expected_head"])
-
     def test_resume_reloads_abandonment_after_acquiring_lock(self):
         engine = self.engine()
         engine.start("Implement greet", self.plan(), pause_after_plan=True)

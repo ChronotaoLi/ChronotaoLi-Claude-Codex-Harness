@@ -12,25 +12,11 @@ from .contracts import judge_work, validate_work_core
 from .recovery import read_bound_result, snapshot_digest
 from .services import RuntimeService
 from .util import HarnessError, dump, read_json, write_json
-from .worker_returns import inspect_return, validate_historical_return_evidence, validate_return_evidence
+from .worker_returns import inspect_return, validate_return_evidence
 
 # Worker inputs live beside the dispatch as immutable files; the ledger keeps
-# their paths and SHA256 (schema 16 and later). Schema 14 and 15 ledgers embed
-# the same inputs; only read-only history checks accept that shape.
+# their paths and SHA256.
 INPUTS = {'packet': 'packet.json', 'schema': 'schema.json'}
-REFERENCED, EMBEDDED = 'referenced', 'embedded'
-# Schema 15 and 16 intents declared the Claude capture mode, which had to match
-# the run configuration; their history is checked in that shape. Schema 17 has
-# a single output mode and its intent carries no capture contract.
-CAPTURE_CONTRACT_VERSIONS = (15, 16)
-
-
-def receipt_shape(run):
-    """The worker intent shape fixed by the ledger's version; never guessed from content."""
-    version = run.get('schema_version')
-    if type(version) is not int or version < 14:
-        raise HarnessError('worker receipts require ledger schema 14 or later')
-    return EMBEDDED if version < 16 else REFERENCED
 
 
 def read_worker_input(directory, entry, intent, field):
@@ -157,25 +143,12 @@ class WorkerReceipts(RuntimeService):
             raise HarnessError('worker receipt dispatch identity missing or ambiguous')
         return matches[0]
 
-    def delivered_contract(self, entry, intent, shape=REFERENCED):
-        """Return the exact contract delivered to a worker, verifying its inputs.
-
-        The referenced shape reads both immutable files and checks their SHA256;
-        the embedded shape exists only in completed historical ledgers.
-        """
-        if shape == EMBEDDED:
-            if (any(field + '_artifact' in intent for field in INPUTS)
-                    or not isinstance(intent.get('schema'), dict) or not isinstance(intent.get('packet'), dict)
-                    or intent.get('packet_digest') != snapshot_digest(intent['packet'])):
-                raise HarnessError('missing mandatory worker receipt linkage')
-            return intent['schema']
-        if shape != REFERENCED or any(field in intent for field in ('packet', 'schema', 'packet_digest')):
-            raise HarnessError('missing mandatory worker receipt linkage')
+    def delivered_contract(self, entry, intent):
+        """Return the exact contract delivered to a worker: both immutable inputs, checked by SHA256."""
         read_worker_input(self.context.directory, entry, intent, 'packet')
         return read_worker_input(self.context.directory, entry, intent, 'schema')
 
-    def validate_links(self, shape=REFERENCED):
-        """Execution accepts only referenced inputs; history passes its own shape."""
+    def validate_links(self):
         receipts = self.context.run['worker_receipts']
         if not isinstance(receipts, dict) or len(receipts) > 1:
             raise HarnessError('invalid/conflicting worker receipts')
@@ -191,41 +164,19 @@ class WorkerReceipts(RuntimeService):
                     or type(intent.get('attempt')) is not int or intent['attempt'] < 1
                     or intent.get('phase') != 'invoking'):
                 raise HarnessError('missing mandatory worker receipt linkage')
-            contract = self.delivered_contract(entry, intent, shape)
+            contract = self.delivered_contract(entry, intent)
             job = self.context.directory / 'dispatches' / entry['id']
-            version = self.context.run['schema_version']
-            if version >= CAPTURE_CONTRACT_VERSIONS[0]:
-                evidence = entry.get('worker_return_evidence')
-                if version in CAPTURE_CONTRACT_VERSIONS:
-                    capture = intent.get('capture')
-                    if (not isinstance(capture, dict) or set(capture) != {'provider', 'mode'}
-                            or capture['provider'] != 'claude'
-                            or capture['mode'] not in ('legacy_json', 'stream_metadata_v1')
-                            or 'worker_no_result' in entry):
-                        raise HarnessError('missing/invalid mandatory worker capture contract')
-                    snapshot = self.context.run.get('config_snapshot', {})
-                    if (capture['provider'] != snapshot.get('roles', {}).get('worker', {}).get('cli')
-                            or capture['mode'] != snapshot.get('runtime', {}).get('claude_output_mode')):
-                        raise HarnessError('worker capture contract differs from run configuration')
-                    if evidence is not None:
-                        validate_historical_return_evidence(job, evidence, capture)
-                else:
-                    # Schema 17 has no capture contract; a capture here is not
-                    # ignored or defaulted, it is refused like any foreign shape.
-                    if 'capture' in intent:
-                        raise HarnessError('worker receipt carries a capture contract removed in schema 17')
-                    if 'worker_no_result' in entry:
-                        raise HarnessError('worker dispatch carries a worker_no_result record from an older protocol')
-                    if evidence is not None:
-                        validate_return_evidence(job, evidence)
-                if entry.get('worker_receipt_consumed') == 'provider_failure' and (
-                        evidence is None or evidence['state'] != 'retryable'):
-                    raise HarnessError('worker provider failure lacks retry evidence')
-                if evidence is not None and evidence['state'] == 'retryable' and entry.get('worker_receipt_consumed') not in (None, 'provider_failure'):
-                    raise HarnessError('worker retry evidence has another outcome')
-                if evidence is not None and evidence['state'] == 'invalid' and (
-                        entry.get('worker_receipt_consumed') != 'result_rejected' or entry.get('status') != 'invalid'):
-                    raise HarnessError('worker invalid-output evidence lacks its rejection')
+            evidence = entry.get('worker_return_evidence')
+            if evidence is not None:
+                validate_return_evidence(job, evidence)
+            if entry.get('worker_receipt_consumed') == 'provider_failure' and (
+                    evidence is None or evidence['state'] != 'retryable'):
+                raise HarnessError('worker provider failure lacks retry evidence')
+            if evidence is not None and evidence['state'] == 'retryable' and entry.get('worker_receipt_consumed') not in (None, 'provider_failure'):
+                raise HarnessError('worker retry evidence has another outcome')
+            if evidence is not None and evidence['state'] == 'invalid' and (
+                    entry.get('worker_receipt_consumed') != 'result_rejected' or entry.get('status') != 'invalid'):
+                raise HarnessError('worker invalid-output evidence lacks its rejection')
             if intent.get('artifact') != str(job / 'returned-result.json') or intent.get('seal') != str(job / 'worker-seal.json'):
                 raise HarnessError('worker intent paths invalid')
             properties = contract.get('properties', {})
@@ -436,18 +387,12 @@ class WorkerReceipts(RuntimeService):
             self.context.run['worker_recovery'].pop(task_id)
 
 
-def validate_worker_receipt_links(run, directory, shape=None):
-    """Read-only structural check for input preparation and guarded historical cleanup.
-
-    Without an explicit shape the ledger's version selects it: schema 14 and 15
-    use their embedded inputs, schema 16 and later the referenced files. Old ledgers are
-    checked in their own shape; no default is filled in.
-    """
+def validate_worker_receipt_links(run, directory):
+    """Read-only structural check for input preparation and guarded cleanup."""
     from types import SimpleNamespace
     if not isinstance(run.get('worker_receipts'), dict):
         raise HarnessError('missing mandatory worker receipts')
-    WorkerReceipts(SimpleNamespace(run=run, directory=Path(directory))).validate_links(
-        receipt_shape(run) if shape is None else shape)
+    WorkerReceipts(SimpleNamespace(run=run, directory=Path(directory))).validate_links()
 
 
 def delivered_work_contract(run, directory, dispatch_id):

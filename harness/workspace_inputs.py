@@ -12,7 +12,7 @@ import stat
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
-from .versions import RUN_SCHEMA_VERSION
+from .versions import require_current_ledger
 from . import git
 from .cleanup import _canonical, _regular_bytes
 from .path_evidence import validate_dispatch_indexes
@@ -104,8 +104,7 @@ def _gate(run, directory, *, terminal=False):
     validate_command_directories(run['dispatches'], directory)
     validate_dispatch_indexes(directory, run['dispatches'])
     validate_input_dispatch_indexes(directory, run['dispatches'])
-    if run['schema_version'] >= 14:
-        validate_worker_receipt_links(run, directory)
+    validate_worker_receipt_links(run, directory)
     ensure_dispatches_exited(run['dispatches'], observe=group_alive)
     git.check_worktree_binding(checkout, run['worktree_binding'])
     if git.head(checkout, binding=run['worktree_binding']) != run['expected_head']:
@@ -159,7 +158,7 @@ def _manifest(run, value):
 def _registered(run, directory):
     binding = run.get('workspace_inputs')
     if binding is None:
-        if run.get('schema_version', 0) >= 12 and 'workspace_inputs' not in run:
+        if 'workspace_inputs' not in run:
             _fail('missing authoritative workspace_inputs field')
         return None, None
     if (not isinstance(binding, dict) or set(binding) != {'schema_version', 'manifest_sha256'}
@@ -207,8 +206,9 @@ def prepare_run(repo, ident, manifest):
     ensure_private_state(repo)
     with lock(directory / 'run.lock'):
         run = _read(directory / 'state.json')
-        if run.get('id') != ident or run.get('repo') != str(repo) or run.get('schema_version') != RUN_SCHEMA_VERSION:
-            _fail('historical run is read-only; start a new run before preparation')
+        require_current_ledger(run)
+        if run.get('id') != ident or run.get('repo') != str(repo):
+            _fail('run ledger does not belong to this repository')
         store = RunStore(repo / '.harness')
         store.attach(run)
         before = _gate(run, directory)

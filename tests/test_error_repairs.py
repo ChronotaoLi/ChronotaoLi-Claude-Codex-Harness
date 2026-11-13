@@ -13,6 +13,7 @@ from harness.cli import main
 from harness.runtime import Runtime
 from harness.shared import HookError, Hooks
 from harness.util import HarnessError, ProcessTimeout, dump, group_alive, read_json, run_process, write_json
+from harness.versions import RUN_SCHEMA_VERSION
 from test_harness import RepoCase, ROOT
 
 
@@ -168,8 +169,8 @@ class ErrorRepairsTests(RepoCase):
     def test_status_retains_healthy_runs_when_other_state_is_damaged(self):
         runs = self.repo / ".harness" / "runs"
         good = {"id": "run_good", "status": "completed", "goal": "done", "branch": "harness/run_good"}
-        write_json(runs / "run_good" / "state.json", good)
-        write_json(runs / "run_partial" / "state.json", {"goal": "partial"})
+        write_json(runs / "run_good" / "state.json", {**good, "schema_version": RUN_SCHEMA_VERSION})
+        write_json(runs / "run_partial" / "state.json", {"goal": "partial", "schema_version": RUN_SCHEMA_VERSION})
         write_json(runs / "run_shape" / "state.json", [])
         write_json(runs / "run_broken" / "state.json", {})
         (runs / "run_broken" / "state.json").write_text("{")

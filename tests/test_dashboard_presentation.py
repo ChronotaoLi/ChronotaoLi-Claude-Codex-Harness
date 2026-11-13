@@ -14,6 +14,7 @@ from pathlib import Path
 
 from harness import observe
 from harness.dashboard_page import APP_JS
+from harness.versions import RUN_SCHEMA_VERSION
 from test_dashboard_page_events import BROWSER_JS
 
 WORKER = "0b7e6d3c-1f0a-4c55-9d43-2f6f0b1c9a01"
@@ -40,11 +41,11 @@ function visibleText(node) {
 function toggle(details, open) { details.open = open; fire(details, "toggle"); }
 function key(name) { return {key: name, preventDefault: function () {}}; }
 // Resolve the oldest unresolved request for this path with a JSON body.
-async function respond(path, body, ok = true) {
+async function respond(path, body, ok = true, status = ok ? 200 : 404) {
   const entry = pending.find(function (p) { return !p.done && p.url.split("?")[0] === path; });
   assert.ok(entry, "no pending request for " + path + "; requested: " + JSON.stringify(requested));
   entry.done = true;
-  entry.resolve({ok: ok, status: ok ? 200 : 404, text: function () { return Promise.resolve(JSON.stringify(body)); }});
+  entry.resolve({ok: ok, status: status, text: function () { return Promise.resolve(JSON.stringify(body)); }});
   await flush();
 }
 const D = fixture.data;
@@ -115,14 +116,10 @@ def detail(run_id, goal, *, status="running", summary=None, dispatches=(), event
            "repo": "/tmp/repo", "commander": "fable", "current_task": "t2", "error_type": None,
            "created_by_operation": "op_1", "config_path": "/tmp/harness.toml", "expected_head": "abc",
            "base_commit": "def", "error": error, "worktree_removed": False}
-    # Historical schema-12 projection: it saved total_attempts, attempt_budget_policy
-    # and runtime.max_total_attempts, shown as saved.
     return {"id": run_id, "sampled_at": 2000.0, "sampled_at_utc": "2026-11-09T00:00:00Z", "ledger_error": None,
-            "summary": base, "summary_error": None, "schema_version": 12, "unavailable": [], "run": run,
-            "budgets": {"total_attempts": 3, "agent_dispatches": 5, "replan_attempts": 0, "final_attempts": 0,
-                        "attempts": {"t1": 1, "t2": 2}, "attempt_budget_policy": "all_invocations",
-                        "limits": {"max_attempts": 4, "max_total_attempts": 10, "max_agent_dispatches": 40,
-                                   "max_replans": 2, "max_final_attempts": 2, "agent_timeout_seconds": 600}},
+            "summary": base, "summary_error": None, "schema_version": RUN_SCHEMA_VERSION, "unavailable": [], "run": run,
+            "budgets": {"agent_dispatches": 5, "attempts": {"t1": 1, "t2": 2}, "attempts_total": 3,
+                        "limits": {"max_attempts": 4, "max_agent_dispatches": 40, "agent_timeout_seconds": 600}},
             "tasks": [{"id": "t1", "title": "Prepare schema", "depends_on": [], "accepted": True},
                       {"id": "t2", "title": "Build service", "depends_on": ["t1"], "accepted": False}],
             "invalid_tasks": 0, "dispatches": rows, "invalid_dispatches": 0, "cost": observe.cost_summary(rows),
@@ -164,9 +161,10 @@ class DashboardPresentationTests(unittest.TestCase):
     def test_long_goal_is_bounded_by_default_with_full_text_on_demand(self):
         data = {"goal": LONG_GOAL,
                 "list": {"sampled_at": 2000.0, "runs": [{"id": "run_long", "status": "running", "goal": LONG_GOAL,
-                                                         "branch": "b", "run_dir": "run_long", "schema_version": 12,
+                                                         "branch": "b", "run_dir": "run_long",
+                                                         "schema_version": RUN_SCHEMA_VERSION,
                                                          "last_event_time": 1990.0}],
-                         "skipped": [], "incomplete": []},
+                         "skipped": [], "incomplete": [], "unsupported": []},
                 "detail": detail("run_long", LONG_GOAL, events=[event(1990.0, "dispatch_started")]),
                 "files": file_index("run_long", "state.json")}
         self.run_browser(data, r'''
@@ -536,28 +534,39 @@ class DashboardPresentationTests(unittest.TestCase):
   assert.ok(!visibleText(byId.main).includes("$0.2500"));
 ''')
 
-    def test_budget_panel_shows_schema16_attempt_sum_and_historical_saved_counter(self):
-        current = detail("run_new", "Schema 16")
-        current["schema_version"] = 16
-        current["budgets"].update(total_attempts=None, attempt_budget_policy=None, attempts_total=3)
-        current["budgets"]["limits"]["max_total_attempts"] = None
-        data = {"current": current, "historical": detail("run_old", "Schema 12")}
+    def test_budget_panel_shows_attempt_sum_without_run_wide_limit(self):
+        data = {"current": detail("run_new", "Current")}
         self.run_browser(data, r'''
   navigate("#/runs/run_new");
   await respond("/api/runs/run_new", D.current);
   fire(one(attrIs("data-tab", "cost")), "click");
-  let panel = visibleText(one(attrIs("data-panel", "cost")));
-  assert.ok(panel.includes("worker 尝试总数"), "schema 16 shows the summed attempts");
+  const panel = visibleText(one(attrIs("data-panel", "cost")));
+  assert.ok(panel.includes("worker 尝试总数"), "the summed attempts are shown");
   assert.ok(panel.includes("各任务 attempts 之和"));
-  assert.ok(panel.includes("work（台账 16 起固定）"));
-  assert.ok(!panel.includes("总尝试（历史台账）"), "no run-wide limit meter for schema 16");
+  assert.ok(panel.includes("5 / 40"), "model dispatches against their limit");
+  assert.ok(!panel.includes("历史台账"), "no saved counter or policy of another ledger version");
+''')
+
+    def test_other_ledger_versions_are_listed_by_path_and_refused_in_detail(self):
+        unsupported = [{"path": "runs/run_old", "schema_version": 17,
+                        "reason": f"台账版本 17 不支持（当前版本 {RUN_SCHEMA_VERSION}）"}]
+        data = {"list": {"sampled_at": 2000.0, "runs": [], "skipped": [], "incomplete": [], "unsupported": unsupported},
+                "refusal": {"error": unsupported[0]["reason"], "status": 409}}
+        self.run_browser(data, r'''
+  await respond("/api/runs", D.list);
+  const box = one(attrIs("data-ui-key", "list:diagnostics"));
+  assert.ok(visibleText(box).includes("不支持的台账版本 1 个"));
+  toggle(box, true);
+  const shown = visibleText(byId.main);
+  assert.ok(shown.includes("runs/run_old：" + D.list.unsupported[0].reason));
+  assert.ok(!all(function (n) { return n.tagName === "a" && (n.href || "").includes("run_old"); }).length,
+            "an unsupported run is not linked to a detail view");
   navigate("#/runs/run_old");
-  await respond("/api/runs/run_old", D.historical);
-  fire(one(attrIs("data-tab", "cost")), "click");
-  panel = visibleText(one(attrIs("data-panel", "cost")));
-  assert.ok(panel.includes("总尝试（历史台账）"), "historical ledgers keep their saved counter");
-  assert.ok(panel.includes("3 / 10"));
-  assert.ok(panel.includes("all_invocations（历史台账保存）"));
+  await respond("/api/runs/run_old", D.refusal, false, 409);
+  const refused = visibleText(byId.main);
+  assert.ok(refused.includes("HTTP 409：" + D.refusal.error));
+  assert.ok(refused.includes("当前版本不解释该 run 的台账"));
+  assert.ok(!refused.includes("可稍后点击刷新重试"));
 ''')
 
     def test_dispatch_event_meanings_review_rounds_and_lower_bound_are_projected(self):
@@ -568,7 +577,7 @@ class DashboardPresentationTests(unittest.TestCase):
              "verdict": "request_changes", "new_blocking": ["ROUND-TWO-NEW"], "status": "invalidated"}]}}
         remaining = {"lower_bound": 2, "tasks": {"t2": 1}, "final_review": 1,
                      "message": "如果之后全部一次通过，至少还需 2 次模型调用（下界：BOUND-TEXT）"}
-        records = [event(1990.0, "dispatch_started", dispatch_id=WORKER),
+        records = [event(1990.0, "dispatch_prepared", dispatch_id=WORKER),
                    event(1991.0, "dispatch_prepared", dispatch_id=LATER),
                    event(1992.0, "dispatch_finished", dispatch_id=LATER, invoked=False),
                    event(1993.0, "dispatch_started", dispatch_id=REVIEWER, invoked=True),
@@ -580,7 +589,7 @@ class DashboardPresentationTests(unittest.TestCase):
   await respond("/api/runs/run_obs", D.detail);
   fire(one(attrIs("data-tab", "events")), "click");
   const shown = visibleText(byId.main);
-  for (const label of ["派发准备（旧版事件，不表示已调用）", "准备派发", "派发结束（未调用）", "开始调用", "调用结束"]) {
+  for (const label of ["准备派发", "派发结束（未调用）", "开始调用", "调用结束"]) {
     assert.ok(shown.includes(label), "event label shown: " + label);
   }
   fire(one(attrIs("data-tab", "cost")), "click");

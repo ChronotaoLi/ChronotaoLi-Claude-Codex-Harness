@@ -1,24 +1,18 @@
-"""Schema 17 runs and read-only schema 15/16 history; every model is simulated offline.
+"""Only the current ledger version is run, cleaned or interpreted; every model is simulated offline.
 
-Each version gets its own terminal fixture: a completed run whose first worker
-attempt timed out without output, then a command continuation, and a retained
-fresh-verification checkout. Historical fixtures are rewritten into the shape the
-older code saved: schema 15 also embeds worker inputs, continuation snapshots,
-the run-wide counter and a version-1 command manifest; schema 15 and 16 declare a
-capture mode in every worker intent and in the configuration snapshot.
-
-The worker return evidence of a historical fixture is never derived by the code
-under test. Its directory and record are copied from tests/data, which holds the
-records bc94b6f's classifier produced for exactly those bytes; the generator,
-tests/data/worker_return_history_bc94b6f.gen.py, imports only a bc94b6f export.
+CurrentLedgerTests use a completed run whose first worker attempt timed out
+without output, then a command continuation, with a retained fresh-verification
+checkout: cleanup, its exit confirmation, damaged-shape refusals and the
+observation projections. UnsupportedLedgerTests save a paused run under another
+schema_version: every entry refuses it before anything is changed, and the run
+list names it by path and version alone.
 """
-import base64
 import contextlib
-import copy
 import hashlib
 import io
 import json
 from pathlib import Path
+import re
 import shutil
 import sys
 import tempfile
@@ -31,59 +25,21 @@ from harness.cleanup import cleanup_run
 from harness.cli import status_summary
 from harness.recovery import snapshot_digest
 from harness.util import HarnessError, ProcessTimeout, read_json, write_json
-from harness.versions import HISTORICAL_CLEANUP_VERSIONS, RUN_SCHEMA_VERSION
+from harness.versions import RUN_SCHEMA_VERSION
+from harness.watch_cli import watch_run
 from harness.workspace_inputs import prepare_run
-from harness.worker_returns import (HISTORICAL_SOURCES, SOURCES, inspect_historical_return,
-                                    validate_historical_return_evidence)
+from harness.worker_returns import SOURCES
+from test_dashboard import DashboardCase
 from test_harness import ROOT, RepoCase
 from test_runtime_changes import ScriptedBackend
 
 INPUTS = {'packet': 'packet.json', 'schema': 'schema.json'}
-REMOVED_KEYS = {'total_attempts', 'attempt_budget_policy'}
-HISTORY = json.loads((Path(__file__).with_name('data') / 'worker_return_history_bc94b6f.json').read_text(encoding='utf-8'))
-ROWS = {row['name'].split()[0]: row for row in HISTORY['rows']}
+# Ledger fields of earlier versions; a new ledger and its projections have none of them.
+REMOVED_KEYS = {'total_attempts', 'attempt_budget_policy', 'replan_attempts', 'final_attempts', 'replan_stopped'}
 
 
 def sha(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
-
-
-def row_bytes(spec):
-    return base64.b64decode(spec['base64']) if 'base64' in spec else spec['text'].encode('utf-8')
-
-
-def write_row(job, row):
-    """Make a dispatch directory hold exactly a baseline row's fingerprinted files."""
-    for name in HISTORICAL_SOURCES:
-        (job / name).unlink(missing_ok=True)
-    for name, spec in row['files'].items():
-        (job / name).write_bytes(row_bytes(spec))
-
-
-def adopt_capture_contract(directory, run, mode, rows=()):
-    """Rewrite schema 17 worker receipts into the schema 15/16 capture shape.
-
-    rows maps worker dispatch IDs to baseline rows: that dispatch directory gets the
-    row's files and its evidence becomes the row's bc94b6f record, never a record
-    derived by the code under test.
-    """
-    capture = {'provider': 'claude', 'mode': mode}
-    rows = dict(rows)
-    run['config_snapshot']['runtime']['claude_output_mode'] = mode
-    for entry in run['dispatches']:
-        if entry.get('role') != 'worker' or not entry.get('invoked'):
-            continue
-        entry['worker_receipt']['capture'] = dict(capture)
-        row = rows.pop(entry['id'], None)
-        if row is not None:
-            assert row['capture'] == capture, row['name']
-            write_row(Path(directory) / 'dispatches' / entry['id'], row)
-            entry['worker_return_evidence'] = copy.deepcopy(row['record'])
-        else:
-            assert 'worker_return_evidence' not in entry, 'historical evidence must come from a baseline row'
-    for receipt in run['worker_receipts'].values():
-        receipt['capture'] = dict(capture)
-    assert not rows, rows
 
 
 def journal(commands, dispatch_id, command_id, *, exited=True):
@@ -101,45 +57,7 @@ def first_worker_times_out(backend, kwargs, packet):
         raise ProcessTimeout(1, kwargs['job'] / 'process')
 
 
-class WorkerReturnHistoryTableTests(unittest.TestCase):
-    """bc94b6f's whole records, for every reachable classification of schema 15/16."""
-
-    def directory(self, row):
-        temporary = tempfile.TemporaryDirectory()
-        self.addCleanup(temporary.cleanup)
-        job = Path(temporary.name).resolve()
-        write_row(job, row)
-        return job
-
-    def test_every_baseline_record_is_reproduced_and_accepted(self):
-        self.assertEqual(len(ROWS), 64)
-        self.assertEqual(len({(row['record']['state'], row['record']['reason']) for row in ROWS.values()}), 22)
-        for name, row in ROWS.items():
-            with self.subTest(row=row['name']):
-                job = self.directory(row)
-                self.assertEqual(inspect_historical_return(job, row['capture']), row['record'])
-                validate_historical_return_evidence(job, row['record'], row['capture'])
-
-    def test_bound_record_cannot_change_capture_files_or_classification(self):
-        legacy, stream, dead_end = ROWS['L5'], ROWS['S9'], ROWS['S7']
-        job = self.directory(legacy)
-        with self.assertRaisesRegex(HarnessError, 'invalid worker return evidence record'):
-            validate_historical_return_evidence(job, legacy['record'], stream['capture'])
-        job = self.directory(stream)
-        (job / 'stream-capture.json').write_bytes(row_bytes(stream['files']['stream-capture.json']) + b'\n')
-        with self.assertRaisesRegex(HarnessError, 'worker return evidence changed'):
-            validate_historical_return_evidence(job, stream['record'], stream['capture'])
-        job = self.directory(dead_end)
-        changed = {**dead_end['record'], 'reason': 'stream process was not launched'}
-        with self.assertRaisesRegex(HarnessError, 'classification does not match bound evidence'):
-            validate_historical_return_evidence(job, changed, dead_end['capture'])
-
-
-class HistoryCase(RepoCase):
-    VERSION = None
-    MODE = None
-    ROW = None
-
+class CurrentLedgerTests(RepoCase):
     def setUp(self):
         super().setUp()
         self.engine_, self.backend, self.run = self.terminal()
@@ -179,44 +97,13 @@ class HistoryCase(RepoCase):
         checkout = Path(read_json(next(engine.directory.glob('verification/final/*/verification-*/checkout.json')))['worktree'])
         self.addCleanup(shutil.rmtree, checkout.parents[1], True)
         worker = self.workers(run)[-1]
-        if self.VERSION != RUN_SCHEMA_VERSION:
-            adopt_capture_contract(engine.directory, run, self.MODE, {timed_out['id']: ROWS[self.ROW]})
-            run['schema_version'] = self.VERSION
-        if self.VERSION == 15:
-            self.rewrite_as_schema15(engine, run, worker)
-        else:
-            folder, _ = journal(worker['command_directory'], worker['id'], 'delete_path')
-            write_json(folder / 'delete-intent.json', {'path': 'obsolete.txt', 'sha256': '0' * 64})
-            write_json(folder / 'receipt.json', {'operation': 'delete_path', 'outcome': 'deleted',
-                                                 'intent_path': str(folder / 'delete-intent.json'),
-                                                 'intent_sha256': sha(folder / 'delete-intent.json')})
+        folder, _ = journal(worker['command_directory'], worker['id'], 'delete_path')
+        write_json(folder / 'delete-intent.json', {'path': 'obsolete.txt', 'sha256': '0' * 64})
+        write_json(folder / 'receipt.json', {'operation': 'delete_path', 'outcome': 'deleted',
+                                             'intent_path': str(folder / 'delete-intent.json'),
+                                             'intent_sha256': sha(folder / 'delete-intent.json')})
         write_json(engine.directory / 'state.json', run)
         return engine, backend, run
-
-    def rewrite_as_schema15(self, engine, run, worker):
-        for entry in self.workers(run):
-            intent, job = entry['worker_receipt'], engine.directory / 'dispatches' / entry['id']
-            packet, schema = read_json(job / 'packet.json'), read_json(job / 'schema.json')
-            for field in INPUTS:
-                intent.pop(field + '_artifact')
-                intent.pop(field + '_artifact_digest')
-            intent.update(schema=schema, packet=packet, packet_digest=snapshot_digest(packet))
-            for name in INPUTS.values():
-                (job / name).unlink()
-        run['continuation_history'] = [{**read_json(Path(row['artifact'])), 'artifact': row['artifact'],
-                                         'artifact_digest': row['artifact_digest']}
-                                        for row in run['continuation_history']]
-        # Historical schema-15 fields, as that code saved them.
-        run.update(total_attempts=sum(run['attempts'].values()), attempt_budget_policy='work')
-        run['config_snapshot']['runtime']['max_total_attempts'] = 60
-        job = engine.directory / 'dispatches' / worker['id']
-        write_json(job / 'commands.json', {
-            'version': 1, 'role': 'worker', 'dispatch_id': worker['id'], 'cwd': run['worktree'], 'job': str(job),
-            'run_path': str(engine.directory / 'state.json'), 'binding': run['worktree_binding'],
-            'expected_head': run['expected_head'], 'timeout': 300, 'parent_deadline': 0.0,
-            'cleanup_margin': 2.0, 'commands': []})
-        journal(worker['command_directory'], worker['id'], 'a' * 64)
-        (engine.directory / 'handoff.md').write_text('# Run handoff\n\nschema 15\n', encoding='utf-8')
 
     def damaged(self, change):
         state = json.loads(self.before)
@@ -235,8 +122,6 @@ class HistoryCase(RepoCase):
 
     def statuses(self, result):
         return [item['status'] for item in result['checkouts']], result['worktree']['status']
-
-    # ----- the four cleanup cases, run for each version -----
 
     def test_cleanup_previews_leave_everything_unchanged(self):
         self.assertEqual(self.statuses(cleanup_run(self.repo, self.run['id'])), (['eligible'], 'eligible'))
@@ -260,7 +145,7 @@ class HistoryCase(RepoCase):
         self.assertEqual(self.path.read_bytes(), self.before)
         self.assertEqual(read_json(self.directory / 'worktree-cleanup.json')['status'], 'removed')
 
-    def test_confirm_exited_records_audit_without_upgrading_the_ledger(self):
+    def test_confirm_exited_records_audit_without_rewriting_the_ledger(self):
         _, child = journal(self.worker['command_directory'], self.worker['id'], 'b' * 64, exited=False)
         before = self.path.read_bytes()
         with self.assertRaisesRegex(HarnessError, 'Cannot confirm command process exited'):
@@ -271,34 +156,41 @@ class HistoryCase(RepoCase):
         saved = read_json(self.path)
         entry = next(d for d in saved['dispatches'] if d['id'] == self.worker['id'])
         self.assertIn(child['id'], entry['command_exit_confirmations'])
-        self.assertEqual((saved['schema_version'], saved['status']), (self.VERSION, 'completed'))
+        self.assertEqual((saved['schema_version'], saved['status']), (RUN_SCHEMA_VERSION, 'completed'))
         original = json.loads(self.before)
         # Only the confirmation and its store revision changed; no defaults were filled in.
         self.assertEqual(set(saved) - set(original), {'store_revision'} - set(original))
-        self.assertEqual(REMOVED_KEYS & set(saved), REMOVED_KEYS & set(original))
         events = [json.loads(line) for line in (self.directory / 'events.jsonl').read_text().splitlines()]
         self.assertEqual(events[-1]['event'], 'command_exit_confirmed_by_operator')
         self.assertEqual(events[-1]['command_id'], child['id'])
 
-    def test_damaged_ledgers_are_refused_in_their_own_version_shape(self):
-        def capture_contract(state, worker):
-            # Raising the version constant must neither skip the schema 15/16
-            # capture contract nor let schema 17 accept one.
-            if self.VERSION == RUN_SCHEMA_VERSION:
-                worker['worker_receipt']['capture'] = {'provider': 'claude', 'mode': 'legacy_json'}
-            else:
-                worker['worker_receipt'].pop('capture')
-        self.damaged(capture_contract)
-        self.assert_cleanup_refuses('capture contract')
-        self.path.write_bytes(self.before)
-
+    def test_damaged_ledgers_are_refused(self):
         def evidence_reason(state, worker):
             evidence = self.workers(state)[0]['worker_return_evidence']
             evidence['reason'] = 'provider returned a complete explicit error'
         self.damaged(evidence_reason)
         self.assert_cleanup_refuses('classification does not match bound evidence')
         self.path.write_bytes(self.before)
-        for change, pattern in self.shape_damage():
+        packet = self.directory / 'dispatches' / self.worker['id'] / 'packet.json'
+
+        def changed_packet():
+            original = packet.read_bytes()
+            packet.write_bytes(original.replace(b'"goal"', b'"Goal"', 1))
+            return lambda: packet.write_bytes(original)
+
+        def embedded_intent():
+            # Inputs copied into the intent instead of referenced by path and digest.
+            def change(state, worker):
+                job = self.directory / 'dispatches' / worker['id']
+                intent = worker['worker_receipt']
+                for field, name in INPUTS.items():
+                    intent.pop(field + '_artifact')
+                    intent.pop(field + '_artifact_digest')
+                    intent[field] = read_json(job / name)
+                intent['packet_digest'] = snapshot_digest(intent['packet'])
+            self.damaged(change)
+        for change, pattern in ((changed_packet, 'worker packet artifact changed'),
+                                (embedded_intent, 'worker packet reference invalid')):
             with self.subTest(pattern=pattern):
                 undo = change()
                 self.assert_cleanup_refuses(pattern)
@@ -307,12 +199,7 @@ class HistoryCase(RepoCase):
                     undo()
         self.assertEqual(self.statuses(cleanup_run(self.repo, self.run['id'])), (['eligible'], 'eligible'))
 
-    # ----- observation -----
-
     def test_status_dashboard_and_observation_read_the_ledger(self):
-        self.assert_version_budgets(*self.observed())
-
-    def observed(self):
         summary = status_summary(self.run)
         self.assertEqual(summary['status'], 'completed')
         self.assertEqual(summary['budgets']['attempts_total'], sum(self.run['attempts'].values()))
@@ -323,167 +210,26 @@ class HistoryCase(RepoCase):
         state = self.repo / '.harness'
         listing = observe.list_runs(state)
         self.assertEqual([(item['id'], item['schema_version']) for item in listing['runs']],
-                         [(self.run['id'], self.VERSION)])
+                         [(self.run['id'], RUN_SCHEMA_VERSION)])
+        self.assertEqual(listing['unsupported'], [])
         detail = observe.run_detail(state, self.run['id'])
         self.assertIsNone(detail['ledger_error'])
         self.assertIsNone(detail['summary_error'])
-        self.assertEqual(detail['schema_version'], self.VERSION)
+        self.assertEqual(detail['schema_version'], RUN_SCHEMA_VERSION)
         self.assertEqual(detail['budgets']['attempts_total'], sum(self.run['attempts'].values()))
         self.assertEqual(len(detail['dispatches']), len(self.run['dispatches']))
+        self.assertFalse(REMOVED_KEYS & set(summary['budgets']))
+        self.assertFalse(REMOVED_KEYS & set(detail['budgets']))
+        self.assertEqual(set(detail['budgets']['limits']), {'max_attempts', 'max_agent_dispatches', 'agent_timeout_seconds'})
+        self.assertEqual(set(summary['budget_explanation']['limits']), {'task_work', 'agent_dispatches'})
         with observe.Observer(state) as observer:
             files = {item['path'] for item in observer.file_index(self.run['id'])['files']}
             self.assertIn('handoff.json', files)
-            if self.VERSION == 15:
-                self.assertIn('schema 15', observer.read_file(self.run['id'], 'handoff.md')['text'])
-            else:
-                self.assertNotIn('handoff.md', files)
-            timed_out = self.workers(self.run)[0]['id']
-            for name in ROWS[self.ROW]['files'] if self.ROW else ():
-                self.assertIn(f'dispatches/{timed_out}/{name}', files)
-                self.assertEqual(observer.read_file(self.run['id'], f'dispatches/{timed_out}/{name}')['text'],
-                                 ROWS[self.ROW]['files'][name]['text'])
+            self.assertNotIn('handoff.md', files)
         self.assertEqual(self.path.read_bytes(), self.before)
-        return summary, detail
-
-
-class HistoricalCase(HistoryCase):
-    def test_resume_is_refused_without_writing_or_dispatching(self):
-        calls = len(self.backend.calls)
-        for options in ({}, {'reverify': True}):
-            with self.subTest(options=options):
-                with self.assertRaisesRegex(HarnessError, f'旧 run.*台账版本 {self.VERSION}.*status.*cleanup-run'):
-                    self.engine(self.backend).resume(self.run['id'], **options)
-        errors = io.StringIO()
-        # The operation record would probe provider CLI versions; keep them unexecuted.
-        with patch('harness.operations.probe_cli', return_value={'path': None, 'version': None}), \
-                contextlib.redirect_stderr(errors), contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(cli.main(['--repo', str(self.repo), 'resume', self.run['id']]), 1)
-        self.assertIn('只能用 status、dashboard 查看', errors.getvalue())
-        # abandon shares the version gate; prepare-run has its own.
-        with self.assertRaisesRegex(HarnessError, f'旧 run.*台账版本 {self.VERSION}'):
-            self.engine(self.backend).abandon(self.run['id'])
-        folder = tempfile.TemporaryDirectory()
-        self.addCleanup(folder.cleanup)
-        manifest = Path(folder.name) / 'inputs.json'
-        write_json(manifest, {'schema_version': 1, 'run_id': self.run['id'], 'head': self.run['expected_head'],
-                              'source_root': '.', 'max_files': 1, 'max_bytes': 1, 'files': []})
-        with self.assertRaisesRegex(HarnessError, 'historical run is read-only'):
-            prepare_run(self.repo, self.run['id'], manifest)
-        self.assertEqual(len(self.backend.calls), calls)
-        self.assertEqual(self.path.read_bytes(), self.before)
-
-    def test_saved_evidence_is_the_baseline_record(self):
-        entry = self.workers(self.run)[0]
-        self.assertEqual(entry['worker_return_evidence'], ROWS[self.ROW]['record'])
-        self.assertEqual(set(entry['worker_return_evidence']['sources']), set(HISTORICAL_SOURCES))
-        self.assertEqual(self.run['config_snapshot']['runtime']['claude_output_mode'], self.MODE)
-
-
-class Schema15HistoryTests(HistoricalCase):
-    VERSION, MODE, ROW = 15, 'legacy_json', 'L5'
-
-    def shape_damage(self):
-        def changed_packet():
-            self.damaged(lambda state, worker: worker['worker_receipt']['packet'].update(goal='changed'))
-
-        def referenced_intent():
-            def change(state, worker):
-                job = self.directory / 'dispatches' / worker['id']
-                intent = worker['worker_receipt']
-                for field, name in INPUTS.items():
-                    write_json(job / name, intent.pop(field))
-                    intent[field + '_artifact'] = str(job / name)
-                    intent[field + '_artifact_digest'] = sha(job / name)
-                intent.pop('packet_digest')
-            self.damaged(change)
-        return [(changed_packet, 'worker receipt linkage'), (referenced_intent, 'worker receipt linkage')]
-
-    def assert_version_budgets(self, summary, detail):
-        # Historical display branch: the saved counter and policy are shown as saved.
-        self.assertEqual(summary['budgets']['total_attempts'], self.run['total_attempts'])
-        self.assertEqual(summary['budgets']['attempt_budget_policy'], 'work')
-        self.assertEqual(detail['budgets']['total_attempts'], self.run['total_attempts'])
-        self.assertEqual(detail['budgets']['limits']['max_total_attempts'], 60)
-        self.assertIn('snapshot', self.run['continuation_history'][0])
-        self.assertEqual(summary['budget_explanation']['limits']['total_worker']['used'], self.run['total_attempts'])
-
-
-class ReferencedInputsCase(HistoryCase):
-    def shape_damage(self):
-        packet = self.directory / 'dispatches' / self.worker['id'] / 'packet.json'
-
-        def changed_packet():
-            original = packet.read_bytes()
-            packet.write_bytes(original.replace(b'"goal"', b'"Goal"', 1))
-            return lambda: packet.write_bytes(original)
-
-        def embedded_intent():
-            def change(state, worker):
-                job = self.directory / 'dispatches' / worker['id']
-                intent = worker['worker_receipt']
-                for field, name in INPUTS.items():
-                    intent.pop(field + '_artifact')
-                    intent.pop(field + '_artifact_digest')
-                    intent[field] = read_json(job / name)
-                intent['packet_digest'] = snapshot_digest(intent['packet'])
-            self.damaged(change)
-        return [(changed_packet, 'worker packet artifact changed'), (embedded_intent, 'worker receipt linkage')]
-
-    def assert_version_budgets(self, summary, detail):
-        self.assertFalse(REMOVED_KEYS & set(summary['budgets']))
-        self.assertIsNone(detail['budgets']['total_attempts'])
-        self.assertIsNone(detail['budgets']['limits']['max_total_attempts'])
-        self.assertNotIn('total_worker', summary['budget_explanation']['limits'])
-
-
-class Schema16HistoryTests(ReferencedInputsCase, HistoricalCase):
-    VERSION, MODE, ROW = 16, 'legacy_json', 'L5'
-
-    def test_old_review_and_worker_identity_shapes_are_not_read_by_observation(self):
-        # Ledger 16 disposed findings by (review_dispatch_id, finding_id) in arrays,
-        # bound worker-findings.json and carried evidence_files; observation reads
-        # none of them, so these shapes need no version branch.
-        state = read_json(self.path)
-        record = state['review_history']['greet'][-1]
-        record['review']['findings'] = [{'id': 'OLD-1', 'severity': 'blocking', 'category': 'defect',
-                                         'location': 'hello.py:1', 'message': 'old', 'evidence': ['e']}]
-        record['review']['finding_dispositions'] = [{'review_dispatch_id': 'earlier', 'finding_id': 'OLD-0',
-                                                     'status': 'resolved', 'evidence': ['checked']}]
-        worker = next(entry for entry in state['dispatches'] if entry['id'] == self.worker['id'])
-        worker['worker_findings'] = {'artifact': 'worker-findings.json', 'artifact_digest': '0' * 64}
-        state['feedback'] = {'task_id': 'greet', 'worker': {'evidence_files': [{'requirement_id': 'x'}]}}
-
-        def observed(run):
-            write_json(self.path, run)
-            detail = observe.run_detail(self.repo / '.harness', run['id'])
-            self.assertIsNone(detail['summary_error'])
-            return status_summary(run), detail['summary']['review_rounds']
-
-        summary, rounds = observed(state)
-        self.assertEqual(rounds, summary['review_rounds'])
-        self.assertEqual(summary['review_rounds']['tasks']['greet'][-1]['new_blocking'], ['OLD-1'])
-        changed = copy.deepcopy(state)
-        changed['review_history']['greet'][-1]['review']['finding_dispositions'] = 'unread'
-        next(entry for entry in changed['dispatches'] if entry['id'] == self.worker['id'])['worker_findings'] = 'unread'
-        changed['feedback']['worker']['evidence_files'] = 'unread'
-        self.assertEqual(observed(changed), (summary, rounds))
-
-
-class Schema16StreamHistoryTests(ReferencedInputsCase, HistoricalCase):
-    VERSION, MODE, ROW = 16, 'stream_metadata_v1', 'S9'
-
-    def test_capture_mode_must_match_the_saved_configuration(self):
-        def legacy_intent(state, worker):
-            self.workers(state)[0]['worker_receipt']['capture']['mode'] = 'legacy_json'
-        self.damaged(legacy_intent)
-        self.assert_cleanup_refuses('differs from run configuration')
-
-
-class Schema17Tests(ReferencedInputsCase):
-    VERSION = RUN_SCHEMA_VERSION
 
     def test_new_ledger_has_no_removed_fields_and_status_sums_attempts(self):
-        self.assertEqual(self.run['schema_version'], 17)
+        self.assertEqual(self.run['schema_version'], 18)
         self.assertFalse(REMOVED_KEYS & set(self.run))
         self.assertFalse({'max_total_attempts', 'claude_output_mode'} & set(self.run['config_snapshot']['runtime']))
         self.assertFalse(any('capture' in entry['worker_receipt'] for entry in self.workers(self.run)))
@@ -497,7 +243,6 @@ class Schema17Tests(ReferencedInputsCase):
         budgets = status_summary(self.run)['budgets']
         self.assertEqual(budgets['attempts_total'], 3)
         self.assertFalse(REMOVED_KEYS & set(budgets))
-        self.assertEqual(HISTORICAL_CLEANUP_VERSIONS, tuple(range(7, 18)))
         # A completed run's resume returns the saved result without dispatching.
         calls = len(self.backend.calls)
         self.assertEqual(self.engine(self.backend).resume(self.run['id'])['status'], 'completed')
@@ -505,78 +250,118 @@ class Schema17Tests(ReferencedInputsCase):
         self.assertEqual(self.path.read_bytes(), self.before)
 
 
-class AbandonedStreamTimeoutHistoryTests(RepoCase):
-    """The leftover of a schema 16 stream-mode worker timeout: resume was blocked, then abandoned.
-
-    Its active worker receipt and `unknown` evidence (baseline row S7) must not make the
-    run uncleanable; cleanup is the only exit an old ledger has.
-    """
+class UnsupportedLedgerTests(DashboardCase):
+    VERSIONS = (17, 19, 1, '18', None)
 
     def setUp(self):
         super().setUp()
-        backend = ScriptedBackend()
-        backend.before_result = first_worker_times_out
-        engine = self.engine(backend)
-        with self.assertRaises(ProcessTimeout):
-            engine.start('Implement greet', read_json(ROOT / 'examples/plan.json'))
-        run = self.engine(backend).abandon(engine.run['id'])
-        self.assertEqual(run['status'], 'abandoned')
-        self.directory, self.worktree = engine.directory, engine.worktree
-        entry = run['dispatches'][-1]
-        self.assertEqual(entry['role'], 'worker')
-        self.assertNotIn('worker_return_evidence', entry)
-        self.dispatch = entry['id']
-        adopt_capture_contract(self.directory, run, 'stream_metadata_v1', {entry['id']: ROWS['S7']})
-        (self.directory / 'dispatches' / entry['id'] / 'stream-metadata.jsonl').write_text('', encoding='utf-8')
-        run['schema_version'] = 16
-        self.run = run
-        self.path = self.directory / 'state.json'
+        self.backend = ScriptedBackend()
+        self.runtime = self.engine(self.backend)
+        run = self.runtime.start('Implement greet', read_json(ROOT / 'examples/plan.json'), pause_after_plan=True)
+        self.ident, self.path = run['id'], self.runtime.directory / 'state.json'
+        self.current = self.path.read_bytes()
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.manifest = Path(folder.name) / 'inputs.json'
+        write_json(self.manifest, {'schema_version': 1, 'run_id': self.ident, 'head': run['expected_head'],
+                                   'source_root': '.', 'max_files': 1, 'max_bytes': 1, 'files': []})
+
+    def save(self, version, **fields):
+        run = json.loads(self.current)
+        if version is None:
+            run.pop('schema_version')
+        else:
+            run['schema_version'] = version
+        run.update(fields)
         write_json(self.path, run)
-        self.before = self.path.read_bytes()
+        return self.path.read_bytes()
 
-    def test_ledger_has_the_dead_end_shape(self):
-        entry = self.run['dispatches'][-1]
-        self.assertEqual(list(self.run['worker_receipts']), ['worker:implement:greet'])
-        self.assertNotIn('worker_receipt_consumed', entry)
-        evidence = entry['worker_return_evidence']
-        self.assertEqual((evidence['state'], evidence['reason']),
-                         ('unknown', 'stream reader stopped before durable transport completion'))
-        self.assertEqual(evidence['capture'], {'provider': 'claude', 'mode': 'stream_metadata_v1'})
-        self.assertEqual(set(evidence['sources']), set(HISTORICAL_SOURCES))
-        self.assertIsNone(evidence['sources']['stream-capture.json'])
+    @staticmethod
+    def refusal(version):
+        if type(version) is int:
+            return f'台账版本 {version} 不支持（当前版本 {RUN_SCHEMA_VERSION}）'
+        return f'台账版本缺失或无效，不支持（当前版本 {RUN_SCHEMA_VERSION}）'
 
-    def test_preview_observation_and_removal(self):
-        result = cleanup_run(self.repo, self.run['id'])
-        self.assertEqual((result['checkouts'], result['worktree']['status']), ([], 'eligible'))
-        self.assertEqual(self.path.read_bytes(), self.before)
-        self.assertEqual(status_summary(self.run)['status'], 'abandoned')
+    def cli(self, *argv):
+        output, errors = io.StringIO(), io.StringIO()
+        # The operation record of resume would probe provider CLI versions; keep them unexecuted.
+        with patch('harness.operations.probe_cli', return_value={'path': None, 'version': None}), \
+                contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+            code = cli.main(['--config', str(ROOT / 'harness.toml'), '--repo', str(self.repo), *argv])
+        return code, output.getvalue(), errors.getvalue()
+
+    def test_every_entry_refuses_another_version_before_changing_anything(self):
         state = self.repo / '.harness'
-        detail = observe.run_detail(state, self.run['id'])
-        self.assertIsNone(detail['ledger_error'])
-        with observe.Observer(state) as observer:
-            files = {item['path'] for item in observer.file_index(self.run['id'])['files']}
-            for name in ('capture-manifest.json', 'process.outcome.json', 'stream-metadata.jsonl'):
-                self.assertIn(f'dispatches/{self.dispatch}/{name}', files)
-        removed = cleanup_run(self.repo, self.run['id'], remove=True)
-        self.assertEqual(removed['worktree']['status'], 'removed')
-        self.assertFalse(self.worktree.exists())
-        self.assertEqual(git.git(self.repo, 'rev-parse', self.run['branch']).strip(), self.run['expected_head'])
-        self.assertEqual(self.path.read_bytes(), self.before)
+        for version in self.VERSIONS:
+            with self.subTest(version=version):
+                # Terminal or not, nothing is resumed, abandoned, prepared or cleaned.
+                for status in ('paused', 'completed'):
+                    before = self.save(version, status=status)
+                    pattern = re.escape(self.refusal(version))
+                    calls = (lambda: self.engine(self.backend).resume(self.ident),
+                             lambda: self.engine(self.backend).resume(self.ident, approve_plan=True),
+                             lambda: self.engine(self.backend).resume(self.ident, reverify=True),
+                             lambda: self.engine(self.backend).abandon(self.ident),
+                             lambda: prepare_run(self.repo, self.ident, self.manifest),
+                             lambda: cleanup_run(self.repo, self.ident),
+                             lambda: cleanup_run(self.repo, self.ident, remove=True),
+                             lambda: watch_run(state, self.ident, stdout=io.StringIO()))
+                    for call in calls:
+                        with self.assertRaisesRegex(HarnessError, pattern):
+                            call()
+                    with self.assertRaisesRegex(observe.Unsupported, pattern):
+                        observe.run_detail(state, self.ident)
+                    for argv in (('resume', self.ident), ('abandon', self.ident), ('status', self.ident),
+                                 ('status', self.ident, '--full'), ('watch', self.ident),
+                                 ('permission-diagnostics', self.ident, 'dispatch-1'),
+                                 ('cleanup-run', self.ident), ('cleanup-run', self.ident, '--remove'),
+                                 ('prepare-run', self.ident, '--manifest', str(self.manifest))):
+                        code, output, errors = self.cli(*argv)
+                        self.assertEqual((code, output), (1, ''), argv)
+                        self.assertIn(self.refusal(version), errors)
+                    self.assertEqual(self.path.read_bytes(), before)
+                    self.assertTrue(self.runtime.worktree.exists())
+        self.assertEqual(self.backend.calls, [])
+        self.assertFalse((self.runtime.directory / 'worktree-cleanup.json').exists())
+        # The current version is still accepted by the same entries.
+        self.path.write_bytes(self.current)
+        self.assertEqual(self.cli('status', self.ident)[0], 0)
+        self.assertEqual(observe.run_detail(state, self.ident)['schema_version'], RUN_SCHEMA_VERSION)
 
-    def test_capture_contract_is_still_checked(self):
-        state = json.loads(self.before)
-        state['worker_receipts']['worker:implement:greet'].pop('capture')
-        write_json(self.path, state)
-        with self.assertRaisesRegex(HarnessError, 'invalid worker receipt identity'):
-            cleanup_run(self.repo, self.run['id'])
-        state['dispatches'][-1]['worker_receipt'].pop('capture')
-        write_json(self.path, state)
-        with self.assertRaisesRegex(HarnessError, 'capture contract'):
-            cleanup_run(self.repo, self.run['id'])
-        self.assertTrue(self.worktree.exists())
+    def test_run_list_names_other_versions_by_path_and_version_only(self):
+        current = self.engine(self.backend).start('Implement greet', read_json(ROOT / 'examples/plan.json'),
+                                                  pause_after_plan=True)
+        # Fields an old ledger might hold in any shape are never read.
+        self.save(17, status={'not': 'a status'}, goal=['unreadable'], tasks='damaged', dispatches='damaged',
+                  accepted='damaged', attempts=None)
+        runs = self.repo / '.harness' / 'runs'
+        write_json(runs / 'run_noversion' / 'state.json', {'id': 'run_noversion', 'status': 'running'})
+        (runs / 'run_damaged').mkdir()
+        (runs / 'run_damaged' / 'state.json').write_text('{not json', encoding='utf-8')
+        expected = sorted([{'path': f'runs/{self.ident}', 'schema_version': 17, 'reason': self.refusal(17)},
+                           {'path': 'runs/run_noversion', 'schema_version': None, 'reason': self.refusal(None)}],
+                          key=lambda item: item['path'])
 
+        listing = observe.list_runs(self.repo / '.harness')
+        self.assertEqual([item['id'] for item in listing['runs']], [current['id']])
+        self.assertEqual(sorted(listing['unsupported'], key=lambda item: item['path']), expected)
+        self.assertEqual([item['path'] for item in listing['skipped']], ['runs/run_damaged/state.json'])
+        self.assertEqual(listing['incomplete'], [])
 
-del HistoryCase, HistoricalCase, ReferencedInputsCase
+        code, output, errors = self.cli('status')
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(output), [{key: current[key] for key in ('id', 'status', 'goal', 'branch')}])
+        for item in expected:
+            self.assertIn(f"/.harness/{item['path']}：{item['reason']}", errors)
+
+        server = self.start_server()
+        status, _, body = self.request(server, '/api/runs')
+        self.assertEqual(status, 200)
+        self.assertEqual(sorted(json.loads(body)['unsupported'], key=lambda item: item['path']), expected)
+        status, _, body = self.request(server, f'/api/runs/{self.ident}')
+        self.assertEqual((status, json.loads(body)['error']), (409, self.refusal(17)))
+        status, _, body = self.request(server, f"/api/runs/{current['id']}")
+        self.assertEqual((status, json.loads(body)['schema_version']), (200, RUN_SCHEMA_VERSION))
 
 
 if __name__ == '__main__':

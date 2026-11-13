@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 from harness import cli
 from harness.util import HarnessError, write_json
+from harness.versions import RUN_SCHEMA_VERSION
 from harness.watch_cli import watch_run
 
 
@@ -17,7 +18,7 @@ class WatchCliTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.state = Path(self.temp.name) / ".harness"
         self.path = self.state / "runs/run_test/state.json"
-        self.run = {"id": "run_test", "status": "running", "current_task": "t", "accepted": {},
+        self.run = {"schema_version": RUN_SCHEMA_VERSION, "id": "run_test", "status": "running", "current_task": "t", "accepted": {},
                     "attempts": {"t": 1}, "dispatches": []}
         write_json(self.path, self.run)
 

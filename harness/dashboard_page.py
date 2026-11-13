@@ -253,18 +253,16 @@ APP_JS = r""""use strict";
   };
   var EVENT = {
     dispatch_prepared: "准备派发", dispatch_started: "开始调用", dispatch_finished: "派发结束", task_accepted: "任务已接受",
-    review_rejected: "审阅要求修改", verification_failed: "验证失败", worker_result_rejected: "worker 结果被拒绝",
+    review_rejected: "审阅要求修改", verification_failed: "验证失败",
     run_completed: "运行完成", run_paused: "运行暂停", run_stopped: "运行停止", run_abandoned: "运行已放弃",
     plan_awaiting_approval: "计划等待批准", plan_approved: "计划已批准", plan_revised: "计划已修订",
     revision_edits_archived: "修订前已归档未接受修改", commander_candidate_changed: "指挥调用期间候选已变化",
-    replan_edits_archived: "再规划前已归档未接受修改（旧台账）",
     final_verification_failed: "整体验证失败", final_review_rejected: "整体审阅拒绝",
     final_reverification_requested: "请求重新整体验证", environment_update_recorded: "登记环境更新",
     environment_checked: "环境检查", command_requirements_checked: "命令授权检查",
-    task_checkpoint_recorded: "记录检查点", output_format_repair: "输出格式修正", output_invalid: "输出无效",
-    invalid_output_repair_requested: "请求修正非法输出", candidate_preflight_failed: "候选预检失败",
+    task_checkpoint_recorded: "记录检查点", output_invalid: "输出无效", candidate_preflight_failed: "候选预检失败",
     pending_task_invalidated: "待处理任务作废", pending_acceptance_invalidated: "待接受结果作废",
-    worktree_removed: "工作树已删除", broad_scope_warning: "范围过宽提示", scope_extension_approved: "范围扩展已批准",
+    broad_scope_warning: "范围过宽提示", scope_extension_approved: "范围扩展已批准",
     error_hook_failed: "错误 hook 失败", resume_config_relaxed: "恢复时放宽配置"
   };
 
@@ -499,7 +497,9 @@ APP_JS = r""""use strict";
         try { body = JSON.parse(text); } catch (error) { body = null; }
         if (!response.ok) {
           var message = body && body.error ? body.error : text.slice(0, 200);
-          throw new Error("HTTP " + response.status + "：" + message);
+          var failure = new Error("HTTP " + response.status + "：" + message);
+          failure.status = response.status;
+          throw failure;
         }
         return body;
       });
@@ -646,7 +646,8 @@ APP_JS = r""""use strict";
     }
     promise.catch(function (error) {
       if (sequence !== renderSequence) { return; }
-      replaceMain([errorCard("读取失败：" + error.message, "可稍后点击刷新重试。")], "error:" + key);
+      replaceMain([errorCard("读取失败：" + error.message, error.status === 409
+        ? "当前版本不解释该 run 的台账；原始文件可用文件工具查看。" : "可稍后点击刷新重试。")], "error:" + key);
     });
   }
 
@@ -704,10 +705,15 @@ APP_JS = r""""use strict";
       head.appendChild(grid);
       nodes.push(head);
     }
-    if (data.skipped.length || data.incomplete.length) {
+    if (data.skipped.length || data.incomplete.length || data.unsupported.length) {
       var diag = el("section", "card");
       var box = disclosure("list:diagnostics", "台账诊断：跳过 " + data.skipped.length + " 个，字段不完整 " +
-        data.incomplete.length + " 个", "block");
+        data.incomplete.length + " 个，不支持的台账版本 " + data.unsupported.length + " 个", "block");
+      if (data.unsupported.length) {
+        // Another ledger version: only its path and version, never its fields.
+        box.appendChild(el("h3", null, "不支持的台账版本"));
+        box.appendChild(list(data.unsupported.map(function (item) { return item.path + "：" + item.reason; })));
+      }
       if (data.skipped.length) {
         box.appendChild(el("h3", null, "已跳过的台账"));
         box.appendChild(list(data.skipped.map(function (item) { return item.path + "：" + item.reason; })));
@@ -814,11 +820,6 @@ APP_JS = r""""use strict";
         cont.state === "revision_pending" ? null : notice("满足请求（追加精确授权或调整超时）后普通 resume 继续；需要先修正时可拒绝该请求。", "hint"),
         cont.state === "revision_pending" ? null : resumeHint(data.id, "--reject-continuation FILE")]);
     }
-    if (summary.replan_stopped) {  // schema 16 and earlier only
-      var stopped = summary.replan_stopped;
-      add("warn", "指挥停止再规划", [line("item-sub", "范围 " + show(stopped.target)),
-        longText("replan:reason", stopped.reason, TEXT_EXCERPT), line("item-sub", "产物 ", mono(stopped.artifact))]);
-    }
     if (summary.convergence && summary.convergence.warnings && summary.convergence.warnings.length) {
       add("warn", "返工提示（仅供判断）", [list(summary.convergence.warnings.map(function (item) {
         var scope = item.kind === "whole_run_rework" ? "整体验收" : "任务 " + show(item.task_id);
@@ -850,9 +851,7 @@ APP_JS = r""""use strict";
   }
 
   // Event names are observations; invoked comes from the ledger write they follow.
-  // Older dispatch_started records (no invoked field) were written before the budget check.
   function eventLabel(record) {
-    if (record.event === "dispatch_started" && record.invoked !== true) { return "派发准备（旧版事件，不表示已调用）"; }
     if (record.event === "dispatch_finished" && record.invoked === true) { return "调用结束"; }
     if (record.event === "dispatch_finished" && record.invoked === false) { return "派发结束（未调用）"; }
     return EVENT[record.event] || show(record.event);
@@ -1241,23 +1240,13 @@ APP_JS = r""""use strict";
     var attempts = summary.budgets && summary.budgets.work_attempts ? summary.budgets.work_attempts : b.attempts;
     panel.appendChild(el("h3", null, "预算"));
     var meters = el("div", "grid-cards");
-    // Schema 16 has no run-wide worker limit: show the sum of task attempts. The
-    // saved total_attempts / max_total_attempts pair exists only in older ledgers.
-    if (typeof b.total_attempts === "number") {
-      meters.appendChild(budgetMeter("总尝试（历史台账）", b.total_attempts, limits.max_total_attempts));
-    } else {
-      var total = el("div", "mini");
-      total.appendChild(el("h3", null, "worker 尝试总数"));
-      total.appendChild(el("div", "metric-value", show(b.attempts_total)));
-      total.appendChild(el("p", "metric-note", "各任务 attempts 之和；全 run 上限由模型派发数约束"));
-      meters.appendChild(total);
-    }
+    // There is no run-wide worker limit: show the sum of task attempts.
+    var total = el("div", "mini");
+    total.appendChild(el("h3", null, "worker 尝试总数"));
+    total.appendChild(el("div", "metric-value", show(b.attempts_total)));
+    total.appendChild(el("p", "metric-note", "各任务 attempts 之和；全 run 上限由模型派发数约束"));
+    meters.appendChild(total);
     meters.appendChild(budgetMeter("模型派发", b.agent_dispatches, limits.max_agent_dispatches));
-    // Replan and final-attempt counters exist only in schema 16 and earlier ledgers.
-    if (typeof b.replan_attempts === "number") {
-      meters.appendChild(budgetMeter("再规划（历史台账）", b.replan_attempts, limits.max_replans));
-      meters.appendChild(budgetMeter("整体验收（历史台账）", b.final_attempts, limits.max_final_attempts));
-    }
     panel.appendChild(meters);
     var remaining = summary.remaining_model_calls;
     if (remaining && typeof remaining.message === "string") {
@@ -1268,9 +1257,6 @@ APP_JS = r""""use strict";
     panel.appendChild(kv([
       ["任务尝试（work_attempts）", attempts && Object.keys(attempts).length ? Object.keys(attempts).map(function (key) {
         return key + "=" + attempts[key] + "/" + show(limits.max_attempts); }).join("，") : UNAVAILABLE],
-      ["计数策略", typeof b.attempt_budget_policy === "string" ? b.attempt_budget_policy + "（历史台账保存）"
-        : typeof data.schema_version === "number" && data.schema_version >= 16 ? "work（台账 16 起固定）"
-        : b.attempt_budget_policy],
       ["单次调用超时（秒）", limits.agent_timeout_seconds]
     ]));
 
@@ -1349,15 +1335,13 @@ APP_JS = r""""use strict";
       ["已接受任务", summary.accepted_tasks ? summary.accepted_tasks.join("、") || "无" : UNAVAILABLE],
       ["基线提交", mono(run.base_commit)], ["期望 HEAD", mono(run.expected_head)],
       ["台账版本", data.schema_version],
-      ["创建该 run 的操作记录", unavailable.indexOf("operation") >= 0 ? "不可用（台账未记录）" : run.created_by_operation],
+      ["创建该 run 的操作记录", run.created_by_operation],
       ["首个事件时间", fmtTime(data.timing && data.timing.first_event_time)],
       ["最后事件时间", fmtTime(data.timing && data.timing.last_event_time)],
       ["事件时间跨度", fmtDuration(data.timing && data.timing.first_event_time, data.timing && data.timing.last_event_time)],
       ["错误类型", run.error_type], ["运行错误", run.error],
       ["不可用区块", unavailable.length ? unavailable.join("、") : "无"]
     ]));
-    if (unavailable.indexOf("decisions") >= 0) { panel.appendChild(notice("操作者决定：不可用（台账版本过旧）", "hint")); }
-    if (unavailable.indexOf("environment") >= 0) { panel.appendChild(notice("环境阻断：不可用（台账版本过旧）", "hint")); }
     if (summary.worker_outcomes) {
       panel.appendChild(el("h3", null, "worker 结果计数（观测值，不等于接受）"));
       panel.appendChild(kv(Object.keys(summary.worker_outcomes).map(function (key) {

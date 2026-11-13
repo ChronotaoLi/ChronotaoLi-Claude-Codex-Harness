@@ -7,7 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from harness.adapters import CLIBackend
-from harness.config import Config, REMOVED_KEYS, RESUME_INCREASES
+from harness.config import Config, RESUME_INCREASES
 from harness.contracts import REVIEW, WORK, envelope, validate
 from harness.shared import toml_value
 from harness.util import HarnessError, read_json, write_json
@@ -46,30 +46,21 @@ class ConfigChangesTests(unittest.TestCase):
         self.assertEqual(self.data, before)
         self.assertEqual(config.resume_changes(config.data), {})
 
-    # Each removed key, a value it used to accept, and what its hint must name.
-    REMOVED = {
-        "max_total_attempts": (60, ("runtime.max_attempts", "runtime.max_agent_dispatches")),
-        "claude_output_mode": ("legacy_json", ("JSON 输出", "stream_metadata_v1 已删除")),
-        "max_replans": (2, ("runtime.max_agent_dispatches",)),
-        "max_final_attempts": (3, ("runtime.max_agent_dispatches",)),
-        "max_tasks": (20, ("runtime.context_chars",)),
+    # Keys earlier versions accepted, and a value each used to take; plus one never known.
+    UNKNOWN = {
+        "max_total_attempts": 60, "claude_output_mode": "legacy_json", "max_replans": 2,
+        "max_final_attempts": 3, "max_tasks": 20, "no_such_key": 1,
     }
 
-    def test_removed_keys_are_rejected_with_their_replacements(self):
-        self.assertEqual(set(REMOVED_KEYS), {"runtime." + key for key in self.REMOVED})
-        values = {"claude_output_mode": ("legacy_json", "stream_metadata_v1", "anything")}
-        for key, (value, hints) in self.REMOVED.items():
-            for written in values.get(key, (value,)):
-                with self.subTest(key=key, value=written):
-                    data = copy.deepcopy(self.data)
-                    data["runtime"][key] = written
-                    with self.assertRaises(HarnessError) as raised:
-                        self.load(data)
-                    message = str(raised.exception)
-                    self.assertIn(f"未知配置键：runtime.{key}", message)
-                    self.assertIn(f"请删除 runtime.{key}", message)
-                    for hint in hints:
-                        self.assertIn(hint, message)
+    def test_unknown_keys_including_removed_ones_are_rejected_without_hints(self):
+        for key, value in self.UNKNOWN.items():
+            with self.subTest(key=key):
+                data = copy.deepcopy(self.data)
+                data["runtime"][key] = value
+                with self.assertRaises(HarnessError) as raised:
+                    self.load(data)
+                # The generic error alone: no per-key migration hint, never silently ignored.
+                self.assertEqual(str(raised.exception), f"未知配置键：runtime.{key}")
             with self.subTest(key=key, snapshot=True):
                 # A saved snapshot carrying the key is equally unknown, never silently dropped.
                 config = self.load()
@@ -79,7 +70,7 @@ class ConfigChangesTests(unittest.TestCase):
                 with self.assertRaisesRegex(HarnessError, f"未知配置键：runtime.{key}"):
                     config.resume_changes(snapshot)
 
-    def test_cli_startup_reports_a_removed_key_before_any_run(self):
+    def test_cli_startup_reports_an_unknown_key_before_any_run(self):
         import contextlib
         import io
         import subprocess
@@ -87,7 +78,7 @@ class ConfigChangesTests(unittest.TestCase):
         repo = self.root / "repo"
         repo.mkdir()
         subprocess.run(["git", "init", "-q", str(repo)], check=True)
-        for key, (value, _) in self.REMOVED.items():
+        for key, value in self.UNKNOWN.items():
             with self.subTest(key=key):
                 data = copy.deepcopy(self.data)
                 data["runtime"][key] = value
@@ -97,7 +88,7 @@ class ConfigChangesTests(unittest.TestCase):
                 with contextlib.redirect_stderr(errors), contextlib.redirect_stdout(io.StringIO()):
                     code = main(["--config", str(path), "--repo", str(repo), "resume", "run_missing"])
                 self.assertEqual(code, 1)
-                self.assertIn(f"请删除 runtime.{key}", errors.getvalue())
+                self.assertEqual(errors.getvalue(), f"harness: 未知配置键：runtime.{key}\n")
                 self.assertFalse((repo / ".harness").exists())
 
     def test_rejects_unsupported_codex_worker_before_dispatch(self):

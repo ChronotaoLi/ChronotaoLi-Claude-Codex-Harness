@@ -504,17 +504,16 @@ class ReservedNameTests(DecideCase):
 
 
 class BudgetConfigTests(DecideCase):
-    def test_removed_budget_keys_are_rejected_with_their_replacement(self):
+    def test_removed_budget_keys_are_unknown_keys(self):
         from harness.config import Config
         text = (Path(__file__).resolve().parents[1] / "harness.toml").read_text()
         self.assertIn("max_attempts = 5", text)
         self.assertEqual(Config.load(Path(__file__).resolve().parents[1] / "harness.toml").data["runtime"]["max_attempts"], 5)
-        for key, hint in (("max_replans", "runtime.max_agent_dispatches"), ("max_final_attempts", "runtime.max_agent_dispatches"),
-                          ("max_tasks", "runtime.context_chars")):
+        for key in ("max_replans", "max_final_attempts", "max_tasks"):
             with self.subTest(key=key):
                 path = self.repo.parent / f"{key}.toml"
                 path.write_text(text.replace("[runtime]\n", f"[runtime]\n{key} = 3\n", 1))
-                with self.assertRaisesRegex(HarnessError, f"未知配置键：runtime.{key}.*{hint}"):
+                with self.assertRaisesRegex(HarnessError, f"^未知配置键：runtime.{key}$"):
                     Config.load(path)
 
     def test_attempt_limit_names_the_key_and_its_value_before_any_decide(self):

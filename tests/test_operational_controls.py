@@ -36,7 +36,7 @@ class OperationalControlsTests(RepoCase):
             else:
                 self.assertNotIn("dispatches", state)
                 self.assertEqual(state["budgets"]["attempts_total"], 0)
-                self.assertFalse({"total_attempts", "attempt_budget_policy"} & set(state["budgets"]))
+                self.assertEqual(set(state["budgets"]), {"attempts", "agent_dispatches", "work_attempts", "attempts_total"})
 
     def test_cli_question_answer_and_abandon_preserve_engine_behavior(self):
         def blocker(backend, kwargs, packet, result):
@@ -93,7 +93,7 @@ class OperationalControlsTests(RepoCase):
 
     def test_malformed_summary_fields_report_diagnostic_and_full_keeps_evidence(self):
         path = self.repo / ".harness" / "runs" / "run_damaged" / "state.json"
-        damaged = {"id": "run_damaged", "accepted": None}
+        damaged = {"id": "run_damaged", "schema_version": RUN_SCHEMA_VERSION, "accepted": None}
         write_json(path, damaged)
         code, output, errors = self.invoke(["status", "run_damaged"])
         self.assertEqual(code, 1)
@@ -111,8 +111,6 @@ class OperationalControlsTests(RepoCase):
                     (None, 5, ["a"], [["task", 1]], {"task": "1"}, {"task": True}, {"task": -1})]
         variants += [{"dispatches": value} for value in (None, 5, {})]
         variants += [
-            # Historical display branch: a schema-15 ledger's saved policy is still validated.
-            {"schema_version": 15, "attempt_budget_policy": "unknown"},
             {"dispatches": [dict(exemption, task_id=[])]},
             {"dispatches": [dict(exemption, task_id="missing")]},
             {"dispatches": [dict(exemption, attempt_exemption=True)]},

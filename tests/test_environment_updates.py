@@ -323,7 +323,7 @@ class EnvironmentUpdateTests(RepoCase):
         write_json(engine.directory / 'state.json', state)
         calls = len(backend.calls)
         before = (engine.directory / 'state.json').read_bytes()
-        with self.assertRaisesRegex(HarnessError, '旧 run'):
+        with self.assertRaisesRegex(HarnessError, '台账版本 8 不支持'):
             self.engine(backend).resume(engine.run['id'], environment_update=path)
         self.assertEqual(len(backend.calls), calls)
         self.assertEqual((engine.directory / 'state.json').read_bytes(), before)
@@ -354,7 +354,7 @@ class EnvironmentUpdateTests(RepoCase):
         write_json(engine.directory / 'state.json', state)
         calls = len(backend.calls)
         before = (engine.directory / 'state.json').read_bytes()
-        with self.assertRaisesRegex(HarnessError, '旧 run'):
+        with self.assertRaisesRegex(HarnessError, '台账版本 8 不支持'):
             self.engine(backend).resume(engine.run['id'])
         self.assertEqual(len(backend.calls), calls)
         self.assertEqual((engine.directory / 'state.json').read_bytes(), before)

@@ -25,18 +25,14 @@ ROLES = {"commander": {"cli": "codex", "model": "gpt-6-astra", "effort": "high"}
 
 
 def ledger(run_id, **fields):
-    # Historical schema-11 shape: it still saved total_attempts, attempt_budget_policy
-    # and runtime.max_total_attempts, which observation shows as saved.
-    base = {"schema_version": 11, "id": run_id, "status": "running", "goal": "Implement greet",
+    base = {"schema_version": RUN_SCHEMA_VERSION, "id": run_id, "status": "running", "goal": "Implement greet",
             "branch": "harness/" + run_id, "worktree": "/tmp/worktree", "commander": "astra",
             "tasks": [{"id": "greet", "title": "Implement greet", "depends_on": []},
                       {"id": "planning", "title": "A user task that happens to be named planning", "depends_on": ["greet"]}],
-            "accepted": {"greet": {"commit": "abc"}}, "attempts": {"greet": 1}, "attempt_budget_policy": "work",
-            "dispatches": [], "config_snapshot": {"roles": ROLES, "runtime": {"max_attempts": 3, "max_total_attempts": 60,
-                                                                               "max_agent_dispatches": 200, "max_replans": 2,
-                                                                               "max_final_attempts": 3}},
-            "total_attempts": 1, "agent_dispatches": 1, "replan_attempts": 0, "final_attempts": 0,
-            "replan_stopped": {}, "decision_requests": [], "operator_decisions": [], "created_by_operation": "op_a"}
+            "accepted": {"greet": {"commit": "abc"}}, "attempts": {"greet": 1},
+            "dispatches": [], "config_snapshot": {"roles": ROLES, "runtime": {"max_attempts": 3,
+                                                                               "max_agent_dispatches": 200}},
+            "agent_dispatches": 1, "decision_requests": [], "operator_decisions": [], "created_by_operation": "op_a"}
     base.update(fields)
     return base
 
@@ -333,27 +329,8 @@ class EventsAndDamageTests(StateCase):
         self.assertIsNone(type_error["summary"])
         self.assertTrue(type_error["summary_error"].startswith("TypeError: "))
         self.assertEqual(type_error["run"]["goal"], "Implement greet")
-        self.assertEqual(type_error["budgets"]["total_attempts"], 1)
+        self.assertEqual(type_error["budgets"]["agent_dispatches"], 1)
         self.assertIsNotNone(observe.run_detail(self.state, good)["summary"])
-
-    def test_old_schema_versions_mark_unavailable_blocks(self):
-        for version, unavailable in ((9, {"decisions", "operation"}), (8, {"decisions", "environment", "operation"})):
-            run = ledger(f"run_v{version}", schema_version=version)
-            del run["created_by_operation"]
-            detail = observe.run_detail(self.state, self.save(run))
-            self.assertEqual(set(detail["unavailable"]), unavailable)
-            self.assertEqual(detail["schema_version"], version)
-            self.assertIsNotNone(detail["summary"])
-            self.assertEqual(detail["summary"]["accepted_tasks"], ["greet"])
-        detail = observe.run_detail(self.state, self.save(ledger("run_v11", created_by_operation=None)))
-        self.assertEqual(detail["unavailable"], [])
-        self.assertIsNone(detail["run"]["created_by_operation"])
-        missing = ledger("run_noversion")
-        del missing["schema_version"]
-        detail = observe.run_detail(self.state, self.save(missing))
-        self.assertIsNone(detail["schema_version"])
-        self.assertIn("decisions", detail["unavailable"])
-
 
 class OperationsTests(StateCase):
     def test_operations_filtered_by_run_with_invalid_count(self):
@@ -435,14 +412,17 @@ class DamageIsolationTests(StateCase):
         huge = int("9" * 400)
         row = dispatch(invoked_at=huge, pgid=huge, provider_usage={"provider": "claude", "reported_cost_usd": huge,
                                                                    "num_turns": huge})
-        run_id = self.save(ledger("run_huge", schema_version=huge, total_attempts=huge, dispatches=[row]))
+        run_id = self.save(ledger("run_huge", agent_dispatches=huge, dispatches=[row]))
+        self.save(ledger("run_hugeversion", schema_version=huge))
         (self.state / "runs" / run_id / "events.jsonl").write_text(
             f'{{"time": {huge}, "event": "dispatch_started", "run_id": "{run_id}"}}\n'
             f'{{"time": {huge}, "event": "dispatch_finished", "run_id": "{run_id}", "dispatch_id": "{row["id"]}"}}\n')
         listing = observe.list_runs(self.state)
         self.assertEqual([item["id"] for item in listing["runs"]], [run_id])
         self.assertIsNone(listing["runs"][0]["last_event_time"])
-        self.assertEqual(listing["runs"][0]["schema_version"], huge)
+        # Another version is named only; its huge integer stays an integer.
+        self.assertEqual(listing["unsupported"], [{"path": "runs/run_hugeversion", "schema_version": huge,
+                                                   "reason": f"台账版本 {huge} 不支持（当前版本 {RUN_SCHEMA_VERSION}）"}])
         detail = observe.run_detail(self.state, run_id)
         self.assertEqual(detail["timing"], {"first_event_time": None, "last_event_time": None, "basis": "events.jsonl 事件时间"})
         self.assertEqual(len(detail["events"]["records"]), 2)
@@ -453,8 +433,7 @@ class DamageIsolationTests(StateCase):
         self.assertEqual(projected["invocation_class"], "usage_recorded")
         self.assertIsNone(detail["cost"]["by_provider"]["claude"]["reported_cost_usd"])
         self.assertEqual(detail["cost"]["by_provider"]["claude"]["usage_recorded"], 1)
-        self.assertEqual(detail["budgets"]["total_attempts"], huge)
-        self.assertEqual(detail["schema_version"], huge)  # Compared as an integer, never via float.
+        self.assertEqual(detail["budgets"]["agent_dispatches"], huge)  # Compared as an integer, never via float.
         self.assertIsNotNone(detail["summary"])
         json.dumps(detail)  # The whole projection stays serializable.
 

@@ -1,6 +1,6 @@
 # 恢复与操作者出口
 
-本文写给处理停止 run 的操作者：看到哪种停止信息，该做什么，用哪个命令。它只适用于台账版本 17 的 run。保存顺序、子状态的设置与清除见[设计：状态转换](design.md#状态转换)，日常命令见 [README](../README.md)。
+本文写给处理停止 run 的操作者：看到哪种停止信息，该做什么，用哪个命令。它只适用于台账版本 18 的 run。保存顺序、子状态的设置与清除见[设计：状态转换](design.md#状态转换)，日常命令见 [README](../README.md)。
 
 - [通用规则](#通用规则)
 - [恢复选项与互斥](#恢复选项与互斥)
@@ -81,7 +81,7 @@
 | `共享规则、skills、MCP 或 hooks 已改变` | 恢复原版本的共享资产 | 普通 `resume` |
 | `配置已改变：…` | 恢复不可放宽的配置值 | 普通 `resume` |
 | `缺少已保存的 worktree Git 绑定` | 启动在绑定保存前中断；核对后手工 `git worktree remove` 并删除 `harness/<run>` 分支 | `abandon RUN` 后重新 `run` |
-| `旧 run 仅保留为历史证据（台账版本 N，当前 17）` | 查看或清理，开始新 run | `status`、`dashboard`、`cleanup-run` |
+| `台账版本 N 不支持（当前版本 18）` | 当前版本不恢复、不放弃、不准备、不清理、不解释这份台账（见[终态与其他版本的台账](#终态与其他版本的台账)） | 开始新 run；原始 JSON 用文件工具查看 |
 | `已有进程持有运行锁` | 等另一个 `run`／`resume`／`abandon` 结束 | 稍后重试 |
 
 ## 恢复步骤
@@ -194,7 +194,7 @@ python3 -m harness --config /path/to/harness.toml --repo /path/to/project resume
 ### 放弃与清理
 
 - `abandon RUN` 把未完成的 run 标为 `abandoned`，保留分支、工作树和证据，之后不能 resume。它先经过 `load_run`：台账恢复链接损坏或加载时核验的证据被删改时拒绝放弃，保留现场供核对；路径索引与输入索引不在加载时核验，它们损坏时仍可放弃。放弃不删除文件；要移除工作树，之后执行 `cleanup-run RUN --remove`。
-- `cleanup-run RUN` 是唯一的清理入口，默认只读预览，加 `--remove` 才逐项删除。它不加载配置、不调用模型，支持版本 7–17 的台账，不改 run 状态，不删除分支、台账或运行证据。
+- `cleanup-run RUN` 是唯一的清理入口，默认只读预览，加 `--remove` 才逐项删除。它不加载配置、不调用模型，只支持当前台账版本，不改 run 状态，不删除分支、台账或运行证据。
   - 共同门禁：在运行锁内核对台账版本与归属（run ID、仓库、工作树路径、分支名、Git 公共目录与管理目录绑定）、命令目录、路径索引与输入索引、worker 回执链接，以及全部派发与命令子进程的退出证据。任一项不通过时整条命令报错，不处理任何资源。
   - 全新验证检出：run 处于任何状态都可清理。已跟踪修改、未跟踪或忽略文件、`assume-unchanged`／`skip-worktree` 标记阻止清理，错误列出前 10 个阻塞路径。目录已缺失而 Git 注册仍在时，只注销该精确路径，不做全仓库 prune。记录写在检出证据旁的 `cleanup.json`。
   - 分支工作树：只在 `completed` 或 `abandoned` 时清理，其他状态下按规则保留（`retained`）。要求原分支仍指向检查点，HEAD 与 Git 绑定未变，没有任何未保存文件（含忽略文件）或隐藏索引标记，已跟踪文件的字节与 HEAD 一致。记录写在 `worktree-cleanup.json`。`--remove --remove-input-copies` 另删除登记且未修改的依赖副本。
@@ -206,10 +206,9 @@ python3 -m harness --config /path/to/harness.toml --repo /path/to/project resume
     - `absent`：预览时资源已不存在（有删除记录，或检出的目录、注册和管理目录都已消失）；加 `--remove` 时补写完成记录，报告 `removed`。
     - `stale_registration`：仅验证检出，目录已缺失而 Git 注册仍在；`--remove` 只注销该精确路径。
     - `input_copies_present`：仅工作树的预览，有登记的依赖副本，需 `--remove --remove-input-copies`。
-    - `retained`：仅工作树，run 还没有 `completed` 或 `abandoned`，按规则保留，`reason` 写明当前状态。`reason_kind` 为 `finish_or_abandon_first` 时，台账是当前版本，先完成或 `abandon` 该 run 再清理；为 `manual_removal` 时，台账是旧版本，当前版本既不能恢复也不能放弃它，`cleanup-run` 不删除这个工作树，需人工核对后自行移除。
+    - `retained`：仅工作树，run 还没有 `completed` 或 `abandoned`，按规则保留，`reason` 写明当前状态。`reason_kind` 为 `finish_or_abandon_first`：先完成或 `abandon` 该 run 再清理。
     - `blocked`：资源本可清理，但门禁挡住了删除或预览；`error` 写明原因和阻塞路径，资源原样保留。
   - 某个资源受阻不影响其余资源。只有出现 `blocked` 时退出码为 1；只有 `retained` 的工作树时退出码为 0。
-  - 已删除的 `abandon --remove-worktree` 在旧台账里留下的 `worktree_removed` 或 `pending_worktree_removal` 被当作已有的删除意图：工作树目录、Git 注册和管理目录都已消失时，工作树按已移除处理，其余资源照常清理。
 - `prepare-run RUN --manifest FILE` 只在 `paused` 或 `awaiting_approval` 且没有待处理阶段时准备依赖副本，格式见[依赖副本清单](operations.md#依赖副本清单)。
 
 ### 证据损坏
@@ -222,13 +221,13 @@ python3 -m harness --config /path/to/harness.toml --repo /path/to/project resume
 
 已发布的计划文件（`plans/revision-N.json`，`plan_history` 的每一行）同样不在加载时核验，只在三处核对：`resume` 的任何写入之前（含 `--confirm-exited` 的审计写入，因此也先于批准计划和重放 worker 回执）、每次推导下一步之前、标记完成之前；逐个核对它们存在、摘要与台账一致、修订号相符，并要求最新版本的任务表等于 `tasks`、`revision-0` 的任务表等于 `original_tasks`。缺失、被改或不一致即停止，不调用模型；恢复原字节后普通 `resume`，无法恢复时 `abandon`（`abandon` 与 `cleanup-run` 不需要计划文件，它们自己的 `--confirm-exited` 照常可用）。不覆盖的情形：worker 运行期间被删改的计划文件要到下一步才发现，那时该任务的验证、审阅与接受可能已经完成；`prepare-run` 与 `status` 等只读入口不核对，之后的 `resume` 会拒绝。每次核对的耗时随计划历史的总大小增长：实测每版约 40 KB 时，200 版约 19 ms，1,000 版约 102 ms。
 
-### 终态与历史台账
+### 终态与其他版本的台账
 
 `completed` run 的普通 `resume` 返回保存结果，不派发；修改选项被拒绝。
 
-版本 16 及更早的台账不迁移、不执行：`resume`、`abandon` 和 `prepare-run` 都要求版本 17，对旧台账拒绝。以下只读与诊断入口不要求当前版本，仍可用于旧台账：`status`（含 `status RUN` 与 `--full`）、`watch`、`dashboard`、`permission-diagnostics`，以及受门禁保护的 `cleanup-run`（版本 7–17；验证检出不限状态，工作树仅限 `completed` 或 `abandoned`）。旧版本中未到终态的 run 不能 `abandon`，因此 `cleanup-run` 只能清理它的验证检出，不能清理其工作树。升级前应完成或放弃进行中的旧 run。
+只支持台账版本 18。其他版本（含缺失或非整数的版本）的台账不迁移、不补默认值、不解释字段：`resume`、`abandon`、`prepare-run`、`cleanup-run`、`status RUN`（含 `--full`）、`watch`、`permission-diagnostics` 与观察网页的 run 详情都拒绝，错误写明该 run 的台账版本与当前版本（`台账版本 N 不支持（当前版本 18）`），退出码 1，台账、工作树与检出都不改动。运行列表（不带 run 的 `status`、观察网页的列表）对这些目录只给出路径、版本和“不支持”；损坏或旧版本的目录不影响其他 run 的列出。原始 JSON 用文件工具查看。
 
-版本 16 及更早的 `stream_metadata_v1` 模式 run，派发目录里保留 `capture-manifest.json` 与 `stream-*` 文件，观察层按普通文件展示；`cleanup-run` 按 worker 接收意图保存的输出模式、用当时的分类规则复核，stream 超时后放弃、仍带活动回执和 unknown 判定的 run 也能清理。
+旧版本 run 的工作树与验证检出不由当前版本清理：用对应版本的 Harness 清理，或人工核对后执行 `git worktree remove`。升级前应完成或放弃进行中的旧 run。
 
 ## 不能自动恢复的窗口
 

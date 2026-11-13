@@ -1,5 +1,4 @@
 import contextlib
-import copy
 import io
 import json
 from pathlib import Path
@@ -8,10 +7,11 @@ import sys
 import tempfile
 from unittest.mock import patch
 
-from harness import git, observe
+from harness import git
 from harness.cleanup import cleanup_run
 from harness.cli import main
 from harness.util import HarnessError, lock, read_json, write_json
+from harness.versions import RUN_SCHEMA_VERSION
 from test_harness import RepoCase, ROOT
 
 
@@ -155,16 +155,6 @@ class VerificationCleanupTests(RepoCase):
         self.assertEqual(self.cli("--remove"), (0, (["removed"], "removed")))
         self.assertFalse(self.checkout.exists())
 
-    def test_old_ledger_removal_key_survives_branch_deletion(self):
-        worktree = self.engine_instance.worktree
-        state = self.directory / "state.json"
-        git.git(self.repo, "worktree", "remove", str(worktree))
-        git.git(self.repo, "branch", "-D", self.run["branch"])
-        write_json(state, {**read_json(state), "status": "abandoned", "schema_version": 12, "worktree_removed": True})
-        self.assertEqual(self.cli(), (0, (["eligible"], "absent")))
-        self.assertEqual(self.cli("--remove"), (0, (["removed"], "removed")))
-        self.assertEqual(self.cli(), (0, (["absent"], "absent")))
-
     def test_interrupted_removals_resume_without_repeating_deletion_or_losing_receipts(self):
         worktree = self.engine_instance.worktree
         receipt = self.directory / "worktree-cleanup.json"
@@ -192,35 +182,22 @@ class VerificationCleanupTests(RepoCase):
         self.assertEqual(git.git(self.repo, "rev-parse", "refs/heads/" + self.run["branch"]).strip(),
                          self.run["expected_head"])
 
-    def test_ledgers_from_the_removed_abandon_option_clean_their_remaining_checkout(self):
+    def test_missing_worktree_without_cleanup_intent_is_blocked_and_checkout_still_removed(self):
         worktree = self.engine_instance.worktree
         state = self.directory / "state.json"
-        # What abandon --remove-worktree left: no worktree, no cleanup receipt.
+        # The worktree disappeared outside cleanup-run: no receipt records an intent.
         git.git(self.repo, "worktree", "remove", str(worktree))
-        base = read_json(state)
-        # A schema 16 ledger also declared its worker capture mode; schema 12 had none.
-        from test_ledger_history import adopt_capture_contract
-        schema16 = copy.deepcopy(base)
-        adopt_capture_contract(self.directory, schema16, "legacy_json")
-        for version, key in ((16, "worktree_removed"), (12, "worktree_removed"), (16, "pending_worktree_removal")):
-            with self.subTest(version=version, key=key):
-                write_json(state, {**(schema16 if version == 16 else base), "status": "abandoned",
-                                   "schema_version": version, key: True})
-                self.assertEqual(self.statuses(self.cleanup()), (["eligible"], "absent"))
-                # Observation keeps reading the old completion key; there is no receipt yet.
-                self.assertIs(observe.run_detail(self.repo / ".harness", self.run["id"])["run"]["worktree_removed"],
-                              key == "worktree_removed")
-        write_json(state, {**base, "status": "abandoned"})
-        missing = self.cleanup()["worktree"]
-        self.assertEqual(missing["status"], "blocked")
-        self.assertIn("清理意图", missing["error"])
-        write_json(state, {**base, "status": "abandoned", "schema_version": 12, "worktree_removed": True})
+        write_json(state, {**read_json(state), "status": "abandoned"})
         ledger = state.read_bytes()
-        self.assertEqual(self.statuses(self.cleanup(remove=True)), (["removed"], "removed"))
+        for remove in (False, True):
+            with self.subTest(remove=remove):
+                result = self.cleanup(remove=remove)
+                self.assertEqual(result["worktree"]["status"], "blocked")
+                self.assertIn("清理意图", result["worktree"]["error"])
+                self.assertEqual(result["checkouts"][0]["status"], "removed" if remove else "eligible")
         self.assertFalse(self.checkout.exists())
+        self.assertFalse((self.directory / "worktree-cleanup.json").exists())
         self.assertEqual(state.read_bytes(), ledger)
-        self.assertEqual(read_json(self.directory / "worktree-cleanup.json")["status"], "removed")
-        self.assertEqual(self.statuses(self.cleanup()), (["absent"], "absent"))
         self.assertEqual(git.git(self.repo, "rev-parse", "refs/heads/" + self.run["branch"]).strip(),
                          self.run["expected_head"])
 
@@ -373,24 +350,23 @@ class VerificationCleanupTests(RepoCase):
         return [entry for line in (self.directory / "events.jsonl").read_text().splitlines()
                 if (entry := json.loads(line))["event"] == "dispatch_exit_confirmed_by_operator"]
 
-    def test_terminal_confirmation_supports_all_ledger_versions_and_preserves_status(self):
+    def test_terminal_confirmation_preserves_status_and_version(self):
         evidence = self.artifact.read_bytes()
-        for version in (7, 8, 9, 10):
-            for status in ("completed", "abandoned"):
-                with self.subTest(version=version, status=status):
-                    self.run.update(schema_version=version, status=status)
-                    ident = f"unknown-{version}-{status}"
-                    self.add_unknown_dispatch(ident)
-                    with self.assertRaisesRegex(HarnessError, "无法确认"):
-                        self.cleanup()
-                    result = cleanup_run(self.repo, self.run["id"], confirm_exited=[ident, ident])
-                    self.assertEqual(result["checkouts"][0]["status"], "eligible")
-                    self.run = read_json(self.directory / "state.json")
-                    self.assertEqual(self.run["status"], status)
-                    self.assertEqual(self.run["schema_version"], version)
-                    self.assertTrue(self.run["dispatches"][-1]["exit_confirmed"])
-                    self.assertIsNone(self.confirmation_events()[-1]["observed"]["group_alive"])
-        self.assertEqual(len(self.confirmation_events()), 8)
+        for status in ("completed", "abandoned"):
+            with self.subTest(status=status):
+                self.run.update(status=status)
+                ident = f"unknown-{status}"
+                self.add_unknown_dispatch(ident)
+                with self.assertRaisesRegex(HarnessError, "无法确认"):
+                    self.cleanup()
+                result = cleanup_run(self.repo, self.run["id"], confirm_exited=[ident, ident])
+                self.assertEqual(result["checkouts"][0]["status"], "eligible")
+                self.run = read_json(self.directory / "state.json")
+                self.assertEqual(self.run["status"], status)
+                self.assertEqual(self.run["schema_version"], RUN_SCHEMA_VERSION)
+                self.assertTrue(self.run["dispatches"][-1]["exit_confirmed"])
+                self.assertIsNone(self.confirmation_events()[-1]["observed"]["group_alive"])
+        self.assertEqual(len(self.confirmation_events()), 2)
         self.assertTrue(self.checkout.exists())
         self.assertEqual(self.artifact.read_bytes(), evidence)
 

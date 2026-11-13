@@ -70,7 +70,7 @@ def terminal(tool_id):
 
 
 class PermissionDiagnosticsCliTests(RepoCase):
-    """Which file is the Claude terminal: fixed for schema 17, declared by a manifest before."""
+    """The Claude terminal is always process.stdout; other ledger versions are refused."""
 
     RUN = 'run_0123456789abcdef'
     DISPATCH = 'dispatch-1'
@@ -97,12 +97,7 @@ class PermissionDiagnosticsCliTests(RepoCase):
         self.assertNotIn('PRIVATE', output.getvalue())
         return json.loads(output.getvalue())
 
-    def test_schema16_stream_dispatch_reads_its_published_terminal(self):
-        path = self.ledger({'capture-manifest.json': {'version': 1, 'mode': 'stream_metadata_v1'},
-                            'stream-terminal.json': terminal('stream_tool'), 'process.stdout': ''}, schema_version=16)
-        self.assertEqual([item['tool_id'] for item in self.report(path)['provider_denials']], ['stream_tool'])
-
-    def test_schema17_dispatch_reads_stdout_even_beside_a_stream_manifest(self):
+    def test_dispatch_reads_stdout_even_beside_a_stream_manifest(self):
         path = self.ledger({'process.stdout': terminal('json_tool'),
                             'capture-manifest.json': {'version': 1, 'mode': 'stream_metadata_v1'},
                             'stream-terminal.json': terminal('stream_tool')}, schema_version=RUN_SCHEMA_VERSION)
@@ -110,12 +105,20 @@ class PermissionDiagnosticsCliTests(RepoCase):
         self.assertEqual(report['reported_denial_count'], 1)
         self.assertEqual([item['tool_id'] for item in report['provider_denials']], ['json_tool'])
 
-    def test_missing_or_non_integer_version_keeps_the_manifest_rule(self):
-        for version in (None, '17'):
+    def test_other_ledger_versions_are_refused_before_any_evidence_is_read(self):
+        for version, shown in ((None, '缺失或无效'), ('18', '缺失或无效'), (17, ' 17 '), (16, ' 16 ')):
             with self.subTest(version=version):
                 shutil.rmtree(self.repo / '.harness', ignore_errors=True)
                 fields = {} if version is None else {'schema_version': version}
                 path = self.ledger({'capture-manifest.json': {'version': 1, 'mode': 'stream_metadata_v1'},
                                     'stream-terminal.json': terminal('stream_tool'),
                                     'process.stdout': terminal('json_tool')}, **fields)
-                self.assertEqual([item['tool_id'] for item in self.report(path)['provider_denials']], ['stream_tool'])
+                before = path.read_bytes()
+                output, errors = io.StringIO(), io.StringIO()
+                with contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+                    code = cli.main(['--config', str(ROOT / 'harness.toml'), '--repo', str(self.repo),
+                                     'permission-diagnostics', self.RUN, self.DISPATCH])
+                self.assertEqual((code, output.getvalue()), (1, ''))
+                self.assertIn(f'台账版本{shown}', errors.getvalue())
+                self.assertIn('不支持（当前版本 18）', errors.getvalue())
+                self.assertEqual(path.read_bytes(), before)

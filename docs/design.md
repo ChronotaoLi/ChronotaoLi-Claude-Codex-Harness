@@ -1,6 +1,6 @@
 # 设计：架构、不变量与状态转换
 
-模型是可替换的决策与执行部件；任务状态、权限边界、证据和接受条件留在确定性的运行时。本文描述台账版本 17 的系统。用法见 [README](../README.md)，停止后的出口见[恢复与操作者出口](recovery.md)，工具接口与观察见[操作与观察](operations.md)，历史改动见 git log 与[验证记录](validation.md)。
+模型是可替换的决策与执行部件；任务状态、权限边界、证据和接受条件留在确定性的运行时。本文描述台账版本 18 的系统。用法见 [README](../README.md)，停止后的出口见[恢复与操作者出口](recovery.md)，工具接口与观察见[操作与观察](operations.md)，历史改动见 git log 与[验证记录](validation.md)。
 
 - [架构](#架构)
 - [不变量](#不变量)
@@ -87,10 +87,10 @@
 **台账、版本与观察**
 
 27. 台账只经 `RunStore` 提交：在 `store.lock` 下比较已加载字节的摘要，拒绝旧写入，原子写入并递增 `store_revision`；外部动作前也核对当前权威。`run.lock` 保护生命周期。
-28. 旧版本台账不迁移、不执行：`resume`、`abandon`、`prepare-run` 只接受版本 17；版本 16 及更早仍可用只读与诊断入口（`status`、`watch`、`dashboard`、`permission-diagnostics`）和受门禁保护的 `cleanup-run`（版本 7–17，按各自形状核对；版本 15、16 的 worker 回执按其意图保存的输出模式、用当时的分类规则原样复核）；不补写旧默认值。resume 另核对共享资产摘要（不含 hook 脚本的依赖）和完整配置快照。
+28. 只支持当前台账版本 18，只解释一种台账形状和一种配置形状：其他版本（含缺失或非整数的版本）不迁移、不补写默认值、不解释字段；`resume`、`abandon`、`prepare-run`、`cleanup-run`、`status RUN`（含 `--full`）、`watch`、`permission-diagnostics` 与观察网页的 run 详情都在读完版本后拒绝，错误写明该 run 的台账版本与当前版本；运行列表（不带 run 的 `status`、观察网页的列表）对其他版本只给出路径、版本和“不支持”，一个旧版本或损坏的目录不影响其他 run 的列出。配置的未知键（含已删除的键）一律报“未知配置键”，不给迁移提示。resume 另核对共享资产摘要（不含 hook 脚本的依赖）和完整配置快照。
 29. hooks 至少一次：`post_agent` 只作用于通过契约校验的结果和 `invalid_rejected` 审阅（读不出否决的无效输出、不合格的指挥提问与 worker 的无效阻断不运行它；合格的指挥提问先运行它再登记请求，失败时回执保留、请求未登记，修复后普通 resume 对同一原件重跑（HEAD 或候选已变也一样）；worker 交接请求的目标在 `post_agent` 与检查点登记之后才检查，不合格时这份结果在 hook 之后才判为无效）；`pre_accept`、`post_accept`、`on_error` 执行前递增计数并用独立日志目录，中断后可能重复。配置出现 `context_compacted` 时报未知事件并提示改用 `context_prepared`。
 30. 必要输入超过 `context_chars` 时不调用模型、不扣额度，报告仍写入 `context-report.json`；可选记忆按整条加入剩余空间。成功派发的报告保留根与顶层字段尺寸及最大的 30 个嵌套字段并给出省略数，超限报告保留全部明细。
-31. 观察层（`status`、`watch`、`dashboard`、操作记录、`supervise` 回执）不写台账、不取 `run.lock`、不参与恢复。观察网页仍保留已删除事件（`output_format_repair`、`invalid_output_repair_requested`、`worker_result_rejected`）的显示名，只用于显示旧台账里的事件；运行时不再写这些事件。
+31. 观察层（`status`、`watch`、`dashboard`、操作记录、`supervise` 回执）不写台账、不取 `run.lock`、不参与恢复。
 
 **身份**
 
@@ -121,7 +121,7 @@
 
 | 键 | 设置与更新 | 清除 | 持久化顺序 | 恢复 |
 | --- | --- | --- | --- | --- |
-| `schema_version`、`id`、`repo`、`goal`、`commander`、`branch`、`worktree`、`base_commit`、`config_path`、`asset_digest`、`created_by_operation` | 首次保存 | 不变 | 早于创建工作树 | 要求版本 17、ID 与仓库一致；比较共享资产摘要 |
+| `schema_version`、`id`、`repo`、`goal`、`commander`、`branch`、`worktree`、`base_commit`、`config_path`、`asset_digest`、`created_by_operation` | 首次保存 | 不变 | 早于创建工作树 | 要求版本 18、ID 与仓库一致；比较共享资产摘要 |
 | `config_snapshot` | 首次保存；resume 接受合法放宽后替换 | 不清除 | 先写 `resume_config_relaxed` 再保存 | 与当前配置比较，只许放宽 |
 | `status` | 见上表 | — | 先保存再运行 hook | 终态拒绝修改选项 |
 | `worktree_binding`、`ignored_baseline` | 首次保存为空；`git worktree add` 后第二次保存填入 | 不清除 | 第一次保存在创建工作树前 | 绑定为空时 resume 拒绝，只能 `abandon` |
@@ -169,7 +169,7 @@
 
 `recovery.py` 的 `RECOVERY_BUSY_KEYS` 列出共用的八个待处理键，环境更新、续作拒绝、执行指导和操作者决定在其中任一有值时拒绝（见[恢复选项](recovery.md#恢复选项与互斥)）。`load_run` 在任何副作用前检查这些对象的类型、所引 dispatch 的角色与任务、`plan_history` 与 `pending_revision` 的引用形状、`pending_revision` 不与任务阶段或待派发指令并存，失败时不改写台账。
 
-清理状态不在台账里：`cleanup-run` 的删除意图与完成记录写在检出证据旁的 `cleanup.json` 和 run 目录的 `worktree-cleanup.json`，清理不改写台账（`--confirm-exited` 的退出确认除外）。已删除的 `abandon --remove-worktree` 曾写入 `pending_worktree_removal`、`worktree_removed`；新 run 不再写这两个键，`cleanup-run` 读旧台账时把它们当作已有的删除意图：工作树目录、Git 注册和管理目录都已消失时按已移除处理。
+清理状态不在台账里：`cleanup-run` 的删除意图与完成记录写在检出证据旁的 `cleanup.json` 和 run 目录的 `worktree-cleanup.json`，清理不改写台账（`--confirm-exited` 的退出确认除外）。
 
 ## 参考项目
 

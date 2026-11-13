@@ -199,12 +199,12 @@ class LowerBoundStageTests(unittest.TestCase):
         self.assertEqual(damaged["lower_bound"], 1)
 
 
-class HistoricalEventObservationTests(StateCase):
-    def test_v15_dispatch_started_without_invoked_projects_from_ledger_only(self):
+class EventObservationTests(StateCase):
+    def test_repeated_or_contradicting_events_project_from_ledger_only(self):
         prepared = dispatch(role="reviewer", kind="review", invoked=False, process_state="prepared",
                             status="failed")
         invoked = dispatch(provider_usage={"provider": "claude", "reported_cost_usd": 0.5})
-        run_id = self.save(ledger("run_hist", schema_version=15, status="blocked",
+        run_id = self.save(ledger("run_events", status="blocked",
                                   dispatches=[invoked, prepared], agent_dispatches=1))
         usage = {"provider": "claude", "reported_cost_usd": 9.0}
         lines = [{"time": 1.0, "event": "dispatch_started", "run_id": run_id, "dispatch_id": invoked["id"]},

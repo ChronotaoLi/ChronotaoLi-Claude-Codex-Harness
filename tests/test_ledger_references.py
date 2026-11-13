@@ -6,18 +6,15 @@ imports only use interfaces that exist on both sides.
 """
 import contextlib
 import hashlib
-import io
 import json
 import os
 from pathlib import Path
-import shutil
 import sys
 from unittest.mock import patch
 
 from harness import git
 from harness.recovery import snapshot_digest
 from harness.util import HarnessError, read_json, write_json
-from harness.versions import RUN_SCHEMA_VERSION
 import harness.worker_receipts as receipts_module
 from test_harness import RepoCase, ROOT
 from test_runtime_changes import ScriptedBackend
@@ -549,80 +546,6 @@ class LedgerReferenceTests(RepoCase):
         self.assertEqual(overflow['field_sizes'], full)
         self.assertNotIn('field_sizes_omitted', overflow)
         self.assertEqual(overflow['required_chars'], report['required_chars'])
-
-    def embedded_v15_terminal(self):
-        """A completed run rewritten into the pre-change embedded v15 shape."""
-        self.config.data['verification'].update(fresh_checkout=True,
-            commands=[[sys.executable, '-c', "from pathlib import Path; assert Path('hello.py').is_file()"]])
-        engine, backend, run = ledger_fixture(self)
-        self.assertEqual(run['status'], 'completed')
-        shutil.rmtree(engine.worktree / '__pycache__', ignore_errors=True)
-        checkout = Path(read_json(next(engine.directory.glob('verification/final/*/verification-*/checkout.json')))['worktree'])
-        self.addCleanup(shutil.rmtree, checkout.parents[1], True)
-        for entry in self.workers(run):
-            intent, job = entry['worker_receipt'], engine.directory / 'dispatches' / entry['id']
-            packet, schema = read_json(job / 'packet.json'), read_json(job / 'schema.json')
-            for field in ('packet', 'schema'):
-                intent.pop(field + '_artifact')
-                intent.pop(field + '_artifact_digest')
-            intent.update(schema=schema, packet=packet, packet_digest=snapshot_digest(packet))
-            for name in INPUTS:
-                (job / name).unlink()
-        run['continuation_history'] = [{**read_json(Path(row['artifact'])), 'artifact': row['artifact'],
-                                         'artifact_digest': row['artifact_digest']}
-                                        for row in run['continuation_history']]
-        self.assertEqual(run['schema_version'], RUN_SCHEMA_VERSION)
-        # Historical schema-15 fields: the declared capture mode, the saved run-wide
-        # counter and the budget policy.
-        from test_ledger_history import adopt_capture_contract
-        adopt_capture_contract(engine.directory, run, 'legacy_json')
-        run.update(schema_version=15, total_attempts=sum(run['attempts'].values()), attempt_budget_policy='work')
-        write_json(engine.directory / 'state.json', run)
-        return engine, backend, run
-
-    def test_completed_embedded_v15_ledger_stays_inspectable_and_cleanable(self):
-        from harness import cli
-        from harness.cleanup import cleanup_run
-        from harness.cli import status_summary
-        engine, backend, run = self.embedded_v15_terminal()
-        path = engine.directory / 'state.json'
-        before = path.read_bytes()
-        self.assertEqual(receipts_module.receipt_shape(run), receipts_module.EMBEDDED)
-        self.assertEqual(status_summary(run)['status'], 'completed')
-        output = io.StringIO()
-        with contextlib.redirect_stdout(output):
-            self.assertEqual(cli.main(['--repo', str(self.repo), 'status', run['id']]), 0)
-        self.assertEqual(json.loads(output.getvalue())['status'], 'completed')
-        preview = cleanup_run(self.repo, run['id'])
-        self.assertEqual(preview['worktree']['status'], 'eligible')
-        self.assertEqual([item['status'] for item in preview['checkouts']], ['eligible'])
-        self.assertEqual(path.read_bytes(), before)
-        # Execution never adopts the historical shape; nothing is dispatched or saved.
-        calls = len(backend.calls)
-        with self.assertRaisesRegex(HarnessError, '旧 run.*台账版本 15'):
-            self.engine(backend).resume(run['id'])
-        self.assertEqual(len(backend.calls), calls)
-        self.assertEqual(path.read_bytes(), before)
-        # The embedded shape is still validated, not skipped.
-        for change in ('digest', 'mixed'):
-            with self.subTest(change=change):
-                damaged = json.loads(before)
-                worker = self.workers(damaged)[0]
-                if change == 'digest':
-                    worker['worker_receipt']['packet']['goal'] = 'changed'
-                else:
-                    job = engine.directory / 'dispatches' / worker['id']
-                    intent = worker['worker_receipt']
-                    for field, name in zip(('packet', 'schema'), INPUTS):
-                        write_json(job / name, intent.pop(field))
-                        intent[field + '_artifact'] = str(job / name)
-                        intent[field + '_artifact_digest'] = sha(job / name)
-                    intent.pop('packet_digest')
-                write_json(path, damaged)
-                for remove in (False, True):
-                    with self.assertRaisesRegex(HarnessError, 'worker receipt linkage'):
-                        cleanup_run(self.repo, run['id'], remove=remove)
-                path.write_bytes(before)
 
 
 if __name__ == '__main__':

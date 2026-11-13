@@ -6,6 +6,7 @@ import sys
 
 from . import observe
 from .util import HarnessError
+from .versions import require_current_ledger
 from .watch import RunWatcher
 
 STOPPED = frozenset(("completed", "abandoned", "blocked", "interrupted", "paused", "awaiting_approval"))
@@ -24,6 +25,7 @@ def watch_run(state, run_id, *, follow=False, stdout=None):
                     run, error = observer._read_ledger(run_id)
                     if error:
                         raise HarnessError(error)
+                    require_current_ledger(run)
                     if run.get("id") != run_id:
                         raise HarnessError("运行台账 ID 与观察目录不符")
                     summary = status_summary(run)

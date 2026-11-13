@@ -22,18 +22,6 @@ RESUME_INCREASES = (
     "agent_timeout_seconds", "verify_timeout_seconds", "context_chars",
     "claude_max_turns", "max_attempts", "max_agent_dispatches",
 )
-# Deleted keys stay unknown; the error names what to delete and what replaces it.
-# Apart from read-only checks of historical ledgers, this hint is the only
-# place a removed key name remains.
-REMOVED_KEYS = {
-    "runtime.max_total_attempts": "请删除 runtime.max_total_attempts：每任务上限是 runtime.max_attempts，"
-                                  "整个 run 的模型调用上限是 runtime.max_agent_dispatches",
-    "runtime.claude_output_mode": "请删除 runtime.claude_output_mode：Claude 只使用 JSON 输出（原 legacy_json），"
-                                  "流式元数据模式 stream_metadata_v1 已删除",
-    "runtime.max_replans": "请删除 runtime.max_replans：修订没有单独额度，每次指挥决定都计入 runtime.max_agent_dispatches",
-    "runtime.max_final_attempts": "请删除 runtime.max_final_attempts：整体尝试没有单独额度，模型调用由 runtime.max_agent_dispatches 封顶",
-    "runtime.max_tasks": "请删除 runtime.max_tasks：计划大小由整体审阅的必要上下文（runtime.context_chars）约束",
-}
 DISPATCH_ROLES = ("commander", "worker", "reviewer")
 
 
@@ -110,8 +98,7 @@ class Config:
             for name in role_names:
                 check_keys(roles.get(name), ("cli", "model", "effort"), f"roles.{name}.")
         if unknown:
-            hints = [REMOVED_KEYS[key] for key in sorted(unknown) if key in REMOVED_KEYS]
-            raise HarnessError("未知配置键：" + "、".join(sorted(unknown)) + "".join("；" + hint for hint in hints))
+            raise HarnessError("未知配置键：" + "、".join(sorted(unknown)))
         shared = data.get("shared")
         if not isinstance(shared, dict):
             raise HarnessError("shared 必须为配置表，包含 rules、skills、mcp、hooks")

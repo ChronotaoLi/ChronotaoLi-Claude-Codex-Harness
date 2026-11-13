@@ -112,8 +112,7 @@ class RunContext:
                    "operator_decisions": deepcopy(self.run.get("operator_decisions", [])),
                    "task_checkpoints": deepcopy(self.run.get("task_checkpoints", [])),
                    "next": "Resume the harness run; every dispatch creates a fresh agent process."}
-        # handoff.json is the only handoff artifact; older run directories may
-        # still hold a handoff.md, which observation keeps readable.
+        # handoff.json is the only handoff artifact.
         write_json(self.directory / "handoff.json", handoff)
 
     def ensure_exited(self):

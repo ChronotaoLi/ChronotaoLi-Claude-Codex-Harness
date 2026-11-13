@@ -6,7 +6,7 @@ import sys
 from copy import deepcopy
 from pathlib import Path
 
-from .versions import RUN_SCHEMA_VERSION
+from .versions import RUN_SCHEMA_VERSION, require_current_ledger
 from .config import normalized
 from . import git
 from .operations import warn
@@ -98,12 +98,7 @@ class RunLifecycle(RuntimeService):
         self.context.run = read_json(self.context.state / "runs" / ident / "state.json")
         if not isinstance(self.context.run, dict):
             raise HarnessError("运行台账必须为对象")
-        version = self.context.run.get("schema_version")
-        if version != RUN_SCHEMA_VERSION:
-            shown = version if type(version) is int else "无效"
-            raise HarnessError(f"旧 run 仅保留为历史证据（台账版本 {shown}，当前 {RUN_SCHEMA_VERSION}）；"
-                               "不迁移、不恢复执行，只能用 status、dashboard 查看，"
-                               "或用 cleanup-run 清理；请开始新 run")
+        require_current_ledger(self.context.run)
         required = {"id": str, "repo": str, "worktree": str, "status": str, "commander": str,
                     "goal": str, "branch": str, "expected_head": str, "base_commit": str,
                     "config_snapshot": dict, "tasks": list, "original_tasks": list,

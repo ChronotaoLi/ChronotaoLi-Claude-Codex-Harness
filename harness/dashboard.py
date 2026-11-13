@@ -41,7 +41,8 @@ SECURITY_HEADERS = (
 )
 TEXT = "text/plain; charset=utf-8"
 JSON = "application/json; charset=utf-8"
-_STATUS_CODES = {observe.InvalidPath: 400, observe.PathRefused: 403, observe.NotFound: 404}
+_STATUS_CODES = {observe.InvalidPath: 400, observe.PathRefused: 403, observe.NotFound: 404,
+                 observe.Unsupported: 409}
 
 
 def _busy_response():

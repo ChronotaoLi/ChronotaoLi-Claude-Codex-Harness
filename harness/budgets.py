@@ -9,36 +9,16 @@ from .recovery import read_bound_result
 from .util import HarnessError
 
 
-def legacy_accounting(run):
-    """Schema 15 and earlier saved their own run-wide counter and task-budget policy."""
-    version = run.get("schema_version")
-    return not (type(version) is int and version >= 16)
-
-
-def historical_policy(run):
-    """The task-budget policy a schema 15-or-earlier ledger saved, for display only.
-
-    Those ledgers stored attempt_budget_policy, and an absent field meant
-    all_invocations. Schema 16 removed the field: it always counts work.
-    """
-    return run.get("attempt_budget_policy", "all_invocations")  # historical display branch
-
-
-def counts_work(run):
-    return not legacy_accounting(run) or historical_policy(run) == "work"
-
-
 def work_attempts(run):
     """Project saved accounting without changing the monotonic invocation totals.
 
     Work counting spares only evidence-bound environment/operator waits.
     """
     attempts = dict(run.get("attempts", {}))
-    if counts_work(run):
-        for entry in run.get("dispatches", []):
-            if isinstance(entry, dict) and entry.get("attempt_exemption"):
-                task_id = entry.get("task_id")
-                attempts[task_id] = attempts.get(task_id, 0) - 1
+    for entry in run.get("dispatches", []):
+        if isinstance(entry, dict) and entry.get("attempt_exemption"):
+            task_id = entry.get("task_id")
+            attempts[task_id] = attempts.get(task_id, 0) - 1
     return attempts
 
 

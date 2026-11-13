@@ -8,6 +8,8 @@ recovery, takes run.lock, writes files, runs git or probes processes.
 
 Ledger interpretation stays in `harness.cli.status_summary`; this module only adds
 bounded projections (invocation classes, per-provider cost, event tails, files).
+Only the current ledger version is interpreted: the list names any other version
+with its path and version alone, and the detail refuses it.
 """
 from __future__ import annotations
 
@@ -22,13 +24,14 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .versions import unsupported_ledger
+
 
 RUN_ID = re.compile(r"^run_[A-Za-z0-9]+$")
 COMPONENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,95}$")
 COMMAND_ID = re.compile(r"^[0-9a-f]{32}$")
 MAX_DEPTH = 8
-# handoff.md is no longer written; run directories from earlier versions keep it readable.
-TOP_LEVEL_FILES = frozenset(("state.json", "events.jsonl", "handoff.json", "handoff.md",
+TOP_LEVEL_FILES = frozenset(("state.json", "events.jsonl", "handoff.json",
                              "ignored-baseline.json", "ignored-paths.json", "worktree-cleanup.json"))
 ROOT_DIRECTORIES = frozenset(("plans", "dispatches", "verification", "hooks", "recovery", "decisions",
                               "environment", "checkpoints", "path-indexes", "indexes", "batches"))
@@ -71,6 +74,10 @@ class PathRefused(ObserveError):
 
 class NotFound(ObserveError):
     """The addressed run or file does not exist (HTTP 404)."""
+
+
+class Unsupported(ObserveError):
+    """The run's ledger is not the current version and is not interpreted (HTTP 409)."""
 
 
 def utc(timestamp):
@@ -582,7 +589,8 @@ class Observer:
 
     def list_runs(self):
         sampled = time.time()
-        result = {"sampled_at": sampled, "sampled_at_utc": utc(sampled), "runs": [], "skipped": [], "incomplete": []}
+        result = {"sampled_at": sampled, "sampled_at_utc": utc(sampled), "runs": [], "skipped": [], "incomplete": [],
+                  "unsupported": []}
         try:
             entries = self.reader.scandir(["runs"])
         except NotFound:
@@ -603,6 +611,13 @@ class Observer:
                 run, error = None, str(failure)
             if run is None:
                 result["skipped"].append({"path": path, "reason": error})
+                continue
+            refusal = unsupported_ledger(run)
+            if refusal is not None:
+                # Another version: its path and version only; no other field is read.
+                result["unsupported"].append({"path": f"runs/{name}",
+                                              "schema_version": _integer(run.get("schema_version")),
+                                              "reason": refusal})
                 continue
             fields = ("id", "status", "goal", "branch")
             if any(key not in run for key in fields):
@@ -625,6 +640,8 @@ class Observer:
         validate_run_id(run_id)
         sampled = time.time()
         run, ledger_error = self._read_ledger(run_id)
+        if run is not None and (refusal := unsupported_ledger(run)) is not None:
+            raise Unsupported(refusal)  # Nothing else of this run is read.
         detail = {"id": run_id, "sampled_at": sampled, "sampled_at_utc": utc(sampled),
                   "ledger_error": ledger_error, "summary": None, "summary_error": None,
                   "schema_version": None, "unavailable": [], "run": None, "budgets": None,
@@ -633,8 +650,7 @@ class Observer:
                   "notes": {"invoked": "invoked=true 在进程启动前写入；它不证明 CLI 已启动或供应商已收到请求",
                             "process": "首版不探测进程；台账记为 running 与进程是否仍在工作是两回事",
                             "events": ("事件只是观察，计数以台账为准：dispatch_prepared 在预算检查前写入，"
-                                       "dispatch_started 在台账保存 invoked=true 之后写入；"
-                                       "不带 invoked 字段的旧版 dispatch_started 早于预算检查，不表示已调用")}}
+                                       "dispatch_started 在台账保存 invoked=true 之后写入")}}
         try:
             detail["events"] = self._events(run_id, DEFAULT_TAIL)
         except ObserveError as error:
@@ -649,21 +665,13 @@ class Observer:
             detail["summary"] = _status_summary(run)
         except Exception as error:  # Any ledger damage: HarnessError, TypeError, KeyError, ...
             detail["summary_error"] = f"{type(error).__name__}: {_first_line(str(error))}"
-        version = _integer(run.get("schema_version"))
-        detail["schema_version"] = version
+        detail["schema_version"] = run["schema_version"]
         unavailable = detail["unavailable"]
-        if version is None or version < 10:
-            unavailable.append("decisions")
-        if version is None or version < 9:
-            unavailable.append("environment")
-        if "created_by_operation" not in run:
-            unavailable.append("operation")
         detail["run"] = {key: _string(run.get(key)) for key in
                          ("id", "status", "goal", "branch", "worktree", "repo", "commander", "current_task",
                           "error_type", "created_by_operation", "config_path", "expected_head", "base_commit")}
         detail["run"]["error"] = _first_line(run.get("error"))
-        detail["run"]["worktree_removed"] = (_boolean(run["worktree_removed"]) if "worktree_removed" in run
-                                             else self._worktree_cleanup_removed(run_id))
+        detail["run"]["worktree_removed"] = self._worktree_cleanup_removed(run_id)
         detail["budgets"] = self._budgets(run)
         detail["tasks"], detail["invalid_tasks"] = task_rows(run)
         rows, detail["invalid_dispatches"], model_unavailable = dispatch_rows(run)
@@ -700,28 +708,18 @@ class Observer:
 
     @staticmethod
     def _budgets(run):
-        # replan_attempts and final_attempts exist only in schema 16 and earlier
-        # ledgers (historical display); they stay null for schema 17.
-        budgets = {key: _integer(run.get(key)) for key in
-                   ("agent_dispatches", "replan_attempts", "final_attempts")}
+        budgets = {"agent_dispatches": _integer(run.get("agent_dispatches"))}
         attempts = run.get("attempts")
         budgets["attempts"] = ({key: value for key, value in attempts.items() if type(value) is int}
                                if isinstance(attempts, dict) else None)
-        # Every worker invocation, derived from the per-task counters (schema 16 and later).
+        # Every worker invocation, derived from the per-task counters.
         budgets["attempts_total"] = (_integer(sum(budgets["attempts"].values()))
                                      if budgets["attempts"] is not None else None)
-        # Historical display branch: schema 15 and earlier also saved total_attempts,
-        # attempt_budget_policy and runtime.max_total_attempts. They are shown as
-        # saved and stay null for schema 16 and later ledgers, which have none of them.
-        budgets["total_attempts"] = _integer(run.get("total_attempts"))
-        budgets["attempt_budget_policy"] = _string(run.get("attempt_budget_policy"))
         snapshot = run.get("config_snapshot")
         runtime = snapshot.get("runtime") if isinstance(snapshot, dict) else None
         runtime = runtime if isinstance(runtime, dict) else {}
-        # max_total_attempts, max_replans and max_final_attempts: older snapshots only.
         budgets["limits"] = {key: _integer(runtime.get(key)) for key in
-                             ("max_attempts", "max_total_attempts", "max_agent_dispatches", "max_replans",
-                              "max_final_attempts", "agent_timeout_seconds")}
+                             ("max_attempts", "max_agent_dispatches", "agent_timeout_seconds")}
         return budgets
 
     def _dispatch_files(self, run_id, dispatch_id):

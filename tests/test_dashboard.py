@@ -25,6 +25,7 @@ from harness import cli, dashboard, observe
 from harness.cli import status_summary
 from harness.dashboard_page import APP_JS
 from harness.util import read_json, write_json
+from harness.versions import RUN_SCHEMA_VERSION
 from test_harness import ROOT, RepoCase
 
 # Every module that binds run_process by name; patching harness.util alone misses them.
@@ -218,9 +219,10 @@ class RouteTests(DashboardCase):
         (runs / "run_broken").mkdir()
         (runs / "run_broken" / "state.json").write_bytes(b"{not json")
         (runs / "run_nostate").mkdir()
-        write_json(runs / "run_harnesserror" / "state.json", {"id": "run_harnesserror", "accepted": None, "goal": "g"})
-        write_json(runs / "run_typeerror" / "state.json",
-                   {"id": "run_typeerror", "goal": "g", "operator_decisions": [{"request_id": []}]})
+        write_json(runs / "run_harnesserror" / "state.json",
+                   {"schema_version": RUN_SCHEMA_VERSION, "id": "run_harnesserror", "accepted": None, "goal": "g"})
+        write_json(runs / "run_typeerror" / "state.json", {"schema_version": RUN_SCHEMA_VERSION, "id": "run_typeerror",
+                                                           "goal": "g", "operator_decisions": [{"request_id": []}]})
         server = self.start_server()
         status, _, body = self.request(server, "/api/runs")
         self.assertEqual(status, 200)
@@ -381,11 +383,7 @@ class ReadOnlyTests(DashboardCase):
 
     def test_observation_never_invokes_backend_or_processes_and_leaves_lock_free(self):
         run_id, run_dir = self.demo_run()
-        # Only handoff.json is written now; a run directory from an earlier
-        # version may still hold handoff.md, which stays viewable.
         self.assertTrue((run_dir / "handoff.json").is_file())
-        self.assertFalse((run_dir / "handoff.md").exists())
-        (run_dir / "handoff.md").write_text("# Run handoff\n\nhistorical\n", encoding="utf-8")
         lock_path = run_dir / "run.lock"
         lock_before = os.stat(lock_path)
         with contextlib.ExitStack() as stack:
@@ -394,12 +392,9 @@ class ReadOnlyTests(DashboardCase):
             doubles["subprocess.Popen"] = stack.enter_context(patch("subprocess.Popen"))
             server = self.start_server()
             for path in ("/api/runs", f"/api/runs/{run_id}", f"/api/runs/{run_id}/events", f"/api/runs/{run_id}/files",
-                         f"/api/runs/{run_id}/files/state.json", f"/api/runs/{run_id}/files/handoff.json",
-                         f"/api/runs/{run_id}/files/handoff.md"):
+                         f"/api/runs/{run_id}/files/state.json", f"/api/runs/{run_id}/files/handoff.json"):
                 status, _, body = self.request(server, path)
                 self.assertEqual(status, 200, path)
-                if path.endswith("handoff.md"):
-                    self.assertIn(b"historical", body)
             for site, double in doubles.items():
                 self.assertEqual(double.call_count, 0, site)
             lock_after = os.stat(lock_path)
@@ -535,7 +530,7 @@ class CLIWiringTests(RepoCase):
         engine.start("Implement greet")
         ledger = read_json(engine.directory / "state.json")
         runs = self.repo / ".harness" / "runs"
-        write_json(runs / "run_partial" / "state.json", {"goal": "partial"})
+        write_json(runs / "run_partial" / "state.json", {"goal": "partial", "schema_version": RUN_SCHEMA_VERSION})
         write_json(runs / "run_shape" / "state.json", [])
         (runs / "run_broken").mkdir()
         (runs / "run_broken" / "state.json").write_text("{")

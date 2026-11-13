@@ -329,7 +329,7 @@ class RuntimeChangesTests(RepoCase):
         result = engine.start("Implement greet", self.plan(), pause_after_plan=True)
         engine.run.pop("schema_version")
         engine.context.save()
-        with self.assertRaisesRegex(HarnessError, "旧 run"):
+        with self.assertRaisesRegex(HarnessError, "台账版本缺失或无效，不支持"):
             self.engine().resume(result["id"], approve_plan=True)
         self.assertEqual(engine.run["dispatches"], [])
 

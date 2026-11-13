@@ -162,7 +162,7 @@ class RedesignIntegrationTests(RepoCase):
         state["schema_version"] = 12
         write_json(path, state)
         before = path.read_bytes()
-        with self.assertRaisesRegex(HarnessError, "旧 run"):
+        with self.assertRaisesRegex(HarnessError, "台账版本 12 不支持"):
             self.engine(backend).resume(engine.run["id"])
         self.assertEqual(path.read_bytes(), before)
         self.assertEqual(backend.calls, [])

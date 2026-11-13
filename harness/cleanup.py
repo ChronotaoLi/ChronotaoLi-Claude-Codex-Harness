@@ -1,6 +1,6 @@
 """The one explicit cleanup entry: retained verification checkouts and the run worktree.
 
-One shared gate (run lock, ledger ownership, historical version, command
+One shared gate (run lock, current ledger version, ledger ownership, command
 directories, indexes, worker receipt links, exit evidence) precedes two
 concrete resources. Fresh verification checkouts are removable in any run
 status; the branch worktree only for completed or abandoned runs. Each
@@ -16,7 +16,7 @@ import stat
 import time
 from pathlib import Path
 
-from .versions import HISTORICAL_CLEANUP_VERSIONS, RUN_SCHEMA_VERSION
+from .versions import unsupported_ledger
 from . import git
 from .input_projection import validate_dispatch_indexes as validate_input_dispatch_indexes
 from .path_evidence import validate_dispatch_indexes
@@ -97,12 +97,15 @@ def _gate(repo, ident, directory, confirm_exited):
     state = directory / "state.json"
     original = _regular_bytes(state)
     run = json.loads(original)
+    if not isinstance(run, dict):
+        raise HarnessError("运行台账必须为对象；保留现场")
+    if (refusal := unsupported_ledger(run)) is not None:
+        raise HarnessError(refusal)
     checkout = repo / ".harness" / "worktrees" / ident
     _canonical(checkout)
     branch = "harness/" + ident
     common = Path(git.git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir").removesuffix("\n")).resolve()
-    if (not isinstance(run, dict) or run.get("schema_version") not in HISTORICAL_CLEANUP_VERSIONS
-            or run.get("id") != ident or run.get("repo") != str(repo)
+    if (run.get("id") != ident or run.get("repo") != str(repo)
             or run.get("worktree") != str(checkout) or run.get("branch") != branch
             or not isinstance(run.get("expected_head"), str)
             or not isinstance(run.get("dispatches"), list)
@@ -121,8 +124,7 @@ def _gate(repo, ident, directory, confirm_exited):
     validate_command_directories(run["dispatches"], directory)
     validate_dispatch_indexes(directory, run["dispatches"])
     validate_input_dispatch_indexes(directory, run["dispatches"])
-    if run["schema_version"] >= 14:
-        validate_worker_receipt_links(run, directory)
+    validate_worker_receipt_links(run, directory)
     if confirm_exited:
         store = RunStore(repo / ".harness")
         store.attach(run)
@@ -276,15 +278,10 @@ def _clean_worktree(repo, run, directory, original, remove, remove_input_copies)
     state, receipt_path = directory / "state.json", directory / "worktree-cleanup.json"
     result = {"worktree": str(checkout), "branch": branch}
     if run.get("status") not in TERMINAL:
-        # Policy, not a refusal. Only the current ledger version can still be
-        # finished or abandoned; an older one leaves the worktree to the operator.
-        if run.get("schema_version") == RUN_SCHEMA_VERSION:
-            return {**result, "status": "retained", "reason_kind": "finish_or_abandon_first",
-                    "reason": f"run 状态为 {run.get('status')}；工作树只在 run 完成（completed）"
-                              "或放弃（abandoned）之后清理，请先完成或放弃该 run"}
-        return {**result, "status": "retained", "reason_kind": "manual_removal",
-                "reason": f"run 状态为 {run.get('status')}，台账版本 {run.get('schema_version')} "
-                          "不能由当前版本恢复或放弃；cleanup-run 不删除这个工作树，请人工核对后自行移除"}
+        # Policy, not a refusal: the run can still be finished or abandoned.
+        return {**result, "status": "retained", "reason_kind": "finish_or_abandon_first",
+                "reason": f"run 状态为 {run.get('status')}；工作树只在 run 完成（completed）"
+                          "或放弃（abandoned）之后清理，请先完成或放弃该 run"}
     expected = run["expected_head"]
     # The receipt names the resource, not the whole ledger: an audited
     # --confirm-exited may rewrite the ledger between an interruption and its rerun.
@@ -306,10 +303,7 @@ def _clean_worktree(repo, run, directory, original, remove, remove_input_copies)
             raise HarnessError("已清理工作树或注册重新出现；保留现场")
         return {**result, "status": "removed" if remove else "absent", "input_copies": input_summary}
     if not exists:
-        # Ledgers from before the single entry recorded removal by abandon
-        # --remove-worktree: an intent (pending_worktree_removal) or its completion.
-        legacy = run.get("worktree_removed") is True or run.get("pending_worktree_removal") is True
-        if registered or admin.exists() or not (previous or legacy):
+        if registered or admin.exists() or not previous:
             raise HarnessError("工作树缺失但清理意图或 Git 注册不符；保留现场")
         status = "absent"
     else:

@@ -40,10 +40,6 @@ class ConvergenceTests(unittest.TestCase):
         # Observation uses saved accounting, not an extra interpretation of retries.
         self.assertEqual(status_summary(run)["budgets"]["work_attempts"], {"task": 2})
         self.assertEqual(status_summary(run)["convergence"]["warnings"], [])
-        # Historical display branch: a schema-15 ledger is read under its saved policy.
-        historical = {**run, "schema_version": 15, "attempt_budget_policy": "all_invocations"}
-        self.assertEqual(status_summary(historical)["budgets"]["work_attempts"], {"task": 3})
-        self.assertEqual(status_summary(historical)["convergence"]["warnings"][0]["recurring_findings"], [])
 
     def test_damaged_history_and_large_warning_sets_remain_bounded(self):
         run = {"status": "running", "accepted": {}, "review_history": {"bad": None}, "final_history": None}

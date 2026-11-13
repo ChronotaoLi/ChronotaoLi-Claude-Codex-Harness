@@ -14,7 +14,7 @@ from pathlib import Path
 
 from . import dashboard, git, observe
 from .adapters import DemoBackend
-from .budgets import attempts_total, counts_work, historical_policy, legacy_accounting, work_attempts
+from .budgets import attempts_total, work_attempts
 from .cleanup import blocked, cleanup_run
 from .config import Config
 from .convergence import convergence_summary, review_rounds
@@ -23,23 +23,7 @@ from .operations import RUN_ID, OperationRecord, config_identity, digest_assets,
 from .runtime import Runtime
 from .shared import mcp_configs, toml_value
 from .util import HarnessError, dump, read_json, write_json
-
-
-def historical_claude_terminal(observer, components):
-    """The Claude terminal file a schema 16-or-earlier dispatch declared in its capture manifest."""
-    try:
-        capture = observer.reader.read(components + ["capture-manifest.json"], limit=4096)
-        if capture["too_large"] or capture["changed_while_reading"]:
-            raise HarnessError("捕获元数据过大或读取时改变")
-        manifest = json.loads(capture["data"])
-        if not isinstance(manifest, dict) or manifest.get("version") != 1:
-            raise HarnessError("捕获元数据格式无效")
-        mode = manifest.get("mode")
-    except observe.NotFound:
-        mode = "legacy_json"
-    if mode not in ("legacy_json", "stream_metadata_v1"):
-        raise HarnessError("未知捕获模式")
-    return "stream-terminal.json" if mode == "stream_metadata_v1" else "process.stdout"
+from .versions import require_current_ledger, unsupported_ledger
 
 
 def doctor(config):
@@ -115,18 +99,15 @@ def status_work_attempts(run):
             or any(not isinstance(key, str) or type(value) is not int or value < 0
                    for key, value in attempts.items())):
         raise HarnessError(diagnostic)
-    if legacy_accounting(run) and historical_policy(run) not in ("all_invocations", "work"):
+    dispatches = run.get("dispatches", [])
+    if not isinstance(dispatches, list):
         raise HarnessError(diagnostic)
-    if counts_work(run):
-        dispatches = run.get("dispatches", [])
-        if not isinstance(dispatches, list):
-            raise HarnessError(diagnostic)
-        for entry in dispatches:
-            if isinstance(entry, dict) and entry.get("attempt_exemption"):
-                task_id = entry.get("task_id")
-                if (not isinstance(entry["attempt_exemption"], dict)
-                        or not isinstance(task_id, str) or task_id not in attempts):
-                    raise HarnessError(diagnostic)
+    for entry in dispatches:
+        if isinstance(entry, dict) and entry.get("attempt_exemption"):
+            task_id = entry.get("task_id")
+            if (not isinstance(entry["attempt_exemption"], dict)
+                    or not isinstance(task_id, str) or task_id not in attempts):
+                raise HarnessError(diagnostic)
     result = work_attempts(run)
     if any(value < 0 for value in result.values()):
         raise HarnessError(diagnostic)
@@ -134,22 +115,14 @@ def status_work_attempts(run):
 
 
 def status_summary(run):
-    # replan_stopped exists only in schema 16 and earlier ledgers (historical display).
-    if not isinstance(run.get("accepted", {}), dict) or not isinstance(run.get("replan_stopped", {}), dict):
-        raise HarnessError("运行台账 accepted 或 replan_stopped 字段无效；使用 status --full 查看原始内容")
+    if not isinstance(run.get("accepted", {}), dict):
+        raise HarnessError("运行台账 accepted 字段无效；使用 status --full 查看原始内容")
     result = {key: run.get(key) for key in ("id", "status", "goal", "branch", "worktree", "current_task")}
     result["accepted_tasks"] = list(run.get("accepted", {}))
     result["budgets"] = {key: run.get(key) for key in ("attempts", "agent_dispatches")}
-    # Historical display branch: schema 16 and earlier saved two more counters.
-    result["budgets"].update({key: run[key] for key in ("replan_attempts", "final_attempts") if key in run})
     result["budgets"]["work_attempts"] = status_work_attempts(run)
     # Every worker invocation, summed from the validated per-task counters.
     result["budgets"]["attempts_total"] = attempts_total(run)
-    if legacy_accounting(run):
-        # Historical display branch: schema 15 and earlier saved total_attempts
-        # and attempt_budget_policy; show them as saved, without recomputing.
-        result["budgets"].update(total_attempts=run.get("total_attempts"),
-                                 attempt_budget_policy=historical_policy(run))
     result["convergence"] = convergence_summary(run, result["budgets"]["work_attempts"])
     result["review_rounds"] = review_rounds(run)
     from .diagnostics import budget_explanation, remaining_model_calls
@@ -229,8 +202,6 @@ def status_summary(run):
             result["last_environment_blocker"] = summary
     if run.get("error"):
         result["error"] = str(run["error"]).splitlines()[0]
-    if run.get("replan_stopped"):
-        result["replan_stopped"] = {key: run["replan_stopped"].get(key) for key in ("target", "reason", "artifact")}
     responses = run.get("operator_decisions", [])
     requests = run.get("decision_requests", [])
     if not isinstance(responses, list) or not isinstance(requests, list):
@@ -243,8 +214,6 @@ def status_summary(run):
         response = latest.get(request.get("id"))
         if request.get("task_id") in run.get("accepted", {}) or (response and response.get("decision") == "continue"):
             continue
-        if request.get("kind") == "replan_stop" and request.get("source", {}).get("dispatch_id") != run.get("replan_stopped", {}).get("dispatch_id"):
-            continue
         pending.append({key: request.get(key) for key in ("id", "task_id", "kind", "question", "artifact", "artifact_digest")})
     if pending:
         result["pending_decisions"] = pending
@@ -256,6 +225,7 @@ def show_status(args, state):
         if not args.run_id.startswith("run_") or not args.run_id[4:].isalnum():
             raise HarnessError("无效 run ID")
         ledger = read_ledger(state / "runs" / args.run_id / "state.json")
+        require_current_ledger(ledger)
         print(dump(ledger if args.full else status_summary(ledger)))
         return
     # The read-only observation layer owns the list; stdout fields are unchanged.
@@ -263,6 +233,8 @@ def show_status(args, state):
         listing = observe.list_runs(state)
     except observe.ObserveError as error:
         raise HarnessError(f"无法读取运行目录 {state / 'runs'}：{error}") from error
+    for item in listing["unsupported"]:
+        print(f"harness: 运行目录 {state / item['path']}：{item['reason']}", file=sys.stderr)
     for item in listing["skipped"]:
         print(f"harness: 跳过无法读取的运行台账 {state / item['path']}：{item['reason']}", file=sys.stderr)
     for path in listing["incomplete"]:
@@ -544,6 +516,8 @@ def _main(argv=None):
             try:
                 with observe.Observer(state, required=True) as observer:
                     run, error = observer._read_ledger(args.run_id)
+                    if error is None and (refusal := unsupported_ledger(run)) is not None:
+                        raise HarnessError(refusal)
                     if error or run.get("id") != args.run_id:
                         raise HarnessError(error or "运行 ID 不符")
                     entry = next((d for d in run.get("dispatches", []) if d.get("id") == args.dispatch_id), None)
@@ -555,13 +529,9 @@ def _main(argv=None):
                     role_key = "fable" if entry.get("role") == "commander" and run.get("commander") == "fable" else entry.get("role")
                     provider = roles.get(role_key, {}).get("cli")
                     if provider == "claude":
-                        version = run.get("schema_version")
-                        # Schema 17 has one output, Claude's JSON terminal in process.stdout.
-                        # Earlier ledgers declared their mode in a capture manifest (history only).
-                        name = ("process.stdout" if type(version) is int and version >= 17
-                                else historical_claude_terminal(observer, components))
+                        # Claude's only output is its JSON terminal in process.stdout.
                         try:
-                            source = observer.reader.read(components + [name], limit=16*1024*1024)
+                            source = observer.reader.read(components + ["process.stdout"], limit=16*1024*1024)
                             if not source["too_large"] and not source["changed_while_reading"]:
                                 terminal = json.loads(source["data"])
                         except (observe.NotFound, ValueError, RecursionError):

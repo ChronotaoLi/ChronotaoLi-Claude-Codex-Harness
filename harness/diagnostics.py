@@ -156,33 +156,18 @@ def budget_explanation(run, work):
     started = sum(type(d.get('pgid')) is int and d['pgid'] > 0 for d in workers.values())
     shown = {'task_work': {tid: budget(count, 'max_attempts') for tid, count in work.items()},
              'agent_dispatches': budget(run.get('agent_dispatches'), 'max_agent_dispatches')}
-    if 'replan_attempts' in run:
-        # Historical display branch: schema 16 and earlier saved replan and
-        # final-attempt counters with their own limits; schema 17 has neither.
-        shown.update(replans=budget(run.get('replan_attempts'), 'max_replans'),
-                     final_attempts=budget(run.get('final_attempts'), 'max_final_attempts'))
-    if 'total_attempts' in run:
-        # Historical display branch: schema 15 and earlier saved a run-wide
-        # worker counter and limit; schema 16 and later have neither.
-        shown['total_worker'] = budget(run.get('total_attempts'), 'max_total_attempts')
     dimensions = {'actual_worker_invocations': started,
                   'charged_worker_invocations': len(workers),
                   'process_start_unconfirmed': len(workers) - started,
                   'reviewed_worker_candidates': len(reviewed),
                   'unlinked_review_records': len(unlinked), 'failed_worker_invocations': failures,
                   'recorded_exemptions': exemptions,
-                  'historical_invocation_unknown': sum(d.get('role') == 'worker' and 'invoked' not in d for d in unique.values()),
                   'duplicate_dispatch_ids': duplicate}
-    version = run.get('schema_version')
-    if type(version) is int and version >= 17:
-        invalid = dict.fromkeys(('commander', 'worker', 'reviewer'), 0)
-        for entry in unique.values():
-            if entry.get('status') == 'invalid' and entry.get('role') in invalid:
-                invalid[entry['role']] += 1
-        dimensions['invalid_outputs'] = invalid
-    else:
-        # Historical display branch: ledgers before 17 recorded format corrections.
-        dimensions['worker_format_corrections'] = sum(d.get('format_correction') is True for d in workers.values())
+    invalid = dict.fromkeys(('commander', 'worker', 'reviewer'), 0)
+    for entry in unique.values():
+        if entry.get('status') == 'invalid' and entry.get('role') in invalid:
+            invalid[entry['role']] += 1
+    dimensions['invalid_outputs'] = invalid
     return {'dimensions': dimensions,
             'limits': shown,
             'evidence_basis': 'recorded_ledger_links_not_revalidated_artifacts',

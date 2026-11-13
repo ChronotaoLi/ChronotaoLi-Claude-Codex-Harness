@@ -42,11 +42,11 @@ class OperatorCLITests(unittest.TestCase):
         self.assertEqual(engine.resume.call_args.kwargs["operator_decision"], [Path("a.json"), Path("b.json")])
 
     def test_status_exposes_only_unanswered_current_requests(self):
-        run = {"accepted": {}, "decision_requests": [
+        run = {"accepted": {"done": {}}, "decision_requests": [
             {"id": "worker", "task_id": "work", "kind": "worker", "question": "Choose approach"},
-            {"id": "old", "task_id": "work", "kind": "replan_stop", "source": {"dispatch_id": "old"}},
-            {"id": "new", "task_id": "work", "kind": "replan_stop", "source": {"dispatch_id": "new"}}],
-            "replan_stopped": {"dispatch_id": "new"}, "operator_decisions": []}
+            {"id": "accepted", "task_id": "done", "kind": "worker", "question": "Asked before acceptance"},
+            {"id": "new", "task_id": "work", "kind": "commander", "question": "Which direction?"}],
+            "operator_decisions": []}
         self.assertEqual([r["id"] for r in status_summary(run)["pending_decisions"]], ["worker", "new"])
         run["operator_decisions"] = [{"request_id": "worker", "decision": "continue"},
                                      {"request_id": "new", "decision": "stop"}]
