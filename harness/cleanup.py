@@ -16,7 +16,7 @@ import stat
 import time
 from pathlib import Path
 
-from .versions import unsupported_ledger
+from .versions import require_current_ledger
 from . import git
 from .input_projection import validate_dispatch_indexes as validate_input_dispatch_indexes
 from .path_evidence import validate_dispatch_indexes
@@ -97,10 +97,7 @@ def _gate(repo, ident, directory, confirm_exited):
     state = directory / "state.json"
     original = _regular_bytes(state)
     run = json.loads(original)
-    if not isinstance(run, dict):
-        raise HarnessError("运行台账必须为对象；保留现场")
-    if (refusal := unsupported_ledger(run)) is not None:
-        raise HarnessError(refusal)
+    require_current_ledger(run)
     checkout = repo / ".harness" / "worktrees" / ident
     _canonical(checkout)
     branch = "harness/" + ident

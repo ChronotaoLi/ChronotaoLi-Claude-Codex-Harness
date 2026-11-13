@@ -542,8 +542,10 @@ class CLIWiringTests(RepoCase):
                                   {"id": "run_partial", "status": "unknown", "goal": "partial", "branch": None}])
         self.assertEqual([list(item) for item in values], [["id", "status", "goal", "branch"]] * 2)
         printed = runs.resolve()  # The CLI reports the git-resolved absolute path, as before.
-        for name in ("run_broken", "run_shape", "run_missing"):
+        for name in ("run_broken", "run_missing"):
             self.assertIn(f"harness: 跳过无法读取的运行台账 {printed / name / 'state.json'}：", errors)
+        # A parsed non-object is not a current-version ledger: path and refusal only.
+        self.assertIn(f"harness: 运行目录 {printed / 'run_shape'}：台账版本缺失或无效，不支持", errors)
         self.assertIn(f"harness: 运行台账字段不完整 {printed / 'run_partial' / 'state.json'}", errors)
         self.assertNotIn("Traceback", errors)
         self.assertNotIn("run_partial", output.replace("run_partial", "", 1))  # listed once

@@ -575,7 +575,12 @@ class Observer:
     # ----- ledger -----
 
     def _read_ledger(self, run_id):
-        """Return (ledger, error). Missing run directory or state.json raises NotFound."""
+        """Return (value, error); error is None exactly when state.json parsed.
+
+        A parsed value is returned as is, object or not: callers refuse anything
+        but a current-version object (``unsupported_ledger``) before reading a field.
+        A missing run directory or state.json raises NotFound.
+        """
         read = self.reader.read(["runs", run_id, "state.json"], limit=STATE_MAX_BYTES)
         if read["too_large"]:
             return None, f"state.json 超过 {STATE_MAX_BYTES} 字节上限，未解析"
@@ -583,8 +588,6 @@ class Observer:
             value = json.loads(read["data"])
         except _PARSE_ERRORS as error:
             return None, f"state.json 无法解析：{type(error).__name__}: {_first_line(str(error))}"
-        if not isinstance(value, dict):
-            return None, "运行台账必须为对象"
         return value, None
 
     def list_runs(self):
@@ -609,14 +612,14 @@ class Observer:
                 run, error = self._read_ledger(name)
             except ObserveError as failure:
                 run, error = None, str(failure)
-            if run is None:
+            if error is not None:
                 result["skipped"].append({"path": path, "reason": error})
                 continue
             refusal = unsupported_ledger(run)
             if refusal is not None:
-                # Another version: its path and version only; no other field is read.
-                result["unsupported"].append({"path": f"runs/{name}",
-                                              "schema_version": _integer(run.get("schema_version")),
+                # Not a current-version object: its path and version only; no other field is read.
+                version = run.get("schema_version") if isinstance(run, dict) else None
+                result["unsupported"].append({"path": f"runs/{name}", "schema_version": _integer(version),
                                               "reason": refusal})
                 continue
             fields = ("id", "status", "goal", "branch")
@@ -640,7 +643,7 @@ class Observer:
         validate_run_id(run_id)
         sampled = time.time()
         run, ledger_error = self._read_ledger(run_id)
-        if run is not None and (refusal := unsupported_ledger(run)) is not None:
+        if ledger_error is None and (refusal := unsupported_ledger(run)) is not None:
             raise Unsupported(refusal)  # Nothing else of this run is read.
         detail = {"id": run_id, "sampled_at": sampled, "sampled_at_utc": utc(sampled),
                   "ledger_error": ledger_error, "summary": None, "summary_error": None,
@@ -659,7 +662,7 @@ class Observer:
         detail["timing"] = {"first_event_time": self._first_event_time(run_id),
                             "last_event_time": detail["events"]["last_time"], "basis": "events.jsonl 事件时间"}
         detail["operations"] = self._operations(run_id)
-        if run is None:
+        if ledger_error is not None:
             return detail
         try:
             detail["summary"] = _status_summary(run)

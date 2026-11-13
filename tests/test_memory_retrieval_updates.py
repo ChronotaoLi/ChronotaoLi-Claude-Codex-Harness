@@ -16,6 +16,7 @@ from harness.cli import main
 from harness.memory import Memory, MAX_SOURCE_BYTES, bind_source_files, source_status, ranking_group
 from harness.mcp_server import handle
 from harness.util import HarnessError
+from harness.versions import RUN_SCHEMA_VERSION
 
 
 class RetrievalUpdatesTests(unittest.TestCase):
@@ -374,7 +375,8 @@ class RetrievalUpdatesTests(unittest.TestCase):
             self.assertEqual(run_memory.read(unavailable)['source_status'], 'unavailable')
             ledger = self.path.parent / 'runs' / 'run_old' / 'state.json'
             ledger.parent.mkdir(parents=True)
-            ledger.write_text(json.dumps({'id': 'run_old', 'repo': str(self.repo), 'status': 'paused',
+            ledger.write_text(json.dumps({'schema_version': RUN_SCHEMA_VERSION, 'id': 'run_old', 'repo': str(self.repo),
+                                          'status': 'paused',
                                           'worktree': str(worktree)}))
             code, ident, error = self.invoke('add', '--key', 'run-bound', '--title', 'Bound', '--text', 'x',
                                              '--run', 'run_old', '--source-file', 'docs/new.md')

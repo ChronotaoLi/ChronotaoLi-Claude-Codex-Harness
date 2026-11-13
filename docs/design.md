@@ -87,7 +87,7 @@
 **台账、版本与观察**
 
 27. 台账只经 `RunStore` 提交：在 `store.lock` 下比较已加载字节的摘要，拒绝旧写入，原子写入并递增 `store_revision`；外部动作前也核对当前权威。`run.lock` 保护生命周期。
-28. 只支持当前台账版本 18，只解释一种台账形状和一种配置形状：其他版本（含缺失或非整数的版本）不迁移、不补写默认值、不解释字段；`resume`、`abandon`、`prepare-run`、`cleanup-run`、`status RUN`（含 `--full`）、`watch`、`permission-diagnostics` 与观察网页的 run 详情都在读完版本后拒绝，错误写明该 run 的台账版本与当前版本；运行列表（不带 run 的 `status`、观察网页的列表）对其他版本只给出路径、版本和“不支持”，一个旧版本或损坏的目录不影响其他 run 的列出。配置的未知键（含已删除的键）一律报“未知配置键”，不给迁移提示。resume 另核对共享资产摘要（不含 hook 脚本的依赖）和完整配置快照。
+28. 只支持当前台账版本 18，只解释一种台账形状和一种配置形状：其他版本（含缺失或非整数的版本）不迁移、不补写默认值、不解释字段；`resume`、`abandon`、`prepare-run`、`cleanup-run`、`status RUN`（含 `--full`）、`watch`、`permission-diagnostics`、观察网页的 run 详情、命令 broker（建 manifest、执行与删除）和只读 MCP 都在读完版本、读任何其他字段之前拒绝，错误写明该 run 的台账版本与当前版本；非对象的台账同样按“不支持”处理；任务记忆的来源台账不是当前版本时来源状态为 `unsupported`，其任务历史不再召回；运行列表（不带 run 的 `status`、观察网页的列表）对其他版本只给出路径、版本和“不支持”，一个旧版本或损坏的目录不影响其他 run 的列出。配置的未知键（含已删除的键）一律报“未知配置键”，不给迁移提示。resume 另核对共享资产摘要（不含 hook 脚本的依赖）和完整配置快照。
 29. hooks 至少一次：`post_agent` 只作用于通过契约校验的结果和 `invalid_rejected` 审阅（读不出否决的无效输出、不合格的指挥提问与 worker 的无效阻断不运行它；合格的指挥提问先运行它再登记请求，失败时回执保留、请求未登记，修复后普通 resume 对同一原件重跑（HEAD 或候选已变也一样）；worker 交接请求的目标在 `post_agent` 与检查点登记之后才检查，不合格时这份结果在 hook 之后才判为无效）；`pre_accept`、`post_accept`、`on_error` 执行前递增计数并用独立日志目录，中断后可能重复。配置出现 `context_compacted` 时报未知事件并提示改用 `context_prepared`。
 30. 必要输入超过 `context_chars` 时不调用模型、不扣额度，报告仍写入 `context-report.json`；可选记忆按整条加入剩余空间。成功派发的报告保留根与顶层字段尺寸及最大的 30 个嵌套字段并给出省略数，超限报告保留全部明细。
 31. 观察层（`status`、`watch`、`dashboard`、操作记录、`supervise` 回执）不写台账、不取 `run.lock`、不参与恢复。

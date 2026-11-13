@@ -6,7 +6,7 @@ import sys
 from copy import deepcopy
 from pathlib import Path
 
-from .versions import RUN_SCHEMA_VERSION, require_current_ledger
+from .versions import RUN_SCHEMA_VERSION, read_current_ledger
 from .config import normalized
 from . import git
 from .operations import warn
@@ -15,7 +15,7 @@ from .path_evidence import validate_dispatch_indexes
 from .services import RuntimeService
 from .continuation import packet as continuation_packet, record_execution_guidance, record_continuation_rejection
 from .shared import asset_digest, validate_mcp
-from .util import HarnessError, lock, read_json, uid, validate_command_directories
+from .util import HarnessError, lock, uid, validate_command_directories
 
 
 class RunLifecycle(RuntimeService):
@@ -95,10 +95,12 @@ class RunLifecycle(RuntimeService):
         runtime = self.context
         if not ident.startswith("run_") or not ident[4:].isalnum():
             raise HarnessError("无效 run ID")
-        self.context.run = read_json(self.context.state / "runs" / ident / "state.json")
-        if not isinstance(self.context.run, dict):
-            raise HarnessError("运行台账必须为对象")
-        require_current_ledger(self.context.run)
+        # Version and identity are checked on a local value: binding the store
+        # reads id and store_revision and locks the directory that id names.
+        run = read_current_ledger(self.context.state / "runs" / ident / "state.json")
+        if run.get("id") != ident:
+            raise HarnessError("运行台账字段缺失或类型无效；保留原文件并核对证据")
+        self.context.run = run
         required = {"id": str, "repo": str, "worktree": str, "status": str, "commander": str,
                     "goal": str, "branch": str, "expected_head": str, "base_commit": str,
                     "config_snapshot": dict, "tasks": list, "original_tasks": list,

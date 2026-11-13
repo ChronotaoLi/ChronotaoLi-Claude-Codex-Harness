@@ -15,6 +15,7 @@ from pathlib import Path, PurePosixPath
 from . import git
 from .contracts import PROPOSALS, REVIEW, validate
 from .util import HarnessError, uid
+from .versions import unsupported_ledger
 
 
 MAX_SOURCE_BYTES = 2 * 1024 * 1024
@@ -402,6 +403,11 @@ class Memory:
         return {"possibly_stale": bool(reasons), "stale_reasons": reasons}
 
     def _source_ledger(self, source_run):
+        """(status, ledger) of a memory's source run.
+
+        ``missing`` when unreadable or unparsable; ``unsupported`` with an empty
+        ledger when it is not a current-version object, whose fields are never read.
+        """
         try:
             ledger_path = self.path.parent / "runs" / source_run / "state.json"
             if not ledger_path.resolve().is_relative_to((self.path.parent / "runs").resolve()):
@@ -411,8 +417,8 @@ class Memory:
             if len(data) > 16 * 1024 * 1024:
                 raise ValueError("oversized source ledger")
             ledger = json.loads(data)
-            if not isinstance(ledger, dict):
-                raise ValueError("invalid source ledger")
+            if unsupported_ledger(ledger) is not None:
+                return "unsupported", {}
             status = ledger.get("status") if ledger.get("id") == source_run else "invalid"
             if not isinstance(status, str) or status not in {
                     "planning", "running", "blocked", "interrupted", "awaiting_approval",
@@ -458,7 +464,7 @@ class Memory:
                     ledger_cache[source_run] = self._source_ledger(source_run)
                 status, ledger = ledger_cache[source_run]
                 try:
-                    if item["kind"] == "accepted_task" and status != "missing":
+                    if item["kind"] == "accepted_task" and status not in ("missing", "unsupported"):
                         task_id = provenance.get("task_id")
                         if not task_id and item["key"].startswith(f"task:{source_run}:"):
                             task_id = item["key"].split(":", 2)[2]
@@ -474,7 +480,7 @@ class Memory:
         if scope == "run":
             applicable = bool(source_run and source_run == run_id)
             if item["kind"] == "accepted_task":
-                applicable = status not in (None, "abandoned", "missing", "invalid")
+                applicable = status not in (None, "abandoned", "missing", "invalid", "unsupported")
         return {"scope": scope, "source_run_id": source_run, "source_run_status": status,
                 "reference_only": True, "applicable": applicable,
                 "historical": bool(source_run and source_run != run_id)}

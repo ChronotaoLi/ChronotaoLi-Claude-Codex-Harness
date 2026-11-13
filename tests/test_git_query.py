@@ -21,6 +21,7 @@ from harness.git_query import covers, parse_git_query, run_git_query
 from harness.mcp_server import handle
 from harness.shared import mcp_configs
 from harness.util import HarnessError, write_json
+from harness.versions import RUN_SCHEMA_VERSION
 from test_harness import ROOT
 
 SHA = "0123456789abcdef0123456789abcdef01234567"
@@ -469,7 +470,8 @@ class GitQueryExecutionTests(Fixture):
 class GitQueryMCPTests(Fixture):
     def run_state(self):
         path = self.root / "run" / "state.json"
-        write_json(path, {"id": "run_fixture", "worktree": self.binding["worktree"], "worktree_binding": self.binding})
+        write_json(path, {"schema_version": RUN_SCHEMA_VERSION, "id": "run_fixture", "worktree": self.binding["worktree"],
+                          "worktree_binding": self.binding})
         return path
 
     @staticmethod

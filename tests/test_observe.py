@@ -306,7 +306,9 @@ class EventsAndDamageTests(StateCase):
                          ["run_good", "run_harnesserror", "run_typeerror"])
         skipped = {item["path"]: item["reason"] for item in listing["skipped"]}
         self.assertIn("无法解析", skipped["runs/run_broken/state.json"])
-        self.assertIn("对象", skipped["runs/run_list/state.json"])
+        # A parsed non-object is not a current-version ledger: named, never interpreted.
+        self.assertEqual(listing["unsupported"], [{"path": "runs/run_list", "schema_version": None,
+                                                   "reason": f"台账版本缺失或无效，不支持（当前版本 {RUN_SCHEMA_VERSION}）"}])
         self.assertIn("runs/run_nostate/state.json", skipped)
         self.assertIn("runs/not-a-run", skipped)
         detail = observe.run_detail(self.state, "run_broken")

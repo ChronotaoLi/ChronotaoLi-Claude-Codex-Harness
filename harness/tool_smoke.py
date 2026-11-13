@@ -17,6 +17,7 @@ from .command_server import DELETE_COMMAND_ID, command_id, ensure_command_proces
 from .config import Config
 from .permission_smoke import _git
 from .util import HarnessError, dump, read_json, run_process, write_json
+from .versions import RUN_SCHEMA_VERSION
 
 
 def prepare_fixture(directory):
@@ -64,7 +65,9 @@ def prepare_fixture(directory):
          {'different': True, 'binary': False, 'diff': '--- left\n+++ right\n@@ -1 +1 @@\n-before\n+after\n'})
     # The read-only harness MCP sees a bound run worktree; the broker does not.
     binding = git.capture_worktree_binding(worktree, None)
-    write_json(directory / 'run-state.json', {'worktree': binding['worktree'], 'worktree_binding': binding})
+    # The harness MCP reads only a current-version ledger, so the stand-in declares it.
+    write_json(directory / 'run-state.json', {'schema_version': RUN_SCHEMA_VERSION, 'worktree': binding['worktree'],
+                                              'worktree_binding': binding})
     blob = hashlib.sha1(b'blob %d\0' % len(known.encode()) + known.encode()).hexdigest()
     case('git_query_ls_tree', 'mcp__harness__git_query',
          {'argv': ['git', 'ls-tree', '-r', binding['detached_head'], '--', 'known.txt']},

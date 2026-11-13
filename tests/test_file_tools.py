@@ -9,6 +9,7 @@ from unittest.mock import patch
 from harness.file_tools import file_diff, file_sha256, json_check, MAX_DIFF_CHARS
 from harness.mcp_server import handle, TOOLS
 from harness.util import HarnessError
+from harness.versions import RUN_SCHEMA_VERSION
 
 
 class FileToolsTests(unittest.TestCase):
@@ -96,7 +97,7 @@ class FileToolsTests(unittest.TestCase):
 
     def test_calls_are_closed_read_only_and_use_run_worktree(self):
         self.put('a.json', b'{}')
-        run = self.put('run.json', json.dumps({'worktree': str(self.base)}).encode())
+        run = self.put('run.json', json.dumps({'schema_version': RUN_SCHEMA_VERSION, 'worktree': str(self.base)}).encode())
         before = {p.relative_to(self.base): p.read_bytes() for p in self.base.rglob('*') if p.is_file()}
         def call(name, arguments):
             return handle({'method': 'tools/call', 'params': {'name': name, 'arguments': arguments}}, None, None, run)

@@ -6,6 +6,7 @@ from pathlib import Path
 
 from harness.memory import Memory
 from harness.util import HarnessError
+from harness.versions import RUN_SCHEMA_VERSION
 from harness.mcp_server import handle
 
 
@@ -19,7 +20,8 @@ class MemoryScopeTests(unittest.TestCase):
     def ledger(self, run, status):
         path = self.state / 'runs' / run / 'state.json'
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({'id': run, 'status': status, 'accepted': {'task': {}}}))
+        path.write_text(json.dumps({'schema_version': RUN_SCHEMA_VERSION, 'id': run, 'status': status,
+                                    'accepted': {'task': {}}}))
         return path
 
     def remember(self, key, **kwargs):
@@ -82,7 +84,8 @@ class MemoryScopeTests(unittest.TestCase):
     def test_malformed_scope_and_unaccepted_task_are_not_recalled(self):
         self.remember('bad-scope', provenance={'scope': []})
         ledger = self.ledger('run_old', 'paused')
-        ledger.write_text(json.dumps({'id': 'run_old', 'status': 'paused', 'accepted': {}}))
+        ledger.write_text(json.dumps({'schema_version': RUN_SCHEMA_VERSION, 'id': 'run_old', 'status': 'paused',
+                                      'accepted': {}}))
         ident = self.remember('task:run_old:task', kind='accepted_task')
         self.assertEqual(self.memory.search('upgrade', run_id='run_new'), [])
         self.assertEqual(self.memory.read(ident)['source_run_status'], 'invalid')
@@ -100,6 +103,30 @@ class MemoryScopeTests(unittest.TestCase):
             self.assertEqual(read.call_count, 2)
             self.assertEqual(self.memory.search('unmatchedword'), [])
             self.assertEqual(read.call_count, 2)
+
+    def test_task_history_of_another_ledger_version_is_not_recalled_but_knowledge_is(self):
+        path = self.ledger('run_old', 'completed')
+        current = json.loads(path.read_text())
+        task = self.remember('task:run_old:task', kind='accepted_task')
+        knowledge = self.remember('knowledge:fact', kind='project_knowledge',
+                                  provenance={'commit': 'a' * 40, 'run_id': 'run_old', 'task_id': 'task',
+                                              'source_hashes': {}})
+        self.assertEqual({item['id'] for item in self.memory.search('upgrade', run_id='run_new')}, {task, knowledge})
+        for name, value in (('version 17', {**current, 'schema_version': 17}), ('no version', {
+                key: item for key, item in current.items() if key != 'schema_version'}), ('array', []), ('null', None)):
+            with self.subTest(ledger=name):
+                path.write_text(json.dumps(value))
+                # The source ledger's status and accepted records are not read: task history drops out.
+                self.assertEqual([item['id'] for item in self.memory.search('upgrade', run_id='run_new')], [knowledge])
+                self.assertEqual(self.memory.search(key='task:run_old:task', run_id='run_new'), [])
+                read = self.memory.read(task, run_id='run_new')
+                self.assertEqual((read['source_run_status'], read['applicable']), ('unsupported', False))
+                # Project knowledge does not depend on its source run's ledger.
+                read = self.memory.read(knowledge, run_id='run_new')
+                self.assertEqual((read['source_run_status'], read['applicable']), ('unsupported', True))
+                self.assertEqual(self.memory._source_ledger('run_old'), ('unsupported', {}))
+                # Nothing is deleted or rewritten.
+                self.assertEqual({item['id'] for item in self.memory.export()}, {task, knowledge})
 
     def test_unknown_source_run_status_is_invalid(self):
         self.ledger('run_old', 'invented_status')

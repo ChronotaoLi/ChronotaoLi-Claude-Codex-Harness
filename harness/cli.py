@@ -23,7 +23,7 @@ from .operations import RUN_ID, OperationRecord, config_identity, digest_assets,
 from .runtime import Runtime
 from .shared import mcp_configs, toml_value
 from .util import HarnessError, dump, read_json, write_json
-from .versions import require_current_ledger, unsupported_ledger
+from .versions import read_current_ledger, unsupported_ledger
 
 
 def doctor(config):
@@ -82,13 +82,6 @@ def main(argv=None):
     finally:
         for signum, handler in previous.items():
             signal.signal(signum, handler)
-
-
-def read_ledger(path):
-    value = read_json(path)
-    if not isinstance(value, dict):
-        raise HarnessError(f"运行台账必须为对象：{path}")
-    return value
 
 
 def status_work_attempts(run):
@@ -224,8 +217,7 @@ def show_status(args, state):
     if args.run_id:
         if not args.run_id.startswith("run_") or not args.run_id[4:].isalnum():
             raise HarnessError("无效 run ID")
-        ledger = read_ledger(state / "runs" / args.run_id / "state.json")
-        require_current_ledger(ledger)
+        ledger = read_current_ledger(state / "runs" / args.run_id / "state.json")
         print(dump(ledger if args.full else status_summary(ledger)))
         return
     # The read-only observation layer owns the list; stdout fields are unchanged.
@@ -254,8 +246,8 @@ def manage_memory(args, repo, state):
             if not re.fullmatch(r"[A-Za-z0-9_-]+", run_id):
                 raise HarnessError("无效运行 ID")
             source_status, _ = Memory(path, repo=repo, read_only=True)._source_ledger(run_id)
-            if source_status in ("missing", "invalid"):
-                raise HarnessError("记忆来源运行缺失、无效或不属于当前项目")
+            if source_status in ("missing", "invalid", "unsupported"):
+                raise HarnessError("记忆来源运行缺失、无效、不属于当前项目或台账版本不支持")
         git.ignore_state(repo)
     elif not path.exists():
         if args.memory_command == "read":

@@ -166,7 +166,8 @@ class CLIBoundaryTests(RepoCase):
             with self.subTest(value=value):
                 self.assertEqual(code, 1)
                 self.assertEqual(output, "")
-                self.assertIn("运行台账必须为对象", errors)
+                # A non-object is not a current-version ledger: the shared refusal, no field read.
+                self.assertIn("台账版本缺失或无效，不支持（当前版本 18）", errors)
                 self.assertNotIn("Traceback", errors)
                 self.assertEqual(read_json(path), value)
 
@@ -178,7 +179,7 @@ class CLIBoundaryTests(RepoCase):
             with self.subTest(value=value):
                 self.assertEqual(code, 1)
                 self.assertEqual(output, "")
-                self.assertIn("harness:", errors)
+                self.assertIn("不支持（当前版本 18）", errors)
                 self.assertNotIn("Traceback", errors)
                 self.assertEqual(read_json(path), value)
 

@@ -1,5 +1,10 @@
-"""Execution protocol version: one ledger shape, never migrated or interpreted across versions."""
-from .util import HarnessError
+"""Execution protocol version: one ledger shape, never migrated or interpreted across versions.
+
+Every entry that reads a run ledger checks it here before any other field is
+read: a value that is not an object, or an object of another version, is refused
+with the same sentence.
+"""
+from .util import HarnessError, read_json
 
 RUN_SCHEMA_VERSION = 18
 
@@ -18,3 +23,10 @@ def require_current_ledger(run):
     message = unsupported_ledger(run)
     if message is not None:
         raise HarnessError(message)
+
+
+def read_current_ledger(path):
+    """Read a run ledger file; refuse any other version before a field is interpreted."""
+    run = read_json(path)
+    require_current_ledger(run)
+    return run

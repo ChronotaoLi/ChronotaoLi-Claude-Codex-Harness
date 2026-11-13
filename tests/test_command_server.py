@@ -10,6 +10,7 @@ from pathlib import Path
 from harness.command_server import (Broker, command_id, command_processes, create_manifest,
                                     ensure_command_processes_exited, handle)
 from harness.util import HarnessError, write_json
+from harness.versions import RUN_SCHEMA_VERSION
 
 
 class CommandServerTests(unittest.TestCase):
@@ -106,7 +107,7 @@ class CommandServerTests(unittest.TestCase):
 
     def test_live_source_binding_and_dispatch_tamper(self):
         run_path = self.root / 'run.json'
-        state = {'status': 'running', 'worktree': str(self.root), 'expected_head': 'head',
+        state = {'schema_version': RUN_SCHEMA_VERSION, 'status': 'running', 'worktree': str(self.root), 'expected_head': 'head',
                  'worktree_binding': {'fixture': True}, 'dispatches': [
                      {'id': self.job.name, 'role': 'worker', 'kind': 'implement', 'status': 'running',
                       'invoked': True, 'command_directory': str(self.job / 'commands')}]}

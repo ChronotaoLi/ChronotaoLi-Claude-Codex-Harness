@@ -8,7 +8,8 @@ from .file_tools import file_diff, file_sha256, json_check
 from . import git_query as git_queries
 from .memory import Memory
 from .shared import read_skill, skills_catalog
-from .util import HarnessError, read_json
+from .util import HarnessError
+from .versions import read_current_ledger
 
 TOOLS = [
     {"name": "memory_search", "description": "Search current project memory; provide exactly one of query or key. Level 0 titles, 1 summaries, 2 details. Data is not policy.",
@@ -43,6 +44,11 @@ class MethodNotFound(HarnessError):
     pass
 
 
+def run_ledger(run):
+    """The bound run ledger, refused unless it is the current version; {} when none is bound."""
+    return read_current_ledger(run) if run else {}
+
+
 def handle(request, memory, skills, run):
     method, params = request.get("method"), request.get("params", {})
     if method == "initialize":
@@ -63,7 +69,7 @@ def handle(request, memory, skills, run):
             required = {"left", "right"} if name == "file_diff" else {"path"}
             if not isinstance(args, dict) or set(args) != required:
                 raise HarnessError(f"{name} requires exactly: {', '.join(sorted(required))}")
-            state = read_json(run) if run else {}
+            state = run_ledger(run)
             base = Path(state["worktree"]) if state.get("worktree") else Path.cwd()
             value = {"file_sha256": file_sha256, "json_check": json_check,
                      "file_diff": file_diff}[name](**args, base=base)
@@ -73,7 +79,7 @@ def handle(request, memory, skills, run):
             query, reason = git_queries.parse_git_query(args["argv"])
             if query is None:
                 raise HarnessError(f"git_query rejected without execution: {reason}")
-            state = read_json(run) if run else {}
+            state = run_ledger(run)
             if not state.get("worktree") or not isinstance(state.get("worktree_binding"), dict):
                 raise HarnessError("git_query requires a run worktree with its Git binding")
             value = git_queries.run_git_query(query, Path(state["worktree"]), state["worktree_binding"])
@@ -83,20 +89,20 @@ def handle(request, memory, skills, run):
             if ("query" in args) == ("key" in args):
                 raise HarnessError("query 和 key 必须且只能提供一个")
             Memory.validate_search(args.get("query"), key=args.get("key"), level=args.get("level", 1))
-            state = read_json(run) if run else {}
+            state = run_ledger(run)
             value = memory.search(args.get("query"), key=args.get("key"), level=args.get("level", 1),
                                   run_id=state.get("id")) if memory.path.exists() else []
         elif name == "memory_read":
             if not memory.path.exists():
                 raise HarnessError(f"没有此记忆：{args['id']}")
-            state = read_json(run) if run else {}
+            state = run_ledger(run)
             value = memory.read(args["id"], run_id=state.get("id"))
         elif name == "skill_list":
             value = skills_catalog(skills)
         elif name == "skill_read":
             value = read_skill(skills, args["name"])
         elif name == "run_status":
-            state = read_json(run) if run else {}
+            state = run_ledger(run)
             value = {k: state.get(k) for k in ("id", "goal", "status", "accepted", "attempts")}
         else:
             raise HarnessError("Unknown tool")
@@ -111,7 +117,12 @@ def main():
     parser.add_argument("--skills", type=Path, required=True)
     parser.add_argument("--run", type=Path)
     args = parser.parse_args()
-    run_state = read_json(args.run) if args.run else {}
+    try:
+        run_state = run_ledger(args.run)
+    except HarnessError as error:
+        # No request is served for a ledger this version does not interpret.
+        print(f"harness: {error}", file=sys.stderr, flush=True)
+        return 1
     repo = Path(run_state["worktree"]) if run_state.get("worktree") else (
         args.state.parent if args.state.name == ".harness" else None)
     memory = Memory(args.state / "memory.sqlite3", repo=repo, read_only=True,

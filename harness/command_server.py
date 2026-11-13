@@ -25,6 +25,7 @@ from pathlib import Path
 from .process_runtime import defer_cleanup_signals
 from . import git
 from .util import HarnessError, ProcessStartError, ProcessTimeout, group_alive, lock, read_json, run_process, tail, write_json
+from .versions import read_current_ledger
 
 
 # Journal identity of delete_path records. Configured commands use 64-hex IDs.
@@ -94,6 +95,9 @@ def create_manifest(config, cwd, job, run_path=None, *, parent_deadline=None, de
     """
     data = config.data if hasattr(config, "data") else config
     cwd, job = _safe(Path(cwd).resolve()), _safe(job)
+    # The ledger's version is checked before anything is created or written.
+    run_path = _safe(run_path).resolve() if run_path is not None else None
+    state = read_current_ledger(run_path) if run_path else {}
     job.mkdir(parents=True, exist_ok=True)
     _safe(job / "commands").mkdir(exist_ok=True)
     commands = {}
@@ -106,8 +110,6 @@ def create_manifest(config, cwd, job, run_path=None, *, parent_deadline=None, de
         raise HarnessError("Command timeout must be finite and positive")
     if parent_deadline is None:
         parent_deadline = time.monotonic() + data["runtime"].get("agent_timeout_seconds", timeout + 5)
-    run_path = _safe(run_path).resolve() if run_path is not None else None
-    state = read_json(run_path) if run_path else {}
     if run_path is not None:
         if delete_scope is not None:
             raise HarnessError("A run-bound worker takes its delete scope from the run ledger")
@@ -215,7 +217,7 @@ class Broker:
         m = self.manifest
         if m["run_path"] is None:
             return
-        state = read_json(_safe(m["run_path"]))
+        state = read_current_ledger(_safe(m["run_path"]))
         entries = [d for d in state.get("dispatches", []) if d.get("id") == m["dispatch_id"]]
         if (state.get("status") != "running" or len(entries) != 1
                 or state.get("dispatches", [])[-1].get("id") != m["dispatch_id"]
@@ -408,7 +410,7 @@ class Broker:
             raise HarnessError("delete_path is unavailable: this dispatch has no current task scope")
         if m["run_path"] is not None:
             # _load already proved the dispatch live; its task scope must still match.
-            state = read_json(_safe(m["run_path"]))
+            state = read_current_ledger(_safe(m["run_path"]))
             if _ledger_delete_scope(state, m["dispatch_id"]) != {k: scope[k] for k in ("task_id", "allowed_paths")}:
                 raise HarnessError("delete_path task scope no longer matches the run ledger")
         return scope

@@ -14,6 +14,7 @@ import json
 from pathlib import Path
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -23,13 +24,16 @@ import uuid
 from harness import cli, git, observe
 from harness.cleanup import cleanup_run
 from harness.cli import status_summary
+from harness.command_server import Broker, create_manifest
+from harness.mcp_server import handle
+from harness.memory import Memory
 from harness.recovery import snapshot_digest
 from harness.util import HarnessError, ProcessTimeout, read_json, write_json
 from harness.versions import RUN_SCHEMA_VERSION
 from harness.watch_cli import watch_run
 from harness.workspace_inputs import prepare_run
 from harness.worker_returns import SOURCES
-from test_dashboard import DashboardCase
+from test_dashboard import DashboardCase, tree_snapshot
 from test_harness import ROOT, RepoCase
 from test_runtime_changes import ScriptedBackend
 
@@ -250,37 +254,66 @@ class CurrentLedgerTests(RepoCase):
         self.assertEqual(self.path.read_bytes(), self.before)
 
 
+# Whole-ledger shapes that are not an object, and a ledger whose version key is absent.
+MISSING, ARRAY, NULL = 'missing', 'array', 'null'
+
+
+def refusal(version):
+    if type(version) is int:
+        return f'台账版本 {version} 不支持（当前版本 {RUN_SCHEMA_VERSION}）'
+    return f'台账版本缺失或无效，不支持（当前版本 {RUN_SCHEMA_VERSION}）'
+
+
+def ledger_bytes(current, version, **fields):
+    """The current ledger saved under another version, or replaced by a non-object."""
+    if version in (ARRAY, NULL):
+        return json.dumps([] if version == ARRAY else None).encode()
+    run = json.loads(current)
+    if version == MISSING:
+        run.pop('schema_version')
+    else:
+        run['schema_version'] = version
+    run.update(fields)
+    return json.dumps(run).encode()
+
+
 class UnsupportedLedgerTests(DashboardCase):
-    VERSIONS = (17, 19, 1, '18', None)
+    # Object ledgers of other versions (including a string and a boolean), then non-objects.
+    VERSIONS = (17, 19, 1, '18', True, MISSING, ARRAY, NULL)
 
     def setUp(self):
         super().setUp()
+        # An ignored destination and a declared source make the input manifest landable.
+        (self.repo / '.gitignore').write_text('__pycache__/\nvendor/\n')
+        git.git(self.repo, 'add', '.gitignore')
+        git.git(self.repo, '-c', 'user.name=Test', '-c', 'user.email=test@localhost', '-c', 'commit.gpgsign=false',
+                'commit', '-m', 'ignore vendor')
+        source = self.repo / 'deps' / 'input.dat'
+        source.parent.mkdir()
+        source.write_bytes(b'dependency bytes\n')
+        source.chmod(0o644)
         self.backend = ScriptedBackend()
         self.runtime = self.engine(self.backend)
         run = self.runtime.start('Implement greet', read_json(ROOT / 'examples/plan.json'), pause_after_plan=True)
         self.ident, self.path = run['id'], self.runtime.directory / 'state.json'
         self.current = self.path.read_bytes()
+        self.runs = self.repo / '.harness' / 'runs'
         folder = tempfile.TemporaryDirectory()
         self.addCleanup(folder.cleanup)
-        self.manifest = Path(folder.name) / 'inputs.json'
+        self.manifest = Path(folder.name).resolve() / 'inputs.json'
         write_json(self.manifest, {'schema_version': 1, 'run_id': self.ident, 'head': run['expected_head'],
-                                   'source_root': '.', 'max_files': 1, 'max_bytes': 1, 'files': []})
+                                   'source_root': '.', 'max_files': 1, 'max_bytes': 1024,
+                                   'files': [{'source': 'deps/input.dat', 'destination': 'vendor/input.dat',
+                                              'sha256': sha(source), 'mode': 0o644, 'type': 'file',
+                                              'ownership': 'input_copy'}]})
 
     def save(self, version, **fields):
-        run = json.loads(self.current)
-        if version is None:
-            run.pop('schema_version')
-        else:
-            run['schema_version'] = version
-        run.update(fields)
-        write_json(self.path, run)
+        self.path.write_bytes(ledger_bytes(self.current, version, **fields))
         return self.path.read_bytes()
 
-    @staticmethod
-    def refusal(version):
-        if type(version) is int:
-            return f'台账版本 {version} 不支持（当前版本 {RUN_SCHEMA_VERSION}）'
-        return f'台账版本缺失或无效，不支持（当前版本 {RUN_SCHEMA_VERSION}）'
+    def tree(self):
+        """Every run directory and the worktree: ledgers, locks, receipts and files."""
+        return tree_snapshot(self.runs), tree_snapshot(self.runtime.worktree)
 
     def cli(self, *argv):
         output, errors = io.StringIO(), io.StringIO()
@@ -290,23 +323,27 @@ class UnsupportedLedgerTests(DashboardCase):
             code = cli.main(['--config', str(ROOT / 'harness.toml'), '--repo', str(self.repo), *argv])
         return code, output.getvalue(), errors.getvalue()
 
+    def entries(self):
+        state = self.repo / '.harness'
+        return ((lambda: self.engine(self.backend).resume(self.ident)),
+                (lambda: self.engine(self.backend).resume(self.ident, approve_plan=True)),
+                (lambda: self.engine(self.backend).resume(self.ident, reverify=True)),
+                (lambda: self.engine(self.backend).abandon(self.ident)),
+                (lambda: prepare_run(self.repo, self.ident, self.manifest)),
+                (lambda: cleanup_run(self.repo, self.ident)),
+                (lambda: cleanup_run(self.repo, self.ident, remove=True)),
+                (lambda: watch_run(state, self.ident, stdout=io.StringIO())))
+
     def test_every_entry_refuses_another_version_before_changing_anything(self):
         state = self.repo / '.harness'
         for version in self.VERSIONS:
             with self.subTest(version=version):
                 # Terminal or not, nothing is resumed, abandoned, prepared or cleaned.
                 for status in ('paused', 'completed'):
-                    before = self.save(version, status=status)
-                    pattern = re.escape(self.refusal(version))
-                    calls = (lambda: self.engine(self.backend).resume(self.ident),
-                             lambda: self.engine(self.backend).resume(self.ident, approve_plan=True),
-                             lambda: self.engine(self.backend).resume(self.ident, reverify=True),
-                             lambda: self.engine(self.backend).abandon(self.ident),
-                             lambda: prepare_run(self.repo, self.ident, self.manifest),
-                             lambda: cleanup_run(self.repo, self.ident),
-                             lambda: cleanup_run(self.repo, self.ident, remove=True),
-                             lambda: watch_run(state, self.ident, stdout=io.StringIO()))
-                    for call in calls:
+                    self.save(version, status=status)
+                    before = self.tree()
+                    pattern = re.escape(refusal(version))
+                    for call in self.entries():
                         with self.assertRaisesRegex(HarnessError, pattern):
                             call()
                     with self.assertRaisesRegex(observe.Unsupported, pattern):
@@ -318,15 +355,38 @@ class UnsupportedLedgerTests(DashboardCase):
                                  ('prepare-run', self.ident, '--manifest', str(self.manifest))):
                         code, output, errors = self.cli(*argv)
                         self.assertEqual((code, output), (1, ''), argv)
-                        self.assertIn(self.refusal(version), errors)
-                    self.assertEqual(self.path.read_bytes(), before)
-                    self.assertTrue(self.runtime.worktree.exists())
+                        self.assertIn(refusal(version), errors)
+                    # No ledger, lock, receipt, input copy or worktree file was written or removed.
+                    self.assertEqual(self.tree(), before)
         self.assertEqual(self.backend.calls, [])
-        self.assertFalse((self.runtime.directory / 'worktree-cleanup.json').exists())
-        # The current version is still accepted by the same entries.
+        # The same entries accept the current version, and the input manifest does land.
         self.path.write_bytes(self.current)
         self.assertEqual(self.cli('status', self.ident)[0], 0)
         self.assertEqual(observe.run_detail(state, self.ident)['schema_version'], RUN_SCHEMA_VERSION)
+        self.assertEqual(prepare_run(self.repo, self.ident, self.manifest)['status'], 'prepared')
+        self.assertEqual((self.runtime.worktree / 'vendor' / 'input.dat').read_bytes(), b'dependency bytes\n')
+
+    def test_damaged_identity_of_another_version_gets_the_same_refusal_and_creates_nothing(self):
+        for identity in ([], 'run_unexpected', {'id': 'nested'}):
+            with self.subTest(identity=identity):
+                self.save(17, id=identity)
+                before = self.tree()
+                for call in self.entries():
+                    with self.assertRaisesRegex(HarnessError, re.escape(refusal(17))):
+                        call()
+                self.assertFalse((self.runs / 'run_unexpected').exists())
+                self.assertEqual(self.tree(), before)
+        # A current-version ledger naming another run is refused before the store
+        # locks the directory that name points to.
+        self.save(RUN_SCHEMA_VERSION, id='run_unexpected')
+        before = self.tree()
+        for call in (lambda: self.engine(self.backend).resume(self.ident),
+                     lambda: self.engine(self.backend).abandon(self.ident)):
+            with self.assertRaisesRegex(HarnessError, '运行台账字段缺失或类型无效'):
+                call()
+        self.assertFalse((self.runs / 'run_unexpected').exists())
+        self.assertEqual(self.tree(), before)
+        self.assertEqual(self.backend.calls, [])
 
     def test_run_list_names_other_versions_by_path_and_version_only(self):
         current = self.engine(self.backend).start('Implement greet', read_json(ROOT / 'examples/plan.json'),
@@ -334,12 +394,14 @@ class UnsupportedLedgerTests(DashboardCase):
         # Fields an old ledger might hold in any shape are never read.
         self.save(17, status={'not': 'a status'}, goal=['unreadable'], tasks='damaged', dispatches='damaged',
                   accepted='damaged', attempts=None)
-        runs = self.repo / '.harness' / 'runs'
-        write_json(runs / 'run_noversion' / 'state.json', {'id': 'run_noversion', 'status': 'running'})
-        (runs / 'run_damaged').mkdir()
-        (runs / 'run_damaged' / 'state.json').write_text('{not json', encoding='utf-8')
-        expected = sorted([{'path': f'runs/{self.ident}', 'schema_version': 17, 'reason': self.refusal(17)},
-                           {'path': 'runs/run_noversion', 'schema_version': None, 'reason': self.refusal(None)}],
+        write_json(self.runs / 'run_noversion' / 'state.json', {'id': 'run_noversion', 'status': 'running'})
+        write_json(self.runs / 'run_array' / 'state.json', [])
+        write_json(self.runs / 'run_null' / 'state.json', None)
+        (self.runs / 'run_damaged').mkdir()
+        (self.runs / 'run_damaged' / 'state.json').write_text('{not json', encoding='utf-8')
+        expected = sorted([{'path': f'runs/{self.ident}', 'schema_version': 17, 'reason': refusal(17)}]
+                          + [{'path': f'runs/{name}', 'schema_version': None, 'reason': refusal(None)}
+                             for name in ('run_noversion', 'run_array', 'run_null')],
                           key=lambda item: item['path'])
 
         listing = observe.list_runs(self.repo / '.harness')
@@ -358,11 +420,122 @@ class UnsupportedLedgerTests(DashboardCase):
         status, _, body = self.request(server, '/api/runs')
         self.assertEqual(status, 200)
         self.assertEqual(sorted(json.loads(body)['unsupported'], key=lambda item: item['path']), expected)
-        status, _, body = self.request(server, f'/api/runs/{self.ident}')
-        self.assertEqual((status, json.loads(body)['error']), (409, self.refusal(17)))
+        for run_id, version in ((self.ident, 17), ('run_array', None), ('run_null', None)):
+            status, _, body = self.request(server, f'/api/runs/{run_id}')
+            self.assertEqual((status, json.loads(body)['error']), (409, refusal(version)), run_id)
         status, _, body = self.request(server, f"/api/runs/{current['id']}")
         self.assertEqual((status, json.loads(body)['schema_version']), (200, RUN_SCHEMA_VERSION))
+        status, _, body = self.request(server, '/api/runs/run_damaged')
+        self.assertEqual(status, 200)
+        self.assertIn('无法解析', json.loads(body)['ledger_error'])
 
+
+class UnsupportedLedgerBrokerTests(RepoCase):
+    """The command broker reads the ledger on its own; it refuses another version too."""
+
+    def test_manifest_and_deletion_refuse_another_version_before_any_effect(self):
+        (self.repo / 'obsolete.txt').write_text('old\n')
+        git.git(self.repo, 'add', 'obsolete.txt')
+        git.git(self.repo, '-c', 'user.name=Test', '-c', 'user.email=test@localhost', '-c', 'commit.gpgsign=false',
+                'commit', '-m', 'deletable fixture')
+        plan = read_json(ROOT / 'examples/plan.json')
+        plan['tasks'][0]['allowed_paths'].append('obsolete.txt')
+        seen = {}
+
+        def during_worker(backend, kwargs, packet, result):
+            if kwargs['role'] != 'worker' or seen:
+                return
+            path, job, target = engine.directory / 'state.json', kwargs['job'], kwargs['cwd'] / 'obsolete.txt'
+            current = path.read_bytes()
+            old = ledger_bytes(current, 17)
+            try:
+                # 1. No manifest, command directory or record is created for another version.
+                fresh = job.parent / (job.name + '-fresh')
+                path.write_bytes(old)
+                seen['manifest'] = outcome(lambda: create_manifest(self.config, kwargs['cwd'], fresh, path))
+                seen['manifest_created'] = fresh.exists()
+                # 2. A broker bound while the ledger was current stops at its live-source check ...
+                path.write_bytes(current)
+                metadata = create_manifest(self.config, kwargs['cwd'], job, path)
+                broker = Broker(metadata['artifact'], metadata['artifact_digest'])
+                path.write_bytes(old)
+                seen['source_delete'] = outcome(lambda: broker.delete_path({'path': 'obsolete.txt'}))
+                seen['source_command'] = outcome(lambda: broker.list_commands())
+                # 3. ... and at the task-scope check when the ledger changes after the source check.
+                path.write_bytes(current)
+                load = Broker._load
+
+                def load_then_replace(self_):
+                    loaded = load(self_)
+                    path.write_bytes(old)
+                    return loaded
+                with patch.object(Broker, '_load', load_then_replace):
+                    seen['scope_delete'] = outcome(lambda: broker.delete_path({'path': 'obsolete.txt'}))
+                seen['file_kept'] = target.is_file() and target.read_text() == 'old\n'
+                seen['records'] = sorted(item.name for item in (job / 'commands').iterdir())
+            finally:
+                path.write_bytes(current)
+        engine = self.engine(ScriptedBackend(during_worker))
+        run = engine.start('Implement greet', plan)
+        self.assertEqual(run['status'], 'completed')
+        for key in ('manifest', 'source_delete', 'source_command', 'scope_delete'):
+            self.assertEqual(seen[key], refusal(17), key)
+        self.assertFalse(seen['manifest_created'])
+        self.assertTrue(seen['file_kept'])
+        self.assertEqual(seen['records'], [])  # No call was published, so none was recorded.
+
+
+def outcome(call):
+    try:
+        call()
+    except HarnessError as error:
+        return str(error)
+    return 'accepted'
+
+
+class UnsupportedLedgerMcpTests(unittest.TestCase):
+    """The read-only MCP server reads the bound ledger for its own tools."""
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        self.state = self.root / '.harness'
+        self.run = self.state / 'runs' / 'run_old' / 'state.json'
+        (self.root / 'file.txt').write_text('content\n')
+        self.memory = Memory(self.state / 'memory.sqlite3')
+        self.memory.remember(key='fact', abstract='fact', overview='fact', detail='fact', source='operator')
+
+    def test_each_ledger_reading_tool_refuses_another_version(self):
+        calls = {'run_status': {}, 'file_sha256': {'path': 'file.txt'}, 'json_check': {'path': 'file.txt'},
+                 'file_diff': {'left': 'file.txt', 'right': 'file.txt'},
+                 'git_query': {'argv': ['git', 'ls-files', '--', 'file.txt']},
+                 'memory_search': {'query': 'fact'}, 'memory_read': {'id': self.memory.export()[0]['id']}}
+        for version in (17, MISSING, ARRAY):
+            write_json(self.run, json.loads(ledger_bytes(json.dumps(
+                {'schema_version': RUN_SCHEMA_VERSION, 'id': 'run_old', 'goal': {'interpreted': True},
+                 'worktree': str(self.root), 'worktree_binding': {}}).encode(), version)))
+            for name, arguments in calls.items():
+                with self.subTest(version=version, tool=name):
+                    request = {'method': 'tools/call', 'params': {'name': name, 'arguments': arguments}}
+                    result = handle(request, self.memory, None, self.run)
+                    self.assertEqual((result['isError'], result['content'][0]['text']), (True, refusal(
+                        17 if version == 17 else None)))
+        # The same tools answer for the current version.
+        write_json(self.run, {'schema_version': RUN_SCHEMA_VERSION, 'id': 'run_old', 'goal': 'g',
+                              'worktree': str(self.root)})
+        request = {'method': 'tools/call', 'params': {'name': 'run_status', 'arguments': {}}}
+        self.assertFalse(handle(request, self.memory, None, self.run)['isError'])
+
+    def test_server_does_not_start_on_another_version(self):
+        write_json(self.run, {'schema_version': 17, 'id': 'run_old', 'worktree': str(self.root)})
+        request = json.dumps({'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call',
+                              'params': {'name': 'run_status', 'arguments': {}}}) + '\n'
+        result = subprocess.run([sys.executable, str(ROOT / 'harness' / 'mcp_entry.py'), '--state', str(self.state),
+                                 '--skills', str(ROOT / 'shared' / 'skills'), '--run', str(self.run)],
+                                input=request, capture_output=True, text=True, timeout=60)
+        self.assertEqual((result.returncode, result.stdout), (1, ''))
+        self.assertIn(refusal(17), result.stderr)
 
 if __name__ == '__main__':
     unittest.main()

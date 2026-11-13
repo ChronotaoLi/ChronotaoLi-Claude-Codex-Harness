@@ -9,6 +9,7 @@ from pathlib import Path
 from harness import git
 from harness.cli import main
 from harness.memory import Memory
+from harness.versions import RUN_SCHEMA_VERSION
 
 
 class MemoryCLIReadTests(unittest.TestCase):
@@ -100,7 +101,8 @@ class MemoryCLIReadTests(unittest.TestCase):
     def test_add_run_binding_and_search_run_option(self):
         ledger = self.state / "runs" / "run_current" / "state.json"
         ledger.parent.mkdir(parents=True)
-        ledger.write_text(json.dumps({"id": "run_current", "status": "paused", "repo": str(self.repo.resolve())}))
+        ledger.write_text(json.dumps({"schema_version": RUN_SCHEMA_VERSION, "id": "run_current", "status": "paused",
+                                      "repo": str(self.repo.resolve())}))
         code, output, errors = self.invoke("add", "--key", "decision", "--title", "Upgrade",
                                            "--text", "SQLite reference", "--run", "run_current")
         self.assertEqual(code, 0, errors)
@@ -115,8 +117,11 @@ class MemoryCLIReadTests(unittest.TestCase):
         ledger = self.state / "runs" / "run_current" / "state.json"
         ledger.parent.mkdir(parents=True)
         original_exclude = self.exclude.read_bytes()
-        for value in ([], {"id": "run_current", "status": "paused", "repo": "/another/repo"},
-                      {"id": "run_current", "status": "unknown", "repo": str(self.repo.resolve())}):
+        current = {"schema_version": RUN_SCHEMA_VERSION, "id": "run_current", "status": "paused",
+                   "repo": str(self.repo.resolve())}
+        for value in ([], {**current, "repo": "/another/repo"}, {**current, "status": "unknown"},
+                      # Another ledger version is not interpreted, however valid its fields look.
+                      {**current, "schema_version": 17}, {key: current[key] for key in ("id", "status", "repo")}):
             ledger.write_text(json.dumps(value))
             with self.subTest(value=value):
                 code, output, errors = self.invoke("add", "--key", "decision", "--title", "Upgrade",
@@ -130,7 +135,8 @@ class MemoryCLIReadTests(unittest.TestCase):
     def test_run_note_cannot_hide_same_key_project_fact(self):
         ledger = self.state / "runs" / "run_current" / "state.json"
         ledger.parent.mkdir(parents=True)
-        ledger.write_text(json.dumps({"id": "run_current", "status": "paused", "repo": str(self.repo.resolve())}))
+        ledger.write_text(json.dumps({"schema_version": RUN_SCHEMA_VERSION, "id": "run_current", "status": "paused",
+                                      "repo": str(self.repo.resolve())}))
         arguments = ("add", "--key", "storage", "--title", "Storage", "--text", "SQLite project fact")
         code, output, errors = self.invoke(*arguments)
         self.assertEqual(code, 0, errors)

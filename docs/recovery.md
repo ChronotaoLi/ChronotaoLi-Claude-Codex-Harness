@@ -225,7 +225,7 @@ python3 -m harness --config /path/to/harness.toml --repo /path/to/project resume
 
 `completed` run 的普通 `resume` 返回保存结果，不派发；修改选项被拒绝。
 
-只支持台账版本 18。其他版本（含缺失或非整数的版本）的台账不迁移、不补默认值、不解释字段：`resume`、`abandon`、`prepare-run`、`cleanup-run`、`status RUN`（含 `--full`）、`watch`、`permission-diagnostics` 与观察网页的 run 详情都拒绝，错误写明该 run 的台账版本与当前版本（`台账版本 N 不支持（当前版本 18）`），退出码 1，台账、工作树与检出都不改动。运行列表（不带 run 的 `status`、观察网页的列表）对这些目录只给出路径、版本和“不支持”；损坏或旧版本的目录不影响其他 run 的列出。原始 JSON 用文件工具查看。
+只支持台账版本 18。其他版本（含缺失或非整数的版本）的台账不迁移、不补默认值、不解释字段：`resume`、`abandon`、`prepare-run`、`cleanup-run`、`status RUN`（含 `--full`）、`watch`、`permission-diagnostics` 与观察网页的 run 详情都拒绝，worker 的命令 broker 与只读 MCP 读到这样的台账也拒绝，错误写明该 run 的台账版本与当前版本（`台账版本 N 不支持（当前版本 18）`；不是对象或缺版本时为“台账版本缺失或无效”），退出码 1，台账、工作树与检出都不改动。运行列表（不带 run 的 `status`、观察网页的列表）对这些目录只给出路径、版本和“不支持”；损坏或旧版本的目录不影响其他 run 的列出。原始 JSON 用文件工具查看。
 
 旧版本 run 的工作树与验证检出不由当前版本清理：用对应版本的 Harness 清理，或人工核对后执行 `git worktree remove`。升级前应完成或放弃进行中的旧 run。
 

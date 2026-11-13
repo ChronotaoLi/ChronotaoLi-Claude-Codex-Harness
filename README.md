@@ -158,7 +158,7 @@ python3 -m harness --repo /path/to/project cleanup-run RUN --remove
 | `max_attempts` | 每个任务的 worker 工作尝试；已完整校验的 environment／operator 阻断不计入 |
 | `max_agent_dispatches` | 整个 run 的模型调用次数，包括指挥、worker、任务审阅、整体审阅和无效输出的重做 |
 
-没有全 run 的 worker 尝试上限，计划任务数、修订次数和整体尝试次数也没有单独的上限：修订新增的任务各有自己的 `max_attempts`（默认 5），全局由 `max_agent_dispatches` 封顶；计划大小由整体审阅的必要上下文约束。模型调用数远多于任务数，例如一次 7 个任务的 run 用了 52 次模型调用。因派发上限停止时，停止信息和 `status RUN` 的 `remaining_model_calls` 给出“如果之后全部一次通过，至少还需 N 次模型调用”；N 是下界，不含指挥决定、返工和重做。`status RUN` 的 `budgets` 另给出 `work_attempts`（扣除豁免后的任务尝试）和 `attempts_total`（各任务 worker 调用之和）。`runtime.max_total_attempts` 已删除；配置中出现它会报未知配置键，并说明改用 `max_attempts` 与 `max_agent_dispatches`。
+没有全 run 的 worker 尝试上限，计划任务数、修订次数和整体尝试次数也没有单独的上限：修订新增的任务各有自己的 `max_attempts`（默认 5），全局由 `max_agent_dispatches` 封顶；计划大小由整体审阅的必要上下文约束。模型调用数远多于任务数，例如一次 7 个任务的 run 用了 52 次模型调用。因派发上限停止时，停止信息和 `status RUN` 的 `remaining_model_calls` 给出“如果之后全部一次通过，至少还需 N 次模型调用”；N 是下界，不含指挥决定、返工和重做。`status RUN` 的 `budgets` 另给出 `work_attempts`（扣除豁免后的任务尝试）和 `attempts_total`（各任务 worker 调用之和）。
 
 `watch RUN` 用 macOS kqueue 或 Linux inotify 等待文件变化，只在观察结果改变时输出简短 JSONL；等待超时不重读台账。默认到阻塞、暂停、等待批准或终态后退出，`--follow` 可继续等待后续恢复。`watch RUN --state /path/to/.harness` 可以直接观察保留下来的运行证据，不要求该目录仍是 Git 工作树。不支持原生通知的平台会明确报错。观察值来自台账，不证明模型进程仍在工作。
 
@@ -259,7 +259,7 @@ python3 -m harness --repo /path/to/project memory export > memory-backup.json
 
 查询返回 `source_status`：`unbound` 未绑定、`matching` 声明来源匹配、`changed` 已变化、`unavailable` 不可用、`not_checked` 未完成核验、`invalid` 来源格式无效。原 `possibly_stale` 和原因列表保留；匹配不证明内容正确或来源已合入当前分支。较早 run 工作树核对主检出后来绑定的文件时，出现 changed/unavailable 是正常结果。
 
-自动任务历史与知识默认 TTL 为 180 天，可通过 `[memory]` 的 `task_ttl_days`／`knowledge_ttl_days` 调整，0 表示不过期；操作者事实默认不过期。检索先排列优先参考，再排列来源变化、不可用、非法或原因未知的需复核记录，组内保留相关性、时间、类型和原有过时降权。未绑定／未核验记录不额外降组，放弃或来源无效的任务历史不自动召回。默认六条仍不能保证某条声明必然进入上下文；必要要求应写入任务验收。没有 embedding 或自动语义冲突合并。
+自动任务历史与知识默认 TTL 为 180 天，可通过 `[memory]` 的 `task_ttl_days`／`knowledge_ttl_days` 调整，0 表示不过期；操作者事实默认不过期。检索先排列优先参考，再排列来源变化、不可用、非法或原因未知的需复核记录，组内保留相关性、时间、类型和原有过时降权。未绑定／未核验记录不额外降组，放弃或来源无效的任务历史不自动召回；来源 run 的台账不是当前版本（`source_run_status` 为 `unsupported`）时，它的任务历史也不再召回，记录本身不删除，获批知识与操作者事实不受影响。默认六条仍不能保证某条声明必然进入上下文；必要要求应写入任务验收。没有 embedding 或自动语义冲突合并。
 
 上下文采用结构化检查点、有界检索和原始证据引用，在任务边界写 `handoff.json`；每次指挥调用重新构建输入。worker 结果的 `summary` 最多 32,000 字符，blocker、evidence、finding 等其余自由文本字段仍为 4,000；后续输入只带截取的摘录和全文的路径与 SHA256。环境阻断的停止信息只带 blocker 与 summary 合计至多 2,000 字符的摘录，并给出原 worker 结果的路径与 SHA256。默认 `context_chars = 100000` 是编排输入字符上限，不是 token 数；必要约束超限就停止，可选记忆按整条移除。CLI 内部上下文不在该预算内。
 

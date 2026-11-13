@@ -9,6 +9,7 @@ from pathlib import Path
 from harness import git
 from harness.memory import Memory, validate_proposals
 from harness.util import HarnessError
+from harness.versions import RUN_SCHEMA_VERSION
 
 
 class KnowledgeMemoryTests(unittest.TestCase):
@@ -171,7 +172,7 @@ class KnowledgeMemoryTests(unittest.TestCase):
         ident = self.promote()[0]
         directory = self.memory.path.parent / "runs" / "run_test"
         directory.mkdir(parents=True)
-        (directory / "state.json").write_text(json.dumps({"id": "run_test", "status": "abandoned"}))
+        (directory / "state.json").write_text(json.dumps({"schema_version": RUN_SCHEMA_VERSION, "id": "run_test", "status": "abandoned"}))
         record = self.memory.search("SQLite", run_id="run_new")[0]
         self.assertEqual(record["id"], ident)
         self.assertEqual(record["scope"], "project")
@@ -181,7 +182,8 @@ class KnowledgeMemoryTests(unittest.TestCase):
     def test_kind_weight_prefers_project_knowledge_over_matching_task_history(self):
         directory = self.memory.path.parent / "runs" / "run"
         directory.mkdir(parents=True)
-        (directory / "state.json").write_text(json.dumps({"id": "run", "status": "completed", "accepted": {"task": {"commit": self.commit}}}))
+        (directory / "state.json").write_text(json.dumps({"schema_version": RUN_SCHEMA_VERSION, "id": "run", "status": "completed",
+                                                         "accepted": {"task": {"commit": self.commit}}}))
         self.memory.remember(key="task:run:task", abstract=self.proposal["abstract"],
                     overview=self.proposal["content"], detail=self.proposal["content"], source="run", kind="accepted_task")
         self.promote()
@@ -192,7 +194,8 @@ class KnowledgeMemoryTests(unittest.TestCase):
     def test_stale_high_weight_record_cannot_hide_fresh_record_at_limit_one(self):
         directory = self.memory.path.parent / "runs" / "run"
         directory.mkdir(parents=True)
-        (directory / "state.json").write_text(json.dumps({"id": "run", "status": "completed", "accepted": {"task": {"commit": self.commit}}}))
+        (directory / "state.json").write_text(json.dumps({"schema_version": RUN_SCHEMA_VERSION, "id": "run", "status": "completed",
+                                                         "accepted": {"task": {"commit": self.commit}}}))
         self.promote()
         fresh = self.memory.remember(key="task:run:task", abstract=self.proposal["abstract"],
                     overview=self.proposal["content"], detail=self.proposal["content"], source="run", kind="accepted_task",
