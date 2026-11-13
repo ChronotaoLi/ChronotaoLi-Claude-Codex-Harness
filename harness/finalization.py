@@ -50,10 +50,13 @@ class FinalAcceptance(RuntimeService):
         artifact = Path(rounds[-1]["artifact_dir"]) / "checkout.json"
         receipt = artifact.with_name("cleanup.json")
         try:
-            if receipt.is_file() and not receipt.is_symlink() and read_json(receipt).get("status") == "removed":
-                return
+            previous = read_json(receipt) if receipt.is_file() and not receipt.is_symlink() else None
         except (OSError, ValueError):
-            pass  # clean_checkout validates the receipt and reports what is wrong with it.
+            previous = None
+        # Anything but a completed receipt goes to clean_checkout, which validates it
+        # and reports what is wrong with it as a reclamation failure.
+        if isinstance(previous, dict) and previous.get("status") == "removed":
+            return
         self.context.store.check_current()
         self.context.ensure_exited()
         try:

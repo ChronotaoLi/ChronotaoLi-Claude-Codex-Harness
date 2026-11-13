@@ -244,33 +244,59 @@ class ReclamationTests(RepoCase):
                                  "pending" if remove_fails else "removed")
                 self.assertEqual(Path(read_json(artifact)["worktree"]).exists(), remove_fails)
 
+    def test_malformed_cleanup_receipt_is_a_reclamation_failure_not_a_stop(self):
+        for content in ("[]", "null", '"removed"', "{not json"):
+            with self.subTest(content=content):
+                backend = ScriptedBackend()
+                engine = self.stop_at_verdict(backend)
+                artifact, = self.artifacts(engine)
+                checkout = Path(read_json(artifact)["worktree"])
+                receipt = artifact.with_name("cleanup.json")
+                receipt.write_text(content)
+                before = len(self.final_checks(read_json(engine.directory / "state.json")))
+                result = self.engine(backend).resume(engine.run["id"])
+                # The damaged receipt keeps the checkout; the verdict and the review are untouched.
+                self.assertEqual(result["status"], "completed")
+                self.assertEqual(len(self.final_checks(result)), before)
+                self.assertEqual(len(result["final_history"][-1]["verification_rounds"]), 1)
+                self.assertEqual(sum(c["kind"] == "final_review" for c in backend.calls), 1)
+                self.assertTrue(checkout.is_dir())
+                self.assertEqual(receipt.read_text(), content)
+                failed = [e for e in events(engine) if e["event"] == "verification_checkout_reclaim_failed"]
+                self.assertEqual(len(failed), 1)
+
     def test_authority_or_exit_failure_stops_instead_of_skipping_reclamation(self):
         from harness.finalization import FinalAcceptance
-        backend = ScriptedBackend()
-        engine = self.engine(backend)
-        state = {"inside": False}
-        reclaim, ensure = FinalAcceptance.reclaim_verified_checkout, engine.context.ensure_exited
+        for gate in ("ensure_exited", "check_current"):
+            with self.subTest(gate=gate):
+                backend = ScriptedBackend()
+                engine = self.engine(backend)
+                state = {"inside": False}
+                reclaim = FinalAcceptance.reclaim_verified_checkout
+                owner = engine.context if gate == "ensure_exited" else engine.context.store
+                original = getattr(owner, gate)
 
-        def flagged(service, record):
-            state["inside"] = True
-            try:
-                return reclaim(service, record)
-            finally:
-                state["inside"] = False
+                def flagged(service, record):
+                    state["inside"] = True
+                    try:
+                        return reclaim(service, record)
+                    finally:
+                        state["inside"] = False
 
-        def ensure_exited():
-            if state["inside"]:
-                raise HarnessError("simulated unconfirmed exit")
-            return ensure()
-        with patch.object(FinalAcceptance, "reclaim_verified_checkout", flagged), \
-                patch.object(engine.context, "ensure_exited", side_effect=ensure_exited), \
-                self.assertRaisesRegex(HarnessError, "simulated unconfirmed exit"):
-            engine.start("Implement greet", self.plan())
-        self.assertEqual(engine.run["status"], "blocked")
-        self.assertFalse(any(c["kind"] == "final_review" for c in backend.calls))
-        artifact, = self.artifacts(engine)
-        self.assertTrue(Path(read_json(artifact)["worktree"]).is_dir())
-        self.assertFalse(artifact.with_name("cleanup.json").exists())
+                def failing(*args, **kwargs):
+                    if state["inside"]:
+                        raise HarnessError(f"simulated {gate} failure")
+                    return original(*args, **kwargs)
+                with patch.object(FinalAcceptance, "reclaim_verified_checkout", flagged), \
+                        patch.object(owner, gate, side_effect=failing), \
+                        self.assertRaisesRegex(HarnessError, f"simulated {gate} failure"):
+                    engine.start("Implement greet", self.plan())
+                # Neither gate is a resource failure: the run stops, nothing is removed or reviewed.
+                self.assertEqual(engine.run["status"], "blocked")
+                self.assertFalse(any(c["kind"] == "final_review" for c in backend.calls))
+                artifact, = self.artifacts(engine)
+                self.assertTrue(Path(read_json(artifact)["worktree"]).is_dir())
+                self.assertFalse(artifact.with_name("cleanup.json").exists())
 
     def assert_both_kept_and_refused(self, engine, backend, kept):
         result = self.engine(backend).resume(engine.run["id"])
