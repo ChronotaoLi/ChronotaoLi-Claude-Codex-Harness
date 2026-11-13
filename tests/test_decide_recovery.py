@@ -364,10 +364,12 @@ class AskCandidateChangeTests(DecideCase):
         answer = self.repo.parent / "continue.json"
         answer.write_text(json.dumps({"schema_version": 1, "request_id": request["id"], "task_id": "a",
                                       "decision": "continue", "summary": "Continue"}))
-        with self.assertRaisesRegex(HarnessError, "worktree HEAD 与检查点不同"):
+        with self.assertRaises(HarnessError) as stopped:
             self.engine(script).resume(saved["id"], operator_decision=[str(answer)])
+        # Behaviour first: no model ran and nothing was accepted, whatever the message says.
         self.assertEqual(len(script.calls), calls)
         self.assertEqual(self.state(engine)["accepted"], {})
+        self.assertRegex(str(stopped.exception), "worktree HEAD 与检查点不同")
 
     def test_returned_ask_interrupted_before_landing_registers_on_resume_despite_a_head_change(self):
         script = self.changing_script(ask("Choose an interface"), head=True)
