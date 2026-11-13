@@ -155,10 +155,6 @@ class Dispatcher(RuntimeService):
         except ContextCapacityError as error:
             report = {**error.report, "request_id": None}
             write_json(job / "context-report.json", report)
-            self.context.run["last_runtime_error"] = {"role": role, "kind": kind, "task_id": task_id,
-                "error": str(error), "artifact": str(job), "context_report": str(job / "context-report.json"),
-                "request_id": report["request_id"]}
-            self.context.save()
             raise
         write_json(job / "context-report.json", report)
         self.context.run["dispatches"].append({"id": dispatch_id, "role": role, "kind": kind, "task_id": task_id,
@@ -317,7 +313,7 @@ class Dispatcher(RuntimeService):
             startup_interrupted = (isinstance(error, (KeyboardInterrupt, SystemExit))
                                    and entry["process_state"] == "starting" and entry["pgid"] is None)
             # Read and inspect first (Git, evidence digests); change the entry after.
-            recovery = (self.services.workflow.worker_recovery(task_id, dispatch_id, job, error)
+            recovery = (self.services.workflow.worker_recovery(task_id, dispatch_id, job)
                         if role == "worker" and invoked else None)
             bound = {}
             receipt = None
@@ -337,9 +333,6 @@ class Dispatcher(RuntimeService):
                 entry["error"] = str(error)
             if receipt is not None:
                 receipt.update(bound)
-            if not isinstance(error, (KeyboardInterrupt, SystemExit)):
-                self.context.run["last_runtime_error"] = {"role": role, "kind": kind, "task_id": task_id,
-                                                 "error": str(error), "artifact": str(job)}
             if recovery is not None:
                 self.context.run.setdefault("worker_recovery", {})[task_id] = recovery
             raise

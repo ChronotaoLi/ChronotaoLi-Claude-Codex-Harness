@@ -247,7 +247,11 @@ class EngineRepairsTests(RepoCase):
                     engine.start("Implement greet", self.plan())
                 state = read_json(engine.directory / "state.json")
                 self.assertEqual(state["status"], expected)
-                self.assertEqual(state["error_type"], type(error).__name__)
+                if expected == "interrupted":
+                    self.assertEqual((state["stop"]["kind"], state["stop"]["reason"]), ("interrupted", "signal"))
+                else:
+                    self.assertEqual((state["stop"]["kind"], state["stop"]["reason"], state["stop"]["data"]["error_type"]),
+                                     ("unclassified", "unexpected_exception", "ValueError"))
 
     def test_real_verification_timeout_records_feedback_then_repairs(self):
         self.config.data["runtime"]["verify_timeout_seconds"] = 1
@@ -301,7 +305,8 @@ class EngineRepairsTests(RepoCase):
             engine.start("Implement greet", self.plan())
         state = read_json(engine.directory / "state.json")
         self.assertEqual(state["status"], "blocked")
-        self.assertEqual(state["error_type"], "OSError")
+        self.assertEqual((state["stop"]["kind"], state["stop"]["reason"], state["stop"]["data"]["error_type"]),
+                         ("unclassified", "unexpected_exception", "OSError"))
         self.assertEqual(state["dispatches"], [])
         self.assertEqual(read_json(engine.directory / "handoff.json")["status"], "blocked")
 

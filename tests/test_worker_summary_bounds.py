@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import unittest
 
+from harness import stops
 from harness.adapters import provider_schema
 from harness.contracts import (DETAIL, REVIEW, WORK, envelope, output_constraints,
                                validate_review)
@@ -118,12 +119,16 @@ class WorkerSummaryLifecycleTests(RepoCase):
             if kwargs["role"] == "worker":
                 result.update(status="blocked", blocker_kind="environment", summary=summary, blockers=[blocker])
         engine = self.engine(ScriptedBackend(environment_blocked))
-        with self.assertRaisesRegex(HarnessError, "环境受阻"):
+        with self.assertRaisesRegex(HarnessError, "环境受阻") as caught:
             engine.start("Implement greet", self.plan())
-        error = engine.run["error"]
+        # The full text goes to stderr; the ledger and run_stopped keep the same bounded excerpt.
+        error = str(caught.exception)
         stopped = [event for event in events(engine) if event["event"] == "run_stopped"]
-        self.assertEqual(read_json(engine.directory / "state.json")["error"], error)
-        self.assertEqual([event["error"] for event in stopped], [error])
+        detail = read_json(engine.directory / "state.json")["stop"]["data"]["detail"]
+        self.assertEqual(detail, stops.bounded(error))
+        self.assertLessEqual(len(detail), 2000)
+        self.assertTrue(error.startswith(detail[:1000]))
+        self.assertEqual([event["stop"]["detail"] for event in stopped], [detail])
         # The bound is structural, so it holds for any temp root: the blockers and
         # summary excerpt stays within 2,000 characters, and everything else is the
         # artifact path plus fixed wording, the truncation note and the digest.

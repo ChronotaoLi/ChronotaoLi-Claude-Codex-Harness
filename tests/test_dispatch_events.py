@@ -131,11 +131,11 @@ class DispatchEventLifecycleTests(RepoCase):
         self.assertIn("至少还需 5 次", str(raised.exception))
         self.assertIn("下界", str(raised.exception))
         saved = read_json(engine.directory / "state.json")
-        self.assertIn("至少还需 5 次", saved["error"])
+        self.assertIn("至少还需 5 次", saved["stop"]["data"]["detail"])
         summary = status_summary(saved)
         self.assertEqual(summary["remaining_model_calls"]["lower_bound"], 5)
         self.assertEqual(summary["remaining_model_calls"]["tasks"], {"greet": 2, "polish": 2})
-        self.assertIn("至少还需 5 次", summary["error"])
+        self.assertIn("至少还需 5 次", summary["stop"]["detail"])
         self.assertEqual(saved["config_snapshot"]["runtime"]["max_agent_dispatches"], 0)
 
     def test_dispatch_limit_stop_with_candidate_awaiting_review_reports_two(self):

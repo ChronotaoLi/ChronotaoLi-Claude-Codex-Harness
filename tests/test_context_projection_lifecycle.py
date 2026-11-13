@@ -33,13 +33,17 @@ class ContextProjectionLifecycleTests(RepoCase):
                 requests.append(deepcopy(kwargs['packet']['trigger']))
             return contract, required
         with patch.object(PacketBuilder, 'role_input', oversized):
-            with self.assertRaises(ContextCapacityError):
+            with self.assertRaises(ContextCapacityError) as caught:
                 engine.start('Implement greeting', read_json(ROOT / 'examples/plan.json'))
             state = read_json(engine.directory / 'state.json')
             for key, value in before[-1].items():
                 self.assertEqual(state.get(key), value, key)
-            report_path = Path(state['last_runtime_error']['context_report'])
-            report = read_json(report_path)
+            # The report is written before the error; the error carries the same report.
+            reports = [path for path in (engine.directory / 'dispatches').glob('*/context-report.json')
+                       if read_json(path)['kind'] == 'decide']
+            self.assertEqual(len(reports), 1)
+            report = read_json(reports[0])
+            self.assertEqual(report['required_chars'], caught.exception.report['required_chars'])
             self.assertEqual(report['kind'], 'decide')
             self.assertGreater(report['required_chars'], report['budget_chars'])
             self.assertFalse(any(c['kind'] == 'decide' for c in backend.calls))

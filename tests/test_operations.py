@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 import harness.run_context
+from harness import stops
 from harness import git
 from harness.adapters import DemoBackend
 from harness.cli import main
@@ -101,9 +102,9 @@ class OperationRecordTests(OperationCase):
         self.assertIsNone(first["exit_status"])
         record = self.record("op-a")
         self.assertEqual({key: record[key] for key in ("operation_id", "kind", "status", "run_id", "exit_status",
-                                                        "result_status", "error", "error_type")},
+                                                        "result_status", "error", "stop")},
                          {"operation_id": "op-a", "kind": "run", "status": "finished", "run_id": run_id,
-                          "exit_status": 0, "result_status": "completed", "error": None, "error_type": None})
+                          "exit_status": 0, "result_status": "completed", "error": None, "stop": None})
         self.assertEqual(record["arguments"], {"goal": "Implement greet", "plan": None, "commander": "astra",
                                                "pause_after_plan": False, "step": False})
         self.assertEqual((record["repo"], record["repo_head"]), (str(self.repo.resolve()), head))
@@ -133,7 +134,8 @@ class OperationRecordTests(OperationCase):
         record = self.record("op-b")
         self.assertEqual((record["status"], record["run_id"], record["run_linked_at"], record["exit_status"]),
                          ("finished", None, None, 1))
-        self.assertEqual((record["result_status"], record["error_type"]), (None, "HarnessError"))
+        self.assertEqual((record["result_status"], record["stop"]["kind"], record["stop"]["reason"]),
+                         (None, "unclassified", "untyped_harness_error"))
         self.assertIn("已跟踪", record["error"])
         self.assertFalse((self.state / "runs").exists())
 
@@ -148,7 +150,8 @@ class OperationRecordTests(OperationCase):
         self.assertIn("harness: simulated provider failure", errors)
         record = self.record("op-c")
         self.assertEqual((record["status"], record["exit_status"], record["result_status"]), ("finished", 1, None))
-        self.assertEqual((record["error"], record["error_type"]), ("simulated provider failure", "HarnessError"))
+        self.assertEqual((record["error"], record["stop"]["kind"]), ("simulated provider failure", "unclassified"))
+        self.assertEqual(record["stop"]["detail"], "simulated provider failure\nsecond line of detail")
         ledger = self.ledger(record["run_id"])
         self.assertEqual((ledger["status"], ledger["created_by_operation"]), ("blocked", "op-c"))
         self.assertIn(notice("run_created", record["run_id"], "op-c"), errors.splitlines())
@@ -188,10 +191,10 @@ class OperationRecordTests(OperationCase):
         self.assertEqual(output, "")
         self.assertIn("dispatch_unknown", errors)
         self.assertEqual(((directory / "state.json").read_bytes(), (directory / "events.jsonl").read_bytes()), before)
-        self.assertNotIn("[harness-json]", errors)
+        self.assertNotIn('"event":"run_resumed"', errors)
         record = self.record("op-reject")
-        self.assertEqual((record["status"], record["run_id"], record["exit_status"], record["error_type"]),
-                         ("finished", run_id, 1, "HarnessError"))
+        self.assertEqual((record["status"], record["run_id"], record["exit_status"], record["stop"]["kind"]),
+                         ("finished", run_id, 1, "unclassified"))
         self.assertEqual(record["arguments"]["confirm_exited"], ["dispatch_unknown"])
 
     def test_resume_stopped_before_dispatch_keeps_events_and_budgets(self):
@@ -223,7 +226,7 @@ class OperationRecordTests(OperationCase):
             self.assertEqual(appended[0]["operation_id"], operation_id)
             saved = self.ledger(run_id)
             self.assertEqual(saved["status"], "blocked")
-            self.assertEqual(saved["error"], appended[1]["error"])
+            self.assertEqual(stops.project_ledger(saved), appended[1]["stop"])
             for key in ("dispatches", "attempts", "agent_dispatches", "accepted"):
                 self.assertEqual(saved[key], before[key], key)
             record = self.record(operation_id)
@@ -255,13 +258,13 @@ class OperationRecordTests(OperationCase):
                 code, output, errors = self.invoke(["resume", run_id, "--operation-id", operation_id], backend)
                 self.assertEqual(code, 1, errors)
                 self.assertEqual(output, "")
-                self.assertNotIn("[harness-json]", errors)
+                self.assertNotIn('"event":"run_resumed"', errors)
                 saved = self.ledger(run_id)
                 self.assertFalse(saved["plan_approved"])
                 for key in ("status", "dispatches", "attempts", "agent_dispatches", "accepted"):
                     self.assertEqual(saved[key], before[key], key)
-                # Rejected before execution: no stop was recorded.
-                self.assertNotIn("error", saved)
+                # Rejected before execution: the run keeps the stop it already had.
+                self.assertEqual((saved["stop"]["kind"], saved["stop"]["reason"]), ("plan_approval", "initial_plan"))
                 if add_grant:
                     self.assertNotEqual(state_path.read_bytes(), state_before)
                     self.assertTrue(events_path.read_bytes().startswith(events_before))
@@ -326,8 +329,8 @@ class OperationRecordTests(OperationCase):
         self.assertEqual(output, "")
         self.assertIn("已中断", errors)
         record = self.record("op-f")
-        self.assertEqual((record["status"], record["exit_status"], record["error"], record["error_type"]),
-                         ("finished", 130, "KeyboardInterrupt", "KeyboardInterrupt"))
+        self.assertEqual((record["status"], record["exit_status"], record["error"], record["stop"]["kind"]),
+                         ("finished", 130, "KeyboardInterrupt", "interrupted"))
         self.assertEqual(self.ledger(record["run_id"])["status"], "interrupted")
 
     def test_record_excludes_environment_values_and_file_contents(self):
@@ -566,8 +569,9 @@ class FileInputPrivacyTests(OperationCase):
         for sentinel in sentinels:
             self.assertNotIn(sentinel.encode("utf-8"), raw)
         record = self.record(operation_id)
-        self.assertEqual((record["status"], record["exit_status"], record["error"], record["error_type"],
-                          record["error_omitted"]), ("finished", 1, None, "HarnessError", self.OMITTED))
+        self.assertEqual((record["status"], record["exit_status"], record["error"], record["stop"]["kind"],
+                          record["error_omitted"]), ("finished", 1, None, "unclassified", self.OMITTED))
+        self.assertNotIn("detail", record["stop"])
         return record
 
     def test_invalid_plan_error_text_is_omitted_from_record(self):

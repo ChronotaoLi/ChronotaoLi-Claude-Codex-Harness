@@ -14,7 +14,7 @@ from harness.dispatch import Dispatcher
 from harness.memory import Memory
 from harness.util import HarnessError, read_json, write_json
 from test_engine_repairs import RecordingBackend
-from test_harness import RepoCase, ROOT, after_save
+from test_harness import RepoCase, ROOT, after_save, stopped
 from test_runtime_changes import ScriptedBackend, decided, finding, finding_key, trigger_kind
 from test_runtime_changes import revised as revised_
 from test_worker_return_recovery import stub_provider_clis
@@ -592,7 +592,7 @@ class UndecodableOutputTests(RepoCase):
             with self.subTest(case=name):
                 state = copy.deepcopy(saved)
                 state["dispatches"][0].update(change)
-                state["status"] = "blocked"
+                stopped(state)
                 write_json(path, state)
                 original = path.read_bytes()
                 with self.assertRaisesRegex(HarnessError, "provider failure lacks retry evidence|"
@@ -781,7 +781,7 @@ class LedgerLinkTests(RepoCase):
                 a = next(d for d in state["dispatches"] if d["id"] == first["id"])
                 b = next(d for d in state["dispatches"] if d["id"] == second["id"])
                 mutate(state, a, b)
-                state["status"] = "blocked"
+                stopped(state)
                 write_json(path, state)
                 original = path.read_bytes()
                 with self.assertRaisesRegex(HarnessError, "运行台账恢复状态无效"):

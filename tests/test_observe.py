@@ -12,6 +12,7 @@ import uuid
 from pathlib import Path
 from unittest.mock import patch
 
+from harness import stops
 from harness import cli, observe
 from harness.cli import status_summary
 from harness.util import read_json, write_json
@@ -34,6 +35,10 @@ def ledger(run_id, **fields):
                                                                                "max_agent_dispatches": 200}},
             "agent_dispatches": 1, "decision_requests": [], "operator_decisions": [], "created_by_operation": "op_a"}
     base.update(fields)
+    if base["status"] in stops.STOP_STATUSES and "stop" not in fields:
+        base["stop"] = (stops.make("plan_approval", "initial_plan") if base["status"] == "awaiting_approval" else
+                        stops.make("interrupted", "signal") if base["status"] == "interrupted" else
+                        stops.make("unclassified", "untyped_harness_error", data={"error_type": "HarnessError"}))
     return base
 
 

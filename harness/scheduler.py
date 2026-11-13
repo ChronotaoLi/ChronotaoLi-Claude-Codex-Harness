@@ -12,6 +12,7 @@ from .finalization import needs_decision, same_snapshot_record
 from .planning import attempt_limit_error, DECIDE_KEY, directive_mismatch
 from .recovery import invalidate_acceptance_review, snapshot_digest
 from .util import HarnessError
+from . import stops
 from .services import RuntimeService
 
 Step = namedtuple("Step", "kind data")
@@ -123,14 +124,18 @@ class Scheduler(RuntimeService):
             if not self.context.run["attempts"] or self.context.run.get("environment_updates") or self.context.run.get("operator_decisions"):
                 self.services.packets.preflight_final_context()
             if self.context.run["plan_approval_required"] and not self.context.run["plan_approved"]:
+                plan = self.context.run["plan_history"][0]
                 self.context.run["status"] = "awaiting_approval"
+                self.context.run["stop"] = stops.make(
+                    "plan_approval", "initial_plan",
+                    data={"revision": plan["revision"], "task_count": len(self.context.run["tasks"])},
+                    source={"artifact": plan["artifact"], "artifact_digest": plan["artifact_digest"]})
                 self.context.save()
                 self.context.checkpoint()
                 self.context.event("plan_awaiting_approval")
                 return self.context.run
             self.context.run["status"] = "running"
-            self.context.run.pop("error", None)
-            self.context.run.pop("error_type", None)
+            self.context.run.pop("stop", None)
             self.context.save()
             accepted_this_call = int(bool(replayed)) + int(self.services.tasks.finish_post_accept())
             if self.context.run.get("pending_acceptance"):

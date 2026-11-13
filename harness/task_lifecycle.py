@@ -26,7 +26,7 @@ from .verification import checks_passed
 from .worker_receipts import read_worker_source
 from .util import dump, HarnessError, read_json, write_json
 
-# The environment-blocked stop message reaches the ledger error and run_stopped;
+# The environment-blocked stop message reaches the stop detail and run_stopped;
 # it carries an excerpt and the digest-bound full artifact.
 ENVIRONMENT_BLOCKER_EXCERPT_CHARS = 2000
 
@@ -238,11 +238,9 @@ class TaskLifecycle(RuntimeService):
             feedback["worker"] = result
         # Inspect Git before any handoff field changes: an interruption inside it
         # must not leave new feedback beside the unconsumed receipt.
-        recovery = self.services.workflow.worker_recovery(tid, entry["id"], artifact.parent, error)
+        recovery = self.services.workflow.worker_recovery(tid, entry["id"], artifact.parent)
         self.context.run["feedback"] = feedback
         entry.update(status="invalid_blocked", error=str(error), worker_outcome=route + "_blocked")
-        self.context.run["last_runtime_error"] = {"role": "worker", "kind": entry["kind"], "task_id": tid,
-                                                  "error": str(error), "artifact": str(artifact.parent)}
         self.context.run.setdefault("worker_recovery", {})[tid] = recovery
         self.services.worker_receipts.consume(key, "invalid_blocker")
         self.context.save()

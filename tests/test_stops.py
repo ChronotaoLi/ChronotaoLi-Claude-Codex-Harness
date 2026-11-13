@@ -1,0 +1,290 @@
+"""Stop values: registry, bounds, ledger rules, one projection everywhere. All calls are simulated."""
+import copy
+import json
+import random
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from harness import stops
+from harness.run_context import RunContext
+from harness.util import HarnessError, ProcessTimeout, read_json, write_json
+from test_harness import ROOT, RepoCase, commit_recorder
+from test_operations import OperationCase
+from test_runtime_changes import ScriptedBackend
+
+
+def plan():
+    return read_json(ROOT / "examples" / "plan.json")
+
+
+def notices(stderr):
+    return [json.loads(line.split(" ", 1)[1]) for line in stderr.splitlines()
+            if line.startswith("[harness-json] ") and '"event":"stop"' in line]
+
+
+class RegistryTests(unittest.TestCase):
+    def test_registry_shape_and_projection(self):
+        self.assertEqual(set(stops.REGISTRY), {("plan_approval", "initial_plan"), ("interrupted", "signal"),
+                                               ("unclassified", "untyped_harness_error"),
+                                               ("unclassified", "unexpected_exception")})
+        codes = {key: entry["exit_code"] for key, entry in stops.REGISTRY.items()}
+        self.assertEqual(codes[("plan_approval", "initial_plan")], 0)
+        self.assertEqual(codes[("interrupted", "signal")], 130)
+        self.assertEqual(codes[("unclassified", "untyped_harness_error")], 1)
+        self.assertEqual(codes[("unclassified", "unexpected_exception")], 1)
+        with self.assertRaises(KeyError):
+            stops.make("budget", "task_attempts")
+        with self.assertRaises(KeyError):
+            stops.make("interrupted", "signal", data={"unknown": 1})
+        with self.assertRaises(KeyError):
+            stops.make("plan_approval", "initial_plan", source={"task_id": "t"})
+        value = stops.make("plan_approval", "initial_plan", data={"revision": 0, "task_count": 2},
+                           source={"artifact": "/runs/r/plans/0.json", "artifact_digest": "a" * 64})
+        stops.validate(value)
+        projected = stops.project(value, "run_ab12")
+        self.assertEqual(projected["exits"], ["status run_ab12 --full", "resume run_ab12 --approve-plan"])
+        self.assertEqual((projected["title"], projected["exit_code"]), ("计划等待明确批准", 0))
+        self.assertEqual(projected["data"], {"revision": 0, "task_count": 2})
+        self.assertNotIn("detail", stops.project(value, "run_ab12", omit_detail=True))
+
+    def test_detail_total_length_is_bounded_including_the_note(self):
+        for length in (0, 1, 1999, 2000, 2001, 2017, 5000, 200000):
+            with self.subTest(length=length):
+                text = "x" * length
+                excerpt = stops.bounded(text)
+                self.assertLessEqual(len(excerpt), 2000)
+                if length <= 2000:
+                    self.assertEqual(excerpt, text)
+                else:
+                    self.assertIn(f"原文 {length} 字符", excerpt)
+                    self.assertTrue(excerpt.startswith("x" * 100))
+                value = stops.of(HarnessError(text))
+                stops.validate(value)
+                self.assertLessEqual(len(value["data"]["detail"]), 2000)
+
+    def test_of_validates_for_arbitrary_text_and_exception_types(self):
+        alphabet = ["a", "\0", "\ud800", "\U0001F600", '"', "\\", "\n", "停", " "]
+        generator = random.Random(4)
+        kinds = (HarnessError, ValueError, OSError, KeyboardInterrupt)
+        for index in range(400):
+            text = "".join(generator.choice(alphabet) for _ in range(generator.randint(0, 3000)))
+            error = kinds[index % len(kinds)](text)
+            value = stops.of(error)
+            stops.validate(value)
+            self.assertLessEqual(len(value["data"]["detail"]), 2000)
+        self.assertEqual(stops.of(HarnessError("x"))["reason"], "untyped_harness_error")
+        self.assertEqual(stops.of(ValueError("x"))["data"]["error_type"], "ValueError")
+        self.assertEqual(stops.of(KeyboardInterrupt())["kind"], "interrupted")
+        self.assertEqual(stops.of(SystemExit(2))["kind"], "interrupted")
+
+    def test_unfit_field_values_are_dropped_not_raised(self):
+        value = stops.make("plan_approval", "initial_plan", data={"revision": -1, "task_count": True},
+                           source={"artifact": "relative/path", "artifact_digest": "not-a-digest"})
+        stops.validate(value)
+        self.assertEqual(value["data"]["dropped_fields"], ["artifact", "artifact_digest", "revision", "task_count"])
+        self.assertEqual(value["source"], {})
+        # A carried value that is not a valid stop never breaks the boundary.
+        error = HarnessError("text", stop={"kind": "nonsense"})
+        self.assertEqual(stops.of(error)["data"]["error_type"], "InvalidStop")
+
+
+class LedgerStopTests(OperationCase):
+    def blocked(self):
+        """A run stopped by the dispatch limit: blocked, with an unclassified stop in 4a."""
+        self.config.data["runtime"]["max_agent_dispatches"] = 1
+        engine = self.engine(ScriptedBackend())
+        with self.assertRaises(HarnessError):
+            engine.start("Implement greet", plan())
+        return engine
+
+    def test_load_rejects_stop_status_mismatch(self):
+        engine = self.blocked()
+        path = engine.directory / "state.json"
+        saved = read_json(path)
+        self.assertEqual(saved["stop"]["kind"], "unclassified")
+        plan_stop = stops.make("plan_approval", "initial_plan")
+        cases = {
+            "blocked without stop": lambda run: run.pop("stop"),
+            "running with stop": lambda run: run.update(status="running"),
+            "awaiting_approval with unclassified": lambda run: run.update(status="awaiting_approval"),
+            "interrupted with plan_approval": lambda run: run.update(status="interrupted", stop=plan_stop),
+            "blocked with interrupted": lambda run: run.update(stop=stops.make("interrupted", "signal")),
+            "unregistered reason": lambda run: run["stop"].update(reason="nonsense"),
+            "extra key": lambda run: run["stop"].update(extra=1),
+            "detail too long": lambda run: run["stop"]["data"].update(detail="x" * 2001),
+        }
+        for name, mutate in cases.items():
+            with self.subTest(case=name):
+                run = copy.deepcopy(saved)
+                mutate(run)
+                write_json(path, run)
+                before = path.read_bytes()
+                for action in (lambda: self.engine().resume(run["id"]), lambda: self.engine().abandon(run["id"])):
+                    with self.assertRaisesRegex(HarnessError, "停止记录与状态不符"):
+                        action()
+                    self.assertEqual(path.read_bytes(), before)
+
+    def test_every_commit_keeps_stop_with_its_status(self):
+        recorder, states = commit_recorder()
+        path = self.repo.parent / "plan.json"
+        write_json(path, plan())
+        self.config.data["runtime"]["max_agent_dispatches"] = 1
+        with recorder:
+            code, _, _ = self.invoke(["run", "Implement greet", "--plan", str(path), "--pause-after-plan"])
+            self.assertEqual(code, 0)
+            run_id = states[-1]["id"]
+            self.assertEqual(states[-1]["stop"]["kind"], "plan_approval")
+            code, _, err = self.invoke(["resume", run_id])
+            self.assertEqual(code, 1)  # 4a: a plain resume still refuses an unapproved plan
+            self.assertEqual(self.ledger(run_id)["stop"]["kind"], "plan_approval")
+            code, _, _ = self.invoke(["resume", run_id, "--approve-plan"])
+            self.assertEqual(code, 1)
+            self.assertEqual((states[-1]["status"], states[-1]["stop"]["kind"]), ("blocked", "unclassified"))
+            self.config.data["runtime"]["max_agent_dispatches"] = 50
+            code, _, _ = self.invoke(["resume", run_id])
+            self.assertEqual(code, 0)
+        self.assertEqual(states[-1]["status"], "completed")
+        for state in states:
+            with self.subTest(status=state["status"], revision=state["store_revision"]):
+                self.assertEqual("stop" in state, state["status"] in stops.STOP_STATUSES)
+                stops.validate_ledger(state)
+        running = next(state for state in states if state["status"] == "running")
+        self.assertNotIn("stop", running)
+
+    def test_awaiting_approval_records_the_plan_stop(self):
+        engine = self.engine(ScriptedBackend())
+        result = engine.start("Implement greet", plan(), pause_after_plan=True)
+        self.assertEqual(result["status"], "awaiting_approval")
+        stop = read_json(engine.directory / "state.json")["stop"]
+        first = result["plan_history"][0]
+        self.assertEqual((stop["kind"], stop["reason"]), ("plan_approval", "initial_plan"))
+        self.assertEqual(stop["source"], {"artifact": first["artifact"], "artifact_digest": first["artifact_digest"]})
+        self.assertEqual(stop["data"], {"revision": 0, "task_count": len(result["tasks"])})
+        code, out, _ = self.invoke(["status", result["id"]])
+        self.assertEqual(code, 0)
+        self.assertIn(f"resume {result['id']} --approve-plan", json.loads(out)["stop"]["exits"])
+
+    def test_interrupt_between_stop_save_and_event(self):
+        self.config.data["runtime"]["max_agent_dispatches"] = 1
+        backend = ScriptedBackend()
+        engine = self.engine(backend)
+        original = RunContext.event
+
+        def event(context, name, **fields):
+            if name == "run_stopped":
+                raise KeyboardInterrupt
+            return original(context, name, **fields)
+        with patch.object(RunContext, "event", event), self.assertRaises(KeyboardInterrupt):
+            engine.start("Implement greet", plan())
+        saved = read_json(engine.directory / "state.json")
+        self.assertEqual((saved["status"], saved["stop"]["kind"]), ("blocked", "unclassified"))
+        self.assertNotIn('"run_stopped"', (engine.directory / "events.jsonl").read_text())
+        self.config.data["runtime"]["max_agent_dispatches"] = 50
+        recorder, states = commit_recorder()
+        with recorder:
+            result = self.engine(backend).resume(saved["id"])
+        self.assertEqual(result["status"], "completed")
+        self.assertNotIn("stop", next(state for state in states if state["status"] == "running"))
+
+    def test_untyped_error_is_unclassified_and_exits_1(self):
+        path = self.repo.parent / "plan.json"
+        write_json(path, plan())
+
+        def boom(*args, **kwargs):
+            raise HarnessError("no type here")
+        code, _, err = self.invoke(["run", "Implement greet", "--plan", str(path)],
+                                   **{"harness.finalization.FinalAcceptance.final_review": boom})
+        self.assertEqual(code, 1)
+        run_id = next((self.state / "runs").iterdir()).name
+        stop = self.ledger(run_id)["stop"]
+        self.assertEqual((stop["kind"], stop["reason"], stop["data"]["error_type"]),
+                         ("unclassified", "untyped_harness_error", "HarnessError"))
+        lines = err.splitlines()
+        first = next(index for index, line in enumerate(lines) if line == "harness: no type here")
+        notice = json.loads(lines[first + 1].split(" ", 1)[1])
+        self.assertEqual((notice["event"], notice["run_id"], notice["stop"]["kind"]), ("stop", run_id, "unclassified"))
+        self.assertNotIn("detail", notice["stop"])
+        record = self.record(notice["operation_id"])
+        self.assertEqual((record["exit_status"], record["stop"]["kind"], record["stop"]["exit_code"]),
+                         (1, "unclassified", 1))
+        self.assertNotIn("error_type", record)
+
+    def test_interrupt_records_signal_stop_and_130(self):
+        path = self.repo.parent / "plan.json"
+        write_json(path, plan())
+
+        def interrupt(*args, **kwargs):
+            raise KeyboardInterrupt
+        code, _, err = self.invoke(["run", "Implement greet", "--plan", str(path)],
+                                   **{"harness.finalization.FinalAcceptance.final_review": interrupt})
+        self.assertEqual(code, 130)
+        run_id = next((self.state / "runs").iterdir()).name
+        saved = self.ledger(run_id)
+        self.assertEqual((saved["status"], saved["stop"]["kind"], saved["stop"]["reason"]),
+                         ("interrupted", "interrupted", "signal"))
+        self.assertIn("harness: 已中断；运行状态和 worktree 已保留", err)
+        notice = notices(err)[-1]
+        self.assertEqual((notice["stop"]["exit_code"], notice["stop"]["exits"]),
+                         (130, [f"resume {run_id}", f"abandon {run_id}"]))
+        record = self.record(notice["operation_id"])
+        self.assertEqual((record["exit_status"], record["stop"]["kind"]), (130, "interrupted"))
+
+    def test_file_input_record_keeps_stop_without_text(self):
+        engine = self.blocked()
+        update = self.repo.parent / "update.json"
+        write_json(update, {"schema_version": 1, "secret": "VALUE-THAT-MUST-NOT-LEAK"})
+        code, _, err = self.invoke(["resume", engine.run["id"], "--environment-update", str(update)])
+        self.assertEqual(code, 1)
+        record = self.record(notices(err)[-1]["operation_id"])
+        self.assertIsNone(record["error"])
+        self.assertTrue(record["error_omitted"])
+        self.assertEqual((record["stop"]["kind"], record["stop"]["exit_code"]), ("unclassified", 1))
+        self.assertIn("reason", record["stop"])
+        self.assertNotIn("detail", record["stop"])
+        self.assertNotIn("VALUE-THAT-MUST-NOT-LEAK", json.dumps(record))
+
+    def test_abandon_clears_the_stop(self):
+        engine = self.blocked()
+        recorder, states = commit_recorder()
+        with recorder:
+            result = self.engine().abandon(engine.run["id"])
+        self.assertEqual(result["status"], "abandoned")
+        self.assertEqual(len(states), 1)
+        self.assertEqual(states[0]["status"], "abandoned")
+        self.assertNotIn("stop", states[0])
+
+
+class WorkerRecoveryProjectionTests(RepoCase):
+    def test_worker_recovery_projection_reads_the_source_entry(self):
+        class FailingOnce(ScriptedBackend):
+            failed = False
+
+            def invoke(self, **kwargs):
+                if kwargs["role"] == "worker" and not self.failed:
+                    self.failed = True
+                    self.calls.append({"role": "worker", "kind": kwargs["kind"], "packet": None, "task_id": "greet"})
+                    raise HarnessError("worker service unavailable: " + "x" * 2500)
+                return super().invoke(**kwargs)
+        backend = FailingOnce()
+        engine = self.engine(backend)
+        with self.assertRaises(HarnessError):
+            engine.start("Implement greet", plan())
+        saved = read_json(engine.directory / "state.json")
+        failed = next(entry for entry in saved["dispatches"] if entry["role"] == "worker")
+        recovery = saved["worker_recovery"]["greet"]
+        self.assertNotIn("error", recovery)
+        self.assertNotIn("error_type", recovery)
+        self.assertEqual(recovery["dispatch_id"], failed["id"])
+        result = self.engine(backend).resume(saved["id"])
+        self.assertEqual(result["status"], "completed")
+        packet = next(call["packet"] for call in backend.calls if call["role"] == "worker" and call["packet"])
+        projected = packet["recovery"]
+        self.assertNotIn("error_type", projected)
+        self.assertEqual(projected["source"]["dispatch_id"], failed["id"])
+        self.assertEqual(projected["source"]["error"], stops.bounded(failed["error"]))
+        self.assertLessEqual(len(projected["source"]["error"]), 2000)
+
+
+if __name__ == "__main__":
+    unittest.main()

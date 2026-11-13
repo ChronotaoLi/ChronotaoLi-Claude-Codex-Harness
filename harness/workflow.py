@@ -1,19 +1,20 @@
 """Cross-stage policy for handoffs, decisions, and stopping."""
 from __future__ import annotations
 from pathlib import Path
-from . import git
+from . import git, stops
 from .decisions import validate_handoff_question
 from .util import HarnessError
 from .services import RuntimeService
 
 class Workflow(RuntimeService):
     def stop(self, error):
+        """Save the status and its stop value in one commit, then report the projection."""
+        value = stops.of(error)
         self.context.run["status"] = "interrupted" if isinstance(error, (KeyboardInterrupt, SystemExit)) else "blocked"
-        self.context.run["error"] = str(error)
-        self.context.run["error_type"] = type(error).__name__
+        self.context.run["stop"] = value
         self.context.save()
         self.context.checkpoint()
-        self.context.event("run_stopped", error=str(error), error_type=type(error).__name__)
+        self.context.event("run_stopped", stop=stops.project(value, self.context.run["id"]))
 
     def handoff_targets(self, task_id):
         """Project only unaccepted transitive descendants, in plan order."""
@@ -88,14 +89,14 @@ class Workflow(RuntimeService):
         raise HarnessError(f"操作者已决定停止：request_id={request['id']}；"
                            "请使用 --operator-decision 显式更新为 continue")
 
-    def worker_recovery(self, task_id, dispatch_id, job, error):
+    def worker_recovery(self, task_id, dispatch_id, job):
         """Build a worker recovery record without changing the ledger.
 
         It inspects Git, which can be interrupted: callers build it before they
         change any entry, then publish it with the judgment it belongs to.
         """
         recovery = {"role": "worker", "kind": "implement", "task_id": task_id, "dispatch_id": dispatch_id,
-                    "error": str(error), "error_type": type(error).__name__, "artifact": str(job)}
+                    "artifact": str(job)}
         try:
             recovery["changed_files"] = git.changed(self.context.worktree, binding=self.context.run["worktree_binding"])
         except Exception as inspection_error:

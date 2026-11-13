@@ -550,7 +550,7 @@ def _operation_summary(name, record):
     summary = {"file": name}
     for key in ("operation_id", "kind", "status", "started_at", "started_at_utc", "finished_at", "finished_at_utc",
                 "run_id", "run_linked_at", "exit_status", "result_status", "repo", "repo_head",
-                "arguments", "harness", "config", "models", "cli"):
+                "arguments", "harness", "config", "models", "cli", "stop"):
         summary[key] = record.get(key)
     summary["error"] = _first_line(record.get("error"))
     return summary
@@ -671,8 +671,7 @@ class Observer:
         unavailable = detail["unavailable"]
         detail["run"] = {key: _string(run.get(key)) for key in
                          ("id", "status", "goal", "branch", "worktree", "repo", "commander", "current_task",
-                          "error_type", "created_by_operation", "config_path", "expected_head", "base_commit")}
-        detail["run"]["error"] = _first_line(run.get("error"))
+                          "created_by_operation", "config_path", "expected_head", "base_commit")}
         detail["run"]["worktree_removed"] = self._worktree_cleanup_removed(run_id)
         detail["budgets"] = self._budgets(run)
         detail["tasks"], detail["invalid_tasks"] = task_rows(run)

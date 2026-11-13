@@ -5,6 +5,7 @@ import hashlib
 import json
 from pathlib import Path
 
+from . import stops
 from .contracts import review_approved
 from .util import HarnessError, strict_json_loads
 
@@ -67,6 +68,9 @@ def worker_recovery_context(run, directory, task_id):
     def source(entry):
         value = {"dispatch_id": entry["id"], "status": entry.get("status", "unknown"),
                  "artifact": str(Path(directory) / "dispatches" / entry["id"])}
+        if isinstance(entry.get("error"), str):
+            # The failure text lives on the dispatch entry, not in a second copy.
+            value["error"] = stops.bounded(entry["error"])
         for key in ("invoked_at", "worker_outcome"):
             if key in entry:
                 value[key] = entry[key]

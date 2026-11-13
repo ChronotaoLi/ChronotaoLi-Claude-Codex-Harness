@@ -12,7 +12,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from . import dashboard, git, observe
+from . import dashboard, git, observe, stops
 from .adapters import DemoBackend
 from .budgets import attempts_total, work_attempts
 from .cleanup import blocked, cleanup_run
@@ -193,8 +193,9 @@ def status_summary(run):
                 if isinstance(latest.get("sequence"), int) and not isinstance(latest["sequence"], bool):
                     summary["latest_update_version"] = latest["sequence"]
             result["last_environment_blocker"] = summary
-    if run.get("error"):
-        result["error"] = str(run["error"]).splitlines()[0]
+    stop = stops.project_ledger(run)
+    if stop is not None:
+        result["stop"] = stop
     responses = run.get("operator_decisions", [])
     requests = run.get("decision_requests", [])
     if not isinstance(responses, list) or not isinstance(requests, list):
@@ -272,12 +273,46 @@ def manage_memory(args, repo, state):
 
 
 def exit_status(error):
-    """The exit code _main/main yield for an exception escaping run or resume."""
-    if isinstance(error, KeyboardInterrupt):
-        return 130
+    """The exit code for an exception: SystemExit keeps its code; every other one comes from its stop."""
     if isinstance(error, SystemExit):
         return error.code if isinstance(error.code, int) else (0 if error.code is None else 1)
-    return 1
+    return stops.exit_code(error)
+
+
+def reported(error):
+    """Exceptions the CLI reports as a stop; anything else propagates as a programming error."""
+    if isinstance(error, (sqlite3.ProgrammingError, sqlite3.InterfaceError)):
+        return False
+    return isinstance(error, (HarnessError, OSError, ValueError, subprocess.TimeoutExpired, sqlite3.Error,
+                              KeyboardInterrupt))
+
+
+def stop_notice(value, run_id, operation_id):
+    """The machine-readable stderr line; the same projection as status and the operation record."""
+    body = {"event": "stop", "run_id": run_id, "operation_id": operation_id,
+            "stop": {key: item for key, item in value.items() if key != "detail"}}
+    try:
+        print("[harness-json] " + json.dumps(body, ensure_ascii=True, separators=(",", ":")),
+              file=sys.stderr, flush=True)
+    except Exception:
+        pass  # Observation output never changes the exit status or the operation record.
+
+
+def report_stop(error, run_id=None, operation_id=None):
+    """stderr: the full text as before, then the projection; returns the projection."""
+    value = stops.project(stops.of(error), run_id)
+    if isinstance(error, KeyboardInterrupt):
+        text = "已中断；运行状态和 worktree 已保留"
+    elif isinstance(error, sqlite3.Error):
+        text = f"SQLite 记忆数据库错误：{error}"
+    else:
+        text = str(error)
+    try:
+        print(f"harness: {text}", file=sys.stderr, flush=True)
+    except Exception:
+        pass
+    stop_notice(value, run_id, operation_id)
+    return value
 
 
 def operation_arguments(args):
@@ -360,11 +395,23 @@ def operate(args, config, repo, state):
             keys = ("id", "status", "branch", "worktree")
         print(dump({**{key: result[key] for key in keys}, "operation_id": operation.id}))
     except BaseException as error:
-        operation.finish(exit_status=exit_status(error), error=error,
-                         run_id=persisted_run_id(args, engine, state))
-        raise
+        run_id = persisted_run_id(args, engine, state)
+        code = exit_status(error)
+        value = report_stop(error, run_id, operation.id) if reported(error) else None
+        operation.finish(exit_status=code, error=error, stop=value, run_id=run_id)
+        if value is None:
+            raise
+        return code
+    saved = None
+    if isinstance(result, dict):
+        try:
+            saved = stops.project_ledger(result)
+        except HarnessError:
+            saved = None
+        if saved is not None:
+            stop_notice(saved, result.get("id"), operation.id)
     operation.finish(exit_status=0, result_status=result.get("status") if isinstance(result, dict) else None,
-                     run_id=persisted_run_id(args, engine, state))
+                     stop=saved, run_id=persisted_run_id(args, engine, state))
     return 0
 
 
@@ -558,14 +605,10 @@ def _main(argv=None):
             (folder / "codex.mcp.toml").write_text("mcp_servers = " + toml_value(codex) + "\n", encoding="utf-8")
             print(str(folder))
         return 0
-    except (HarnessError, OSError, ValueError, subprocess.TimeoutExpired) as e:
-        print(f"harness: {e}", file=sys.stderr)
-        return 1
-    except sqlite3.Error as e:
-        if isinstance(e, (sqlite3.ProgrammingError, sqlite3.InterfaceError)):
+    except (HarnessError, OSError, ValueError, subprocess.TimeoutExpired, sqlite3.Error, KeyboardInterrupt) as e:
+        if not reported(e):
             raise
-        print(f"harness: SQLite 记忆数据库错误：{e}", file=sys.stderr)
-        return 1
-    except KeyboardInterrupt:
-        print("harness: 已中断；运行状态和 worktree 已保留", file=sys.stderr)
-        return 130
+        value = report_stop(e, getattr(args, "run_id", None))
+        if args.command == "cleanup-run" and not isinstance(e, KeyboardInterrupt):
+            return 1  # cleanup-run reports per-resource results, not the run stop protocol
+        return value["exit_code"]

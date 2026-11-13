@@ -12,7 +12,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from harness import stops
 from harness.adapters import CLIBackend, DemoBackend
+from harness.recovery import worker_recovery_context
 from harness.util import HarnessError, ProcessTimeout, read_json, write_json
 from harness.worker_returns import SOURCES, inspect_return, validate_return_evidence
 from test_harness import RepoCase, ROOT
@@ -177,7 +179,15 @@ class WorkerReturnRecoveryTests(RepoCase):
             with self.assertRaisesRegex(HarnessError, 'stop before new work'):
                 engine.resume(engine.run['id'])
         self.assertEqual(engine.run['worker_recovery']['greet'], original)
-        self.assertEqual(original['error_type'], 'ProcessTimeout')
+        # The timeout stays on the failed entry after the retry retired it as a provider failure,
+        # and the recovery projection reads it from there.
+        failed = next(d for d in engine.run['dispatches'] if d['id'] == original['dispatch_id'])
+        self.assertTrue(failed['error'].startswith('进程超过 1s'), failed['error'])
+        self.assertEqual(failed['worker_receipt_consumed'], 'provider_failure')
+        projected = worker_recovery_context(engine.run, engine.directory, 'greet')
+        self.assertEqual(projected['source']['dispatch_id'], failed['id'])
+        self.assertEqual(projected['source']['error'], failed['error'])
+        self.assertNotIn('error_type', projected)
         result = engine.resume(engine.run['id'])
         self.assertEqual(result['status'], 'completed')
         self.assertEqual(result['attempts']['greet'], 2)
@@ -250,7 +260,7 @@ class WorkerReturnRecoveryTests(RepoCase):
         entry = engine.run['dispatches'][0]
         self.assertEqual(entry['worker_return_evidence']['state'], 'returned')
         self.assertIn('before immutable seal', entry['error'])
-        self.assertEqual(entry['error'], engine.run['last_runtime_error']['error'])
+        self.assertEqual(engine.run['stop']['data']['detail'], stops.bounded(entry['error']))
         (engine.directory / 'dispatches' / first['id'] / 'response.json').unlink()
         with self.assertRaisesRegex(HarnessError, 'return evidence changed'):
             engine.resume(engine.run['id'])
@@ -263,7 +273,7 @@ class WorkerReturnRecoveryTests(RepoCase):
             engine.resume(engine.run['id'])
         worker = engine.run['dispatches'][-1]
         self.assertIn('candidate changed', worker['error'])
-        self.assertEqual(worker['error'], engine.run['last_runtime_error']['error'])
+        self.assertEqual(engine.run['stop']['data']['detail'], stops.bounded(worker['error']))
         self.assertEqual(engine.run['attempts']['greet'], 1)
 
     def crash_controller(self, boundary):

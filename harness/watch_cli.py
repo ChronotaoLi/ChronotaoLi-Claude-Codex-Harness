@@ -37,7 +37,9 @@ def watch_run(state, run_id, *, follow=False, stdout=None):
                                 "accepted_tasks": summary["accepted_tasks"][:50],
                                 "accepted_task_count": len(summary["accepted_tasks"]),
                                 "work_attempts": summary["budgets"]["work_attempts"],
-                                "error": summary.get("error"), "active_dispatches": active[:20],
+                                "stop": ({key: summary["stop"][key] for key in ("kind", "reason", "title", "exit_code")}
+                                         if summary.get("stop") else None),
+                                "active_dispatches": active[:20],
                                 "active_dispatch_count": len(active), "convergence": summary["convergence"],
                                 "process_observation": "ledger_only"}
                     encoded = json.dumps(snapshot, ensure_ascii=False, sort_keys=True)

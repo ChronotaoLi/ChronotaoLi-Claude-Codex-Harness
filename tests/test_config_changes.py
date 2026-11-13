@@ -88,7 +88,10 @@ class ConfigChangesTests(unittest.TestCase):
                 with contextlib.redirect_stderr(errors), contextlib.redirect_stdout(io.StringIO()):
                     code = main(["--config", str(path), "--repo", str(repo), "resume", "run_missing"])
                 self.assertEqual(code, 1)
-                self.assertEqual(errors.getvalue(), f"harness: 未知配置键：runtime.{key}\n")
+                first, notice = errors.getvalue().splitlines()
+                self.assertEqual(first, f"harness: 未知配置键：runtime.{key}")
+                stop = json.loads(notice.removeprefix("[harness-json] "))["stop"]
+                self.assertEqual((stop["kind"], stop["exit_code"]), ("unclassified", 1))
                 self.assertFalse((repo / ".harness").exists())
 
     def test_rejects_unsupported_codex_worker_before_dispatch(self):

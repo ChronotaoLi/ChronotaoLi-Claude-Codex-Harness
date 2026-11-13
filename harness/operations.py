@@ -180,7 +180,7 @@ class OperationRecord:
                   "cli": {name: probe_cli(name) for name in PROVIDER_CLIS},
                   "run_id": None, "run_linked_at": None,
                   "finished_at": None, "finished_at_utc": None,
-                  "exit_status": None, "result_status": None, "error": None, "error_type": None,
+                  "exit_status": None, "result_status": None, "error": None, "stop": None,
                   "error_omitted": None}
         directory = Path(state) / "operations"
         path = directory / f"{operation_id}.json"
@@ -210,17 +210,23 @@ class OperationRecord:
         self.record.update(run_id=run_id, run_linked_at=time.time(), status="running")
         write_json(self.path, self.record)
 
-    def finish(self, *, exit_status, result_status=None, error=None, run_id=None):
-        """Best-effort final update: never raises, never changes the caller's exit status."""
+    def finish(self, *, exit_status, result_status=None, error=None, run_id=None, stop=None):
+        """Best-effort final update: never raises, never changes the caller's exit status.
+
+        ``stop`` is the projection the CLI reported; with file inputs its text
+        is omitted, while kind, reason, exit code and exits are kept.
+        """
         try:
             if self.record["run_id"] is None and run_id is not None:
                 self.record.update(run_id=run_id, run_linked_at=time.time())
             finished = time.time()
             omitted = error is not None and self.file_inputs
+            if stop is not None and omitted:
+                stop = {key: value for key, value in stop.items() if key != "detail"}
             self.record.update(status="finished", finished_at=finished, finished_at_utc=utc_text(finished),
                                exit_status=exit_status, result_status=result_status,
                                error=first_line(error) if error is not None and not omitted else None,
-                               error_type=type(error).__name__ if error is not None else None,
+                               stop=stop,
                                error_omitted=ERROR_OMITTED if omitted else None)
             write_json(self.path, self.record)
         except Exception as failure:

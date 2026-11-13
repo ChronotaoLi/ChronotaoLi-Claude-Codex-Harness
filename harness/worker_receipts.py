@@ -370,14 +370,12 @@ class WorkerReceipts(RuntimeService):
         if reason != 'provider_failure' or not previous or previous.get('dispatch_id') != entry['id']:
             # A later classification must not replace an observed timeout or
             # cancellation with the generic recovery error used to retire it.
-            recovery = self.services.workflow.worker_recovery(entry['task_id'], entry['id'], job, error)
+            recovery = self.services.workflow.worker_recovery(entry['task_id'], entry['id'], job)
         if evidence is not None:
             entry['worker_return_evidence'] = evidence
         entry.update(status=status, error=str(error))
         if invalid_output is not None:
             entry['invalid_output'] = invalid_output
-        self.context.run['last_runtime_error'] = {'role': 'worker', 'kind': entry['kind'],
-            'task_id': entry['task_id'], 'error': str(error), 'artifact': str(job)}
         if recovery is not None:
             self.context.run.setdefault('worker_recovery', {})[entry['task_id']] = recovery
         self.consume(key, reason)

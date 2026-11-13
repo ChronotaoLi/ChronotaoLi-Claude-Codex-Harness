@@ -47,7 +47,9 @@ class RejectionCLITests(unittest.TestCase):
         self.assertEqual(len(records), 1)
         record = read_json(records[0])
         self.assertEqual(record['arguments']['reject_continuation'], 'private.json')
-        self.assertEqual(record['error_type'], 'HarnessError')
+        self.assertEqual((record['stop']['kind'], record['stop']['reason'], record['stop']['exit_code']),
+                         ('unclassified', 'untyped_harness_error', 1))
+        self.assertNotIn('detail', record['stop'])
         self.assertIsNone(record['error'])
         self.assertTrue(record['error_omitted'])
         self.assertNotIn(secret, records[0].read_text())

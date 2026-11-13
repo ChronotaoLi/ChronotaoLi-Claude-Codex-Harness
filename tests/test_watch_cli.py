@@ -6,6 +6,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from test_harness import stopped
+from harness import stops
 from harness import cli
 from harness.util import HarnessError, write_json
 from harness.versions import RUN_SCHEMA_VERSION
@@ -37,14 +39,19 @@ class WatchCliTests(unittest.TestCase):
                 if self.calls == 2:
                     write_json(path, run)
                     return True
-                write_json(path, {**run, "status": "blocked", "error": "budget reached"})
+                write_json(path, {**run, "status": "blocked",
+                                  "stop": stops.make("unclassified", "untyped_harness_error",
+                                                     data={"error_type": "HarnessError", "detail": "budget reached"})})
                 return True
         output = io.StringIO()
         with patch("harness.watch_cli.RunWatcher", Watcher):
             self.assertEqual(watch_run(self.state, "run_test", stdout=output), 0)
         rows = [json.loads(line) for line in output.getvalue().splitlines()]
         self.assertEqual([row["status"] for row in rows], ["running", "blocked"])
-        self.assertEqual(rows[-1]["error"], "budget reached")
+        self.assertEqual(rows[-1]["stop"], {"kind": "unclassified", "reason": "untyped_harness_error",
+                                            "title": stops.REGISTRY[("unclassified", "untyped_harness_error")]["title"],
+                                            "exit_code": 1})
+        self.assertNotIn("error", rows[-1])
 
     def test_explicit_state_command_needs_no_git_repository_or_config(self):
         write_json(self.path, {**self.run, "status": "completed"})
@@ -57,7 +64,7 @@ class WatchCliTests(unittest.TestCase):
         self.assertEqual(json.loads(output.getvalue())["status"], "completed")
 
     def test_follow_continues_past_blocked_and_closes_on_interrupt(self):
-        write_json(self.path, {**self.run, "status": "blocked"})
+        write_json(self.path, stopped(dict(self.run)))
         closed = []
         class Watcher:
             backend = "fixture"

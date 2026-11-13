@@ -18,7 +18,14 @@ PROCESS_HEARTBEAT_SECONDS = 60
 
 
 class HarnessError(Exception):
-    pass
+    """A rejected step; ``stop`` is the stop value it carries (stops.make), or None."""
+
+    stop = None
+
+    def __init__(self, *args, stop=None):
+        super().__init__(*args)
+        if stop is not None:
+            self.stop = stop
 
 
 class ProcessStartError(HarnessError):

@@ -10,7 +10,7 @@
 
 ## 通用规则
 
-- 先看 `status RUN`：它给出状态、错误首行、预算（`budgets`、`budget_explanation`、`remaining_model_calls`）、worker 结局计数 `worker_outcomes`、待答决定 `pending_decisions`、续作 `continuation`、缺失命令 `missing_command_requirements`、最近环境阻断 `last_environment_blocker`、返工提示 `convergence` 和审阅轮次 `review_rounds`。`status RUN --full` 输出完整台账。
+- 先看 `status RUN`：它给出状态、停止投影 `stop`（类型、标题、出口命令与诊断摘录）、预算（`budgets`、`budget_explanation`、`remaining_model_calls`）、worker 结局计数 `worker_outcomes`、待答决定 `pending_decisions`、续作 `continuation`、缺失命令 `missing_command_requirements`、最近环境阻断 `last_environment_blocker`、返工提示 `convergence` 和审阅轮次 `review_rounds`。`status RUN --full` 输出完整台账。
 - 每个出口都沿用同一 run 的累计预算、证据和接受条件。读得出的拒绝、停止和阻断不会被丢弃；读不出否决的无效输出不是结果，由新调用重做（见[无效输出与自动重做](#无效输出与自动重做)）。同一快照上重复 `resume` 只会得到同样的停止，或消耗新的调用。
 - 出口可以是继续，也可以是保留现场后 `abandon`。`abandon` 与 `resume` 一样先经过 `load_run`：加载时核验的证据（见[证据损坏](#证据损坏)）被删改时，两者都被拒绝。
 - `resume` 使用与 `run` 相同的 `--config`。恢复时只能提高 `agent_timeout_seconds`、`verify_timeout_seconds`、`context_chars`、`claude_max_turns`（及各角色实际生效的 `claude_max_turns_by_role`）、`max_attempts`、`max_agent_dispatches`，或在 `permissions.worker_commands` 追加精确 argv；其他配置、模型和共享资产必须与创建时一致。
@@ -43,7 +43,7 @@
 
 ## 阻塞状态与操作者出口
 
-“停止信息”是 `status RUN` 的 `error` 或 stderr 中的错误首行（节选）。
+“停止信息”是 `status RUN` 的 `stop.detail` 或 stderr 的第一行（节选）。当前只有计划待批准（`plan_approval`）与中断（`interrupted`）有专门的类型，其余停止都是 `unclassified`，按停止信息选择下表的出口。
 
 | 停止信息或状态 | 操作者该做什么 | 命令 |
 | --- | --- | --- |

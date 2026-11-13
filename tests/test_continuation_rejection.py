@@ -14,7 +14,7 @@ from harness.cli import status_summary
 from harness.recovery import snapshot_digest
 from harness.util import HarnessError, read_json, write_json
 import harness.worker_receipts as worker_receipts_module
-from test_harness import RepoCase, ROOT, add_worker_dispatch, after_save
+from test_harness import RepoCase, ROOT, add_worker_dispatch, after_save, stopped
 from test_runtime_changes import ScriptedBackend
 
 
@@ -26,9 +26,9 @@ class RejectionEvidenceTests(unittest.TestCase):
         self.candidate = {'head': 'head', 'index': 'index', 'files': {'code': 'candidate'}}
         self.saved = []
         self.context = SimpleNamespace(directory=self.root / 'run', state=self.root / '.harness',
-            run={'id': 'run', 'tasks': [{'id': 'task'}], 'accepted': {}, 'dispatches': [],
-                 'current_task': 'task', 'status': 'blocked', 'attempts': {'task': 1},
-                 'agent_dispatches': 1, 'rounds': 3},
+            run=stopped({'id': 'run', 'tasks': [{'id': 'task'}], 'accepted': {}, 'dispatches': [],
+                         'current_task': 'task', 'attempts': {'task': 1},
+                         'agent_dispatches': 1, 'rounds': 3}),
             config={'runtime': {'agent_timeout_seconds': 30}, 'permissions': {'worker_commands': []},
                     'verification': {'commands': [['python3', '-m', 'unittest']]}},
             snapshot=lambda: deepcopy(self.candidate), save=lambda: self.saved.append(deepcopy(self.context.run)))

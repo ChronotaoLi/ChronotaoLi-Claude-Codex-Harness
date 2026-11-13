@@ -120,6 +120,30 @@ def after_save(engine, predicate, action):
     return patch.object(engine.context, "save", side_effect=wrapped), state
 
 
+def stopped(run, status="blocked"):
+    """Put a hand-built ledger into a stop status together with its stop value, as a real stop saves it."""
+    from harness import stops
+    value = (stops.make("interrupted", "signal") if status == "interrupted" else
+             stops.make("unclassified", "untyped_harness_error", data={"error_type": "HarnessError"}))
+    run.update(status=status, stop=value)
+    return run
+
+
+def commit_recorder():
+    """Record a copy of the ledger after every successful RunStore commit; commits are unchanged."""
+    import copy
+    from unittest.mock import patch
+    from harness.run_store import RunStore
+    states = []
+    original = RunStore.commit
+
+    def recording(store, *args, **kwargs):
+        result = original(store, *args, **kwargs)
+        states.append(copy.deepcopy(store.run))
+        return result
+    return patch.object(RunStore, "commit", recording), states
+
+
 def review_bound(kind):
     """Predicate: a returned review of this kind is bound by its digest (the receipt save)."""
     def predicate(run):
@@ -384,7 +408,7 @@ class RuntimeTests(RepoCase):
     def test_resume_refuses_live_old_process(self):
         engine = self.engine()
         engine.start("Implement greet")
-        engine.run["status"] = "interrupted"
+        stopped(engine.run, "interrupted")
         engine.run["dispatches"][-1]["pgid"] = os.getpgrp()
         engine.run["dispatches"][-1]["exit_confirmed"] = False
         engine.context.save()

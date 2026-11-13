@@ -135,8 +135,6 @@ class ResultReceipts(RuntimeService):
             return
         entry = next(d for d in self.context.run["dispatches"] if d["id"] == receipt["dispatch_id"])
         entry.update(status="failed", error=str(error))
-        self.context.run["last_runtime_error"] = {"role": entry["role"], "kind": entry["kind"],
-            "task_id": entry["task_id"], "error": str(error), "artifact": str(Path(receipt["artifact"]).parent)}
         self.context.save()
 
     def discard_unreturned(self, key):
@@ -169,8 +167,6 @@ class ResultReceipts(RuntimeService):
         if out_of_scope_paths is not None:
             # Never auto-redone: the redo rule treats it like a redo already spent.
             entry["out_of_scope_paths"] = list(out_of_scope_paths)
-        self.context.run["last_runtime_error"] = {"role": entry["role"], "kind": entry["kind"],
-            "task_id": entry["task_id"], "error": str(error), "artifact": str(Path(receipt["artifact"]).parent)}
         self.context.run[field].pop(key)
         self.context.save()
         self.observe_invalid(entry)

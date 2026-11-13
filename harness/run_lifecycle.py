@@ -8,7 +8,7 @@ from pathlib import Path
 
 from .versions import RUN_SCHEMA_VERSION, read_current_ledger
 from .config import normalized
-from . import git
+from . import git, stops
 from .operations import warn
 from .input_projection import validate_dispatch_indexes as validate_input_dispatch_indexes
 from .path_evidence import validate_dispatch_indexes
@@ -114,6 +114,7 @@ class RunLifecycle(RuntimeService):
         if (self.context.run.get("id") != ident or any(type(self.context.run.get(k)) is not t for k, t in required.items())
                 or any(not isinstance(d, dict) for d in self.context.run["dispatches"])):
             raise HarnessError("运行台账字段缺失或类型无效；保留原文件并核对证据")
+        self.validate_stop()
         if self.context.run["repo"] != str(self.context.repo):
             raise HarnessError("Run 属于另一个项目")
         if self.context.run['config_snapshot'] != normalized(self.context.run['config_snapshot']):
@@ -129,6 +130,10 @@ class RunLifecycle(RuntimeService):
         self.services.decisions.validate_decision_links()
         self.services.progress.validate_checkpoint_links()
         continuation_packet(runtime)
+
+    def validate_stop(self):
+        """``stop`` exists exactly while the status is a stop, matches it, and is registered."""
+        stops.validate_ledger(self.context.run)
 
     def validate_recovery_links(self):
         """Reject inconsistent recovery links before any resumed side effects.
@@ -269,6 +274,7 @@ class RunLifecycle(RuntimeService):
             self.context.ensure_exited()
             if self.context.run["status"] != "abandoned":
                 self.context.run["status"] = "abandoned"
+                self.context.run.pop("stop", None)
                 self.context.save()
                 self.context.checkpoint()
                 self.context.event("run_abandoned")

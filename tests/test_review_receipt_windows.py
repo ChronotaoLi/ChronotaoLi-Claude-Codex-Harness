@@ -1,6 +1,7 @@
 from pathlib import Path
 from unittest.mock import patch
 
+from harness import stops
 from harness.util import HarnessError, read_json, write_json
 from test_harness import ROOT, RepoCase, crash_after_save, review_bound
 from test_runtime_changes import ScriptedBackend, finding
@@ -211,7 +212,7 @@ class ReviewReceiptWindowTests(RepoCase):
         self.assertEqual(len(backend.calls), calls)
         self.assertEqual(len(read_json(engine.directory / "state.json")["final_history"]), 1)
 
-    def test_missing_review_receipt_updates_dispatch_and_runtime_error(self):
+    def test_missing_review_receipt_updates_dispatch_and_stop(self):
         backend = ScriptedBackend()
         engine = self.engine(backend)
         self.stop_after_final_bound(engine)
@@ -220,6 +221,6 @@ class ReviewReceiptWindowTests(RepoCase):
         resumed = self.engine(backend)
         with self.assertRaisesRegex(HarnessError, "缺失或无法读取"):
             resumed.resume(engine.run["id"])
-        self.assertIn("缺失或无法读取", resumed.run["last_runtime_error"]["error"])
         entry = next(d for d in resumed.run["dispatches"] if d["id"] == source["dispatch_id"])
-        self.assertEqual(entry["error"], resumed.run["last_runtime_error"]["error"])
+        self.assertIn("缺失或无法读取", entry["error"])
+        self.assertEqual(resumed.run["stop"]["data"]["detail"], stops.bounded(entry["error"]))

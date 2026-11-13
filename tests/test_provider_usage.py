@@ -4,6 +4,7 @@ import subprocess
 import sys
 from unittest.mock import patch
 
+from harness import stops
 from harness.adapters import CLIBackend, provider_usage
 from harness.util import HarnessError, read_json
 from test_harness import RepoCase, ROOT
@@ -193,7 +194,9 @@ class ProviderUsageTests(RepoCase):
             engine.start("Implement greet", self.plan())
         self.assertIn("Reached maximum number of turns (100)", str(caught.exception))
         self.assertNotIn("MODEL_PRIVATE_BODY", str(caught.exception))
-        self.assertEqual(engine.run["last_runtime_error"]["error"], str(caught.exception))
+        worker = next(entry for entry in engine.run["dispatches"] if entry["role"] == "worker")
+        self.assertEqual(worker["error"], str(caught.exception))
+        self.assertEqual(engine.run["stop"]["data"]["detail"], stops.bounded(str(caught.exception)))
         self.assertEqual(engine.run["accepted"], {})
         self.assertEqual(engine.run["attempts"], {"greet": 1})
         self.assertEqual(len(backend.calls), 1)

@@ -19,6 +19,7 @@
 | `runtime.py`、`services.py`、`run_context.py` | 生命周期 API `Runtime`；组装命名服务；当前 run 的台账、事件、快照 |
 | `run_store.py` | 台账唯一提交入口（不变量 27） |
 | `run_lifecycle.py` | 新建 run、`load_run` 校验、恢复预检与选项互斥、`abandon` |
+| `stops.py` | 停止值、登记表与投影 |
 | `scheduler.py`、`workflow.py` | 唯一调度循环与下一步的推导（`next_step`）；停止记账、交接目标、决定请求同步、指挥提问门禁、worker 失败来源 |
 | `planning.py`、`requirements.py` | 计划登记、`decide` 的组包与三种落地、修订的复核、归档与发布、待派发指令的复核、范围授权；任务命令前置条件 |
 | `dispatch.py`、`packets.py`、`context.py`、`input_projection.py`、`path_evidence.py` | 派发、预算、`invoked`、无效输出的重做；角色输入；上下文与容量报告；输入和路径索引 |
@@ -89,7 +90,7 @@
 27. 台账只经 `RunStore` 提交：在 `store.lock` 下比较已加载字节的摘要，拒绝旧写入，原子写入并递增 `store_revision`；外部动作前也核对当前权威。`run.lock` 保护生命周期。
 28. 只支持当前台账版本 18，只解释一种台账形状和一种配置形状：其他版本（含缺失或非整数的版本）不迁移、不补写默认值、不解释字段；`resume`、`abandon`、`prepare-run`、`cleanup-run`、`status RUN`（含 `--full`）、`watch`、`permission-diagnostics`、观察网页的 run 详情、命令 broker（建 manifest、执行与删除）和只读 MCP 都在读完版本、读任何其他字段之前拒绝，错误写明该 run 的台账版本与当前版本；非对象的台账同样按“不支持”处理；任务记忆的来源台账不是当前版本时来源状态为 `unsupported`，其任务历史不再召回；运行列表（不带 run 的 `status`、观察网页的列表）对其他版本只给出路径、版本和“不支持”，一个旧版本或损坏的目录不影响其他 run 的列出。配置的未知键（含已删除的键）一律报“未知配置键”，不给迁移提示。resume 另核对共享资产摘要和完整配置快照。
 29. 必要输入超过 `context_chars` 时不调用模型、不扣额度，报告仍写入 `context-report.json`；可选记忆按整条加入剩余空间。成功派发的报告保留根与顶层字段尺寸及最大的 30 个嵌套字段并给出省略数，超限报告保留全部明细。
-30. 观察层（`status`、`watch`、`dashboard`、操作记录、`supervise` 回执）不写台账、不取 `run.lock`、不参与恢复。
+30. 观察层（`status`、`watch`、`dashboard`、操作记录、`supervise` 回执）不写台账、不取 `run.lock`、不参与恢复。它们显示的停止信息都是 `stop` 的投影，不解析文字。
 
 **身份**
 
@@ -103,6 +104,10 @@
 
 33. 运行时拥有的全新验证检出随用途结束：检出记录 `checkout.json` 创建时写明所属的 run、整体尝试与验证轮次（`owner`），整体验证结论（含 `phase=reviewing`）与该记录的摘要（轮次的 `checkout_digest`）在同一次保存里登记；结论保存之后、整体审阅派发之前，运行时在这一个位置尝试回收该尝试最近一轮、结论已绑定的检出，首次进入与恢复走同一个调用点。回收与 `cleanup-run` 共用同一段删除代码与门禁（证据位置、归属、摘要、路径形状、Git 绑定、HEAD、可删除性），先写 `cleanup.json` 的 `pending` 再 `git worktree remove`、确认目录与注册都消失后写 `removed`；不写台账；删除失败只记尽力而为的事件，不改变结论、不重跑验证或审阅；权威核对或退出证据失败时 run 照常停止。失败或中断轮次的检出保留到 `cleanup-run --remove`，连同其中的忽略文件删除。任务工作树的忽略文件只在本次命令带 `--remove-ignored` 时随工作树删除。两种资源上，未忽略的未跟踪文件、已跟踪改动、暂存区与 HEAD 不符、隐藏索引标志都阻止删除。
 
+**停止**
+
+34. 停止是一个有限的值 `stop = {kind, reason, data, source}`，只在 `status` 为 `awaiting_approval`、`blocked`、`interrupted` 时存在，与 `status` 同一次保存，进入 `running` 或 `abandoned` 时同一次删除。`(kind, reason)` 必须是登记表（`stops.REGISTRY`）的一行；`data` 只含该行登记的有界字段与诊断摘录 `detail`（最多 2,000 字符），`source` 只含身份（任务、派发、请求、续作、产物路径与摘要）。文案、建议出口和退出码由登记表从这个值投影；`status`、`run_stopped`、操作记录、stderr 用同一个投影。运行时不读 `stop` 做调度、权限或恢复判断，恢复仍重跑全部门禁。未标注类型的异常记为 `unclassified`。
+
 ## 状态转换
 
 ### run 状态
@@ -110,13 +115,13 @@
 | 状态 | 进入 | 离开 |
 | --- | --- | --- |
 | `planning` | 首次保存 | 计划登记后进入 `running` 或 `awaiting_approval` |
-| `awaiting_approval` | `--pause-after-plan` 且计划未批准 | `resume --approve-plan` |
-| `running` | 每次进入执行循环，同时清除 `error`、`error_type` | 停止、暂停或完成 |
+| `awaiting_approval` | `--pause-after-plan` 且计划未批准；与 `stop`（`plan_approval/initial_plan`）同次保存 | `resume --approve-plan` |
+| `running` | 每次进入执行循环，同时删除 `stop` | 停止、暂停或完成 |
 | `paused` | `--step` 下本次已接受一个任务 | 普通 `resume` |
-| `blocked` | 执行中出错：先保存状态与错误，再写 `run_stopped` | 对应恢复出口或 `abandon` |
-| `interrupted` | Ctrl-C、SIGTERM、SIGHUP | 普通 `resume` 或 `abandon` |
+| `blocked` | 执行中出错：先在一次保存里写状态与 `stop`，再写 `run_stopped` | 对应恢复出口或 `abandon` |
+| `interrupted` | Ctrl-C、SIGTERM、SIGHUP；与 `stop`（`interrupted/signal`）同次保存 | 普通 `resume` 或 `abandon` |
 | `completed` | 整体批准后保存 | 终态；普通 `resume` 返回保存结果 |
-| `abandoned` | `abandon` | 终态；不能 resume |
+| `abandoned` | `abandon`，同时删除 `stop` | 终态；不能 resume |
 
 ### 新建台账的键
 
@@ -163,9 +168,8 @@
 | `pending_revision` | `decide` 的 revise 落地：计划文件先写，再与回执消费同次保存修订号、路径与 SHA256 | 修订发布 | 发布前复核文件与原件、重放修订；需要时归档、重置，再发布；其间任一点中断，普通 resume 从计划文件重来（见 recovery.md 的指挥提问、修订与范围） |
 | `pending_continuation` | 续作登记 | 条件满足或被拒绝时置 null | 条件未满足时停止并列出缺口 |
 | `continuation_rejections` | `--reject-continuation` | 不清除；由 worker dispatch 的 `continuation_rejection_id` 消费 | 拒绝文件先写；与 `pending_directive` 同次 |
-| `worker_recovery` | 已调用的 worker 失败、结果或交接被拒 | 同 dispatch 正常交接、接受、需归档的修订发布 | 后续指挥与 worker 的 `recovery` 输入 |
-| `last_runtime_error` | 调用或回执处理失败 | 不清除 | 诊断 |
-| `error`、`error_type` | 停止时 | 在重新 `running` 时清除 | 先保存再写 `run_stopped` |
+| `worker_recovery` | 已调用的 worker 失败、结果或交接被拒 | 同 dispatch 正常交接、接受、需归档的修订发布 | 后续指挥与 worker 的 `recovery` 输入；记录不含错误文字，组包时从来源派发条目读取错误摘录 |
+| `stop` | `Workflow.stop()`；进入 `awaiting_approval` | 进入 `running`；`abandon` | 与 `status` 同次保存，之后写 `run_stopped`；`load_run` 校验存在条件、登记与形状 |
 | `command_requirements` | 计划登记、恢复、调度时重算，变化才保存 | 不清除 | 只是诊断，派发前总是重算 |
 | `context_capacity` | 整体审阅容量预估，变化才保存 | 不清除 | 必要下界超限时提前停止 |
 

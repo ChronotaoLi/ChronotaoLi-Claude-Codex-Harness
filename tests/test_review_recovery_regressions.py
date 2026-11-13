@@ -130,7 +130,8 @@ class ReviewRecoveryRegressionTests(RepoCase):
         engine = self.engine(backend)
         with self.assertRaises(HarnessError):
             engine.start("Implement and confirm greet", plan)
-        failure = copy.deepcopy(engine.run["last_runtime_error"])
+        failed = next(entry for entry in engine.run["dispatches"] if entry["role"] == "worker")
+        failed_job = str(engine.directory / "dispatches" / failed["id"])
         self.assertIn("unfinished edit", (engine.worktree / "hello.py").read_text())
         result = self.engine(backend).resume(engine.run["id"])
         self.assertEqual(result["status"], "completed")
@@ -143,8 +144,10 @@ class ReviewRecoveryRegressionTests(RepoCase):
             recovery = recovery["recovery"] if call["role"] == "commander" else recovery
             self.assertEqual(recovery["task_id"], "greet")
             self.assertEqual(recovery["kind"], "implement")
-            self.assertEqual(recovery["artifact"], failure["artifact"])
-            self.assertIn("error_max_turns", recovery["error"])
+            self.assertEqual(recovery["artifact"], failed_job)
+            self.assertEqual(recovery["source"]["dispatch_id"], failed["id"])
+            self.assertIn("error_max_turns", recovery["source"]["error"])
+            self.assertNotIn("error", recovery)
             self.assertIn("hello.py", recovery["changed_files"])
         other_task = [call for call in backend.calls if call["task_id"] == "confirm"]
         self.assertTrue(other_task)

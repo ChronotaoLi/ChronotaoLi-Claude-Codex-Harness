@@ -782,8 +782,14 @@ APP_JS = r""""use strict";
     if (data.summary_error) {
       add("bad", "状态摘要失败", [notice(data.summary_error, "error-text"), notice("其余区块按原始字段尽量给出。", "hint")]);
     }
-    if (run.error) {
-      add("bad", "运行错误" + (run.error_type ? "（" + run.error_type + "）" : ""), [notice(run.error, "error-text")]);
+    var stop = summary.stop;
+    if (stop && stop.kind !== "plan_approval") {
+      add(stop.exit_code === 130 ? "warn" : "bad", "停止：" + stop.title + "（" + stop.kind + "/" + stop.reason + "）",
+        [stop.detail ? notice(stop.detail, "error-text") : null].concat((stop.exits || []).map(function (command) {
+          var node = el("p", "hint", "出口：");
+          node.appendChild(el("code", null, command));
+          return node;
+        })).filter(function (node) { return node !== null; }));
     } else if (run.status === "blocked") {
       add("bad", "运行已阻断", [notice("台账状态为 blocked，可在调用记录和事件日志中查看原因。")]);
     }
@@ -1313,7 +1319,8 @@ APP_JS = r""""use strict";
       panel.appendChild(table(["操作", "类型", "状态", "开始", "耗时", "结果", "错误", "详情"],
         operations.records.map(function (op) {
           var more = disclosure("operation:" + show(op.file), "技术字段");
-          more.appendChild(kv([["记录文件", mono(op.file)], ["退出码", op.exit_status], ["结束", fmtTime(op.finished_at)],
+          more.appendChild(kv([["记录文件", mono(op.file)], ["退出码", op.exit_status],
+            ["停止类型", op.stop ? op.stop.kind + "/" + op.stop.reason : null], ["结束", fmtTime(op.finished_at)],
             ["Harness 修订", op.harness && op.harness.revision], ["参数", op.arguments]]));
           return [mono(op.operation_id), op.kind, op.status, fmtTime(op.started_at), fmtDuration(op.started_at, op.finished_at),
             op.result_status, op.error ? el("span", "error-text", op.error) : optional(null), more];
@@ -1340,7 +1347,8 @@ APP_JS = r""""use strict";
       ["首个事件时间", fmtTime(data.timing && data.timing.first_event_time)],
       ["最后事件时间", fmtTime(data.timing && data.timing.last_event_time)],
       ["事件时间跨度", fmtDuration(data.timing && data.timing.first_event_time, data.timing && data.timing.last_event_time)],
-      ["错误类型", run.error_type], ["运行错误", run.error],
+      ["停止类型", summary.stop ? summary.stop.kind + "/" + summary.stop.reason : null],
+      ["停止详情", summary.stop ? summary.stop.detail : null],
       ["不可用区块", unavailable.length ? unavailable.join("、") : "无"]
     ]));
     if (summary.worker_outcomes) {

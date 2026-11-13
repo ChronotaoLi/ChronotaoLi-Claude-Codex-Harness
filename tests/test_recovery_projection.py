@@ -1,5 +1,6 @@
 from copy import deepcopy
 from pathlib import Path
+from harness import stops
 from harness.recovery import worker_recovery_context
 from harness.util import HarnessError, ProcessTimeout, dump, read_json
 from test_engine_repairs import RecordingBackend
@@ -95,7 +96,11 @@ class RecoveryProjectionTests(RepoCase):
         for source, attempt in ((original, 1), (failed, 3)):
             entry = next(item for item in result["dispatches"] if item["id"] == source["dispatch_id"])
             self.assertEqual(entry["status"], "failed")
-            self.assertEqual(entry["error"], source["error"])
+            # The recovery record carries no text; the failure text stays on its dispatch entry.
+            self.assertNotIn("error", source)
+            self.assertTrue(entry["error"])
+            if source is failed:
+                self.assertEqual(projected["source"]["error"], stops.bounded(entry["error"]))
             self.assertEqual((Path(source["artifact"]) / "failure.log").read_text(), f"timeout evidence {attempt}\n")
         self.assertEqual([item["attempt"] for item in result["review_history"]["greet"]], [2, 4])
         self.assertEqual(result["review_history"]["greet"][0]["review"]["findings"], [finding()])

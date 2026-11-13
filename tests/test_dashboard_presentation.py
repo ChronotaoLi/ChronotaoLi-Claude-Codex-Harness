@@ -101,7 +101,14 @@ def event(time, name, task="t2", dispatch_id=None, **extra):
     return record
 
 
-def detail(run_id, goal, *, status="running", summary=None, dispatches=(), events=(), error=None):
+def stop_value(detail_text, kind="unclassified", reason="untyped_harness_error", title="未分类的停止；不推测恢复动作",
+               exit_code=1, exits=()):
+    """A stop projection as cli.status_summary() reports it."""
+    return {"kind": kind, "reason": reason, "title": title, "exit_code": exit_code, "exits": list(exits),
+            "data": {}, "source": {}, "detail": detail_text}
+
+
+def detail(run_id, goal, *, status="running", summary=None, dispatches=(), events=(), stop=None):
     rows = list(dispatches)
     records = list(events)
     last = records[-1]["time"] if records else None
@@ -111,11 +118,13 @@ def detail(run_id, goal, *, status="running", summary=None, dispatches=(), event
             "convergence": {"advisory_only": True, "warnings": [], "truncated": False, "suggestion": "advisory"},
             "worker_outcomes": {"completed": 1, "task_blocked": 0, "environment_blocked": 0, "operator_blocked": 0,
                                 "continuation_blocked": 0, "runtime_failed": 0, "unknown": 0}}
+    if stop is not None:
+        base["stop"] = stop
     base.update(summary or {})
     run = {"id": run_id, "status": status, "goal": goal, "branch": "harness/" + run_id, "worktree": "/tmp/wt",
-           "repo": "/tmp/repo", "commander": "fable", "current_task": "t2", "error_type": None,
+           "repo": "/tmp/repo", "commander": "fable", "current_task": "t2",
            "created_by_operation": "op_1", "config_path": "/tmp/harness.toml", "expected_head": "abc",
-           "base_commit": "def", "error": error, "worktree_removed": False}
+           "base_commit": "def", "worktree_removed": False}
     return {"id": run_id, "sampled_at": 2000.0, "sampled_at_utc": "2026-11-09T00:00:00Z", "ledger_error": None,
             "summary": base, "summary_error": None, "schema_version": RUN_SCHEMA_VERSION, "unavailable": [], "run": run,
             "budgets": {"agent_dispatches": 5, "attempts": {"t1": 1, "t2": 2}, "attempts_total": 3,
@@ -436,7 +445,7 @@ class DashboardPresentationTests(unittest.TestCase):
 
     def test_actionable_problems_lead_the_detail_and_vanish_when_none(self):
         question = "是否允许扩大到 config 目录？" + "背景说明" * 200 + "QUESTION-END-MARKER"
-        problems = detail("run_bad", "Ship it", status="blocked", error="boom: provider failure",
+        problems = detail("run_bad", "Ship it", status="blocked", stop=stop_value("boom: provider failure"),
                           dispatches=[dispatch(WORKER, status="failed", outcome=None, error="worker crashed")],
                           summary={
                               "pending_decisions": [{"id": "req-1", "task_id": "t2", "kind": "operator",
@@ -476,6 +485,30 @@ class DashboardPresentationTests(unittest.TestCase):
   assert.equal(all(attrIs("data-attention", "true")).length, 0, "no empty problem section");
   assert.ok(byId.main.textContent.includes("HISTORIC-BLOCKER"), "historic blocker stays discoverable");
   assert.ok(!visibleText(byId.main).includes("HISTORIC-BLOCKER"), "historic blocker is secondary");
+''')
+
+    def test_stop_attention_item_and_meta(self):
+        interrupted = detail("run_int", "Ship it", status="interrupted", stop=stop_value(
+            "STOP-DETAIL-MARKER", kind="interrupted", reason="signal", title="运行被中断", exit_code=130,
+            exits=["resume run_int", "abandon run_int"]))
+        waiting = detail("run_wait", "Ship it", status="awaiting_approval", stop=stop_value(
+            None, kind="plan_approval", reason="initial_plan", title="计划等待明确批准", exit_code=0,
+            exits=["status run_wait --full", "resume run_wait --approve-plan"]))
+        self.run_browser({"interrupted": interrupted, "waiting": waiting}, r'''
+  navigate("#/runs/run_int");
+  await respond("/api/runs/run_int", D.interrupted);
+  const attention = one(attrIs("data-attention", "true"));
+  const shown = visibleText(attention);
+  for (const expected of ["停止：运行被中断（interrupted/signal）", "STOP-DETAIL-MARKER", "resume run_int", "abandon run_int"]) {
+    assert.ok(shown.includes(expected), "stop item shows: " + expected);
+  }
+  assert.ok(byId.main.textContent.includes("停止类型"), "meta panel names the stop type");
+  assert.ok(byId.main.textContent.includes("interrupted/signal"), "meta panel shows kind/reason");
+  navigate("#/runs/run_wait");
+  await respond("/api/runs/run_wait", D.waiting);
+  const waitingText = visibleText(one(attrIs("data-attention", "true")));
+  assert.ok(waitingText.includes("计划等待批准"), "the approval item stays");
+  assert.ok(!waitingText.includes("停止："), "plan approval is not shown twice");
 ''')
 
     def test_damaged_ledger_and_pending_grants_stay_prominent_with_diagnostics_reachable(self):
