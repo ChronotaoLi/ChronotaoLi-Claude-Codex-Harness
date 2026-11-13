@@ -259,6 +259,7 @@ APP_JS = r""""use strict";
     revision_edits_archived: "修订前已归档未接受修改", commander_candidate_changed: "指挥调用期间候选已变化",
     final_verification_failed: "整体验证失败", final_review_rejected: "整体审阅拒绝",
     final_reverification_requested: "请求重新整体验证", environment_update_recorded: "登记环境更新",
+    verification_checkout_reclaimed: "已回收验证检出", verification_checkout_reclaim_failed: "验证检出回收失败",
     environment_checked: "环境检查", command_requirements_checked: "命令授权检查",
     task_checkpoint_recorded: "记录检查点", output_invalid: "输出无效", candidate_preflight_failed: "候选预检失败",
     pending_task_invalidated: "待处理任务作废", pending_acceptance_invalidated: "待接受结果作废",

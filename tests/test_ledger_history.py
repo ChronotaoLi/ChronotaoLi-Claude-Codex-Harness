@@ -74,6 +74,8 @@ class CurrentLedgerTests(RepoCase):
         return [entry for entry in run['dispatches'] if entry['role'] == 'worker' and entry.get('invoked')]
 
     def terminal(self):
+        # Keep the verified checkout as a reclamation failure before its intent would.
+        self.enterContext(patch("harness.finalization.FinalAcceptance.reclaim_verified_checkout"))
         self.config.data['verification'].update(fresh_checkout=True,
             commands=[[sys.executable, '-c', "from pathlib import Path; assert Path('hello.py').is_file()"]])
         command = [sys.executable, '-c', "print('focused continuation check')"]

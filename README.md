@@ -133,7 +133,7 @@ setup_commands = [["npm", "ci"]]
 
 默认 `fresh_checkout = false`、`setup_commands = []`。开启后，仅整体验证改用目标仓库外的全新 detached worktree，顺序执行准备与验证；准备不得改变已跟踪文件或留下未忽略文件，也不授予 worker 权限。任务级验证仍在原工作树，依赖仍须可用。同一 run 不可改变这两项设置。
 
-验证检出保留供检查，只由 `cleanup-run` 显式清理；失败后恢复及显式清理见[整体验证与重验](docs/recovery.md#整体验证与重验)和[放弃与清理](docs/recovery.md#放弃与清理)。该模式仍使用当前环境、Git 配置及声明的准备命令，不承诺容器级可复现性。忽略路径清单只是诊断，不校验目录内部内容，不能替代全新检出。
+验证通过、结论已保存的检出由运行时在整体审阅派发前尝试回收（删除失败只记事件，留给 `cleanup-run`）；准备失败、验证失败或中断的检出保留供检查，由 `cleanup-run` 显式清理；失败后恢复及显式清理见[整体验证与重验](docs/recovery.md#整体验证与重验)和[放弃与清理](docs/recovery.md#放弃与清理)。该模式仍使用当前环境、Git 配置及声明的准备命令，不承诺容器级可复现性。审阅包里的忽略清单只列路径（目录折叠、有界），不校验内容，不能替代全新检出。
 
 ## 状态、恢复与清理
 
@@ -147,6 +147,8 @@ python3 -m harness --config /path/to/harness.toml --repo /path/to/project resume
 python3 -m harness --config /path/to/harness.toml --repo /path/to/project abandon RUN
 python3 -m harness --repo /path/to/project cleanup-run RUN
 python3 -m harness --repo /path/to/project cleanup-run RUN --remove
+python3 -m harness --repo /path/to/project cleanup-run RUN --remove-ignored
+python3 -m harness --repo /path/to/project cleanup-run RUN --remove --remove-ignored
 ```
 
 `status RUN` 显示任务、预算、待答决定、续作、审阅轮次和最后错误首行，`--full` 查看完整台账。`resume` 使用保存的现场和全新 agent，不恢复供应商会话，也不清零累计预算。可增加上下文、超时、轮数、尝试与派发上限，或追加精确 worker argv；其余配置及共享资产必须一致。
@@ -187,7 +189,7 @@ python3 -m harness --repo /path/to/project cleanup-run RUN --remove
 
 `abandon RUN` 保留分支、工作树和证据并禁止恢复；它与 `resume` 一样先核验台账和加载时证据，这些证据损坏时同样被拒绝（见[证据损坏](docs/recovery.md#证据损坏)）。放弃不删除文件，移除工作树用之后的 `cleanup-run RUN --remove`。
 
-`cleanup-run RUN` 是唯一的清理入口：默认预览，逐项列出保留的全新验证检出和分支工作树能否清理、被什么挡住；`--remove` 才逐项删除。验证检出在任何 run 状态都可清理；工作树只在 `completed` 或 `abandoned` 时清理，其他状态下报告 `retained`，`reason` 写明当前状态，先完成或放弃该 run。工作树清理完成后可以删除或移动分支，之后再运行仍报告已清理。未保存文件（含忽略文件）、隐藏索引标记、与 HEAD 不符的字节，或原分支已离开检查点，会让对应资源报告 `blocked`，`error` 列出原因与阻塞路径，资源保留，其余资源照常清理。每项的 `status` 为 `eligible`（可删除）、`removed`（已删除）、`absent`（已不存在）、`stale_registration`（检出目录缺失但仍有 Git 注册）、`input_copies_present`（需加 `--remove-input-copies`）、`retained` 或 `blocked`，含义见[放弃与清理](docs/recovery.md#放弃与清理)；只有出现 `blocked` 时退出码为 1。派发或命令子进程退出未确认时整条命令拒绝；父 dispatch 退出不能证明 broker 命令子进程退出，核实后可加 `--confirm-exited DISPATCH_ID` 记录确认。删除意图和完成记录分别写在检出证据旁的 `cleanup.json` 和 run 目录的 `worktree-cleanup.json`，中断后重跑同一命令续做；普通预览不生成记录。命令不改 run 状态，不删除分支、台账或运行证据；需要删除分支时，先完成清理，再由操作者核对集成结果并处理分支。完整规则见[放弃与清理](docs/recovery.md#放弃与清理)。
+`cleanup-run RUN` 是唯一的显式清理入口（验证通过的检出另由运行时在整体审阅前尝试回收）：默认预览，逐项列出保留的全新验证检出和分支工作树能否清理、被什么挡住；`--remove` 才逐项删除。验证检出在任何 run 状态都可清理；工作树只在 `completed` 或 `abandoned` 时清理，其他状态下报告 `retained`，`reason` 写明当前状态，先完成或放弃该 run。工作树清理完成后可以删除或移动分支，之后再运行仍报告已清理。未被忽略的未跟踪文件、已跟踪改动、隐藏索引标记、与 HEAD 不符的字节，或原分支已离开检查点，会让对应资源报告 `blocked`，`error` 列出原因与阻塞路径，资源保留，其余资源照常清理；被挡住的检出条目给出 `recorded_worktree`（检出记录里的目录，未经核对、只作诊断）。验证检出里被 Git 忽略的文件随检出删除；工作树里的忽略文件不带 `--remove-ignored` 时报 `blocked`，`cleanup-run RUN --remove-ignored` 预览有界的忽略清单，`--remove --remove-ignored` 连同删除（被忽略目录里的嵌套仓库也一并删除，清单不显示目录内部）；只有本次命令的选项能授权删除忽略文件。每项的 `status` 为 `eligible`（可删除）、`removed`（已删除）、`absent`（已不存在）、`stale_registration`（检出目录缺失但仍有 Git 注册）、`input_copies_present`（需加 `--remove-input-copies`）、`retained` 或 `blocked`，含义见[放弃与清理](docs/recovery.md#放弃与清理)；只有出现 `blocked` 时退出码为 1。派发或命令子进程退出未确认时整条命令拒绝；父 dispatch 退出不能证明 broker 命令子进程退出，核实后可加 `--confirm-exited DISPATCH_ID` 记录确认。删除意图和完成记录分别写在检出证据旁的 `cleanup.json` 和 run 目录的 `worktree-cleanup.json`，中断后重跑同一命令续做；普通预览不生成记录。命令不改 run 状态，不删除分支、台账或运行证据；需要删除分支时，先完成清理，再由操作者核对集成结果并处理分支。完整规则见[放弃与清理](docs/recovery.md#放弃与清理)。
 
 台账版本为 18，要求完整的 worker 接收意图与配置快照，缺失时不补造默认值。台账只存摘要与引用：worker 接收意图记录派发目录中不可变的 `packet.json`、`schema.json` 的路径与 SHA256，续作、执行指导和续作拒绝行只记 `snapshot_digest`，完整快照在 `continuations/` 等目录的不可变文件里；这些文件被删除、修改或换成符号链接时 `resume` 停止并保留现场。共享规则变更也受资产摘要门禁约束。已完成 run 的普通恢复返回保存结果。
 
@@ -316,7 +318,7 @@ python3 -m harness --config /abs/config.toml --repo /abs/project supervise -- ru
 python3 -m harness --repo /abs/project cleanup-run RUN --remove --remove-input-copies
 ```
 
-`prepare-run` 仅在暂停/等待批准且无未消费阶段的边界准备清单指定的不可变依赖。它不导入需要修改的源代码。`cleanup-run --remove-input-copies` 仍为预览，必须同时 `--remove` 才删除登记且未修改的副本；源文件和其他忽略文件保留。清单与恢复规则见 [操作说明](docs/operations.md#依赖副本清单)。
+`prepare-run` 仅在暂停/等待批准且无未消费阶段的边界准备清单指定的不可变依赖。它不导入需要修改的源代码。`cleanup-run --remove-input-copies` 仍为预览，必须同时 `--remove` 才删除登记且未修改的副本；源文件和其他忽略文件保留（加 `--remove-ignored` 时其他忽略文件随工作树删除；`--remove-ignored` 不能代替 `--remove-input-copies`）。清单与恢复规则见 [操作说明](docs/operations.md#依赖副本清单)。
 
 `supervise` 只启动一次指定的 Harness `run`/`resume`，保留子进程 stdout，监督回执写入 `.harness/supervision/` 并输出到 stderr，退出码等于子进程退出码；不会重启或自动恢复。父进程退出仍不证明 broker 子进程退出。要在 run 停下时得到提示，用 `watch RUN`（到阻塞、暂停、等待批准或终态时退出）或 `supervise`。
 

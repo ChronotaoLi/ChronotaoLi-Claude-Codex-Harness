@@ -61,6 +61,8 @@ class FinalPacketBuilderTests(RepoCase):
                 expected["dispatch_id"] = estimated["dispatch_id"]
                 expected["packet"]["diff_artifact"] = estimated["packet"]["diff_artifact"]
                 expected["packet"]["verification"] = estimated["packet"]["verification"]
+                # The ignored listing is read when the review is built, like its outputs.
+                expected["packet"]["ignored_paths"] = estimated["packet"]["ignored_paths"]
                 self.assertEqual(estimated, expected)
                 # Final review takes the index only; no empty checkpoint lists.
                 self.assertFalse({"task_checkpoints", "checkpoint_history", "checkpoint_sources"}
@@ -82,7 +84,7 @@ class FinalPacketBuilderTests(RepoCase):
         engine = self.engine()
         engine.start("Initial goal", read_json(ROOT / "examples" / "plan.json"), pause_after_plan=True)
         builder = engine.services.packets
-        first = builder.final_review_packet(checks=[], diff_artifact="first.diff", changed_paths=[])
+        first = builder.final_review_packet(checks=[], diff_artifact="first.diff", changed_paths=[], ignored_paths=None)
         replacement = copy.deepcopy(engine.run)
         replacement["goal"] = "Replacement goal"
         replacement["tasks"][0]["description"] = "Refined implementation requirement"
@@ -93,7 +95,8 @@ class FinalPacketBuilderTests(RepoCase):
         engine.run.update(replacement)
         engine.context.save()
         engine.run = copy.deepcopy(engine.run)
-        second = builder.final_review_packet(checks=[], diff_artifact="second.diff", changed_paths=["AGENTS.md"])
+        second = builder.final_review_packet(checks=[], diff_artifact="second.diff", changed_paths=["AGENTS.md"],
+                                             ignored_paths=None)
         self.assertEqual(first["goal"], "Initial goal")
         self.assertEqual(first["prior_reviews"], [])
         self.assertEqual(second["goal"], "Replacement goal")

@@ -1,6 +1,5 @@
 """Resources and persistence barriers shared by named runtime services."""
 from __future__ import annotations
-import hashlib
 import sys
 from copy import deepcopy
 from pathlib import Path
@@ -9,7 +8,7 @@ from .adapters import CLIBackend
 from .budgets import work_attempts
 from .memory import Memory
 from .run_store import RunStore
-from .util import append_event, confirm_dispatches_exited, ensure_dispatches_exited, group_alive, validate_command_directories, write_json
+from .util import HarnessError, append_event, confirm_dispatches_exited, ensure_dispatches_exited, group_alive, validate_command_directories, write_json
 
 class RunContext:
     def __init__(self, config, repo, state=None, backend=None, commander="astra", operation=None):
@@ -47,34 +46,16 @@ class RunContext:
         git.check_worktree_state(self.worktree)
         return git.snapshot(self.worktree, binding=self.run["worktree_binding"])
 
-    def ignored_paths(self):
-        return sorted(filter(None, git.git(self.worktree, "ls-files", "--others", "--ignored",
-                           "--exclude-standard", "--directory", "-z",
-                           binding=self.run["worktree_binding"]).split("\0")))
+    def ignored_inventory(self):
+        """The run worktree's current ignored set for one packet: bounded, never saved.
 
-    def record_ignored_paths(self, stage, folder):
-        """Expose ignored-path inventory as diagnostics, never as content proof."""
-        names = self.ignored_paths()
-        baseline_path = self.directory / "ignored-baseline.json"
-        baseline = self.run["ignored_baseline"]
-        # Baseline data is durable before its optional inspectable artifact.
-        # Recovery must never recapture an initial state after a worker ran.
-        if not baseline_path.exists():
-            write_json(baseline_path, baseline)
-        detail = {"stage": stage, "paths": names, "added": sorted(set(names) - set(baseline)),
-                  "removed": sorted(set(baseline) - set(names)),
-                  "limitation": "Path inventory only; existing ignored files and directory contents are not hashed."}
-        artifact = Path(folder) / "ignored-paths.json"
-        write_json(artifact, detail)
-        summary = {"stage": stage, "count": len(names), "added_count": len(detail["added"]),
-                   "removed_count": len(detail["removed"]), "artifact": str(artifact),
-                   "artifact_digest": hashlib.sha256(artifact.read_bytes()).hexdigest(),
-                   "coverage": "paths_only_not_contents"}
-        self.run["ignored_diagnostics"] = summary
-        self.save()
-        if detail["added"] or detail["removed"]:
-            self.event("ignored_paths_changed", **summary)
-        return summary
+        An unreadable listing says so with its reason; it is never an empty list.
+        """
+        try:
+            return git.bounded_paths(git.ignored_paths(self.worktree, binding=self.run["worktree_binding"]))
+        except (HarnessError, OSError) as error:
+            return {"coverage": "paths_only_not_contents", "entries": None, "entry_count": None,
+                    "omitted_count": None, "error": str(error)[:500]}
 
     def save(self):
         """Publish through RunStore, then notify the current observer."""
@@ -85,6 +66,17 @@ class RunContext:
     def event(self, event, **fields):
         append_event(self.directory / "events.jsonl", self.run["id"], event, **fields)
         print(f"[harness] {event} {fields.get('task_id', '')}", file=sys.stderr, flush=True)
+
+    def observe(self, event, **fields):
+        """Append a best-effort observation that cannot change the lifecycle.
+
+        The ledger and its event log are not written atomically: a crash can omit
+        an event, and recovery neither re-emits nor repeats one.
+        """
+        try:
+            self.event(event, **fields)
+        except Exception:
+            pass
 
     def checkpoint(self):
         # Model-independent handoff. Full logs remain separate and are never recycled as conversation.

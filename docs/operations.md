@@ -199,7 +199,7 @@ run 列表 → run 详情 → 文件查看。列表按最近事件排序，以�
 
 ### 文件访问
 
-只能通过固定根读取 run 目录内的普通文件：顶层 `state.json`、`events.jsonl`、`handoff.json`、`ignored-baseline.json`、`ignored-paths.json`、`worktree-cleanup.json`；目录 `plans/`、`dispatches/<uuid>/`（含 `commands/<32 位十六进制>/`）、`verification/`、`recovery/`、`decisions/`、`environment/`、`checkpoints/`、`path-indexes/`、`indexes/`、`batches/`。`mcp.json`、`run.lock`、`*.tmp` 与 `memory.sqlite3*` 被排除；符号链接与非普通文件一律拒绝，中间目录在检查后被替换为符号链接也无法逃出根目录；路径深度不超过 8。台账中的绝对路径只显示不打开。文件内容永远以 `text/plain`（或 `format=json`）返回，日志不会作为 HTML 执行。
+只能通过固定根读取 run 目录内的普通文件：顶层 `state.json`、`events.jsonl`、`handoff.json`、`worktree-cleanup.json`；目录 `plans/`、`dispatches/<uuid>/`（含 `commands/<32 位十六进制>/`）、`verification/`、`recovery/`、`decisions/`、`environment/`、`checkpoints/`、`path-indexes/`、`indexes/`、`batches/`。`mcp.json`、`run.lock`、`*.tmp` 与 `memory.sqlite3*` 被排除；符号链接与非普通文件一律拒绝，中间目录在检查后被替换为符号链接也无法逃出根目录；路径深度不超过 8。台账中的绝对路径只显示不打开。文件内容永远以 `text/plain`（或 `format=json`）返回，日志不会作为 HTML 执行。
 
 ### 限制
 
@@ -248,7 +248,7 @@ WORK 结果可以带可选的 `checkpoints`，每项为 `{id, summary, inputs, e
 
 源为主检出中的普通独立文件；目标必须在隔离 worktree 中、被 Git 忽略且未跟踪。拒绝符号链接、硬链接、保留路径、隐式凭据路径、源目标重叠和未知已有目标。复制前冻结清单摘要与台账绑定，再记录意图、独占临时文件身份、发布及回执；源和副本不共享 inode。中断后仅用登记的文件身份恢复，不能凭内容相同接管文件。resume 与派发前均核验登记副本；前置核验失败不新增 worker 次数。
 
-清理默认只读预览。`cleanup-run RUN --remove --remove-input-copies` 在终态与进程退出、HEAD/Git 绑定门禁通过后，整批预检源和副本未改变，再逐项记录删除意图和结果。未知或改动的文件保留；其他遗留文件仍会阻止整个 worktree 删除。中断可能留下已删/未删回执，重复执行仅恢复同一意图。此机制不认领构建产物、不运行任意 setup，也不将忽略的可编辑源码导入任务。
+清理默认只读预览。`cleanup-run RUN --remove --remove-input-copies` 在终态与进程退出、HEAD/Git 绑定门禁通过后，整批预检源和副本未改变，再逐项记录删除意图和结果。未知或改动的文件保留；未被忽略的遗留文件仍会阻止整个 worktree 删除，其他被 Git 忽略的文件只在同时加 `--remove-ignored` 时随工作树删除（`--remove-ignored` 不能代替 `--remove-input-copies`：登记的副本还在时照样阻止）。中断可能留下已删/未删回执，重复执行仅恢复同一意图。此机制不认领构建产物、不运行任意 setup，也不将忽略的可编辑源码导入任务。
 
 ## 单次监督
 

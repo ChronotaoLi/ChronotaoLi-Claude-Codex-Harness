@@ -244,7 +244,8 @@ class ExitConfirmationRecoveryTests(RepoCase):
         with patch("harness.cleanup.group_alive", return_value=True):
             removal = cleanup_run(self.repo, engine.run["id"], remove=True)["worktree"]
         self.assertEqual(removal["status"], "blocked")
-        self.assertIn("uncommitted.bin", removal["error"])
+        self.assertIn("__pycache__/", removal["error"])
+        self.assertIn("--remove-ignored", removal["error"])
         self.assertEqual(unsaved.read_bytes(), b"unsaved ignored file")
         self.assertTrue(read_json(engine.directory / "state.json")["dispatches"][0]["exit_confirmed"])
         unsaved.unlink()

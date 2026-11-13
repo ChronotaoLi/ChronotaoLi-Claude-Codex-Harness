@@ -180,7 +180,6 @@ class TaskLifecycle(RuntimeService):
             self.services.worker_receipts.reject(key, error, "result_rejected", status="invalid", invalid_output={
                 "artifact": str(worker_artifact), "artifact_digest": worker_source["worker_artifact_digest"]})
             return False
-        self.context.record_ignored_paths("worker", worker_artifact.parent)
         if snapshot_digest(self.context.snapshot()) != candidate_digest:
             raise HarnessError("worker candidate changed during handoff preparation")
         if result["status"] == "blocked":
@@ -407,7 +406,7 @@ class TaskLifecycle(RuntimeService):
                  {"goal": self.context.run["goal"], "task": task, "base_commit": self.context.run["expected_head"], "changed_files": paths,
                   "instruction_file_changes": instruction_file_changes(paths),
                   "diff_artifact": str(evidence), "verification": compact_checks(checks),
-                  "ignored_paths": deepcopy(self.context.run.get("ignored_diagnostics")),
+                  "ignored_paths": self.context.ignored_inventory(),
                   "prior_reviews": prior_reviews,
                   "required_findings": required,
                   "repair_claims": claims_for_review(required, delivered, pending["worker_result"].get("repair_claims")),

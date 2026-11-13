@@ -6,6 +6,10 @@ concrete resources. Fresh verification checkouts are removable in any run
 status; the branch worktree only for completed or abandoned runs. Each
 resource keeps its own receipt, so an interrupted removal resumes from the
 saved intent. The branch, ledger and run evidence are never removed.
+
+The checkout step (``clean_checkout``) is also the runtime's reclamation of a
+verified checkout after the whole-run verdict is saved: same ownership,
+identity and removability gates, no run lock and no ledger file access.
 """
 from __future__ import annotations
 
@@ -50,12 +54,40 @@ def _ensure_exited(run):
     ensure_dispatches_exited(run["dispatches"], observe=group_alive)
 
 
-def cleanup_run(repo: Path, ident: str, *, remove=False, confirm_exited=(), remove_input_copies=False):
+def common_dir(repo):
+    """The repository's Git common directory, the parent of every linked worktree's admin directory."""
+    return Path(git.git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir").removesuffix("\n")).resolve()
+
+
+def checkout_folder(directory, final, index):
+    """The evidence directory of round ``index`` (from 1) of one whole-run attempt."""
+    return Path(directory) / "verification" / "final" / str(final["attempt"]) / f"verification-{index}"
+
+
+def checkout_record_digest(artifact):
+    """SHA256 of a checkout record read as a canonical regular file; the verdict save binds it."""
+    _canonical(artifact)
+    return hashlib.sha256(_regular_bytes(artifact)).hexdigest()
+
+
+def recorded_worktree(artifact):
+    """The directory a checkout record names, unverified: for diagnostics, never for removal."""
+    try:
+        value = json.loads(_regular_bytes(artifact)).get("worktree")
+    except (OSError, ValueError, AttributeError, HarnessError):
+        return None
+    return value if isinstance(value, str) else None
+
+
+def cleanup_run(repo: Path, ident: str, *, remove=False, confirm_exited=(), remove_input_copies=False,
+                remove_ignored=False):
     """Preview every retained resource of one run, or remove the eligible ones.
 
     Gate failures raise before any resource is touched. A refused resource is
     reported as ``blocked`` with its error; the others are still handled. The
-    worktree of a non-terminal run is ``retained`` with its reason.
+    worktree of a non-terminal run is ``retained`` with its reason. Ignored
+    files in the worktree are removed only with ``remove_ignored``; those in a
+    checkout always go with it.
     """
     repo = git.repository(repo)
     if not ident.startswith("run_") or not ident[4:].isalnum():
@@ -72,18 +104,21 @@ def cleanup_run(repo: Path, ident: str, *, remove=False, confirm_exited=(), remo
     with (lock if remove or confirm_exited else readonly_lock)(directory / "run.lock"):
         run, original, common, artifacts = _gate(repo, ident, directory, confirm_exited)
         checkouts = []
-        for artifact, expected_head in artifacts:
+        for artifact, final, index in artifacts:
             try:
-                checkouts.append(_clean_checkout(repo, run, artifact, expected_head, common, remove))
+                checkouts.append(clean_checkout(repo, run, directory, final, index, common, remove))
             except (HarnessError, OSError, ValueError) as error:
-                checkouts.append({"artifact": str(artifact), "status": "blocked", "error": str(error)})
+                # The recorded directory is unverified: a diagnostic, never an authority to remove.
+                checkouts.append({"artifact": str(artifact), "recorded_worktree": recorded_worktree(artifact),
+                                  "status": "blocked", "error": str(error)})
         try:
-            worktree = _clean_worktree(repo, run, directory, original, remove, remove_input_copies)
+            worktree = _clean_worktree(repo, run, directory, original, remove, remove_input_copies,
+                                       remove_ignored)
         except (HarnessError, OSError, ValueError) as error:
             worktree = {"worktree": run["worktree"], "branch": run["branch"],
                         "status": "blocked", "error": str(error)}
-        return {"id": ident, "remove": remove, "run_status": run.get("status"),
-                "checkouts": checkouts, "worktree": worktree}
+        return {"id": ident, "remove": remove, "remove_ignored": remove_ignored,
+                "run_status": run.get("status"), "checkouts": checkouts, "worktree": worktree}
 
 
 def blocked(result):
@@ -101,7 +136,7 @@ def _gate(repo, ident, directory, confirm_exited):
     checkout = repo / ".harness" / "worktrees" / ident
     _canonical(checkout)
     branch = "harness/" + ident
-    common = Path(git.git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir").removesuffix("\n")).resolve()
+    common = common_dir(repo)
     if (run.get("id") != ident or run.get("repo") != str(repo)
             or run.get("worktree") != str(checkout) or run.get("branch") != branch
             or not isinstance(run.get("expected_head"), str)
@@ -143,14 +178,14 @@ def _gate(repo, ident, directory, confirm_exited):
                 or not isinstance(final.get("verification_rounds"), list)):
             raise HarnessError("整体验证台账无效；保留现场")
         for index, round_record in enumerate(final["verification_rounds"], 1):
-            folder = directory / "verification" / "final" / str(final["attempt"]) / f"verification-{index}"
+            folder = checkout_folder(directory, final, index)
             if not isinstance(round_record, dict) or round_record.get("artifact_dir") != str(folder):
                 raise HarnessError("整体验证证据目录与运行台账不符")
             artifact = folder / "checkout.json"
             _canonical(artifact)
             if artifact.exists():
-                artifacts.append((artifact, final["head"]))
-    if len({artifact for artifact, _ in artifacts}) != len(artifacts):
+                artifacts.append((artifact, final, index))
+    if len({artifact for artifact, _, _ in artifacts}) != len(artifacts):
         raise HarnessError("整体验证台账重复引用检出证据")
     return run, original, common, artifacts
 
@@ -195,10 +230,31 @@ def _check_missing_binding(checkout, binding):
         raise HarnessError("缺失检出的 detached HEAD 绑定已改变；保留注册")
 
 
-def _clean_checkout(repo, run, artifact, expected_head, common, remove):
-    """One fresh verification checkout; its receipt is cleanup.json beside the evidence."""
+def clean_checkout(repo, run, directory, final, index, common, remove, *, by="cleanup-run"):
+    """One fresh verification checkout; its receipt is cleanup.json beside the evidence.
+
+    Round ``index`` of the whole-run record ``final`` names the evidence
+    directory. The record there must belong to this run, attempt and round,
+    and a round whose verdict was saved also binds the record's bytes; only
+    then do the identity, binding and removability gates run. Ignored files
+    inside this runtime-owned checkout are removed with it. ``by`` names the
+    writer of the receipt (the runtime or cleanup-run).
+    """
+    folder = checkout_folder(directory, final, index)
+    round_record = final["verification_rounds"][index - 1]
+    if not isinstance(round_record, dict) or round_record.get("artifact_dir") != str(folder):
+        raise HarnessError("整体验证证据目录与运行台账不符")
+    artifact = folder / "checkout.json"
+    _canonical(artifact)
+    expected_head = final["head"]
     original = _regular_bytes(artifact)
     environment = json.loads(original)
+    if not isinstance(environment, dict) or environment.get("owner") != {
+            "run_id": run["id"], "attempt": final["attempt"], "round": index}:
+        raise HarnessError("验证检出记录不属于该 run 的这一轮验证；保留现场")
+    if ("checkout_digest" in round_record
+            and hashlib.sha256(original).hexdigest() != round_record["checkout_digest"]):
+        raise HarnessError("验证检出记录与整体验证结论保存的摘要不符；保留现场")
     checkout, binding = _checkout_identity(repo, run, environment, expected_head, common)
     receipt_path = artifact.with_name("cleanup.json")
     _canonical(receipt_path)
@@ -219,7 +275,7 @@ def _clean_checkout(repo, run, artifact, expected_head, common, remove):
         # Git may reuse the old administrative directory name for another
         # checkout. A completed receipt never authorizes touching that directory.
         return {"artifact": str(artifact), "worktree": str(checkout),
-                "status": "removed" if remove else "absent"}
+                "status": "removed" if remove else "absent", "removed_by": previous.get("by")}
     if exists:
         git.check_worktree_binding(checkout, binding)
         git.assert_removable_worktree(checkout, binding=binding)
@@ -235,7 +291,7 @@ def _clean_checkout(repo, run, artifact, expected_head, common, remove):
     if not remove:
         return result
     # Persist intent before Git changes anything, without altering raw evidence.
-    write_json(receipt_path, {**receipt, "status": "pending", "time": time.time()})
+    write_json(receipt_path, {**receipt, "status": "pending", "by": by, "time": time.time()})
     _ensure_exited(run)
     if _regular_bytes(artifact) != original:
         raise HarnessError("验证检出证据在清理前改变；保留现场")
@@ -255,7 +311,7 @@ def _clean_checkout(repo, run, artifact, expected_head, common, remove):
             parent.rmdir()
         except OSError:
             pass
-    write_json(receipt_path, {**receipt, "status": "removed", "time": time.time()})
+    write_json(receipt_path, {**receipt, "status": "removed", "by": by, "time": time.time()})
     return {**result, "status": "removed"}
 
 
@@ -267,7 +323,16 @@ def _branch_matches(repo, branch, expected):
         return False
 
 
-def _clean_worktree(repo, run, directory, original, remove, remove_input_copies):
+def _ignored_gate(checkout, binding, remove_ignored):
+    """Without the option any ignored entry refuses removal; with it, the bounded listing Git will delete."""
+    names = git.ignored_paths(checkout, binding=binding)
+    if names and not remove_ignored:
+        raise HarnessError(f"工作树有 {len(names)} 个被 Git 忽略的条目（目录折叠后）；确认可以丢弃后用 "
+                           "--remove-ignored 预览、--remove --remove-ignored 删除：" + git.describe_paths(names))
+    return git.bounded_paths(names) if remove_ignored else None
+
+
+def _clean_worktree(repo, run, directory, original, remove, remove_input_copies, remove_ignored):
     """The run's branch worktree; its receipt is worktree-cleanup.json in the run directory."""
     checkout, branch = Path(run["worktree"]), run["branch"]
     binding = run["worktree_binding"]
@@ -299,6 +364,7 @@ def _clean_worktree(repo, run, directory, original, remove, remove_input_copies)
         if exists or registered or admin.exists():
             raise HarnessError("已清理工作树或注册重新出现；保留现场")
         return {**result, "status": "removed" if remove else "absent", "input_copies": input_summary}
+    listing = None
     if not exists:
         if registered or admin.exists() or not previous:
             raise HarnessError("工作树缺失但清理意图或 Git 注册不符；保留现场")
@@ -313,15 +379,29 @@ def _clean_worktree(repo, run, directory, original, remove, remove_input_copies)
         git.check_worktree_state(checkout, binding=binding)
         from .workspace_inputs import cleanup_inputs
         input_summary = cleanup_inputs(run, directory, remove=remove and remove_input_copies)
-        if input_summary["files"] and not remove and input_summary["status"] != "removed":
-            return {**result, "status": "input_copies_present", "input_copies": input_summary}
+        if input_summary["files"] and input_summary["status"] != "removed":
+            if not remove:
+                return {**result, "status": "input_copies_present", "input_copies": input_summary}
+            # Registered copies keep their own gate; --remove-ignored never stands in for it.
+            raise HarnessError("登记的依赖副本仍在工作树中；加 --remove-input-copies 删除")
         git.assert_removable_worktree(checkout, binding=binding)
+        listing = _ignored_gate(checkout, binding, remove_ignored)
         status = "eligible"
     result = {**result, "status": status, "input_copies": input_summary}
+    if listing is not None:
+        result["ignored_paths"] = listing
     if not remove:
         return result
     # The ledger digest is kept as a record of the state that authorized the removal.
     record = {**identity, "state_digest": hashlib.sha256(original).hexdigest()}
+    if exists:
+        # Only this command's option authorizes deleting ignored files; the listing is re-read now.
+        record["remove_ignored"] = remove_ignored
+        if listing is not None:
+            record["ignored_paths"] = listing
+    else:
+        # Completing a removal an earlier command performed keeps what that command recorded.
+        record.update({key: previous[key] for key in ("remove_ignored", "ignored_paths") if key in previous})
     write_json(receipt_path, {**record, "status": "pending", "time": time.time()})
     _ensure_exited(run)
     if _regular_bytes(state) != original:
@@ -334,6 +414,7 @@ def _clean_worktree(repo, run, directory, original, remove, remove_input_copies)
             raise HarnessError("worktree HEAD 在清理前改变；保留现场")
         git.check_worktree_state(checkout, binding=binding)
         git.assert_removable_worktree(checkout, binding=binding)
+        _ignored_gate(checkout, binding, remove_ignored)
         git.git(repo, "worktree", "remove", str(checkout))
     if checkout.exists() or checkout.is_symlink() or admin.exists() or str(checkout) in _registered(repo):
         raise HarnessError("工作树尚未完全移除；保留待清理记录")

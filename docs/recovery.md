@@ -185,7 +185,7 @@ python3 -m harness --config /path/to/harness.toml --repo /path/to/project resume
 
 全部任务接受后，整体验证失败时：全部失败项都是超时则停在当前尝试，修复环境或提高 `verify_timeout_seconds` 后普通 `resume` 在同一快照重验；普通非零退出交给指挥决定，同一快照重验须显式 `--reverify`。`--reverify` 只在本次恢复首次进入整体验收时生效，开始新的整体尝试，保留原失败记录；已返回而未落地的指挥决定存在时拒绝（先普通 `resume`），从未返回的决定意图在核实退出后丢弃，已扣的预算不退回。整体拒绝或验证失败之后，在新的修订落地之前每次都是指挥决定；已接受的修正任务未改变失败快照时，指挥再决定，不重抽整体审阅、不重跑相同代码。
 
-开启 `verification.fresh_checkout` 时，整体验证在系统临时目录的全新 detached worktree 中执行；准备失败或中断后，普通 `resume` 在另一个新检出重试当前最终尝试。验证中产生未忽略的新文件时，核对后可在 `git rev-parse --git-common-dir` 指向的公共目录的 `info/exclude` 中加入精确模式，再恢复；不要用宽泛模式掩盖待交付代码。
+开启 `verification.fresh_checkout` 时，整体验证在系统临时目录的全新 detached worktree 中执行；准备失败或中断后，普通 `resume` 在另一个新检出重试当前最终尝试。验证通过、结论（连同检出记录 `checkout.json` 的摘要）已保存的检出，由运行时在整体审阅派发之前尝试回收（首次进入与恢复同一处）；删除失败只记事件 `verification_checkout_reclaim_failed`，不改变结论、不重跑验证或审阅，检出留给 `cleanup-run`。准备失败、验证失败或中断的检出保留供诊断。验证中产生未忽略的新文件时，核对后可在 `git rev-parse --git-common-dir` 指向的公共目录的 `info/exclude` 中加入精确模式，再恢复；不要用宽泛模式掩盖待交付代码。
 
 ### 进程退出确认
 
@@ -194,20 +194,22 @@ python3 -m harness --config /path/to/harness.toml --repo /path/to/project resume
 ### 放弃与清理
 
 - `abandon RUN` 把未完成的 run 标为 `abandoned`，保留分支、工作树和证据，之后不能 resume。它先经过 `load_run`：台账恢复链接损坏或加载时核验的证据被删改时拒绝放弃，保留现场供核对；路径索引与输入索引不在加载时核验，它们损坏时仍可放弃。放弃不删除文件；要移除工作树，之后执行 `cleanup-run RUN --remove`。
-- `cleanup-run RUN` 是唯一的清理入口，默认只读预览，加 `--remove` 才逐项删除。它不加载配置、不调用模型，只支持当前台账版本，不改 run 状态，不删除分支、台账或运行证据。
+- `cleanup-run RUN` 是唯一的显式清理入口（验证通过的检出另由运行时在整体审阅前尝试回收，见[整体验证与重验](#整体验证与重验)），默认只读预览，加 `--remove` 才逐项删除。它不加载配置、不调用模型，只支持当前台账版本，不改 run 状态，不删除分支、台账或运行证据。
   - 共同门禁：在运行锁内核对台账版本与归属（run ID、仓库、工作树路径、分支名、Git 公共目录与管理目录绑定）、命令目录、路径索引与输入索引、worker 回执链接，以及全部派发与命令子进程的退出证据。任一项不通过时整条命令报错，不处理任何资源。
-  - 全新验证检出：run 处于任何状态都可清理。已跟踪修改、未跟踪或忽略文件、`assume-unchanged`／`skip-worktree` 标记阻止清理，错误列出前 10 个阻塞路径。目录已缺失而 Git 注册仍在时，只注销该精确路径，不做全仓库 prune。记录写在检出证据旁的 `cleanup.json`。
-  - 分支工作树：只在 `completed` 或 `abandoned` 时清理，其他状态下按规则保留（`retained`）。要求原分支仍指向检查点，HEAD 与 Git 绑定未变，没有任何未保存文件（含忽略文件）或隐藏索引标记，已跟踪文件的字节与 HEAD 一致。记录写在 `worktree-cleanup.json`。`--remove --remove-input-copies` 另删除登记且未修改的依赖副本。
+  - 全新验证检出：run 处于任何状态都可清理。检出记录必须属于本 run 的这一轮验证（`checkout.json` 的 `owner` 等于 run、整体尝试与轮次）；结论已保存的轮次另要求记录字节等于台账里该轮的 `checkout_digest`；不符即 `blocked`，被引用的目录不动。已跟踪修改、未被忽略的未跟踪文件、`assume-unchanged`／`skip-worktree` 标记阻止清理，错误列出前 10 个阻塞路径；被 Git 忽略的文件（含被忽略目录里的嵌套仓库）随检出删除，不需要选项——需要保留诊断产物时先另存。目录已缺失而 Git 注册仍在时，只注销该精确路径，不做全仓库 prune。记录写在检出证据旁的 `cleanup.json`，`by` 是这份记录的写入者（`runtime` 或 `cleanup-run`）。
+  - 分支工作树：只在 `completed` 或 `abandoned` 时清理，其他状态下按规则保留（`retained`）。要求原分支仍指向检查点，HEAD 与 Git 绑定未变，没有未被忽略的未跟踪文件、`.harness` 目录或隐藏索引标记，已跟踪文件的字节与 HEAD 一致。记录写在 `worktree-cleanup.json`。`--remove --remove-input-copies` 另删除登记且未修改的依赖副本；登记的副本仍在时，`--remove` 报 `blocked`，`--remove-ignored` 不能代替 `--remove-input-copies`。
+  - 工作树里的忽略文件：不带 `--remove-ignored` 时，有任何被 Git 忽略的条目即 `blocked`，`error` 列出目录折叠后的前 10 条并提示选项。`cleanup-run RUN --remove-ignored` 预览：工作树条目带 `ignored_paths`（`{coverage, entries, entry_count, omitted_count}`，目录折叠、不计空目录，最多 100 条与 8 KiB，其余只计数；被忽略目录里的内容包括嵌套仓库不显示）。`--remove --remove-ignored` 在写意图之前重新列出清单，意图与完成记录写明 `remove_ignored` 与这份清单，然后由 `git worktree remove` 连同忽略文件删除。只有本次命令的选项能授权：意图里存的允许不延续到之后不带选项的命令（工作树还在时照样 `blocked`）；工作树已被删、只差完成记录时，补写的记录保留原意图的 `remove_ignored` 与清单。预览与删除之间清单可能变化。
+  - “忽略”按 Harness 调用的 Git 判定：工作树里的 `.gitignore`、公共 Git 目录的 `info/exclude`（含运行时加入的 `/.harness/`）以及 `core.excludesFile`（未设置时为 `$XDG_CONFIG_HOME/git/ignore` 或 `~/.config/git/ignore`）。Harness 调用 Git 时去掉全部 `GIT_*` 环境变量（含 `GIT_CONFIG_GLOBAL`），以 `--remove-ignored` 预览列出的清单为准，不以自己 shell 里的 `git status` 为准。
   - 每个资源先保存删除意图，再执行 Git 删除，完成后记为 `removed`。删除后记账前中断时，重跑同一命令按已存意图续做，已经删掉的资源不再执行删除。工作树的记录绑定 run、工作树路径、分支名、检查点和 Git 绑定，不绑定整份台账，所以中断后用 `--confirm-exited` 补的退出确认不妨碍续做。
   - 工作树记为 `removed` 之后，操作者删除或移动分支、或之后的 `--confirm-exited` 改写台账，都不会改变结果：再次运行仍报告 `removed`（预览为 `absent`），只有路径、Git 注册或管理目录重新出现才报 `blocked`。分支核对只在工作树仍存在、即将删除时进行。
   - 输出逐项列出每个资源的 `status`：
     - `eligible`：预览时可以删除。
     - `removed`：已删除，完成记录已写入。
-    - `absent`：预览时资源已不存在（有删除记录，或检出的目录、注册和管理目录都已消失）；加 `--remove` 时补写完成记录，报告 `removed`。
+    - `absent`：预览时资源已不存在（有删除记录，或检出的目录、注册和管理目录都已消失）；加 `--remove` 时补写完成记录，报告 `removed`。此前已删除的检出带 `removed_by`（完成记录的写入者，`runtime` 表示运行时回收）。
     - `stale_registration`：仅验证检出，目录已缺失而 Git 注册仍在；`--remove` 只注销该精确路径。
     - `input_copies_present`：仅工作树的预览，有登记的依赖副本，需 `--remove --remove-input-copies`。
     - `retained`：仅工作树，run 还没有 `completed` 或 `abandoned`，按规则保留，`reason` 写明当前状态。`reason_kind` 为 `finish_or_abandon_first`：先完成或 `abandon` 该 run 再清理。
-    - `blocked`：资源本可清理，但门禁挡住了删除或预览；`error` 写明原因和阻塞路径，资源原样保留。
+    - `blocked`：资源本可清理，但门禁挡住了删除或预览；`error` 写明原因和阻塞路径，资源原样保留。被挡住的检出条目没有 `worktree`，改给 `recorded_worktree`：`checkout.json` 里记录的目录，未经核对、只作诊断（读不出时为 null），从不用于删除。
   - 某个资源受阻不影响其余资源。只有出现 `blocked` 时退出码为 1；只有 `retained` 的工作树时退出码为 0。
 - `prepare-run RUN --manifest FILE` 只在 `paused` 或 `awaiting_approval` 且没有待处理阶段时准备依赖副本，格式见[依赖副本清单](operations.md#依赖副本清单)。
 

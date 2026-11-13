@@ -114,7 +114,7 @@ class PlanPreflightDiagnosticsTests(RepoCase):
     def test_removal_diagnostic_lists_bounded_paths_and_preserves_all_files(self):
         engine = self.engine()
         engine.start("Implement greet", self.plan(), pause_after_plan=True)
-        folder = engine.worktree / "__pycache__"
+        folder = engine.worktree / "evidence"
         folder.mkdir()
         names = [f"evidence-{index:02}.pyc" for index in range(12)]
         for name in names:
@@ -125,8 +125,8 @@ class PlanPreflightDiagnosticsTests(RepoCase):
         removal = cleanup_run(self.repo, engine.run["id"], remove=True)["worktree"]
         self.assertEqual(removal["status"], "blocked")
         message = removal["error"]
-        self.assertIn("__pycache__/evidence-00.pyc", message)
-        self.assertIn("__pycache__/evidence-09.pyc", message)
+        self.assertIn("evidence/evidence-00.pyc", message)
+        self.assertIn("evidence/evidence-09.pyc", message)
         self.assertNotIn("evidence-11.pyc", message)
         self.assertLess(len(message), 3000)
         for name in names:

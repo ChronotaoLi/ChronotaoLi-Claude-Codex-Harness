@@ -1,5 +1,4 @@
 from copy import deepcopy
-import hashlib
 from pathlib import Path
 import shutil
 import sys
@@ -101,7 +100,9 @@ class FreshVerificationTests(RepoCase):
         artifact = self.checkout_artifacts(engine)[0]
         environment = read_json(artifact)
         self.assertEqual(environment["status"], "verified")
-        self.assertEqual((Path(environment["worktree"]) / "ignored-helper").read_text(), "ready")
+        # The verified checkout was reclaimed after the verdict; its evidence stays.
+        self.assertFalse(Path(environment["worktree"]).exists())
+        self.assertEqual(read_json(artifact.with_name("cleanup.json"))["status"], "removed")
         self.assertEqual(read_json(Path(environment["setup_artifact"]))[0]["exit_code"], 0)
         review = next(call["packet"] for call in backend.calls if call["kind"] == "final_review")
         self.assertEqual(review["verification"][0]["checkout_artifact"], str(artifact))
@@ -154,7 +155,8 @@ class FreshVerificationTests(RepoCase):
         second = read_json(artifacts[1])
         self.assertNotEqual(first["worktree"], second["worktree"])
         self.assertTrue(Path(first["worktree"]).is_dir())
-        self.assertTrue(Path(second["worktree"]).is_dir())
+        self.assertFalse(Path(second["worktree"]).exists())
+        self.assertFalse(first_artifact.with_name("cleanup.json").exists())
         self.assertEqual(read_json(first_artifact), first)
 
     def test_final_reviewer_service_recovery_reuses_finished_fresh_verification(self):
@@ -248,7 +250,7 @@ class FreshVerificationTests(RepoCase):
                 self.engine(backend).resume(engine.run["id"], approve_plan=True)
             self.assertEqual(backend.calls, [])
 
-    def test_normal_verification_exposes_ignored_path_inventory_without_claiming_content_coverage(self):
+    def test_normal_verification_exposes_a_bounded_ignored_listing_without_claiming_content_coverage(self):
         self.config.data["verification"]["fresh_checkout"] = False
         self.need_ignored_helper()
         backend = ScriptedBackend(self.helper_worker)
@@ -259,15 +261,11 @@ class FreshVerificationTests(RepoCase):
         reviews = [call["packet"] for call in backend.calls if call["role"] == "reviewer"]
         self.assertEqual(len(reviews), 2)
         for packet in reviews:
-            summary = packet["ignored_paths"]
-            self.assertGreaterEqual(summary["added_count"], 1)
-            self.assertEqual(summary["coverage"], "paths_only_not_contents")
-            artifact = Path(summary["artifact"])
-            inventory = read_json(artifact)
-            self.assertIn("ignored-helper", inventory["paths"])
-            self.assertIn("ignored-helper", inventory["added"])
-            self.assertEqual(hashlib.sha256(artifact.read_bytes()).hexdigest(), summary["artifact_digest"])
-            self.assertIn("not hashed", inventory["limitation"])
+            listing = packet["ignored_paths"]
+            self.assertEqual(listing["coverage"], "paths_only_not_contents")
+            self.assertIn("ignored-helper", listing["entries"])
+            self.assertEqual(listing["entry_count"], len(listing["entries"]) + listing["omitted_count"])
+            self.assertNotIn("artifact", listing)
 
 
 class FreshVerificationConfigTests(unittest.TestCase):

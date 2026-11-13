@@ -75,41 +75,37 @@ class StartupRecoveryTests(RepoCase):
         self.assertEqual(read_json(Path(result["plan_history"][0]["artifact"]))["tasks"], plan["tasks"])
         self.assertFalse(any(call["role"] == "commander" for call in backend.calls))
 
-    def test_supplied_multitask_plan_recovers_after_binding_and_diagnostic_saves(self):
-        for stage in ("binding", "diagnostics"):
-            with self.subTest(stage=stage):
-                plan = self.plan()
-                backend = RecordingBackend(self.implement_tasks)
-                engine = self.engine(backend)
-                saved = self.interrupt_save(engine, lambda run: bool(run["worktree_binding"])
-                    and not run["tasks"] and (stage == "binding" or "ignored_diagnostics" in run), plan)
-                self.assertEqual(saved["tasks"], [])
-                self.assertEqual(saved["original_tasks"], plan["tasks"])
-                self.assertEqual(backend.calls, [])
-                resumed = self.engine(backend)
-                result = resumed.resume(saved["id"])
-                self.assertEqual(result["status"], "completed")
-                self.assert_registered(result, plan, backend)
-                self.assertEqual(list(result["accepted"]), [task["id"] for task in plan["tasks"]])
-                self.assertEqual([call["task_id"] for call in backend.calls if call["role"] == "worker"],
-                                 [task["id"] for task in plan["tasks"]])
-                self.assertEqual(sum(call["kind"] == "review" for call in backend.calls), 3)
-                self.assertEqual(sum(call["kind"] == "final_review" for call in backend.calls), 1)
-                for accepted in result["accepted"].values():
-                    checks = read_json(Path(accepted["verification"]))
-                    self.assertTrue(checks)
-                    self.assertTrue(all(check["exit_code"] == 0 for check in checks))
-                self.assertEqual(result["final_history"][-1]["status"], "approved")
-                self.assertEqual(result["expected_head"], git.head(resumed.worktree, binding=result["worktree_binding"]))
-                self.assertFalse((self.repo / "hello.py").exists())
+    def test_supplied_multitask_plan_recovers_after_the_binding_save(self):
+        plan = self.plan()
+        backend = RecordingBackend(self.implement_tasks)
+        engine = self.engine(backend)
+        saved = self.interrupt_save(engine, lambda run: bool(run["worktree_binding"]) and not run["tasks"], plan)
+        self.assertEqual(saved["tasks"], [])
+        self.assertEqual(saved["original_tasks"], plan["tasks"])
+        self.assertEqual(backend.calls, [])
+        resumed = self.engine(backend)
+        result = resumed.resume(saved["id"])
+        self.assertEqual(result["status"], "completed")
+        self.assert_registered(result, plan, backend)
+        self.assertEqual(list(result["accepted"]), [task["id"] for task in plan["tasks"]])
+        self.assertEqual([call["task_id"] for call in backend.calls if call["role"] == "worker"],
+                         [task["id"] for task in plan["tasks"]])
+        self.assertEqual(sum(call["kind"] == "review" for call in backend.calls), 3)
+        self.assertEqual(sum(call["kind"] == "final_review" for call in backend.calls), 1)
+        for accepted in result["accepted"].values():
+            checks = read_json(Path(accepted["verification"]))
+            self.assertTrue(checks)
+            self.assertTrue(all(check["exit_code"] == 0 for check in checks))
+        self.assertEqual(result["final_history"][-1]["status"], "approved")
+        self.assertEqual(result["expected_head"], git.head(resumed.worktree, binding=result["worktree_binding"]))
+        self.assertFalse((self.repo / "hello.py").exists())
 
-    def test_first_ignored_path_interrupt_preserves_plan_and_approval_pause(self):
+    def test_interrupt_after_binding_save_preserves_plan_and_approval_pause(self):
         backend = RecordingBackend()
         engine = self.engine(backend)
         plan = self.plan()
-        with patch.object(engine.context, "ignored_paths", side_effect=KeyboardInterrupt), self.assertRaises(KeyboardInterrupt):
-            engine.start("Implement messages", plan, pause_after_plan=True)
-        saved = self.saved(engine)
+        saved = self.interrupt_save(engine, lambda run: bool(run["worktree_binding"]) and not run["tasks"],
+                                    plan, pause_after_plan=True)
         self.assertTrue(saved["worktree_binding"])
         self.assertEqual(saved["tasks"], [])
         self.assertEqual(saved["original_tasks"], plan["tasks"])
@@ -150,7 +146,7 @@ class StartupRecoveryTests(RepoCase):
     def test_without_supplied_plan_startup_recovery_still_plans_once(self):
         backend = RecordingBackend()
         engine = self.engine(backend)
-        saved = self.interrupt_save(engine, lambda run: "ignored_diagnostics" in run, None)
+        saved = self.interrupt_save(engine, lambda run: bool(run["worktree_binding"]), None)
         self.assertEqual(saved["original_tasks"], [])
         result = self.engine(backend).resume(saved["id"])
         self.assertEqual(result["status"], "completed")

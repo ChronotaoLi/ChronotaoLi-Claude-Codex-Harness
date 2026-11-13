@@ -21,7 +21,10 @@ class VerificationCleanupTests(RepoCase):
         self.config.data["verification"].update(fresh_checkout=True,
             commands=[[sys.executable, "-c", "from pathlib import Path; assert Path('hello.py').is_file()"]])
         self.engine_instance = self.engine()
-        self.run = self.engine_instance.start("Implement greet", read_json(ROOT / "examples/plan.json"))
+        # A verified checkout the runtime did not reclaim: the state a reclamation
+        # failure before its intent leaves behind (no cleanup.json).
+        with patch("harness.finalization.FinalAcceptance.reclaim_verified_checkout"):
+            self.run = self.engine_instance.start("Implement greet", read_json(ROOT / "examples/plan.json"))
         self.directory = self.engine_instance.directory
         self.artifact = next(self.directory.glob("verification/final/*/verification-*/checkout.json"))
         self.environment = read_json(self.artifact)
@@ -54,10 +57,13 @@ class VerificationCleanupTests(RepoCase):
         self.roots.append(root)
         checkout = root / ".harness" / "checkout"
         git.git(self.repo, "worktree", "add", "--detach", str(checkout), self.environment["head"])
-        environment = {**self.environment, "worktree": str(checkout),
-                       "binding": git.capture_worktree_binding(checkout, None)}
         final = self.run["final_history"][-1]
-        folder = self.artifact.parent.parent / f"verification-{len(final['verification_rounds']) + 1}"
+        index = len(final["verification_rounds"]) + 1
+        # A later round of the same attempt records its own run, attempt and round.
+        environment = {**self.environment, "worktree": str(checkout),
+                       "owner": {**self.environment["owner"], "round": index},
+                       "binding": git.capture_worktree_binding(checkout, None)}
+        folder = self.artifact.parent.parent / f"verification-{index}"
         artifact = folder / "checkout.json"
         write_json(artifact, environment)
         final["verification_rounds"].append({"artifact_dir": str(folder), "status": "completed"})
@@ -201,16 +207,14 @@ class VerificationCleanupTests(RepoCase):
         self.assertEqual(git.git(self.repo, "rev-parse", "refs/heads/" + self.run["branch"]).strip(),
                          self.run["expected_head"])
 
-    def test_refuses_modified_untracked_ignored_and_hidden_index_files(self):
-        variants = ("tracked", "untracked", "ignored", "assume-unchanged", "skip-worktree")
+    def test_refuses_modified_untracked_and_hidden_index_files(self):
+        variants = ("tracked", "untracked", "assume-unchanged", "skip-worktree")
         for variant in variants:
             with self.subTest(variant=variant):
                 if variant == "tracked":
                     (self.checkout / "hello.py").write_text("unsaved")
-                elif variant in ("untracked", "ignored"):
-                    name = "scratch" if variant == "untracked" else "__pycache__/scratch"
-                    path = self.checkout / name
-                    path.parent.mkdir(exist_ok=True)
+                elif variant == "untracked":
+                    path = self.checkout / "scratch"
                     path.write_text("unsaved")
                 else:
                     git.git(self.checkout, "update-index", "--" + variant, "hello.py")
@@ -220,11 +224,9 @@ class VerificationCleanupTests(RepoCase):
                 self.assertFalse(self.artifact.with_name("cleanup.json").exists())
                 if variant == "tracked":
                     git.git(self.checkout, "checkout", "--", "hello.py")
-                elif variant in ("untracked", "ignored"):
+                elif variant == "untracked":
                     self.assertEqual(path.read_text(), "unsaved")
                     path.unlink()
-                    if variant == "ignored":
-                        path.parent.rmdir()
                 else:
                     git.git(self.checkout, "update-index", "--no-" + variant, "hello.py")
 
@@ -414,8 +416,7 @@ class VerificationCleanupTests(RepoCase):
 
     def test_cli_terminal_confirmation_needs_no_configuration_and_keeps_file_gates(self):
         selected = self.add_unknown_dispatch()
-        unsaved = self.checkout / "__pycache__" / "operator-data"
-        unsaved.parent.mkdir()
+        unsaved = self.checkout / "operator-data"
         unsaved.write_text("keep")
         stdout, stderr = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):

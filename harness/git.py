@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import shutil
 import stat
@@ -202,21 +203,25 @@ def check_worktree_state(repo: Path, *, binding=None):
 
 
 def assert_removable_worktree(repo: Path, *, binding=None):
-    """Refuse removal unless all tracked bytes match HEAD and no data is hidden.
+    """Refuse removal unless `git worktree remove` would lose no unignored data.
 
-    Git status may trust cached stat fields or index flags. Hash the actual
-    bytes with Git's blob framing, without clean filters or external programs.
-    This intentionally refuses transformed checkouts (for example autocrlf)
-    when their bytes differ from the saved blobs.
+    All tracked bytes must match HEAD, no index flag may hide data and no
+    unignored untracked file may exist. Ignored files are the caller's
+    decision: Git removes them with the worktree. Git status may trust cached
+    stat fields or index flags. Hash the actual bytes with Git's blob framing,
+    without clean filters or external programs. This intentionally refuses
+    transformed checkouts (for example autocrlf) when their bytes differ from
+    the saved blobs.
     """
     for entry in git_bytes(repo, "ls-files", "-v", "-z", binding=binding).split(b"\0"):
         if entry[:1].islower() or entry.startswith(b"S "):
             raise HarnessError("worktree 索引含 assume-unchanged/skip-worktree 标记；"
                                f"请先核对并清除，不能移除：{os.fsdecode(entry[2:])}")
     untracked = [os.fsdecode(name) for name in
-                 git_bytes(repo, "ls-files", "--others", "-z", binding=binding).split(b"\0") if name]
+                 git_bytes(repo, "ls-files", "--others", "--exclude-standard", "-z", binding=binding).split(b"\0")
+                 if name]
     if untracked:
-        raise HarnessError("worktree 有未保存文件（包括忽略文件）；请先归档或清理，不能移除："
+        raise HarnessError("worktree 有未被忽略的未跟踪文件；请先归档或清理，不能移除："
                            + describe_paths(untracked))
     tree = {}
     for entry in git_bytes(repo, "ls-tree", "-r", "-z", "HEAD", binding=binding).split(b"\0"):
@@ -264,6 +269,38 @@ def assert_removable_worktree(repo: Path, *, binding=None):
         digest = hashlib.new(object_format, b"blob " + str(len(data)).encode("ascii") + b"\0" + data).hexdigest()
         if digest.encode("ascii") != object_id:
             raise HarnessError(f"worktree 文件内容与 HEAD 不同；请先保存或归档，不能移除：{os.fsdecode(name)}")
+
+
+IGNORED_LIMIT_ENTRIES = 100
+IGNORED_LIMIT_BYTES = 8192
+
+
+def ignored_paths(repo: Path, *, binding=None):
+    """Git's current ignored set: directories folded, empty directories omitted, sorted.
+
+    "Ignored" is what Git decides for this worktree: its .gitignore files, the
+    common directory's info/exclude and core.excludesFile. Raises when Git
+    cannot list it.
+    """
+    return sorted(os.fsdecode(name) for name in git_bytes(
+        repo, "ls-files", "--others", "--ignored", "--exclude-standard", "--directory",
+        "--no-empty-directory", "-z", binding=binding).split(b"\0") if name)
+
+
+def bounded_paths(names):
+    """A path-only listing: the sorted prefix within 100 entries and 8 KiB; the rest is counted."""
+    entries, size = [], 2
+    for name in names:
+        if len(entries) >= IGNORED_LIMIT_ENTRIES:
+            break
+        # Compact JSON with filesystem bytes escaped as util.dump writes them.
+        added = len(json.dumps(name, ensure_ascii=False).encode("utf-8", errors="backslashreplace")) + bool(entries)
+        if size + added > IGNORED_LIMIT_BYTES:
+            break
+        entries.append(name)
+        size += added
+    return {"coverage": "paths_only_not_contents", "entries": entries,
+            "entry_count": len(names), "omitted_count": len(names) - len(entries)}
 
 
 def snapshot(repo: Path, *, binding=None):

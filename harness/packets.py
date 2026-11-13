@@ -32,7 +32,7 @@ class PacketBuilder(RuntimeService):
     def plan_context(self):
         return compact_plan(self.context.run["original_tasks"], self.context.run["tasks"])
 
-    def final_review_packet(self, *, checks, diff_artifact, changed_paths,
+    def final_review_packet(self, *, checks, diff_artifact, changed_paths, ignored_paths,
                             tasks=None, original_tasks=None, history=None, required=None):
         """Build the shared final-review evidence before runtime projections.
 
@@ -54,7 +54,7 @@ class PacketBuilder(RuntimeService):
             "head": self.context.run["expected_head"], "diff_artifact": diff_artifact,
             "verification": compact_checks(checks),
             "instruction_file_changes": instruction_file_changes(changed_paths),
-            "ignored_paths": deepcopy(self.context.run.get("ignored_diagnostics")),
+            "ignored_paths": ignored_paths,
             "tool_constraints": self.tool_constraints(),
             "prior_reviews": compact_reviews([item for item in history if item["status"] != "running"]),
             "required_findings": required,
@@ -108,7 +108,9 @@ class PacketBuilder(RuntimeService):
         checks = [{"argv": command, "exit_code": 0, "stdout": "", "stderr": "",
                    "log": "", "timed_out": False}
                   for command in self.context.config.data["verification"]["commands"]]
+        # The ignored listing is read when the review is built; the lower bound holds an empty one.
         packet = self.final_review_packet(checks=checks, diff_artifact="", changed_paths=[],
+                                          ignored_paths=git.bounded_paths([]),
                                           tasks=tasks, original_tasks=original_tasks)
         packet = self.runtime_packet(packet, role="reviewer", kind="final_review", task_id="final")
         _, required = self.role_input(role="reviewer", kind="final_review", task_id="final",
@@ -140,6 +142,9 @@ class PacketBuilder(RuntimeService):
         final_suffix = f"{max(limits['max_agent_dispatches'], len(self.context.run.get('final_history', [])) + 1)}-{dispatch_id}"
         final_folder = self.context.directory / "verification" / "final" / final_suffix
         packet["diff_artifact"] = str(final_folder / "change.diff")
+        # Reserve the listing's bound: 100 entries whose JSON list stays within 8 KiB.
+        packet["ignored_paths"] = {**packet["ignored_paths"], "entry_count": git.IGNORED_LIMIT_ENTRIES,
+                                   "entries": ["x" * 78] * git.IGNORED_LIMIT_ENTRIES}
         for index, check in enumerate(packet["verification"]):
             check.update(stdout="x" * 250, stderr="x" * 250,
                          log=str(final_folder / f"check-{index}"), output_truncated=True)
@@ -153,7 +158,7 @@ class PacketBuilder(RuntimeService):
             "verification_commands": len(checks), "tasks": len(tasks),
             "includes_existing_review_history": True, "includes_future_review_history": False,
             "decisions_in_projection_only": True, "final_checkpoints_index_only": True,
-            "projection_is_guarantee": False,
+            "ignored_paths_bytes": git.IGNORED_LIMIT_BYTES, "projection_is_guarantee": False,
         }
         return report
 

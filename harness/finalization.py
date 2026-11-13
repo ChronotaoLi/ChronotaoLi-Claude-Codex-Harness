@@ -4,7 +4,7 @@ from __future__ import annotations
 from copy import deepcopy
 from pathlib import Path
 
-from . import git
+from . import cleanup, git
 from .context import compact_checks, compact_feedback
 from .contracts import review_approved
 from .recovery import snapshot_digest
@@ -35,6 +35,37 @@ class FinalAcceptance(RuntimeService):
         return {"kind": "final",
                 "final_review": compact_feedback({"final_review": deepcopy(record)})["final_review"],
                 "accepted_since": sorted(set(self.context.run["accepted"]) - set(record["accepted_tasks"]))}
+
+    def reclaim_verified_checkout(self, record):
+        """Try to remove the latest round's verified fresh checkout; a failure never changes the verdict.
+
+        Only a round whose saved verdict bound its checkout record is touched:
+        that digest is of the bytes that said ``verified``. Authority and exit
+        evidence failures stop the run as anywhere else; only the removal's own
+        failure is recorded as a best-effort event, and the review proceeds.
+        """
+        rounds = record["verification_rounds"]
+        if not rounds or rounds[-1].get("status") != "completed" or "checkout_digest" not in rounds[-1]:
+            return
+        artifact = Path(rounds[-1]["artifact_dir"]) / "checkout.json"
+        receipt = artifact.with_name("cleanup.json")
+        try:
+            if receipt.is_file() and not receipt.is_symlink() and read_json(receipt).get("status") == "removed":
+                return
+        except (OSError, ValueError):
+            pass  # clean_checkout validates the receipt and reports what is wrong with it.
+        self.context.store.check_current()
+        self.context.ensure_exited()
+        try:
+            result = cleanup.clean_checkout(self.context.repo, self.context.run, self.context.directory, record,
+                                            len(rounds), cleanup.common_dir(self.context.repo), True, by="runtime")
+        except (HarnessError, OSError, ValueError) as error:
+            self.context.observe("verification_checkout_reclaim_failed", attempt=record["attempt"],
+                                 artifact=str(artifact), recorded_worktree=cleanup.recorded_worktree(artifact),
+                                 error=str(error)[:2000])
+            return
+        self.context.observe("verification_checkout_reclaimed", attempt=record["attempt"],
+                             artifact=str(artifact), worktree=result["worktree"])
 
     def final_review(self, *, reverify=False):
         # Consume the resume flag on first entry, including new snapshots and
@@ -106,10 +137,16 @@ class FinalAcceptance(RuntimeService):
             round_record = {"artifact_dir": str(verification_folder), "status": "running"}
             rounds.append(round_record)
             self.context.save()
-            checks = self.services.verification.verify("final", attempt, whole_run=True, artifact_dir=verification_folder, before=snapshot)
+            checks = self.services.verification.verify("final", attempt, whole_run=True, artifact_dir=verification_folder,
+                                                       before=snapshot, round_index=len(rounds))
+            # Read before any record change: the verdict save binds this round's checkout record.
+            checkout_digest = (cleanup.checkout_record_digest(verification_folder / "checkout.json")
+                               if self.context.config.data["verification"]["fresh_checkout"] else None)
             evidence = folder / "change.diff"
             evidence.write_bytes(git.range_diff_bytes(self.context.worktree, self.context.run["base_commit"], binding=self.context.run["worktree_binding"]))
             round_record["status"] = "completed"
+            if checkout_digest is not None:
+                round_record["checkout_digest"] = checkout_digest
             record.update(verification=str(verification_folder / "results.json"), diff_artifact=str(evidence))
             failures = [check for check in checks if checks_failed(check)]
             if failures:
@@ -125,6 +162,8 @@ class FinalAcceptance(RuntimeService):
         else:
             checks = read_json(Path(record["verification"]))
         if record["phase"] == "reviewing":
+            # The verdict is durable: first entry and recovery try to reclaim at this one point.
+            self.reclaim_verified_checkout(record)
             changed_paths = git.git(self.context.worktree, "diff", "--no-ext-diff", "--no-textconv",
                                     "--name-only", "--no-renames", "-z", self.context.run["base_commit"], "HEAD",
                                     binding=self.context.run["worktree_binding"]).split("\0")
@@ -134,7 +173,8 @@ class FinalAcceptance(RuntimeService):
             review, diagnostics = self.services.receipts.dispatch_review("final_review", "final",
                      self.services.packets.final_review_packet(
                          checks=checks, diff_artifact=record["diff_artifact"],
-                         changed_paths=changed_paths, history=history[:-1], required=required),
+                         changed_paths=changed_paths, ignored_paths=self.context.ignored_inventory(),
+                         history=history[:-1], required=required),
                      required=required)
             record["review_source"] = bind_review_source(self.context, "final_review", "final", review, digest)
             if not diagnostics:

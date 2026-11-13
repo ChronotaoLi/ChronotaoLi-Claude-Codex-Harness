@@ -126,18 +126,22 @@ class BoundaryDiagnosticsTests(unittest.TestCase):
             git.assert_removable_worktree(self.repo)
         self.assertEqual(path.read_text(encoding="utf-8"), "changed\n")
 
-    def test_removal_rejects_ignored_untracked_and_staged_data(self):
+    def test_removal_allows_ignored_and_rejects_untracked_and_staged_data(self):
         exclude = self.repo / ".git/info/exclude"
         exclude.write_text("ignored.log\n", encoding="utf-8")
-        for name in ("ignored.log", "untracked.log"):
-            path = self.repo / name
-            path.write_text("keep this evidence\n", encoding="utf-8")
-            try:
-                with self.subTest(name=name), self.assertRaisesRegex(HarnessError, "未保存文件"):
-                    git.assert_removable_worktree(self.repo)
-                self.assertTrue(path.is_file())
-            finally:
-                path.unlink()
+        # Ignored files are the caller's decision; unignored untracked data always refuses.
+        ignored = self.repo / "ignored.log"
+        ignored.write_text("generated\n", encoding="utf-8")
+        git.assert_removable_worktree(self.repo)
+        path = self.repo / "untracked.log"
+        path.write_text("keep this evidence\n", encoding="utf-8")
+        try:
+            with self.assertRaisesRegex(HarnessError, "未被忽略的未跟踪文件.*untracked.log"):
+                git.assert_removable_worktree(self.repo)
+            self.assertTrue(path.is_file())
+        finally:
+            path.unlink()
+            ignored.unlink()
         path = self.repo / "base.txt"
         original = path.read_bytes()
         path.write_text("staged content\n", encoding="utf-8")

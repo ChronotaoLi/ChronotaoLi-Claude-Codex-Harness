@@ -32,7 +32,7 @@
 | `git.py`、`memory.py` | Git 绑定、快照、范围、接受提交与归档；SQLite 项目记忆 |
 | `shared.py`、`contracts.py`、`config.py`、`versions.py` | 共享资产摘要、MCP 校验；输出契约；配置；台账版本 |
 | `private_state.py`、`workspace_inputs.py` | `.harness` 私有根保护；依赖副本清单 |
-| `cleanup.py` | `cleanup-run`：共同门禁之后分别处理全新验证检出与分支工作树 |
+| `cleanup.py` | `cleanup-run`（唯一的显式清理入口）：共同门禁之后分别处理全新验证检出与分支工作树；检出删除步骤（含归属核验）也供整体验收在结论保存后尝试回收验证通过的检出 |
 | `observe.py`、`dashboard.py`、`dashboard_page.py`、`watch.py`、`watch_cli.py` | 只读观察：列表与详情、本地网页、原生文件通知 |
 | `operations.py`、`supervisor.py` | 操作记录；`supervise` |
 | `permission_diagnostics.py`、`permission_smoke.py`、`tool_smoke.py` | 权限诊断；真实账号联调入口 |
@@ -49,7 +49,7 @@
 2. 调用身份与预算先于进程启动保存：本地准备（上下文、输入与路径索引、MCP、快照、待派发指令与上一份无效原件的核对、额度检查）成功后，`attempts`、`agent_dispatches`、接收意图和 `invoked=true` 同一次保存，然后才调用后端。本地准备失败不扣额度，后端失败照常计数。
 3. 退出未确认就不继续：恢复、放弃和清理要求父 dispatch 及其每个命令子进程都有退出证据；`starting` 或缺 pgid 且未确认的记录阻塞。`--confirm-exited` 是审计过的操作者断言，不补造退出码、输出或成功。
 4. 领导进程正常退出后，同组后代最多观察 2 秒，仍未退出就停止消费结果，不向身份不明的进程组发信号。只有进程组查询报告“不存在”才算后代已退出；组内只剩等待回收的僵尸进程时（macOS 对此返回 EPERM）算作仍存在、继续观察，窗口结束时的查询仍被拒绝才记为清理错误。
-5. 台账的 `invoked` 是调用事实的权威。事件 `dispatch_prepared`（预算检查前）、`dispatch_started`（`invoked=true` 保存后）和带 `invoked` 的 `dispatch_finished` 只是尽力而为的观察：追加失败不阻止调用，崩溃可能缺事件且不补发；按 `dispatch_id` 去重，费用只按台账统计。
+5. 台账的 `invoked` 是调用事实的权威。事件 `dispatch_prepared`（预算检查前）、`dispatch_started`（`invoked=true` 保存后）和带 `invoked` 的 `dispatch_finished` 只是尽力而为的观察：追加失败不阻止调用，崩溃可能缺事件且不补发；按 `dispatch_id` 去重，费用只按台账统计。验证检出的回收事件（`verification_checkout_reclaimed`、`verification_checkout_reclaim_failed`）同样经 `RunContext.observe()` 追加，追加失败不影响执行。
 
 **结论与证据**
 
@@ -99,6 +99,10 @@
 
 32. 指挥只有一种调用 `decide`，结果是 implement、revise 或 ask。是否需要决策由台账与工作树事实推导（`Scheduler.next_step`），不设持久标记；需要决策的条件在决策落地之前持续成立，已返回的回执受保护，所以中断、提高预算或确认退出之后，不会重跑已报告阻断的 worker，也不会漏掉一次决策（允许的外部变化可能让调度停下，或按明确规则改变下一步）。每次落地是一次保存，并在其中消费回执：implement 写待派发指令；revise 只在全部校验（含整体审阅必要容量）通过后，先写不可变的计划文件（执行字段的唯一权威），再保存只含引用与摘要的 `pending_revision`；发布前按摘要复核文件、读回原件重放修订；需要时归档、重置之后，计划版本、`tasks`、`current_task` 与下一条指令同次发布，指令的快照取保留的候选或重置后的干净快照。非初始规划的 revise 必须带指令；初始规划的 revise 不带指令。修订发布的指令在 worker 调用前、本地准备之后与计划文件、任务表和快照核对一次；所有待派发指令都要求快照等于保存时的快照。ask 登记操作者请求（种类 `commander`）并停止；未答或答 stop 时不调度任何模型，回答成为下一次 `decide` 的输入，不授予范围，也不降低验收。
 
+**资源**
+
+33. 运行时拥有的全新验证检出随用途结束：检出记录 `checkout.json` 创建时写明所属的 run、整体尝试与验证轮次（`owner`），整体验证结论（含 `phase=reviewing`）与该记录的摘要（轮次的 `checkout_digest`）在同一次保存里登记；结论保存之后、整体审阅派发之前，运行时在这一个位置尝试回收该尝试最近一轮、结论已绑定的检出，首次进入与恢复走同一个调用点。回收与 `cleanup-run` 共用同一段删除代码与门禁（证据位置、归属、摘要、路径形状、Git 绑定、HEAD、可删除性），先写 `cleanup.json` 的 `pending` 再 `git worktree remove`、确认目录与注册都消失后写 `removed`；不写台账；删除失败只记尽力而为的事件，不改变结论、不重跑验证或审阅；权威核对或退出证据失败时 run 照常停止。失败或中断轮次的检出保留到 `cleanup-run --remove`，连同其中的忽略文件删除。任务工作树的忽略文件只在本次命令带 `--remove-ignored` 时随工作树删除。两种资源上，未忽略的未跟踪文件、已跟踪改动、暂存区与 HEAD 不符、隐藏索引标志都阻止删除。
+
 ## 状态转换
 
 ### run 状态
@@ -123,13 +127,13 @@
 | `schema_version`、`id`、`repo`、`goal`、`commander`、`branch`、`worktree`、`base_commit`、`config_path`、`asset_digest`、`created_by_operation` | 首次保存 | 不变 | 早于创建工作树 | 要求版本 18、ID 与仓库一致；比较共享资产摘要 |
 | `config_snapshot` | 首次保存；resume 接受合法放宽后替换 | 不清除 | 先写 `resume_config_relaxed` 再保存 | 与当前配置比较，只许放宽 |
 | `status` | 见上表 | — | 先保存再写 `run_stopped` | 终态拒绝修改选项 |
-| `worktree_binding`、`ignored_baseline` | 首次保存为空；`git worktree add` 后第二次保存填入 | 不清除 | 第一次保存在创建工作树前 | 绑定为空时 resume 拒绝，只能 `abandon` |
+| `worktree_binding` | 首次保存为空；`git worktree add` 后第二次保存填入 | 不清除 | 第一次保存在创建工作树前 | 绑定为空时 resume 拒绝，只能 `abandon` |
 | `original_tasks` | 供给计划在首次保存；模型计划与首版计划同次 | 不变 | 供给计划的副本早于 `tasks` 登记；模型写的首版计划与 `tasks`、`plan_history` 同次保存 | `tasks` 为空时：有供给计划则重新校验并登记同一计划，否则推导出规划的 `decide`（回执已返回则重放同一原件） |
 | `tasks`、`plan_history` | 首版计划登记；修订发布 | 不清除 | 先写 `plans/revision-N.json`；`plan_history` 每行只存修订号、路径与 SHA256；修订发布与 `current_task`、`pending_directive`、`feedback` 同次 | 按计划版本继续；修订的执行字段只在计划文件里 |
 | `plan_approval_required`、`plan_approved` | 创建时；`--approve-plan` | 不变 | 先写 `plan_approved` 再保存 | 普通 resume 不批准 |
 | `expected_head`、`accepted` | 任务接受 | 不清除 | 与 `pending_post_accept` 同次 | 工作树 HEAD 必须等于 `expected_head` |
 | `attempts`、`agent_dispatches` | 调用后端前 | 只增 | 与接收意图、`invoked` 同次 | 已记账的调用不退回 |
-| `final_history` | 新的整体尝试追加 `running` 记录（尝试号是 `len(final_history)+1`），随后更新阶段与结论；进入 reviewing 时与阶段同次写入该次审阅的对照 `required_findings`（在验证开始前算出） | 不清除 | 尝试记录先于快照产物；失败或拒绝与 `feedback` 同次 | 同一快照：未完成则复用该尝试，已批准则完成，已拒绝或非超时验证失败则推导出整体阶段的 `decide` |
+| `final_history` | 新的整体尝试追加 `running` 记录（尝试号是 `len(final_history)+1`），随后更新阶段与结论；进入 reviewing 时与阶段同次写入该次审阅的对照 `required_findings`（在验证开始前算出）；开启 `fresh_checkout` 时，验证结论那次保存同时写入该轮的 `checkout_digest`（`checkout.json` 字节的 SHA256） | 不清除 | 尝试记录先于快照产物；失败或拒绝与 `feedback` 同次；进入 reviewing 之后、整体审阅之前尝试回收最近一轮的检出（不写台账） | 同一快照：未完成则复用该尝试，已批准则完成，已拒绝或非超时验证失败则推导出整体阶段的 `decide` |
 | `dispatches` | 准备完成追加（`status=running`、`process_state=prepared`、`invoked=false`）；调用前 `process_state=starting`、`invoked=true`，重做另记 `retry_of`（去掉了提示时记 `previous_invalid_omitted`）；启动记 pgid；结束记进程事实与用量；读不出否决的无效输出记 `status=invalid`、错误与 `invalid_output`，否决类记 `invalid_rejected`、`invalid_asked` 或 `invalid_blocked`；只因越界而无效的修订另记 `out_of_scope_paths`；调用期间候选或 HEAD 已变的提问另记 `candidate_changed` | 不清除 | 准备条目先于本地准备门禁（输入、索引、MCP、快照、待派发指令与上一份无效原件的核对、额度），这些门禁失败时条目以 `invoked=false`、`status=failed` 收尾；`retry_of` 与预算同次；`invalid` 与回执消费同次；`candidate_changed`（与 `invalid_asked`）和提问登记、回执消费同次 | 退出门禁读进程事实；`worker_receipt_consumed` 记 worker 回执结局；`retry_of` 必须指向它之前最后一次模型调用 |
 | `feedback` | worker 阻断（含无效阻断，带 `output_error`；结构不可信时没有 `worker`）、审阅拒绝、验证或预检失败、候选变化、整体失败、修订发布 | 接受、整体批准时置 null | 与引起它的转换同次 | 下一次指挥与 worker 的输入 |
 | `review_history` | 任务审阅结束；候选变化前把已返回审阅存为 invalidated；每条记录带派发时的对照副本 `required_findings` | 不清除 | 与审阅后的阶段同次 | 返工输入、`review_rounds` 来源；处置只经副本映射，副本与重算清单不符即停止 |
@@ -164,11 +168,10 @@
 | `error`、`error_type` | 停止时 | 在重新 `running` 时清除 | 先保存再写 `run_stopped` |
 | `command_requirements` | 计划登记、恢复、调度时重算，变化才保存 | 不清除 | 只是诊断，派发前总是重算 |
 | `context_capacity` | 整体审阅容量预估，变化才保存 | 不清除 | 必要下界超限时提前停止 |
-| `ignored_diagnostics` | 开始、worker 返回、验证结束 | 不清除 | 只是路径清单摘要 |
 
 `recovery.py` 的 `RECOVERY_BUSY_KEYS` 列出共用的八个待处理键，环境更新、续作拒绝、执行指导和操作者决定在其中任一有值时拒绝（见[恢复选项](recovery.md#恢复选项与互斥)）。`load_run` 在任何副作用前检查这些对象的类型、所引 dispatch 的角色与任务、`plan_history` 与 `pending_revision` 的引用形状、`pending_revision` 不与任务阶段或待派发指令并存，失败时不改写台账。
 
-清理状态不在台账里：`cleanup-run` 的删除意图与完成记录写在检出证据旁的 `cleanup.json` 和 run 目录的 `worktree-cleanup.json`，清理不改写台账（`--confirm-exited` 的退出确认除外）。
+清理状态不在台账里：检出的删除意图与完成记录写在检出证据旁的 `cleanup.json`（`by` 是这份记录的写入者——运行时回收或 `cleanup-run`；补写完成记录的一方可能不是执行删除的一方），任务工作树的写在 run 目录的 `worktree-cleanup.json`（含本次是否允许删除忽略文件 `remove_ignored` 与删除前重新列出的有界清单）；运行时回收与 `cleanup-run` 都不改写台账（`--confirm-exited` 的退出确认除外）。台账里与检出有关的只有整体验证结论那次保存的 `checkout_digest`，它是结论的证据绑定，不是清理状态。
 
 ## 参考项目
 
@@ -196,7 +199,8 @@ Orca 按本机 CLI 1.4.237 参考，不运行它；“一任务一实例”比 O
 - 调用前的台账保存失败时，`finally` 的保存可能留下已扣预算、`invoked=true` 的条目；恢复按可重试处理，保守地多计一次尝试。
 - 接受时重建暂存区改变了已审阅的暂存区摘要、在 commit 前中断，恢复作废旧批准并消耗新的工作尝试。
 - 进程组监督不是完整的 OS 进程树隔离；`--confirm-exited` 依赖操作者核实。
-- 快照每次全量哈希，成本随仓库增长；忽略路径清单不校验内容；全新检出验证不保证 hermetic 构建。
+- 快照每次全量哈希，成本随仓库增长；审阅包的忽略清单只列路径（目录折叠、最多 100 条与 8 KiB），不显示被忽略目录里的内容，不校验内容；全新检出验证不保证 hermetic 构建。
+- 结论未保存的验证轮次（准备失败、中断）没有台账摘要，`cleanup-run` 只凭检出记录里的归属与身份核对处理它们；能改写本 run 证据目录的人可以伪造归属。
 - 记忆检索是本地词法排序，没有 embedding 或语义冲突检测；来源 `matching` 不证明事实正确。
 - 串行 DAG；并行需要每任务工作树、依赖集成和冲突处理。
 - 轮数上限与墙钟超时只限制单次调用，不是任务累计工具预算；到限不自动扩容、续接会话或豁免预算，也没有到限前的交接协议。

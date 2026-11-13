@@ -420,6 +420,8 @@ def _main(argv=None):
     retirement.add_argument("--remove", action="store_true",
                             help="逐项移除通过安全检查的资源：验证检出不限 run 状态，工作树仅限终态")
     retirement.add_argument("--remove-input-copies", action="store_true", help="显式删除登记且未修改的依赖副本；保留源文件")
+    retirement.add_argument("--remove-ignored", action="store_true",
+                            help="任务工作树：预览，或与 --remove 同用时删除 Git 判定为忽略的文件；验证检出的忽略文件不需要此选项")
     retirement.add_argument("--confirm-exited", action="append", metavar="DISPATCH_ID",
                             help="显式确认旧派发及其命令进程已退出；可重复指定")
     prepare = sub.add_parser("prepare-run", help="在暂停边界按清单准备不可变依赖副本")
@@ -487,6 +489,7 @@ def _main(argv=None):
             elif args.command == "cleanup-run":
                 result = cleanup_run(repo, args.run_id, remove=args.remove,
                                      remove_input_copies=args.remove_input_copies,
+                                     remove_ignored=args.remove_ignored,
                                      confirm_exited=args.confirm_exited or ())
                 print(dump(result))
                 return 1 if blocked(result) else 0

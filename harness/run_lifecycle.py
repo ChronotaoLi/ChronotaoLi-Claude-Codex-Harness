@@ -47,7 +47,7 @@ class RunLifecycle(RuntimeService):
                     "environment_updates": [], "environment_checks": [],
                     "decision_requests": [], "operator_decisions": [], "task_checkpoints": [], "checkpoint_batches": [],
                     "continuation_history": [], "execution_guidance": [],
-                    "worktree_binding": {}, "ignored_baseline": [],
+                    "worktree_binding": {},
                     "agent_dispatches": 0,
                     "plan_approval_required": pause_after_plan, "plan_approved": not pause_after_plan,
                     "created_by_operation": getattr(operation, "id", None) if operation is not None else None}
@@ -58,9 +58,7 @@ class RunLifecycle(RuntimeService):
             try:
                 git.git(self.context.repo, "worktree", "add", "-b", self.context.run["branch"], str(worktree), "HEAD")
                 self.context.run["worktree_binding"] = git.capture_worktree_binding(worktree, self.context.run["branch"])
-                self.context.run["ignored_baseline"] = self.context.ignored_paths()
                 self.context.save()
-                self.context.record_ignored_paths("initial", self.context.directory)
             except BaseException as error:
                 self.services.workflow.stop(error)
                 raise
@@ -106,7 +104,7 @@ class RunLifecycle(RuntimeService):
                     "config_snapshot": dict, "tasks": list, "original_tasks": list,
                     "accepted": dict, "attempts": dict, "dispatches": list,
                     "review_history": dict, "review_receipts": dict,
-                    "worker_receipts": dict, "commander_receipts": dict, "worktree_binding": dict, "ignored_baseline": list,
+                    "worker_receipts": dict, "commander_receipts": dict, "worktree_binding": dict,
                     "approved_scope": list,
                     "final_history": list, "plan_history": list,
                     "agent_dispatches": int, "plan_approval_required": bool, "plan_approved": bool,

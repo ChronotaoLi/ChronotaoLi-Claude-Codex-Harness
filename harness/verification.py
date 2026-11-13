@@ -143,14 +143,16 @@ class Verification(RuntimeService):
                 break
         return results
 
-    def verify(self, task_id, attempt, *, whole_run=False, artifact_dir=None, before=None):
+    def verify(self, task_id, attempt, *, whole_run=False, artifact_dir=None, before=None, round_index=None):
         folder = Path(artifact_dir) if artifact_dir is not None else self.verification_directory(task_id, attempt, whole_run=whole_run)
         folder.mkdir(parents=True, exist_ok=True)
         # Callers may pass a just-computed snapshot only when no model or
         # verification process has run since. The exit gate always rehashes files.
         before = self.context.snapshot() if before is None else before
         if whole_run and self.context.config.data["verification"]["fresh_checkout"]:
-            return self.verify_fresh_checkout(task_id, folder, before)
+            # The checkout record names its run, whole-run attempt and verification round.
+            return self.verify_fresh_checkout(task_id, folder, before, {
+                "run_id": self.context.run["id"], "attempt": attempt, "round": round_index})
         results = self.run_verification_commands(task_id, self.context.config.data["verification"]["commands"],
                                                   self.context.worktree, folder, self.context.run["worktree_binding"])
         after = self.context.snapshot()
@@ -164,12 +166,16 @@ class Verification(RuntimeService):
                                "请配置构建/测试输出位置或显式忽略生成产物；不自动豁免文件。"
                                "运行中可在公共 Git 目录的 info/exclude 精确忽略新生成文件；"
                                "这会改变后续快照可见范围，不豁免已跟踪文件，请先核对文件内容。")
-        self.context.record_ignored_paths("verification", folder)
         write_json(folder / "results.json", results)
         return results
 
-    def verify_fresh_checkout(self, task_id, folder, source_snapshot):
-        """Verify committed bytes in a new external checkout with explicit setup."""
+    def verify_fresh_checkout(self, task_id, folder, source_snapshot, owner):
+        """Verify committed bytes in a new external checkout with explicit setup.
+
+        ``owner`` ({run_id, attempt, round}) is in the record from its first
+        write, before the checkout exists, so cleanup can tell this round's
+        checkout from any other legitimate one.
+        """
         self.context.store.check_current()
         self.context.ensure_exited()
         git.check_worktree_binding(self.context.worktree, self.context.run["worktree_binding"])
@@ -179,7 +185,7 @@ class Verification(RuntimeService):
             raise HarnessError("全新整体验证要求临时目录位于目标仓库之外；请设置外部 TMPDIR")
         checkout = root / ".harness" / "checkout"
         artifact = folder / "checkout.json"
-        environment = {"mode": "fresh_checkout", "worktree": str(checkout),
+        environment = {"mode": "fresh_checkout", "owner": owner, "worktree": str(checkout),
                        "head": self.context.run["expected_head"], "status": "preparing",
                        "setup_commands": self.context.config.data["verification"]["setup_commands"]}
         write_json(artifact, environment)
@@ -212,5 +218,4 @@ class Verification(RuntimeService):
                            setup_artifact=str(folder / "setup/results.json"))
         write_json(artifact, environment)
         write_json(folder / "results.json", results)
-        self.context.record_ignored_paths("final_source", folder)
         return results

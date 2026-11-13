@@ -175,7 +175,7 @@ class Dispatcher(RuntimeService):
             entry["command_directory"] = str(job / "commands")
         self.context.save()
         # Events observe the ledger; the saved invoked flag stays authoritative.
-        self._observe("dispatch_prepared", task_id=task_id, dispatch_id=dispatch_id, role=role)
+        self.context.observe("dispatch_prepared", task_id=task_id, dispatch_id=dispatch_id, role=role)
         def on_start(pgid):
             entry["pgid"] = pgid
             entry["process_state"] = "running"
@@ -287,7 +287,7 @@ class Dispatcher(RuntimeService):
             self.context.save()
             invoked = True
             # Only after the durable invoked=True; a failed append never blocks the call.
-            self._observe("dispatch_started", task_id=task_id, dispatch_id=dispatch_id, role=role, invoked=True)
+            self.context.observe("dispatch_started", task_id=task_id, dispatch_id=dispatch_id, role=role, invoked=True)
             result = self.context.backend.invoke(role=role, model=self.context.config.role(role, self.context.commander), cwd=self.context.worktree,
                                          job=job, schema=contract, prompt=prompt, run_path=self.context.directory / "state.json",
                                          on_start=on_start, task=task, kind=kind, on_outcome=on_outcome)
@@ -362,16 +362,5 @@ class Dispatcher(RuntimeService):
                 except Exception:
                     pass
             self.context.save()
-            self._observe("dispatch_finished", task_id=task_id, dispatch_id=dispatch_id, role=role,
-                          status=entry["status"], invoked=invoked, provider_usage=entry.get("provider_usage"))
-
-    def _observe(self, event, **fields):
-        """Append a best-effort observation; consumers de-duplicate by dispatch_id.
-
-        The ledger and its event log are not written atomically: a crash can omit
-        an event, and recovery neither re-emits nor repeats one.
-        """
-        try:
-            self.context.event(event, **fields)
-        except Exception:
-            pass
+            self.context.observe("dispatch_finished", task_id=task_id, dispatch_id=dispatch_id, role=role,
+                                 status=entry["status"], invoked=invoked, provider_usage=entry.get("provider_usage"))
