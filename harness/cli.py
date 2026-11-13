@@ -298,9 +298,9 @@ def stop_notice(value, run_id, operation_id):
         pass  # Observation output never changes the exit status or the operation record.
 
 
-def report_stop(error, run_id=None, operation_id=None):
+def report_stop(error, run_id=None, operation_id=None, value=None):
     """stderr: the full text as before, then the projection; returns the projection."""
-    value = stops.project(stops.of(error), run_id)
+    value = value if value is not None else stops.project(stops.of(error), run_id)
     if isinstance(error, KeyboardInterrupt):
         text = "已中断；运行状态和 worktree 已保留"
     elif isinstance(error, sqlite3.Error):
@@ -397,9 +397,13 @@ def operate(args, config, repo, state):
     except BaseException as error:
         run_id = persisted_run_id(args, engine, state)
         code = exit_status(error)
-        value = report_stop(error, run_id, operation.id) if reported(error) else None
+        # Every failure is recorded with its projection; only the reported ones
+        # also get the stderr diagnostic and return, the rest propagate as before.
+        value = stops.project(stops.of(error), run_id)
+        if reported(error):
+            report_stop(error, run_id, operation.id, value)
         operation.finish(exit_status=code, error=error, stop=value, run_id=run_id)
-        if value is None:
+        if not reported(error):
             raise
         return code
     saved = None

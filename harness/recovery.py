@@ -46,12 +46,14 @@ def invalidate_acceptance_review(run, feedback=None, *, attempt=None, candidate_
     return changed
 
 
-def worker_recovery_context(run, directory, task_id):
+def worker_recovery_context(run, directory, task_id, *, feedback=None):
     """Separate a retained failure from the latest evidenced task stages.
 
     This is navigation over persisted records, never an acceptance decision or
     a claim that the original failure's cause was fixed. Only one worker and
     its matching stages are projected; full histories remain in the ledger.
+    The failure's text appears once per packet: on the failure source, unless
+    ``feedback`` (the same packet's feedback) already carries it.
     """
     recovery = run.get("worker_recovery", {}).get(task_id)
     if not recovery:
@@ -65,12 +67,16 @@ def worker_recovery_context(run, directory, task_id):
         raise HarnessError("worker recovery invocation accounting is invalid")
     attempts = {entry["id"]: index for index, entry in enumerate(invoked, 1)}
 
-    def source(entry):
+    def source(entry, *, failure=False):
         value = {"dispatch_id": entry["id"], "status": entry.get("status", "unknown"),
                  "artifact": str(Path(directory) / "dispatches" / entry["id"])}
-        if isinstance(entry.get("error"), str):
-            # The failure text lives on the dispatch entry, not in a second copy.
-            value["error"] = stops.bounded(entry["error"])
+        text = entry.get("error")
+        carried = (isinstance(feedback, dict) and feedback.get("task_id") == task_id
+                   and feedback.get("output_error") == text)
+        if failure and isinstance(text, str) and not carried:
+            # The retained failure's text, read from its dispatch entry: once, on
+            # the failure source, never again on the latest worker.
+            value["error"] = stops.bounded(text)
         for key in ("invoked_at", "worker_outcome"):
             if key in entry:
                 value[key] = entry[key]
@@ -80,7 +86,7 @@ def worker_recovery_context(run, directory, task_id):
 
     original = next((entry for entry in workers if entry["id"] == recovery.get("dispatch_id")), None)
     latest = next((entry for entry in reversed(workers) if entry.get("invoked") is True), None)
-    result["source"] = source(original) if original else {"status": "unknown"}
+    result["source"] = source(original, failure=True) if original else {"status": "unknown"}
     result["relation"] = "unknown"
     if latest is None:
         return result

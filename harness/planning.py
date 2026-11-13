@@ -139,9 +139,9 @@ class Planner(RuntimeService):
         run = self.context.run
         current = run.get("current_task")
         ids = [t["id"] for t in ready]
-        return {"kind": "task", "ready": ids, "current_task": current,
-                "feedback": compact_feedback(run.get("feedback")),
-                "recovery": (worker_recovery_context(run, self.context.directory, current)
+        feedback = compact_feedback(run.get("feedback"))
+        return {"kind": "task", "ready": ids, "current_task": current, "feedback": feedback,
+                "recovery": (worker_recovery_context(run, self.context.directory, current, feedback=feedback)
                              if current in ids else None)}
 
     def decide_packet(self, trigger):

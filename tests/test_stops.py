@@ -1,7 +1,9 @@
 """Stop values: registry, bounds, ledger rules, one projection everywhere. All calls are simulated."""
 import copy
+import io
 import json
 import random
+import sqlite3
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -12,6 +14,8 @@ from harness.util import HarnessError, ProcessTimeout, read_json, write_json
 from test_harness import ROOT, RepoCase, commit_recorder
 from test_operations import OperationCase
 from test_runtime_changes import ScriptedBackend
+
+REMOVED = ("error", "error_type", "last_runtime_error")
 
 
 def plan():
@@ -149,6 +153,7 @@ class LedgerStopTests(OperationCase):
             with self.subTest(status=state["status"], revision=state["store_revision"]):
                 self.assertEqual("stop" in state, state["status"] in stops.STOP_STATUSES)
                 stops.validate_ledger(state)
+                self.assertFalse(set(REMOVED) & set(state), "the removed error records came back")
         running = next(state for state in states if state["status"] == "running")
         self.assertNotIn("stop", running)
 
@@ -244,6 +249,63 @@ class LedgerStopTests(OperationCase):
         self.assertNotIn("detail", record["stop"])
         self.assertNotIn("VALUE-THAT-MUST-NOT-LEAK", json.dumps(record))
 
+    def test_propagated_exceptions_still_record_their_projection(self):
+        path = self.repo.parent / "plan.json"
+        write_json(path, plan())
+        cases = (("before run creation", RuntimeError("internal fault"), "harness.runtime.Runtime.start"),
+                 ("before run creation", sqlite3.ProgrammingError("db misuse"), "harness.runtime.Runtime.start"),
+                 ("during the run", RuntimeError("internal fault after acceptance"),
+                  "harness.finalization.FinalAcceptance.final_review"))
+        for index, (moment, error, target) in enumerate(cases):
+            with self.subTest(moment=moment, error=type(error).__name__):
+                operation_id = f"op-propagated-{index}"
+
+                def fail(*args, **kwargs):
+                    raise error
+                errors = io.StringIO()
+                with self.assertRaises(type(error)):
+                    self.invoke(["run", "Implement greet", "--plan", str(path), "--operation-id", operation_id],
+                                ScriptedBackend(), errors=errors, **{target: fail})
+                self.assertNotIn("harness: ", errors.getvalue())  # propagated: no diagnostic, as before
+                self.assertNotIn('"event":"stop"', errors.getvalue())
+                record = self.record(operation_id)
+                self.assertEqual((record["exit_status"], record["error"]), (1, None))  # file input: text omitted
+                stop = record["stop"]
+                self.assertEqual((stop["kind"], stop["reason"], stop["data"]["error_type"], stop["exit_code"]),
+                                 ("unclassified", "unexpected_exception", type(error).__name__, 1))
+                self.assertNotIn("detail", stop)
+                if moment == "during the run":
+                    ledger = stops.project_ledger(self.ledger(record["run_id"]), omit_detail=True)
+                    self.assertEqual(stop, ledger)
+
+    def test_no_save_writes_the_removed_error_records(self):
+        """Stops, worker failures and invalid blockers never bring back run error, error_type or last_runtime_error."""
+        class FailingThenBlocking(ScriptedBackend):
+            def invoke(self, **kwargs):
+                workers = sum(call["role"] == "worker" for call in self.calls)
+                if kwargs["role"] == "worker" and workers == 0:
+                    self.calls.append({"role": "worker", "kind": kwargs["kind"], "packet": None, "task_id": "greet"})
+                    raise HarnessError("worker service unavailable")
+                return super().invoke(**kwargs)
+
+        def invalid_blocker(backend, kwargs, packet, result):
+            if kwargs["role"] == "worker" and sum(call["role"] == "worker" for call in backend.calls) == 2:
+                result.update(status="blocked", blocker_kind="environment", blockers=["Docker stopped"], summary="x" * 32001)
+        backend = FailingThenBlocking(invalid_blocker)
+        recorder, states = commit_recorder()
+        with recorder:
+            engine = self.engine(backend)
+            with self.assertRaises(HarnessError):
+                engine.start("Implement greet", plan())
+            with self.assertRaisesRegex(HarnessError, "环境受阻"):
+                self.engine(backend).resume(engine.run["id"])
+        self.assertGreater(len(states), 5)
+        for state in states:
+            with self.subTest(revision=state["store_revision"]):
+                self.assertFalse(set(REMOVED) & set(state))
+                for task_id, recovery in state.get("worker_recovery", {}).items():
+                    self.assertFalse({"error", "error_type"} & set(recovery), task_id)
+
     def test_abandon_clears_the_stop(self):
         engine = self.blocked()
         recorder, states = commit_recorder()
@@ -284,6 +346,77 @@ class WorkerRecoveryProjectionTests(RepoCase):
         self.assertEqual(projected["source"]["dispatch_id"], failed["id"])
         self.assertEqual(projected["source"]["error"], stops.bounded(failed["error"]))
         self.assertLessEqual(len(projected["source"]["error"]), 2000)
+        # The failure text is carried once: not again on the latest worker.
+        self.assertNotIn("error", projected["latest"]["worker"])
+        self.assertEqual(json.dumps(packet, ensure_ascii=False).count("worker service unavailable"), 1)
+
+    def test_invalid_environment_blocker_recovery_reads_the_judgment_from_its_entry(self):
+        """The one visible difference: the recovery text is the judgment, not the stop that followed it.
+
+        Before, the dispatch's exception handler overwrote the recovery record with the
+        environment stop text (blocker excerpt, artifact path and digest). The text now
+        comes from the judged entry; feedback already carries it, so the packet holds it once.
+        """
+        def change(backend, kwargs, packet, result):
+            if kwargs["role"] == "worker" and sum(call["role"] == "worker" for call in backend.calls) == 1:
+                result.update(status="blocked", blocker_kind="environment", blockers=["Docker stopped " + "d" * 1500],
+                              summary="x" * 32001)
+        backend = ScriptedBackend(change)
+        engine = self.engine(backend)
+        with self.assertRaisesRegex(HarnessError, "环境受阻") as caught:
+            engine.start("Implement greet", plan())
+        stop_text = str(caught.exception)
+        worker = next(entry for entry in engine.run["dispatches"] if entry["role"] == "worker")
+        self.assertEqual((worker["status"], worker["error"]), ("invalid_blocked", engine.run["feedback"]["output_error"]))
+        self.assertNotEqual(worker["error"], stop_text)
+        update = self.repo.parent / "environment-update.json"
+        write_json(update, {"schema_version": 1, "task_id": "greet", "blocker_dispatch_id": worker["id"],
+                            "summary": "Restored"})
+        result = self.engine(backend).resume(engine.run["id"], environment_update=update)
+        self.assertEqual(result["status"], "completed")
+        packet = [call["packet"] for call in backend.calls if call["role"] == "worker"][-1]
+        whole = json.dumps(packet, ensure_ascii=False)
+        self.assertEqual(packet["feedback"]["output_error"], worker["error"])
+        self.assertEqual(whole.count(worker["error"]), 1)
+        self.assertNotIn("error", packet["recovery"]["source"])
+        self.assertNotIn("环境受阻", whole)
+        self.assertEqual(packet["recovery"]["source"]["dispatch_id"], worker["id"])
+
+
+class RecoveryCapacityTests(RepoCase):
+    """A resume whose worker context sits just inside the budget completes exactly as before 4a."""
+    FAILURE = "service unavailable: " + "x" * 1900
+    MARGIN = 600  # smaller than the failure text: a second copy of it would exceed the budget
+
+    def scenario(self, padding, failure):
+        backend = ScriptedBackend()
+
+        def fail_first(backend, kwargs, packet):
+            if kwargs["role"] == "worker" and len(backend.calls) == 1:
+                raise HarnessError(failure)
+        backend.before_result = fail_first
+        engine = self.engine(backend)
+        with self.assertRaises(HarnessError):
+            engine.start("Implement greet. " + "g" * padding, plan())
+        try:
+            result = self.engine(backend).resume(engine.run["id"])
+        except HarnessError:
+            result = read_json(engine.directory / "state.json")
+        workers = [entry for entry in result["dispatches"] if entry["role"] == "worker"]
+        report = engine.directory / "dispatches" / workers[-1]["id"] / "context-report.json"
+        required = read_json(report)["required_chars"] if len(workers) == 2 else None
+        return result, backend, required
+
+    def test_resume_at_the_capacity_edge_completes(self):
+        budget = self.config.data["runtime"]["context_chars"]
+        _, _, calibrated = self.scenario(60000, "service unavailable")
+        padding = 60000 + (budget - self.MARGIN) - (calibrated + len(self.FAILURE) - len("service unavailable"))
+        result, backend, required = self.scenario(padding, self.FAILURE)
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(required, budget - self.MARGIN)
+        self.assertEqual(result["attempts"], {"greet": 2})
+        self.assertEqual(result["agent_dispatches"], 5)
+        self.assertEqual([call["role"] for call in backend.calls].count("worker"), 2)
 
 
 if __name__ == "__main__":

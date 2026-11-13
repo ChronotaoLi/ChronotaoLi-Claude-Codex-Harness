@@ -14,6 +14,7 @@ from unittest.mock import patch
 
 from harness import stops
 from harness.adapters import CLIBackend, DemoBackend
+from harness.process_runtime import ProcessOutcome
 from harness.recovery import worker_recovery_context
 from harness.util import HarnessError, ProcessTimeout, read_json, write_json
 from harness.worker_returns import SOURCES, inspect_return, validate_return_evidence
@@ -169,12 +170,21 @@ class WorkerReturnRecoveryTests(RepoCase):
             def invoke(self, **kwargs):
                 if kwargs['role'] == 'worker' and self.first:
                     self.first = False
+                    # A supervised timeout reports its process facts before raising.
+                    kwargs['on_outcome'](ProcessOutcome(started=True, startup_state='started', exit_code=-9,
+                                                        termination_reason='timeout', exit_confirmed=True))
                     raise ProcessTimeout(1, kwargs['job'] / 'process')
                 return super().invoke(**kwargs)
+
+        def process_facts(entry):
+            return (entry['termination_reason'], entry['exit_confirmed'], entry['process_outcome']['termination_reason'],
+                    entry['process_outcome']['exit_confirmed'], entry['process_outcome']['exit_code'])
         engine = self.engine(TimeoutOnce())
         with self.assertRaises(ProcessTimeout):
             engine.start('Implement greet', self.plan())
         original = deepcopy(engine.run['worker_recovery']['greet'])
+        timed_out = next(d for d in engine.run['dispatches'] if d['id'] == original['dispatch_id'])
+        self.assertEqual(process_facts(timed_out), ('timeout', True, 'timeout', True, -9))
         with patch.object(engine.services.tasks, 'task_attempt', side_effect=HarnessError('stop before new work')):
             with self.assertRaisesRegex(HarnessError, 'stop before new work'):
                 engine.resume(engine.run['id'])
@@ -184,6 +194,8 @@ class WorkerReturnRecoveryTests(RepoCase):
         failed = next(d for d in engine.run['dispatches'] if d['id'] == original['dispatch_id'])
         self.assertTrue(failed['error'].startswith('进程超过 1s'), failed['error'])
         self.assertEqual(failed['worker_receipt_consumed'], 'provider_failure')
+        # Retiring the receipt as a provider failure keeps the observed timeout facts.
+        self.assertEqual(process_facts(failed), ('timeout', True, 'timeout', True, -9))
         projected = worker_recovery_context(engine.run, engine.directory, 'greet')
         self.assertEqual(projected['source']['dispatch_id'], failed['id'])
         self.assertEqual(projected['source']['error'], failed['error'])
@@ -191,6 +203,8 @@ class WorkerReturnRecoveryTests(RepoCase):
         result = engine.resume(engine.run['id'])
         self.assertEqual(result['status'], 'completed')
         self.assertEqual(result['attempts']['greet'], 2)
+        retired = next(d for d in result['dispatches'] if d['id'] == original['dispatch_id'])
+        self.assertEqual(process_facts(retired), ('timeout', True, 'timeout', True, -9))
 
     def test_lingering_failure_is_retryable_only_after_descendants_exit(self):
         backend = terminal_tests.LingeringCLI(self.config, self.repo, 'implement', no_terminal=True, exit_code=1)

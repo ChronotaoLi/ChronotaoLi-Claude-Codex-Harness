@@ -105,10 +105,11 @@ class TaskLifecycle(RuntimeService):
         self.context.save()
         self.context.checkpoint()
         prior_reviews = compact_reviews(self.context.run["review_history"].get(tid, []))
+        feedback = compact_feedback(self.context.run.get("feedback"), prior_reviews)
         result = self.services.dispatch.dispatch("worker", "implement", tid, WORK,
                  {"goal": self.context.run["goal"], "task": task, "instruction": directive["instruction"],
-                  "feedback": compact_feedback(self.context.run.get("feedback"), prior_reviews), "prior_reviews": prior_reviews,
-                  "recovery": worker_recovery_context(self.context.run, self.context.directory, tid),
+                  "feedback": feedback, "prior_reviews": prior_reviews,
+                  "recovery": worker_recovery_context(self.context.run, self.context.directory, tid, feedback=feedback),
                   "dependencies": {d: self.services.packets.accepted_context()[d] for d in task["depends_on"]},
                   "handoff_targets": self.services.workflow.handoff_targets(tid),
                   "verification_commands": self.context.config.data["verification"]["commands"],
