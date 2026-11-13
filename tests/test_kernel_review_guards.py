@@ -4,7 +4,6 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import unittest
-from unittest.mock import Mock
 
 from harness.run_store import RunStore
 from harness.run_context import RunContext
@@ -13,7 +12,7 @@ from harness.util import HarnessError
 
 
 class KernelReviewGuards(unittest.TestCase):
-    def test_stale_context_rejects_hook_and_snapshot_before_effect(self):
+    def test_stale_context_rejects_snapshot_before_effect(self):
         with TemporaryDirectory() as tmp:
             first, second = RunStore(tmp), RunStore(tmp)
             first.attach({'id': 'run_guard'})
@@ -21,12 +20,8 @@ class KernelReviewGuards(unittest.TestCase):
             second.attach(json.loads(first._path.read_text()))
             context = object.__new__(RunContext)
             context.store = second
-            context.hooks = SimpleNamespace(emit=Mock())
             first.run['changed'] = True
             first.commit()
-            with self.assertRaises(HarnessError):
-                context.emit_hook('context_prepared', {}, Path(tmp))
-            context.hooks.emit.assert_not_called()
             with self.assertRaises(HarnessError):
                 context.snapshot()
 

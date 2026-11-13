@@ -120,7 +120,7 @@ git cat-file commit SHA | sed '1,/^$/d' | git -c trailer.separators=: interpret-
 
 指挥只有一种调用 `decide`，每次返回 `implement`（选一个就绪任务并给出指令）、`revise`（首版计划，或对当前计划的增量修订并选出下一个任务）或 `ask`（向操作者提问并停止）之一；是否需要指挥决定由台账推导。返工时指挥可直接修订，缺少前置条件时补充任务，验收在当前边界内不可达时提问，无需先重复派发 worker。操作者接受风险不改变验收；停止后的部分交付与恢复出口见[验收不可达](docs/recovery.md#验收不可达)。
 
-一条 run 按 DAG 串行执行，复用工作树和已接受代码。Git worktree 是任务隔离，不是操作系统安全沙箱；范围检查发生在接受前，忽略文件和外部服务副作用不在 Git 快照覆盖范围内。CLI、hooks、验证命令和 MCP 服务以当前用户权限运行。更强隔离需专用 OS 用户或容器。
+一条 run 按 DAG 串行执行，复用工作树和已接受代码。Git worktree 是任务隔离，不是操作系统安全沙箱；范围检查发生在接受前，忽略文件和外部服务副作用不在 Git 快照覆盖范围内。CLI、验证命令和 MCP 服务以当前用户权限运行。更强隔离需专用 OS 用户或容器。
 
 需要验证交付提交不依赖 worker 留下的忽略文件时：
 
@@ -168,7 +168,7 @@ python3 -m harness --repo /path/to/project cleanup-run RUN --remove
 
 运行详情默认通过事件订阅更新，列表和文件页使用手动刷新。连接心跳仅表示观察服务可用；订阅断开后显示断开提示，由刷新按钮重新连接，不退回定时轮询。
 
-同一快照上的已保存阶段可复用：验证中断只重跑验证，审阅调用故障只新派发 reviewer，接受 hook 失败只重试 hook。worker 的完整接收记录绑定结果与返回后候选，恢复继续原校验及交接，复用封存结果本身不重新派发或扣除调用额度。已有能解码成对象的原始输出、尚未封存候选时中断则停止，不能把恢复时的文件补认原候选。调用结束且退出得到确认、却没有封存结果时，按原始输出判定：`process.stdout` 为空或是完整的供应商错误时重试；输出完整但解不出对象结果（截断、不能严格解码、不是 result 终态）是一次无效交付，记一次尝试后调度继续；与原始输出冲突或读不出时停止。判定、原件摘要、恢复信息和回执消费在同一次保存里发布。无效的结果保留原件并消费回执，下一次尝试是新的计费调用。代码变化使旧批准失效，进程未确认退出、HEAD／Git 绑定异常或证据损坏会停止；保存顺序见[设计：状态转换](docs/design.md#状态转换)。
+同一快照上的已保存阶段可复用：验证中断只重跑验证，审阅调用故障只新派发 reviewer。worker 的完整接收记录绑定结果与返回后候选，恢复继续原校验及交接，复用封存结果本身不重新派发或扣除调用额度。已有能解码成对象的原始输出、尚未封存候选时中断则停止，不能把恢复时的文件补认原候选。调用结束且退出得到确认、却没有封存结果时，按原始输出判定：`process.stdout` 为空或是完整的供应商错误时重试；输出完整但解不出对象结果（截断、不能严格解码、不是 result 终态）是一次无效交付，记一次尝试后调度继续；与原始输出冲突或读不出时停止。判定、原件摘要、恢复信息和回执消费在同一次保存里发布。无效的结果保留原件并消费回执，下一次尝试是新的计费调用。代码变化使旧批准失效，进程未确认退出、HEAD／Git 绑定异常或证据损坏会停止；保存顺序见[设计：状态转换](docs/design.md#状态转换)。
 
 | 情况 | 常用出口 |
 | --- | --- |
@@ -193,7 +193,7 @@ python3 -m harness --repo /path/to/project cleanup-run RUN --remove
 
 旧版本的台账与配置不受支持：其他版本的台账在各入口一律被拒绝（`台账版本 N 不支持（当前版本 18）`），运行列表只列出它的路径、版本和“不支持”；配置里已删除的键与其他未知键一样报“未知配置键”。见[终态与其他版本的台账](docs/recovery.md#终态与其他版本的台账)。
 
-## 共用 skills / MCP / hooks
+## 共用 skills / MCP
 
 共用源在 `shared/`，由运行时读取，避免为两个厂商维护两套业务规则：
 
@@ -202,7 +202,6 @@ python3 -m harness --repo /path/to/project cleanup-run RUN --remove
 | [shared/RULES.md](shared/RULES.md) | 所有角色的任务协议 |
 | `shared/skills/*/SKILL.md` | 角色工作方式与可选业务技能 |
 | [shared/mcp.json](shared/mcp.json) | 外部 MCP 服务的唯一配置源 |
-| [shared/hooks.json](shared/hooks.json) | 确定性的编排生命周期 hooks |
 
 协议说明放在 RULES 与角色 skill 里，每次派发都注入；包里放数据、索引和现场事实。环境更新、操作者决定、检查点、执行指导、权限、审阅、路径与命令索引、问题进度和计划增量的读法都只在 RULES 与技能里。包里不再有静态协议说明：指挥包不带 `instruction`；不经指挥直接派发时 worker 包的 `instruction` 为 null，续作拒绝写入的指令只含操作者的理由。重做时包里的 `previous_invalid` 只带上一次无效输出的引用与错误，是数据；任务审阅包的 `commit_message` 是从 worker 原件读出的数据。某任务没有相关的环境更新、决定或检查点时，包里只带对应索引。指挥包另带 `workspace: {head, clean}`：当时的 `expected_head` 与工作树 `git status` 是否干净。
 
@@ -226,14 +225,6 @@ python3 -m harness sync --role worker
 ```
 
 `sync` 生成 `.harness/generated/worker/claude.mcp.json` 和 `codex.mcp.toml`；正式 dispatch 使用各自配置，不覆盖用户 CLI 配置。Codex 使用 `--ignore-user-config`，依赖自定义 provider/base URL 的登录需先扩展适配器。生成的调用关闭个人原生 hooks 与自动记忆、关闭项目指令自动注入；只读角色的厂商差异见[设计：不变量](docs/design.md#不变量)。候选项目指令作为待审阅证据，不能改变目标、验收或权限。
-
-生命周期 hooks 支持 `pre_agent`、`post_agent`、`pre_verify`、`post_verify`、`pre_accept`、`post_accept`、`context_prepared`、`on_error`：
-
-```json
-{"pre_accept": [{"argv": ["python3", "scripts/check_policy.py"], "timeout_seconds": 30}]}
-```
-
-脚本在配置所在目录运行，从 stdin 读 JSON 事件，用事件绝对路径定位目标项目；非零退出或超时阻止继续。默认空数组表示无额外策略。每个事件带运行 ID `run_id` 和三个绝对路径字段 `repo`、`worktree`、`run_dir`；全新检出中的 `pre_verify`／`post_verify` 以验证目录为 `worktree`，另带 `source_worktree`。hooks 可因中断重复执行，外部副作用需可重复执行。配置出现 `context_compacted` 时启动报未知事件，应改用 `context_prepared`。它们不是厂商原生工具 hooks，运行时不截获所有工具调用。
 
 ## 记忆与上下文
 
@@ -265,7 +256,7 @@ python3 -m harness --repo /path/to/project memory export > memory-backup.json
 
 实际派发的 `context-report.json` 记录角色、阶段、必要字符数及字段尺寸，容器开销包含 JSON 键、引号与分隔符。成功派发的报告保留根与顶层字段尺寸及最大的 30 个嵌套字段，并在 `field_sizes_omitted` 给出省略数；必要输入超限时也保存报告且保留全部字段明细，不启动模型或扣调用预算。较长的续作历史、操作指导与重复命令通过 `input-indexes/` 中的不可变摘要索引检索；当前等待条件及指导义务仍保留，索引不授予命令权限。
 
-dispatch 私有 `context-report.json` 中的 `memory_retrieval` 记录候选、匹配、作用域、数量上限与容量筛选计数。最多四十条明细，依次优先保留返回项、数量上限排除项、作用域排除项和未匹配项，并按实际 ID 标记装入情况；计数完整，明细不保证涵盖全部排除项。报告也随既有 `context_prepared` hook 传递，不加入模型提示词。
+dispatch 私有 `context-report.json` 中的 `memory_retrieval` 记录候选、匹配、作用域、数量上限与容量筛选计数。最多四十条明细，依次优先保留返回项、数量上限排除项、作用域排除项和未匹配项，并按实际 ID 标记装入情况；计数完整，明细不保证涵盖全部排除项。报告不加入模型提示词。
 
 大量变更路径与恢复路径使用 SHA256 绑定的完整索引，按需检索，不重复塞进模型输入。相同清单共用索引，原始范围、验收、diff 与快照仍保留；索引缺失或损坏会阻止继续，不能靠截断路径绕过门禁。
 
@@ -295,7 +286,6 @@ claude_max_turns_by_role = { worker = 200 }
     handoff.json        # 任务边界交接检查点
     dispatches/<uuid>/  # 输入（worker 的 packet.json、schema.json）、结果、封存、CLI 日志、commands/
     verification/      # 命令、日志、diff、快照、checkout.json
-    hooks/             # 生命周期日志
     plans/ / recovery/ # 计划版本、修订及未接受修改归档
     continuations/ / continuation-rejections/ / execution-guidance/  # 续作类不可变记录
     environment/       # 环境更新与只读前置检查

@@ -13,7 +13,8 @@ from harness import continuation
 from harness.cli import status_summary
 from harness.recovery import snapshot_digest
 from harness.util import HarnessError, read_json, write_json
-from test_harness import RepoCase, ROOT, add_worker_dispatch
+import harness.worker_receipts as worker_receipts_module
+from test_harness import RepoCase, ROOT, add_worker_dispatch, after_save
 from test_runtime_changes import ScriptedBackend
 
 
@@ -237,10 +238,14 @@ class RejectionLifecycleTests(RepoCase):
         before = deepcopy(engine.run)
         timeout = self.config.data['runtime']['agent_timeout_seconds']
         resumed = self.engine(backend)
-        def fail(event, payload, logs):
-            if event == 'pre_agent' and payload['role'] == 'worker':
-                raise HarnessError('fixture preparation failure')
-        with patch.object(resumed.hooks, 'emit', side_effect=fail), self.assertRaisesRegex(HarnessError, 'fixture preparation'):
+        original = worker_receipts_module.write_json
+        def fail(target, value):
+            # Worker input publication fails during local preparation.
+            if target.name == 'packet.json':
+                raise OSError(28, 'No space left on device')
+            return original(target, value)
+        with patch.object(worker_receipts_module, 'write_json', fail), \
+                self.assertRaisesRegex(HarnessError, 'no budget was charged'):
             resumed.resume(engine.run['id'], reject_continuation=path)
         saved = read_json(engine.directory / 'state.json')
         self.assertIsNone(saved['pending_continuation'])
@@ -253,15 +258,21 @@ class RejectionLifecycleTests(RepoCase):
         self.assertEqual(sum(result['attempts'].values()), 2)
         self.assertEqual(self.config.data['runtime']['agent_timeout_seconds'], timeout)
 
-    def test_pre_agent_candidate_mutation_blocks_before_invocation_and_guard_stays_active(self):
+    def test_candidate_mutation_during_preparation_blocks_before_invocation_and_guard_stays_active(self):
         engine, backend, path, _, _ = self.waiting()
         resumed = self.engine(backend)
         original = (engine.worktree / 'hello.py').read_bytes()
-        def mutate(event, payload, logs):
-            if event == 'pre_agent' and payload['role'] == 'worker':
-                (engine.worktree / 'hello.py').write_text('# changed by preparation\n')
-        with patch.object(resumed.hooks, 'emit', side_effect=mutate), self.assertRaises(HarnessError):
+
+        def worker_prepared(run):
+            last = run['dispatches'][-1] if run['dispatches'] else {}
+            return last.get('role') == 'worker' and last.get('process_state') == 'prepared'
+
+        def mutate():
+            (engine.worktree / 'hello.py').write_text('# changed during preparation\n')
+        change, state = after_save(resumed, worker_prepared, mutate)
+        with change, self.assertRaises(HarnessError):
             resumed.resume(engine.run['id'], reject_continuation=path)
+        self.assertTrue(state['fired'])
         saved = read_json(engine.directory / 'state.json')
         self.assertEqual(len(backend.calls), 1)
         for key in ('attempts', 'agent_dispatches'):

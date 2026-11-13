@@ -3,7 +3,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from harness import git
-from harness.shared import HookError, read_skill
+from harness.shared import read_skill
 from harness.util import HarnessError, read_json, write_json
 from test_engine_repairs import RecordingBackend
 from test_harness import RepoCase, ROOT
@@ -34,30 +34,6 @@ class DispatchAccountingTests(RepoCase):
                 self.assertEqual(backend.requests, [])
             self.config.data["runtime"]["context_chars"] = 100000
             result = self.engine(backend).resume(engine.run["id"])
-        self.assertEqual(result["status"], "completed")
-        self.assertEqual(result["attempts"], {"greet": 1})
-        self.assertFalse(any(call["role"] == "commander" for call in backend.calls))
-
-    def test_pre_agent_failure_finishes_entry_without_spending_worker_budget(self):
-        backend = RecordingBackend()
-        engine = self.engine(backend)
-
-        def deny_worker(event, payload, logs):
-            if event == "pre_agent" and payload["role"] == "worker":
-                raise HookError(event, 7, logs)
-
-        with patch.object(engine.hooks, "emit", side_effect=deny_worker):
-            with self.assertRaises(HookError):
-                engine.start("Implement greet", self.plan())
-        saved = read_json(engine.directory / "state.json")
-        entry = saved["dispatches"][-1]
-        self.assertEqual(entry["status"], "failed")
-        self.assertTrue(entry["exit_confirmed"])
-        self.assertEqual(saved["attempts"], {})
-        self.assertEqual(sum(saved["attempts"].values()), 0)
-        self.assertEqual(saved["agent_dispatches"], 0)
-        self.assertEqual(backend.requests, [])
-        result = self.engine(backend).resume(saved["id"])
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["attempts"], {"greet": 1})
         self.assertFalse(any(call["role"] == "commander" for call in backend.calls))

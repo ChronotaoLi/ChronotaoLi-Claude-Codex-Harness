@@ -7,7 +7,6 @@ import hashlib
 import json
 import os
 import subprocess
-import sys
 import tempfile
 from pathlib import Path
 from unittest.mock import patch
@@ -16,9 +15,8 @@ from harness import git
 from harness.budgets import work_attempts
 from harness.contracts import WORK, judge_work
 from harness.git import commit_message_text
-from harness.shared import HookError
 from harness.util import HarnessError, read_json, write_json
-from test_harness import RepoCase, ROOT
+from test_harness import RepoCase, ROOT, crash_after_save, crash_point
 from test_runtime_changes import ScriptedBackend, finding
 
 
@@ -153,7 +151,7 @@ class CommitMessageTests(RepoCase):
         self.assertEqual(first["status"], "invalid")
         self.assertNotIn("pending_task", result)
 
-    def rejected_then_approved(self, gated=False):
+    def rejected_then_approved(self):
         """Review 1 rejects worker A's subject; worker B changes only the message; review 2 approves."""
         wanted = "feat: add greet"
 
@@ -166,8 +164,6 @@ class CommitMessageTests(RepoCase):
                     "message": "The repository requires a conventional commit subject"}])
         backend = ScriptedBackend(script)
         engine = self.engine(backend)
-        if gated:
-            engine.hooks.spec = self.pre_accept_gate(engine)
         return engine, backend, wanted
 
     def test_review_judges_the_message_and_the_repair_commits_the_new_one(self):
@@ -181,31 +177,33 @@ class CommitMessageTests(RepoCase):
         _, body = commit_object(self.repo, result["accepted"]["greet"]["commit"])
         self.assertTrue(body.startswith(f"{wanted}\n\n".encode()))
 
-    def pre_accept_gate(self, engine):
-        marker = engine.state / "acceptance-permitted"
-        return {"pre_accept": [{"argv": [sys.executable, "-c",
-                "import pathlib,sys; sys.exit(0 if pathlib.Path(sys.argv[1]).exists() else 7)", str(marker)]}]}
+    @staticmethod
+    def stop_at_acceptance(engine):
+        """The controller dies right after an approval is saved as pending_acceptance."""
+        crash, state = crash_after_save(engine, lambda run: "pending_acceptance" in run)
+        with crash:
+            try:
+                engine.start("Implement greet", read_json(ROOT / "examples" / "plan.json"))
+            except KeyboardInterrupt:
+                pass
+        assert state["fired"]
+        return read_json(engine.directory / "state.json")
 
     def stopped_before_acceptance(self):
-        """Worker B's approval waits in pending_acceptance behind a failing pre_accept hook."""
-        engine, backend, wanted = self.rejected_then_approved(gated=True)
-        with self.assertRaises(HookError):
-            engine.start("Implement greet", self.plan())
-        saved = read_json(engine.directory / "state.json")
+        """Worker B's approval waits in pending_acceptance; the controller died before accepting it."""
+        engine, backend, wanted = self.rejected_then_approved()
+        saved = self.stop_at_acceptance(engine)
         self.assertIn("pending_acceptance", saved)
-        (engine.state / "acceptance-permitted").touch()
         first = next(entry for entry in saved["dispatches"] if entry["role"] == "worker")
         return engine, backend, saved, worker_source(engine, first)
 
     def resume_refused(self, engine, backend, saved, pattern):
         write_json(engine.directory / "state.json", saved)
         head = git.head(engine.worktree)
-        resumed = self.engine(backend)
-        resumed.hooks.spec = self.pre_accept_gate(resumed)
-        with self.assertRaisesRegex(HarnessError, pattern):
-            resumed.resume(saved["id"])
+        with patch("harness.git.accept", wraps=git.accept) as accept, self.assertRaisesRegex(HarnessError, pattern):
+            self.engine(backend).resume(saved["id"])
+        accept.assert_not_called()
         self.assertEqual(git.head(engine.worktree), head)
-        self.assertFalse((engine.directory / "hooks" / "greet-2" / "pre_accept-2").exists())
         self.assertIn("pending_acceptance", read_json(engine.directory / "state.json"))
 
     def test_acceptance_refuses_a_worker_source_other_than_the_approved_one(self):
@@ -251,31 +249,32 @@ class CommitMessageTests(RepoCase):
             self.engine(backend).resume(saved["id"])
         self.assertFalse(any(call["kind"] == "review" for call in backend.calls))
 
-    def hook_changes_original(self, mode):
-        script = ("import json,pathlib,sys; path = pathlib.Path(sys.argv[1]); "
-                  "value = json.loads(path.read_text()); value['commit_message']['subject'] = 'Changed by a hook'; "
-                  "path.unlink() if sys.argv[2] == 'delete' else path.write_text(json.dumps(value))")
-
-        def arm(backend, kwargs, packet, result):
-            if kwargs["kind"] == "review":
-                artifact = engine.run["pending_task"]["worker_artifact"]
-                engine.hooks.spec = {"pre_accept": [{"argv": [sys.executable, "-c", script, artifact, mode]}]}
-        backend = ScriptedBackend(arm)
+    def original_changed_while_pending(self, mode):
+        backend = ScriptedBackend()
         engine = self.engine(backend)
         base = git.head(self.repo)
-        with self.assertRaisesRegex(HarnessError, "原始结果已改变|non-symlink file"):
-            engine.start("Implement greet", self.plan())
+        saved = self.stop_at_acceptance(engine)
+        artifact = Path(saved["pending_acceptance"]["worker_source"]["artifact"])
+        if mode == "delete":
+            artifact.unlink()
+        else:
+            value = read_json(artifact)
+            value["commit_message"]["subject"] = "Changed while acceptance was pending"
+            write_json(artifact, value)
+        with patch("harness.git.accept", wraps=git.accept) as accept, \
+                self.assertRaisesRegex(HarnessError, "原始结果已改变|non-symlink file"):
+            self.engine(backend).resume(saved["id"])
+        accept.assert_not_called()
         self.assertEqual(git.head(engine.worktree), base)
-        saved = read_json(engine.directory / "state.json")
-        self.assertIn("pending_acceptance", saved)
-        self.assertEqual(saved["accepted"], {})
-        self.assertTrue((engine.directory / "hooks" / "greet-1" / "pre_accept-1").exists())
+        after = read_json(engine.directory / "state.json")
+        self.assertIn("pending_acceptance", after)
+        self.assertEqual(after["accepted"], {})
 
-    def test_hook_that_rewrites_the_worker_original_stops_before_commit(self):
-        self.hook_changes_original("rewrite")
+    def test_rewritten_worker_original_stops_before_commit(self):
+        self.original_changed_while_pending("rewrite")
 
-    def test_hook_that_deletes_the_worker_original_stops_before_commit(self):
-        self.hook_changes_original("delete")
+    def test_deleted_worker_original_stops_before_commit(self):
+        self.original_changed_while_pending("delete")
 
     def test_interruption_after_the_commit_never_commits_twice(self):
         def write(backend, kwargs, packet, result):
@@ -285,17 +284,26 @@ class CommitMessageTests(RepoCase):
         engine = self.engine(backend)
         base = git.head(self.repo)
         accept = git.accept
+        crash, die = crash_point(engine)
 
         def commit_then_die(*args, **kwargs):
             accept(*args, **kwargs)
-            raise KeyboardInterrupt
-        with patch("harness.git.accept", side_effect=commit_then_die), self.assertRaises(KeyboardInterrupt):
+            die()
+        with crash, patch("harness.git.accept", side_effect=commit_then_die), self.assertRaises(KeyboardInterrupt):
             engine.start("Implement greet", self.plan())
         saved = read_json(engine.directory / "state.json")
+        self.assertIn("pending_acceptance", saved)
         head = git.head(engine.worktree)
         self.assertNotEqual(head, saved["expected_head"])
-        with self.assertRaisesRegex(HarnessError, "HEAD 与检查点不同"):
-            self.engine(backend).resume(saved["id"])
+        error = None
+        with patch("harness.git.accept", wraps=git.accept) as again:
+            try:
+                self.engine(backend).resume(saved["id"])
+            except HarnessError as caught:
+                error = caught
+        # The commit step itself never runs again, whatever stops the resume.
+        again.assert_not_called()
+        self.assertRegex(str(error), "HEAD 与检查点不同")
         self.assertEqual(git.head(engine.worktree), head)
         self.assertEqual(git.git(self.repo, "rev-list", "--count", f"{base}..{head}").strip(), "1")
         original = read_json(Path(saved["pending_acceptance"]["worker_source"]["artifact"]))["commit_message"]

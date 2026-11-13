@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 from harness import git
 from harness.util import HarnessError, read_json, write_json
+import harness.worker_receipts as worker_receipts_module
 from test_harness import ROOT, RepoCase
 from test_runtime_changes import ScriptedBackend, finding, revised, trigger_kind
 
@@ -284,17 +285,20 @@ class DescriptionReplanTests(RepoCase):
                 self.assertEqual((engine.worktree / "hello.py").read_text(), CANDIDATE)
                 self.assertEqual((engine.worktree / "notes.txt").read_text(), NOTES)
 
-    def test_pre_agent_preparation_failure_keeps_directive_and_invocation_budgets(self):
+    def test_preparation_failure_keeps_directive_and_invocation_budgets(self):
         engine, backend = self.interrupted("published")
         saved = read_json(engine.directory / "state.json")
         resumed = self.engine(backend)
+        original = worker_receipts_module.write_json
 
-        def fail_worker(event, payload, logs):
-            if event == "pre_agent" and payload["role"] == "worker":
-                raise HarnessError("local worker preparation unavailable")
+        def fail_worker(path, value):
+            # Worker input publication fails during local preparation.
+            if path.name == "packet.json":
+                raise OSError(28, "No space left on device")
+            return original(path, value)
 
-        with patch.object(resumed.hooks, "emit", side_effect=fail_worker), self.assertRaisesRegex(
-                HarnessError, "local worker preparation"):
+        with patch.object(worker_receipts_module, "write_json", fail_worker), self.assertRaisesRegex(
+                HarnessError, "no budget was charged"):
             resumed.resume(engine.run["id"])
         after = read_json(engine.directory / "state.json")
         self.assertEqual(after["pending_directive"], saved["pending_directive"])
@@ -310,23 +314,17 @@ class DescriptionReplanTests(RepoCase):
         self.assertEqual(backend.retained_seen, [2])
         self.assertNotIn("pending_directive", result)
 
-    def test_pre_agent_hook_cannot_replace_retained_candidate(self):
+    def test_retained_candidate_change_before_dispatch_stops_and_restores(self):
         for target in ("bytes", "index"):
             with self.subTest(target=target):
                 engine, backend = self.interrupted("published")
                 saved = read_json(engine.directory / "state.json")
+                if target == "bytes":
+                    (engine.worktree / "hello.py").write_text(CANDIDATE + "# outside edit\n")
+                else:
+                    git.git(engine.worktree, "add", "hello.py")
                 resumed = self.engine(backend)
-                emit = resumed.hooks.emit
-
-                def mutate(event, payload, logs):
-                    if event == "pre_agent" and payload["role"] == "worker":
-                        if target == "bytes":
-                            (resumed.worktree / "hello.py").write_text(CANDIDATE + "# hook edit\n")
-                        else:
-                            git.git(resumed.worktree, "add", "hello.py")
-                    return emit(event, payload, logs)
-                with patch.object(resumed.hooks, "emit", side_effect=mutate), self.assertRaisesRegex(
-                        HarnessError, "待派发指令与已发布计划或候选不符"):
+                with self.assertRaisesRegex(HarnessError, "待派发指令的代码快照已变化"):
                     resumed.resume(engine.run["id"])
                 after = read_json(engine.directory / "state.json")
                 self.assertEqual(after["pending_directive"], saved["pending_directive"])
@@ -345,20 +343,6 @@ class DescriptionReplanTests(RepoCase):
                     (engine.worktree / "hello.py").write_text(CANDIDATE)
                 result = self.engine(backend).resume(engine.run["id"])
                 self.assertEqual(result["status"], "completed")
-
-    def test_implement_directive_still_lets_pre_agent_hook_edit_candidate(self):
-        # Contrast: only retained and rejection directives lock the candidate after pre_agent.
-        engine = self.engine(ScriptedBackend())
-        emit = engine.hooks.emit
-
-        def mutate(event, payload, logs):
-            if event == "pre_agent" and payload["role"] == "worker":
-                (engine.worktree / "notes.txt").write_text("prepared by hook\n")
-            return emit(event, payload, logs)
-        with patch.object(engine.hooks, "emit", side_effect=mutate):
-            result = engine.start("Implement greeting", self.plan(two_ready=True), step=True)
-        self.assertEqual(result["status"], "paused")
-        self.assertEqual(set(result["accepted"]), {"greet"})
 
     def test_new_prerequisite_still_archives_candidate_before_other_task(self):
         backend = DescriptionBackend(self, prerequisite=True)

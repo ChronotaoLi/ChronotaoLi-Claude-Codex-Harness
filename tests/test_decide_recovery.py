@@ -12,6 +12,7 @@ from harness import git
 from harness.planning import Planner
 from harness.recovery import snapshot_digest
 from harness.util import HarnessError, read_json
+from test_harness import crash_after_save, crash_point, decide_bound
 from test_decide import (KEY, DecideCase, Script, ask, block_first, blocked_by_task, describe, implement,
                          revise, task)
 
@@ -371,7 +372,9 @@ class AskCandidateChangeTests(DecideCase):
     def test_returned_ask_interrupted_before_landing_registers_on_resume_despite_a_head_change(self):
         script = self.changing_script(ask("Choose an interface"), head=True)
         engine = self.engine(script)
-        with patch.object(Planner, "land_ask", side_effect=KeyboardInterrupt()), self.assertRaises(KeyboardInterrupt):
+        crash, die = crash_point(engine)
+        with crash, patch.object(Planner, "land_ask", side_effect=lambda *args, **kwargs: die()), \
+                self.assertRaises(KeyboardInterrupt):
             engine.start("head", {"tasks": [task("a")]})
         saved = self.state(engine)
         self.assertIn(KEY, saved["commander_receipts"])
@@ -381,27 +384,20 @@ class AskCandidateChangeTests(DecideCase):
             self.engine(script).resume(saved["id"])
         self.assert_registered_then_head_gated(engine, script, calls)
 
-    def test_returned_ask_hook_is_rerun_after_repair_despite_a_head_change(self):
+    def test_bound_ask_lands_on_resume_despite_a_head_change(self):
         script = self.changing_script(ask("Choose an interface"), head=True)
         engine = self.engine(script)
-        emit = engine.context.emit_hook
-
-        def failing(name, value, logs):
-            if name == "post_agent" and value.get("role") == "commander":
-                raise HarnessError("commander hook unavailable")
-            return emit(name, value, logs)
-        with patch.object(engine.context, "emit_hook", side_effect=failing), \
-                self.assertRaisesRegex(HarnessError, "commander hook unavailable"):
-            engine.start("hook", {"tasks": [task("a")]})
+        # The controller dies after the returned ask is bound, before its entry is judged.
+        crash, state = crash_after_save(engine, decide_bound)
+        with crash, self.assertRaises(KeyboardInterrupt):
+            engine.start("bound", {"tasks": [task("a")]})
+        self.assertTrue(state["fired"])
         saved = self.state(engine)
-        self.assertIn(KEY, saved["commander_receipts"])
+        self.assertIn("artifact_digest", saved["commander_receipts"][KEY])
         self.assertEqual(saved["decision_requests"], [])
         calls = len(script.calls)
-        resumed = self.engine(script)
-        with patch.object(resumed.context, "emit_hook", wraps=resumed.context.emit_hook) as hooks, \
-                self.assertRaisesRegex(HarnessError, "等待操作者决定"):
-            resumed.resume(saved["id"])
-        self.assertEqual([c.args[0] for c in hooks.call_args_list].count("post_agent"), 1)
+        with self.assertRaisesRegex(HarnessError, "等待操作者决定"):
+            self.engine(script).resume(saved["id"])
         self.assertEqual(self.state(engine)["commander_receipts"], {})
         self.assert_registered_then_head_gated(engine, script, calls)
 
@@ -428,7 +424,7 @@ class AskCandidateChangeTests(DecideCase):
     def test_other_decisions_still_stop_on_a_changed_candidate(self):
         script = self.changing_script(revise(selected="a", instruction="continue a", updates=[describe("a")]))
         engine = self.engine(script)
-        with self.assertRaisesRegex(HarnessError, "指挥或 hook 修改了代码/HEAD"):
+        with self.assertRaisesRegex(HarnessError, "指挥期间或之后修改了代码/HEAD"):
             engine.start("revise", {"tasks": [task("a")]})
         saved = self.state(engine)
         self.assertIn(KEY, saved["commander_receipts"])

@@ -325,7 +325,7 @@ class AskTests(DecideCase):
         self.assertEqual(result["status"], "completed")
         self.assertEqual(len(script.of("commander", "decide")), 2)
 
-    def test_malformed_question_still_registers_and_stops_without_redo_or_hook(self):
+    def test_malformed_question_still_registers_and_stops_without_redo(self):
         variants = {
             "operations": {**ask(), "new_tasks": [task("z")]},
             "long": ask("Q" * 5000),
@@ -342,12 +342,6 @@ class AskTests(DecideCase):
                     return None
                 script = Script(decide, block_first("a"))
                 engine = self.engine(script)
-                emitted = []
-                emit = engine.hooks.emit
-
-                def spy(event, payload, logs):
-                    emitted.append((event, payload.get("kind")))
-                    return emit(event, payload, logs)
                 if name == "missing field":
                     original = script.decide
                     script.decide = lambda s, t, p: (lambda v: v and {k: x for k, x in v.items() if x is not None})(original(s, t, p))
@@ -358,15 +352,13 @@ class AskTests(DecideCase):
                         if kwargs["role"] == "commander" and result.get("action") == "ask":
                             result.pop("updates", None)
                     script.change = drop
-                with mock.patch.object(engine.hooks, "emit", side_effect=spy), \
-                        self.assertRaisesRegex(HarnessError, "等待操作者决定"):
+                with self.assertRaisesRegex(HarnessError, "等待操作者决定"):
                     engine.start("ask", {"tasks": [task("a"), task("b", ["a"])]})
                 run = self.state(engine)
                 entry = self.commander_entries(run)[-1]
                 self.assertEqual(entry["status"], "invalid_asked")
                 self.assertTrue(entry["error"])
                 self.assertEqual(len(script.of("commander", "decide")), 1)
-                self.assertNotIn(("post_agent", "decide"), emitted)
                 request = run["decision_requests"][-1]
                 self.assertEqual(request["kind"], "commander")
                 self.assertEqual(request["source"]["dispatch_id"], entry["id"])
@@ -530,7 +522,7 @@ class BudgetConfigTests(DecideCase):
         resumed.load_run(engine.run["id"])
         with self.assertRaisesRegex(HarnessError, r"runtime\.max_attempts 当前值 1"):
             resumed.services.tasks.task_attempt(resumed.run["tasks"][0], {"selected_task": "a", "action": "implement",
-                                                                          "instruction": None}, False)
+                                                                          "instruction": None})
 
 
 class LedgerLinkTests(DecideCase):

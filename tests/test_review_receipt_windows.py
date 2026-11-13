@@ -2,7 +2,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from harness.util import HarnessError, read_json, write_json
-from test_harness import ROOT, RepoCase
+from test_harness import ROOT, RepoCase, crash_after_save, review_bound
 from test_runtime_changes import ScriptedBackend, finding
 
 
@@ -51,7 +51,7 @@ class ReviewReceiptWindowTests(RepoCase):
             self.engine(backend).resume(engine.run["id"], reverify=True)
         self.assertEqual(backend.calls, calls)
 
-    def test_cached_result_with_wrong_dispatch_identity_never_reaches_hook_or_acceptance(self):
+    def test_cached_result_with_wrong_dispatch_identity_never_reaches_acceptance(self):
         def wrong_identity(backend, kwargs, packet, result):
             if kwargs["kind"] == "final_review":
                 result["dispatch_id"] = "wrong-dispatch-id"
@@ -62,13 +62,9 @@ class ReviewReceiptWindowTests(RepoCase):
         evidence = artifact.read_bytes()
         calls = list(backend.calls)
         resumed = self.engine(backend)
-        with patch.object(resumed.hooks, "emit", wraps=resumed.hooks.emit) as hooks:
-            # The cached result is judged invalid without a new call, then redone once.
-            with self.assertRaisesRegex(HarnessError, "连续两次无效"):
-                resumed.resume(engine.run["id"])
-        final_hooks = [call for call in hooks.call_args_list
-                       if call.args[0] == "post_agent" and call.args[1].get("kind") == "final_review"]
-        self.assertEqual(final_hooks, [])
+        # The cached result is judged invalid without a new call, then redone once.
+        with self.assertRaisesRegex(HarnessError, "连续两次无效"):
+            resumed.resume(engine.run["id"])
         self.assertEqual(resumed.run["status"], "blocked")
         self.assertEqual(resumed.run["final_history"][-1]["status"], "running")
         self.assertEqual(backend.calls[:len(calls)], calls)
@@ -78,35 +74,26 @@ class ReviewReceiptWindowTests(RepoCase):
         self.assertEqual(finals[0]["invalid_output"]["artifact"], str(artifact))
         self.assertEqual(artifact.read_bytes(), evidence)
 
-    def fail_final_hook(self, engine):
-        emit = engine.hooks.emit
-
-        def unavailable(event, payload, logs):
-            if event == "post_agent" and payload.get("kind") == "final_review":
-                raise HarnessError("post-agent policy service unavailable")
-            return emit(event, payload, logs)
-
-        with patch.object(engine.hooks, "emit", side_effect=unavailable), self.assertRaisesRegex(HarnessError, "policy service"):
+    def stop_after_final_bound(self, engine):
+        """The controller dies right after the returned final review is bound by its digest."""
+        crash, state = crash_after_save(engine, review_bound("final_review"))
+        with crash, self.assertRaises(KeyboardInterrupt):
             engine.start("Implement greet", self.plan())
-        dispatch = engine.run["dispatches"][-1]
-        return engine.directory / "dispatches" / dispatch["id"] / "returned-result.json"
+        self.assertTrue(state["fired"])
+        receipt = read_json(engine.directory / "state.json")["review_receipts"]["reviewer:final_review:final"]
+        return Path(receipt["artifact"])
 
-    def test_hook_failure_retries_gate_for_same_returned_approval_without_more_models(self):
+    def test_bound_approval_is_reused_without_more_models(self):
         backend = ScriptedBackend()
         engine = self.engine(backend)
-        artifact = self.fail_final_hook(engine)
+        artifact = self.stop_after_final_bound(engine)
         evidence = artifact.read_bytes()
         calls = list(backend.calls)
-        resumed = self.engine(backend)
-        with patch.object(resumed.hooks, "emit", wraps=resumed.hooks.emit) as hooks:
-            result = resumed.resume(engine.run["id"])
+        result = self.engine(backend).resume(engine.run["id"])
         self.assertEqual(result["status"], "completed")
         self.assertEqual(len(result["final_history"]), 1)
         self.assertEqual(backend.calls, calls)
         self.assertEqual(artifact.read_bytes(), evidence)
-        final_hooks = [call for call in hooks.call_args_list
-                       if call.args[0] == "post_agent" and call.args[1].get("kind") == "final_review"]
-        self.assertEqual(len(final_hooks), 1)
 
     def test_transient_memory_check_error_reuses_valid_task_review_and_worker(self):
         self.config.data["runtime"]["max_attempts"] = 1
@@ -136,7 +123,7 @@ class ReviewReceiptWindowTests(RepoCase):
     def test_hash_bound_missing_result_is_not_treated_as_an_unreturned_call(self):
         backend = ScriptedBackend()
         engine = self.engine(backend)
-        artifact = self.fail_final_hook(engine)
+        artifact = self.stop_after_final_bound(engine)
         calls = list(backend.calls)
         artifact.unlink()
         resumed = self.engine(backend)
@@ -146,20 +133,18 @@ class ReviewReceiptWindowTests(RepoCase):
         self.assertEqual(resumed.run["status"], "blocked")
         self.assertNotEqual(resumed.run["final_history"][-1]["status"], "approved")
 
-    def test_hash_bound_modified_result_cannot_bypass_retrying_hook(self):
+    def test_hash_bound_modified_result_is_refused_without_reroll(self):
         backend = ScriptedBackend()
         engine = self.engine(backend)
-        artifact = self.fail_final_hook(engine)
+        artifact = self.stop_after_final_bound(engine)
         calls = list(backend.calls)
         changed = read_json(artifact)
         changed["dispatch_id"] = "forged-dispatch-id"
         write_json(artifact, changed)
         resumed = self.engine(backend)
-        with patch.object(resumed.hooks, "emit", wraps=resumed.hooks.emit) as hooks:
-            with self.assertRaises(HarnessError):
-                resumed.resume(engine.run["id"])
+        with self.assertRaisesRegex(HarnessError, "已改变"):
+            resumed.resume(engine.run["id"])
         self.assertEqual(backend.calls, calls)
-        self.assertFalse(any(call.args[0] == "post_agent" for call in hooks.call_args_list))
         self.assertNotEqual(resumed.run["final_history"][-1]["status"], "approved")
 
     def test_reviewer_service_retries_are_bounded_and_explicit_budget_increase_recovers(self):
@@ -229,14 +214,8 @@ class ReviewReceiptWindowTests(RepoCase):
     def test_missing_review_receipt_updates_dispatch_and_runtime_error(self):
         backend = ScriptedBackend()
         engine = self.engine(backend)
-
-        def fail(event, payload, logs):
-            if event == "post_agent" and payload.get("kind") == "final_review":
-                raise HarnessError("hook unavailable")
-        with patch.object(engine.hooks, "emit", side_effect=fail):
-            with self.assertRaisesRegex(HarnessError, "hook unavailable"):
-                engine.start("Implement greet", self.plan())
-        source = engine.run["review_receipts"]["reviewer:final_review:final"]
+        self.stop_after_final_bound(engine)
+        source = read_json(engine.directory / "state.json")["review_receipts"]["reviewer:final_review:final"]
         Path(source["artifact"]).unlink()
         resumed = self.engine(backend)
         with self.assertRaisesRegex(HarnessError, "缺失或无法读取"):

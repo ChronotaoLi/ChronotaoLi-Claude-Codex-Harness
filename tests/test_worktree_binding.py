@@ -8,7 +8,7 @@ from harness import git
 from harness.cleanup import cleanup_run
 from harness.memory import Memory, validate_proposals
 from harness.util import HarnessError, read_json, write_json
-from test_harness import ROOT, RepoCase
+from test_harness import ROOT, RepoCase, after_save
 from test_runtime_changes import ScriptedBackend
 
 
@@ -207,20 +207,20 @@ class EngineWorktreeBindingTests(RepoCase):
         self.assertEqual(len(backend.calls), 1)
         self.assertTrue((engine.worktree / "hello.py").is_file())
 
-    def test_pre_accept_redirect_cannot_commit_to_main(self):
+    def test_redirect_before_acceptance_cannot_commit_to_main(self):
         engine = self.engine()
-        original = engine.hooks.emit
         base = git.head(self.repo)
         main_index = (self.repo / ".git" / "index").read_bytes()
 
-        def redirect(event, payload, logs):
-            original(event, payload, logs)
-            if event == "pre_accept":
-                (engine.worktree / ".git").write_text(f"gitdir: {self.repo / '.git'}\n")
+        def redirect():
+            # The approval is saved; the worktree is redirected to the main repository before acceptance.
+            (engine.worktree / ".git").write_text(f"gitdir: {self.repo / '.git'}\n")
 
-        with patch.object(engine.hooks, "emit", side_effect=redirect):
+        change, state = after_save(engine, lambda run: "pending_acceptance" in run, redirect)
+        with change:
             with self.assertRaisesRegex(HarnessError, "绑定"):
                 engine.start("Implement greet", read_json(ROOT / "examples" / "plan.json"))
+        self.assertTrue(state["fired"])
         self.assertFalse(engine.run["accepted"])
         self.assertEqual(git.head(self.repo), base)
         self.assertEqual((self.repo / ".git" / "index").read_bytes(), main_index)

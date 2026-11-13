@@ -51,10 +51,6 @@ class Runtime:
         self.context.backend = value
 
     @property
-    def hooks(self):
-        return self.context.hooks
-
-    @property
     def commander(self):
         return self.context.commander
 

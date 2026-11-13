@@ -8,7 +8,7 @@ from unittest.mock import patch
 from harness.util import HarnessError, read_json, write_json
 from harness.review_progress import claim_gaps, delivered_worker_findings, required_findings
 from test_engine_repairs import RecordingBackend
-from test_harness import RepoCase, ROOT
+from test_harness import RepoCase, ROOT, after_save
 from test_runtime_changes import finding, finding_key
 
 
@@ -108,24 +108,39 @@ class WorkerRepairObligationsTests(RepoCase):
         self.assertTrue(all(row["artifact"] == result["review_history"]["greet"][0]["review_source"]["artifact"]
                             for row in delivered))
 
-    def test_pre_agent_candidate_change_preserves_exact_delivered_requirements(self):
+    def test_candidate_change_after_packet_stops_the_directed_worker_and_restores(self):
         backend, _ = self.scenario()
         engine = self.engine(backend)
+        original = {}
 
-        def mutate(event, payload, logs):
-            if (event == "pre_agent" and payload["role"] == "worker"
-                    and sum(call["role"] == "worker" for call in backend.calls) == 2):
-                with (engine.worktree / "hello.py").open("a") as stream:
-                    stream.write("# hook changed the candidate after packet construction\n")
+        def third_worker_prepared(run):
+            workers = [row for row in run["dispatches"] if row["role"] == "worker"]
+            return len(workers) == 3 and workers[-1].get("process_state") == "prepared"
 
-        with patch.object(engine.hooks, "emit", side_effect=mutate):
-            result = engine.start("Implement greet", self.plan())
+        def mutate():
+            # The packet is built; the candidate changes before the invocation binds it.
+            original["bytes"] = (engine.worktree / "hello.py").read_bytes()
+            with (engine.worktree / "hello.py").open("a") as stream:
+                stream.write("# changed after packet construction\n")
+
+        change, state = after_save(engine, third_worker_prepared, mutate)
+        with change, self.assertRaisesRegex(HarnessError, "待派发指令的代码快照已变化"):
+            engine.start("Implement greet", self.plan())
+        self.assertTrue(state["fired"])
+        saved = read_json(engine.directory / "state.json")
+        self.assertEqual(saved["attempts"], {"greet": 2})
+        self.assertIn("pending_directive", saved)
+        self.assertEqual(sum(call["role"] == "worker" for call in backend.calls), 2)
+        (engine.worktree / "hello.py").write_bytes(original["bytes"])
+        result = self.engine(backend).resume(engine.run["id"])
         self.assert_completed(engine, result, backend)
-        worker = [row for row in result["dispatches"] if row["role"] == "worker"][-1]
-        self.assertEqual(labels(required_findings(result, "greet", worker["snapshot_digest"])),
-                         ["edge-case", "second-defect"])
+        # The call binds the snapshot its packet was built on, so the delivered
+        # requirements are exactly those of that snapshot.
+        worker = [row for row in result["dispatches"] if row["role"] == "worker" and row.get("invoked")][-1]
         packet = read_json(Path(worker["worker_receipt"]["packet_artifact"]))
         self.assertEqual(labels(packet["required_findings"]), ["second-defect"])
+        self.assertEqual(labels(required_findings(result, "greet", worker["snapshot_digest"])),
+                         labels(packet["required_findings"]))
 
     def test_worker_claim_scope_cannot_remove_reviewer_obligation(self):
         backend, _ = self.scenario(reopen_old=True)

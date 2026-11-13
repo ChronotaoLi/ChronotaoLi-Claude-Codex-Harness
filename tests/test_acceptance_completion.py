@@ -5,7 +5,9 @@ from pathlib import Path
 from harness import git
 from harness.adapters import DemoBackend
 from harness.util import HarnessError, dump, read_json
-from test_harness import ROOT, RepoCase
+from unittest.mock import patch
+
+from test_harness import ROOT, RepoCase, crash_point
 from test_memory_pipeline import ProposedKnowledge
 
 
@@ -52,7 +54,7 @@ class AcceptanceCompletionTests(RepoCase):
         self.assertEqual(detail["finding_count"], 30)
         self.assertEqual(read_json(Path(detail["review_artifact"]))["review"], accepted["review"])
 
-    def test_memory_write_failure_after_commit_is_retried_before_hook_and_final_review(self):
+    def test_memory_write_failure_after_commit_is_retried_before_final_review(self):
         engine = self.engine(ProposedKnowledge())
 
         def unavailable(**kwargs):
@@ -68,34 +70,25 @@ class AcceptanceCompletionTests(RepoCase):
         persisted = read_json(engine.directory / "state.json")
         self.assertEqual(persisted["pending_post_accept"]["completion"]["approved_keys"], ["greeting"])
         resumed = self.engine(ProposedKnowledge())
-        emit = resumed.hooks.emit
-        hook_calls = []
-
-        def check_memory(event, payload, logs):
-            if event == "post_accept":
-                hook_calls.append(event)
-                self.assertEqual(len(resumed.memory.export()), 2)
-            return emit(event, payload, logs)
-
-        resumed.hooks.emit = check_memory
         resumed.resume(engine.run["id"])
-        self.assertEqual(hook_calls, ["post_accept"])
         self.assert_completed_once(resumed, commit, 2)
 
     def test_interrupt_after_task_memory_transaction_does_not_create_another_version(self):
         engine = self.engine(ProposedKnowledge())
         remember = engine.memory.remember
+        crash, die = crash_point(engine)
 
         def interrupt_after_write(**kwargs):
             remember(**kwargs)
-            raise KeyboardInterrupt()
+            die()
 
         engine.memory.remember = interrupt_after_write
-        with self.assertRaises(KeyboardInterrupt):
+        with crash, self.assertRaises(KeyboardInterrupt):
             engine.start("Implement greet")
-        commit = engine.run["accepted"]["greet"]["commit"]
+        saved = read_json(engine.directory / "state.json")
+        commit = saved["accepted"]["greet"]["commit"]
         original = engine.memory.export()[0]
-        self.assertNotIn("task_memory_id", engine.run["pending_post_accept"]["completion"])
+        self.assertNotIn("task_memory_id", saved["pending_post_accept"]["completion"])
         resumed = self.engine(ProposedKnowledge())
         resumed.resume(engine.run["id"])
         self.assertEqual(resumed.memory.read(original["id"])["created"], original["created"])
@@ -137,18 +130,20 @@ class AcceptanceCompletionTests(RepoCase):
     def test_interrupt_after_knowledge_transaction_does_not_repeat_promotion(self):
         engine = self.engine(ProposedKnowledge())
         promote = engine.memory.remember_proposals
+        crash, die = crash_point(engine)
 
         def interrupt_after_promotion(*args, **kwargs):
             promote(*args, **kwargs)
-            raise KeyboardInterrupt()
+            die()
 
         engine.memory.remember_proposals = interrupt_after_promotion
-        with self.assertRaises(KeyboardInterrupt):
+        with crash, self.assertRaises(KeyboardInterrupt):
             engine.start("Implement greet")
-        commit = engine.run["accepted"]["greet"]["commit"]
+        saved = read_json(engine.directory / "state.json")
+        commit = saved["accepted"]["greet"]["commit"]
         original = {record["id"]: record["expires"] for record in engine.memory.export()}
         self.assertEqual(len(original), 2)
-        self.assertEqual(engine.run["pending_post_accept"]["completion"]["knowledge"]["status"], "pending")
+        self.assertEqual(saved["pending_post_accept"]["completion"]["knowledge"]["status"], "pending")
         resumed = self.engine(ProposedKnowledge())
         resumed.resume(engine.run["id"])
         self.assertEqual({record["id"]: record["expires"] for record in resumed.memory.export()}, original)
@@ -157,16 +152,18 @@ class AcceptanceCompletionTests(RepoCase):
     def test_replaying_completed_promotion_preserves_a_newer_knowledge_version(self):
         engine = self.engine(ProposedKnowledge())
         promote = engine.memory.remember_proposals
+        crash, die = crash_point(engine)
 
         def interrupt_after_promotion(*args, **kwargs):
             promote(*args, **kwargs)
-            raise KeyboardInterrupt()
+            die()
 
         engine.memory.remember_proposals = interrupt_after_promotion
-        with self.assertRaises(KeyboardInterrupt):
+        with crash, self.assertRaises(KeyboardInterrupt):
             engine.start("Implement greet")
-        commit = engine.run["accepted"]["greet"]["commit"]
-        completion = engine.run["pending_post_accept"]["completion"]
+        saved = read_json(engine.directory / "state.json")
+        commit = saved["accepted"]["greet"]["commit"]
+        completion = saved["pending_post_accept"]["completion"]
         newer = promote(completion["proposals"], completion["approved_keys"], commit,
                         "run_other", "newer_task")[0]
         resumed = self.engine(ProposedKnowledge())
@@ -199,46 +196,88 @@ class AcceptanceCompletionTests(RepoCase):
     def test_acceptance_event_is_not_repeated_after_append_interruption(self):
         engine = self.engine(ProposedKnowledge())
         event = engine.context.event
+        crash, die = crash_point(engine)
 
         def interrupt_after_event(name, **fields):
             event(name, **fields)
             if name == "task_accepted":
-                raise KeyboardInterrupt()
+                die()
 
         engine.context.event = interrupt_after_event
-        with self.assertRaises(KeyboardInterrupt):
+        with crash, self.assertRaises(KeyboardInterrupt):
             engine.start("Implement greet")
-        commit = engine.run["accepted"]["greet"]["commit"]
+        saved = read_json(engine.directory / "state.json")
+        self.assertIn("pending_post_accept", saved)
+        commit = saved["accepted"]["greet"]["commit"]
         self.assertEqual(len(self.events(engine, "task_accepted")), 1)
         resumed = self.engine(ProposedKnowledge())
         resumed.resume(engine.run["id"])
         self.assert_completed_once(resumed, commit, 2)
 
-    def test_optional_proposal_discard_survives_hook_failure_and_resume(self):
+    def test_discarded_knowledge_stays_discarded_after_crash(self):
         engine = self.engine(ProposedKnowledge())
-        remember = engine.memory.remember
+        crash, die = crash_point(engine)
+        event = engine.context.event
 
-        def operator_claims_key(**kwargs):
-            ident = remember(**kwargs)
-            remember(key="knowledge:greeting", abstract="Operator fact", overview="Operator-owned key",
-                     detail="Operator-owned key", source="operator")
-            return ident
+        def conflict(*args, **kwargs):
+            raise HarnessError("knowledge key temporarily owned elsewhere")
 
-        engine.memory.remember = operator_claims_key
-        emit = engine.hooks.emit
-
-        def fail_hook(event, payload, logs):
-            if event == "post_accept":
-                raise HarnessError("hook unavailable")
-            return emit(event, payload, logs)
-
-        engine.hooks.emit = fail_hook
-        with self.assertRaisesRegex(HarnessError, "hook unavailable"):
+        def die_after_discard(name, **fields):
+            event(name, **fields)
+            if name == "memory_proposals_discarded" and "event_id" in fields:
+                die()
+        engine.memory.remember_proposals = conflict
+        engine.context.event = die_after_discard
+        with crash, self.assertRaises(KeyboardInterrupt):
             engine.start("Implement greet")
-        commit = engine.run["accepted"]["greet"]["commit"]
-        self.assertEqual(engine.run["pending_post_accept"]["completion"]["knowledge"]["status"], "discarded")
+        saved = read_json(engine.directory / "state.json")
+        self.assertEqual(saved["pending_post_accept"]["completion"]["knowledge"]["status"], "discarded")
+        self.assertFalse(self.events(engine, "task_accepted"))
+        # The promotion would succeed now; the saved verdict is not redrawn.
         resumed = self.engine(ProposedKnowledge())
-        resumed.resume(engine.run["id"])
+        resumed.resume(saved["id"])
         self.assertEqual(len(self.events(resumed, "memory_proposals_discarded")), 1)
-        self.assertEqual({item["kind"] for item in resumed.memory.export()}, {"accepted_task", "operator"})
-        self.assert_completed_once(resumed, commit, 2)
+        self.assertEqual({item["kind"] for item in resumed.memory.export()}, {"accepted_task"})
+        self.assert_completed_once(resumed, saved["accepted"]["greet"]["commit"], 1)
+
+    def test_completed_task_memory_step_is_not_repeated(self):
+        engine = self.engine(ProposedKnowledge())
+        crash, die = crash_point(engine)
+
+        def die_before_knowledge(*args, **kwargs):
+            die()
+        engine.memory.remember_proposals = die_before_knowledge
+        with crash, self.assertRaises(KeyboardInterrupt):
+            engine.start("Implement greet")
+        saved = read_json(engine.directory / "state.json")
+        self.assertIn("task_memory_id", saved["pending_post_accept"]["completion"])
+        resumed = self.engine(ProposedKnowledge())
+        # A completed step never touches the memory store again, even when it is unavailable.
+        with patch.object(resumed.memory, "remember",
+                          side_effect=sqlite3.OperationalError("store unavailable")) as remember:
+            resumed.resume(saved["id"])
+        remember.assert_not_called()
+        self.assert_completed_once(resumed, saved["accepted"]["greet"]["commit"], 2)
+
+    def test_promoted_knowledge_is_not_promoted_again_after_crash(self):
+        engine = self.engine(ProposedKnowledge())
+        crash, die = crash_point(engine)
+        event = engine.context.event
+
+        def die_before_acceptance_event(name, **fields):
+            if name == "task_accepted":
+                die()
+            event(name, **fields)
+        engine.context.event = die_before_acceptance_event
+        with crash, self.assertRaises(KeyboardInterrupt):
+            engine.start("Implement greet")
+        saved = read_json(engine.directory / "state.json")
+        self.assertEqual(saved["pending_post_accept"]["completion"]["knowledge"]["status"], "promoted")
+        self.assertFalse(self.events(engine, "task_accepted"))
+        resumed = self.engine(ProposedKnowledge())
+        unavailable = sqlite3.OperationalError("store unavailable")
+        with patch.object(resumed.memory, "remember_proposals", side_effect=unavailable) as promote, \
+                patch.object(resumed.memory, "remember", side_effect=unavailable):
+            resumed.resume(saved["id"])
+        promote.assert_not_called()
+        self.assert_completed_once(resumed, saved["accepted"]["greet"]["commit"], 2)

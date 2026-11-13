@@ -5,27 +5,21 @@ from unittest.mock import patch
 from harness import git
 from harness.util import HarnessError, read_json, write_json
 from test_engine_repairs import RecordingBackend
-from test_harness import ROOT, RepoCase
+from test_harness import ROOT, RepoCase, crash_after_save, review_bound
 
 
 class RecoveryStateValidationTests(RepoCase):
     def blocked_review(self):
-        """Stop on a retained review receipt: the review's post_agent hook fails."""
+        """Stop on a retained review receipt: the controller dies right after the review is bound."""
         backend = RecordingBackend()
         engine = self.engine(backend)
-        emit = engine.hooks.emit
-
-        def fail(event, payload, logs):
-            if event == "post_agent" and payload.get("kind") == "review":
-                raise HarnessError("policy gate unavailable")
-            return emit(event, payload, logs)
-
-        with patch.object(engine.hooks, "emit", side_effect=fail):
-            with self.assertRaisesRegex(HarnessError, "policy gate unavailable"):
-                engine.start("Implement greet", read_json(ROOT / "examples/plan.json"))
+        crash, state = crash_after_save(engine, review_bound("review"))
+        with crash, self.assertRaises(KeyboardInterrupt):
+            engine.start("Implement greet", read_json(ROOT / "examples/plan.json"))
+        self.assertTrue(state["fired"])
         self.engine_before = engine
         self.backend = backend
-        self.saved = copy.deepcopy(engine.run)
+        self.saved = read_json(engine.directory / "state.json")
         self.key = "reviewer:review:greet"
         self.receipt = copy.deepcopy(self.saved["review_receipts"][self.key])
 

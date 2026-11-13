@@ -12,7 +12,8 @@ from harness import git, mcp_server
 from harness.adapters import DemoBackend
 from harness.config import Config
 from harness.runtime import Runtime
-from harness.util import HarnessError
+from harness.util import HarnessError, read_json
+from test_harness import crash_after_save, review_bound
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -221,17 +222,25 @@ class BoundaryDiagnosticsTests(unittest.TestCase):
 
         self.assert_final_private_state_blocked(Runtime(self.config, self.repo, backend=HiddenFinalBackend()))
 
-    def test_final_review_hook_private_state_cannot_complete_or_reroll(self):
+    def test_private_state_after_bound_final_review_cannot_complete_or_reroll(self):
         engine = Runtime(self.config, self.repo, backend=DemoBackend())
-        original = engine.hooks.emit
-
-        def emit(event, payload, logs):
-            original(event, payload, logs)
-            if event == "post_agent" and payload.get("kind") == "final_review":
-                (engine.worktree / ".harness").mkdir()
-
-        with patch.object(engine.hooks, "emit", side_effect=emit):
-            self.assert_final_private_state_blocked(engine)
+        # The controller dies right after the returned final review is bound;
+        # private state then appears in the run worktree before the resume.
+        crash, state = crash_after_save(engine, review_bound("final_review"))
+        with crash, self.assertRaises(KeyboardInterrupt):
+            engine.start("Implement greet", self.plan())
+        self.assertTrue(state["fired"])
+        (engine.worktree / ".harness").mkdir()
+        saved = read_json(engine.directory / "state.json")
+        self.assertEqual(set(saved["accepted"]), {"greet"})
+        dispatch_count = len(saved["dispatches"])
+        resumed = Runtime(self.config, self.repo, backend=DemoBackend())
+        with self.assertRaisesRegex(HarnessError, "受保护"):
+            resumed.resume(saved["id"])
+        self.assertNotEqual(resumed.run["status"], "completed")
+        self.assertIn("reviewer:final_review:final", resumed.run["review_receipts"])
+        self.assertEqual(len(resumed.run["dispatches"]), dispatch_count)
+        self.assertEqual(len(resumed.run["final_history"]), 1)
 
     def test_submodule_repository_rejected_before_worktree_creation(self):
         # A gitlink with no directory or .gitmodules still represents a submodule.
@@ -275,7 +284,7 @@ class ConfigurationDiagnosticsTests(unittest.TestCase):
         del data["shared"]
         with self.assertRaisesRegex(HarnessError, "shared"):
             Config.validate(data)
-        for key in ("rules", "skills", "mcp", "hooks"):
+        for key in ("rules", "skills", "mcp"):
             for invalid in (None, [], {}, 3, False, "", " ", "path\0suffix"):
                 data = copy.deepcopy(original)
                 data["shared"][key] = invalid
@@ -285,6 +294,14 @@ class ConfigurationDiagnosticsTests(unittest.TestCase):
             del data["shared"][key]
             with self.subTest(missing=key), self.assertRaisesRegex(HarnessError, f"shared\\.{key}"):
                 Config.validate(data)
+
+
+    def test_shared_hooks_is_an_ordinary_unknown_key(self):
+        data = copy.deepcopy(Config.load(ROOT / "harness.toml").data)
+        data["shared"]["hooks"] = "shared/hooks.json"
+        with self.assertRaises(HarnessError) as raised:
+            Config.validate(data)
+        self.assertEqual(str(raised.exception), "未知配置键：shared.hooks")
 
 
 class MCPDiagnosticsTests(unittest.TestCase):

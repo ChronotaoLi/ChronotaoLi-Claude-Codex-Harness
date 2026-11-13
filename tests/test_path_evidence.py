@@ -9,7 +9,7 @@ from unittest.mock import patch
 from harness import git
 from harness.path_evidence import project_paths, validate_indexes
 from harness.util import HarnessError, dump, read_json
-from test_harness import RepoCase, ROOT
+from test_harness import RepoCase, ROOT, after_save
 from test_runtime_changes import ScriptedBackend, finding
 
 
@@ -298,7 +298,7 @@ class PathEvidenceLifecycleTests(RepoCase):
         self.assertEqual(result['status'], 'completed')
         self.assertEqual(result['attempts'], {'greet': 1})
 
-    def test_pre_accept_index_damage_blocks_commit_and_preserves_approved_review(self):
+    def test_index_damage_before_commit_blocks_and_preserves_approved_review(self):
         plan = self.fixture()
         saved = {}
 
@@ -308,19 +308,19 @@ class PathEvidenceLifecycleTests(RepoCase):
 
         backend = ScriptedBackend(delete)
         engine = self.engine(backend)
-        emit = engine.context.emit_hook
 
-        def corrupt(event, payload, logs):
-            emit(event, payload, logs)
-            if event == 'pre_accept' and not saved:
-                entry = next(d for d in reversed(engine.run['dispatches']) if d['role'] == 'reviewer')
-                path = Path(entry['path_evidence'][0]['artifact'])
-                saved.update(path=path, raw=path.read_bytes())
-                path.write_bytes(b'{}')
+        def corrupt():
+            # The approval is saved; the index is damaged before acceptance checks it.
+            entry = next(d for d in reversed(engine.run['dispatches']) if d['role'] == 'reviewer')
+            path = Path(entry['path_evidence'][0]['artifact'])
+            saved.update(path=path, raw=path.read_bytes())
+            path.write_bytes(b'{}')
 
-        with patch.object(engine.context, 'emit_hook', side_effect=corrupt):
+        damage, state = after_save(engine, lambda run: 'pending_acceptance' in run, corrupt)
+        with damage:
             with self.assertRaisesRegex(HarnessError, 'path evidence index changed'):
                 engine.start('Replace legacy docs', plan)
+        self.assertTrue(state['fired'])
         self.assertEqual(engine.run['accepted'], {})
         self.assertIn('pending_acceptance', engine.run)
         saved['path'].write_bytes(saved['raw'])

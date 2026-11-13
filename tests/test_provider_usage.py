@@ -5,7 +5,6 @@ import sys
 from unittest.mock import patch
 
 from harness.adapters import CLIBackend, provider_usage
-from harness.shared import HookError
 from harness.util import HarnessError, read_json
 from test_harness import RepoCase, ROOT
 
@@ -243,14 +242,23 @@ class ProviderUsageTests(RepoCase):
     def test_receipt_resume_keeps_one_observation_for_the_existing_dispatch(self):
         backend = self.backend()
         engine = self.engine(backend)
+        save = engine.context.save
+        failed = []
 
-        def fail_review_hook(event, payload, logs):
-            if event == "post_agent" and payload["role"] == "reviewer":
-                raise HookError(event, 7, logs)
+        def fail_judged_review_save(*args, **kwargs):
+            # The ledger commit that would record the judged review fails; the
+            # bound receipt stays, and the dispatch still records its usage.
+            entry = engine.run["dispatches"][-1] if engine.run["dispatches"] else {}
+            if (not failed and entry.get("role") == "reviewer" and entry.get("status") == "completed"
+                    and "artifact_digest" in engine.run["review_receipts"].get("reviewer:review:greet", {})):
+                failed.append(True)
+                raise OSError("ledger store unavailable")
+            return save(*args, **kwargs)
 
-        with patch.object(engine.hooks, "emit", side_effect=fail_review_hook):
-            with self.assertRaises(HookError):
+        with patch.object(engine.context, "save", side_effect=fail_judged_review_save):
+            with self.assertRaisesRegex(OSError, "ledger store unavailable"):
                 engine.start("Implement greet", self.plan())
+        self.assertTrue(failed)
         prior = copy.deepcopy(engine.run["dispatches"][-1])
         self.assertEqual(prior["role"], "reviewer")
         result = self.engine(backend).resume(engine.run["id"])

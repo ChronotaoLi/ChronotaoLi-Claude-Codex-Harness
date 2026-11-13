@@ -1,11 +1,10 @@
 import copy
 import json
 import unittest
-from unittest.mock import patch
 
 from harness.contracts import apply_revision, validate_revision
 from harness.util import HarnessError, read_json, write_json
-from test_harness import ROOT, RepoCase
+from test_harness import ROOT, RepoCase, crash_after_save, decide_bound
 from test_runtime_changes import ScriptedBackend
 
 
@@ -102,15 +101,14 @@ class ScopeExtensionRecoveryTests(RepoCase):
         with self.assertRaisesRegex(HarnessError, "仅用于未完成的 run"):
             done.services.planning.approve_scope_extensions(["support.txt"])
 
-        engine = self.engine(ScriptedBackend(self.block_worker))
-        emit = engine.hooks.emit
-
-        def fail(event, payload, logs):
-            if event == "post_agent" and payload.get("kind") == "decide":
-                raise HarnessError("question hook unavailable")
-            return emit(event, payload, logs)
-        with patch.object(engine.hooks, "emit", side_effect=fail), self.assertRaisesRegex(HarnessError, "question hook"):
-            engine.start("Implement greeting", self.plan())
+        stopped = self.engine(ScriptedBackend(self.block_worker))
+        # The controller dies right after the returned question is bound.
+        crash, state = crash_after_save(stopped, decide_bound)
+        with crash, self.assertRaises(KeyboardInterrupt):
+            stopped.start("Implement greeting", self.plan())
+        self.assertTrue(state["fired"])
+        engine = self.engine()
+        engine.load_run(stopped.run["id"])
         self.assertIn("commander:decide:run", engine.run["commander_receipts"])
         before = copy.deepcopy(engine.run)
         with self.assertRaisesRegex(HarnessError, "已返回、尚未处理的指挥决定"):

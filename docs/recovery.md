@@ -14,7 +14,7 @@
 - 每个出口都沿用同一 run 的累计预算、证据和接受条件。读得出的拒绝、停止和阻断不会被丢弃；读不出否决的无效输出不是结果，由新调用重做（见[无效输出与自动重做](#无效输出与自动重做)）。同一快照上重复 `resume` 只会得到同样的停止，或消耗新的调用。
 - 出口可以是继续，也可以是保留现场后 `abandon`。`abandon` 与 `resume` 一样先经过 `load_run`：加载时核验的证据（见[证据损坏](#证据损坏)）被删改时，两者都被拒绝。
 - `resume` 使用与 `run` 相同的 `--config`。恢复时只能提高 `agent_timeout_seconds`、`verify_timeout_seconds`、`context_chars`、`claude_max_turns`（及各角色实际生效的 `claude_max_turns_by_role`）、`max_attempts`、`max_agent_dispatches`，或在 `permissions.worker_commands` 追加精确 argv；其他配置、模型和共享资产必须与创建时一致。
-- 恢复先确认旧进程退出、核对 Git 绑定与 HEAD，再做其他事；这些检查失败时不写入任何恢复输入。例外：已返回而未登记的指挥提问在 HEAD 门禁之前完成 `post_agent` 与登记（见[指挥提问、修订与范围](#指挥提问修订与范围)），之后的回答与执行仍先过 HEAD 门禁。
+- 恢复先确认旧进程退出、核对 Git 绑定与 HEAD，再做其他事；这些检查失败时不写入任何恢复输入。例外：已返回而未登记的指挥提问在 HEAD 门禁之前完成登记（见[指挥提问、修订与范围](#指挥提问修订与范围)），之后的回答与执行仍先过 HEAD 门禁。
 - 外层自动化会话的权限边界见[外层 agent 操作说明](operations.md#外层-agent-操作说明)：新增权限、预算或需求选择要向用户请求。
 
 ## 恢复选项与互斥
@@ -71,14 +71,14 @@
 | worker 的 blocked 输出无效（条目 `invalid_blocked`，反馈带 `output_error`） | 核心结构与语义都合法、只有界限检查失败的阻断保留原路由，原结果进入反馈的 `worker`：environment／operator 按对应行处理，task 交给指挥决定；结构或语义不合法的阻断（例如 `blocker_kind=operator` 而 `blockers` 为空）一律按 task 阻断交给指挥决定，反馈不带原结果，不登记决定请求；都不给尝试豁免 | 对应出口 |
 | `… 请先核对并清理越界修改，再 resume` | 核对并清理范围外改动，不自动删除 | 普通 `resume` |
 | `<role> 输出连续两次无效：…；原件 PATH；普通 resume 重新请求，或 abandon` | 读原件与错误（派发条目的 `error`、`invalid_output`）；计划超出整体审阅的必要上下文同样是无效输出 | 普通 `resume`（新请求，最多再两次调用），或 `abandon RUN` |
-| `无效输出原始结果缺失或无法读取`、`无效输出原始结果已改变` | 上一次无效输出的原件被删改（准备前，或本地准备与 `pre_agent` 期间），调用计费前停止 | 恢复原字节后普通 `resume`，或 `abandon RUN` |
+| `无效输出原始结果缺失或无法读取`、`无效输出原始结果已改变` | 上一次无效输出的原件被删改，调用计费前的核对停止（这次核对在本地准备之后，留下一个 `invoked=false` 的失败准备条目） | 恢复原字节后普通 `resume`，或 `abandon RUN` |
 | `worktree HEAD 与检查点不同` | 核对是否有含 `Harness-Run`／`Harness-Task` 的提交（见下一节第 1 条；读取命令见 [README](../README.md#对自己的项目执行任务)）；不手工伪造接受 | 恢复可信现场后 `resume`，或 `abandon` |
 | 加载时核验的证据被删改（`worker packet artifact changed`、`worker schema artifact changed`、`evidence artifact disagrees with ledger` 等，见[证据损坏](#证据损坏)） | 恢复原字节；不改台账摘要。`abandon` 同样被拒绝 | 恢复后普通 `resume`；无法恢复时保留 run 目录原样，另开新 run |
 | 路径索引、输入索引或环境更新产物损坏（`path-indexes/`、`input-indexes/`、`environment/`） | 恢复原字节 | 恢复后普通 `resume`；无法恢复时可 `abandon RUN` |
 | `待派发指令的代码快照已变化`、`修订保留候选的代码或暂存区已变化`、`待派发指令与已发布计划或候选不符`、`pending continuation candidate or task changed` | 恢复原快照或保留证据 | 普通 `resume` 或 `abandon` |
 | `计划的整体审阅必要上下文 N 字符超过预算 M`（供给计划） | 提高 `context_chars`；模型给出的过大计划不停在这里，按无效输出重做 | 普通 `resume` |
 | `应用修订前 HEAD 与已校验计划不符`、`待应用的计划文件缺失或无法读取`、`…已改变`、`已发布的计划文件（revision-N）缺失或无法读取`、`…已改变`、`台账任务表与已发布的计划文件不符` | 恢复原 HEAD 或计划文件的原字节 | 普通 `resume`，或 `abandon RUN` |
-| `共享规则、skills、MCP 或 hooks 已改变` | 恢复原版本的共享资产 | 普通 `resume` |
+| `共享规则、skills 或 MCP 已改变` | 恢复原版本的共享资产 | 普通 `resume` |
 | `配置已改变：…` | 恢复不可放宽的配置值 | 普通 `resume` |
 | `缺少已保存的 worktree Git 绑定` | 启动在绑定保存前中断；核对后手工 `git worktree remove` 并删除 `harness/<run>` 分支 | `abandon RUN` 后重新 `run` |
 | `台账版本 N 不支持（当前版本 18）` | 当前版本不恢复、不放弃、不准备、不清理、不解释这份台账（见[终态与其他版本的台账](#终态与其他版本的台账)） | 开始新 run；原始 JSON 用文件工具查看 |
@@ -161,7 +161,7 @@ python3 -m harness --config /path/to/harness.toml --repo /path/to/project resume
 
 指挥的 `ask` 登记一条种类 `commander` 的决定请求并停止（有当前任务时目标是它，否则是 `final`）。这条请求未答或答 stop 时不调度任何模型，与目标无关；用 `--operator-decision` 回答 continue 后，下一次指挥决定带上 `operator_answer`。回答不授予范围、不降低验收，也不增加预算。规划、任务和整体三个阶段都可能提问。
 
-提问的识别只要求公共前提（退出已确认、原件已绑定摘要、严格解码成对象、envelope 身份相符），不要求调用期间候选代码与 HEAD 未变：变了也照常登记，派发条目记 `candidate_changed` 并写事件 `commander_candidate_changed`，停止信息提示先核对工作树；登记不认可这些改动，之后的派发、验证与接受各自核对快照与 HEAD。其他决定（implement、revise）在候选或 HEAD 变化时不判定，停止并保留回执，恢复原状后普通 `resume`。合格的提问先运行 `post_agent`，再在一次保存里登记请求并消费回执；hook 失败时回执保留、请求尚未登记，修复 hook 后普通 `resume` 对同一原件重跑 hook（日志目录按次递增）再登记。已返回而未登记的提问（登记前中断或 hook 失败）在普通 `resume` 的 HEAD 门禁之前完成 hook 与登记，HEAD 或候选已变也一样；之后的回答登记与执行仍要先过 HEAD 门禁，HEAD 不同时须先核对并恢复。不合格的提问不运行 hook，直接登记。
+提问的识别只要求公共前提（退出已确认、原件已绑定摘要、严格解码成对象、envelope 身份相符），不要求调用期间候选代码与 HEAD 未变：变了也照常登记，派发条目记 `candidate_changed` 并写事件 `commander_candidate_changed`，停止信息提示先核对工作树；登记不认可这些改动，之后的派发、验证与接受各自核对快照与 HEAD。其他决定（implement、revise）在候选或 HEAD 变化时不判定，停止并保留回执，恢复原状后普通 `resume`。合格的提问在一次保存里登记请求并消费回执。已返回而未登记的提问（登记前中断）在普通 `resume` 的 HEAD 门禁之前完成登记，HEAD 或候选已变也一样；之后的回答登记与执行仍要先过 HEAD 门禁，HEAD 不同时须先核对并恢复。不合格的提问直接登记（条目记 `invalid_asked`）。
 
 修订越出已批准范围、其余全部合格时，派发条目记为无效（`out_of_scope_paths` 列出越界模式），回执消费后停止，不自动重做。`--allow-scope PATTERN` 在 run 未完成、未放弃、没有已返回而未落地的指挥决定时可用：先校验整批模式，再写审计事件并保存去重后的 `approved_scope`，然后照常继续；它只扩大之后的修订可选的范围，不修改既有任务。授权与否，之后的普通 `resume` 都是新的指挥决定，旧修订不复用。
 
@@ -175,7 +175,7 @@ python3 -m harness --config /path/to/harness.toml --repo /path/to/project resume
 
 没有通过契约的模型输出不是结果。运行时只从原件读否决：退出已确认、原件字节已绑定摘要、严格解码成对象（拒绝重复键与非有限数，含溢出的数值字面量）、envelope 身份相符之后，审阅的 `request_changes`、blocking finding 或未 `resolved` 的必需项（核心结构合法时），指挥的 `ask`（`action` 为 ask 即可），以及 worker 的 `blocked`，都保持约束力。
 
-- **指挥与审阅**：读不出否决的无效输出（含结构非法的审阅、不可解码的供应商输出）在同一次保存里记为 `status=invalid`、错误与原件摘要（`invalid_output`），回执消费，然后自动重做一次。重做是新派发，计入 `max_agent_dispatches`，条目记 `retry_of`，包里带 `previous_invalid`（上一次无效输出的引用与前 2,000 字符的错误；带上它会超出上下文预算时不带，条目记 `previous_invalid_omitted`）。重做仍无效即停止；之后的普通 `resume` 发起新请求，同样有一次重做。是否重做只看整个 run 的最后一次模型调用，所以重做调用之前的中断、或重做在本地准备时（额度、上下文、hook）停止，恢复后的那次调用仍是重做；重做已经调用、结果绑定之前被中断时，它按无返回处理，恢复后的调用是不带 `previous_invalid` 的新请求，这个新请求仍有自己的一次重做，与不中断相比最多多两次调用。
+- **指挥与审阅**：读不出否决的无效输出（含结构非法的审阅、不可解码的供应商输出）在同一次保存里记为 `status=invalid`、错误与原件摘要（`invalid_output`），回执消费，然后自动重做一次。重做是新派发，计入 `max_agent_dispatches`，条目记 `retry_of`，包里带 `previous_invalid`（上一次无效输出的引用与前 2,000 字符的错误；带上它会超出上下文预算时不带，条目记 `previous_invalid_omitted`）。重做仍无效即停止；之后的普通 `resume` 发起新请求，同样有一次重做。是否重做只看整个 run 的最后一次模型调用，所以重做调用之前的中断、或重做在本地准备时（额度、上下文、原件核对）停止，恢复后的那次调用仍是重做；重做已经调用、结果绑定之前被中断时，它按无返回处理，恢复后的调用是不带 `previous_invalid` 的新请求，这个新请求仍有自己的一次重做，与不中断相比最多多两次调用。
 - **带否决的无效输出**：审阅按拒绝返工（`invalid_rejected`），它的 blocking finding 成为下一轮必需项；指挥的 ask 照样登记提问并停止（`invalid_asked`，条目记错误）；worker 的 blocked 见上表。整体审阅的拒绝写入整体记录后同一快照不再审阅；无否决的无效整体审阅不写结论，同一快照可以重做。
 - **worker**：无效输出（含解不出对象的完整输出）计一次工作尝试，回执消费，调度继续，受 `max_attempts` 约束。
 - **可选产物**：worker 的 `checkpoints`、`proposed_memories` 与审阅的 `approved_memory_keys` 不合格只丢弃自身，记 `checkpoints_discarded`、`memory_proposals_discarded`，结果照常处理；之后的上下文只带它们经过校验的投影（登记后的检查点、整批合法时的提案 key，不带记忆批准），原件保留原值。worker 的 `decision_requests` 不合格则整份结果无效。
@@ -217,7 +217,7 @@ python3 -m harness --config /path/to/harness.toml --repo /path/to/project resume
 
 路径索引（`path-indexes/`）、输入索引（`input-indexes/`）和环境更新产物（`environment/`）在 `resume` 预检、派发或接受前核验，不在加载时核验：它们损坏会阻止继续，但不阻止 `abandon`。
 
-提交消息的来源在用到时核验，同样不阻止 `abandon`：构造任务审阅包前，`pending_task.worker_result` 与 worker 原件不同即停止“worker 结果台账与原件不同”，不派发审阅；接受时在 `pre_accept` 前后各核对一次，`pending_acceptance.worker_source` 不完整、与批准它的审阅记录的来源或工作尝试不符即停止“待接受的 worker 来源与批准它的审阅不符”，原件缺失或被改（包括被 `pre_accept` hook 改动）即停止，都不提交。出口是把台账或原件的原字节恢复回去后 `resume`，或者 `abandon`。
+提交消息的来源在用到时核验，同样不阻止 `abandon`：构造任务审阅包前，`pending_task.worker_result` 与 worker 原件不同即停止“worker 结果台账与原件不同”，不派发审阅；接受时在提交前核对一次，`pending_acceptance.worker_source` 不完整、与批准它的审阅记录的来源或工作尝试不符即停止“待接受的 worker 来源与批准它的审阅不符”，原件缺失或被改即停止，都不提交，`pending_acceptance` 保留。出口是把台账或原件的原字节恢复回去后 `resume`，或者 `abandon`。
 
 已发布的计划文件（`plans/revision-N.json`，`plan_history` 的每一行）同样不在加载时核验，只在三处核对：`resume` 的任何写入之前（含 `--confirm-exited` 的审计写入，因此也先于批准计划和重放 worker 回执）、每次推导下一步之前、标记完成之前；逐个核对它们存在、摘要与台账一致、修订号相符，并要求最新版本的任务表等于 `tasks`、`revision-0` 的任务表等于 `original_tasks`。缺失、被改或不一致即停止，不调用模型；恢复原字节后普通 `resume`，无法恢复时 `abandon`（`abandon` 与 `cleanup-run` 不需要计划文件，它们自己的 `--confirm-exited` 照常可用）。不覆盖的情形：worker 运行期间被删改的计划文件要到下一步才发现，那时该任务的验证、审阅与接受可能已经完成；`prepare-run` 与 `status` 等只读入口不核对，之后的 `resume` 会拒绝。每次核对的耗时随计划历史的总大小增长：实测每版约 40 KB 时，200 版约 19 ms，1,000 版约 102 ms。
 
@@ -239,8 +239,7 @@ python3 -m harness --config /path/to/harness.toml --repo /path/to/project resume
 4. **调用前台账保存失败**：可能留下已扣预算、`invoked=true` 的条目；恢复按可重试处理，多计一次尝试。
 5. **派发 `starting` 后、pgid 落盘前中断**：缺 pgid 的记录不能证明未启动，需核实后 `--confirm-exited`。
 6. **启动时 `worktree_binding` 保存前中断**：没有可信绑定，只能 `abandon` 后重新运行，并手工清理已创建的工作树和分支。
-7. **`post_accept` 或其他 hook 成功后、完成记账前中断**：hook 会再次执行；外部副作用必须可重复。
-8. **`delete_path` 删除之后**：删除立即生效，接受门禁只决定候选是否被接受；需要恢复文件时从 Git 历史中取回。
-9. **`prepare-run` 在保存临时文件身份之前中断**：不能凭相同字节接管文件，需人工核对。
-10. **`command-staging/` 中的准备目录**：发布前失败或被杀时留下；运行时不枚举它们，也不回收，反复失败会累积磁盘占用。
-11. **指挥或审阅的供应商输出不可解码、判定保存之前中断**：回执里没有原件，恢复按无返回处理，发起没有 `retry_of` 的调用；与不中断相比最多多一次调用。
+7. **`delete_path` 删除之后**：删除立即生效，接受门禁只决定候选是否被接受；需要恢复文件时从 Git 历史中取回。
+8. **`prepare-run` 在保存临时文件身份之前中断**：不能凭相同字节接管文件，需人工核对。
+9. **`command-staging/` 中的准备目录**：发布前失败或被杀时留下；运行时不枚举它们，也不回收，反复失败会累积磁盘占用。
+10. **指挥或审阅的供应商输出不可解码、判定保存之前中断**：回执里没有原件，恢复按无返回处理，发起没有 `retry_of` 的调用；与不中断相比最多多一次调用。

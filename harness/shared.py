@@ -2,20 +2,18 @@ from __future__ import annotations
 
 import hashlib
 import json
-import math
 import re
 import sys
 from pathlib import Path
 
-from .config import validate_commands
-from .util import HarnessError, ProcessTimeout, read_json, run_process
+from .util import HarnessError, read_json
 
 
 def asset_digest(config):
     # Logical identities keep a byte-identical installation portable; framing
     # binds each identity to its bytes without ambiguous concatenation.
     digest = hashlib.sha256(b"personal-harness/shared-assets/v2\0")
-    files = [(key, config.asset(key)) for key in ("rules", "mcp", "hooks")]
+    files = [(key, config.asset(key)) for key in ("rules", "mcp")]
     files += [(f"skills/{path.parent.name}/SKILL.md", path)
               for path in sorted(config.asset("skills").glob("*/SKILL.md"))]
     for identity, path in files:
@@ -146,64 +144,3 @@ def mcp_configs(config, state: Path, role: str, run_path: Path | None = None):
                 claude[name]["headers"] = {"Authorization": "Bearer ${" + token + "}"}
                 codex[name]["bearer_token_env_var"] = token
     return {"mcpServers": claude}, codex
-
-
-class HookError(HarnessError):
-    def __init__(self, event, code, log, *, cause=None):
-        self.event, self.code, self.log = event, code, log
-        self.timeout = cause.timeout if isinstance(cause, ProcessTimeout) else None
-        detail = f"exit={code}" if code is not None else str(cause)
-        super().__init__(f"hook {event} 拒绝继续，{detail}；日志：{log}")
-
-
-class Hooks:
-    EVENTS = {"pre_agent", "post_agent", "pre_verify", "post_verify", "pre_accept", "post_accept", "on_error",
-              "context_prepared"}
-
-    def __init__(self, config):
-        self.config = config
-        path = config.asset("hooks")
-        try:
-            self.spec = read_json(path)
-        except (OSError, ValueError) as e:
-            raise HarnessError(f"无法读取 hooks JSON：{path}：{e}") from e
-        self.validate()
-
-    def validate(self):
-        if not isinstance(self.spec, dict):
-            raise HarnessError("hooks.json 必须为事件对象")
-        unknown = sorted(str(event) for event in set(self.spec) - self.EVENTS)
-        if unknown:
-            # The removed alias gets a pointer to its replacement in the error text only.
-            hint = "；context_compacted 已删除，请改用 context_prepared" if "context_compacted" in unknown else ""
-            raise HarnessError("hooks.json 含未知事件：" + "、".join(name[:80] for name in unknown[:10]) + hint)
-        for event, hooks in self.spec.items():
-            if not isinstance(hooks, list):
-                raise HarnessError(f"hook {event} 必须为数组")
-            for i, hook in enumerate(hooks):
-                field = f"hook {event}[{i}]"
-                if not isinstance(hook, dict) or set(hook) - {"argv", "timeout_seconds"}:
-                    raise HarnessError(f"{field} 必须为仅含 argv 和 timeout_seconds 的对象")
-                validate_commands([hook.get("argv")], f"{field}.argv")
-                timeout = hook.get("timeout_seconds", 30)
-                try:
-                    valid_timeout = type(timeout) in (int, float) and math.isfinite(timeout) and timeout > 0
-                except OverflowError:
-                    valid_timeout = False
-                if not valid_timeout:
-                    raise HarnessError(f"{field}.timeout_seconds 必须为正有限数值")
-
-    def emit(self, event, payload, logs: Path):
-        # Validate the entire configuration before any script, including hooks
-        # on later events, can run. Keep this guard for in-process overrides.
-        self.validate()
-        for i, hook in enumerate(self.spec.get(event, [])):
-            argv = hook["argv"]
-            log = logs / f"hook-{event}-{i}"
-            try:
-                code = run_process(argv, self.config.root, log,
-                                   stdin=json.dumps({**payload, "event": event}), timeout=hook.get("timeout_seconds", 30))
-            except HarnessError as e:
-                raise HookError(event, None, log, cause=e) from e
-            if code:
-                raise HookError(event, code, log)

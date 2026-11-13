@@ -9,7 +9,7 @@ from harness.adapters import DemoBackend
 from harness.config import Config
 from harness.shared import mcp_configs, toml_value, validate_mcp
 from harness.util import HarnessError, read_json, write_json
-from test_harness import ROOT, RepoCase
+from test_harness import ROOT, RepoCase, after_save, prepared_entry
 
 
 class MCPConfigTests(unittest.TestCase):
@@ -143,17 +143,14 @@ class MCPPreflightLifecycleTests(RepoCase):
         original = path.read_bytes()
         backend = DemoBackend()
         engine = self.engine(backend)
-        original_emit = engine.hooks.emit
-
-        def corrupt_mcp(event, payload, logs):
-            if event == "pre_agent" and payload["role"] == "worker":
-                write_json(path, {"servers": {"worker_service": {"transport": "http"}}})
-            return original_emit(event, payload, logs)
-
-        with patch.object(engine.hooks, "emit", side_effect=corrupt_mcp), \
-                patch.object(backend, "invoke", wraps=backend.invoke) as invoke:
+        # The MCP configuration is damaged while the worker call is being prepared.
+        corrupt_mcp, state = after_save(
+            engine, prepared_entry("worker"),
+            lambda: write_json(path, {"servers": {"worker_service": {"transport": "http"}}}))
+        with corrupt_mcp, patch.object(backend, "invoke", wraps=backend.invoke) as invoke:
             with self.assertRaises(HarnessError) as raised:
                 engine.start("Implement greet", read_json(ROOT / "examples" / "plan.json"))
+        self.assertTrue(state["fired"])
         self.assertIn("servers.worker_service.url", str(raised.exception))
         invoke.assert_not_called()
         saved = read_json(engine.directory / "state.json")

@@ -1,6 +1,5 @@
 import copy
 import json
-import sys
 from pathlib import Path
 from unittest.mock import patch
 
@@ -152,58 +151,6 @@ class ReviewRecoveryRegressionTests(RepoCase):
         self.assertTrue(all(not call["packet"].get("recovery") for call in other_task))
         self.assertNotIn("greet", result.get("worker_recovery", {}))
         self.assertEqual(result["attempts"], {"greet": 2, "confirm": 1})
-
-    def hook_spec(self, event, marker, fail_first=False):
-        script = ("from pathlib import Path; import sys; "
-                  "p=Path(sys.argv[1]); n=int(p.read_text())+1 if p.exists() else 1; "
-                  "p.write_text(str(n)); print('hook attempt', n); "
-                  f"sys.exit(7 if {fail_first!r} and n == 1 else 0)")
-        return {event: [{"argv": [sys.executable, "-c", script, str(marker)]}]}
-
-    def test_post_accept_retry_retains_both_hook_outputs(self):
-        backend = ScriptedBackend()
-        engine = self.engine(backend)
-        spec = self.hook_spec("post_accept", engine.state / "post-accept-count", fail_first=True)
-        engine.hooks.spec = spec
-        with self.assertRaises(HarnessError):
-            engine.start("Implement greet", self.plan())
-        commit = engine.run["accepted"]["greet"]["commit"]
-        before = {path: path.read_bytes() for path in engine.directory.rglob("hook-post_accept-0.stdout")}
-        self.assertEqual(len(before), 1)
-        resumed = self.engine(backend)
-        resumed.hooks.spec = spec
-        result = resumed.resume(engine.run["id"])
-        self.assertEqual(result["status"], "completed")
-        outputs = {path: path.read_bytes() for path in engine.directory.rglob("hook-post_accept-0.stdout")}
-        self.assertEqual(len(outputs), 2)
-        self.assertEqual(set(outputs.values()), {b"hook attempt 1\n", b"hook attempt 2\n"})
-        self.assertTrue(all(outputs[path] == content for path, content in before.items()))
-        self.assertEqual(result["accepted"]["greet"]["commit"], commit)
-        self.assertEqual(sum(call["role"] == "worker" for call in backend.calls), 1)
-
-    def test_repeated_errors_retain_each_on_error_hook_output(self):
-        def fail_worker(backend, kwargs, packet):
-            if kwargs["role"] == "worker":
-                self.assertFalse((kwargs["job"] / "response.json").exists())
-                raise HarnessError("worker service unavailable")
-
-        backend = ScriptedBackend()
-        backend.before_result = fail_worker
-        engine = self.engine(backend)
-        spec = self.hook_spec("on_error", engine.state / "on-error-count")
-        engine.hooks.spec = spec
-        with self.assertRaises(HarnessError):
-            engine.start("Implement greet", self.plan())
-        before = {path: path.read_bytes() for path in engine.directory.rglob("hook-on_error-0.stdout")}
-        self.assertEqual(len(before), 1)
-        resumed = self.engine(backend)
-        resumed.hooks.spec = spec
-        with self.assertRaises(HarnessError):
-            resumed.resume(engine.run["id"])
-        outputs = {path: path.read_bytes() for path in engine.directory.rglob("hook-on_error-0.stdout")}
-        self.assertEqual(len(outputs), 2)
-        self.assertEqual(set(outputs.values()), {b"hook attempt 1\n", b"hook attempt 2\n"})
-        self.assertTrue(all(outputs[path] == content for path, content in before.items()))
 
     def test_noop_final_verification_correction_decides_again_without_reverification(self):
         def correct_in_second_task(backend, kwargs, packet, result):

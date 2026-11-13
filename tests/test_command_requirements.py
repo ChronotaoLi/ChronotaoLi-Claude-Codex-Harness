@@ -9,6 +9,7 @@ from harness.cli import status_summary
 from harness.runtime import Runtime
 from harness.requirements import missing_commands
 from harness.util import HarnessError, read_json
+import harness.worker_receipts as worker_receipts_module
 from test_harness import ROOT, RepoCase
 from test_runtime_changes import ScriptedBackend, revised, trigger_kind
 
@@ -179,6 +180,17 @@ class CommandRequirementsTests(RepoCase):
                     self.assertEqual(sum(call['kind'] == 'decide' for call in backend.calls), 3)
                     self.assertEqual(result['agent_dispatches'], 9)
 
+    @staticmethod
+    def failed_worker_inputs():
+        """Worker input publication fails: a local preparation failure before any budget."""
+        original = worker_receipts_module.write_json
+
+        def failing(path, value):
+            if path.name == 'packet.json':
+                raise OSError(28, 'No space left on device')
+            return original(path, value)
+        return patch.object(worker_receipts_module, 'write_json', failing)
+
     def test_selected_directive_survives_worker_preparation_failure(self):
         backend = ScriptedBackend()
         engine = self.engine(backend)
@@ -186,11 +198,7 @@ class CommandRequirementsTests(RepoCase):
         plan = self.plan([self.command])
         plan['tasks'].append({**copy.deepcopy(plan['tasks'][0]), 'id': 'other'})
 
-        def fail_worker(event, payload, logs):
-            if event == 'pre_agent' and payload.get('role') == 'worker':
-                raise HarnessError('worker preparation failed')
-
-        with patch.object(engine.context, 'emit_hook', side_effect=fail_worker), self.assertRaises(HarnessError):
+        with self.failed_worker_inputs(), self.assertRaisesRegex(HarnessError, 'no budget was charged'):
             engine.start('Implement greet', plan)
         saved = self.saved(engine)
         directive = saved['pending_directive']['directive']
@@ -223,12 +231,8 @@ class CommandRequirementsTests(RepoCase):
         backend = ScriptedBackend()
         engine = self.engine(backend)
         self.config.data['permissions']['worker_commands'].append(self.command)
-        def fail_preparation(event, *args):
-            if event == 'pre_agent':
-                raise HarnessError('prepare failed')
-
-        with patch.object(engine.context, 'emit_hook', side_effect=fail_preparation):
-            with self.assertRaises(HarnessError):
+        with self.failed_worker_inputs():
+            with self.assertRaisesRegex(HarnessError, 'no budget was charged'):
                 engine.start('Implement greet', self.plan([self.command]))
         self.assertEqual(backend.calls, [])
         before = self.saved(engine)

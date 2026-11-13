@@ -8,7 +8,6 @@ from . import git
 from .adapters import CLIBackend
 from .budgets import work_attempts
 from .memory import Memory
-from .shared import Hooks
 from .run_store import RunStore
 from .util import append_event, confirm_dispatches_exited, ensure_dispatches_exited, group_alive, validate_command_directories, write_json
 
@@ -22,7 +21,6 @@ class RunContext:
         self.backend = backend or CLIBackend(config, self.state)
         self.commander = commander
         self.operation = operation
-        self.hooks = Hooks(config)
         self.store = RunStore(self.state)
         self.reverify_requested = False
         # Optional post-commit observer; failures propagate after durable state.
@@ -43,15 +41,6 @@ class RunContext:
     @property
     def worktree(self):
         return Path(self.run["worktree"])
-
-    def emit_hook(self, event, payload, logs):
-        self.store.check_current()
-        # Bind every lifecycle event to its run, including resumed receipts and
-        # error paths. Verification may explicitly target a fresh checkout.
-        context = {**payload, "run_id": self.run["id"], "repo": str(self.repo),
-                   "worktree": payload.get("worktree", str(self.worktree)),
-                   "run_dir": str(self.directory)}
-        return self.hooks.emit(event, context, logs)
 
     def snapshot(self):
         self.store.check_current()

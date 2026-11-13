@@ -97,7 +97,7 @@ def config_identity(config):
 
 
 def shared_paths(config):
-    return {key: str(config.asset(key)) for key in ("rules", "skills", "mcp", "hooks")}
+    return {key: str(config.asset(key)) for key in ("rules", "skills", "mcp")}
 
 
 def digest_assets(config):

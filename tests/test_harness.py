@@ -17,7 +17,7 @@ from harness.contracts import PLAN, WORK, envelope, validate, validate_plan
 from harness.runtime import Runtime
 from harness.mcp_server import handle
 from harness.memory import Memory
-from harness.shared import Hooks, mcp_configs, toml_value
+from harness.shared import mcp_configs, toml_value
 from harness.util import HarnessError, read_json, run_process
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -62,6 +62,100 @@ def add_worker_dispatch(run, directory, dispatch_id, task_id, *, required=(), **
              **fields}
     run.setdefault("dispatches", []).append(entry)
     return entry
+
+
+def crash_point(engine):
+    """A process death at an injection point the test chooses.
+
+    ``die()`` raises KeyboardInterrupt, and from then on every ledger save of
+    this process is dropped: finally blocks, stop() and receipt error handlers
+    cannot publish past the point. Events and handoff.json are still written.
+    Resume with a new Runtime, which reloads the ledger from disk.
+    """
+    from unittest.mock import patch
+    save = engine.context.save
+    state = {"dead": False}
+
+    def wrapped(*args, **kwargs):
+        if not state["dead"]:
+            save(*args, **kwargs)
+
+    def die():
+        state["dead"] = True
+        raise KeyboardInterrupt()
+    return patch.object(engine.context, "save", side_effect=wrapped), die
+
+
+def crash_after_save(engine, predicate):
+    """A process death right after the first save whose ledger satisfies ``predicate``."""
+    from unittest.mock import patch
+    save = engine.context.save
+    state = {"fired": False}
+
+    def wrapped(*args, **kwargs):
+        if state["fired"]:
+            return None
+        save(*args, **kwargs)
+        if predicate(engine.run):
+            state["fired"] = True
+            raise KeyboardInterrupt()
+        return None
+    return patch.object(engine.context, "save", side_effect=wrapped), state
+
+
+def after_save(engine, predicate, action):
+    """Run ``action`` once, in process, right after the first save satisfying ``predicate``.
+
+    An outside change while the run continues; it does not simulate a crash.
+    """
+    from unittest.mock import patch
+    save = engine.context.save
+    state = {"fired": False}
+
+    def wrapped(*args, **kwargs):
+        save(*args, **kwargs)
+        if not state["fired"] and predicate(engine.run):
+            state["fired"] = True
+            action()
+    return patch.object(engine.context, "save", side_effect=wrapped), state
+
+
+def review_bound(kind):
+    """Predicate: a returned review of this kind is bound by its digest (the receipt save)."""
+    def predicate(run):
+        return any(key.startswith(f"reviewer:{kind}:") and "artifact_digest" in receipt
+                   for key, receipt in run["review_receipts"].items())
+    return predicate
+
+
+def prepared_entry(role=None):
+    """Predicate: the last dispatch entry (of ``role``, or any) is saved as prepared, before its local checks."""
+    def predicate(run):
+        last = run["dispatches"][-1] if run["dispatches"] else {}
+        return (role is None or last.get("role") == role) and last.get("process_state") == "prepared"
+    return predicate
+
+
+def decide_bound(run):
+    """Predicate: the returned decide original is bound by its digest."""
+    receipt = run["commander_receipts"].get("commander:decide:run")
+    return bool(receipt and "artifact_digest" in receipt)
+
+
+class ExitReportingBackend(DemoBackend):
+    """DemoBackend whose worker calls report a confirmed normal exit before returning.
+
+    A CLI call saves its exit facts through on_outcome before it returns. The
+    plain DemoBackend has no process, so dispatch records its exit only in a
+    finally block, which a simulated process death must not run.
+    """
+    def invoke(self, **kwargs):
+        result = super().invoke(**kwargs)
+        if kwargs["role"] == "worker" and kwargs.get("on_outcome") is not None:
+            from harness.process_runtime import ProcessOutcome
+            kwargs["on_outcome"](ProcessOutcome(started=True, startup_state="started", exit_code=0,
+                                                exit_confirmed=True))
+        return result
 
 
 class RepoCase(unittest.TestCase):
@@ -299,8 +393,10 @@ class RuntimeTests(RepoCase):
 
     def test_verification_must_not_rewrite_review_candidate(self):
         self.config.data["verification"]["commands"] = [[sys.executable, "-c", "from pathlib import Path; Path('hello.py').write_text('bad')"]]
+        engine = self.engine()
         with self.assertRaisesRegex(HarnessError, "验证命令修改"):
-            self.engine().start("Implement greet")
+            engine.start("Implement greet")
+        self.assertEqual(engine.run["accepted"], {})
 
     def test_dependent_tasks_receive_separate_dispatches_and_bounded_handoffs(self):
         class TwoTasks(DemoBackend):
@@ -326,16 +422,24 @@ class RuntimeTests(RepoCase):
 
     def test_mutation_after_review_prevents_acceptance(self):
         engine = self.engine()
-        emit = engine.hooks.emit
-        def mutate(event, payload, logs):
-            if event == "pre_accept":
-                (engine.worktree / "hello.py").write_text("changed after review")
-            return emit(event, payload, logs)
-        engine.hooks.emit = mutate
-        with self.assertRaisesRegex(HarnessError, "审阅后文件发生变化"):
-            engine.start("Implement greet")
-        self.assertEqual(engine.run["accepted"], {})
-        self.assertEqual(engine.memory.export(), [])
+
+        def mutate():
+            with (engine.worktree / "hello.py").open("a") as stream:
+                stream.write("# changed after review\n")
+        change, state = after_save(engine, lambda run: "pending_acceptance" in run, mutate)
+        with change:
+            result = engine.start("Implement greet")
+        self.assertTrue(state["fired"])
+        self.assertEqual(result["status"], "completed")
+        # The approval of the reviewed candidate is void; a new attempt is verified and reviewed.
+        self.assertEqual(result["review_history"]["greet"][0].get("status"), "invalidated")
+        invoked = [entry for entry in result["dispatches"] if entry.get("invoked")]
+        self.assertEqual(sum(entry["role"] == "worker" for entry in invoked), 2)
+        self.assertEqual(sum(entry.get("kind") == "review" for entry in invoked), 2)
+        events = [json.loads(line)["event"] for line in (engine.directory / "events.jsonl").read_text().splitlines()]
+        self.assertIn("pending_acceptance_invalidated", events)
+        committed = git.git(engine.worktree, "show", result["accepted"]["greet"]["commit"] + ":hello.py")
+        self.assertNotIn("changed after review", committed)
 
     def test_resume_rejects_changed_configuration(self):
         engine = self.engine()
@@ -366,12 +470,6 @@ class IntegrationTests(RepoCase):
         claude, codex = mcp_configs(self.config, self.repo / ".harness", "worker")
         parsed = tomllib.loads("mcp_servers = " + toml_value(codex))
         self.assertEqual(parsed["mcp_servers"]["harness"]["args"], claude["mcpServers"]["harness"]["args"])
-
-    def test_hooks_receive_common_envelope_and_can_block(self):
-        hooks = Hooks(self.config)
-        hooks.spec = {"pre_agent": [{"argv": [sys.executable, "-c", "import sys,json; x=json.load(sys.stdin); sys.exit(7 if x['event']=='pre_agent' else 0)"]}]}
-        with self.assertRaisesRegex(HarnessError, "exit=7"):
-            hooks.emit("pre_agent", {"task_id": "x"}, self.repo / "logs")
 
     def test_timeout_kills_owned_child(self):
         pgids = []

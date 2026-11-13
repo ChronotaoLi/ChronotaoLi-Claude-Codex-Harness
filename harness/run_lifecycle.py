@@ -307,7 +307,7 @@ class RunLifecycle(RuntimeService):
             self.context.reverify_requested = reverify
             changes = self.context.config.resume_changes(self.context.run["config_snapshot"])
             if self.context.run.get("asset_digest") != asset_digest(self.context.config):
-                raise HarnessError("共享规则、skills、MCP 或 hooks 已改变；请恢复原版本后继续")
+                raise HarnessError("共享规则、skills 或 MCP 已改变；请恢复原版本后继续")
             self.services.environment.environment_context()
             # The published plan is the authority: checked before any write of
             # this resume, the audited exit confirmation included.

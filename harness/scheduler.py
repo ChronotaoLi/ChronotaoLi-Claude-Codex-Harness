@@ -86,13 +86,13 @@ class Scheduler(RuntimeService):
                 task = next((t for t in ready if t["id"] == saved["directive"]["selected_task"]), None)
                 if task is None:
                     raise directive_mismatch()
-                return Step("worker", (task, saved["directive"], True))
+                return Step("worker", (task, saved["directive"]))
             if planning.published_directive_missing():
                 raise HarnessError("修订已发布但待派发指令缺失；保留现场")
             if len(ready) == 1 and not run.get("feedback") and not run["attempts"].get(ready[0]["id"]):
                 # Direct dispatch: the worker skill states the default; no commander text.
                 return Step("worker", (ready[0], {"selected_task": ready[0]["id"], "action": "implement",
-                                                  "instruction": None}, False))
+                                                  "instruction": None}))
             return Step("decide", planning.task_trigger(ready))
         record = None
         if run["final_history"]:

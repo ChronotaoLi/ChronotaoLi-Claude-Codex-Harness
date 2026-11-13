@@ -254,10 +254,12 @@ class WorkerReceipts(RuntimeService):
             self.services.receipts.record_receipt_error(self.context.run['worker_receipts'].get(key), error)
             raise
 
-    def _finish(self, key, task):
-        self.context.ensure_exited()
-        receipt = self.context.run['worker_receipts'][key]
-        entry = self.entry(receipt)
+    def sealed_record(self, receipt):
+        """Read the immutable seal: path, bound digest (once bound), structure and content name.
+
+        Identity, process facts and source files are checked by ``_finish`` only;
+        callers after it rely on the digest it bound to read the same record.
+        """
         path = self.seal_path(receipt)
         if Path(receipt['artifact']).parent.is_symlink():
             raise HarnessError('unsafe worker dispatch evidence directory')
@@ -274,6 +276,24 @@ class WorkerReceipts(RuntimeService):
             raise HarnessError('invalid worker seal structure')
         if path.name != 'worker-seal.' + snapshot_digest(record) + '.json':
             raise HarnessError('immutable worker seal content digest changed')
+        return path, digest, record
+
+    def sealed_candidate(self, key):
+        """The candidate the sealed return bound; the handoff compares against it.
+
+        Requires the seal digest that ``_finish`` bound after its full checks, so
+        the record read here is the one it verified.
+        """
+        receipt = self.context.run['worker_receipts'][key]
+        if 'seal_digest' not in receipt:
+            raise HarnessError('worker seal not bound')
+        return self.sealed_record(receipt)[2]['candidate_digest']
+
+    def _finish(self, key, task):
+        self.context.ensure_exited()
+        receipt = self.context.run['worker_receipts'][key]
+        entry = self.entry(receipt)
+        path, digest, record = self.sealed_record(receipt)
         if (record.get('intent') != entry['worker_receipt'] or record.get('dispatch_id') != entry['id']
                 or record.get('task_id') != task['id'] or record.get('git_binding') != self.context.run['worktree_binding']
                 or record.get('head') != self.context.run['expected_head']
@@ -295,10 +315,8 @@ class WorkerReceipts(RuntimeService):
                 raise HarnessError('unsafe worker source evidence path')
             if source.is_symlink() or not source.is_file() or hashlib.sha256(source.read_bytes()).hexdigest() != expected:
                 raise HarnessError('worker source evidence changed')
-        current = snapshot_digest(self.context.snapshot())
-        expected = receipt.get('post_hook_digest', record['candidate_digest'])
-        if current != expected:
-            raise HarnessError('worker candidate changed since sealed return or interrupted hook')
+        if snapshot_digest(self.context.snapshot()) != record['candidate_digest']:
+            raise HarnessError('worker candidate changed since sealed return')
         receipt.update(seal_digest=digest, phase='sealed')
         result = record['result']
         artifact = Path(receipt['artifact'])
@@ -324,23 +342,13 @@ class WorkerReceipts(RuntimeService):
         # The delivered contract is read back from its immutable file and digest.
         judgment = judge_work(result, self.delivered_contract(entry, entry['worker_receipt']), self.context.state)
         if judgment.state == 'veto':
-            # A blocked report stays binding; no post_agent, no exemption.
+            # A blocked report stays binding; no exemption.
             return self.services.tasks.publish_invalid_blocker(task, key, result, judgment)
         if judgment.state == 'invalid':
             self.reject(key, judgment.error, 'result_rejected', status='invalid',
                         invalid_output={'artifact': receipt['artifact'], 'artifact_digest': receipt['artifact_digest']})
             return None
         worker_outcome = 'completed' if result['status'] == 'completed' else result['blocker_kind'] + '_blocked'
-        if 'post_hook_digest' not in receipt:
-            receipt['hook_attempts'] = receipt.get('hook_attempts', 0) + 1
-            self.context.save()
-            self.context.emit_hook('post_agent', {**entry, 'worker_outcome': worker_outcome, 'result': result},
-                                   path.parent / f"post-agent-{receipt['hook_attempts']}")
-            if git.head(self.context.worktree, binding=self.context.run['worktree_binding']) != record['head']:
-                raise HarnessError('worker hook changed HEAD')
-            git.check_scope(self.context.worktree, task['allowed_paths'], binding=self.context.run['worktree_binding'])
-            receipt['post_hook_digest'] = snapshot_digest(self.context.snapshot())
-            self.context.save()
         # The entry records its outcome only after the last interruptible step.
         entry.update(worker_outcome=worker_outcome, status='completed')
         return {k: v for k, v in result.items() if k not in ('task_id', 'dispatch_id')}

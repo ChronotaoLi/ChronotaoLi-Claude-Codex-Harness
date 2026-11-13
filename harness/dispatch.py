@@ -48,7 +48,6 @@ class Dispatcher(RuntimeService):
         if last is None or dispatch_key(last) != key or last.get("status") != "invalid":
             return None, None
         source = last["invalid_output"]
-        read_bound_bytes(source, "无效输出")
         previous = {"dispatch_id": last["id"], "artifact": source["artifact"],
                     "artifact_digest": source["artifact_digest"],
                     "error": str(last.get("error", ""))[:ERROR_EXCERPT_CHARS]}
@@ -162,7 +161,6 @@ class Dispatcher(RuntimeService):
             self.context.save()
             raise
         write_json(job / "context-report.json", report)
-        self.context.emit_hook("context_prepared", {"report": report}, job)
         self.context.run["dispatches"].append({"id": dispatch_id, "role": role, "kind": kind, "task_id": task_id,
                                        "status": "running", "pgid": None, "process_state": "prepared", "invoked": False})
         entry = self.context.run["dispatches"][-1]
@@ -218,15 +216,14 @@ class Dispatcher(RuntimeService):
         startup_interrupted = False
         invocation_error = None
         try:
-            self.context.emit_hook("pre_agent", entry, job)
             from .workspace_inputs import validate_inputs
             validate_inputs(self.context.run, self.context.directory)
             validate_indexes(self.context.directory, path_evidence)
             validate_mcp(self.context.config, roles=(role,))
             if previous_invalid is not None:
                 # The invalid original this call refers to (as a redo, or as the
-                # hint of a new request) must still be the bound bytes after
-                # local preparation; damage stops before the call is accounted.
+                # hint of a new request) is read by digest once, after local
+                # preparation; damage stops before the call is accounted.
                 read_bound_bytes(previous_invalid, "无效输出")
             before = self.context.snapshot()
             entry["snapshot_digest"] = snapshot_digest(before)
@@ -237,9 +234,9 @@ class Dispatcher(RuntimeService):
             if self.context.run.get("pending_directive"):
                 if role != "worker":
                     raise HarnessError("待派发指令存在时不得派发其他模型调用；保留现场")
-                # After every local preparation step (pre_agent included) and
-                # before the directive or any budget is consumed.
-                self.services.planning.check_directive(task_id, before, prepared=True)
+                # The one check of the saved directive: after every local
+                # preparation step, before the directive or any budget is consumed.
+                self.services.planning.check_directive(task_id, before)
             self.services.budgets.validate_attempt_accounting()
             limit = self.context.config.data["runtime"]["max_agent_dispatches"]
             if self.context.run["agent_dispatches"] >= limit:
@@ -250,7 +247,7 @@ class Dispatcher(RuntimeService):
                     + (remaining["message"] + "；" if remaining else "")
                     + "可显式增大 max_agent_dispatches 后恢复")
             # Persist all invocation budgets together after local preparation.
-            # Provider failures still count; local context/hook/MCP/snapshot failures do not.
+            # Provider failures still count; local context/MCP/snapshot failures do not.
             if role == "worker":
                 attempts = self.context.run["attempts"].get(task_id, 0)
                 if self.services.budgets.task_budget_used(task_id) >= self.context.config.data["runtime"]["max_attempts"]:

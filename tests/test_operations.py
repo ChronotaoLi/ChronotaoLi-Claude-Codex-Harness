@@ -15,7 +15,6 @@ from harness import git
 from harness.adapters import DemoBackend
 from harness.cli import main
 from harness.runtime import Runtime
-from harness.run_context import RunContext
 from harness.operations import OperationRecord
 from harness.shared import asset_digest
 from harness.util import HarnessError, read_json, write_json
@@ -195,7 +194,7 @@ class OperationRecordTests(OperationCase):
                          ("finished", run_id, 1, "HarnessError"))
         self.assertEqual(record["arguments"]["confirm_exited"], ["dispatch_unknown"])
 
-    def test_resume_stopped_before_dispatch_keeps_events_hooks_and_budgets(self):
+    def test_resume_stopped_before_dispatch_keeps_events_and_budgets(self):
         plan = read_json(ROOT / "examples" / "plan.json")
         plan["tasks"][0]["required_commands"] = [["required-tool", "run", "--exact"]]
         plan_path = self.repo / "input-plan.json"
@@ -213,8 +212,7 @@ class OperationRecordTests(OperationCase):
             operation_id = f"op-stopped-{index}"
             before = self.ledger(run_id)
             events_before = events_path.read_bytes()
-            with patch.object(RunContext, "emit_hook", autospec=True, side_effect=RunContext.emit_hook) as hook:
-                code, output, errors = self.invoke(["resume", run_id, "--operation-id", operation_id], backend)
+            code, output, errors = self.invoke(["resume", run_id, "--operation-id", operation_id], backend)
             self.assertEqual(code, 1, errors)
             self.assertEqual(output, "")
             self.assertIn(notice("run_resumed", run_id, operation_id), errors.splitlines())
@@ -225,12 +223,9 @@ class OperationRecordTests(OperationCase):
             self.assertEqual(appended[0]["operation_id"], operation_id)
             saved = self.ledger(run_id)
             self.assertEqual(saved["status"], "blocked")
-            self.assertEqual(saved["error_hook_attempts"], before["error_hook_attempts"] + 1)
+            self.assertEqual(saved["error"], appended[1]["error"])
             for key in ("dispatches", "attempts", "agent_dispatches", "accepted"):
                 self.assertEqual(saved[key], before[key], key)
-            hook.assert_called_once()
-            self.assertEqual(hook.call_args.args[1], "on_error")
-            self.assertEqual(hook.call_args.args[3], directory.resolve() / "hooks" / f"error-{saved['error_hook_attempts']}")
             record = self.record(operation_id)
             self.assertEqual((record["run_id"], record["status"], record["exit_status"]),
                              (run_id, "finished", 1))
@@ -265,7 +260,8 @@ class OperationRecordTests(OperationCase):
                 self.assertFalse(saved["plan_approved"])
                 for key in ("status", "dispatches", "attempts", "agent_dispatches", "accepted"):
                     self.assertEqual(saved[key], before[key], key)
-                self.assertNotIn("error_hook_attempts", saved)
+                # Rejected before execution: no stop was recorded.
+                self.assertNotIn("error", saved)
                 if add_grant:
                     self.assertNotEqual(state_path.read_bytes(), state_before)
                     self.assertTrue(events_path.read_bytes().startswith(events_before))
@@ -646,7 +642,7 @@ class DoctorEchoTests(OperationCase):
                                             "sha256": hashlib.sha256(self.config.path.read_bytes()).hexdigest()})
         self.assertEqual(report["asset_digest"], asset_digest(self.config))
         self.assertNotIn("asset_error", report)
-        self.assertEqual(report["shared"], {key: str(self.config.asset(key)) for key in ("rules", "skills", "mcp", "hooks")})
+        self.assertEqual(report["shared"], {key: str(self.config.asset(key)) for key in ("rules", "skills", "mcp")})
         self.config.data["shared"]["rules"] = "missing-rules.md"
         code, report, errors = self.doctor()
         self.assertEqual(code, 0, errors)

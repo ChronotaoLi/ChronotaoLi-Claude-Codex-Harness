@@ -65,10 +65,10 @@ class EnvironmentUpdateTests(RepoCase):
         resumed = self.engine(backend)
         task_attempt = resumed.services.tasks.task_attempt
 
-        def interrupt_after_revision(task, directive, saved):
+        def interrupt_after_revision(task, directive):
             if len(resumed.run['tasks']) > 1:
                 raise KeyboardInterrupt()
-            return task_attempt(task, directive, saved)
+            return task_attempt(task, directive)
 
         with patch.object(resumed.services.tasks, 'task_attempt', side_effect=interrupt_after_revision):
             with self.assertRaises(KeyboardInterrupt):

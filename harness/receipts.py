@@ -1,4 +1,4 @@
-"""Validate durable returned results and post-agent gates without redrawing conclusions."""
+"""Validate durable returned results without redrawing conclusions."""
 from __future__ import annotations
 
 import hashlib
@@ -186,7 +186,7 @@ class ResultReceipts(RuntimeService):
             pass
 
     def finish_commander_receipt(self, key):
-        """Judge the original decide result, then run its hook gate when valid.
+        """Judge the original decide result.
 
         ``ask`` is a veto read after the common preconditions only (exit
         confirmed, bytes bound, strict object, envelope identity): any other
@@ -214,14 +214,14 @@ class ResultReceipts(RuntimeService):
         asked = (isinstance(result, dict) and result.get("action") == "ask"
                  and result.get("task_id") == entry["task_id"] and result.get("dispatch_id") == entry["id"])
         if not asked and self.candidate_changed(receipt):
-            raise HarnessError("指挥或 hook 修改了代码/HEAD；原指挥结果不能用于当前快照")
+            raise HarnessError("指挥期间或之后修改了代码/HEAD；原指挥结果不能用于当前快照")
         if asked:
             payload = {k: v for k, v in result.items() if k not in ("task_id", "dispatch_id")}
             try:
                 validate(result, contract)
                 self.services.planning.check_decision(payload, packet)
             except HarnessError as error:
-                # The landing save records invalid_asked with this error; no hook runs.
+                # The landing save records invalid_asked with this error.
                 return Decision(payload, veto=str(error), candidate_changed=self.candidate_changed(receipt))
         else:
             payload = {k: v for k, v in result.items() if k not in ("task_id", "dispatch_id")} if isinstance(result, dict) else None
@@ -236,19 +236,11 @@ class ResultReceipts(RuntimeService):
                 raise ScopeStop(invalid.entry, message) from error
             except HarnessError as error:
                 raise self.record_invalid(key, error) from error
-        if not receipt.get("hook_completed"):
-            receipt["hook_attempts"] = receipt.get("hook_attempts", 0) + 1
-            self.context.save()
-            self.context.emit_hook("post_agent", {**entry, "status": "completed", "result": result},
-                            artifact.parent / f"post-agent-{receipt['hook_attempts']}")
-            if not asked and self.candidate_changed(receipt):
-                raise HarnessError("commander hook 修改了代码/HEAD；已停止，保留现场")
-            receipt["hook_completed"] = True
         entry["status"] = "completed"
         entry.pop("error", None)
         self.context.save()
         if asked:
-            # Read after the hook, before the landing save that records it.
+            # Read before the landing save that records it.
             return Decision(payload, candidate_changed=self.candidate_changed(receipt))
         return Decision(payload, proposed)
 
@@ -279,7 +271,6 @@ class ResultReceipts(RuntimeService):
         receipt = self.context.run["review_receipts"][key]
         self.validate_terminal_capture(receipt)
         entry = next(d for d in self.context.run["dispatches"] if d["id"] == receipt["dispatch_id"])
-        artifact = Path(receipt["artifact"])
         result, digest = read_bound_result(receipt, "审阅", bind=self.context.save)
         if "artifact_digest" not in receipt:
             receipt["artifact_digest"] = digest
@@ -288,23 +279,12 @@ class ResultReceipts(RuntimeService):
             raise HarnessError("审阅原始结果已改变；保留证据，禁止重新抽取结论")
         if (git.head(self.context.worktree, binding=self.context.run["worktree_binding"]) != self.context.run["expected_head"]
                 or snapshot_digest(self.context.snapshot()) != receipt["snapshot_digest"]):
-            raise HarnessError("审阅或 hook 修改了代码/HEAD；原审阅结果不能用于当前快照")
+            raise HarnessError("审阅期间或之后修改了代码/HEAD；原审阅结果不能用于当前快照")
         self.context.ensure_exited()
         judgment = judge_review(result, envelope(schema, entry["task_id"], entry["id"]))
         if judgment.state == "invalid":
             raise self.record_invalid(key, judgment.error) from judgment.error
         rejection = InvalidReviewRejection(result, receipt, judgment.error) if judgment.state == "veto" else None
-        if not receipt.get("hook_completed"):
-            receipt["hook_attempts"] = receipt.get("hook_attempts", 0) + 1
-            self.context.save()
-            logs = artifact.parent / f"post-agent-{receipt['hook_attempts']}"
-            self.context.emit_hook("post_agent", {**entry, "status": "invalid_rejected" if rejection else "completed",
-                                           "result": result,
-                                           **({"validation_error": str(rejection)} if rejection else {})}, logs)
-            if (git.head(self.context.worktree, binding=self.context.run["worktree_binding"]) != self.context.run["expected_head"]
-                    or snapshot_digest(self.context.snapshot()) != receipt["snapshot_digest"]):
-                raise HarnessError("reviewer hook 修改了代码；已停止，保留现场")
-            receipt["hook_completed"] = True
         entry["status"] = "invalid_rejected" if rejection else "completed"
         if rejection:
             entry["error"] = str(rejection)

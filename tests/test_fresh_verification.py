@@ -5,7 +5,6 @@ import shutil
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
 
 from harness import git
 from harness.config import Config
@@ -221,22 +220,6 @@ class FreshVerificationTests(RepoCase):
         self.assertEqual(git.head(self.repo), main_head)
         self.assertEqual(git.git(self.repo, "branch", "--show-current").strip(), "main")
         self.assertFalse(any(call["kind"] == "final_review" for call in backend.calls))
-
-    def test_fresh_pre_verify_hook_cannot_change_source_run_candidate(self):
-        engine = self.engine(ScriptedBackend())
-        emit = engine.hooks.emit
-
-        def mutate_source(event, payload, logs):
-            emit(event, payload, logs)
-            if event == "pre_verify" and payload.get("mode") == "fresh_checkout":
-                with (Path(payload["source_worktree"]) / "hello.py").open("a") as stream:
-                    stream.write("# source changed during fresh check\n")
-
-        with patch.object(engine.hooks, "emit", side_effect=mutate_source):
-            with self.assertRaisesRegex(HarnessError, "原工作树发生变化"):
-                engine.start("Implement greet", self.plan())
-        self.assertEqual(engine.run["status"], "blocked")
-        self.assertFalse(any(call["kind"] == "final_review" for call in engine.backend.calls))
 
     def test_setup_cannot_change_source_run_candidate(self):
         run_root = str(self.repo.resolve() / ".harness" / "worktrees")

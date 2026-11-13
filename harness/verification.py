@@ -146,16 +146,13 @@ class Verification(RuntimeService):
     def verify(self, task_id, attempt, *, whole_run=False, artifact_dir=None, before=None):
         folder = Path(artifact_dir) if artifact_dir is not None else self.verification_directory(task_id, attempt, whole_run=whole_run)
         folder.mkdir(parents=True, exist_ok=True)
-        # Callers may pass a just-computed snapshot only when no hook, model or
+        # Callers may pass a just-computed snapshot only when no model or
         # verification process has run since. The exit gate always rehashes files.
         before = self.context.snapshot() if before is None else before
         if whole_run and self.context.config.data["verification"]["fresh_checkout"]:
             return self.verify_fresh_checkout(task_id, folder, before)
-        self.context.emit_hook("pre_verify", {"task_id": task_id, "worktree": str(self.context.worktree),
-                                      "scope": "run" if whole_run else "task"}, folder)
         results = self.run_verification_commands(task_id, self.context.config.data["verification"]["commands"],
                                                   self.context.worktree, folder, self.context.run["worktree_binding"])
-        self.context.emit_hook("post_verify", {"task_id": task_id, "results": results}, folder)
         after = self.context.snapshot()
         if after != before:
             changes = git.snapshot_changes(before, after)
@@ -192,13 +189,10 @@ class Verification(RuntimeService):
         environment["binding"] = binding
         write_json(artifact, environment)
         baseline = git.snapshot(checkout, binding=binding)
-        self.context.emit_hook("pre_verify", {"task_id": task_id, "worktree": str(checkout),
-                                      "source_worktree": str(self.context.worktree), "scope": "run",
-                                      "mode": "fresh_checkout"}, folder)
         setup = self.run_verification_commands(task_id, environment["setup_commands"], checkout,
                                                folder / "setup", binding, phase="setup")
         if git.snapshot(checkout, binding=binding) != baseline:
-            raise HarnessError(f"依赖准备或 pre_verify 修改了全新检出的受检文件；证据：{artifact}")
+            raise HarnessError(f"依赖准备修改了全新检出的受检文件；证据：{artifact}")
         if not checks_passed(setup):
             environment["status"] = "setup_failed"
             write_json(artifact, environment)
@@ -207,8 +201,6 @@ class Verification(RuntimeService):
                                                  checkout, folder, binding)
         for result in results:
             result.update(worktree=str(checkout), checkout_artifact=str(artifact))
-        self.context.emit_hook("post_verify", {"task_id": task_id, "results": results,
-                                       "worktree": str(checkout), "source_worktree": str(self.context.worktree)}, folder)
         after = git.snapshot(checkout, binding=binding)
         if after != baseline:
             write_json(folder / "file-changes.json", git.snapshot_changes(baseline, after))

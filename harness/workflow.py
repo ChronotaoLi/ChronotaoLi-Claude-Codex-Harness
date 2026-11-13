@@ -11,15 +11,9 @@ class Workflow(RuntimeService):
         self.context.run["status"] = "interrupted" if isinstance(error, (KeyboardInterrupt, SystemExit)) else "blocked"
         self.context.run["error"] = str(error)
         self.context.run["error_type"] = type(error).__name__
-        self.context.run["error_hook_attempts"] = self.context.run.get("error_hook_attempts", 0) + 1
         self.context.save()
         self.context.checkpoint()
         self.context.event("run_stopped", error=str(error), error_type=type(error).__name__)
-        try:
-            self.context.emit_hook("on_error", {"error": str(error)},
-                            self.context.directory / "hooks" / f"error-{self.context.run['error_hook_attempts']}")
-        except Exception as hook_error:
-            self.context.event("error_hook_failed", error=str(hook_error))
 
     def handoff_targets(self, task_id):
         """Project only unaccepted transitive descendants, in plan order."""

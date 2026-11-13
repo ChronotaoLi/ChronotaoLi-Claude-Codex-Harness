@@ -204,7 +204,7 @@ class Planner(RuntimeService):
     def land_returned_ask(self):
         """Finish and register a returned, unlanded ask before any execution gate.
 
-        Its hook and registration need only the common preconditions, not the
+        Its registration needs only the common preconditions, not the
         bound HEAD or candidate; the run then stops at the question and every
         execution step keeps its own HEAD and snapshot gates.
         """
@@ -387,12 +387,12 @@ class Planner(RuntimeService):
         return False
 
     # ---- the saved directive before a worker starts ----------------------------
-    def check_directive(self, task_id, snapshot, *, prepared=False):
+    def check_directive(self, task_id, snapshot):
         """Bind the saved directive to its task, its published plan and its candidate.
 
-        Called before ``pre_agent`` with the current snapshot, and again after
-        local preparation (``prepared``) with the snapshot the invocation binds,
-        before the directive or any budget is consumed.
+        Called once, after local preparation, with the snapshot the invocation
+        binds, before the directive or any budget is consumed. Every directive,
+        retained or not, requires that snapshot to equal the saved one.
         """
         run = self.context.run
         saved = run.get("pending_directive")
@@ -401,7 +401,6 @@ class Planner(RuntimeService):
         directive = saved["directive"]
         if directive.get("selected_task") != task_id or run.get("current_task") != task_id:
             raise directive_mismatch()
-        retain = False
         if "revision" in saved:
             history = run["plan_history"]
             if saved["revision"] != len(history) - 1 or saved["revision"] < 1:
@@ -409,16 +408,10 @@ class Planner(RuntimeService):
             content = self.read_plan(history[saved["revision"]])
             if content.get("directive") != directive or content.get("tasks") != run["tasks"]:
                 raise directive_mismatch()
-            retain = content.get("candidate") == "retain"
-            if retain and content.get("snapshot_digest") != saved["snapshot_digest"]:
+            if content.get("candidate") == "retain" and content.get("snapshot_digest") != saved["snapshot_digest"]:
                 raise directive_mismatch()
-        if not prepared:
-            if snapshot_digest(snapshot) != saved["snapshot_digest"]:
-                raise HarnessError("待派发指令的代码快照已变化；请核对并恢复原快照")
-        elif retain and snapshot_digest(snapshot) != saved["snapshot_digest"]:
-            # A retained candidate is the one the revision bound; a preparation
-            # hook must not replace it. Ordinary directives keep current behavior.
-            raise directive_mismatch()
+        if snapshot_digest(snapshot) != saved["snapshot_digest"]:
+            raise HarnessError("待派发指令的代码快照已变化；请核对并恢复原快照")
 
     def verify_plan_authority(self):
         """Every published plan version is intact, and the ledger's mirrors equal their files.

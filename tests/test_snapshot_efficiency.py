@@ -1,3 +1,4 @@
+import sys
 from unittest.mock import patch
 
 from harness import git
@@ -14,23 +15,18 @@ class SnapshotEfficiencyTests(RepoCase):
         self.assertEqual(result["status"], "completed")
         self.assertEqual(sum(result["attempts"].values()), 1)
         self.assertEqual(len(result["final_history"]), 1)
-        # Durable worker return, replay, hook and publication guards add four
-        # net reads; none may reuse a snapshot across those boundaries.
-        self.assertLessEqual(snapshots.call_count, 19)
+        # Durable worker return, replay and publication guards add net reads;
+        # none may reuse a snapshot across those boundaries.
+        self.assertLessEqual(snapshots.call_count, 15)
 
-    def test_reused_verification_snapshot_still_detects_hook_changes(self):
+    def test_reused_verification_snapshot_still_detects_changes(self):
+        # The last command changes the candidate after the checks have passed.
+        self.config.data["verification"]["commands"] = [
+            [sys.executable, "-m", "unittest", "-v"],
+            [sys.executable, "-c", "open('hello.py', 'a').write('# Changed after checks\\n')"]]
         engine = self.engine()
-        original = engine.hooks.emit
-
-        def change_after_checks(event, payload, logs):
-            original(event, payload, logs)
-            if event == "post_verify":
-                with (engine.worktree / "hello.py").open("a") as output:
-                    output.write("# Changed after checks\n")
-
-        with patch.object(engine.hooks, "emit", side_effect=change_after_checks):
-            with self.assertRaisesRegex(HarnessError, "验证命令修改"):
-                engine.start("Implement greet", read_json(ROOT / "examples" / "plan.json"))
+        with self.assertRaisesRegex(HarnessError, "验证命令修改"):
+            engine.start("Implement greet", read_json(ROOT / "examples" / "plan.json"))
         self.assertFalse(engine.run["accepted"])
         self.assertFalse(any(d["role"] == "reviewer" for d in engine.run["dispatches"]))
 

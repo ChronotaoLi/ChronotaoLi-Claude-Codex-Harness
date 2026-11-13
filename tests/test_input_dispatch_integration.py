@@ -1,11 +1,10 @@
 """Behavioral input gates across real run lifecycle with offline agents."""
 import hashlib
-from unittest.mock import patch
 from harness import git
 from harness.util import HarnessError, read_json, write_json
 from harness.workspace_inputs import prepare_run
 from harness.versions import RUN_SCHEMA_VERSION
-from test_harness import RepoCase, ROOT
+from test_harness import RepoCase, ROOT, after_save, prepared_entry
 from test_runtime_changes import ScriptedBackend
 
 
@@ -29,17 +28,15 @@ class InputDispatchIntegrationTests(RepoCase):
         prepare_run(self.repo, engine.run['id'], manifest)
         return engine, backend
 
-    def test_pre_agent_copy_mutation_blocks_before_worker_charge_and_invocation(self):
+    def test_copy_mutation_during_preparation_blocks_before_worker_charge_and_invocation(self):
         engine, backend = self.prepared()
         resumed = self.engine(backend)
-        original = resumed.context.emit_hook
-        def mutate(event, entry, job):
-            original(event, entry, job)
-            if event == 'pre_agent' and entry['role'] == 'worker':
-                (resumed.worktree / 'vendor/input.txt').write_text('modified by hook')
-        with patch.object(resumed.context, 'emit_hook', side_effect=mutate):
+        change, state = after_save(resumed, prepared_entry('worker'),
+                                   lambda: (resumed.worktree / 'vendor/input.txt').write_text('modified during preparation'))
+        with change:
             with self.assertRaises(HarnessError):
                 resumed.resume(engine.run['id'], approve_plan=True)
+        self.assertTrue(state['fired'])
         state = read_json(engine.directory / 'state.json')
         self.assertEqual(sum(state['attempts'].values()), 0)
         self.assertEqual(state['agent_dispatches'], 0)

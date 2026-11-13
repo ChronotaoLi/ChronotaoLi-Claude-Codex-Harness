@@ -11,7 +11,6 @@ from unittest.mock import patch
 from harness.adapters import CLIBackend, UndecodableOutput
 from harness.cli import main
 from harness.runtime import Runtime
-from harness.shared import HookError, Hooks
 from harness.util import HarnessError, ProcessTimeout, dump, group_alive, read_json, run_process, write_json
 from harness.versions import RUN_SCHEMA_VERSION
 from test_harness import RepoCase, ROOT
@@ -121,50 +120,6 @@ class ErrorRepairsTests(RepoCase):
                              if cli == "claude" else value)
             with self.subTest(cli=cli):
                 self.assertEqual(self.invoke_provider(cli, raw), value)
-
-    def hooks(self, spec):
-        path = self.repo / ".harness" / "hooks.json"
-        write_json(path, spec)
-        self.config.data["shared"]["hooks"] = str(path)
-        return Hooks(self.config)
-
-    def test_all_hook_configuration_is_validated_before_any_hook_executes(self):
-        valid = {"argv": [sys.executable, "-c", "pass"]}
-        invalid = [[], {"unknown": []}, {"pre_agent": {}}, {"post_accept": [None]},
-                   {"post_accept": [{}]}, {"post_accept": [{"argv": "echo nope"}]},
-                   {"post_accept": [{"argv": [""]}]}, {"post_accept": [{"argv": ["echo", "\0"]}]},
-                   {"post_accept": [{"argv": ["echo"], "extra": "typo"}]}]
-        invalid += [{"post_accept": [{**valid, "timeout_seconds": value}]}
-                    for value in (True, False, 0, -1, "30", None, float("nan"), float("inf"), 10 ** 1000)]
-        with patch("harness.shared.run_process") as process:
-            for spec in invalid:
-                with self.subTest(spec=spec), self.assertRaises(HarnessError):
-                    self.hooks(spec)
-            hooks = self.hooks({"pre_agent": [valid]})
-            hooks.spec["post_accept"] = [{"argv": []}]
-            with self.assertRaises(HarnessError):
-                hooks.emit("pre_agent", {}, self.repo / "logs")
-        process.assert_not_called()
-
-    def test_hook_rejection_carries_exit_code_and_evidence(self):
-        hooks = self.hooks({"pre_accept": [{"argv": [sys.executable, "-c", "print('policy failed'); raise SystemExit(7)"]}]})
-        with self.assertRaises(HookError) as caught:
-            hooks.emit("pre_accept", {"task_id": "greet"}, self.repo / "logs")
-        error = caught.exception
-        self.assertEqual((error.event, error.code, error.timeout), ("pre_accept", 7, None))
-        self.assertEqual(error.log.with_suffix(".stdout").read_text(), "policy failed\n")
-
-    def test_hook_timeout_and_missing_command_keep_structured_failure(self):
-        fixtures = [("timeout", [sys.executable, "-c", "import time; time.sleep(30)"], 0.05),
-                    ("startup", [str(self.repo / "missing-hook")], 30)]
-        for name, argv, timeout in fixtures:
-            hooks = self.hooks({"pre_accept": [{"argv": argv, "timeout_seconds": timeout}]})
-            with self.subTest(name=name), self.assertRaises(HookError) as caught:
-                hooks.emit("pre_accept", {}, self.repo / name)
-            self.assertEqual(caught.exception.event, "pre_accept")
-            self.assertIsNone(caught.exception.code)
-            self.assertEqual(caught.exception.timeout, timeout if name == "timeout" else None)
-            self.assertTrue(caught.exception.log.with_suffix(".stderr").exists())
 
     def test_status_retains_healthy_runs_when_other_state_is_damaged(self):
         runs = self.repo / ".harness" / "runs"

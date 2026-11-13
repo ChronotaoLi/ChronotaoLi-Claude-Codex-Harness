@@ -1,5 +1,6 @@
 import copy
 import json
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -405,19 +406,6 @@ class RuntimeChangesTests(RepoCase):
         self.assertEqual(result["status"], "completed")
         self.assertEqual(set(result["accepted"]), {"prepare", "greet"})
 
-    def test_pre_verify_hook_cannot_rewrite_candidate(self):
-        engine = self.engine()
-        emit = engine.hooks.emit
-        def mutate(event, payload, folder):
-            if event == "pre_verify":
-                with (engine.worktree / "hello.py").open("a") as file:
-                    file.write("# hook rewrite\n")
-            return emit(event, payload, folder)
-        engine.hooks.emit = mutate
-        with self.assertRaisesRegex(HarnessError, "验证命令修改"):
-            engine.start("Implement greet", self.plan())
-        self.assertEqual(engine.run["accepted"], {})
-
     def test_approval_cannot_preapprove_plan_generated_after_interruption(self):
         def interrupt(backend, kwargs, packet, result):
             if trigger_kind(kwargs, packet) == "plan":
@@ -488,24 +476,22 @@ class RuntimeChangesTests(RepoCase):
         self.assertTrue((engine.worktree / "folder").is_symlink())
         self.assertEqual((self.repo / "folder" / "file.txt").read_text(), "tracked\n")
 
-    def test_post_accept_hook_must_succeed_on_resume_without_repeating_worker(self):
+    def test_post_accept_work_must_finish_on_resume_without_repeating_worker(self):
         backend = ScriptedBackend()
-        def failing_hook(engine):
-            emit = engine.hooks.emit
-            def fail(event, payload, logs):
-                if event == "post_accept":
-                    raise HarnessError("post_accept policy rejected")
-                return emit(event, payload, logs)
-            engine.hooks.emit = fail
+
+        def memory_unavailable(engine):
+            def unavailable(**kwargs):
+                raise sqlite3.OperationalError("memory storage temporarily unavailable")
+            engine.memory.remember = unavailable
         engine = self.engine(backend)
-        failing_hook(engine)
-        with self.assertRaisesRegex(HarnessError, "post_accept policy rejected"):
+        memory_unavailable(engine)
+        with self.assertRaisesRegex(sqlite3.OperationalError, "memory storage"):
             engine.start("Implement greet", self.plan())
         accepted = engine.run["accepted"]["greet"]["commit"]
         self.assertIn("pending_post_accept", engine.run)
         resumed = self.engine(backend)
-        failing_hook(resumed)
-        with self.assertRaisesRegex(HarnessError, "post_accept policy rejected"):
+        memory_unavailable(resumed)
+        with self.assertRaisesRegex(sqlite3.OperationalError, "memory storage"):
             resumed.resume(engine.run["id"])
         self.assertEqual(resumed.run["status"], "blocked")
         self.assertEqual(resumed.run["accepted"]["greet"]["commit"], accepted)

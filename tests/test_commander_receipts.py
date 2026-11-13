@@ -3,7 +3,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 from harness.util import HarnessError, read_json, write_json
-from test_harness import ROOT, RepoCase
+import harness.worker_receipts as worker_receipts_module
+from test_harness import ROOT, RepoCase, crash_after_save, decide_bound
 from test_runtime_changes import ScriptedBackend, decided, trigger_kind
 
 
@@ -35,20 +36,15 @@ class CommanderReceiptTests(RepoCase):
         self.assertTrue(interrupted)
         return read_json(engine.directory / "state.json")
 
-    def fail_post_agent(self, engine, kind, plan=None, **start_kwargs):
-        emit = engine.hooks.emit
-
-        def fail(event, payload, logs):
-            if event == "post_agent" and payload.get("kind") == kind:
-                Path(logs).mkdir(parents=True, exist_ok=True)
-                (Path(logs) / "attempt.txt").write_text("failed gate")
-                raise HarnessError("policy gate unavailable")
-            return emit(event, payload, logs)
-
-        with patch.object(engine.hooks, "emit", side_effect=fail):
-            with self.assertRaisesRegex(HarnessError, "policy gate unavailable"):
-                engine.start("Implement greet", plan, **start_kwargs)
-        return read_json(engine.directory / "state.json")
+    def interrupt_bound(self, engine, plan=None, **start_kwargs):
+        """The controller dies right after the returned decide original is bound by digest."""
+        crash, state = crash_after_save(engine, decide_bound)
+        with crash, self.assertRaises(KeyboardInterrupt):
+            engine.start("Implement greet", plan, **start_kwargs)
+        self.assertTrue(state["fired"])
+        saved = read_json(engine.directory / "state.json")
+        self.assertIn("artifact_digest", saved["commander_receipts"]["commander:decide:run"])
+        return saved
 
     def test_plan_atomic_result_write_recovers_original_plan_with_no_budget_left(self):
         self.config.data["runtime"]["max_agent_dispatches"] = 1
@@ -79,25 +75,23 @@ class CommanderReceiptTests(RepoCase):
             self.assertEqual(sum(resumed.run["attempts"].values()), 1)
         self.assertEqual(resumed.run["commander_receipts"], {})
 
-    def test_plan_post_agent_recovery_keeps_original_result_and_separate_logs(self):
+    def test_bound_plan_recovery_keeps_original_result(self):
         backend = ScriptedBackend()
         engine = self.engine(backend)
-        saved = self.fail_post_agent(engine, "decide", pause_after_plan=True)
+        saved = self.interrupt_bound(engine, pause_after_plan=True)
         receipt = saved["commander_receipts"]["commander:decide:run"]
-        first_log = Path(receipt["artifact"]).parent / "post-agent-1" / "attempt.txt"
-        resumed = self.engine(backend)
-        with patch.object(resumed.hooks, "emit", wraps=resumed.hooks.emit) as hooks:
-            result = resumed.resume(saved["id"])
-        retry = next(call for call in hooks.call_args_list if call.args[0] == "post_agent")
-        self.assertEqual(Path(retry.args[2]).name, "post-agent-2")
-        self.assertEqual(first_log.read_text(), "failed gate")
+        original = Path(receipt["artifact"]).read_bytes()
+        result = self.engine(backend).resume(saved["id"])
         self.assertEqual(len(backend.calls), 1)
         self.assertEqual(result["status"], "awaiting_approval")
+        self.assertEqual(result["commander_receipts"], {})
+        self.assertEqual(result["tasks"], read_json(Path(receipt["artifact"]))["new_tasks"])
+        self.assertEqual(Path(receipt["artifact"]).read_bytes(), original)
 
-    def test_ask_post_agent_failure_recovers_question_before_explicit_fresh_request(self):
+    def test_bound_ask_recovers_question_before_explicit_fresh_request(self):
         backend = ScriptedBackend(self.block_worker)
         engine = self.engine(backend)
-        saved = self.fail_post_agent(engine, "decide", self.plan())
+        saved = self.interrupt_bound(engine, self.plan())
         receipt = saved["commander_receipts"]["commander:decide:run"]
         original = Path(receipt["artifact"]).read_bytes()
         calls = copy.deepcopy(backend.calls)
@@ -126,13 +120,16 @@ class CommanderReceiptTests(RepoCase):
         engine = self.engine(backend)
         saved = self.interrupt_result(engine, "decide", self.plan(multiple=True))
         resumed = self.engine(backend)
+        original = worker_receipts_module.write_json
 
-        def deny_worker(event, payload, logs):
-            if event == "pre_agent" and payload.get("role") == "worker":
-                raise HarnessError("worker preparation unavailable")
+        def deny_worker(path, value):
+            # Worker input publication fails: local preparation, before any budget.
+            if path.name == "packet.json":
+                raise OSError(28, "No space left on device")
+            return original(path, value)
 
-        with patch.object(resumed.hooks, "emit", side_effect=deny_worker):
-            with self.assertRaisesRegex(HarnessError, "worker preparation unavailable"):
+        with patch.object(worker_receipts_module, "write_json", deny_worker):
+            with self.assertRaisesRegex(HarnessError, "no budget was charged"):
                 resumed.resume(saved["id"])
         self.assertEqual(resumed.run["commander_receipts"], {})
         self.assertIn("pending_directive", resumed.run)
@@ -167,7 +164,7 @@ class CommanderReceiptTests(RepoCase):
             with self.subTest(mode=mode):
                 backend = ScriptedBackend()
                 engine = self.engine(backend)
-                saved = self.fail_post_agent(engine, "decide", pause_after_plan=True)
+                saved = self.interrupt_bound(engine, pause_after_plan=True)
                 artifact = Path(saved["commander_receipts"]["commander:decide:run"]["artifact"])
                 if mode == "missing":
                     artifact.unlink()
@@ -265,7 +262,7 @@ class CommanderReceiptTests(RepoCase):
     def test_bound_request_cannot_change_schema_before_replay(self):
         backend = ScriptedBackend()
         engine = self.engine(backend)
-        saved = self.fail_post_agent(engine, "decide", pause_after_plan=True)
+        saved = self.interrupt_bound(engine, pause_after_plan=True)
         receipt = saved["commander_receipts"]["commander:decide:run"]
         receipt["request"]["schema"]["additionalProperties"] = True
         write_json(engine.directory / "state.json", saved)
@@ -277,7 +274,6 @@ class CommanderReceiptTests(RepoCase):
         backend = ScriptedBackend()
         engine = self.engine(backend)
         verify = engine.services.verification.verify
-        emit = engine.hooks.emit
 
         def failed_final(*args, **kwargs):
             if kwargs.get("whole_run"):
@@ -285,14 +281,12 @@ class CommanderReceiptTests(RepoCase):
                          "stderr": "Integration failed", "log": "integration.log", "timed_out": False}]
             return verify(*args, **kwargs)
 
-        def fail_replan(event, payload, logs):
-            if event == "post_agent" and payload.get("kind") == "decide":
-                raise HarnessError("stop hook unavailable")
-            return emit(event, payload, logs)
-
-        with patch.object(engine.services.verification, "verify", side_effect=failed_final), patch.object(engine.hooks, "emit", side_effect=fail_replan):
-            with self.assertRaisesRegex(HarnessError, "stop hook unavailable"):
+        # The controller dies after the final-stage decide original is bound.
+        crash, state = crash_after_save(engine, decide_bound)
+        with patch.object(engine.services.verification, "verify", side_effect=failed_final), crash:
+            with self.assertRaises(KeyboardInterrupt):
                 engine.start("Implement greet", self.plan())
+        self.assertTrue(state["fired"])
         calls = copy.deepcopy(backend.calls)
         before = (engine.directory / "state.json").read_bytes()
         with self.assertRaisesRegex(HarnessError, "--reverify 不能用于已返回、尚未处理的指挥决定"):

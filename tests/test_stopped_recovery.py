@@ -7,7 +7,7 @@ from harness import git
 from harness.cleanup import cleanup_run
 from harness.process_runtime import ProcessOutcome
 from harness.util import HarnessError, read_json, run_process, write_json
-from test_harness import ROOT, RepoCase
+from test_harness import ROOT, RepoCase, crash_after_save, decide_bound
 from test_runtime_changes import ScriptedBackend, finding, revised, trigger_kind
 
 
@@ -73,17 +73,15 @@ class StoppedRecoveryTests(RepoCase):
                     return run_process(argv, cwd, log, **kwargs)
 
                 backend = ScriptedBackend(block_task)
+                stopped = self.engine(backend)
+                # The controller dies right after the returned decide is bound.
+                crash, state = crash_after_save(stopped, decide_bound)
+                with patch("harness.verification.run_process", side_effect=fail_final), crash, \
+                        self.assertRaises(KeyboardInterrupt):
+                    stopped.start("Implement greet", self.plan())
+                self.assertTrue(state["fired"])
                 engine = self.engine(backend)
-                emit = engine.hooks.emit
-
-                def fail_decide_hook(event, payload, logs):
-                    if event == "post_agent" and payload.get("kind") == "decide":
-                        raise HarnessError("question hook unavailable")
-                    return emit(event, payload, logs)
-                with patch("harness.verification.run_process", side_effect=fail_final), \
-                        patch.object(engine.hooks, "emit", side_effect=fail_decide_hook), \
-                        self.assertRaisesRegex(HarnessError, "question hook unavailable"):
-                    engine.start("Implement greet", self.plan())
+                engine.load_run(stopped.run["id"])
                 self.assertIn("commander:decide:run", engine.run["commander_receipts"])
                 # Even an explicit exit confirmation must wait until the option
                 # combination has been validated, before auditing or saving it.

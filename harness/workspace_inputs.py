@@ -180,7 +180,7 @@ def _registered(run, directory):
     return manifest, journal
 
 def validate_inputs(run, directory, *, allow_removed=False):
-    """Read-only gate, called on resume and after pre_agent before worker count."""
+    """Read-only gate, called on resume and after local preparation, before the worker is counted."""
     directory = Path(directory)
     manifest, journal = _registered(run, directory)
     if manifest is None:

@@ -89,7 +89,7 @@ class AssetPortabilityTests(unittest.TestCase):
         original, relocated = self.installation("original"), self.installation("relocated")
         self.assertEqual(original.resume_changes(relocated.data), {})
         self.assertEqual(asset_digest(original), asset_digest(relocated))
-        for key in ("rules", "mcp", "hooks"):
+        for key in ("rules", "mcp"):
             path = relocated.asset(key)
             renamed = path.with_name("relocated-" + path.name)
             path.rename(renamed)
@@ -99,7 +99,7 @@ class AssetPortabilityTests(unittest.TestCase):
     def test_content_and_skill_identity_changes_still_invalidate_digest(self):
         original = self.installation("original")
         baseline = asset_digest(original)
-        for key in ("rules", "mcp", "hooks"):
+        for key in ("rules", "mcp"):
             changed = self.installation(key)
             path = changed.asset(key)
             path.write_bytes(path.read_bytes() + b"\n")

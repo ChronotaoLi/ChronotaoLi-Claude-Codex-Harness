@@ -30,8 +30,7 @@ from test_harness import ROOT, RepoCase
 
 # Every module that binds run_process by name; patching harness.util alone misses them.
 RUN_PROCESS_SITES = ("harness.adapters.run_process", "harness.verification.run_process",
-                     "harness.command_server.run_process", "harness.shared.run_process",
-                     "harness.util.run_process")
+                     "harness.command_server.run_process", "harness.util.run_process")
 
 # Minimal DOM/fetch stand-in that executes the real APP_JS under node and reports what it rendered.
 PAGE_HARNESS_JS = r"""
@@ -256,10 +255,9 @@ class FileRouteTests(DashboardCase):
         command = uuid.uuid4().hex
         samples = {
             "verification/tasks/greet/1/retry-2/results.json": b'[{"exit_code": 0}]\n',
-            "hooks/greet-1/pre_accept-1/hook-pre_accept-0.stdout": b"hook output\n",
             f"dispatches/{worker}/commands/{command}/output.stdout": b"<script>alert(1)</script>\n<b>bold</b>\n",
             f"dispatches/{worker}/process.stderr": b"<html><body onload=alert(1)>stderr</body></html>\n",
-            f"dispatches/{worker}/post-agent-1/hook-post_agent-0.stderr": b"nested hook\n",
+            f"dispatches/{worker}/nested/step-0.stderr": b"nested evidence\n",
             "plans/replan-1.json": b"{}\n",
         }
         for relative, content in samples.items():
@@ -324,7 +322,7 @@ class FileRouteTests(DashboardCase):
             "/etc/passwd": 400, "worktrees/x": 400, "state.json/x": 400, "dispatches": 400,
             f"dispatches/{worker.upper()}/prompt.txt": 400, "dispatches/not-a-uuid/prompt.txt": 400,
             f"dispatches/{worker}/commands/not-hex/output.stdout": 400,
-            "verification/a/b/c/d/e/f/g/h.txt": 400,
+            "verification/a/b/c/d/e/f/g/h.txt": 400, "hooks/greet-1/log.stdout": 400,
             "run.lock": 403, f"dispatches/{worker}/mcp.json": 403, f"dispatches/{worker}/scratch.tmp": 403,
             "recovery/secret.txt": 403, f"dispatches/{alias}/prompt.txt": 403,
             f"dispatches/{worker}/linked.txt": 403, f"dispatches/{worker}/relative.txt": 403,

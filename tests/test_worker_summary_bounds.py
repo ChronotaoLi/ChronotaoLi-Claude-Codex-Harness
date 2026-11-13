@@ -2,15 +2,13 @@
 import hashlib
 import json
 from pathlib import Path
-import sys
-import tempfile
 import unittest
 
 from harness.adapters import provider_schema
 from harness.contracts import (DETAIL, REVIEW, WORK, envelope, output_constraints,
                                validate_review)
 from harness.context import WORKER_CONTEXT_CHARS
-from harness.util import dump, HarnessError, read_json, write_json
+from harness.util import dump, HarnessError, read_json
 from test_harness import RepoCase, ROOT
 from test_runtime_changes import ScriptedBackend, validate_work_contract, revised, trigger_kind
 
@@ -115,13 +113,6 @@ class WorkerSummaryLifecycleTests(RepoCase):
         summary = ("Sandbox refused the build step; details follow. " * 1000)[:31992 - 4] + "-END"
         self.assertEqual(len(summary), 31992)
         blocker = "The sandbox denied the required build command"
-        outside = tempfile.TemporaryDirectory()
-        self.addCleanup(outside.cleanup)
-        hooks = Path(outside.name)
-        captured = hooks / "on_error-input.json"
-        write_json(hooks / "hooks.json", {"on_error": [{"argv": [
-            sys.executable, "-c", "import sys; open(sys.argv[1], 'w').write(sys.stdin.read())", str(captured)]}]})
-        self.config.data["shared"]["hooks"] = str(hooks / "hooks.json")
 
         def environment_blocked(backend, kwargs, packet, result):
             if kwargs["role"] == "worker":
@@ -131,10 +122,8 @@ class WorkerSummaryLifecycleTests(RepoCase):
             engine.start("Implement greet", self.plan())
         error = engine.run["error"]
         stopped = [event for event in events(engine) if event["event"] == "run_stopped"]
-        hook_error = json.loads(captured.read_text())["error"]
         self.assertEqual(read_json(engine.directory / "state.json")["error"], error)
         self.assertEqual([event["error"] for event in stopped], [error])
-        self.assertEqual(hook_error, error)
         # The bound is structural, so it holds for any temp root: the blockers and
         # summary excerpt stays within 2,000 characters, and everything else is the
         # artifact path plus fixed wording, the truncation note and the digest.

@@ -123,7 +123,7 @@ class InvocationClassTests(StateCase):
             "no_usage": dispatch(status="failed", error="worker CLI exit=1\nsecond line"),
             "prepared": dispatch(invoked=False, process_state="prepared", status="running"),
             "gate_failed": dispatch(invoked=False, process_state="exited", status="failed",
-                                    error="hook pre_agent 拒绝继续"),
+                                    error="MCP servers.worker_service.url 必须为非空字符串"),
             "missing_invoked": dispatch(role="reviewer", kind="review"),
             "true_prepared": dispatch(process_state="prepared"),
             "false_running": dispatch(invoked=False, process_state="running", pgid=4242),
@@ -596,12 +596,12 @@ class PathPolicyTests(unittest.TestCase):
                      f"dispatches/{dispatch_id}/process.stdout",
                      f"dispatches/{dispatch_id}/commands/{'a' * 32}/output.stdout",
                      "verification/tasks/greet/1/retry-2/results.json",
-                     "hooks/greet-1/pre_accept-1/hook-pre_accept-0.stdout", "path-indexes/abc.json"):
+                     "path-indexes/abc.json"):
             self.assertEqual("/".join(observe.validate_path(path)), path)
         for path in ("", "/etc/passwd", "../state.json", "state.json/x", "plans", "worktrees/x", ".hidden",
                      "dispatches/not-a-uuid/prompt.txt", f"dispatches/{dispatch_id.upper()}/prompt.txt",
                      f"dispatches/{dispatch_id}/commands/XYZ/output.stdout",
-                     "verification/" + "/".join(["d"] * 8), "hooks/" + "a" * 97):
+                     "verification/" + "/".join(["d"] * 8), "hooks/greet-1/log.stdout"):
             with self.subTest(path=path), self.assertRaises(observe.InvalidPath):
                 observe.validate_path(path)
         for path in ("run.lock", f"dispatches/{dispatch_id}/mcp.json", "plans/revision-0.json.abc.tmp",

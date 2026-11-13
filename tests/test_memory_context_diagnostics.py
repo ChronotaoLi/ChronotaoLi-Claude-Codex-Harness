@@ -1,14 +1,13 @@
 import copy
 import hashlib
 import json
-import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 from harness.context import compose
 from harness.memory import Memory
-from harness.util import HarnessError, dump, read_json, write_json
+from harness.util import HarnessError, dump, read_json
 from test_harness import RepoCase, ROOT
 from test_runtime_changes import ScriptedBackend
 
@@ -98,13 +97,7 @@ class MemoryCompositionDiagnosticsTests(unittest.TestCase):
 
 
 class MemoryDispatchDiagnosticsTests(RepoCase):
-    def test_metadata_is_recalled_in_worker_and_same_report_reaches_hook(self):
-        hooks = self.repo / ".harness" / "diagnostic-hooks.json"
-        events = self.repo / ".harness" / "diagnostic-events.jsonl"
-        script = ("import json,sys; from pathlib import Path; event=json.load(sys.stdin); "
-                  "p=Path(sys.argv[1]); f=p.open('a'); f.write(json.dumps(event)+'\\n'); f.close()")
-        write_json(hooks, {"context_prepared": [{"argv": [sys.executable, "-c", script, str(events)]}]})
-        self.config.data["shared"]["hooks"] = str(hooks)
+    def test_metadata_is_recalled_in_worker_and_recorded_in_its_report(self):
         observed = []
 
         def capture(backend, kwargs, packet, result):
@@ -136,10 +129,8 @@ class MemoryDispatchDiagnosticsTests(RepoCase):
         result = engine.start("Implement greeting", plan)
         self.assertEqual(result["status"], "completed")
         self.assertEqual(len(observed), 3)
-        hook_reports = [json.loads(line)["report"] for line in events.read_text().splitlines()]
         for index, (prompt, job) in enumerate(observed):
             report = read_json(job / "context-report.json")
-            self.assertIn(report, hook_reports)
             self.assertIn(identifiers[index], report["memory_ids"])
             memory_records = [json.loads(value) for value in prompt.split(MEMORY_SEPARATOR)[1:]]
             self.assertIn(identifiers[index], [item["id"] for item in memory_records])

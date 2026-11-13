@@ -1,13 +1,12 @@
 """Waits preserve task work budgets, never erase actual invocation accounting."""
 import copy
 from pathlib import Path
-from unittest.mock import patch
 
 from harness import git
 from harness.budgets import work_attempts
 from harness.cli import status_summary
 from harness.util import HarnessError, read_json, write_json
-from test_harness import ROOT, RepoCase
+from test_harness import ROOT, RepoCase, after_save, prepared_entry
 from test_runtime_changes import ScriptedBackend, finding
 
 
@@ -138,19 +137,17 @@ class WorkAttemptBudgetTests(RepoCase):
             self.engine(backend).resume(engine.run["id"])
         self.assertEqual(len(backend.calls), 1)
 
-    def test_pre_agent_tampering_cannot_spend_budget_using_an_old_exemption(self):
+    def test_tampering_during_preparation_cannot_spend_budget_using_an_old_exemption(self):
         engine, backend = self.start_blocked()
         before = read_json(engine.directory / "state.json")
         artifact = Path(before["dispatches"][0]["attempt_exemption"]["artifact"])
         resumed = self.engine(backend)
-
-        def tamper(event, payload, logs):
-            if event == "pre_agent":
-                artifact.write_bytes(artifact.read_bytes() + b"\n")
-
-        with patch.object(resumed.hooks, "emit", side_effect=tamper):
+        tamper, state = after_save(resumed, prepared_entry(),
+                                   lambda: artifact.write_bytes(artifact.read_bytes() + b"\n"))
+        with tamper:
             with self.assertRaisesRegex(HarnessError, "原始结果已改变"):
                 resumed.resume(engine.run["id"])
+        self.assertTrue(state["fired"])
         self.assertEqual(len(backend.calls), 1)
         after = read_json(engine.directory / "state.json")
         for key in ("attempts", "agent_dispatches"):

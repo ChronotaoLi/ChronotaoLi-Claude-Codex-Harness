@@ -14,7 +14,7 @@ from harness.dispatch import Dispatcher
 from harness.memory import Memory
 from harness.util import HarnessError, read_json, write_json
 from test_engine_repairs import RecordingBackend
-from test_harness import RepoCase, ROOT
+from test_harness import RepoCase, ROOT, after_save
 from test_runtime_changes import ScriptedBackend, decided, finding, finding_key, trigger_kind
 from test_runtime_changes import revised as revised_
 from test_worker_return_recovery import stub_provider_clis
@@ -658,7 +658,7 @@ class EvidenceDamageTests(RepoCase):
         self.assertIn(REVIEW_KEY, resumed.run["review_receipts"])
         self.assertNotEqual(entries(resumed.run, "reviewer", "review")[0]["status"], "invalid")
 
-    def test_changed_previous_invalid_original_stops_before_dispatch(self):
+    def test_changed_previous_invalid_original_stops_before_the_call(self):
         def change(backend, kwargs, packet, result):
             if kwargs["kind"] == "review" and len(calls(backend, "reviewer", "review")) == 1:
                 result["summary"] = "x" * 4001
@@ -677,13 +677,19 @@ class EvidenceDamageTests(RepoCase):
         first = entries(engine.run, "reviewer", "review")[0]
         Path(first["invalid_output"]["artifact"]).write_text("{}")
         before = len(backend.calls)
-        dispatches = len(read_json(engine.directory / "state.json")["dispatches"])
+        saved = read_json(engine.directory / "state.json")
+        dispatches, budget = len(saved["dispatches"]), saved["agent_dispatches"]
         resumed = self.engine(backend)
         with self.assertRaisesRegex(HarnessError, "无效输出原始结果已改变"):
             resumed.resume(engine.run["id"])
         self.assertEqual(len(backend.calls), before)
-        # Damage found before preparation: no dispatch is prepared and no hook runs for it.
-        self.assertEqual(len(resumed.run["dispatches"]), dispatches)
+        # The one check runs after local preparation, before the call is accounted:
+        # the prepared entry is finished as failed and never invoked.
+        after = read_json(engine.directory / "state.json")
+        self.assertEqual(len(after["dispatches"]), dispatches + 1)
+        last = after["dispatches"][-1]
+        self.assertEqual((last["role"], last["invoked"], last["status"]), ("reviewer", False, "failed"))
+        self.assertEqual(after["agent_dispatches"], budget)
 
 
 class OptionalProductTests(RepoCase):
@@ -735,19 +741,13 @@ class OptionalProductTests(RepoCase):
 class AcceptancePreflightTests(RepoCase):
     def test_task_memory_record_failure_stops_before_commit(self):
         engine = self.engine(ScriptedBackend())
-        hooks = []
-        emit = engine.context.emit_hook
-
-        def record(event, payload, logs):
-            hooks.append(event)
-            return emit(event, payload, logs)
-        with patch.object(engine.context, "emit_hook", side_effect=record), \
+        with patch("harness.git.accept", wraps=git.accept) as accept, \
                 patch.object(Memory, "validate_record", side_effect=HarnessError("too large")):
             with self.assertRaisesRegex(HarnessError, "任务记忆记录不合格；未提交"):
                 engine.start("Implement greet", plan())
+        accept.assert_not_called()
         self.assertEqual(git.head(engine.worktree), engine.run["base_commit"])
         self.assertIn("pending_acceptance", engine.run)
-        self.assertNotIn("pre_accept", hooks)
 
 
 class LedgerLinkTests(RepoCase):
@@ -1063,18 +1063,21 @@ class ReviewFindingRegressionTests(RepoCase):
 
                 backend = ScriptedBackend(change)
                 engine = self.engine(backend)
-                emit = engine.hooks.emit
 
-                def hook(event, payload, logs, damage=damage):
-                    if event == "pre_agent" and payload.get("role") == "reviewer":
-                        invalid = [d for d in engine.run["dispatches"] if d.get("status") == "invalid"]
-                        if invalid:
-                            path = Path(invalid[-1]["invalid_output"]["artifact"])
-                            path.unlink() if damage == "delete" else path.write_text("{}")
-                    return emit(event, payload, logs)
-                with patch.object(engine.hooks, "emit", side_effect=hook):
+                def redo_prepared(run):
+                    last = run["dispatches"][-1] if run["dispatches"] else {}
+                    return (last.get("role") == "reviewer" and last.get("process_state") == "prepared"
+                            and any(d.get("status") == "invalid" for d in run["dispatches"]))
+
+                def damage_original(damage=damage):
+                    invalid = [d for d in engine.run["dispatches"] if d.get("status") == "invalid"]
+                    path = Path(invalid[-1]["invalid_output"]["artifact"])
+                    path.unlink() if damage == "delete" else path.write_text("{}")
+                change_during_preparation, state = after_save(engine, redo_prepared, damage_original)
+                with change_during_preparation:
                     with self.assertRaisesRegex(HarnessError, "无效输出原始结果" + ("缺失" if damage == "delete" else "已改变")):
                         engine.start("Implement greet", plan())
+                self.assertTrue(state["fired"])
                 self.assertEqual(len(calls(backend, "reviewer", "review")), 1)
                 redo = entries(engine.run, "reviewer", "review")
                 self.assertEqual(len(redo), 1)

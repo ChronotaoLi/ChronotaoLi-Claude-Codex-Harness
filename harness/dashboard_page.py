@@ -263,7 +263,7 @@ APP_JS = r""""use strict";
     task_checkpoint_recorded: "记录检查点", output_invalid: "输出无效", candidate_preflight_failed: "候选预检失败",
     pending_task_invalidated: "待处理任务作废", pending_acceptance_invalidated: "待接受结果作废",
     broad_scope_warning: "范围过宽提示", scope_extension_approved: "范围扩展已批准",
-    error_hook_failed: "错误 hook 失败", resume_config_relaxed: "恢复时放宽配置"
+    resume_config_relaxed: "恢复时放宽配置"
   };
 
   function freshUi(runId) {

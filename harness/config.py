@@ -90,7 +90,7 @@ class Config:
         check_keys(data, {*DEFAULTS, "shared", "roles"})
         for section, defaults in DEFAULTS.items():
             check_keys(data.get(section), defaults, section + ".")
-        check_keys(data.get("shared"), ("rules", "skills", "mcp", "hooks"), "shared.")
+        check_keys(data.get("shared"), ("rules", "skills", "mcp"), "shared.")
         roles = data.get("roles")
         role_names = ("commander", "worker", "reviewer", "fable")
         check_keys(roles, role_names, "roles.")
@@ -101,8 +101,8 @@ class Config:
             raise HarnessError("未知配置键：" + "、".join(sorted(unknown)))
         shared = data.get("shared")
         if not isinstance(shared, dict):
-            raise HarnessError("shared 必须为配置表，包含 rules、skills、mcp、hooks")
-        for key in ("rules", "skills", "mcp", "hooks"):
+            raise HarnessError("shared 必须为配置表，包含 rules、skills、mcp")
+        for key in ("rules", "skills", "mcp"):
             value = shared.get(key)
             if not isinstance(value, str) or not value.strip() or "\0" in value:
                 raise HarnessError(f"shared.{key} 必须为非空路径字符串")

@@ -4,7 +4,7 @@ from unittest.mock import patch
 
 from harness import git
 from harness.util import HarnessError, read_json, write_json
-from test_harness import ROOT, RepoCase
+from test_harness import ROOT, RepoCase, crash_after_save
 from test_runtime_changes import ScriptedBackend
 
 
@@ -12,16 +12,11 @@ class TaskPhaseHandoffTests(RepoCase):
     def test_conflicting_acceptance_phase_preserves_commit_and_returned_review(self):
         backend = ScriptedBackend()
         engine = self.engine(backend)
-        emit = engine.hooks.emit
-
-        def stop_before_commit(event, payload, logs):
-            if event == "pre_accept":
-                raise HarnessError("acceptance gate unavailable")
-            return emit(event, payload, logs)
-
-        with patch.object(engine.hooks, "emit", side_effect=stop_before_commit):
-            with self.assertRaises(HarnessError):
-                engine.start("Implement greet", read_json(ROOT / "examples/plan.json"))
+        # The controller dies right after the approval is saved, before acceptance.
+        crash, state = crash_after_save(engine, lambda run: "pending_acceptance" in run)
+        with crash, self.assertRaises(KeyboardInterrupt):
+            engine.start("Implement greet", read_json(ROOT / "examples/plan.json"))
+        self.assertTrue(state["fired"])
         path = engine.directory / "state.json"
         saved = read_json(path)
         original_head = saved["expected_head"]
@@ -52,19 +47,10 @@ class TaskPhaseHandoffTests(RepoCase):
 
     def test_commit_and_post_accept_work_survive_same_save_interruption(self):
         engine = self.engine()
-        save = engine.context.save
-        interrupted = False
-
-        def stop_after_handoff():
-            nonlocal interrupted
-            save()
-            if engine.run.get("pending_post_accept") and not interrupted:
-                interrupted = True
-                raise KeyboardInterrupt()
-
-        with patch.object(engine.context, "save", side_effect=stop_after_handoff):
-            with self.assertRaises(KeyboardInterrupt):
-                engine.start("Implement greet", read_json(ROOT / "examples/plan.json"))
+        crash, state = crash_after_save(engine, lambda run: "pending_post_accept" in run)
+        with crash, self.assertRaises(KeyboardInterrupt):
+            engine.start("Implement greet", read_json(ROOT / "examples/plan.json"))
+        self.assertTrue(state["fired"])
         saved = read_json(engine.directory / "state.json")
         accepted = saved["accepted"]["greet"]
         self.assertEqual(saved["expected_head"], accepted["commit"])

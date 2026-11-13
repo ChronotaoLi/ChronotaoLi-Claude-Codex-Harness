@@ -47,7 +47,6 @@ knowledge_ttl_days = 180
 rules = "shared/RULES.md"
 skills = "shared/skills"
 mcp = "shared/mcp.json"
-hooks = "shared/hooks.json"
 
 [verification]
 # 配置目标项目的验证命令。这里的默认值用于本 Harness 项目。

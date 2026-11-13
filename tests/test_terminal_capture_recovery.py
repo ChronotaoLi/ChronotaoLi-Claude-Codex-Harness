@@ -92,14 +92,13 @@ class TerminalCaptureRecoveryTests(RepoCase):
         self.assertEqual(entry["process_outcome"]["cleanup_actions"].count("drain_descendants"), 1)
         self.assertNotIn("sigterm", entry["process_outcome"]["cleanup_actions"])
 
-    def test_short_worker_verification_and_hook_descendants_finish_normally(self):
+    def test_short_worker_and_verification_descendants_finish_normally(self):
         spawn = ("import subprocess,sys; subprocess.Popen([sys.executable,'-c',"
                  "'import time;time.sleep(.1)'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)")
         self.config.data["verification"]["commands"] = [[sys.executable, "-c",
             "from hello import greet; assert greet('Ada') == 'Hello, Ada!'; " + spawn]]
         backend = self.backend("implement", duration=.1)
         engine = self.engine(backend)
-        engine.hooks.spec = {"pre_accept": [{"argv": [sys.executable, "-c", spawn]}]}
         try:
             result = engine.start("Implement greet", read_json(ROOT / "examples/plan.json"))
         except HarnessError as error:

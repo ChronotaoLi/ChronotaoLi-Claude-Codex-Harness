@@ -39,21 +39,6 @@ class ProcessExitRecoveryTests(RepoCase):
         self.assertEqual(sum(result["attempts"].values()), 1)
         self.assertTrue(result["dispatches"][0]["exit_confirmed"])
 
-    def test_pre_agent_hook_can_check_exit_gate_before_process_start(self):
-        engine = self.engine()
-        script = ("import json,sys; from pathlib import Path; "
-                  "sys.path.insert(0,sys.argv[1]); "
-                  "from harness.util import ensure_dispatches_exited,read_json; "
-                  "data=json.load(sys.stdin); "
-                  "run=read_json(Path(data['run_dir'])/'state.json'); "
-                  "assert run['dispatches'][-1]['process_state']=='prepared'; "
-                  "ensure_dispatches_exited(run['dispatches'])")
-        engine.hooks.spec = {"pre_agent": [{"argv": [sys.executable, "-c", script, str(ROOT)]}]}
-        result = engine.start("Implement greet", read_json(ROOT / "examples/plan.json"))
-        self.assertEqual(result["status"], "completed")
-        self.assertTrue(all(entry["exit_confirmed"] for entry in result["dispatches"]))
-        self.assertTrue(all(entry["process_state"] == "exited" for entry in result["dispatches"]))
-
     def test_controller_death_after_real_popen_before_pgid_save_stays_unknown(self):
         # A separate controller exits without running finally blocks immediately
         # after a real local subprocess starts. No provider account is involved.

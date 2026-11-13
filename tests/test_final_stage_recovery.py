@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 from harness.process_runtime import ProcessOutcome
 from harness.util import HarnessError, ProcessTimeout, read_json, run_process, write_json
-from test_harness import RepoCase, ROOT
+from test_harness import RepoCase, ROOT, crash_after_save, decide_bound, review_bound
 from test_runtime_changes import ScriptedBackend, decided, finding, revised, trigger_kind
 
 
@@ -305,17 +305,13 @@ class FinalStageRecoveryTests(RepoCase):
 
         backend = ScriptedBackend(corrective)
         engine = self.engine(backend)
-        emit = engine.hooks.emit
-
-        def interrupt_returned_decide(name, payload, folder):
-            if name == "post_agent" and payload.get("kind") == "decide":
-                raise KeyboardInterrupt()
-            return emit(name, payload, folder)
-
+        # The controller dies right after the returned decide is bound by its digest.
+        crash, state = crash_after_save(engine, decide_bound)
         with patch("harness.verification.run_process", side_effect=self.fail_final_check(timed_out=False)):
-            with patch.object(engine.hooks, "emit", side_effect=interrupt_returned_decide), self.assertRaises(KeyboardInterrupt):
+            with crash, self.assertRaises(KeyboardInterrupt):
                 engine.start("Implement greet", self.plan())
-            receipt = engine.run["commander_receipts"]["commander:decide:run"]
+            self.assertTrue(state["fired"])
+            receipt = read_json(engine.directory / "state.json")["commander_receipts"]["commander:decide:run"]
             self.assertTrue(Path(receipt["artifact"]).is_file())
             state = engine.directory / "state.json"
             before = state.read_bytes()
@@ -399,22 +395,18 @@ class FinalStageRecoveryTests(RepoCase):
         self.assertEqual(len(resumed.run["final_history"]), 1)
         self.assertEqual(resumed.run["final_history"][-1]["status"], "rejected")
 
-    def test_returned_rejection_replays_validation_after_hook_interrupt_without_reroll(self):
+    def test_returned_rejection_replays_validation_after_bind_interrupt_without_reroll(self):
         def reject_final(backend, kwargs, packet, result):
             if kwargs["kind"] == "final_review":
                 result.update(verdict="request_changes", findings=[finding()])
 
         backend = ScriptedBackend(reject_final)
         engine = self.engine(backend)
-        emit = engine.hooks.emit
-
-        def interrupt_post_agent(name, payload, folder):
-            if name == "post_agent" and payload.get("kind") == "final_review":
-                raise KeyboardInterrupt()
-            return emit(name, payload, folder)
-
-        with patch.object(engine.hooks, "emit", side_effect=interrupt_post_agent), self.assertRaises(KeyboardInterrupt):
+        # The controller dies right after the returned rejection is bound by its digest.
+        crash, state = crash_after_save(engine, review_bound("final_review"))
+        with crash, self.assertRaises(KeyboardInterrupt):
             engine.start("Implement greet", self.plan())
+        self.assertTrue(state["fired"])
         calls = list(backend.calls)
         resumed = self.engine(backend)
         # The replayed rejection is final for this snapshot; the demo commander then asks.

@@ -24,11 +24,10 @@ from .review_progress import (
 from .verification_plan import candidate_preflight
 from .verification import checks_passed
 from .worker_receipts import read_worker_source
-from .shared import HookError
 from .util import dump, HarnessError, read_json, write_json
 
-# The environment-blocked stop message reaches the ledger error, run_stopped and
-# the on_error hook; it carries an excerpt and the digest-bound full artifact.
+# The environment-blocked stop message reaches the ledger error and run_stopped;
+# it carries an excerpt and the digest-bound full artifact.
 ENVIRONMENT_BLOCKER_EXCERPT_CHARS = 2000
 
 
@@ -72,11 +71,7 @@ class TaskLifecycle(RuntimeService):
             self.acceptance_event_once("memory_proposals_discarded", completion["id"] + ":discarded",
                                        task_id=tid, reason=completion["knowledge"]["reason"])
         self.acceptance_event_once("task_accepted", completion["id"], task_id=tid, commit=commit)
-        # A crash after hook success but before saving can retry the hook.
-        # Memory completion and this gate both precede any subsequent dispatch.
-        pending["hook_attempts"] = pending.get("hook_attempts", 0) + 1
-        self.context.save()
-        self.context.emit_hook("post_accept", payload, Path(pending["logs"]) / f"post_accept-{pending['hook_attempts']}")
+        # Memory completion precedes any subsequent dispatch.
         self.context.run.pop("pending_post_accept")
         self.context.save()
         self.services.workflow.synchronize_decision_requests()
@@ -100,14 +95,12 @@ class TaskLifecycle(RuntimeService):
                 stream.write("\n")
         self.context.event(event, event_id=event_id, **fields)
 
-    def task_attempt(self, task, directive, saved):
+    def task_attempt(self, task, directive):
         """Start one worker for a saved directive or a direct dispatch (instruction None)."""
         tid = task["id"]
         limit = self.context.config.data["runtime"]["max_attempts"]
         if self.services.budgets.task_budget_used(tid) >= limit:
             raise attempt_limit_error(tid, limit)
-        if saved:
-            self.services.planning.check_directive(tid, self.context.snapshot())
         self.context.run["current_task"] = tid
         self.context.save()
         self.context.checkpoint()
@@ -143,8 +136,9 @@ class TaskLifecycle(RuntimeService):
         tid = task["id"]
         key = f"worker:implement:{tid}"
         receipt = self.context.run["worker_receipts"][key]
-        candidate_digest = receipt.get("post_hook_digest")
-        if not candidate_digest or snapshot_digest(self.context.snapshot()) != candidate_digest:
+        # The handoff binds the candidate of the sealed return, never a later one.
+        candidate_digest = self.services.worker_receipts.sealed_candidate(key)
+        if snapshot_digest(self.context.snapshot()) != candidate_digest:
             raise HarnessError("worker candidate changed before handoff publication")
         attempt = self.context.run["worker_receipts"][key]["attempt"]
         paths = git.check_scope(self.context.worktree, task["allowed_paths"], binding=self.context.run["worktree_binding"])
@@ -355,7 +349,7 @@ class TaskLifecycle(RuntimeService):
             required = required_findings(self.context.run, tid, pending["snapshot_digest"])
             delivered = delivered_worker_findings(self.context, tid, worker_id)
             # Only source reads occurred since this snapshot; verification will
-            # independently rehash after its hooks and commands have run.
+            # independently rehash after its commands have run.
             preflight = candidate_preflight(task, full_result, worktree=self.context.worktree,
                 candidate_snapshot=snapshot, current_snapshot=snapshot,
                 worker_artifact=pending["worker_artifact"],
@@ -471,7 +465,7 @@ class TaskLifecycle(RuntimeService):
 
         pending_acceptance.worker_source must equal the source of the review record
         that approved this candidate, for the same work attempt; the original is
-        then read by its digest. Runs before and after the pre_accept hook.
+        then read by its digest. Read once per acceptance, before its snapshot check.
         """
         tid, source = pending["task_id"], pending.get("worker_source")
         records = [record for record in self.context.run["review_history"].get(tid, [])
@@ -548,10 +542,8 @@ class TaskLifecycle(RuntimeService):
         """Publish the commit and its remaining work at the same durable barrier."""
         runtime = self.context
         self._require_handoff("pending_acceptance", pending, "pending_task", "pending_post_accept")
-        tid, attempt = pending["task_id"], pending["attempt"]
-        successor = {"payload": {"task_id": tid, **accepted},
-                     "logs": str(self.context.directory / "hooks" / f"{tid}-{attempt}"),
-                     "completion": completion}
+        tid = pending["task_id"]
+        successor = {"payload": {"task_id": tid, **accepted}, "completion": completion}
         self.context.run["expected_head"] = accepted["commit"]
         self.context.run["accepted"][tid] = accepted
         self.context.run["feedback"] = None
@@ -582,6 +574,17 @@ class TaskLifecycle(RuntimeService):
         tid, attempt = pending["task_id"], pending["attempt"]
         task = next(task for task in self.context.run["tasks"] if task["id"] == tid)
         self.context.ensure_exited()
+        # Reads that never touch the worktree come first: a predictable record
+        # error stops before the commit, and the message is read by its digest.
+        try:
+            Memory.validate_record(**self.task_memory_record(task, pending, "0" * len(self.context.run["expected_head"]),
+                                                             pending["files"])[0])
+        except HarnessError as error:
+            raise HarnessError(f"任务记忆记录不合格；未提交：{error}") from error
+        message = self.approved_worker_message(pending)
+        # The one candidate check: after those reads, before the checks of run
+        # evidence and scope that lead to the commit. A changed candidate voids
+        # the approval; every other failure keeps pending_acceptance.
         if snapshot_digest(self.context.snapshot()) != pending["snapshot_digest"]:
             feedback = {"task_id": tid, "acceptance": {
                 "error": "待接受文件已变化，旧审阅失效；需要重新验证和独立审阅",
@@ -593,33 +596,10 @@ class TaskLifecycle(RuntimeService):
             self.context.save()
             self.context.event("pending_acceptance_invalidated", task_id=tid)
             return False
-        # A predictable record error must stop before the commit, not after it.
-        try:
-            Memory.validate_record(**self.task_memory_record(task, pending, "0" * len(self.context.run["expected_head"]),
-                                                             pending["files"])[0])
-        except HarnessError as error:
-            raise HarnessError(f"任务记忆记录不合格；未提交：{error}") from error
-        # Refuse a broken worker source before running the hook; recheck after it.
-        self.approved_worker_message(pending)
-        pending["hook_attempts"] = pending.get("hook_attempts", 0) + 1
-        logs = self.context.directory / "hooks" / f"{tid}-{attempt}" / f"pre_accept-{pending['hook_attempts']}"
-        self.context.save()
-        try:
-            self.context.emit_hook("pre_accept", {"task_id": tid, "review": pending["review"]}, logs)
-        except Exception as error:
-            detail = {"error": str(error), "logs": str(logs), "review_artifact": pending["review_artifact"]}
-            if isinstance(error, HookError):
-                detail.update(exit_code=error.code, log=str(error.log))
-            self.context.run["feedback"] = {"task_id": tid, "pre_accept": detail}
-            self.context.save()
-            raise
-        if snapshot_digest(self.context.snapshot()) != pending["snapshot_digest"]:
-            raise HarnessError("审阅后文件发生变化；禁止接受旧审阅结果")
         validate_dispatch_indexes(self.context.directory, self.context.run["dispatches"])
         validate_input_dispatch_indexes(self.context.directory, self.context.run["dispatches"])
         paths = git.check_scope(self.context.worktree, task["allowed_paths"], binding=self.context.run["worktree_binding"])
         validate_review_source(self.context.run, tid, pending, candidate_digest=pending["snapshot_digest"])
-        message = self.approved_worker_message(pending)
         commit = git.accept(self.context.worktree, paths, self.context.run["id"], tid, message,
                             binding=self.context.run["worktree_binding"])
         accepted = {"commit": commit, "summary": pending["review"]["summary"], "summary_source": "reviewer",

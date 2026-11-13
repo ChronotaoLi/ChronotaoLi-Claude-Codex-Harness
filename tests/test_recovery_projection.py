@@ -1,10 +1,9 @@
 from copy import deepcopy
 from pathlib import Path
-from unittest.mock import patch
 from harness.recovery import worker_recovery_context
 from harness.util import HarnessError, ProcessTimeout, dump, read_json
 from test_engine_repairs import RecordingBackend
-from test_harness import RepoCase, ROOT
+from test_harness import RepoCase, ROOT, crash_after_save
 from test_runtime_changes import finding, revised, trigger_kind
 
 
@@ -150,13 +149,13 @@ class RecoveryProjectionTests(RepoCase):
             engine.start("Implement greet", self.plan())
         run_id = engine.run["id"]
         engine = self.engine(backend)
-
-        def unavailable(event, payload, logs):
-            if event == "pre_accept":
-                raise HarnessError("acceptance policy unavailable")
-
-        with patch.object(engine.hooks, "emit", side_effect=unavailable), self.assertRaisesRegex(HarnessError, "policy unavailable"):
+        # The controller dies right after the approval is saved, before acceptance.
+        crash, state = crash_after_save(engine, lambda run: "pending_acceptance" in run)
+        with crash, self.assertRaises(KeyboardInterrupt):
             engine.resume(run_id)
+        self.assertTrue(state["fired"])
+        engine = self.engine(backend)
+        engine.load_run(run_id)
         record = deepcopy(engine.run["review_history"]["greet"][-1])
         review_bytes = Path(record["artifact"]).read_bytes()
         self.assertEqual(record["review"]["verdict"], "approve")

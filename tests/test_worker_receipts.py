@@ -3,7 +3,7 @@ import json
 from pathlib import Path
 from unittest.mock import patch
 
-from test_harness import RepoCase, ROOT
+from test_harness import ExitReportingBackend, RepoCase, ROOT, after_save
 from harness.adapters import DemoBackend
 from harness.util import HarnessError, read_json
 import harness.worker_receipts as receipts_module
@@ -14,46 +14,67 @@ class WorkerReceiptTests(RepoCase):
         return read_json(ROOT / 'examples' / 'plan.json')
 
     def interrupted(self, boundary):
-        engine = self.engine()
+        """A process death at one worker-return boundary; later saves never reach the ledger.
+
+        The backend reports the worker's exit before returning, as a CLI call does,
+        because dispatch's finally block (the demo backend's only exit record)
+        does not run after a process death.
+        """
+        engine = self.engine(ExitReportingBackend())
         self.config.data['runtime']['max_attempts'] = 1
         original_write = receipts_module.write_json
         original_publish = engine.services.tasks.publish_worker_result
-        fired = False
+        original_save = engine.context.save
+        state = {'fired': False, 'dead': False}
+
+        def die():
+            state['fired'] = state['dead'] = True
+            raise KeyboardInterrupt()
+
+        def save(*args, **kwargs):
+            if state['dead']:
+                return
+            original_save(*args, **kwargs)
+            receipt = next(iter(engine.run['worker_receipts'].values()), {})
+            if state['fired']:
+                return
+            if boundary == 'sealed_saved' and receipt.get('phase') == 'sealed' and 'artifact_digest' not in receipt:
+                die()
+            if boundary == 'finish_saved' and 'artifact_digest' in receipt:
+                die()
 
         def write(path, value):
-            nonlocal fired
-            if not fired and boundary == 'before_seal' and path.name.startswith('worker-seal.'):
-                fired = True
-                raise KeyboardInterrupt()
+            if not state['fired'] and boundary == 'before_seal' and path.name.startswith('worker-seal.'):
+                die()
             original_write(path, value)
-            if not fired and boundary == 'after_seal' and path.name.startswith('worker-seal.'):
-                fired = True
-                raise KeyboardInterrupt()
-            if not fired and boundary == 'derived_result' and path.name == 'returned-result.json':
-                fired = True
-                raise KeyboardInterrupt()
+            if not state['fired'] and boundary == 'after_seal' and path.name.startswith('worker-seal.'):
+                die()
+            if not state['fired'] and boundary == 'derived_result' and path.name == 'returned-result.json':
+                die()
 
         def publish(*args):
-            nonlocal fired
-            if not fired and boundary == 'publish':
-                fired = True
-                raise KeyboardInterrupt()
+            if not state['fired'] and boundary == 'publish':
+                die()
             return original_publish(*args)
 
-        with patch.object(receipts_module, 'write_json', write), patch.object(engine.services.tasks, 'publish_worker_result', publish):
+        with patch.object(receipts_module, 'write_json', write), \
+                patch.object(engine.services.tasks, 'publish_worker_result', publish), \
+                patch.object(engine.context, 'save', side_effect=save):
             with self.assertRaises(KeyboardInterrupt):
                 engine.start('Implement greeting', self.plan())
-        self.assertTrue(fired)
+        self.assertTrue(state['fired'])
         return engine
 
     def test_sealed_boundaries_replay_without_worker_even_at_attempt_limit(self):
-        for boundary in ('after_seal', 'derived_result', 'publish'):
+        # Seal file written; seal saved before the derived result; derived result
+        # written; receipt bound; finish returned before the handoff.
+        for boundary in ('after_seal', 'sealed_saved', 'derived_result', 'finish_saved', 'publish'):
             with self.subTest(boundary=boundary):
                 # Each case gets an isolated target repository/worktree.
                 if boundary != 'after_seal':
                     self.setUp()
                 engine = self.interrupted(boundary)
-                run = engine.resume(engine.run['id'])
+                run = self.engine().resume(engine.run['id'])
                 self.assertEqual(run['status'], 'completed')
                 self.assertEqual(run['attempts']['greet'], 1)
                 self.assertEqual(sum(e['role'] == 'worker' and e['invoked'] for e in run['dispatches']), 1)
@@ -89,56 +110,33 @@ class WorkerReceiptTests(RepoCase):
         with self.assertRaisesRegex(HarnessError, 'missing active worker receipt'):
             engine.resume(engine.run['id'])
 
-    def test_successful_hook_has_separate_candidate_binding(self):
+    def test_handoff_compares_against_the_sealed_candidate(self):
         engine = self.engine()
-        original = engine.context.emit_hook
-        seen = []
 
-        def hook(event, payload, logs):
-            if event == 'post_agent' and payload.get('role') == 'worker':
-                (engine.worktree / 'hello.py').write_text((engine.worktree / 'hello.py').read_text() + '\n# hook edit\n')
-                seen.append(logs)
-            return original(event, payload, logs)
+        def bound(run):
+            return any('artifact_digest' in receipt for receipt in run['worker_receipts'].values())
 
-        with patch.object(engine.context, 'emit_hook', hook):
-            run = engine.start('Implement greeting', self.plan())
-        self.assertEqual(run['status'], 'completed')
-        self.assertEqual(len(seen), 1)
-        self.assertIn('# hook edit', (engine.worktree / 'hello.py').read_text())
+        def edit():
+            with (engine.worktree / 'hello.py').open('a') as stream:
+                stream.write('\n# edited after the sealed candidate was checked\n')
+        change, state = after_save(engine, bound, edit)
+        with change, self.assertRaisesRegex(HarnessError, 'worker candidate changed before handoff publication'):
+            engine.start('Implement greeting', self.plan())
+        self.assertTrue(state['fired'])
+        saved = read_json(engine.directory / 'state.json')
+        self.assertNotIn('pending_task', saved)
+        self.assertEqual(next(iter(saved['worker_receipts'].values()))['phase'], 'sealed')
+        self.assertEqual(saved['attempts'], {'greet': 1})
 
-    def test_interrupted_hook_unchanged_retries_with_separate_log(self):
-        engine = self.engine()
-        original = engine.context.emit_hook
-        logs_seen = []
-        def hook(event, payload, logs):
-            if event == 'post_agent' and payload.get('role') == 'worker':
-                logs_seen.append(str(logs))
-                if len(logs_seen) == 1:
-                    raise KeyboardInterrupt()
-            return original(event, payload, logs)
-        with patch.object(engine.context, 'emit_hook', hook):
-            with self.assertRaises(KeyboardInterrupt):
-                engine.start('Implement greeting', self.plan())
-            run = engine.resume(engine.run['id'])
-        self.assertEqual(run['status'], 'completed')
-        self.assertEqual(run['attempts']['greet'], 1)
-        self.assertEqual(len(set(logs_seen)), 2)
-
-    def test_interrupted_hook_changed_candidate_blocks(self):
-        engine = self.engine()
-        original = engine.context.emit_hook
-        def hook(event, payload, logs):
-            if event == 'post_agent' and payload.get('role') == 'worker':
-                with (engine.worktree / 'hello.py').open('a') as stream:
-                    stream.write('\n# incomplete hook\n')
-                raise KeyboardInterrupt()
-            return original(event, payload, logs)
-        with patch.object(engine.context, 'emit_hook', hook):
-            with self.assertRaises(KeyboardInterrupt):
-                engine.start('Implement greeting', self.plan())
-        with self.assertRaisesRegex(HarnessError, 'candidate changed'):
-            engine.resume(engine.run['id'])
-        self.assertEqual(engine.run['attempts']['greet'], 1)
+    def test_crash_after_finish_save_then_candidate_change_blocks(self):
+        engine = self.interrupted('finish_saved')
+        with (engine.worktree / 'hello.py').open('a') as stream:
+            stream.write('\n# changed while the controller was down\n')
+        resumed = self.engine()
+        with self.assertRaisesRegex(HarnessError, 'candidate changed since sealed return'):
+            resumed.resume(engine.run['id'])
+        self.assertEqual(resumed.run['attempts']['greet'], 1)
+        self.assertEqual(next(iter(resumed.run['worker_receipts'].values()))['phase'], 'sealed')
 
     def test_bound_derived_artifact_bytes_cannot_be_rebound(self):
         engine = self.interrupted('publish')
@@ -265,28 +263,6 @@ class WorkerReceiptTests(RepoCase):
         self.assertEqual(packet['task_checkpoints'][0]['freshness_origin'], worker['invoked_at'])
         run = engine.resume(engine.run['id'])
         self.assertEqual(run['status'], 'completed')
-        self.assertEqual(run['attempts']['greet'], 1)
-
-    def test_successful_hook_edit_survives_publication_interruption(self):
-        engine = self.engine()
-        original = engine.context.emit_hook
-        hooks = []
-        def hook(event, payload, logs):
-            if event == 'post_agent' and payload.get('role') == 'worker':
-                hooks.append(str(logs))
-                with (engine.worktree / 'hello.py').open('a') as stream:
-                    stream.write('\n# completed hook\n')
-            return original(event, payload, logs)
-        with patch.object(engine.context, 'emit_hook', hook):
-            with patch.object(engine.services.tasks, 'publish_worker_result', side_effect=KeyboardInterrupt):
-                with self.assertRaises(KeyboardInterrupt):
-                    engine.start('Implement greeting', self.plan())
-            receipt = next(iter(engine.run['worker_receipts'].values()))
-            seal = read_json(next((engine.directory / 'dispatches').glob('*/worker-seal.*.json')))
-            self.assertNotEqual(receipt['post_hook_digest'], seal['candidate_digest'])
-            run = engine.resume(engine.run['id'])
-        self.assertEqual(run['status'], 'completed')
-        self.assertEqual(len(hooks), 1)
         self.assertEqual(run['attempts']['greet'], 1)
 
     def test_changed_provider_source_blocks_replay(self):

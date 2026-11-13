@@ -7,7 +7,7 @@ from unittest.mock import patch
 from harness import git
 from harness.util import HarnessError, read_json, write_json
 from test_engine_repairs import RecordingBackend
-from test_harness import RepoCase, ROOT
+from test_harness import RepoCase, ROOT, crash_after_save, review_bound
 from test_runtime_changes import finding, invalid_rejection, revised, trigger_kind
 
 
@@ -159,17 +159,18 @@ class InvalidReviewRecoveryTests(RepoCase):
 
         backend = RecordingBackend(change)
         engine = self.engine(backend)
-
-        def fail_hook(event, payload, logs):
-            if event == "post_agent" and payload.get("status") == "invalid_rejected":
-                raise HarnessError("invalid-review policy unavailable")
-
-        with patch.object(engine.hooks, "emit", side_effect=fail_hook), self.assertRaisesRegex(HarnessError, "policy unavailable"):
+        # The controller dies right after the returned invalid rejection is bound.
+        crash, state = crash_after_save(engine, review_bound("review"))
+        with crash, self.assertRaises(KeyboardInterrupt):
             engine.start("Implement greet", self.plan())
+        self.assertTrue(state["fired"])
+        run_id = engine.run["id"]
+        engine = self.engine(backend)
+        engine.load_run(run_id)
         self.assertEqual(engine.run["accepted"], {})
         return engine, backend
 
-    def test_invalid_rejection_hook_recovery_reuses_result_before_rework(self):
+    def test_bound_invalid_rejection_is_reused_before_rework(self):
         engine, backend = self.pending_invalid_task_review()
         resumed = self.engine(backend)
         result = resumed.resume(engine.run["id"])

@@ -7,9 +7,9 @@ from unittest.mock import patch
 
 from harness import git
 from harness.recovery import snapshot_digest
-from harness.shared import HookError
+from harness.memory import Memory
 from harness.util import HarnessError, read_json, write_json
-from test_harness import RepoCase, ROOT
+from test_harness import RepoCase, ROOT, crash_after_save
 from test_runtime_changes import ScriptedBackend, finding, revised, trigger_kind
 
 
@@ -35,10 +35,17 @@ class EngineRepairsTests(RepoCase):
     def plan(self):
         return read_json(ROOT / "examples" / "plan.json")
 
-    def pre_accept_gate(self, engine, marker):
-        engine.hooks.spec = {"pre_accept": [{"argv": [sys.executable, "-c",
-            "import pathlib,sys; print('checking acceptance policy'); "
-            "sys.exit(0 if pathlib.Path(sys.argv[1]).exists() else 7)", str(marker)]}]}
+    def stop_at_acceptance(self, backend):
+        """The controller dies right after the approval is saved as pending_acceptance."""
+        engine = self.engine(backend)
+        crash, state = crash_after_save(engine, lambda run: "pending_acceptance" in run)
+        with crash, self.assertRaises(KeyboardInterrupt):
+            engine.start("Implement greet", self.plan())
+        self.assertTrue(state["fired"])
+        saved = read_json(engine.directory / "state.json")
+        self.assertIn("pending_acceptance", saved)
+        self.assertEqual(saved["accepted"], {})
+        return engine
 
     def test_invalid_worker_output_gets_a_fresh_dispatch_with_the_same_model_and_budget(self):
         def malformed(backend, kwargs, packet, result):
@@ -204,44 +211,23 @@ class EngineRepairsTests(RepoCase):
             if request["role"] == "reviewer":
                 self.assertNotIn(worker_claim, request["prompt"])
 
-    def test_pre_accept_failure_resumes_same_candidate_without_repeating_agents(self):
+    def test_acceptance_window_resumes_same_candidate_without_repeating_agents(self):
         backend = RecordingBackend()
-        engine = self.engine(backend)
-        marker = engine.state / "acceptance-permitted"
-        self.pre_accept_gate(engine, marker)
-        with self.assertRaises(HookError):
-            engine.start("Implement greet", self.plan())
-        feedback = engine.run["feedback"]["pre_accept"]
-        self.assertEqual(feedback["exit_code"], 7)
-        self.assertIn("checking acceptance policy", Path(feedback["log"]).with_suffix(".stdout").read_text())
-        self.assertTrue(Path(feedback["review_artifact"]).exists())
-        self.assertIn("pending_acceptance", read_json(engine.directory / "state.json"))
-        self.assertEqual(engine.run["accepted"], {})
-        marker.touch()
-        resumed = self.engine(backend)
-        self.pre_accept_gate(resumed, marker)
-        result = resumed.resume(engine.run["id"])
+        engine = self.stop_at_acceptance(backend)
+        result = self.engine(backend).resume(engine.run["id"])
         self.assertEqual(result["status"], "completed")
         self.assertEqual(sum(call["role"] == "worker" for call in backend.calls), 1)
         self.assertEqual(sum(call["kind"] == "review" for call in backend.calls), 1)
         self.assertEqual(sum(result["attempts"].values()), 1)
         self.assertEqual(sum(d["role"] == "verification" and d["task_id"] == "greet" for d in result["dispatches"]), 1)
         self.assertNotIn("pending_acceptance", result)
-        self.assertTrue((engine.directory / "hooks/greet-1/pre_accept-2/hook-pre_accept-0.stdout").exists())
 
     def test_changed_pending_candidate_requires_new_validation_and_review(self):
         backend = RecordingBackend()
-        engine = self.engine(backend)
-        marker = engine.state / "acceptance-permitted"
-        self.pre_accept_gate(engine, marker)
-        with self.assertRaises(HookError):
-            engine.start("Implement greet", self.plan())
+        engine = self.stop_at_acceptance(backend)
         with (engine.worktree / "hello.py").open("a") as file:
-            file.write("# change after rejected acceptance hook\n")
-        marker.touch()
-        resumed = self.engine(backend)
-        self.pre_accept_gate(resumed, marker)
-        result = resumed.resume(engine.run["id"])
+            file.write("# change while acceptance was pending\n")
+        result = self.engine(backend).resume(engine.run["id"])
         self.assertEqual(result["status"], "completed")
         workers = [call for call in backend.calls if call["role"] == "worker"]
         self.assertEqual(len(workers), 2)
@@ -376,6 +362,29 @@ class EngineRepairsTests(RepoCase):
         handoff = read_json(engine.directory / "handoff.json")
         self.assertEqual(handoff["final_history"], result["final_history"])
 
+    def test_candidate_change_during_acceptance_prechecks_invalidates_the_approval(self):
+        backend = RecordingBackend()
+        engine = self.engine(backend)
+        validate = Memory.validate_record
+        changed = []
+
+        def change_after_precheck(*args, **kwargs):
+            # An outside edit while acceptance runs its record precheck.
+            result = validate(*args, **kwargs)
+            if not changed and "pending_acceptance" in engine.run:
+                changed.append(True)
+                with (engine.worktree / "hello.py").open("a") as stream:
+                    stream.write("# changed during acceptance prechecks\n")
+            return result
+        with patch.object(Memory, "validate_record", side_effect=change_after_precheck):
+            result = engine.start("Implement greet", self.plan())
+        self.assertTrue(changed)
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["review_history"]["greet"][0].get("status"), "invalidated")
+        self.assertEqual(sum(call["role"] == "worker" for call in backend.calls), 2)
+        self.assertEqual(sum(call["kind"] == "review" for call in backend.calls), 2)
+        committed = git.git(engine.worktree, "show", result["accepted"]["greet"]["commit"] + ":hello.py")
+        self.assertNotIn("changed during acceptance prechecks", committed)
 
 
 if __name__ == "__main__":
