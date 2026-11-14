@@ -57,9 +57,10 @@ class DecisionContextTests(RepoCase):
             self.assertEqual(Path(path).read_bytes(), raw)
         reports = [read_json(p) for p in (engine.directory / 'dispatches').glob('*/context-report.json')]
         self.assertTrue(reports)
-        # The decide prompt carries the whole plan and every decision: 34.7K in the
-        # eight-decision case (the dispatch prompt it replaced was 25.7K).
-        self.assertTrue(all(r['used_chars'] <= 36000 for r in reports))
+        # The decide prompt carries the whole plan and every decision: 36.5K in the
+        # eight-decision case with the append-only update fields and the scope boundary
+        # (the dispatch prompt it replaced was 25.7K).
+        self.assertTrue(all(r['used_chars'] <= 37000 for r in reports))
 
     def test_four_full_length_answers_fit_complete_engine_prompts(self):
         self.exercise(4, 4000)
@@ -79,10 +80,10 @@ class DecisionIndexTests(unittest.TestCase):
         engine = self.engine
         before = engine.decision_packet({}, task_id='one')['operator_decision_index']
         raw = Path(before['artifact']).read_bytes()
-        engine.record_operator_decision(engine.prepare_operator_decision(engine.response(self.request, 'stop')))
+        engine.commit_resume_inputs([engine.prepare_operator_decision(engine.response(self.request, 'stop'))])
         stopped = engine.decision_packet({}, task_id='one')
         self.assertEqual(stopped['operator_decisions'][0]['response']['decision'], 'stop')
-        engine.record_operator_decision(engine.prepare_operator_decision(engine.response(self.request)))
+        engine.commit_resume_inputs([engine.prepare_operator_decision(engine.response(self.request))])
         packet = engine.decision_packet({}, task_id='one')
         index = read_json(Path(packet['operator_decision_index']['artifact']))
         self.assertEqual([r['decision'] for r in index['responses']], ['stop', 'continue'])
@@ -92,8 +93,8 @@ class DecisionIndexTests(unittest.TestCase):
 
     def test_unselected_source_and_superseded_response_tamper_fail_closed(self):
         engine = self.engine
-        engine.record_operator_decision(engine.prepare_operator_decision(engine.response(self.request, 'stop')))
-        engine.record_operator_decision(engine.prepare_operator_decision(engine.response(self.request)))
+        engine.commit_resume_inputs([engine.prepare_operator_decision(engine.response(self.request, 'stop'))])
+        engine.commit_resume_inputs([engine.prepare_operator_decision(engine.response(self.request))])
         for path in (engine.source['artifact'], engine.context.run['operator_decisions'][0]['artifact']):
             original = Path(path).read_bytes()
             Path(path).write_text('{}')

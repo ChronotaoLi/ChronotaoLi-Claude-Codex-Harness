@@ -145,7 +145,7 @@ class RecoveryProjectionTests(RepoCase):
                 revised(result, packet, "Clarify implementation details", selected="greet",
                         instruction="Clarify implementation details before retrying",
                         updates=[{"id": "greet", "description": "Implement and independently verify the greeting",
-                                  "add_depends_on": []}])
+                                  "add_depends_on": [], "add_allowed_paths": [], "add_required_commands": []}])
 
         backend = RecordingBackend(change)
         backend.before_result = interrupt

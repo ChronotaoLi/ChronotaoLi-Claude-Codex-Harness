@@ -33,7 +33,7 @@ class CommanderAskDecisionTests(RepoCase):
                     decided(result, 'ask', reason=reason)
                 elif target == 'greet':
                     revised(result, packet, 'Use the clarified approach',
-                            updates=[dict(id='greet', description='Implement using the clarified approach', add_depends_on=[])])
+                            updates=[dict(id='greet', description='Implement using the clarified approach', add_depends_on=[], add_allowed_paths=[], add_required_commands=[])])
                 else:
                     task = copy.deepcopy(packet['original_tasks'][0])
                     task.update(id='correct', depends_on=['greet'])
@@ -93,12 +93,12 @@ class CommanderAskDecisionTests(RepoCase):
         engine, backend = self.asked()
         before = self.saved(engine)
         resumed = self.engine(backend)
-        record = resumed.services.decisions.record_operator_decisions
+        record = resumed.services.decisions.commit_resume_inputs
 
-        def record_then_interrupt(records):
-            record(records)
+        def record_then_interrupt(records, **kwargs):
+            record(records, **kwargs)
             raise KeyboardInterrupt()
-        with patch.object(resumed.services.decisions, 'record_operator_decisions', side_effect=record_then_interrupt):
+        with patch.object(resumed.services.decisions, 'commit_resume_inputs', side_effect=record_then_interrupt):
             with self.assertRaises(KeyboardInterrupt):
                 resumed.resume(engine.run['id'], operator_decision=self.answer(before['decision_requests'][0]))
         interrupted = self.saved(engine)

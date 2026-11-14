@@ -323,7 +323,7 @@ class EngineRepairsTests(RepoCase):
                 prerequisite = copy.deepcopy(self.plan()["tasks"][0])
                 prerequisite.update(id="prerequisite", title="Resolve prerequisite")
                 revised(result, packet, "Resolve prerequisite work", new_tasks=[prerequisite], selected="prerequisite", updates=[{
-                    "id": "greet", "description": "Implement after prerequisite", "add_depends_on": ["prerequisite"]}])
+                    "id": "greet", "description": "Implement after prerequisite", "add_depends_on": ["prerequisite"], "add_allowed_paths": [], "add_required_commands": []}])
         backend = RecordingBackend(replan)
         engine = self.engine(backend)
         def fail_archive(repo, expected_head, archive, owned_root, **kwargs):

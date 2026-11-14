@@ -42,7 +42,7 @@ def revise(reason="refine", selected="", instruction="", new_tasks=(), updates=(
 
 
 def describe(tid, text=None, deps=()):
-    return {"id": tid, "description": text or f"Produce {tid}.txt (refined)", "add_depends_on": list(deps)}
+    return {"id": tid, "description": text or f"Produce {tid}.txt (refined)", "add_depends_on": list(deps), "add_allowed_paths": [], "add_required_commands": []}
 
 
 def blocked_by_task(feedback):
@@ -383,10 +383,13 @@ class AskTests(DecideCase):
             engine.start("plan it", pause_after_plan=True)
         run = self.state(engine)
         self.assertEqual((run["tasks"], run["original_tasks"], run["plan_history"]), ([], [], []))
-        # Approving a plan does not answer the question that precedes it.
-        with self.assertRaisesRegex(HarnessError, "等待操作者决定"):
+        # Approving a plan does not answer the question that precedes it: no plan is published yet,
+        # so the approval is refused before any write and without a model call.
+        raw, calls = (engine.directory / "state.json").read_bytes(), len(script.of("commander", "decide"))
+        with self.assertRaisesRegex(HarnessError, "首版计划尚未发布") as caught:
             self.engine(script).resume(run["id"], approve_plan=True)
-        self.assertFalse(self.state(engine)["plan_approved"])
+        self.assertEqual((caught.exception.stop["kind"], caught.exception.stop["reason"]), ("invalid_input", "plan_unpublished"))
+        self.assertEqual(((engine.directory / "state.json").read_bytes(), len(script.of("commander", "decide"))), (raw, calls))
         paused = self.engine(script).resume(run["id"], operator_decision=[self.answer(run)])
         self.assertEqual(paused["status"], "awaiting_approval")
         self.assertNotIn("pending_directive", paused)
@@ -570,7 +573,7 @@ class LedgerLinkTests(DecideCase):
             with self.subTest(case=name):
                 self.assert_load_rejects(engine, {**copy.deepcopy(saved), **change})
 
-    def test_redo_link_cannot_name_an_out_of_scope_stop(self):
+    def test_redo_link_cannot_name_a_held_proposal(self):
         def decide(script, trigger, packet):
             if trigger["kind"] == "task" and blocked_by_task(trigger["feedback"]):
                 return revise(selected="z", instruction="do z", new_tasks=[task("z")],
@@ -578,13 +581,13 @@ class LedgerLinkTests(DecideCase):
             return None
         script = Script(decide, block_first("a"))
         engine = self.engine(script)
-        with self.assertRaisesRegex(HarnessError, "越出已批准的文件范围"):
+        with self.assertRaisesRegex(HarnessError, "无法证明"):
             engine.start("scope", {"tasks": [task("a")]})
         saved = self.state(engine)
-        stop = self.commander_entries(saved)[-1]
-        self.assertEqual(stop["out_of_scope_paths"], ["z.txt"])
-        redo = {**copy.deepcopy(stop), "id": "fabricated-redo", "retry_of": stop["id"], "status": "completed"}
-        redo.pop("out_of_scope_paths")
+        held = self.commander_entries(saved)[-1]
+        self.assertEqual((held["status"], saved["stop"]["data"]["gaps"]), ("completed", {"z": ["z.txt"]}))
+        # A held proposal was judged valid: no redo may name it.
+        redo = {**copy.deepcopy(held), "id": "fabricated-redo", "retry_of": held["id"], "status": "completed"}
         state = copy.deepcopy(saved)
         state["dispatches"].append(redo)
         self.assert_load_rejects(engine, state)

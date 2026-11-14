@@ -31,22 +31,22 @@ class RejectionCLITests(unittest.TestCase):
         return code, engine, stdout.getvalue(), stderr.getvalue()
 
     def test_rejection_argument_routes_path_and_ordinary_resume_omits_it(self):
-        code, engine, _, _ = self.invoke(['--reject-continuation', 'input.json'])
+        code, engine, _, _ = self.invoke(['--reject-request', 'input.json'])
         self.assertEqual(code, 0)
-        self.assertEqual(engine.resume.call_args.kwargs['reject_continuation'], Path('input.json'))
+        self.assertEqual(engine.resume.call_args.kwargs['reject_request'], Path('input.json'))
         code, engine, _, _ = self.invoke([])
         self.assertEqual(code, 0)
-        self.assertNotIn('reject_continuation', engine.resume.call_args.kwargs)
+        self.assertNotIn('reject_request', engine.resume.call_args.kwargs)
 
     def test_file_input_error_text_is_not_copied_to_operation_record(self):
         secret = 'private operator reason and candidate contents'
-        code, engine, _, _ = self.invoke(['--reject-continuation', 'private.json'], HarnessError(secret))
+        code, engine, _, _ = self.invoke(['--reject-request', 'private.json'], HarnessError(secret))
         self.assertEqual(code, 1)
         engine.resume.assert_called_once()
         records = list((self.repo / '.harness/operations').glob('*.json'))
         self.assertEqual(len(records), 1)
         record = read_json(records[0])
-        self.assertEqual(record['arguments']['reject_continuation'], 'private.json')
+        self.assertEqual(record['arguments']['reject_request'], 'private.json')
         self.assertEqual((record['stop']['kind'], record['stop']['reason'], record['stop']['exit_code']),
                          ('unclassified', 'untyped_harness_error', 1))
         self.assertNotIn('detail', record['stop'])

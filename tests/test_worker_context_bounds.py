@@ -64,7 +64,7 @@ class BoundedWorkerLifecycleTests(RepoCase):
                 inspected.append("commander")
                 revised(result, packet, "Resolve prerequisite explicitly",
                         updates=[{"id": "greet", "description": "Implement greet after checking prerequisites",
-                                  "add_depends_on": []}])
+                                  "add_depends_on": [], "add_allowed_paths": [], "add_required_commands": []}])
             elif kwargs["role"] == "worker":
                 # The published revision's feedback carries the decision's trigger.
                 self.assert_full_evidence(packet["feedback"]["trigger"]["feedback"]["worker"], blocked)

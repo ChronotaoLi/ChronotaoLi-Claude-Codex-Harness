@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sys
 from copy import deepcopy
 from pathlib import Path
@@ -17,8 +18,10 @@ from . import git, stops
 from .budgets import work_attempts
 from .context import compact_feedback
 from .contracts import apply_revision, DECIDE, validate_decision, validate_plan
+from .receipts import judged_decide, ProposalCapacityHold, ScopeHold, SuppliedPlanHold
 from .recovery import read_bound_result, snapshot_digest, worker_recovery_context
 from .requirements import missing_commands
+from .scope import gaps as scope_gaps, proposal_gaps, proposal_request_id, scope_args, suggestions
 from .services import RuntimeService
 from .shared import skills_catalog
 from .util import dump, HarnessError, strict_json_loads, uid, write_json
@@ -79,53 +82,47 @@ class Planner(RuntimeService):
         receipt = self.context.run["commander_receipts"].get(DECIDE_KEY)
         return bool(receipt and ("artifact_digest" in receipt or Path(receipt["artifact"]).exists()))
 
-    def approve_scope_extensions(self, patterns):
-        """Record explicit operator authority for new tasks of a later decide request."""
-        patterns = list(patterns)
-        for pattern in patterns:
-            if not isinstance(pattern, str):
-                raise HarnessError("额外批准的文件范围必须是字符串", stop=stops.make("invalid_input", "input_schema", data={"option": "--allow-scope"}))
-            git.validate_scope_pattern(pattern)
-        if not patterns:
-            return
-        if self.context.run["status"] in ("completed", "abandoned") or self.decide_returned():
-            raise HarnessError("--allow-scope 仅用于未完成的 run，且不能有已返回、尚未处理的指挥决定；先普通 resume", stop=stops.make("invalid_input", "run_state", data={"status": str(self.context.run.get("status"))}))
-        approved = self.context.run.get("approved_scope", [])
-        added = [pattern for pattern in dict.fromkeys(patterns) if pattern not in approved]
-        if not added:
-            return
-        combined = [*approved, *added]
-        # Audit first: interruption must not leave an unaudited authorization.
-        self.context.event("scope_extension_approved", added_paths=added, approved_scope=combined)
-        self.context.run["approved_scope"] = combined
-        self.context.save()
-
     # ---- the decide request -------------------------------------------------
     def gated_tasks(self):
         return {t["id"] for t in self.context.run["tasks"]
                 if self.services.workflow.task_decision_gate(t["id"]) is not None}
 
-    def capacity_check(self, tasks, original_tasks=None):
-        report = self.services.packets.final_context_capacity(tasks, original_tasks)
-        if report["status"] == "required_overflow":
-            fields = "、".join(f"{row['field']} {row['chars']}" for row in report.get("largest_fields", []))
-            raise HarnessError(f"计划的整体审阅必要上下文 {report['required_chars']} 字符超过预算 "
-                               f"{report['budget_chars']}" + (f"；最大的字段：{fields}" if fields else "")
-                               + "；请减少或合并任务")
-        return report
+    def capacity_report(self, tasks, original_tasks=None):
+        """A running condition (spec-6 2.3.1): the final review's required input under current configuration and records."""
+        return self.services.packets.final_context_capacity(tasks, original_tasks)
+
+    @staticmethod
+    def capacity_error(report):
+        fields = "、".join(f"{row['field']} {row['chars']}" for row in report.get("largest_fields", []))
+        return (f"计划的整体审阅必要上下文 {report['required_chars']} 字符超过预算 {report['budget_chars']}"
+                + (f"；最大的字段：{fields}" if fields else "") + "；请减少或合并任务")
 
     def check_decision(self, payload, request_packet):
-        """Branch rules against the request's own ready list and the current ledger."""
+        """The original's contract against its frozen baseline, and its boundary gaps: (action, proposed, gaps).
+
+        No running condition (capacity) is consulted here; the request's own ready list is the baseline.
+        """
         trigger = request_packet.get("trigger", {}) if isinstance(request_packet, dict) else {}
         return validate_decision(
             payload, tasks=self.context.run["tasks"], accepted=self.context.run["accepted"],
             ready=trigger.get("ready", []), gated=self.gated_tasks(),
-            approved_scope=self.context.run.get("approved_scope", []),
-            validate_tasks=self.validate_tasks,
-            capacity=lambda tasks, original: self.capacity_check(tasks, original))
+            scope=self.context.run["scope"], validate_tasks=self.validate_tasks)
+
+    def decide_landed(self, entry):
+        """Whether this decide landed: its receipt was consumed by a landing save (spec-6 2.7).
+
+        A rejection is not a landing; a held, kept or not yet landed original still has its receipt.
+        """
+        if entry.get("role") != "commander" or entry.get("kind") != "decide" or entry.get("invoked") is not True:
+            return False
+        if entry.get("status") == "invalid_asked":
+            return True
+        receipt = self.context.run["commander_receipts"].get(DECIDE_KEY) or {}
+        return (entry.get("status") == "completed" and "proposal_rejection" not in entry
+                and receipt.get("dispatch_id") != entry.get("id"))
 
     def operator_answer(self):
-        """The latest continue answer to a commander question, until a decide lands."""
+        """The latest continue answer to a commander question, until a decide actually lands."""
         dispatches = self.context.run["dispatches"]
         for request in reversed(self.services.decisions.decision_context()):
             if request["kind"] != "commander":
@@ -133,9 +130,7 @@ class Planner(RuntimeService):
             response = request["response"]
             if not response or response["decision"] != "continue":
                 return None
-            if any(d.get("role") == "commander" and d.get("kind") == "decide"
-                   and d.get("status") in ("completed", "invalid_asked")
-                   for d in dispatches[response["dispatch_count"]:]):
+            if any(self.decide_landed(d) for d in dispatches[response["dispatch_count"]:]):
                 return None
             return {"request_id": request["id"], "task_id": request["task_id"], "question": request["question"],
                     "decision": response["decision"], "summary": response["summary"],
@@ -156,14 +151,162 @@ class Planner(RuntimeService):
         packet = {"goal": run["goal"], "trigger": deepcopy(trigger),
                   "accepted": self.services.packets.accepted_context(),
                   "attempts": deepcopy(run["attempts"]), "work_attempts": work_attempts(run),
-                  "approved_scope": deepcopy(run.get("approved_scope", [])),
+                  "scope": deepcopy(run["scope"]),
                   "tool_constraints": self.services.packets.tool_constraints()}
         if run["tasks"]:
             packet.update(self.services.packets.plan_context())
         answer = self.operator_answer()
         if answer:
             packet["operator_answer"] = answer
+        rejected = self.rejected_revision()
+        if rejected:
+            packet["rejected_revision"] = rejected
         return packet
+
+    def rejected_revision(self):
+        """The latest rejected proposal, shown until a later decide actually lands (spec-6 2.5.1)."""
+        last = None
+        for entry in self.context.run["dispatches"]:
+            if "proposal_rejection" in entry:
+                last = entry
+            elif last is not None and self.decide_landed(entry):
+                last = None
+        if last is None:
+            return None
+        reference = last["proposal_rejection"]
+        with stops.evidence_reads(source={"artifact": reference["artifact"], "dispatch_id": last["id"]}):
+            record, _ = read_bound_result(reference, "提案拒绝")
+            source = record.get("source") if isinstance(record, dict) else None
+            if (not isinstance(source, dict) or source.get("dispatch_id") != last["id"]
+                    or record.get("run_id") != self.context.run["id"]):
+                raise HarnessError("提案拒绝文件与派发条目不符；保留现场")
+        return {"request_id": record["request_id"], "kind": record["kind"], "dispatch_id": last["id"],
+                "artifact": source["artifact"], "artifact_digest": source["artifact_digest"],
+                "reason": record["reason"], "rejection_artifact": reference["artifact"],
+                "rejection_artifact_digest": reference["artifact_digest"]}
+
+    # ---- a judged proposal that cannot land now (spec-6 2.3) -------------------
+    def hold_stop(self, receipt, payload, gaps, proposed):
+        """The stop of a judged original missing only scope; reads nothing, writes nothing."""
+        run = self.context.run
+        initial = not run["tasks"]
+        request_id = proposal_request_id(run, receipt)
+        entries, widened = suggestions(gaps)
+        missing = missing_commands(proposed, run["accepted"], self.context.config.data)
+        data = {"suggested_scope": entries, "gaps": gaps, "missing_commands": missing,
+                "scope": list(run["scope"]), "widened": widened}
+        if missing:
+            data["config_key"] = "permissions.worker_commands"
+        if not initial:
+            data["selected_task"] = payload["selected_task"]
+        stop = stops.make("scope_extension", "initial_plan" if initial else "revision", data=data,
+                          source={"request_id": request_id, "dispatch_id": receipt["dispatch_id"],
+                                  "artifact": receipt["artifact"], "artifact_digest": receipt["artifact_digest"]})
+        label = "首版计划" if initial else "修订"
+        return ScopeHold(f"指挥{label}有模式无法证明在范围边界内（当前规则无法证明包含）："
+                         + json.dumps(gaps, ensure_ascii=False) + "；提案已持有，未调用模型。核对后扩大边界："
+                         + f"resume RUN {scope_args(entries)}（建议条目可能比缺口宽，见 widened），"
+                         + f"或拒绝：resume RUN --reject-request FILE（request_id={request_id}）；完整缺口见 status RUN",
+                         stop=stop)
+
+    def capacity_hold(self, receipt, report):
+        """The stop of a judged original over the final review's capacity on a replay; the original is kept."""
+        request_id = proposal_request_id(self.context.run, receipt)
+        stop = stops.make("budget", "proposal_capacity",
+                          data={"config_key": "runtime.context_chars", "required_chars": report["required_chars"],
+                                "budget_chars": report["budget_chars"]},
+                          source={"request_id": request_id, "dispatch_id": receipt["dispatch_id"],
+                                  "artifact": receipt["artifact"], "artifact_digest": receipt["artifact_digest"]})
+        return ProposalCapacityHold(self.capacity_error(report) + f"；已判定合格的提案保留（request_id={request_id}），"
+                                    "未调用模型；提高 runtime.context_chars 后普通 resume，或 resume RUN --reject-request FILE",
+                                    stop=stop)
+
+    def returned_proposal(self):
+        """The returned, judged, unlanded revise original: (receipt, payload, request_id, gaps), or None.
+
+        Read-only: the original is read by its bound digest and its gaps are computed by
+        pure functions; nothing else is read or written (status and the rejection preflight).
+        """
+        run = self.context.run
+        receipt = run["commander_receipts"].get(DECIDE_KEY)
+        if receipt is None or "artifact_digest" not in receipt:
+            return None
+        entry = next((d for d in run["dispatches"] if d.get("id") == receipt["dispatch_id"]), None)
+        if entry is None or not judged_decide(entry) or "proposal_rejection" in entry:
+            return None
+        result, _ = read_bound_result(receipt, "指挥")
+        if not isinstance(result, dict) or result.get("action") != "revise":
+            return None
+        payload = {k: v for k, v in result.items() if k not in ("task_id", "dispatch_id")}
+        with stops.classify("runtime_failure", "invariant"):
+            gaps = proposal_gaps(run, payload)
+        return receipt, payload, proposal_request_id(run, receipt), gaps
+
+    def prepare_proposal_rejection(self, value):
+        """Every check of a proposal rejection, before any write (resume step 9); returns what to publish."""
+        run = self.context.run
+        found = self.returned_proposal()
+        if found is None or found[2] != value["request_id"]:
+            raise HarnessError("拒绝的 request_id 不是已判定合格、尚未落地的指挥提案；用 status RUN 核对",
+                               stop=stops.make("invalid_input", "stale_request", data={"option": "--reject-request"},
+                                               source={"request_id": value["request_id"]}))
+        receipt, payload, request_id, gaps = found
+        if self.services.receipts.candidate_changed(receipt):
+            raise HarnessError("指挥提案绑定的候选或 HEAD 已改变；恢复原状后再拒绝",
+                               stop=stops.make("workspace_mismatch", "candidate_changed",
+                                               source={"dispatch_id": receipt["dispatch_id"]}))
+        # A plan file written for this proposal before an interruption: the only way to tell it is
+        # this proposal's own is to rebuild its bytes from the original and the frozen baseline.
+        orphan = self.context.directory / "plans" / f"revision-{len(run['plan_history'])}.json"
+        prewritten = None
+        if orphan.exists() or orphan.is_symlink():
+            with stops.classify("runtime_failure", "invariant"):
+                expected = (dump(self.plan_content(receipt, payload)) + "\n").encode("utf-8")
+            with stops.evidence_reads(source={"artifact": str(orphan)}):
+                if orphan.is_symlink() or orphan.read_bytes() != expected:
+                    raise HarnessError("未登记的计划文件不是被拒提案的预写文件；保留现场")
+            prewritten = {"artifact": str(orphan), "artifact_digest": hashlib.sha256(expected).hexdigest()}
+        record = {"run_id": run["id"], "request_id": request_id, "kind": "revision" if run["tasks"] else "initial_plan",
+                  "reason": value["reason"], "gaps": gaps, "source": self.source(receipt),
+                  "base_revision": len(run["plan_history"]) - 1, "snapshot_digest": receipt["snapshot_digest"]}
+        return {"record": record, "prewritten": prewritten}
+
+    def record_proposal_rejection(self, prepared):
+        """Publish a prepared rejection: its file, the archive of the proposal's plan file, then one save."""
+        run = self.context.run
+        record = prepared["record"]
+        raw = (dump(record) + "\n").encode("utf-8")
+        digest = hashlib.sha256(raw).hexdigest()
+        artifact = self.context.directory / "proposal-rejections" / f"{digest}.json"
+        if not artifact.exists() and not artifact.is_symlink():
+            write_json(artifact, record)
+        with stops.evidence_reads(source={"artifact": str(artifact)}):
+            if artifact.is_symlink() or artifact.read_bytes() != raw:
+                raise HarnessError("提案拒绝文件内容不符；保留现场")
+        prewritten = prepared["prewritten"]
+        if prewritten is not None:
+            # The bytes the preflight attributed to this proposal, read again right before the rename.
+            orphan = Path(prewritten["artifact"])
+            with stops.evidence_reads(source={"artifact": str(orphan)}):
+                if orphan.is_symlink() or hashlib.sha256(orphan.read_bytes()).hexdigest() != prewritten["artifact_digest"]:
+                    raise HarnessError("未登记的计划文件在拒绝预检之后改变；保留现场")
+            target = self.context.directory / "plans" / "rejected" / f"{prewritten['artifact_digest']}.json"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(orphan, target)
+            self.context.observe("proposal_plan_archived", artifact=str(target),
+                                 revision=len(run["plan_history"]), request_id=record["request_id"])
+        receipts = run["commander_receipts"]
+        entry = next(d for d in run["dispatches"] if d.get("id") == receipts[DECIDE_KEY]["dispatch_id"])
+        entry["proposal_rejection"] = {"artifact": str(artifact), "artifact_digest": digest}
+        run["commander_receipts"] = {key: value for key, value in receipts.items() if key != DECIDE_KEY}
+        try:
+            self.context.save()
+        except BaseException:
+            run["commander_receipts"] = receipts
+            entry.pop("proposal_rejection", None)
+            raise
+        self.context.observe("proposal_rejected", request_id=record["request_id"], dispatch_id=entry["id"],
+                             artifact=str(artifact))
 
     def decide(self, trigger):
         """One commander call; its result lands as a directive, a revision or a question."""
@@ -265,15 +408,54 @@ class Planner(RuntimeService):
             raise HarnessError(f"{label}与台账引用不符；保留现场")
         return content
 
+    @staticmethod
+    def first_plan(tasks, reason, source):
+        return {"revision": 0, "reason": reason, "tasks": tasks, "source": source}
+
+    def plan_content(self, receipt, payload):
+        """The plan file a returned revise original publishes, rebuilt from it and the frozen baseline.
+
+        Landing writes exactly these bytes, and a rejection recognizes a plan file written
+        before an interruption by them (spec-6 2.5).
+        """
+        run = self.context.run
+        if not run["tasks"]:
+            return self.first_plan(self.validate_tasks({"tasks": payload["new_tasks"]}), payload["reason"],
+                                   self.source(receipt))
+        tasks = apply_revision(run["tasks"], payload, run["accepted"], scope=run["scope"], gaps={})
+        directive = {"selected_task": payload["selected_task"], "action": "implement",
+                     "instruction": payload["instruction"]}
+        revision = len(run["plan_history"])
+        return {"revision": revision, "reason": payload["reason"], "trigger": receipt["request"]["packet"].get("trigger"),
+                "tasks": tasks, "source": self.source(receipt), "head": run["expected_head"],
+                "snapshot_digest": receipt["snapshot_digest"],
+                "candidate": "retain" if self.retained(tasks, directive) else "archive", "directive": directive}
+
     def land_initial_plan(self, decision):
         receipt = self.context.run["commander_receipts"][DECIDE_KEY]
-        tasks = self.validate_tasks({"tasks": decision.payload["new_tasks"]})
-        return self.record_plan(tasks, decision.payload["reason"], source=self.source(receipt))
+        content = self.plan_content(receipt, decision.payload)
+        return self.record_plan(content["tasks"], content["reason"], source=content["source"])
 
     def record_plan(self, tasks, reason, *, source=None):
-        """Publish the first plan: the file first, then original_tasks, tasks and history together."""
+        """Publish the first plan: the boundary first, then the file, then original_tasks, tasks and history together.
+
+        Both first plans pass here: a model's (``source``) and a supplied one (``source`` None), so a
+        supplied plan published on resume is checked against the boundary declared since its start.
+        """
         run = self.context.run
-        reference = self.write_plan(0, {"revision": 0, "reason": reason, "tasks": tasks, "source": source})
+        missing = scope_gaps({t["id"]: t["allowed_paths"] for t in tasks}, run["scope"]) if run["scope"] else {}
+        if missing:
+            if source is not None:
+                raise HarnessError("首版发布前的边界复核失败：判定刚放行的原件越出范围边界；保留现场",
+                                   stop=stops.make("runtime_failure", "invariant"))
+            entries, widened = suggestions(missing)
+            raise SuppliedPlanHold(
+                "供给的首版计划越出范围边界（当前规则无法证明包含）：" + json.dumps(missing, ensure_ascii=False)
+                + f"；未发布、未调用模型；扩大边界 resume RUN {scope_args(entries)}，或 abandon RUN",
+                stop=stops.make("scope_extension", "supplied_plan",
+                                data={"suggested_scope": entries, "gaps": missing, "scope": list(run["scope"]),
+                                      "widened": widened}))
+        reference = self.write_plan(0, self.first_plan(tasks, reason, source))
         run["original_tasks"] = deepcopy(tasks)
         run["tasks"] = deepcopy(tasks)
         run["plan_history"] = [reference]
@@ -296,15 +478,16 @@ class Planner(RuntimeService):
                   + json.dumps(broad, ensure_ascii=True), file=sys.stderr, flush=True)
 
     def description_revision_task(self, previous, tasks, current):
-        """Recognize only an actual description change to the current task."""
+        """Recognize a change to the current task's description, scope or commands only (all append-only but the first)."""
         if not current or current in self.context.run["accepted"] or len(previous) != len(tasks):
             return None
         changed = []
+        mutable = ("description", "allowed_paths", "required_commands")
         for old, new in zip(previous, tasks):
             if old != new:
                 if (old["id"] != current or new.get("id") != current
-                        or {k: v for k, v in old.items() if k != "description"}
-                        != {k: v for k, v in new.items() if k != "description"}):
+                        or {k: v for k, v in old.items() if k not in mutable}
+                        != {k: v for k, v in new.items() if k not in mutable}):
                     return None
                 changed.append(new)
         return changed[0] if len(changed) == 1 else None
@@ -317,16 +500,8 @@ class Planner(RuntimeService):
     def land_revision(self, decision):
         run = self.context.run
         receipt = run["commander_receipts"][DECIDE_KEY]
-        payload = decision.payload
-        tasks = decision.proposed
-        directive = {"selected_task": payload["selected_task"], "action": "implement",
-                     "instruction": payload["instruction"]}
-        revision = len(run["plan_history"])
-        reference = self.write_plan(revision, {
-            "revision": revision, "reason": payload["reason"], "trigger": receipt["request"]["packet"].get("trigger"),
-            "tasks": tasks, "source": self.source(receipt), "head": run["expected_head"],
-            "snapshot_digest": receipt["snapshot_digest"],
-            "candidate": "retain" if self.retained(tasks, directive) else "archive", "directive": directive})
+        content = self.plan_content(receipt, decision.payload)
+        reference = self.write_plan(content["revision"], content)
         run["pending_revision"] = reference
         run["commander_receipts"].pop(DECIDE_KEY)
         self.context.save()
@@ -352,8 +527,8 @@ class Planner(RuntimeService):
         if (not isinstance(result, dict) or result.get("task_id") != "run"
                 or result.get("dispatch_id") != source["dispatch_id"] or result.get("action") != "revise"):
             raise HarnessError("待应用修订的原件不是这次修订；保留现场")
-        tasks = apply_revision(run["tasks"], result, run["accepted"],
-                               additional_allowed_paths=run.get("approved_scope", []), scope_violations=[])
+        # The boundary only grows: a revision admitted inside it is still inside (spec-6 2.6).
+        tasks = apply_revision(run["tasks"], result, run["accepted"], scope=run["scope"])
         directive = {"selected_task": result.get("selected_task"), "action": "implement",
                      "instruction": result.get("instruction")}
         if (content.get("tasks") != tasks or content.get("directive") != directive

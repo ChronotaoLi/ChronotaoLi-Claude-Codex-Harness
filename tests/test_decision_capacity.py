@@ -29,7 +29,7 @@ class DecisionCapacityTests(RepoCase):
             engine.start('Implement greet', read_json(ROOT / 'examples' / 'plan.json'))
         before = engine.services.packets.final_context_capacity()
         path = self.answer(engine)
-        engine.services.decisions.record_operator_decision(engine.services.decisions.prepare_operator_decision(path))
+        engine.services.decisions.commit_resume_inputs([engine.services.decisions.prepare_operator_decision(path)])
         after = engine.services.packets.final_context_capacity()
         self.assertEqual(after['required_chars'], before['required_chars'])
         self.assertGreater(after['projected_chars'], before['projected_chars'])

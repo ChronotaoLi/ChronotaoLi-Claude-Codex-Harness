@@ -200,11 +200,8 @@ class LedgerReferenceTests(RepoCase):
         engine, backend, _ = waiting(self)
         original = engine.run['continuation_history'][-1]
         path = self.repo / 'rejection.json'
-        write_json(path, {'continuation_id': original['id'], 'task_id': 'greet',
-                          'source_dispatch_id': original['source']['dispatch_id'],
-                          'source_snapshot_digest': original['snapshot_digest'],
-                          'reason': 'Complete with another approach.'})
-        result = self.engine(backend).resume(engine.run['id'], reject_continuation=path)
+        write_json(path, {'request_id': original['id'], 'reason': 'Complete with another approach.'})
+        result = self.engine(backend).resume(engine.run['id'], reject_request=path)
         self.assertEqual(result['status'], 'completed')
         rejection = result['continuation_rejections'][0]
         artifact = self.assert_projection(rejection, 'continuation-rejections')
@@ -249,10 +246,8 @@ class LedgerReferenceTests(RepoCase):
                                  'source_snapshot_digest': row['snapshot_digest'], 'summary': 'Keep the retained candidate.'}
                         option = {'execution_guidance': path}
                     else:
-                        value = {'continuation_id': row['id'], 'task_id': 'greet',
-                                 'source_dispatch_id': row['source']['dispatch_id'],
-                                 'source_snapshot_digest': row['snapshot_digest'], 'reason': 'Use another approach.'}
-                        option = {'reject_continuation': path}
+                        value = {'request_id': row['id'], 'reason': 'Use another approach.'}
+                        option = {'reject_request': path}
                     write_json(path, value)
                     key = 'execution_guidance' if category == 'execution-guidance' else 'continuation_rejections'
                     with interrupt_after(category), self.assertRaises(KeyboardInterrupt):

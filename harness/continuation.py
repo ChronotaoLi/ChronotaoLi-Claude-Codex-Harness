@@ -219,7 +219,8 @@ def _read_input(path, keys, text_key, label):
     for key in keys:
         if not isinstance(value[key], str) or not value[key].strip() or '\0' in value[key] or len(value[key]) > (4000 if key == text_key else 120):
             raise HarnessError(f'{label} text invalid')
-    if len(value['source_snapshot_digest']) != 64 or any(c not in '0123456789abcdef' for c in value['source_snapshot_digest']):
+    digest = value.get('source_snapshot_digest')
+    if digest is not None and (len(digest) != 64 or any(c not in '0123456789abcdef' for c in digest)):
         raise HarnessError(f'{label} snapshot digest invalid')
     return value
 
@@ -247,14 +248,12 @@ def _rejections(context, history=None):
         original = originals.get(row.get('continuation_id'))
         value = row.get('input')
         directive = row.get('directive')
-        # Both complete artifacts were checked against their snapshot digests.
+        # Both complete artifacts were checked against their snapshot digests; the task,
+        # source and candidate bindings are the record's own fields, equal to the original's.
         if (original is None or original['id'] in seen
                 or any(row.get(key) != original[key] for key in ('task_id', 'source', 'snapshot_digest'))
-                or not isinstance(value, dict)
-                or set(value) != {'continuation_id', 'task_id', 'source_dispatch_id', 'source_snapshot_digest', 'reason'}
-                or value.get('continuation_id') != original['id'] or value.get('task_id') != row['task_id']
-                or value.get('source_dispatch_id') != row['source']['dispatch_id']
-                or value.get('source_snapshot_digest') != row['snapshot_digest']
+                or not isinstance(value, dict) or set(value) != {'request_id', 'reason'}
+                or value.get('request_id') != original['id']
                 or not isinstance(value.get('reason'), str) or not value['reason'].strip()
                 or len(value['reason']) > 4000 or '\0' in value['reason']
                 or not isinstance(directive, dict) or set(directive) != {'selected_task', 'action', 'instruction'}
@@ -310,46 +309,57 @@ def validate_continuation_rejection(context, current_snapshot=None, worker_task=
     return active
 
 
-@stops.classifies("invalid_input", "input_schema", data={"option": "--reject-continuation"})
-def read_continuation_rejection(path):
-    return _read_input(path, {'continuation_id', 'task_id', 'source_dispatch_id', 'source_snapshot_digest', 'reason'},
-                       'reason', 'continuation rejection')
+REQUEST_PREFIXES = ('proposal', 'continuations')
 
 
-def record_continuation_rejection(context, path, current_snapshot=None, *, value=None):
-    """``value`` is the file resume already read (one read, before any write); else the file is read here."""
-    value = read_continuation_rejection(path) if value is None else value
+@stops.classifies("invalid_input", "input_schema", data={"option": "--reject-request"})
+def read_request_rejection(path):
+    """``{request_id, reason}``: a returned commander proposal (``proposal_``) or the pending continuation."""
+    value = _read_input(path, {'request_id', 'reason'}, 'reason', 'request rejection')
+    prefix, _, digest = value['request_id'].rpartition('_')
+    if prefix not in REQUEST_PREFIXES or len(digest) != 64 or any(c not in '0123456789abcdef' for c in digest):
+        raise HarnessError('request rejection request_id invalid')
+    return value
+
+
+def prepare_continuation_rejection(context, value, current_snapshot=None):
+    """Every check of a continuation rejection, before any write; ``publish_continuation_rejection`` writes it."""
     history = _records(context, 'continuations', 'continuation_history')
     records, active = _rejections(context, history)
     if context.run.get('status') not in ('blocked', 'interrupted', 'paused'):
         raise HarnessError('continuation rejection requires a safe pending task boundary', stop=stops.make('invalid_input', 'run_state', data={'status': context.run.get('status')}))
-    old = next((row for row in records if row['continuation_id'] == value['continuation_id']), None)
+    old = next((row for row in records if row['continuation_id'] == value['request_id']), None)
     if old is not None:
         if old['input'] != value or active is None or active['id'] != old['id']:
-            raise HarnessError('continuation rejection conflicts with prior input or was already consumed', stop=stops.make('invalid_input', 'conflicting_retry', data={'option': '--reject-continuation'}))
+            raise HarnessError('continuation rejection conflicts with prior input or was already consumed', stop=stops.make('invalid_input', 'conflicting_retry', data={'option': '--reject-request'}))
         validate_continuation_rejection(context, current_snapshot)
-        return deepcopy(old)
+        return {'old': deepcopy(old)}
     if active or any(context.run.get(key) for key in RECOVERY_BUSY_KEYS):
         raise HarnessError('continuation rejection requires a safe pending task boundary', stop=stops.make('invalid_input', 'run_state', data={'status': context.run.get('status')}))
     pending = context.run.get('pending_continuation')
     row = next((row for row in history if row['id'] == pending), None)
-    if (row is None or value['continuation_id'] != pending or value['task_id'] != row['task_id']
-            or value['source_dispatch_id'] != row['source']['dispatch_id']
-            or value['source_snapshot_digest'] != row['snapshot_digest']):
-        raise HarnessError('continuation rejection must bind the current request and candidate', stop=stops.make('invalid_input', 'stale_request', data={'option': '--reject-continuation'}))
+    if row is None or value['request_id'] != pending:
+        raise HarnessError('continuation rejection must name the pending continuation request', stop=stops.make('invalid_input', 'stale_request', data={'option': '--reject-request'}, source={'request_id': value['request_id']}))
     # Check identity, source, candidate and dispatch order, without granting its requirements.
     continuation_gate(context, current_snapshot)
     # The complete rejection artifact keeps the original's whole snapshot.
     original = _complete(context, 'continuations', row)
     record = dict(run_id=context.run['id'], sequence=len(records) + 1,
-                  continuation_id=pending, input=value,
+                  continuation_id=pending, input=deepcopy(value),
                   **{key: deepcopy(original[key]) for key in ('task_id', 'source', 'snapshot', 'snapshot_digest')})
     # The directive carries data only: the operator's reason. How to revise a
     # rejected continuation is protocol, stated in the worker skill.
     record['directive'] = {'selected_task': row['task_id'], 'action': 'implement', 'instruction': value['reason']}
-    with stops.classify('invalid_input', 'conflicting_retry', data={'option': '--reject-continuation'}):
-        rejection = _write(context, 'continuation-rejections', record)
-    context.run['continuation_rejections'] = [*records, rejection]
+    return {'record': record, 'records': records}
+
+
+def publish_continuation_rejection(context, prepared):
+    """Write the prepared rejection file, then publish it with the cleared request in one save."""
+    if 'old' in prepared:
+        return prepared['old']
+    with stops.classify('invalid_input', 'conflicting_retry', data={'option': '--reject-request'}):
+        rejection = _write(context, 'continuation-rejections', prepared['record'])
+    context.run['continuation_rejections'] = [*prepared['records'], rejection]
     context.run['pending_continuation'] = None
     context.run['pending_directive'] = _revision_directive(rejection)
     # Publish the resolution and candidate guard together. An orphan immutable file

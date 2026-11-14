@@ -18,7 +18,7 @@ class ContextProjectionLifecycleTests(RepoCase):
                               summary='Retain this candidate and refine its description')
             elif trigger_kind(kwargs, packet) == 'task' and packet['trigger']['feedback']:
                 revised(result, packet, 'Clarify implementation',
-                    updates=[{'id': 'greet', 'description': 'Implement the same greeting with clarified detail', 'add_depends_on': []}])
+                    updates=[{'id': 'greet', 'description': 'Implement the same greeting with clarified detail', 'add_depends_on': [], 'add_allowed_paths': [], 'add_required_commands': []}])
         backend = ScriptedBackend(change)
         engine = self.engine(backend)
         original = PacketBuilder.role_input

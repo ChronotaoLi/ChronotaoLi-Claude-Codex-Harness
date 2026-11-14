@@ -166,7 +166,7 @@ class TaskStageRecoveryTests(RepoCase):
                 task.update(id="prepare", skills=["missing-business-skill"])
                 revised(result, packet, "Add prerequisite", new_tasks=[task], selected="prepare", updates=[{
                     "id": "greet", "description": packet["original_tasks"][0]["description"],
-                    "add_depends_on": ["prepare"]}])
+                    "add_depends_on": ["prepare"], "add_allowed_paths": [], "add_required_commands": []}])
 
         self.config.data["runtime"]["max_agent_dispatches"] = 3
         backend = RecordingBackend(fail_replan)
@@ -204,7 +204,7 @@ class TaskStageRecoveryTests(RepoCase):
                 task.update(id="prepare", skills=["missing-business-skill"])
                 revised(result, packet, "Add prerequisite", new_tasks=[task], selected="prepare", updates=[{
                     "id": "greet", "description": packet["original_tasks"][0]["description"],
-                    "add_depends_on": ["prepare"]}])
+                    "add_depends_on": ["prepare"], "add_allowed_paths": [], "add_required_commands": []}])
 
         self.config.data["runtime"]["max_agent_dispatches"] = 3
         backend = RecordingBackend(unknown_skill)

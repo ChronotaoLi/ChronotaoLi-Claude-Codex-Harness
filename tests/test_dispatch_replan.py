@@ -24,7 +24,7 @@ class DispatchReplanTests(RepoCase):
                 prerequisite = copy.deepcopy(self.plan()["tasks"][0])
                 prerequisite.update(id="prerequisite", title="Resolve prerequisite")
                 revised(result, packet, "Resolve the missing prerequisite first", new_tasks=[prerequisite], selected="prerequisite",
-                        updates=[{"id": "greet", "description": "Implement after prerequisite", "add_depends_on": ["prerequisite"]}])
+                        updates=[{"id": "greet", "description": "Implement after prerequisite", "add_depends_on": ["prerequisite"], "add_allowed_paths": [], "add_required_commands": []}])
         return ScriptedBackend(coordinate)
 
     def test_rejected_task_can_ask_without_another_worker_and_resume_cannot_reroll(self):

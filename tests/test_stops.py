@@ -29,7 +29,7 @@ def notices(stderr):
 
 class RegistryTests(unittest.TestCase):
     def test_registry_shape_and_projection(self):
-        self.assertEqual(len(stops.REGISTRY), 58)
+        self.assertEqual(len(stops.REGISTRY), 64)
         self.assertLessEqual({("plan_approval", "initial_plan"), ("interrupted", "signal"),
                               ("unclassified", "untyped_harness_error"), ("unclassified", "unexpected_exception")},
                              set(stops.REGISTRY))
@@ -52,6 +52,31 @@ class RegistryTests(unittest.TestCase):
         self.assertEqual((projected["title"], projected["exit_code"]), ("计划等待明确批准", 0))
         self.assertEqual(projected["data"], {"revision": 0, "task_count": 2})
         self.assertNotIn("detail", stops.project(value, "run_ab12", omit_detail=True))
+
+    def test_strings_map_drops_bad_values_keeps_heads_and_fits_the_whole_value(self):
+        key = ("scope_extension", "revision")
+        bad = stops.make(*key, data={"gaps": {"not an id!": ["x"]}, "suggested_scope": ["x"]})
+        self.assertEqual((bad["kind"], bad["data"]["dropped_fields"]), ("scope_extension", ["gaps"]))
+        bad = stops.make(*key, data={"gaps": {"t": [1]}})
+        self.assertEqual(bad["data"]["dropped_fields"], ["gaps"])
+        big = {f"t{i}": [f"dir{i}/" + "x" * 300 + f"/{j}" for j in range(20)] for i in range(5)}
+        value = stops.make(*key, data={"gaps": big})
+        kept = value["data"]["gaps"]
+        self.assertLessEqual(len(json.dumps(kept, ensure_ascii=True)), stops.LIST_BYTES)
+        self.assertEqual(sum(map(len, kept.values())) + value["data"]["gaps_omitted"], 100)
+        self.assertEqual(list(kept)[0], "t0")  # task order, then pattern order
+        self.assertEqual(kept["t0"], big["t0"][:len(kept["t0"])])
+        # Five full lists exceed the whole value's limit: the later-listed ones shrink first.
+        full = ["p/" + "y" * 200 + f"/{i}" for i in range(200)]
+        value = stops.make(*key, data={"suggested_scope": full, "gaps": big, "scope": full, "widened": full,
+                                       "missing_commands": {"t0": [["cmd", "z" * 100]] * 20}})
+        error = HarnessError("\u4e2d" * 5000)
+        error.stop = value
+        final = stops.of(error)
+        self.assertEqual((final["kind"], final["reason"]), key)
+        self.assertLessEqual(len(json.dumps(final, ensure_ascii=True)), stops.STOP_LIMIT)
+        self.assertEqual(final["data"]["widened"], [])
+        self.assertGreater(len(final["data"]["suggested_scope"]), 0)
 
     def test_detail_total_length_is_bounded_including_the_note(self):
         for length in (0, 1, 1999, 2000, 2001, 2017, 5000, 200000):

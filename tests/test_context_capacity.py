@@ -19,6 +19,9 @@ def reconstruct(packet):
         if "description" in update:
             by_id[update["id"]]["description"] = update["description"]
         by_id[update["id"]]["depends_on"].extend(update.get("add_depends_on", []))
+        by_id[update["id"]]["allowed_paths"].extend(update.get("add_allowed_paths", []))
+        if update.get("add_required_commands"):
+            by_id[update["id"]].setdefault("required_commands", []).extend(update["add_required_commands"])
     tasks.extend(copy.deepcopy(packet.get("tasks_delta", {}).get("new_tasks", [])))
     return tasks
 
@@ -31,18 +34,28 @@ class PlanCompactionTests(unittest.TestCase):
         current = apply_revision(original, {
             "action": "revise", "reason": "Need prerequisite", "new_tasks": [first],
             "updates": [{"id": "greet", "description": "Implement after preparation",
-                         "add_depends_on": ["prepare"]}],
+                         "add_depends_on": ["prepare"], "add_allowed_paths": [], "add_required_commands": []}],
         }, set())
         second = copy.deepcopy(first)
         second.update(id="document", description="Document integration", depends_on=["greet"])
         current = apply_revision(current, {
             "action": "revise", "reason": "Clarify implementation", "new_tasks": [second],
             "updates": [{"id": "greet", "description": "Implement the complete contract after preparation",
-                         "add_depends_on": []},
-                        {"id": "prepare", "description": "Clarified prerequisite", "add_depends_on": []}],
+                         "add_depends_on": [], "add_allowed_paths": [], "add_required_commands": []},
+                        {"id": "prepare", "description": "Clarified prerequisite", "add_depends_on": [], "add_allowed_paths": [], "add_required_commands": []}],
         }, set())
+        # A third revision appends scope and a prerequisite command to an unaccepted original task.
+        current = apply_revision(current, {
+            "action": "revise", "reason": "Widen greet", "new_tasks": [],
+            "updates": [{"id": "greet", "description": "Implement the complete contract after preparation",
+                         "add_depends_on": [], "add_allowed_paths": ["hello_test.py"],
+                         "add_required_commands": [["python3", "-m", "unittest", "hello_test"]]}],
+        }, set(), scope=["hello_test.py"])
         packet = compact_plan(original, current)
         self.assertEqual(reconstruct(packet), current)
+        self.assertEqual((packet["tasks_delta"]["updates"][0]["add_allowed_paths"],
+                          packet["tasks_delta"]["updates"][0]["add_required_commands"]),
+                         (["hello_test.py"], [["python3", "-m", "unittest", "hello_test"]]))
         self.assertNotIn("tasks", packet)
         self.assertEqual(packet["original_tasks"], original)
         self.assertEqual([task["id"] for task in packet["tasks_delta"]["new_tasks"]], ["prepare", "document"])
@@ -192,9 +205,10 @@ class FinalContextCapacityTests(RepoCase):
         self.assertNotIn(str(engine.directory / "state.json"), dump(packet["accepted"]))
 
     def test_final_review_after_revision_keeps_original_obligations_only_once(self):
-        # The decide prompt carries the 13.5K original plan (34.5K here); the final
-        # prompt (about 29.4K) must fit and the duplicated plan (about 43K) must not.
-        self.config.data["runtime"]["context_chars"] = 36000
+        # The decide prompt carries the 13.5K original plan (about 36.3K here, with the
+        # append-only update fields and the scope boundary); the final prompt (about
+        # 29.4K) must fit and the duplicated plan (about 43K) must not.
+        self.config.data["runtime"]["context_chars"] = 37000
         final_inputs = []
         def corrective(backend, kwargs, packet, result):
             if kwargs["kind"] == "final_review":

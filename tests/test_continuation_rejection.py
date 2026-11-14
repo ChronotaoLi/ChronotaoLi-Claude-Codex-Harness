@@ -42,13 +42,15 @@ class RejectionEvidenceTests(unittest.TestCase):
                        'artifact_digest': hashlib.sha256(source_path.read_bytes()).hexdigest()}
         add_worker_dispatch(self.context.run, self.context.directory, 'worker1', 'task')
         self.row = continuation.record_continuation(self.context, 'task', self.result, self.source, self.candidate)
-        self.value = {'continuation_id': self.row['id'], 'task_id': 'task', 'source_dispatch_id': 'worker1',
-                      'source_snapshot_digest': snapshot_digest(self.candidate), 'reason': 'Use an alternative implementation.'}
+        self.value = {'request_id': self.row['id'], 'reason': 'Use an alternative implementation.'}
         self.path = self.root / 'rejection.json'
         write_json(self.path, self.value)
 
     def reject(self):
-        return continuation.record_continuation_rejection(self.context, self.path)
+        """Read the file once, check, then publish: the order resume follows."""
+        value = continuation.read_request_rejection(self.path)
+        return continuation.publish_continuation_rejection(
+            self.context, continuation.prepare_continuation_rejection(self.context, value))
 
     def test_atomic_permission_neutral_record_and_idempotent_unconsumed_retry(self):
         before, config = deepcopy(self.context.run), deepcopy(self.context.config)
@@ -75,16 +77,21 @@ class RejectionEvidenceTests(unittest.TestCase):
         malformed = ['[]', '{}', '{', json.dumps({**self.value, 'extra': True}),
                      json.dumps({**self.value, 'reason': ' '}), json.dumps({**self.value, 'reason': 'x' * 4001}),
                      json.dumps({**self.value, 'reason': '\0'}),
-                     json.dumps(self.value)[:-1] + ',"reason":"duplicate"}', ' ' * 65537]
-        for key in ('continuation_id', 'task_id', 'source_dispatch_id', 'source_snapshot_digest'):
-            malformed.append(json.dumps({**self.value, key: 'wrong'}))
+                     json.dumps(self.value)[:-1] + ',"reason":"duplicate"}', ' ' * 65537,
+                     json.dumps({**self.value, 'request_id': 'wrong'}),
+                     json.dumps({**self.value, 'request_id': 'request_' + '0' * 64}),
+                     json.dumps({**self.value, 'task_id': 'task'})]
+        cases = [(raw, 'input_schema') for raw in malformed]
+        # A well-formed request ID that is not the pending continuation names a stale request.
+        cases.append((json.dumps({**self.value, 'request_id': 'continuations_' + '0' * 64}), 'stale_request'))
         baseline = deepcopy(self.context.run)
         saves = len(self.saved)
-        for raw in malformed:
+        for raw, reason in cases:
             with self.subTest(raw=raw[:100]):
                 self.path.write_text(raw)
-                with self.assertRaises(HarnessError):
+                with self.assertRaises(HarnessError) as caught:
                     self.reject()
+                self.assertEqual((caught.exception.stop['kind'], caught.exception.stop['reason']), ('invalid_input', reason))
                 self.assertEqual(self.context.run, baseline)
                 self.assertEqual(len(self.saved), saves)
 
@@ -136,7 +143,7 @@ class RejectionEvidenceTests(unittest.TestCase):
 
     def test_status_projects_pending_source_bindings_then_saved_revision(self):
         self.assertEqual(status_summary(self.context.run)['continuation'], {
-            'state': 'awaiting_requirements', 'continuation_id': self.row['id'], 'task_id': 'task',
+            'state': 'awaiting_requirements', 'request_id': self.row['id'], 'task_id': 'task',
             'source_dispatch_id': 'worker1', 'source_snapshot_digest': self.row['snapshot_digest'],
             'request': self.row['request']})
         rejection = self.reject()
@@ -199,9 +206,7 @@ class RejectionLifecycleTests(RepoCase):
             engine.start('Implement greet', plan)
         row = engine.run['continuation_history'][-1]
         path = self.repo / 'rejection.json'
-        write_json(path, {'continuation_id': row['id'], 'task_id': 'greet',
-                         'source_dispatch_id': row['source']['dispatch_id'],
-                         'source_snapshot_digest': row['snapshot_digest'], 'reason': 'Complete with another approach.'})
+        write_json(path, {'request_id': row['id'], 'reason': 'Complete with another approach.'})
         return engine, backend, path, command, new_command
 
     def test_rejection_fresh_worker_new_request_requires_new_exact_grant_and_all_gates(self):
@@ -210,7 +215,7 @@ class RejectionLifecycleTests(RepoCase):
         with self.assertRaises(HarnessError):
             self.engine(backend).resume(engine.run['id'])
         self.assertEqual(len(backend.calls), calls)
-        # The second listed exit: resume RUN --reject-continuation FILE; the fresh worker asks again.
+        # The second listed exit: resume RUN --reject-request FILE; the fresh worker asks again.
         rejected = walk_exit(self, engine.directory, ('continuation', 'commands_required'), backend=backend, choose=1,
                              fill={'FILE': path}, expect_code=3, expect_status='blocked')
         self.assertEqual(rejected['attempts']['greet'], 2)
@@ -247,7 +252,7 @@ class RejectionLifecycleTests(RepoCase):
             return original(target, value)
         with patch.object(worker_receipts_module, 'write_json', fail), \
                 self.assertRaisesRegex(HarnessError, 'no budget was charged'):
-            resumed.resume(engine.run['id'], reject_continuation=path)
+            resumed.resume(engine.run['id'], reject_request=path)
         saved = read_json(engine.directory / 'state.json')
         self.assertIsNone(saved['pending_continuation'])
         self.assertEqual(len(saved['continuation_rejections']), 1)
@@ -272,7 +277,7 @@ class RejectionLifecycleTests(RepoCase):
             (engine.worktree / 'hello.py').write_text('# changed during preparation\n')
         change, state = after_save(resumed, worker_prepared, mutate)
         with change, self.assertRaises(HarnessError):
-            resumed.resume(engine.run['id'], reject_continuation=path)
+            resumed.resume(engine.run['id'], reject_request=path)
         self.assertTrue(state['fired'])
         saved = read_json(engine.directory / 'state.json')
         self.assertEqual(len(backend.calls), 1)
@@ -293,7 +298,7 @@ class RejectionLifecycleTests(RepoCase):
             if resumed.run.get('continuation_rejections'):
                 raise KeyboardInterrupt()
         with patch.object(resumed.context, 'save', side_effect=interrupt_after_save), self.assertRaises(KeyboardInterrupt):
-            resumed.resume(engine.run['id'], reject_continuation=path)
+            resumed.resume(engine.run['id'], reject_request=path)
         saved = read_json(engine.directory / 'state.json')
         self.assertIsNone(saved['pending_continuation'])
         self.assertEqual(sum(saved['attempts'].values()), 1)
@@ -308,7 +313,7 @@ class RejectionLifecycleTests(RepoCase):
         engine, backend, path, _, _ = self.waiting()
         resumed = self.engine(backend)
         with self.assertRaises(HarnessError):
-            resumed.resume(engine.run['id'], reject_continuation=path)
+            resumed.resume(engine.run['id'], reject_request=path)
         saved = read_json(engine.directory / 'state.json')
         self.assertEqual(saved['attempts']['greet'], 1)
         self.assertEqual(sum(saved['attempts'].values()), 1)
@@ -322,11 +327,11 @@ class RejectionLifecycleTests(RepoCase):
         engine, backend, path, _, _ = self.waiting()
         options = ({'execution_guidance': path}, {'environment_update': path},
                    {'operator_decision': [path]}, {'reverify': True},
-                   {'allow_scope': ['extra/**']})
+                   {'scope': ['extra/**']})
         before = (engine.directory / 'state.json').read_bytes()
         for extra in options:
             with self.subTest(extra=extra), self.assertRaises(HarnessError):
-                self.engine(backend).resume(engine.run['id'], reject_continuation=path, **extra)
+                self.engine(backend).resume(engine.run['id'], reject_request=path, **extra)
             self.assertEqual((engine.directory / 'state.json').read_bytes(), before)
             self.assertEqual(len(backend.calls), 1)
 
@@ -336,7 +341,7 @@ class RejectionLifecycleTests(RepoCase):
         engine, backend, path, _, _ = self.waiting()
         self.config.data['permissions']['worker_commands'].remove(extra)
         with self.assertRaises(HarnessError):
-            self.engine(backend).resume(engine.run['id'], reject_continuation=path)
+            self.engine(backend).resume(engine.run['id'], reject_request=path)
         self.assertEqual(len(backend.calls), 1)
         self.assertFalse(read_json(engine.directory / 'state.json').get('continuation_rejections'))
 
@@ -349,7 +354,7 @@ class RejectionLifecycleTests(RepoCase):
         with self.assertRaises(HarnessError):
             self.engine(backend).resume(engine.run['id'])
         self.assertEqual(len(backend.calls), calls)
-        result = self.engine(backend).resume(engine.run['id'], reject_continuation=path)
+        result = self.engine(backend).resume(engine.run['id'], reject_request=path)
         self.assertEqual(result['status'], 'completed')
         self.assertEqual(self.config.data['runtime']['agent_timeout_seconds'], timeout)
         self.assertEqual(result['attempts']['greet'], 2)
@@ -362,16 +367,16 @@ class RejectionLifecycleTests(RepoCase):
         self.config.data['permissions']['worker_commands'].append(required)
         engine, backend, path, _, _ = self.waiting(required_command=required)
         resumed = self.engine(backend)
-        record = continuation.record_continuation_rejection
-        def revoke_after_record(context, rejection_path, **kwargs):
-            row = record(context, rejection_path, **kwargs)
+        record = continuation.publish_continuation_rejection
+        def revoke_after_record(context, prepared):
+            row = record(context, prepared)
             # Model an in-process grant becoming unavailable after resume's
             # config compatibility check; task admission must still recheck.
             context.config.data['permissions']['worker_commands'].remove(required)
             return row
-        with patch('harness.run_lifecycle.record_continuation_rejection', side_effect=revoke_after_record), \
+        with patch('harness.run_lifecycle.publish_continuation_rejection', side_effect=revoke_after_record), \
                 self.assertRaises(HarnessError):
-            resumed.resume(engine.run['id'], reject_continuation=path)
+            resumed.resume(engine.run['id'], reject_request=path)
         saved = read_json(engine.directory / 'state.json')
         self.assertEqual(saved['command_requirements']['missing'], {'greet': [required]})
         self.assertEqual(sum(saved['attempts'].values()), 1)

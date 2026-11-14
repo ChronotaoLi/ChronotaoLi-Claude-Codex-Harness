@@ -94,7 +94,7 @@ class WorkerSummaryLifecycleTests(RepoCase):
                         seen.append(packet["trigger"]["feedback"]["worker"])
                         revised(result, packet, "Clarify prerequisite",
                                 updates=[{"id": "greet", "description": "Implement greet with the prerequisite",
-                                          "add_depends_on": []}])
+                                          "add_depends_on": [], "add_allowed_paths": [], "add_required_commands": []}])
                 backend = ScriptedBackend(blocked_first)
                 engine = self.engine(backend)
                 result = engine.start("Implement greet", self.plan())

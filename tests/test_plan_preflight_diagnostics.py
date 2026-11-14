@@ -76,7 +76,7 @@ class PlanPreflightDiagnosticsTests(RepoCase):
                 if sum(c["kind"] == "decide" for c in backend.calls) == 1:
                     revised_(result, packet, "Refine description", selected="greet",
                              updates=[{"id": "greet", "description": greet["description"] + " with clarification",
-                                       "add_depends_on": []}])
+                                       "add_depends_on": [], "add_allowed_paths": [], "add_required_commands": []}])
                 else:
                     revised_(result, packet, "Add followup", selected="followup",
                              new_tasks=[{**copy.deepcopy(greet), "id": "followup"}])

@@ -76,7 +76,7 @@ python3 -m harness --config /absolute/path/harness.toml --repo /absolute/path/to
 
 配置拒绝未知节和键，并指出完整路径。非 editable 安装不附带默认 `harness.toml` 与 `shared/`，执行任务需显式提供配置；`status`、`watch`、`dashboard`、`memory` 和 `cleanup-run` 不依赖配置。运行事件和诊断写 stderr，`run`、`resume`、`demo` 的 stdout 保持单个 JSON 结果。
 
-可用 `--plan /path/to/plan.json` 提供已有计划，格式见 [examples/plan.json](examples/plan.json)。输入在创建 run、分支和 worktree 前校验任务 ID、DAG、非空验收、范围和 skill。范围从仓库根目录匹配：`src/*` 只匹配直接子项，`src/**` 匹配所有层级，`**/*.py` 也匹配根目录文件；只有独立 `**` 路径段跨越 `/`。范围应覆盖必要测试与夹具。全仓库模式允许但会警告；`.git`、`.harness`、`.codex`、`.claude` 仍受保护。
+可用 `--plan /path/to/plan.json` 提供已有计划，格式见 [examples/plan.json](examples/plan.json)。输入在创建 run、分支和 worktree 前校验任务 ID、DAG、非空验收、范围和 skill。范围从仓库根目录匹配：`src/*` 只匹配直接子项，`src/**` 匹配所有层级，`**/*.py` 也匹配根目录文件；只有独立 `**` 路径段跨越 `/`。范围应覆盖必要测试与夹具。全仓库模式允许但会警告；`.git`、`.harness`、`.codex`、`.claude` 仍受保护。可用 `--scope PATTERN`（可重复）在启动前声明 run 的范围边界：只接受具体路径、字面子树 `p/…/**` 或 `**`；首版计划与之后每次修订新增的模式都必须能证明在边界内，`--plan` 越界时不创建 run。不声明时首版不受约束，修订只能复用已发布计划的模式。
 
 任务的 `required_commands` 最多声明 32 条不同的完整 argv，表示执行前置条件，不授予权限。派发前与 `verification.commands`、`permissions.worker_commands` 精确比较；不接受前缀，`verification.setup_commands` 不授予 worker 能力。能被内置 [`git_query`](docs/operations.md#git_query) 解析的只读 Git 查询（例如 `["git", "ls-files", "-z", "--", "src"]`）算作已满足，无需授权；`self_checks` 按同样规则比较。缺少授权时不启动 worker 或消耗其尝试，其他满足条件的就绪任务仍可继续；已有任务选择保持绑定。`status RUN` 显示 `missing_command_requirements`，追加精确授权后普通 `resume` 即可重检，无需环境更新。计划批准不增加权限，检查不证明命令存在、执行成功或验收通过。
 
@@ -86,20 +86,20 @@ python3 -m harness --config /absolute/path/harness.toml --repo /absolute/path/to
 
 worker 可用结构化续作请求正常交还控制权，等待精确命令授权或单次派发超时调整；满足条件后以全新派发继续原候选，累计调用和任务预算保留。`resume RUN --execution-guidance FILE` 可在安全待处理任务边界登记绑定来源与候选的操作约束；指导不授予命令权限。格式与适用边界见[续作与操作指导](docs/recovery.md#续作与操作指导)。
 
-续作请求中的命令或方案需要先修正时，使用 `resume RUN --reject-continuation FILE` 显式拒绝当前请求，保留候选交给同一任务的全新 worker。无需先授权旧命令或增加请求的超时；拒绝记录绑定原请求和候选，累计预算继续计算，新命令仍须独立授权。`status RUN` 提供请求绑定字段，输入格式与中断恢复规则见[续作与操作指导](docs/recovery.md#续作与操作指导)。
+续作请求中的命令或方案需要先修正时，使用 `resume RUN --reject-request FILE`（`{request_id, reason}`，`request_id` 取 `status RUN` 的 `continuation.request_id`）显式拒绝当前请求，保留候选交给同一任务的全新 worker。无需先授权旧命令或增加请求的超时；拒绝记录绑定原请求和候选，累计预算继续计算，新命令仍须独立授权。`status RUN` 提供请求绑定字段，输入格式与中断恢复规则见[续作与操作指导](docs/recovery.md#续作与操作指导)。
 
 默认连续执行。需要先检查计划或分步执行时：
 
 ```bash
-python3 -m harness --config /path/to/harness.toml --repo /path/to/project run "实现导出功能" --pause-after-plan
+python3 -m harness --config /path/to/harness.toml --repo /path/to/project run "实现导出功能" --pause-after-plan --scope 'src/**' --scope 'tests/**'
 python3 -m harness --repo /path/to/project status RUN
 python3 -m harness --config /path/to/harness.toml --repo /path/to/project resume RUN --approve-plan --step
 python3 -m harness --config /path/to/harness.toml --repo /path/to/project resume RUN --step
 ```
 
-`RUN` 替换为实际 run ID。`--pause-after-plan` 等待显式 `--approve-plan`，普通恢复不会批准。`--step` 最多接受一个任务后暂停，最后一个任务完成后仍执行整体验收。
+`RUN` 替换为实际 run ID。`--pause-after-plan` 等待显式 `--approve-plan`，普通恢复不会批准；`--approve-plan` 只批准已发布的首版，首版尚未发布时被拒。等待批准时 `status RUN` 的 `scope_summary` 按任务列出模式及其是否在边界内。`--step` 最多接受一个任务后暂停，最后一个任务完成后仍执行整体验收。
 
-指挥的修订若只细化当前未接受任务的说明且仍选它，会核验并保留该任务的候选代码，交给同一任务的新 worker；新增任务或依赖仍先归档未接受修改。指挥提问后 run 停止，须通过 `resume RUN --operator-decision FILE` 明确回答；回答进入下一次指挥决定。详见[指挥提问、修订与范围](docs/recovery.md#指挥提问修订与范围)。
+指挥的修订若只细化当前未接受任务的说明、追加它的范围或前置命令且仍选它，会核验并保留该任务的候选代码，交给同一任务的新 worker；新增任务或依赖仍先归档未接受修改。提案有模式无法证明在范围边界内时被持有（回执保留、不调用模型）：核对后执行停止信息给出的 `resume RUN --scope=…` 落地同一提案，或用 `resume RUN --reject-request FILE` 拒绝它。指挥提问后 run 停止，须通过 `resume RUN --operator-decision FILE` 明确回答；回答进入下一次指挥决定。详见[指挥提问、修订与范围](docs/recovery.md#指挥提问修订与范围)。
 
 所有更改在 `<目标项目>/.harness/worktrees/<run_id>` 的 `harness/<run_id>` 分支完成。每个通过检查和审阅的任务生成本地提交。成功输出分支和路径，便于查看 diff、merge 或 cherry-pick；最终集成由你操作。
 
@@ -176,12 +176,12 @@ python3 -m harness --repo /path/to/project cleanup-run RUN --remove --remove-ign
 | --- | --- |
 | 等待计划批准（`plan_approval/initial_plan`） | `resume RUN --approve-plan` |
 | 精确命令未授权（`missing_commands/*`） | 追加配置后普通 `resume RUN` |
-| 续作请求需要先修正（`continuation/*`） | `resume RUN --reject-continuation FILE` |
+| 续作请求需要先修正（`continuation/*`） | `resume RUN --reject-request FILE` |
 | 已保存 worker 环境阻断（`environment/worker_blocked`） | 修复条件后 `resume RUN --environment-update FILE` |
 | 供应商额度用尽、限速、过载或认证失败（`provider_quota/*`、`provider_failure/overloaded`、`provider_failure/authentication`） | 额度恢复或修复登录后普通 `resume RUN`；worker 的这次调用不计工作尝试 |
 | 等待用户决定 | 从 status 取 request ID，`resume RUN --operator-decision FILE`；可重复参数一次回答多项 |
 | 指挥提问 | 从 status 取 request ID，`resume RUN --operator-decision FILE` 回答；回答进入下一次指挥决定 |
-| 指挥修订越出已批准范围（`scope_extension/revision`） | 核对后 `resume RUN --allow-scope 'config/**'`，或普通 `resume`；两者都是新的指挥决定 |
+| 指挥提案越出范围边界，已持有（`scope_extension/revision`、`scope_extension/initial_plan`） | 核对 `gaps` 与建议后执行停止信息给出的 `resume RUN --scope=…`，或 `resume RUN --reject-request FILE`；都不重抽提案 |
 | 最终验证普通非零退出（`operator_decision/answer_required`） | 指挥提问时修复环境后 `resume RUN --operator-decision FILE --reverify` 一次答复并重验；指挥决定尚未返回（如额度或服务中断）而环境已修复时，可显式 `resume RUN --reverify`（已返回的指挥决定存在时拒绝） |
 | 模型派发上限用尽（`budget/agent_dispatches`） | 按 `remaining_model_calls` 的下界提高 `max_agent_dispatches` 后普通 `resume RUN` |
 | 旧 dispatch 退出记录无法确认（`process_unconfirmed/*`） | 人工核实后 `--confirm-exited DISPATCH_ID` |

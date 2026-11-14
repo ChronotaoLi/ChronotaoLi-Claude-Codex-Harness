@@ -106,7 +106,7 @@ class OperationRecordTests(OperationCase):
                          {"operation_id": "op-a", "kind": "run", "status": "finished", "run_id": run_id,
                           "exit_status": 0, "result_status": "completed", "error": None, "stop": None})
         self.assertEqual(record["arguments"], {"goal": "Implement greet", "plan": None, "commander": "astra",
-                                               "pause_after_plan": False, "step": False})
+                                               "pause_after_plan": False, "step": False, "scope": []})
         self.assertEqual((record["repo"], record["repo_head"]), (str(self.repo.resolve()), head))
         self.assertEqual(record["harness"]["package"], str(ROOT / "harness"))
         self.assertEqual(record["harness"]["python"], sys.version.split()[0])
@@ -172,7 +172,7 @@ class OperationRecordTests(OperationCase):
         self.assertEqual(record["arguments"], {
             "run_id": run_id, "approve_plan": True, "step": False, "reverify": False,
             "confirm_exited": [], "environment_update": None,
-            "operator_decision": [], "execution_guidance": None, "reject_continuation": None, "allow_scope": []})
+            "operator_decision": [], "execution_guidance": None, "reject_request": None, "scope": []})
         self.assertIsInstance(record["run_linked_at"], float)
         self.assertEqual([event["operation_id"] for event in self.events(run_id, "run_resumed")], ["op-resume"])
         self.assertIn(notice("run_resumed", run_id, "op-resume"), errors.splitlines())

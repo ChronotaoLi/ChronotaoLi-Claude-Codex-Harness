@@ -87,7 +87,7 @@ class ReviewRecoveryRegressionTests(RepoCase):
                 else:
                     revised(result, packet, "Use the clarified implementation approach",
                             updates=[{"id": "greet", "description": "Implement the clarified greeting behavior",
-                                      "add_depends_on": []}])
+                                      "add_depends_on": [], "add_allowed_paths": [], "add_required_commands": []}])
 
         backend = ScriptedBackend(ask_once)
         engine = self.engine(backend)

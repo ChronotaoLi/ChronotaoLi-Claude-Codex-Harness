@@ -165,7 +165,7 @@ class CommandRequirementsTests(RepoCase):
                             revised(result, packet, 'x' * 4001 if long_reason and not repairing else 'Prepare prerequisite',
                                     new_tasks=[{**original, 'id': 'prep', 'required_commands': copy.deepcopy(commands)}],
                                     updates=[{'id': original['id'], 'description': original['description'],
-                                              'add_depends_on': ['prep']}], selected='prep')
+                                              'add_depends_on': ['prep'], 'add_allowed_paths': [], 'add_required_commands': []}], selected='prep')
 
                     backend = ScriptedBackend(declare)
                     result = self.engine(backend).start('Implement greet', plan)
@@ -246,8 +246,9 @@ class CommandRequirementsTests(RepoCase):
         self.assertEqual(backend.calls, [])
 
     def test_requirements_immutable_for_existing_tasks(self):
-        old = self.plan([self.command])['tasks']
-        for changed in ([], [['different']], [self.command, ['additional']]):
+        # Existing requirements only grow: removing, replacing or reordering is refused, appending is allowed.
+        old = self.plan([self.command, ['second']])['tasks']
+        for changed in ([], [['different']], [['second'], self.command], [self.command], [['additional'], self.command, ['second']]):
             proposed = copy.deepcopy(old)
             proposed[0]['description'] += ' Refined.'
             proposed[0]['required_commands'] = changed
@@ -255,6 +256,8 @@ class CommandRequirementsTests(RepoCase):
                 validate_revision(old, proposed, [])
         proposed = copy.deepcopy(old)
         proposed[0]['description'] += ' Refined.'
+        self.assertEqual(validate_revision(old, proposed, []), proposed)
+        proposed[0]['required_commands'] = [self.command, ['second'], ['additional']]
         self.assertEqual(validate_revision(old, proposed, []), proposed)
 
     def test_legacy_plan_stays_unchanged_and_new_task_can_declare(self):

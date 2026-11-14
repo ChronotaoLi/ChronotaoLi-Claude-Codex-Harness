@@ -7,8 +7,10 @@ stderr) shows the same projection. The registry decides the title, the exit
 commands and the exit code; nothing parses the diagnostic text.
 
 Exit templates may be conditional: ``(template, "flag")`` applies when
-``data.flag`` is true, ``(template, "!flag")`` when it is false. A value whose
-applying exits need a field it lacks degrades to ``unclassified`` (exit 1).
+``data.flag`` is true (or a non-empty list), ``(template, "!flag")`` when it is
+false. A value whose applying exits need a field it lacks degrades to
+``unclassified`` (exit 1). ``{field:scope_args}`` renders a list of scope entries
+as ``--scope=VALUE`` shell words.
 """
 from __future__ import annotations
 
@@ -43,13 +45,19 @@ def _argv_list(v): return (type(v) is list and all(type(a) is list and all(type(
                            and _size(v) <= LIST_BYTES)
 def _argv_map(v): return (type(v) is dict and all(_id(k) and _argv_list(x) for k, x in v.items())
                           and _size(v) <= LIST_BYTES)
+def _map_shape(v): return (type(v) is dict and all(_id(k) and type(x) is list
+                                                    and all(type(p) is str and len(p) <= 4096 for p in x)
+                                                    for k, x in v.items()))
+def _strings_map(v): return _map_shape(v) and _size(v) <= LIST_BYTES
 def _superseded(v): return type(v) is dict and set(v) == {"kind", "reason"} and all(_id(x) for x in v.values())
 
 
 SOURCE_TYPES = {"task_id": _id, "dispatch_id": _id, "request_id": _id, "continuation_id": _id,
                 "artifact": _artifact, "artifact_digest": _digest}
 COMMON_DATA = {"detail": _text, "dropped_fields": _strings, "superseded": _superseded}
-LIST_FIELDS = {"patterns", "missing_commands", "options"}
+LIST_FIELDS = {"patterns", "missing_commands", "options", "scope", "gaps", "suggested_scope", "widened"}
+# Room kept for the bounded detail (every character escaped) when several lists share one stop value.
+DETAIL_RESERVE = 6 * DETAIL_LIMIT + 64
 
 REGISTRY = {}
 
@@ -68,13 +76,24 @@ _row("operator_decision", "answer_required", 3, "等待操作者决定",
      candidate_changed=_bool, reverify_available=_bool)
 _row("operator_decision", "operator_stopped", 3, "操作者已决定停止", ("resume {run} --operator-decision FILE",),
      ("request_id", "task_id"), request_kind=_enum("worker", "handoff", "commander"))
-_row("scope_extension", "revision", 3, "指挥修订越出已批准的文件范围",
-     ("resume {run} --allow-scope 'PATTERN'", "resume {run}"), ("dispatch_id", "artifact", "artifact_digest"),
-     patterns=_strings)
+# A held proposal (spec-6 2.3): its receipt is kept; scope widening or a rejection are the exits.
+# Data fields are listed in the order they are kept when the whole value must shrink (last shrinks first).
+_SCOPE_EXITS = (("resume {run} {suggested_scope:scope_args}", "suggested_scope"),
+                "resume {run} --reject-request FILE", "status {run}")
+_PROPOSAL_SOURCE = ("request_id", "dispatch_id", "artifact", "artifact_digest")
+_row("scope_extension", "revision", 3, "指挥修订有模式无法证明在范围边界内（已持有）", _SCOPE_EXITS, _PROPOSAL_SOURCE,
+     suggested_scope=_strings, gaps=_strings_map, missing_commands=_argv_map, scope=_strings, widened=_strings,
+     selected_task=_id, config_key=_key)
+_row("scope_extension", "initial_plan", 3, "首版计划有模式无法证明在范围边界内（已持有）", _SCOPE_EXITS, _PROPOSAL_SOURCE,
+     suggested_scope=_strings, gaps=_strings_map, missing_commands=_argv_map, scope=_strings, widened=_strings,
+     config_key=_key)
+_row("scope_extension", "supplied_plan", 3, "供给的首版计划越出启动后声明的范围边界",
+     (("resume {run} {suggested_scope:scope_args}", "suggested_scope"), "abandon {run}"), (),
+     suggested_scope=_strings, gaps=_strings_map, scope=_strings, widened=_strings)
 for _r, _t, _extra in (("commands_required", "续作需要授权精确命令", {"missing_commands": _argv_list}),
                        ("timeout_required", "续作需要更长的单次时限",
                         {"config_key": _key, "minimum_timeout_seconds": _int, "agent_timeout_seconds": _int})):
-    _row("continuation", _r, 3, _t, ("resume {run}", "resume {run} --reject-continuation FILE"),
+    _row("continuation", _r, 3, _t, ("resume {run}", "resume {run} --reject-request FILE"),
          ("continuation_id", "task_id", "dispatch_id"), **_extra)
 _row("missing_commands", "selected_task", 3, "选中任务所需命令尚未授权", ("resume {run}",), ("task_id",),
      config_key=_key, missing=_argv_map)
@@ -89,6 +108,9 @@ _row("budget", "agent_dispatches", 3, "模型派发次数达到上限", ("resume
      config_key=_key, used=_int, limit=_int, minimum_remaining_calls=_int)
 _row("budget", "context_capacity", 3, "必要上下文超过预算", ("resume {run}", "abandon {run}"), ("artifact",),
      config_key=_key, required_chars=_int, budget_chars=_int, scope=_enum("dispatch", "final_review"))
+_row("budget", "proposal_capacity", 3, "已判定合格的提案在当前条件下超过整体审阅容量（提案保留）",
+     ("resume {run}", "resume {run} --reject-request FILE"), _PROPOSAL_SOURCE,
+     config_key=_key, required_chars=_int, budget_chars=_int)
 _row("budget", "review_findings", 3, "待核验阻断问题超过单次审阅容量", ("abandon {run}",), ("task_id",),
      open_findings=_int, limit=_int)
 _row("budget", "agent_timeout", 3, "调用超过单次时限", ("resume {run}",),
@@ -156,6 +178,11 @@ _row("interrupted", "signal", 130, "运行被中断", ("resume {run}", ("abandon
 for _r, _t in (("cli_arguments", "命令参数无效"), ("input_schema", "输入文件不合格"), ("conflicting_retry", "重试与已写的不可变文件冲突")):
     _row("invalid_input", _r, 2, _t, (), (), option=_key)
 _row("invalid_input", "incompatible_options", 2, "选项不能同用", (), (), options=_strings)
+_row("invalid_input", "plan_outside_scope", 2, "供给的计划越出声明的范围边界", (), (),
+     option=_key, suggested_scope=_strings, gaps=_strings_map, scope=_strings)
+_row("invalid_input", "scope_pattern", 2, "范围边界条目形式不合法", (), (), option=_key, patterns=_strings)
+_row("invalid_input", "plan_unpublished", 2, "首版计划尚未发布，不能批准", ("status {run}",), (),
+     option=_key, status=_key)
 _row("invalid_input", "stale_request", 2, "输入针对的请求或来源已失效", ("status {run}",),
      ("request_id", "continuation_id", "dispatch_id"), option=_key)
 _row("invalid_input", "run_state", 2, "该命令或选项不适用于 run 的当前状态", ("status {run}",), (), status=_key)
@@ -174,12 +201,48 @@ def bounded(text):
     return text[:DETAIL_LIMIT - len(note)] + note
 
 
+def _holds(data, flag):
+    if flag.startswith("!"):
+        return data.get(flag[1:]) is False
+    value = data.get(flag)
+    return value is True or (type(value) is list and len(value) > 0)
+
+
 def active_exits(entry, data):
     """The exit templates that apply: unconditional ones and those whose condition holds."""
     for item in entry["exits"]:
         template, flag = item if isinstance(item, tuple) else (item, None)
-        if flag is None or (data.get(flag[1:]) is False if flag.startswith("!") else data.get(flag) is True):
+        if flag is None or _holds(data, flag):
             yield template
+
+
+class _ExitFormatter(string.Formatter):
+    def format_field(self, value, format_spec):
+        if format_spec == "scope_args":
+            from .scope import scope_args
+            return scope_args(value)
+        return super().format_field(value, format_spec)
+
+
+def _count(value):
+    return len(value) if type(value) is list else sum(len(x) for x in value.values())
+
+
+def _head(value, check):
+    """The longest head of a list, or of a strings map (task order, then pattern order), that passes ``check``."""
+    if type(value) is list:
+        kept = list(value)
+        while kept and not check(kept):
+            kept.pop()
+        return kept
+    kept = {}
+    for key, items in value.items():
+        for item in items:
+            trial = {**kept, key: [*kept.get(key, []), item]}
+            if not check(trial):
+                return kept
+            kept = trial
+    return kept
 
 
 def required_fields(kind, reason, data):
@@ -208,11 +271,9 @@ def make(kind, reason, *, data=None, source=None):
             raise KeyError(f"{kind}/{reason} has no data field {name}")
         if name == "detail" and type(value) is str:
             value = bounded(value)
-        if name in LIST_FIELDS and type(value) is list and not check(value):
-            kept = list(value)
-            while kept and not check(kept):
-                kept.pop()
-            clean_data[name + "_omitted"] = len(value) - len(kept)
+        if name in LIST_FIELDS and (type(value) is list or _map_shape(value)) and not check(value):
+            kept = _head(value, check)
+            clean_data[name + "_omitted"] = _count(value) - _count(kept)
             value = kept
         if check(value):
             clean_data[name] = value
@@ -225,6 +286,21 @@ def make(kind, reason, *, data=None, source=None):
             clean_source[name] = value
         else:
             dropped.append(name)
+    # Several bounded lists may still exceed the whole value's limit: shrink the
+    # later-listed ones first, keeping room for the bounded detail.
+    for name in reversed([name for name in entry["data"] if name in LIST_FIELDS and name in clean_data]):
+        if _size({"data": clean_data, "source": clean_source}) + DETAIL_RESERVE <= STOP_LIMIT:
+            break
+        value = clean_data[name]
+        if type(value) is list or _map_shape(value):
+            room = STOP_LIMIT - DETAIL_RESERVE - _size({"data": {**clean_data, name: type(value)()},
+                                                        "source": clean_source})
+            kept = _head(value, lambda v: _size(v) <= room)
+            clean_data[name + "_omitted"] = clean_data.get(name + "_omitted", 0) + _count(value) - _count(kept)
+            clean_data[name] = kept
+        else:
+            dropped.append(name)
+            del clean_data[name]
     if dropped:
         clean_data["dropped_fields"] = sorted(set(dropped))
     missing = [name for name in required_fields(kind, reason, clean_data)
@@ -406,7 +482,7 @@ def project(value, run_id=None, *, omit_detail=False):
     fields = {**value["data"], **value["source"], "run": run_id or "RUN"}
     result = {"kind": value["kind"], "reason": value["reason"], "title": entry["title"],
               "exit_code": entry["exit_code"],
-              "exits": [template.format(**fields) for template in active_exits(entry, value["data"])],
+              "exits": [_ExitFormatter().format(template, **fields) for template in active_exits(entry, value["data"])],
               "data": {key: item for key, item in value["data"].items() if key != "detail"},
               "source": dict(value["source"])}
     if not omit_detail:

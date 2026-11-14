@@ -336,7 +336,7 @@ class CommanderDecisionTests(RepoCase):
             self.block_once(backend, kwargs, result)
             if trigger_kind(kwargs, packet) == "task" and worker_task_blocker(packet):
                 description = "" if len(decides(backend)) == 1 else "Implement greet after clarification"
-                revised_(result, packet, "Clarified", updates=[{"id": "greet", "description": description, "add_depends_on": []}])
+                revised_(result, packet, "Clarified", updates=[{"id": "greet", "description": description, "add_depends_on": [], "add_allowed_paths": [], "add_required_commands": []}])
 
         backend = ScriptedBackend(change)
         run = self.engine(backend).start("Implement greet", plan())
@@ -346,7 +346,7 @@ class CommanderDecisionTests(RepoCase):
         self.assertEqual(replans[1]["retry_of"], replans[0]["id"])
         self.assertEqual(len(run["plan_history"]), 2)
 
-    def test_out_of_scope_revision_stops_without_redo_and_resume_is_a_new_decision(self):
+    def test_out_of_scope_revision_is_held_without_redo(self):
         def change(backend, kwargs, packet, result):
             self.block_once(backend, kwargs, result)
             if trigger_kind(kwargs, packet) == "task" and worker_task_blocker(packet):
@@ -354,34 +354,34 @@ class CommanderDecisionTests(RepoCase):
                 task.update(id="prepare", allowed_paths=["hello.py", "support.txt"])
                 revised_(result, packet, "Add prerequisite", new_tasks=[task], selected="prepare",
                         updates=[{"id": "greet", "description": packet["original_tasks"][0]["description"],
-                                  "add_depends_on": ["prepare"]}])
+                                  "add_depends_on": ["prepare"], "add_allowed_paths": [], "add_required_commands": []}])
 
         backend = ScriptedBackend(change)
         engine = self.engine(backend)
-        with self.assertRaisesRegex(HarnessError, r'指挥修订越出已批准的文件范围：\["support.txt"\].*--allow-scope'):
+        with self.assertRaisesRegex(HarnessError, r'无法证明.*\{"prepare": \["support.txt"\]\}.*--scope=support.txt'):
             engine.start("Implement greet", plan())
         saved = read_json(engine.directory / "state.json")
-        self.assertNotIn("commander:decide:run", saved["commander_receipts"])
         first = entries(saved, "commander", "decide")
+        # Only scope is missing: held, not invalid output, never redone; the receipt stays.
         self.assertEqual(len(first), 1)
-        self.assertEqual((first[0]["status"], first[0]["out_of_scope_paths"]), ("invalid", ["support.txt"]))
-        # Without authority the second listed exit, an ordinary resume, is a new decision, not a redo.
-        after = walk_exit(self, engine.directory, ("scope_extension", "revision"), backend=backend, choose=1,
-                          expect_code=3, expect_status="blocked")
-        self.assertEqual((after["stop"]["kind"], after["stop"]["data"]["patterns"]), ("scope_extension", ["support.txt"]))
-        second = entries(after, "commander", "decide")
-        self.assertEqual(len(second), 2)
-        self.assertNotIn("retry_of", second[1])
-        # The first listed exit (row scope-revision): resume RUN --allow-scope 'PATTERN'.
+        self.assertEqual(first[0]["status"], "completed")
+        self.assertNotIn("invalid_output", first[0])
+        self.assertEqual(saved["commander_receipts"]["commander:decide:run"]["dispatch_id"], first[0]["id"])
+        self.assertEqual(saved["stop"]["data"]["gaps"], {"prepare": ["support.txt"]})
+        # An ordinary resume replays the same original: the same stop, no model call, no redo.
+        calls = len(backend.calls)
+        with self.assertRaisesRegex(HarnessError, "无法证明"):
+            self.engine(backend).resume(engine.run["id"])
+        self.assertEqual(len(backend.calls), calls)
+        self.assertEqual(entries(read_json(engine.directory / "state.json"), "commander", "decide"), first)
+        # The listed scope exit widens the boundary and the same original lands.
         run = walk_exit(self, engine.directory, ("scope_extension", "revision"), backend=backend,
-                        fill={"PATTERN": "support.txt"}, expect_status="completed")
-        third = entries(run, "commander", "decide")
-        # The authorized revision lands; the original task is then selected by one more decide.
-        self.assertEqual([entry["status"] for entry in third], ["invalid", "invalid", "completed", "completed"])
-        self.assertNotIn("retry_of", third[2])
-        packet = decides(backend)[2]["packet"]
-        self.assertEqual(packet["previous_invalid"]["dispatch_id"], third[1]["id"])
-        self.assertEqual(packet["approved_scope"], ["support.txt"])
+                        expect_status="completed")
+        landed = entries(run, "commander", "decide")
+        self.assertEqual(landed[0]["id"], first[0]["id"])
+        self.assertFalse(any("retry_of" in entry for entry in landed))
+        self.assertEqual(read_json(Path(run["plan_history"][1]["artifact"]))["source"]["dispatch_id"], first[0]["id"])
+        self.assertEqual(decides(backend)[-1]["packet"]["scope"], ["support.txt"])
 
     def test_out_of_scope_revision_with_another_defect_is_redone(self):
         def change(backend, kwargs, packet, result):
@@ -389,7 +389,7 @@ class CommanderDecisionTests(RepoCase):
             if trigger_kind(kwargs, packet) == "task" and worker_task_blocker(packet):
                 if "previous_invalid" in packet:
                     revised_(result, packet, "Clarified", updates=[{"id": "greet", "description": "Clarified greet",
-                                                                   "add_depends_on": []}])
+                                                                   "add_depends_on": [], "add_allowed_paths": [], "add_required_commands": []}])
                     return
                 task = copy.deepcopy(packet["original_tasks"][0])
                 task.update(id="prepare", allowed_paths=["support.txt"], skills=["no-such-skill"])
@@ -400,7 +400,7 @@ class CommanderDecisionTests(RepoCase):
         self.assertEqual(run["status"], "completed")
         decisions = entries(run, "commander", "decide")
         self.assertEqual([entry["status"] for entry in decisions], ["invalid", "completed"])
-        self.assertNotIn("out_of_scope_paths", decisions[0])
+        self.assertEqual(run["commander_receipts"], {})  # never held: another defect makes it invalid output
         self.assertEqual(decisions[1]["retry_of"], decisions[0]["id"])
 
 
@@ -542,7 +542,7 @@ class WorkerInvalidOutputTests(RepoCase):
             if kwargs["role"] == "worker" and kwargs["task"]["description"] != revised:
                 result.update(status="blocked", blocker_kind="task", blockers=["b" * 4001])
             if trigger_kind(kwargs, packet) == "task" and worker_task_blocker(packet):
-                revised_(result, packet, "Clarified", updates=[{"id": "greet", "description": revised, "add_depends_on": []}])
+                revised_(result, packet, "Clarified", updates=[{"id": "greet", "description": revised, "add_depends_on": [], "add_allowed_paths": [], "add_required_commands": []}])
 
         backend = ScriptedBackend(change)
         engine = self.engine(backend)
@@ -1072,7 +1072,7 @@ class ReviewFindingRegressionTests(RepoCase):
                 def change(backend, kwargs, packet, result, damage=damage):
                     damage(backend, kwargs, packet, result)
                     if trigger_kind(kwargs, packet) == "task" and worker_task_blocker(packet):
-                        revised_(result, packet, "Clarified", updates=[{"id": "greet", "description": revised, "add_depends_on": []}])
+                        revised_(result, packet, "Clarified", updates=[{"id": "greet", "description": revised, "add_depends_on": [], "add_allowed_paths": [], "add_required_commands": []}])
 
                 backend = ScriptedBackend(change)
                 engine = self.engine(backend)

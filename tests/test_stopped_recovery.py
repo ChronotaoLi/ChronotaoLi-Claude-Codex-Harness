@@ -29,7 +29,7 @@ class StoppedRecoveryTests(RepoCase):
             if trigger_kind(kwargs, packet) == "task" and "operator_answer" in packet:
                 revised(result, packet, "Use the clarified implementation approach",
                         updates=[{"id": "greet", "description": "Implement greet with the revised approach",
-                                  "add_depends_on": []}])
+                                  "add_depends_on": [], "add_allowed_paths": [], "add_required_commands": []}])
         return ScriptedBackend(change)
 
     def test_question_survives_plain_resume_and_answer_leads_to_one_decide(self):

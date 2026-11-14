@@ -100,7 +100,7 @@ class IncrementalRevisionTests(unittest.TestCase):
         prerequisite = task("foundation")
         prerequisite["allowed_paths"] = original[0]["allowed_paths"][:1]
         operation = revision(new_tasks=[prerequisite], updates=[
-            {"id": "implement", "description": "Use the prerequisite", "add_depends_on": ["foundation"]}])
+            {"id": "implement", "description": "Use the prerequisite", "add_depends_on": ["foundation"], "add_allowed_paths": [], "add_required_commands": []}])
         before = copy.deepcopy((original, operation))
         revised = apply_revision(original, operation, set())
         self.assertEqual((original, operation), before)
@@ -112,7 +112,7 @@ class IncrementalRevisionTests(unittest.TestCase):
 
     def test_updates_cannot_supply_immutable_fields_or_touch_accepted_tasks(self):
         original = [task()]
-        update = {"id": "implement", "description": "Refined brief", "add_depends_on": []}
+        update = {"id": "implement", "description": "Refined brief", "add_depends_on": [], "add_allowed_paths": [], "add_required_commands": []}
         for field in ("title", "allowed_paths", "acceptance", "skills", "depends_on"):
             with self.subTest(field=field), self.assertRaises(HarnessError):
                 apply_revision(original, revision(updates=[{**update, field: original[0][field]}]), set())
@@ -122,9 +122,9 @@ class IncrementalRevisionTests(unittest.TestCase):
     def test_unknown_duplicate_and_cyclic_updates_fail_before_mutation(self):
         original = [task("foundation"), task(dependencies=["foundation"])]
         before = copy.deepcopy(original)
-        update = {"id": "implement", "description": "Refined", "add_depends_on": []}
+        update = {"id": "implement", "description": "Refined", "add_depends_on": [], "add_allowed_paths": [], "add_required_commands": []}
         variants = [[{**update, "id": "unknown"}], [update, update],
-                    [{**update, "id": "foundation", "add_depends_on": ["implement"]}]]
+                    [{**update, "id": "foundation", "add_depends_on": ["implement"], "add_allowed_paths": [], "add_required_commands": []}]]
         for updates in variants:
             with self.subTest(updates=updates), self.assertRaises(HarnessError):
                 apply_revision(original, revision(updates=updates), set())
@@ -135,7 +135,7 @@ class IncrementalRevisionTests(unittest.TestCase):
         for operation in (revision(), revision(new_tasks=[task("implement")]),
                           revision(new_tasks=[{**task("extra"), "allowed_paths": ["*"]}]),
                           revision(updates=[{"id": "implement", "description": original[0]["description"],
-                                             "add_depends_on": []}])):
+                                             "add_depends_on": [], "add_allowed_paths": [], "add_required_commands": []}])):
             with self.subTest(operation=operation), self.assertRaises(HarnessError):
                 apply_revision(original, operation, set())
 
@@ -148,17 +148,17 @@ class IncrementalRevisionTests(unittest.TestCase):
                          "reason": "Add the missing prerequisite", "new_tasks": [], "updates": [], **changes}
             validate(operation, DECIDE)
             return validate_decision(operation, tasks=original, accepted=set(), ready=["implement"])
-        with self.assertRaises(ScopeExtensionRequired) as raised:
-            check(new_tasks=[outside])
-        self.assertEqual(raised.exception.patterns, ["secrets/**"])
+        # Only scope missing: the contract holds and the gaps are returned (the caller holds it).
+        action, proposed, gaps = check(new_tasks=[outside])
+        self.assertEqual((action, [t["id"] for t in proposed], gaps), ("revise", ["implement", "extra"], {"extra": ["secrets/**"]}))
         for changes in ({"reason": "x" * 4001},
-                        {"updates": [{"id": "implement", "description": "Refined", "add_depends_on": ["implement"]}]},
+                        {"updates": [{"id": "implement", "description": "Refined", "add_depends_on": ["implement"], "add_allowed_paths": [], "add_required_commands": []}]},
                         {"selected_task": "missing"},
                         {"new_tasks": [{**outside, "id": "final"}]}):
             with self.subTest(changes=list(changes)):
                 with self.assertRaises(HarnessError) as raised:
                     check(**{"new_tasks": [outside], **changes})
-                # Another defect makes it an ordinary invalid output, redone once.
+                # Another defect makes it an ordinary invalid output, redone once: never a hold.
                 self.assertNotIsInstance(raised.exception, ScopeExtensionRequired)
 
 

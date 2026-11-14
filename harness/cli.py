@@ -12,7 +12,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from . import dashboard, git, observe, stops
+from . import dashboard, git, observe, scope as boundary, stops
 from .adapters import DemoBackend
 from .budgets import attempts_total, work_attempts
 from .cleanup import blocked, cleanup_run
@@ -143,7 +143,7 @@ def status_summary(run):
         source = next((row for row in continuation_history if isinstance(row, dict) and row.get("id") == pending), None)
         if source and isinstance(source.get("source"), dict):
             result["continuation"] = {
-                "continuation_id": source["id"], "task_id": source.get("task_id"),
+                "request_id": source["id"], "task_id": source.get("task_id"),
                 "source_dispatch_id": source["source"].get("dispatch_id"),
                 "source_snapshot_digest": source.get("snapshot_digest"),
                 "request": source.get("request"), "state": "awaiting_requirements"}
@@ -196,6 +196,17 @@ def status_summary(run):
     stop = stops.project_ledger(run)
     if stop is not None:
         result["stop"] = stop
+    declared = run.get("scope")
+    if isinstance(declared, list):
+        # Read-only projections: they authorize nothing and take no part in recovery.
+        result["scope"] = {"entries": list(declared), "declared": bool(declared)}
+        if not declared:
+            result["scope"]["note"] = "未声明：首版计划不受边界约束，修订只能复用已发布计划的模式"
+        held = boundary.held_view(run)
+        if held is not None:
+            result["scope"]["held"] = held
+        if run.get("status") == "awaiting_approval":
+            result["scope_summary"] = boundary.summary(run)
     responses = run.get("operator_decisions", [])
     requests = run.get("decision_requests", [])
     if not isinstance(responses, list) or not isinstance(requests, list):
@@ -319,15 +330,16 @@ def operation_arguments(args):
     """Invocation arguments for the record: file options are recorded as path text only."""
     if args.command == "run":
         return {"goal": args.goal, "plan": str(args.plan) if args.plan is not None else None,
-                "commander": args.commander, "pause_after_plan": args.pause_after_plan, "step": args.step}
+                "commander": args.commander, "pause_after_plan": args.pause_after_plan, "step": args.step,
+                "scope": list(args.scope or ())}
     return {"run_id": args.run_id, "approve_plan": args.approve_plan, "step": args.step,
             "reverify": args.reverify,
             "confirm_exited": list(args.confirm_exited or ()),
             "environment_update": str(args.environment_update) if args.environment_update is not None else None,
             "operator_decision": [str(path) for path in args.operator_decision or ()],
             "execution_guidance": str(args.execution_guidance) if getattr(args, "execution_guidance", None) is not None else None,
-            "reject_continuation": str(args.reject_continuation) if getattr(args, "reject_continuation", None) is not None else None,
-            "allow_scope": list(args.allow_scope or ())}
+            "reject_request": str(args.reject_request) if getattr(args, "reject_request", None) is not None else None,
+            "scope": list(args.scope or ())}
 
 
 def resume_options(args):
@@ -339,12 +351,12 @@ def resume_options(args):
     if args.operator_decision is not None:
         options["operator_decision"] = (args.operator_decision[0] if len(args.operator_decision) == 1
                                         else args.operator_decision)
-    if args.allow_scope:
-        options["allow_scope"] = args.allow_scope
+    if args.scope:
+        options["scope"] = args.scope
     if getattr(args, "execution_guidance", None) is not None:
         options["execution_guidance"] = args.execution_guidance
-    if getattr(args, "reject_continuation", None) is not None:
-        options["reject_continuation"] = args.reject_continuation
+    if getattr(args, "reject_request", None) is not None:
+        options["reject_request"] = args.reject_request
     return options
 
 
@@ -353,7 +365,7 @@ def file_inputs_present(args):
         return args.plan is not None
     return (args.environment_update is not None or bool(args.operator_decision)
             or getattr(args, "execution_guidance", None) is not None
-            or getattr(args, "reject_continuation", None) is not None)
+            or getattr(args, "reject_request", None) is not None)
 
 
 def persisted_run_id(args, engine, state):
@@ -390,7 +402,7 @@ def operate(args, config, repo, state):
             except (OSError, ValueError) as error:
                 raise HarnessError(f"计划文件无法读取或不是有效 JSON：{error}",
                                    stop=stops.make("invalid_input", "input_schema", data={"option": "--plan"})) from error
-            result = engine.start(args.goal, supplied,
+            result = engine.start(args.goal, supplied, scope=args.scope or (),
                                   pause_after_plan=args.pause_after_plan, step=args.step)
             keys = ("id", "status", "branch", "worktree", "accepted")
         else:
@@ -439,6 +451,8 @@ def _main(argv=None):
     run.add_argument("--plan", type=Path, help="使用已编写的 JSON 任务计划")
     run.add_argument("--pause-after-plan", action="store_true", help="保存计划并等待显式批准，再开始执行")
     run.add_argument("--step", action="store_true", help="最多接受一个任务后暂停；最后一个任务仍需整体验收")
+    run.add_argument("--scope", action="append", metavar="PATTERN",
+                     help="声明 run 的范围边界：具体路径、字面子树 p/…/** 或 **；可重复；首版与之后的修订都受它约束")
     run.add_argument("--operation-id", metavar="ID", help="本次操作记录的 ID；默认自动生成，已存在则拒绝")
     resume = sub.add_parser("resume")
     resume.add_argument("run_id")
@@ -452,12 +466,12 @@ def _main(argv=None):
                         help="提供操作者环境澄清 JSON 文件；不扩展权限、文件范围或命令授权")
     resume.add_argument("--execution-guidance", type=Path, metavar="FILE",
                         help="在停止边界提供绑定任务及候选的执行约束；不授权命令或放松验收")
-    resume.add_argument("--reject-continuation", type=Path, metavar="FILE",
-                        help="显式拒绝当前续作请求并保留候选交给新 worker 修正；不授权命令、不重置预算")
+    resume.add_argument("--reject-request", type=Path, metavar="FILE",
+                        help="拒绝已判定合格而未落地的指挥提案，或当前续作请求（{request_id, reason}）；不授权命令、不重置预算")
     resume.add_argument("--operator-decision", type=Path, action="append", metavar="FILE",
                         help="回答 status 中的操作者决策请求；可重复指定，整批校验保存后继续，不跳过验收或授予命令权限")
-    resume.add_argument("--allow-scope", action="append", metavar="PATTERN",
-                        help="为之后的指挥修订授权新增文件范围模式；可重复指定，不改变原任务范围")
+    resume.add_argument("--scope", action="append", metavar="PATTERN",
+                        help="扩大 run 的范围边界（具体路径、字面子树 p/…/** 或 **）；可重复；持有的提案随后重放")
     status = sub.add_parser("status")
     status.add_argument("run_id", nargs="?")
     status.add_argument("--full", action="store_true", help="输出完整运行台账")

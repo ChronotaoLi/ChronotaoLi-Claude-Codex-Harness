@@ -540,7 +540,7 @@ class DashboardPresentationTests(unittest.TestCase):
   navigate("#/runs/run_cmd");
   await respond("/api/runs/run_cmd", D.grants);
   const shown = visibleText(one(attrIs("data-attention", "true")));
-  for (const expected of ["MISSING-ARGV", "CONTINUATION-REASON", "--reject-continuation"]) {
+  for (const expected of ["MISSING-ARGV", "CONTINUATION-REASON", "--reject-request"]) {
     assert.ok(shown.includes(expected), "visible without interaction: " + expected);
   }
 ''')

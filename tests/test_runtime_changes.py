@@ -69,14 +69,24 @@ def revised(result, packet, reason, new_tasks=(), updates=(), selected=None, ins
                    selected_task=selected, instruction=instruction)
 
 
+def update(task, description=None, deps=(), paths=(), commands=()):
+    """One revision update row: every field present (the contract requires them), unused ones empty."""
+    return {"id": task["id"], "description": description or task["description"], "add_depends_on": list(deps),
+            "add_allowed_paths": list(paths), "add_required_commands": [list(argv) for argv in commands]}
+
+
 def current_tasks(packet):
     """Rebuild the current plan from a decide packet's compact plan context (RULES' delta reading)."""
     tasks = copy.deepcopy(packet[packet.get("tasks_ref", packet.get("tasks_base_ref"))])
     by_id = {task["id"]: task for task in tasks}
-    for update in packet.get("tasks_delta", {}).get("updates", []):
-        if "description" in update:
-            by_id[update["id"]]["description"] = update["description"]
-        by_id[update["id"]]["depends_on"].extend(update.get("add_depends_on", []))
+    for row in packet.get("tasks_delta", {}).get("updates", []):
+        task = by_id[row["id"]]
+        if "description" in row:
+            task["description"] = row["description"]
+        task["depends_on"].extend(row.get("add_depends_on", []))
+        task["allowed_paths"].extend(row.get("add_allowed_paths", []))
+        if row.get("add_required_commands"):
+            task.setdefault("required_commands", []).extend(row["add_required_commands"])
     tasks.extend(copy.deepcopy(packet.get("tasks_delta", {}).get("new_tasks", [])))
     return tasks
 
@@ -241,7 +251,7 @@ class RuntimeChangesTests(RepoCase):
                 prerequisite_task = copy.deepcopy(original)
                 prerequisite_task.update(id="prepare", title="Prepare prerequisite")
                 revised(result, packet, "Prepare prerequisite before original task", new_tasks=[prerequisite_task],
-                        updates=[{"id": original["id"], "description": original["description"], "add_depends_on": ["prepare"]}])
+                        updates=[{"id": original["id"], "description": original["description"], "add_depends_on": ["prepare"], "add_allowed_paths": [], "add_required_commands": []}])
             elif kwargs["role"] == "worker" and kwargs["task"]["id"] == "prepare":
                 # DemoBackend already generated a valid file; inspect the archived original separately.
                 with (kwargs["cwd"] / "hello.py").open("a") as file:
@@ -387,7 +397,7 @@ class RuntimeChangesTests(RepoCase):
                 prerequisite = copy.deepcopy(task)
                 prerequisite["id"] = "prepare"
                 revised(result, packet, "Add preparation", new_tasks=[prerequisite],
-                        updates=[{"id": task["id"], "description": task["description"], "add_depends_on": ["prepare"]}])
+                        updates=[{"id": task["id"], "description": task["description"], "add_depends_on": ["prepare"], "add_allowed_paths": [], "add_required_commands": []}])
         engine = self.engine(ScriptedBackend(revise))
         save = engine.context.save
         def interrupt_after_application():
@@ -415,7 +425,13 @@ class RuntimeChangesTests(RepoCase):
             engine.start("Implement greet", pause_after_plan=True)
         self.assertEqual(engine.run["tasks"], [])
         backend = ScriptedBackend()
-        result = self.engine(backend).resume(engine.run["id"], approve_plan=True)
+        # The plan does not exist yet: the approval is refused before any write or model call.
+        raw = (engine.directory / "state.json").read_bytes()
+        with self.assertRaisesRegex(HarnessError, "首版计划尚未发布") as caught:
+            self.engine(backend).resume(engine.run["id"], approve_plan=True)
+        self.assertEqual((caught.exception.stop["reason"], (engine.directory / "state.json").read_bytes(), backend.calls),
+                         ("plan_unpublished", raw, []))
+        result = self.engine(backend).resume(engine.run["id"])
         self.assertEqual(result["status"], "awaiting_approval")
         self.assertFalse(result["plan_approved"])
         self.assertEqual([call["kind"] for call in backend.calls], ["decide"])

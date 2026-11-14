@@ -97,7 +97,7 @@ class DecisionLifecycleTests(RepoCase):
         values, records = engine.services.decisions.prepare_operator_decisions(paths)
         with patch.object(engine.context, 'save', side_effect=OSError('disk unavailable')):
             with self.assertRaises(OSError):
-                engine.services.decisions.record_operator_decisions(records)
+                engine.services.decisions.commit_resume_inputs(records)
         self.assertEqual(engine.run['operator_decisions'], [])
         self.assertEqual(self.saved(engine)['operator_decisions'], [])
         result = self.engine(backend).resume(engine.run['id'], operator_decision=paths)
@@ -274,7 +274,7 @@ class DecisionLifecycleTests(RepoCase):
         before = (engine.directory / 'state.json').read_bytes()
         stop_answer = Path(path).with_name('stop-answer.json')
         write_json(stop_answer, {**read_json(path), 'decision': 'stop'})
-        for answer, options in ((path, {'environment_update': path}), (path, {'allow_scope': ['extra.py']}),
+        for answer, options in ((path, {'environment_update': path}), (path, {'reject_request': path}),
                                 (stop_answer, {'reverify': True})):  # a stop answer ends the resume before any re-verification
             with self.subTest(options=options), self.assertRaises(HarnessError):
                 self.engine(backend).resume(engine.run['id'], operator_decision=answer, **options)

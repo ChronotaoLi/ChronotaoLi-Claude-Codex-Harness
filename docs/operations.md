@@ -41,11 +41,11 @@ python3 -m harness --repo /abs/project dashboard --port 8765
 
 外层 agent 指替操作者调用上述入口的自动化会话（例如另一个 Claude Code 或 Codex 会话）。它在已有授权内可以：
 
-- 启动 `run`，并为每次调用指定可追溯的 `--operation-id`；
+- 启动 `run`，并为每次调用指定可追溯的 `--operation-id`；启动前先与用户确认允许改动的区域（目录级）、必要的测试与生成文件的位置，再用 `run --scope` 提交为范围边界（没有声明时 `status RUN` 的 `scope.note` 会写明首版不受约束）；
 - 用 `status`、`status RUN`、`status RUN --full`、`watch RUN` 和 `dashboard` 观察，读取目标项目 `.harness/` 下的台账、事件、dispatch 产物与操作记录；
 - 使用[阻塞状态与操作者出口](recovery.md#阻塞状态与操作者出口)中明确适用于当前状态的恢复出口，例如 `--approve-plan`、追加精确命令授权后的普通 `resume`、`--environment-update`、`--operator-decision`。
 
-读停止时用退出码与 `stop.kind` 分流，不解析文字：3 按 `stop.exits` 中适用于当前状态的出口处理，涉及新增权限或需求选择时请示用户；2 修正本次调用的输入；1 停下报告（证据或现场不符、Harness 自身失败、未分类）；0 读结果 JSON 的 `status`（`completed`、`paused` 或待批准）；130 是中断。供应商额度类停止（`provider_quota/*`）与 `provider_failure/{overloaded,authentication}` 都是 3：等额度恢复或修复登录后按 `stop.exits` 普通 `resume`，worker 的这次调用不计工作尝试；不要用正则匹配错误文字判断额度。遇到真正的新增权限（新的命令授权、范围扩展、预算或轮数提高）或需求选择（操作者决定、是否接受风险、是否放弃）时向用户请求，不自行代答。
+读停止时用退出码与 `stop.kind` 分流，不解析文字：3 按 `stop.exits` 中适用于当前状态的出口处理，涉及新增权限或需求选择时请示用户；2 修正本次调用的输入；1 停下报告（证据或现场不符、Harness 自身失败、未分类）；0 读结果 JSON 的 `status`（`completed`、`paused` 或待批准）；130 是中断。供应商额度类停止（`provider_quota/*`）与 `provider_failure/{overloaded,authentication}` 都是 3：等额度恢复或修复登录后按 `stop.exits` 普通 `resume`，worker 的这次调用不计工作尝试；不要用正则匹配错误文字判断额度。遇到真正的新增权限（新的命令授权、范围扩展、预算或轮数提高）或需求选择（操作者决定、是否接受风险、是否放弃）时向用户请求，不自行代答。指挥提案被持有（`scope_extension/*`）时，`resume --scope` 扩大边界与 `--reject-request` 拒绝提案都要向用户请求：边界是持续、跨任务的授权，停止给出的建议条目可能比缺口宽（`data.widened`），完整缺口在 `status RUN` 的 `scope.held`。
 
 不能做的事：
 
@@ -70,7 +70,7 @@ python3 -m harness --repo /abs/project dashboard --port 8765
 | `operation_id`、`kind` | 记录 ID；`run` 或 `resume` |
 | `status` | `prepared`（已创建）→ `running`（已关联 run）→ `finished`（CLI 结束） |
 | `started_at`、`started_at_utc`、`finished_at`、`finished_at_utc` | epoch 秒与 ISO 8601 UTC |
-| `arguments` | `run`：`goal`、`plan`（路径或 null）、`commander`、`pause_after_plan`、`step`；`resume`：`run_id`、`approve_plan`、`step`、`reverify`、`confirm_exited`、`environment_update`、`execution_guidance`、`reject_continuation`（后三项为路径或 null）、`operator_decision`（路径列表）、`allow_scope`。文件型选项只记路径 |
+| `arguments` | `run`：`goal`、`plan`（路径或 null）、`commander`、`pause_after_plan`、`step`、`scope`（列表）；`resume`：`run_id`、`approve_plan`、`step`、`reverify`、`confirm_exited`、`environment_update`、`execution_guidance`、`reject_request`（后三项为路径或 null）、`operator_decision`（路径列表）、`scope`（列表）。文件型选项只记路径 |
 | `repo`、`repo_head` | 目标项目绝对路径与当时 HEAD；取不到为 null |
 | `harness` | `package`、`revision`、`runtime_modified`、`python`、`executable`，与 `doctor` 回显相同 |
 | `config` | `path`、`sha256`（配置文件字节摘要） |
@@ -78,7 +78,7 @@ python3 -m harness --repo /abs/project dashboard --port 8765
 | `models` | 配置中 commander／fable／worker／reviewer 的 `cli`、`model`、`effort` 原样 |
 | `cli` | `claude`、`codex` 的 `path`（PATH 查找结果）与 `version`（`--version` 首个非空行，5 秒超时，失败为 null） |
 | `run_id`、`run_linked_at` | run 持久登记后立即写入；创建 run 前失败时为 null |
-| `exit_status`、`result_status`、`error`、`stop`、`error_omitted` | CLI 退出码（0／2／3／1／130，见[退出码](recovery.md#退出码)）、最终 JSON 的 `status`、错误首行与停止投影（`kind`、`reason`、标题、退出码、出口命令、`data`、`source`、诊断摘录 `detail`；结束时 run 停在待批准上时也有）。本次调用含文件型输入（计划或恢复 JSON，包括执行指导与续作拒绝）且出错时，`error` 为 null 并写 `error_omitted: "file inputs present; see stderr"`，`stop` 去掉 `detail`、保留其余字段，因为校验错误可能引用文件中的字段值；错误全文仍输出到 stderr。无文件输入时 `error_omitted` 为 null |
+| `exit_status`、`result_status`、`error`、`stop`、`error_omitted` | CLI 退出码（0／2／3／1／130，见[退出码](recovery.md#退出码)）、最终 JSON 的 `status`、错误首行与停止投影（`kind`、`reason`、标题、退出码、出口命令、`data`、`source`、诊断摘录 `detail`；结束时 run 停在待批准上时也有）。本次调用含文件型输入（计划或恢复 JSON，包括执行指导与请求拒绝 `--reject-request`）且出错时，`error` 为 null 并写 `error_omitted: "file inputs present; see stderr"`，`stop` 去掉 `detail`、保留其余字段，因为校验错误可能引用文件中的字段值；错误全文仍输出到 stderr。无文件输入时 `error_omitted` 为 null |
 
 记录不保存环境变量值、凭据、计划或恢复 JSON 的文件内容或生成的 MCP 配置。
 

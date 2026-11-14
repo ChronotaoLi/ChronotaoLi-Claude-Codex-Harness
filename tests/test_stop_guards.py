@@ -50,7 +50,8 @@ class RegistryGuard(unittest.TestCase):
         expected = {"evidence": 1, "workspace_mismatch": 1, "scope_violation": 1, "runtime_failure": 1,
                     "unclassified": 1, "interrupted": 130, "plan_approval": 0, "invalid_input": 2,
                     "config_mismatch": 2, "unsupported_ledger": 2}
-        self.assertEqual(len(stops.REGISTRY), 58)  # 54 from step 4, four provider types from step 5
+        # 54 from step 4, four provider types from step 5, six scope boundary types from step 6
+        self.assertEqual(len(stops.REGISTRY), 64)
         for (kind, reason), entry in stops.REGISTRY.items():
             with self.subTest(row=(kind, reason)):
                 self.assertEqual(entry["exit_code"], expected.get(kind, 3))
@@ -193,6 +194,41 @@ class DegradedStops(unittest.TestCase):
         self.assertEqual((value["kind"], stops.project(value, "run_x")["exits"]), ("interrupted", ["resume run_x"]))
         confirmed = stops.make("interrupted", "signal", data={"exits_confirmed": True})
         self.assertEqual(stops.project(confirmed, "run_x")["exits"], ["resume run_x", "abandon run_x"])
+
+    def test_scope_args_exits_render_operator_entries(self):
+        """{field:scope_args} (spec-6 5.6): every listed --scope value is an operator entry, the suggestion unchanged."""
+        import random
+        import shlex
+        from harness import scope
+        rows = sorted(key for key, entry in stops.REGISTRY.items()
+                      if any(":scope_args}" in (item if isinstance(item, str) else item[0]) for item in entry["exits"]))
+        self.assertEqual(rows, [("scope_extension", "initial_plan"), ("scope_extension", "revision"),
+                                ("scope_extension", "supplied_plan")])
+        rng = random.Random(20261116)
+        segments = ["app", "src", "x.py", "*", "?", "[ab]", "a*", "*.py", "**", "-x", "c d", "it's", "$HOME"]
+        for key in rows:
+            for _ in range(300):
+                gaps = {}
+                for task in ("t1", "t2"):
+                    patterns = ["/".join(rng.choice(segments) for _ in range(rng.randint(1, 4))) for _ in range(3)]
+                    gaps[task] = [p for p in patterns if not p.startswith("/") and "//" not in p
+                                  and all(part not in ("", ".", "..") for part in p.split("/"))]
+                gaps = {task: patterns for task, patterns in gaps.items() if patterns}
+                entries, widened = scope.suggestions(gaps)
+                value = stops.make(*key, data={"suggested_scope": entries, "gaps": gaps, "widened": widened, "scope": []})
+                self.assertEqual((value["kind"], value["reason"]), key)
+                commands = [c for c in stops.project(value, "run_x")["exits"] if "--scope=" in c]
+                self.assertEqual(len(commands), 1 if entries else 0)
+                for command in commands:
+                    scoped = [word[len("--scope="):] for word in shlex.split(command) if word.startswith("--scope=")]
+                    self.assertEqual(scoped, entries)
+                    for entry in scoped:
+                        self.assertEqual(scope.operator_entry(entry), entry)
+                        self.assertTrue(all(any(scope.contains(gap, [e]) for e in scoped) for gap in sum(gaps.values(), [])))
+            # Without suggestions the conditional exit is not listed and nothing degrades.
+            empty = stops.make(*key, data={"suggested_scope": []})
+            self.assertEqual(empty["kind"], key[0])
+            self.assertFalse(any("--scope" in c for c in stops.project(empty, "run_x")["exits"]))
 
     def test_unknown_field_names_still_raise(self):
         with self.assertRaises(KeyError):
@@ -396,7 +432,7 @@ class LoadFailureClasses(RepoCase):
         """A ledger that points its pending continuation back at a rejected one: load_integrity (code-4b 1 census)."""
         from test_continuation_rejection import RejectionLifecycleTests
         engine, backend, path, _, _ = RejectionLifecycleTests.waiting(self, second_request=True)
-        self.assertEqual(run_cli(self, backend, ["resume", engine.run["id"], "--reject-continuation", str(path)])[0], 3)
+        self.assertEqual(run_cli(self, backend, ["resume", engine.run["id"], "--reject-request", str(path)])[0], 3)
         state = engine.directory / "state.json"
         ledger = read_json(state)
         rejected = ledger["continuation_rejections"][0]["continuation_id"]
@@ -694,7 +730,7 @@ class PreflightRefusals(RepoCase):
         paths = {"continue": answer, "stop": {**answer, "decision": "stop"},
                  "stale": {**answer, "request_id": "request_" + "0" * 64},
                  "update": {"schema_version": 1}, "guidance": {"task_id": "greet"},
-                 "rejection": {"continuation_id": "c"}}
+                 "rejection": {"request_id": "continuations_" + "0" * 64, "reason": "Not this request."}}
         for name, value in paths.items():
             write_json(folder / f"{name}.json", value)
         (folder / "broken.json").write_text("{not json")
@@ -770,8 +806,20 @@ class PreflightRefusals(RepoCase):
             ("--execution-guidance with --operator-decision", None, None,
              ["--execution-guidance", files["guidance"], "--operator-decision", files["continue"]],
              ("invalid_input", "incompatible_options"), 2, False),
-            ("--reject-continuation with --reverify", None, None, ["--reject-continuation", files["rejection"], "--reverify"],
+            ("--reject-request with --reverify", None, None, ["--reject-request", files["rejection"], "--reverify"],
              ("invalid_input", "incompatible_options"), 2, False),
+            ("--reject-request with --scope", None, None, ["--reject-request", files["rejection"], "--scope", "x.py"],
+             ("invalid_input", "incompatible_options"), 2, False),
+            ("--environment-update with --scope", None, None, ["--environment-update", files["update"], "--scope", "x.py"],
+             ("invalid_input", "incompatible_options"), 2, False),
+            ("--scope entry of an unaccepted form", None, None, ["--scope", "x.py", "--scope=src/*.py"],
+             ("invalid_input", "scope_pattern"), 2, False),
+            ("--scope under a protected root", None, None, ["--scope", ".harness/**"],
+             ("invalid_input", "scope_pattern"), 2, False),
+            ("unreadable rejection file", None, None, ["--reject-request", files["broken"]],
+             ("invalid_input", "input_schema"), 2, False),
+            ("rejection of a request that is not pending", None, None, ["--reject-request", files["rejection"]],
+             ("invalid_input", "stale_request"), 2, False),
             ("stop answer with --reverify, before the exit-confirmation audit", unconfirmed, None,
              ["--operator-decision", files["stop"], "--reverify", "--confirm-exited", worker["id"]],
              ("invalid_input", "incompatible_options"), 2, False),
@@ -818,6 +866,25 @@ class PreflightRefusals(RepoCase):
         self.assertEqual(run_cli(self, backend, ["abandon", engine.run["id"]])[0], 0)
         with self.subTest(refusal="abandoned run"):
             self.check(backend, engine, [], ("invalid_input", "run_state"), 2)
+
+    def test_scope_boundary_refusals_leave_the_run_unchanged(self):
+        """The first plan is held (spec-6): approving it, or rejecting a stale or moved proposal, writes nothing."""
+        from harness.scope import proposal_request_id
+        backend = ScriptedBackend()
+        engine = self.engine(backend)
+        with self.assertRaises(HarnessError):
+            engine.start("Implement greet", scope=["src/**"], pause_after_plan=True)
+        held = read_json(engine.directory / "state.json")
+        folder = scratch(self)
+        stale, current = folder / "stale.json", folder / "current.json"
+        write_json(stale, {"request_id": "proposal_" + "0" * 64, "reason": "Not this proposal."})
+        write_json(current, {"request_id": proposal_request_id(held, held["commander_receipts"]["commander:decide:run"]),
+                             "reason": "Not this proposal."})
+        self.check(backend, engine, ["--approve-plan"], ("invalid_input", "plan_unpublished"), 2)
+        self.check(backend, engine, ["--approve-plan", "--scope", "hello.py"], ("invalid_input", "plan_unpublished"), 2)
+        self.check(backend, engine, ["--reject-request", str(stale)], ("invalid_input", "stale_request"), 2)
+        (engine.worktree / "hello.py").write_text("changed while held\n")
+        self.check(backend, engine, ["--reject-request", str(current)], ("workspace_mismatch", "candidate_changed"), 1)
 
     def test_reverify_refuses_a_returned_decision_before_any_write(self):
         from test_harness import decide_bound
@@ -926,7 +993,7 @@ class FileInputRefusals(RepoCase):
         self.config.data["runtime"]["max_agent_dispatches"] = 50
         state = engine.directory / "state.json"
         before = state.read_bytes()
-        for option in ("--operator-decision", "--environment-update", "--execution-guidance", "--reject-continuation"):
+        for option in ("--operator-decision", "--environment-update", "--execution-guidance", "--reject-request"):
             for name, path in self.broken_files().items():
                 with self.subTest(option=option, file=name):
                     notice = refused_by_cli(self, backend, ["resume", engine.run["id"], option, str(path)],

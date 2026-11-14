@@ -45,6 +45,13 @@ ROW_COVERAGE = {
     "plan-file": Row(("invalid_input", "input_schema"), OPERATION, "test_stop_exits.PlanRowTests.test_plan_file"),
     "plan-approval": Row(("plan_approval", "initial_plan"), RUN,
                          "test_cli_controls.CLIControlsTests.test_plan_gate_requires_explicit_cli_approval"),
+    "plan-unpublished": Row(("invalid_input", "plan_unpublished"), OPERATION,
+                            "test_scope_boundary.InitialPlanHoldTests."
+                            "test_model_first_plan_outside_scope_is_held_then_lands_and_pauses"),
+    "plan-outside-scope": Row(("invalid_input", "plan_outside_scope"), OPERATION,
+                              "test_scope_boundary.StartBoundaryTests.test_supplied_plan_outside_scope_creates_nothing"),
+    "scope-pattern": Row(("invalid_input", "scope_pattern"), OPERATION,
+                         "test_scope_boundary.StartBoundaryTests.test_scope_pattern_forms_rejected_before_anything"),
     "plan-approval-after-capacity": Row(("budget", "context_capacity"), RUN,
                                         "test_stop_exits.PlanRowTests.test_plan_approval_after_capacity"),
     "commands-all-ready": Row(("missing_commands", "all_ready_tasks"), RUN,
@@ -74,8 +81,13 @@ ROW_COVERAGE = {
     "operator-stopped": Row(("operator_decision", "operator_stopped"), RUN,
                             "test_decide.AskTests.test_stop_answer_blocks_until_it_is_revised_to_continue"),
     "scope-revision": Row(("scope_extension", "revision"), RUN,
-                          "test_invalid_output_redo.CommanderDecisionTests."
-                          "test_out_of_scope_revision_stops_without_redo_and_resume_is_a_new_decision"),
+                          "test_scope_boundary.RevisionHoldTests."
+                          "test_hold_keeps_receipt_replays_without_model_and_scope_lands_same_original"),
+    "scope-initial-plan": Row(("scope_extension", "initial_plan"), RUN,
+                              "test_scope_boundary.InitialPlanHoldTests."
+                              "test_model_first_plan_outside_scope_is_held_then_lands_and_pauses"),
+    "scope-supplied-plan": Row(("scope_extension", "supplied_plan"), RUN,
+                               "test_scope_boundary.ClassificationTests.test_supplied_plan_recovery_rechecks_the_boundary"),
     "task-attempts": Row(("budget", "task_attempts"), RUN,
                          "test_invalid_output_redo.WorkerInvalidOutputTests.test_always_invalid_worker_stops_at_the_attempt_limit"),
     "dispatch-limit": Row(("budget", "agent_dispatches"), RUN, "test_stop_exits.ExitRowTests.test_dispatch_limit"),
@@ -140,6 +152,8 @@ ROW_COVERAGE = {
     "context-final": Row(("budget", "context_capacity"), RUN,
                          "test_context_capacity.FinalContextCapacityTests."
                          "test_required_overflow_saves_plan_before_workers_and_resumes_with_larger_budget"),
+    "proposal-capacity": Row(("budget", "proposal_capacity"), RUN,
+                             "test_scope_boundary.ClassificationTests.test_capacity_flip_on_replay_keeps_the_judged_original"),
     "plan-file-damaged": Row(("evidence", "runtime_integrity"), OPERATION,
                              "test_stop_exits.EvidenceRowTests.test_plan_file_damaged"),
     "revision-head": Row(("workspace_mismatch", "head_changed"), RUN, "test_stop_exits.WorkspaceRowTests.test_revision_head"),
@@ -236,7 +250,7 @@ class PlanRowTests(RepoCase):
                 original = copy.deepcopy(packet["original_tasks"][0])
                 revised(result, packet, "Add a prerequisite with its own command",
                         new_tasks=[{**original, "id": "prep", "required_commands": [command]}],
-                        updates=[{"id": "greet", "description": original["description"], "add_depends_on": ["prep"]}],
+                        updates=[{"id": "greet", "description": original["description"], "add_depends_on": ["prep"], "add_allowed_paths": [], "add_required_commands": []}],
                         selected="prep", instruction="Prepare first")
         backend = ScriptedBackend(change)
         engine = self.engine(backend)
@@ -596,7 +610,7 @@ class WorkspaceRowTests(RepoCase):
                 result.update(status="blocked", blocker_kind="task", blockers=["The description is ambiguous"])
             elif trigger_kind(kwargs, packet) == "task" and packet["trigger"]["feedback"]:
                 revised(result, packet, "Clarify", selected="greet",
-                        updates=[{"id": "greet", "description": "Implement greet(name) precisely", "add_depends_on": []}])
+                        updates=[{"id": "greet", "description": "Implement greet(name) precisely", "add_depends_on": [], "add_allowed_paths": [], "add_required_commands": []}])
         backend = ScriptedBackend(revise_once)
         engine = self.engine(backend)
         change, fired = after_save(engine, lambda run: "pending_revision" in run, lambda: self.commit_in(engine.worktree))

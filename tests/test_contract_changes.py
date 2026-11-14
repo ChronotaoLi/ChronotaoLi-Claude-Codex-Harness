@@ -72,12 +72,20 @@ class RevisionContractTests(unittest.TestCase):
                 validate_revision(original, revised, set())
 
     def test_new_tasks_cannot_introduce_new_scope_patterns(self):
+        from harness.contracts import ScopeExtensionRequired
         original = [task()]
-        for scope in (["*"], ["secrets/*"], ["src/new.py"]):
+        for scope in (["*"], ["secrets/*"]):  # not provable inside src/* or tests/*: a gap, never accepted
             corrective = task("corrective")
             corrective["allowed_paths"] = scope
-            with self.subTest(scope=scope), self.assertRaises(HarnessError):
+            with self.subTest(scope=scope), self.assertRaises(ScopeExtensionRequired) as caught:
                 validate_revision(original, original + [corrective], set())
+            self.assertEqual(caught.exception.gaps, {"corrective": scope})
+            gaps = {}
+            validate_revision(original, original + [corrective], set(), gaps=gaps)
+            self.assertEqual(gaps, {"corrective": scope})
+        corrective = task("corrective")
+        corrective["allowed_paths"] = ["src/new.py"]  # a concrete path src/* already matches
+        self.assertEqual(validate_revision(original, original + [corrective], set())[-1]["allowed_paths"], ["src/new.py"])
 
     def test_revision_rejects_noop_reordering_and_limit_bypass(self):
         original = [task("one"), task("two")]
@@ -90,7 +98,7 @@ class RevisionContractTests(unittest.TestCase):
         ask = {"action": "ask", "selected_task": "", "instruction": "", "reason": "External credentials are unavailable",
                "new_tasks": [], "updates": []}
         validate(ask, DECIDE)
-        self.assertEqual(validate_decision(ask, tasks=[task()], accepted={}, ready=["one"]), ("ask", None))
+        self.assertEqual(validate_decision(ask, tasks=[task()], accepted={}, ready=["one"]), ("ask", None, {}))
         for change in ({"reason": ""}, {"reason": " \n"}, {"selected_task": "one"}, {"new_tasks": [task("two")]}):
             with self.subTest(change=change), self.assertRaises(HarnessError):
                 validate_decision({**ask, **change}, tasks=[task()], accepted={}, ready=["one"])

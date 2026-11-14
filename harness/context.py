@@ -28,18 +28,22 @@ def compact_plan(original_tasks, tasks):
     if [task["id"] for task in tasks[:len(original_tasks)]] != list(original):
         raise HarnessError("当前计划无法无损表示：原始任务被移除或重排")
     updates = []
+    appended = ("depends_on", "allowed_paths", "required_commands")
     for task in tasks[:len(original_tasks)]:
         before = original[task["id"]]
-        immutable = set(before) - {"description", "depends_on"}
-        if (set(task) != set(before) or any(task[key] != before[key] for key in immutable)
-                or task["depends_on"][:len(before["depends_on"])] != before["depends_on"]):
+        immutable = (set(before) | set(task)) - {"description", *appended}
+        if (any(task.get(key) != before.get(key) for key in immutable)
+                or any(task.get(key, [])[:len(before.get(key, []))] != before.get(key, []) for key in appended)
+                or ("required_commands" in before and "required_commands" not in task)):
             raise HarnessError("当前计划无法无损表示：原始任务约束已改变")
         update = {"id": task["id"]}
         if task["description"] != before["description"]:
             update["description"] = task["description"]
-        added = task["depends_on"][len(before["depends_on"]):]
-        if added:
-            update["add_depends_on"] = deepcopy(added)
+        for key, field in (("depends_on", "add_depends_on"), ("allowed_paths", "add_allowed_paths"),
+                           ("required_commands", "add_required_commands")):
+            added = task.get(key, [])[len(before.get(key, [])):]
+            if added:
+                update[field] = deepcopy(added)
         if len(update) > 1:
             updates.append(update)
     # How to apply the delta is shared protocol (RULES), not packet data.

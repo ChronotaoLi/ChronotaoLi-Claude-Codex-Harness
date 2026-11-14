@@ -8,28 +8,39 @@ from pathlib import Path
 
 from .versions import RUN_SCHEMA_VERSION, read_current_ledger
 from .config import normalized
-from . import git, stops
+from . import git, scope as boundary, stops
 from .operations import warn
 from .input_projection import validate_dispatch_indexes as validate_input_dispatch_indexes
 from .path_evidence import validate_dispatch_indexes
 from .services import RuntimeService
-from .continuation import (packet as continuation_packet, read_continuation_rejection, read_execution_guidance,
-                           record_continuation_rejection, record_execution_guidance)
+from .continuation import (packet as continuation_packet, prepare_continuation_rejection,
+                           publish_continuation_rejection, read_execution_guidance, read_request_rejection,
+                           record_execution_guidance)
 from .shared import asset_digest, validate_mcp
 from .util import HarnessError, lock, uid, validate_command_directories
 
 
 class RunLifecycle(RuntimeService):
-    def start(self, goal, plan=None, *, pause_after_plan=False, step=False):
+    def start(self, goal, plan=None, *, scope=(), pause_after_plan=False, step=False):
         runtime = self.context
         if not goal.strip():
             raise HarnessError("目标不能为空", stop=stops.make("invalid_input", "cli_arguments", data={"option": "goal"}))
+        scope = boundary.declared(scope)
         untracked = git.check_starting_checkout(self.context.repo)
         if not self.context.config.data["verification"]["commands"]:
             raise HarnessError("请先配置目标项目的 verification.commands")
         git.reject_submodules(self.context.repo)
         with stops.classify("invalid_input", "input_schema", data={"option": "--plan"}):
             supplied_tasks = self.services.planning.validate_tasks(plan) if plan is not None else []
+        missing = boundary.gaps({t["id"]: t["allowed_paths"] for t in supplied_tasks}, scope) if scope else {}
+        if missing:
+            # Before any run directory, ledger or worktree exists.
+            entries, _ = boundary.suggestions(missing)
+            raise HarnessError("供给的计划越出声明的范围边界（当前规则无法证明包含）：" + json.dumps(missing, ensure_ascii=False)
+                               + "；修正计划或调整 --scope 后重新 run；未创建 run",
+                               stop=stops.make("invalid_input", "plan_outside_scope",
+                                               data={"option": "--plan", "scope": scope, "gaps": missing,
+                                                     "suggested_scope": entries}))
         validate_mcp(self.context.config)
         if untracked:
             print("[harness] 主检出存在未跟踪文件；保留原处，不进入隔离 worktree："
@@ -45,7 +56,7 @@ class RunLifecycle(RuntimeService):
                     "original_tasks": deepcopy(supplied_tasks),
                     "review_history": {}, "final_history": [], "plan_history": [],
                     "worker_receipts": {}, "review_receipts": {}, "commander_receipts": {},
-                    "approved_scope": [],
+                    "scope": scope,
                     "environment_updates": [], "environment_checks": [],
                     "decision_requests": [], "operator_decisions": [], "task_checkpoints": [], "checkpoint_batches": [],
                     "continuation_history": [], "execution_guidance": [],
@@ -130,7 +141,7 @@ class RunLifecycle(RuntimeService):
                     "accepted": dict, "attempts": dict, "dispatches": list,
                     "review_history": dict, "review_receipts": dict,
                     "worker_receipts": dict, "commander_receipts": dict, "worktree_binding": dict,
-                    "approved_scope": list,
+                    "scope": list,
                     "final_history": list, "plan_history": list,
                     "agent_dispatches": int, "plan_approval_required": bool, "plan_approved": bool,
                     "environment_updates": list, "environment_checks": list,
@@ -140,6 +151,11 @@ class RunLifecycle(RuntimeService):
                 or any(not isinstance(d, dict) for d in self.context.run["dispatches"])):
             raise HarnessError("运行台账字段缺失或类型无效；保留原文件并核对证据")
         self.validate_stop()
+        try:
+            if boundary.operator_entries(self.context.run["scope"]) != self.context.run["scope"]:
+                raise HarnessError("duplicate entry")
+        except HarnessError as error:
+            raise HarnessError(f"运行台账的范围边界无效（{error}）；保留原文件并核对证据") from error
         if self.context.run['config_snapshot'] != normalized(self.context.run['config_snapshot']):
             raise HarnessError('运行配置快照字段缺失；当前协议不补写旧版本默认值')
         if ("workspace_inputs" not in self.context.run
@@ -328,7 +344,6 @@ class RunLifecycle(RuntimeService):
             if (previous is None or previous.get("id") != entry["retry_of"]
                     or f"{previous.get('role')}:{previous.get('kind')}:{previous.get('task_id')}" != key
                     or previous.get("status") != "invalid" or "retry_of" in previous
-                    or "out_of_scope_paths" in previous
                     or entry.get("role") not in ("commander", "reviewer")):
                 fail("dispatches.retry_of 必须指向它之前最后一次模型调用，且那是同一调用、未重做过的无效输出")
             if entry.get("invoked") is True:
@@ -337,6 +352,20 @@ class RunLifecycle(RuntimeService):
                 retried.add(entry["retry_of"])
         for tid, recovery in self.context.run.get("worker_recovery", {}).items():
             source(recovery, f"worker:implement:{tid}", "worker_recovery." + tid)
+        # A rejected proposal (spec-6 5.3): shape only; the rejection file is read where it is used.
+        receipt = self.context.run["commander_receipts"].get("commander:decide:run") or {}
+        for entry in dispatch_list:
+            if "proposal_rejection" not in entry:
+                continue
+            value = mapping(entry["proposal_rejection"], "dispatches.proposal_rejection")
+            digest = value.get("artifact_digest")
+            if (set(value) != {"artifact", "artifact_digest"} or not isinstance(digest, str) or len(digest) != 64
+                    or any(c not in "0123456789abcdef" for c in digest)
+                    or value.get("artifact") != str(self.context.directory / "proposal-rejections" / f"{digest}.json")
+                    or (entry.get("role"), entry.get("kind"), entry.get("task_id")) != ("commander", "decide", "run")
+                    or entry.get("invoked") is not True or entry.get("status") != "completed"
+                    or receipt.get("dispatch_id") == entry.get("id")):
+                fail("dispatches.proposal_rejection 必须只在已调用、已判定的指挥决定上，引用拒绝文件，且该派发没有回执")
 
     def abandon(self, ident, *, confirm_exited=()):
         """Mark an unfinished run abandoned; the worktree is removed only by cleanup-run."""
@@ -363,8 +392,8 @@ class RunLifecycle(RuntimeService):
                 raise
 
     def resume(self, ident, *, step=False, approve_plan=False, reverify=False, confirm_exited=(),
-               allow_scope=(), environment_update=None, operator_decision=None,
-               execution_guidance=None, reject_continuation=None):
+               scope=(), environment_update=None, operator_decision=None,
+               execution_guidance=None, reject_request=None):
         runtime = self.context
         self.load_run(ident)
         with lock(self.context.directory / "run.lock", stop=stops.make("busy", "run_lock")):
@@ -379,26 +408,33 @@ class RunLifecycle(RuntimeService):
                     raise HarnessError("该 run 已放弃；保留分支、工作树与证据，不能继续派发", stop=state("abandoned"))
                 self.context.commander = self.context.run["commander"]
                 if self.context.run["status"] == "completed":
-                    if confirm_exited or allow_scope or environment_update is not None or operator_decision is not None or execution_guidance is not None or reject_continuation is not None:
-                        raise HarnessError("恢复修改选项仅用于未完成的 run（含 --reject-continuation 与 --execution-guidance）",
+                    if (confirm_exited or scope or environment_update is not None or operator_decision is not None
+                            or execution_guidance is not None or reject_request is not None):
+                        raise HarnessError("恢复修改选项仅用于未完成的 run（含 --scope、--reject-request 与 --execution-guidance）",
                                            stop=state("completed"))
                     return self.context.run
-                if reject_continuation is not None and (operator_decision is not None or environment_update is not None
-                        or execution_guidance is not None or reverify or allow_scope):
-                    raise HarnessError("--reject-continuation 不能与决定、环境更新、执行指导、重验或扩展范围合用",
-                                       stop=incompatible("--reject-continuation", "--operator-decision", "--environment-update",
-                                                         "--execution-guidance", "--reverify", "--allow-scope"))
+                if reject_request is not None and (operator_decision is not None or environment_update is not None
+                        or execution_guidance is not None or reverify or scope):
+                    raise HarnessError("--reject-request 不能与决定、环境更新、执行指导、重验或扩大范围合用",
+                                       stop=incompatible("--reject-request", "--operator-decision", "--environment-update",
+                                                         "--execution-guidance", "--reverify", "--scope"))
                 if execution_guidance is not None and (operator_decision is not None or environment_update is not None
-                        or reverify or allow_scope):
-                    raise HarnessError("--execution-guidance 不能与决定、环境更新、重验或扩展范围合用",
+                        or reverify or scope):
+                    raise HarnessError("--execution-guidance 不能与决定、环境更新、重验或扩大范围合用",
                                        stop=incompatible("--execution-guidance", "--operator-decision", "--environment-update",
-                                                         "--reverify", "--allow-scope"))
-                if operator_decision is not None and (environment_update is not None or allow_scope):
-                    raise HarnessError("--operator-decision 不能与环境更新或扩展范围合用",
-                                       stop=incompatible("--operator-decision", "--environment-update", "--allow-scope"))
-                if environment_update is not None and (reverify or allow_scope):
-                    raise HarnessError("--environment-update 不能与 --reverify 或 --allow-scope 合用",
-                                       stop=incompatible("--environment-update", "--reverify", "--allow-scope"))
+                                                         "--reverify", "--scope"))
+                if operator_decision is not None and environment_update is not None:
+                    raise HarnessError("--operator-decision 不能与环境更新合用",
+                                       stop=incompatible("--operator-decision", "--environment-update"))
+                if environment_update is not None and (reverify or scope):
+                    raise HarnessError("--environment-update 不能与 --reverify 或 --scope 合用",
+                                       stop=incompatible("--environment-update", "--reverify", "--scope"))
+                scope = boundary.declared(scope)
+                if approve_plan and not self.context.run["plan_history"]:
+                    # Only a published first plan can be approved; nothing is written.
+                    raise HarnessError("首版计划尚未发布，--approve-plan 无可批准的计划；先普通 resume 或扩大范围，发布后再批准",
+                                       stop=stops.make("invalid_input", "plan_unpublished",
+                                                       data={"option": "--approve-plan", "status": self.context.run["status"]}))
                 # Checked before any write, including an exit confirmation: a returned
                 # decision is never discarded by re-verification.
                 if reverify and self.services.planning.decide_returned():
@@ -419,7 +455,7 @@ class RunLifecycle(RuntimeService):
                 # The other input files are read here too, once, before any write: a file that
                 # cannot be read or parsed is refused without rewriting the run.
                 guidance = read_execution_guidance(execution_guidance) if execution_guidance is not None else None
-                rejection = read_continuation_rejection(reject_continuation) if reject_continuation is not None else None
+                rejection = read_request_rejection(reject_request) if reject_request is not None else None
                 self.context.reverify_requested = reverify
                 with stops.classify("config_mismatch", "immutable_config"):
                     changes = self.context.config.resume_changes(self.context.run["config_snapshot"])
@@ -455,12 +491,25 @@ class RunLifecycle(RuntimeService):
                 decision_values, decisions = (self.services.decisions.prepare_operator_decisions(
                                                   operator_decision, values=parsed_decisions)
                                               if operator_decision is not None else ([], []))
-                # After the answers and the environment update are prepared: a rejected
-                # input never follows this possible digest save.
+                publish_rejection = None
+                if rejection is not None:
+                    if rejection["request_id"].startswith("proposal_"):
+                        prepared = self.services.planning.prepare_proposal_rejection(rejection)
+                        publish_rejection = lambda: self.services.planning.record_proposal_rejection(prepared)
+                    else:
+                        prepared = prepare_continuation_rejection(runtime, rejection)
+                        publish_rejection = lambda: publish_continuation_rejection(runtime, prepared)
+                added = [pattern for pattern in scope if pattern not in self.context.run["scope"]]
+                # After every input is prepared: a rejected input never follows this possible digest save.
                 self.services.receipts.validate_pending_terminal_captures()
-                if allow_scope:
-                    self.services.planning.approve_scope_extensions(allow_scope)
-                self.services.decisions.record_operator_decisions(decisions)
+                # One commit: the answers, the widened boundary and the adopted relaxation (spec-6 3.1).
+                self.services.decisions.commit_resume_inputs(
+                    decisions, scope_added=added, relaxed_config=self.context.config.data if changes else None)
+                if changes:
+                    self.context.event("resume_config_relaxed", changes=changes)
+                if added:
+                    print("[harness] 范围边界已扩大：" + json.dumps(added, ensure_ascii=False)
+                          + "；当前与之后的提案都可复用这些条目", file=sys.stderr, flush=True)
                 if operator_decision is not None:
                     stopped = next((value for value in decision_values if value["decision"] == "stop"), None)
                     if stopped is not None:
@@ -472,15 +521,11 @@ class RunLifecycle(RuntimeService):
                         raise error
                 self.context.memory.repo = self.context.worktree
                 self.context.memory.binding = self.context.run["worktree_binding"]
-                if changes:
-                    self.context.run["config_snapshot"] = deepcopy(self.context.config.data)
-                    self.context.event("resume_config_relaxed", changes=changes)
-                    self.context.save()
                 self.services.environment.record_environment_update(update)
                 if execution_guidance is not None:
                     record_execution_guidance(runtime, execution_guidance, value=guidance)
-                if reject_continuation is not None:
-                    record_continuation_rejection(runtime, reject_continuation, value=rejection)
+                if publish_rejection is not None:
+                    publish_rejection()
                 self.services.planning.report_command_requirements()
                 if self.context.run["tasks"] and self.context.run["plan_approval_required"] and not self.context.run["plan_approved"]:
                     if not approve_plan and self.context.run["status"] == "awaiting_approval":

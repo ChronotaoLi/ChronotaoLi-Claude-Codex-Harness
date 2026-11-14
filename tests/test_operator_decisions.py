@@ -75,7 +75,7 @@ class OperatorDecisionTests(unittest.TestCase):
         engine.context.run['dispatches'].append({'id': 'later', 'task_id': 'one', 'invoked': True})
         before = set((engine.context.directory / 'decisions').iterdir())
         with self.assertRaisesRegex(HarnessError, 'stale'):
-            engine.record_operator_decisions(records)
+            engine.commit_resume_inputs(records)
         self.assertEqual(engine.context.run['operator_decisions'], [])
         self.assertEqual(set((engine.context.directory / 'decisions').iterdir()), before)
 
@@ -83,10 +83,10 @@ class OperatorDecisionTests(unittest.TestCase):
         engine = self.engine
         request = engine.request()
         self.assertEqual(engine.request()['id'], request['id'])
-        engine.record_operator_decision(engine.prepare_operator_decision(engine.response(request, 'stop')))
+        engine.commit_resume_inputs([engine.prepare_operator_decision(engine.response(request, 'stop'))])
         self.assertEqual(engine.pending_decision('one')['response']['decision'], 'stop')
         path = engine.response(request)
-        engine.record_operator_decision(engine.prepare_operator_decision(path))
+        engine.commit_resume_inputs([engine.prepare_operator_decision(path)])
         self.assertIsNone(engine.pending_decision('one'))
         self.assertIsNone(engine.prepare_operator_decision(path))
         self.assertEqual(len(engine.context.run['operator_decisions']), 2)
@@ -146,7 +146,7 @@ class OperatorDecisionTests(unittest.TestCase):
     def test_packet_scopes_latest_answers_and_preserves_references(self):
         engine = self.engine
         request = engine.request()
-        engine.record_operator_decision(engine.prepare_operator_decision(engine.response(request)))
+        engine.commit_resume_inputs([engine.prepare_operator_decision(engine.response(request))])
         unrelated = engine.decision_packet({}, task_id='two')
         self.assertNotIn('operator_decisions', unrelated)
         self.assertIn('operator_decision_index', unrelated)
@@ -170,7 +170,7 @@ class OperatorDecisionTests(unittest.TestCase):
         with self.assertRaises(HarnessError):
             engine.register_decision_request('one', 'one', 'worker', engine.source, 'Fabricated question')
         request = engine.register_decision_request('one', 'one', 'worker', engine.source, 'Select the option')
-        engine.record_operator_decision(engine.prepare_operator_decision(engine.response(request)))
+        engine.commit_resume_inputs([engine.prepare_operator_decision(engine.response(request))])
         self.assertIsNone(engine.pending_decision('one'))
         engine.context.run['dispatches'].append({'id': 'unrelated', 'task_id': 'two', 'invoked': True})
         with self.assertRaisesRegex(HarnessError, 'stale after subsequent model invocation'):
@@ -194,7 +194,7 @@ class OperatorDecisionTests(unittest.TestCase):
         engine.context.run['accepted']['one']['worker_source'] = engine.source.copy()
         request = engine.register_decision_request('two', 'one', 'handoff', engine.source, requests[0]['question'], 'choice')
         engine.context.run['dispatches'].append({'id': 'unrelated', 'task_id': 'other', 'invoked': True})
-        engine.record_operator_decision(engine.prepare_operator_decision(engine.response(request)))
+        engine.commit_resume_inputs([engine.prepare_operator_decision(engine.response(request))])
         engine.context.run['accepted']['two'] = {'commit': 'accepted'}
         engine.validate_decision_links()
         with self.assertRaises(HarnessError):
@@ -220,10 +220,10 @@ class OperatorDecisionTests(unittest.TestCase):
         request = engine.request()
         path = engine.response(request)
         prepared = engine.prepare_operator_decision(path)
-        engine.record_operator_decision(prepared)
+        engine.commit_resume_inputs([prepared])
         row = engine.context.run['operator_decisions'].pop()
         original = Path(row['artifact']).read_bytes()
-        engine.record_operator_decision(engine.prepare_operator_decision(path))
+        engine.commit_resume_inputs([engine.prepare_operator_decision(path)])
         self.assertEqual(Path(row['artifact']).read_bytes(), original)
         self.assertEqual(len(engine.context.run['operator_decisions']), 1)
         self.assertEqual(engine.context.run['operator_decisions'][0]['id'], row['id'])
@@ -253,7 +253,7 @@ class OperatorDecisionTests(unittest.TestCase):
         prepared = self.engine.prepare_operator_decision(self.engine.response(request))
         self.engine.context.run['pending_acceptance'] = {'task_id': 'one'}
         with self.assertRaises(HarnessError):
-            self.engine.record_operator_decision(prepared)
+            self.engine.commit_resume_inputs([prepared])
         self.assertFalse(self.engine.context.run['operator_decisions'])
 
 

@@ -58,8 +58,8 @@ class Runtime:
     def operation(self):
         return self.context.operation
 
-    def start(self, goal, plan=None, *, pause_after_plan=False, step=False):
-        return self.services.lifecycle.start(goal, plan, pause_after_plan=pause_after_plan, step=step)
+    def start(self, goal, plan=None, *, scope=(), pause_after_plan=False, step=False):
+        return self.services.lifecycle.start(goal, plan, scope=scope, pause_after_plan=pause_after_plan, step=step)
 
     def load_run(self, ident):
         return self.services.lifecycle.load_run(ident)
@@ -68,12 +68,12 @@ class Runtime:
         return self.services.lifecycle.abandon(ident, confirm_exited=confirm_exited)
 
     def resume(self, ident, *, step=False, approve_plan=False, reverify=False, confirm_exited=(),
-               allow_scope=(), environment_update=None, operator_decision=None,
-               execution_guidance=None, reject_continuation=None):
+               scope=(), environment_update=None, operator_decision=None,
+               execution_guidance=None, reject_request=None):
         return self.services.lifecycle.resume(ident, step=step, approve_plan=approve_plan, reverify=reverify,
             confirm_exited=confirm_exited,
-            allow_scope=allow_scope, environment_update=environment_update, operator_decision=operator_decision,
-            execution_guidance=execution_guidance, reject_continuation=reject_continuation)
+            scope=scope, environment_update=environment_update, operator_decision=operator_decision,
+            execution_guidance=execution_guidance, reject_request=reject_request)
 
     def execute(self, supplied_plan=None, *, step=False):
         return self.services.scheduler.execute(supplied_plan, step=step)

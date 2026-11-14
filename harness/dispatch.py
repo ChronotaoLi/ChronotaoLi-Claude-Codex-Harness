@@ -11,7 +11,7 @@ from . import stops
 from .adapters import provider_usage, UndecodableOutput
 from .context import compose
 from .continuation import validate_continuation_rejection
-from .receipts import ERROR_EXCERPT_CHARS, InvalidOutput, InvalidReviewRejection, ScopeStop
+from .receipts import ERROR_EXCERPT_CHARS, InvalidOutput, InvalidReviewRejection, judged_decide, RetainedProposal
 from .input_projection import validate_dispatch_indexes as validate_input_dispatch_indexes
 from .path_evidence import validate_dispatch_indexes, validate_indexes
 from .planning import attempt_limit_error
@@ -113,9 +113,9 @@ class Dispatcher(RuntimeService):
 
         Only the run's last model call counts: when it is an invalid output of
         this same call without retry_of, this call is its one automatic redo.
-        When that invalid output was itself a redo, or a revision stopped only
-        for scope authority (never redone), this is a new request (a resume
-        after the stop), still shown the previous invalid output.
+        When that invalid output was itself a redo, this is a new request (a
+        resume after the stop), still shown the previous invalid output. A held
+        proposal is ``completed``, never a redo basis.
         """
         last = last_model_call(self.context.run["dispatches"])
         if last is None or dispatch_key(last) != key or last.get("status") != "invalid":
@@ -124,7 +124,7 @@ class Dispatcher(RuntimeService):
         previous = {"dispatch_id": last["id"], "artifact": source["artifact"],
                     "artifact_digest": source["artifact_digest"],
                     "error": str(last.get("error", ""))[:ERROR_EXCERPT_CHARS]}
-        return previous, (None if last.get("retry_of") or "out_of_scope_paths" in last else last["id"])
+        return previous, (None if last.get("retry_of") else last["id"])
 
     def dispatch(self, role, kind, task_id, schema, packet, task=None):
         validate_dispatch_indexes(self.context.directory, self.context.run["dispatches"])
@@ -166,7 +166,7 @@ class Dispatcher(RuntimeService):
             except InvalidOutput as invalid:
                 if invalid.entry.get("retry_of"):
                     raise self.stop_invalid(role, invalid) from invalid
-            except (InvalidReviewRejection, ScopeStop):
+            except (InvalidReviewRejection, RetainedProposal):
                 raise
             except HarnessError as error:
                 if role == "worker" and key in self.context.run["worker_receipts"]:
@@ -429,7 +429,7 @@ class Dispatcher(RuntimeService):
                 return self.services.receipts.finish_review_receipt(key, schema)
             if role == "commander":
                 return self.services.receipts.finish_commander_receipt(f"{role}:{kind}:{task_id}")
-        except (InvalidReviewRejection, InvalidOutput, ScopeStop):
+        except (InvalidReviewRejection, InvalidOutput, RetainedProposal):
             # Already judged: the entry carries its verdict, never "failed".
             raise
         except BaseException as error:
@@ -448,9 +448,10 @@ class Dispatcher(RuntimeService):
                     artifact = job / "returned-result.json"
                     if artifact.is_file() and not artifact.is_symlink():
                         bound["artifact_digest"] = hashlib.sha256(artifact.read_bytes()).hexdigest()
-            if entry["status"] not in JUDGED:
+            if entry["status"] not in JUDGED and not judged_decide(entry):
                 # A judged delivery keeps its verdict (e.g. an invalid blocker's
-                # stop); only an unjudged failure becomes "failed".
+                # stop, or a decide original judged valid); only an unjudged
+                # failure becomes "failed".
                 entry["status"] = "failed"
                 entry["error"] = str(error)
             if receipt is not None:

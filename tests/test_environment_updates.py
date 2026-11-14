@@ -301,7 +301,7 @@ class EnvironmentUpdateTests(RepoCase):
     def test_conflicting_recovery_options_reject_before_dispatch(self):
         engine, backend, path, value = self.blocked()
         for options in ({'reverify': True},
-                        {'allow_scope': ['extra.py']}):
+                        {'scope': ['extra.py']}):
             with self.subTest(options=options), self.assertRaises(HarnessError):
                 self.engine(backend).resume(engine.run['id'], environment_update=path, **options)
             self.assertEqual(len(backend.calls), 1)

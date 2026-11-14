@@ -57,7 +57,7 @@ class DescriptionBackend(ScriptedBackend):
             result.update(verdict="request_changes", findings=[finding()])
         if trigger_kind(kwargs, packet) == "task" and packet["trigger"]["feedback"] and len(packet.get("accepted", {})) == 0:
             updates = [{"id": "greet", "description": "Refined execution detail for the same greeting acceptance",
-                        "add_depends_on": ["prepare"] if self.prerequisite else []}]
+                        "add_depends_on": ["prepare"] if self.prerequisite else [], "add_allowed_paths": [], "add_required_commands": []}]
             new_tasks = []
             if self.prerequisite:
                 prerequisite = copy.deepcopy(self.case.plan()["tasks"][0])

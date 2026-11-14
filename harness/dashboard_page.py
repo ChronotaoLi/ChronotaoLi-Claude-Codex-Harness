@@ -263,7 +263,8 @@ APP_JS = r""""use strict";
     environment_checked: "环境检查", command_requirements_checked: "命令授权检查",
     task_checkpoint_recorded: "记录检查点", output_invalid: "输出无效", candidate_preflight_failed: "候选预检失败",
     pending_task_invalidated: "待处理任务作废", pending_acceptance_invalidated: "待接受结果作废",
-    broad_scope_warning: "范围过宽提示", scope_extension_approved: "范围扩展已批准",
+    broad_scope_warning: "范围过宽提示", scope_extended: "范围边界已扩大", proposal_rejected: "指挥提案已拒绝",
+    proposal_plan_archived: "已归档被拒提案的计划文件",
     resume_config_relaxed: "恢复时放宽配置"
   };
 
@@ -798,7 +799,11 @@ APP_JS = r""""use strict";
     }
     if (run.status === "paused") { add("warn", "运行已暂停", [notice("不会自动继续，需要显式恢复。")]); }
     if (run.status === "awaiting_approval") {
-      add("warn", "计划等待批准", [notice("普通恢复不会批准计划。"), resumeHint(data.id, "--approve-plan")]);
+      var bounds = summary.scope;
+      add("warn", "计划等待批准", [notice("普通恢复不会批准计划。"),
+        bounds ? notice(bounds.declared ? "范围边界：" + bounds.entries.join("、") +
+          "；计划模式是否在边界内见 status 的 scope_summary（分组只做导航）" : "范围边界未声明：首版计划不受边界约束", "hint") : null,
+        resumeHint(data.id, "--approve-plan")].filter(function (node) { return node !== null; }));
     }
     (summary.pending_decisions || []).forEach(function (item, index) {
       add("warn", "等待操作者决定" + (item.task_id ? "：" + item.task_id : ""), [
@@ -827,7 +832,7 @@ APP_JS = r""""use strict";
         line("item-sub", "任务 " + show(cont.task_id) + " · 状态 " + show(cont.state)),
         cont.request ? longText("continuation:request", JSON.stringify(cont.request), TEXT_EXCERPT) : null,
         cont.state === "revision_pending" ? null : notice("满足请求（追加精确授权或调整超时）后普通 resume 继续；需要先修正时可拒绝该请求。", "hint"),
-        cont.state === "revision_pending" ? null : resumeHint(data.id, "--reject-continuation FILE")]);
+        cont.state === "revision_pending" ? null : resumeHint(data.id, "--reject-request FILE")]);
     }
     if (summary.convergence && summary.convergence.warnings && summary.convergence.warnings.length) {
       add("warn", "返工提示（仅供判断）", [list(summary.convergence.warnings.map(function (item) {
@@ -1342,6 +1347,7 @@ APP_JS = r""""use strict";
       ["run", mono(data.id)], ["台账状态（原始值）", run.status], ["分支", mono(run.branch)], ["工作树（仅显示）", mono(run.worktree)], ["工作树已删除", run.worktree_removed],
       ["仓库（仅显示）", mono(run.repo)], ["配置（仅显示）", mono(run.config_path)], ["指挥", run.commander],
       ["当前任务", run.current_task],
+      ["范围边界", Array.isArray(run.scope) ? (run.scope.length ? run.scope.join("、") : "未声明") : UNAVAILABLE],
       ["已接受任务", summary.accepted_tasks ? summary.accepted_tasks.join("、") || "无" : UNAVAILABLE],
       ["基线提交", mono(run.base_commit)], ["期望 HEAD", mono(run.expected_head)],
       ["台账版本", data.schema_version],

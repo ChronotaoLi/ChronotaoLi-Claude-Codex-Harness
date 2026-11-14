@@ -333,14 +333,14 @@ class DecisionRecovery(RuntimeService):
                 records.append(record)
         return values, records
 
-    def record_operator_decision(self, record):
-        self.record_operator_decisions([] if record is None else [record])
+    def commit_resume_inputs(self, records, *, scope_added=(), relaxed_config=None):
+        """Prewrite immutable answers and audit the boundary, then publish the answers, the
+        widened boundary and the adopted configuration relaxation in one ledger save.
 
-    def record_operator_decisions(self, records):
-        """Prewrite immutable evidence, then publish all answers in one ledger save.
-
-        Orphan artifacts from an interrupted prewrite are harmless and are reused
-        on retry. No model may run before this method has returned successfully.
+        All or nothing: every commit holds all three old or all three new values, and a
+        failed save restores them in memory. Orphan answer artifacts from an interrupted
+        prewrite are harmless and are reused on retry. No model may run before this
+        method has returned successfully.
         """
         prepared_records = []
         seen = set()
@@ -357,20 +357,29 @@ class DecisionRecovery(RuntimeService):
             if any(record.get(k) != prepared[k] for k in prepared if k != 'recorded_at'):
                 raise HarnessError('prepared operator decision changed')
             prepared_records.append(record)
-        if not prepared_records:
-            return
         # A conflicting retry (answers resubmitted in another order) is refused before
         # any file is written, so the original order still matches afterwards.
         for record in prepared_records:
             self._written_decision_artifact(record)
         rows = [self._decision_artifact(record, 'operator_decision_recorded')
                 for record in prepared_records]
-        old = self.context.run.get('operator_decisions', [])
-        self.context.run['operator_decisions'] = [*old, *rows]
+        run = self.context.run
+        added = [pattern for pattern in scope_added if pattern not in run['scope']] if scope_added else []
+        if added:
+            # Audit first: an interruption must not leave an unaudited boundary.
+            self.context.event('scope_extended', added=added, scope=[*run['scope'], *added])
+        if not rows and not added and relaxed_config is None:
+            return
+        old = {key: run[key] for key in ('operator_decisions', 'scope', 'config_snapshot') if key in run}
+        run['operator_decisions'] = [*run.get('operator_decisions', []), *rows]
+        if added:
+            run['scope'] = [*run['scope'], *added]
+        if relaxed_config is not None:
+            run['config_snapshot'] = deepcopy(relaxed_config)
         try:
             self.context.save()
         except BaseException:
-            self.context.run['operator_decisions'] = old
+            run.update(old)
             raise
 
     def _decision_index(self, records):
