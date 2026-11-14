@@ -132,12 +132,14 @@ class Verification(RuntimeService):
                             pass
                 if error is None:
                     error = persistence_error
-            if error is not None and not isinstance(error, ProcessTimeout):
+            # The command boundary (spec 4.3 cells 1-2): process facts come first. A timeout is a
+            # verification result only when its cleanup and persistence were clean.
+            from .dispatch import process_stop
+            stop = process_stop(error, entry["id"]) if error is not None else None
+            faulty = stop is not None and stop["kind"] == "evidence"
+            if error is not None and (not isinstance(error, ProcessTimeout) or faulty):
                 self.context.run["feedback"] = {"task_id": task_id,
                     "verification_error": {"argv": command, "error": str(error), "log": str(log)}}
-                # The command boundary (spec 4.3 cells 1-2): process facts type an untyped failure.
-                from .dispatch import process_stop
-                stop = process_stop(error, entry["id"])
                 if stop is not None and not (isinstance(error, HarnessError) and error.stop is not None):
                     if isinstance(error, HarnessError):
                         error.stop = stop

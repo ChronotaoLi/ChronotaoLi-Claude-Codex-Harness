@@ -14,7 +14,7 @@ import time
 
 from .contracts import validate_work_core
 from .worker_receipts import delivered_work_contract
-from .util import HarnessError, dump, write_json
+from .util import EvidenceError, HarnessError, dump, write_json
 
 _SHA = re.compile(r"[0-9a-f]{64}\Z")
 _SAFE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,119}\Z")
@@ -135,7 +135,10 @@ class ProgressRecovery(RuntimeService):
             return _validation.sources[key]
         raw = _read(expected)
         if _digest(raw) != source["artifact_digest"]:
-            raise HarnessError("checkpoint original result changed", stop=stops.make("evidence", "runtime_integrity"))
+            # Changed evidence, by class: the load boundary and settling make it load_integrity.
+            raise EvidenceError("checkpoint original result changed", stop=stops.make(
+                "evidence", "runtime_integrity",
+                source={"artifact": str(expected), "artifact_digest": source["artifact_digest"]}))
         try:
             result = json.loads(raw)
         except (ValueError, UnicodeError) as error:

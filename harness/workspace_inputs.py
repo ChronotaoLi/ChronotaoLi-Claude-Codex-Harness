@@ -216,7 +216,14 @@ def prepare_run(repo, ident, manifest):
         store.attach(run)
         before = _gate(run, directory)
         with stops.classify('invalid_input', 'input_schema', data={'option': 'manifest'}):
-            value = _read(Path(manifest).absolute()) if isinstance(manifest, (str, Path)) else manifest
+            if isinstance(manifest, (str, Path)):
+                try:
+                    value = _read(Path(manifest).absolute())
+                except (OSError, ValueError, RecursionError) as error:
+                    # The operator's file (missing, unreadable, not UTF-8 JSON): this call's input is refused.
+                    raise HarnessError(f'manifest cannot be read as JSON: {error}') from error
+            else:
+                value = manifest
             value = _manifest(run, value)
         frozen, journal = _registered(run, directory)
         journal_path = directory / 'workspace-inputs.json'

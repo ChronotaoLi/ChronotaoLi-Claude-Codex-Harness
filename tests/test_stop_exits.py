@@ -25,7 +25,7 @@ from harness.process_runtime import ProcessOutcome
 from harness.runtime import Runtime
 from harness.util import HarnessError, read_json, write_json
 from test_decide import DecideCase, Script, ask, block_first, blocked_by_task, implement, task
-from test_harness import (ROOT, RepoCase, cli_notice, continues_without_stop, no_command_exit, refused_by_cli,
+from test_harness import (ROOT, RepoCase, cli_notice, continues_without_stop, no_command_exit, refused_by_cli, scratch,
                           run_cli, walk_exit, walk_notice_exit)
 from test_runtime_changes import ScriptedBackend, revised, trigger_kind
 
@@ -193,7 +193,7 @@ class PlanRowTests(RepoCase):
     def test_plan_file(self):
         bad = plan()
         bad["tasks"][0]["allowed_paths"] = ["../outside"]
-        path = self.repo.parent / "plan.json"
+        path = scratch(self) / "plan.json"
         write_json(path, bad)
         backend = ScriptedBackend()
         notice = refused_by_cli(self, backend, ["run", "Implement greet", "--plan", str(path)],
@@ -305,7 +305,7 @@ class ExitRowTests(RepoCase):
                 if exit_number:
                     self.setUp()
                 backend, engine, worker = self.blocked_by_environment()
-                update = self.repo.parent / "update.json"
+                update = scratch(self) / "update.json"
                 write_json(update, {"schema_version": 1, "task_id": "greet", "blocker_dispatch_id": worker["id"],
                                     "summary": "Docker restarted"})
                 after = walk_exit(self, engine.directory, ("environment", "worker_blocked"), backend=backend,
@@ -675,7 +675,7 @@ class WorkspaceRowTests(RepoCase):
         tracked = engine.worktree / "hello.py"
         accepted = tracked.read_bytes()
         tracked.write_bytes(accepted + b"# unreviewed\n")
-        answer = self.repo.parent / "continue.json"
+        answer = scratch(self) / "continue.json"
         write_json(answer, {"schema_version": 1, "request_id": request["id"], "task_id": "final",
                             "decision": "continue", "summary": "Proceed with the edited tree."})
         with self.assertRaises(HarnessError):
@@ -859,7 +859,7 @@ class InputRowTests(RepoCase):
         with self.assertRaises(HarnessError):
             engine.start("Implement greet", plan())
         request = engine.run["decision_requests"][-1]
-        answer = self.repo.parent / "answer.json"
+        answer = scratch(self) / "answer.json"
         return backend, engine, request, answer
 
     def test_input_arguments(self):
@@ -939,7 +939,7 @@ def final_failure_scenario(case):
 
 
 def final_answer(case, request, decision="continue"):
-    path = case.repo.parent / f"answer-{decision}.json"
+    path = scratch(case) / f"answer-{decision}.json"
     write_json(path, {"schema_version": 1, "request_id": request["id"], "task_id": "final",
                       "decision": decision, "summary": "环境已修复，请对同一快照重验"})
     return path
@@ -1055,7 +1055,7 @@ class RefusalRowTests(RepoCase):
 
     def test_incompatible_options(self):
         backend, engine = self.blocked()
-        update = self.repo.parent / "update.json"
+        update = scratch(self) / "update.json"
         write_json(update, {"schema_version": 1})
         before = (engine.directory / "state.json").read_bytes()
         refused_by_cli(self, backend, ["resume", engine.run["id"], "--reverify", "--environment-update", str(update)],

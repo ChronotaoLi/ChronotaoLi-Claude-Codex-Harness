@@ -211,6 +211,13 @@ def run_cli(case, backend, argv):
     return code, errors.getvalue()
 
 
+def scratch(case):
+    """A private folder outside the repository for this test's input files (never the shared temp root)."""
+    folder = tempfile.TemporaryDirectory()
+    case.addCleanup(folder.cleanup)
+    return Path(folder.name)
+
+
 def cli_notice(errors):
     """The last ``[harness-json]`` stop line of a CLI call's stderr."""
     lines = [line for line in errors.splitlines() if line.startswith("[harness-json] ")]
@@ -299,17 +306,23 @@ def injected(error):
 
 
 def install_stop_guards(case):
-    """G7: no runtime stop is unclassified. G10: a stop's listed exits are not blocked by the load checks.
+    """G7: no runtime stop is unclassified. G10: a published stop's listed exits are not blocked by the load checks.
 
-    G7 wraps Workflow.stop and the resume/abandon/start operations; an
-    ``unclassified`` stop whose innermost frame is in the runtime (or the standard
-    library) fails the test, unless the class sets ``allow_unclassified``. G10, after
-    every saved stop, loads the run with a fresh Runtime: listed ``resume``/``abandon``
-    exits imply the load passes, ``load_integrity`` implies it is refused. In
-    ``addCleanup`` (after the body and tearDown, before the temporary directory is
-    removed), if the run still holds that saved stop, the first listed ``abandon``
-    exit is executed on the original fixture. Stops the test continued past are
-    skipped; operation refusals and CLI projections are guarded elsewhere.
+    What they see, and no more:
+
+    - G7 wraps ``Workflow.stop``, ``Runtime.start``/``resume``/``abandon`` and the module function
+      ``workspace_inputs.prepare_run`` (the CLI looks it up at call time; a test that imported the
+      function by name calls it unwrapped). An ``unclassified`` stop whose innermost frame is in the
+      runtime or the standard library fails the test, unless the class sets ``allow_unclassified``;
+      one raised by test code (a frame under ``tests/``, or a patched ``side_effect`` in
+      ``unittest.mock``) is exempt (``injected()``, self-tested in test_stop_guards.InjectionRule).
+    - G10 checks every stop saved through ``Workflow.stop`` and every plan awaiting approval that
+      ``start``/``resume`` return (saved, or reported again): a fresh ``Runtime`` loads the run, and
+      listed ``resume``/``abandon`` exits imply the load passes, ``load_integrity`` that it is
+      refused. In ``addCleanup`` (after the body and tearDown, before the temporary directory is
+      removed), if the run still holds that saved stop and still loads, the first listed ``abandon``
+      exit is executed on the original fixture. It does not see operation refusals (G1 and the row
+      tests check those), CLI projections (G11), or a stop whose evidence the test changed later.
     """
     import shlex
     from unittest.mock import patch
@@ -327,12 +340,9 @@ def install_stop_guards(case):
                 tb = tb.tb_next
             unclassified.append((value["reason"], type(error).__name__, str(error)[:160], where))
 
-    def stop(workflow, error):
-        result = original_stop(workflow, error)
-        note(error)
-        run = workflow.context.run
+    def published(run, directory):
         value = run.get("stop") or {}
-        path = workflow.context.directory / "state.json"
+        path = directory / "state.json"
         if value.get("kind") and path.exists():
             try:
                 Runtime(case.config, case.repo, backend=DemoBackend()).load_run(run["id"])
@@ -344,7 +354,12 @@ def install_stop_guards(case):
                 mismatches.append(("exit listed but the load fails", value["kind"], value["reason"]))
             if value["reason"] == "load_integrity" and loads:
                 mismatches.append(("load_integrity but the load passes", value["kind"], value["reason"]))
-            seen[run["id"]] = (value, path.read_bytes(), workflow.context.directory, case.config, case.repo)
+            seen[run["id"]] = (value, path.read_bytes(), directory, case.config, case.repo)
+
+    def stop(workflow, error):
+        result = original_stop(workflow, error)
+        note(error)
+        published(workflow.context.run, workflow.context.directory)
         return result
 
     def operation(name):
@@ -352,7 +367,19 @@ def install_stop_guards(case):
 
         def wrapped(runtime, *args, **kwargs):
             try:
-                return original(runtime, *args, **kwargs)
+                result = original(runtime, *args, **kwargs)
+            except BaseException as error:
+                note(error)
+                raise
+            if isinstance(result, dict) and result.get("status") == "awaiting_approval":
+                published(result, runtime.directory)  # the approval stop: saved, or reported again
+            return result
+        return wrapped
+
+    def guarded(function):
+        def wrapped(*args, **kwargs):
+            try:
+                return function(*args, **kwargs)
             except BaseException as error:
                 note(error)
                 raise
@@ -387,7 +414,10 @@ def install_stop_guards(case):
             if status != "abandoned":
                 mismatches.append(("listed abandon failed", value["kind"], value["reason"], " ".join(words), status))
 
-    patches = [patch.object(Workflow, "stop", stop)] + [
+    case.stop_guard_findings = {"unclassified": unclassified, "mismatches": mismatches}  # for the guards' self-tests
+    from harness import workspace_inputs
+    patches = [patch.object(Workflow, "stop", stop),
+               patch.object(workspace_inputs, "prepare_run", guarded(workspace_inputs.prepare_run))] + [
         patch.object(Runtime, name, operation(name)) for name in ("start", "resume", "abandon")]
     for item in patches:
         item.start()

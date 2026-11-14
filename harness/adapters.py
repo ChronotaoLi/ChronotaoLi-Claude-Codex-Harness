@@ -14,7 +14,7 @@ from . import stops
 from .command_server import create_manifest
 from .provider_failures import claude_http_status
 from .shared import mcp_configs, toml_value
-from .util import HarnessError, dump, read_json, run_process, strict_json_loads, tail, write_json
+from .util import EvidenceError, HarnessError, dump, read_json, run_process, strict_json_loads, tail, write_json
 from .worker_returns import decode_terminal
 
 
@@ -279,7 +279,7 @@ class CLIBackend:
             # invocation. Only use it unchanged; never write or replace it here.
             if (contract.is_symlink() or not contract.is_file()
                     or contract.read_bytes() != (dump(schema) + "\n").encode("utf-8")):
-                raise HarnessError(f"worker 契约文件缺失或与本次调用不符；保留现场：{contract}", stop=stops.make("evidence", "runtime_integrity", source={"artifact": str(contract), "dispatch_id": Path(job).name}))
+                raise EvidenceError(f"worker 契约文件缺失或与本次调用不符；保留现场：{contract}", stop=stops.make("evidence", "runtime_integrity", source={"artifact": str(contract), "dispatch_id": Path(job).name}))
         else:
             write_json(contract, schema)
         (job / "prompt.txt").write_text(prompt, encoding="utf-8")

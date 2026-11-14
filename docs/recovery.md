@@ -45,9 +45,12 @@
 
 “停止信息”是 `status RUN` 的 `stop.detail` 或 stderr 的第一行（节选）。每个停止都有类型 `stop.kind/stop.reason`；外层按类型选择下表的行，`stop.exits` 给出可直接执行的出口命令，`data`、`source` 给出出口所需的身份（请求号、任务、派发、原件路径与摘要）。行标识是稳定的名字，`tests/test_stop_exits.py` 用它把行与走完出口的用例绑在一起；同一类型因情形不同（例如环境阻断的两条路由）分成几行。
 
-表的读法：类型后标“（操作）”的行是本次调用被拒或失败，停止只在 stderr 与操作记录里，不写入台账；其余行写入台账（`status RUN` 可见）。“出口命令”一列就是登记表给出的 `stop.exits` 模板：`RUN` 换成 run ID，`{dispatch_id}` 取自 `source.dispatch_id`，`FILE`、`PATTERN` 由操作者填写；带〔`flag`〕的只在 `data.flag` 为真时列出，〔`!flag`〕只在为假时列出。“无命令出口”表示不给可执行的命令，按“操作者该做什么”处理；“非停止”的行不停止 run。
+表的读法：类型后标“（操作）”的行是本次调用被拒或失败，停止只在 stderr 与操作记录里，不写入台账；其余行写入台账（`status RUN` 可见）。这个标记说的是该行的情形，同一类型在别的情形可能落在另一个边界（例如 `command-exit`、`head-changed`）。“出口命令”一列就是登记表给出的 `stop.exits` 模板：`RUN` 换成 run ID，`{dispatch_id}` 取自 `source.dispatch_id`，`FILE`、`PATTERN` 由操作者填写；带〔`flag`〕的只在 `data.flag` 为真时列出，〔`!flag`〕只在为假时列出。“无命令出口”表示不给可执行的命令，按“操作者该做什么”处理；“非停止”的行不停止 run。
 
-停止在落盘或上抛之前会“定稿”：加载核验重跑一次，若此刻台账或加载核验的证据已不符，最终的停止就是那次加载失败（`evidence/load_integrity` 或 `runtime_failure/io`，`data.superseded` 记下原来的停止），所以列出的 `resume`／`abandon` 在那一刻不会被加载核验挡住；中断不定稿。
+停止在落盘、上抛或重报之前会“定稿”：加载核验重跑一次，若此刻台账或加载核验的证据已不符，最终的停止就是那次加载失败（`evidence/load_integrity` 或 `runtime_failure/io`，`data.superseded` 记下原来的停止）。进入计划待批准的保存与普通 `resume` 对它的重报同样定稿：失败时本次调用以那次加载失败结束（退出 1），不是待批准、不是 0。
+
+- 保证：已落盘、已上抛或已重报的停止，在那一刻列出的 `resume`／`abandon` 不被加载核验挡住；加载核验失败时，`resume`、`abandon` 报告的是加载失败自己的类型，不列命令出口。
+- 不保证：中断不做定稿复核（中断的停止只区分已开始的进程是否都确认了退出）；定稿之后证据再被改动，之前列出的出口可能被挡住；出口只保证不被加载核验挡住，不保证走到“操作者该做什么”预期的结果——别的门禁仍然生效，也可能得到新的停止（例如确认退出之后转到只能放弃的停止）。
 
 ### 退出码
 
@@ -77,7 +80,7 @@
 | `agent-turns` | `budget/agent_turns` | 3 | Claude 轮数用尽（信封 `subtype=error_max_turns`，计一次工作尝试） | 核对候选进展，再决定是否提高 `claude_max_turns_by_role` | `resume RUN` |
 | `final-timeout` | `verification/final_timeout` | 3 | `整体验证超时` | 修复环境或提高 `verify_timeout_seconds`；普通 `resume` 在同一快照重验 | `resume RUN` |
 | `dispatch-exit` | `process_unconfirmed/dispatch_exit` | 3 | `旧 dispatch … 的进程组仍存在` 或 `无法确认旧 dispatch … 已退出` | 核实该进程及其命令子进程已退出，不终止无关进程；终态 run 用 `cleanup-run` 的同名选项。`data.returned_unsealed` 为真时，这是一个已返回对象结果、尚未封存的 worker：未封存的结果事后不补认，确认之后只能放弃，所以不列 `resume`；为假时，确认之后 worker 的这次调用按原件判定（可重试、无效输出或未封存结果都可能） | 〔`!returned_unsealed`〕`resume RUN --confirm-exited {dispatch_id}`；`abandon RUN --confirm-exited {dispatch_id}` |
-| `command-exit` | `process_unconfirmed/command_exit`（操作） | 3 | `Cannot confirm command process exited: …` | 同上；用父 dispatch ID（`source.dispatch_id`）确认 | 〔`!returned_unsealed`〕`resume RUN --confirm-exited {dispatch_id}`；`abandon RUN --confirm-exited {dispatch_id}` |
+| `command-exit` | `process_unconfirmed/command_exit`（操作） | 3 | `Cannot confirm command process exited: …`。本行是恢复预检的拒绝；运行中发现时（例如 worker 返回、封存之前）同一类型作为 run 停止写入台账 | 同上；用父 dispatch ID（`source.dispatch_id`）确认 | 〔`!returned_unsealed`〕`resume RUN --confirm-exited {dispatch_id}`；`abandon RUN --confirm-exited {dispatch_id}` |
 | `provider-quota` | `provider_quota/usage_limit` | 3 | 供应商额度用尽（Claude 信封 `api_error=usage_limit_reached`；`source.artifact` 是失败原件 `process.stdout` 与摘要） | 等额度恢复后普通 `resume`；worker 的这次调用已当场判定，不计工作尝试，仍计入 `max_agent_dispatches`；额度未恢复时会再失败一次 | `resume RUN` |
 | `provider-rate-limit` | `provider_quota/rate_limit` | 3 | 供应商限速（`api_error=rate_limit_error`，或没有标签而 `api_error_status=429`） | 稍后普通 `resume`；worker 不计工作尝试 | `resume RUN` |
 | `provider-overloaded` | `provider_failure/overloaded` | 3 | 供应商过载（`api_error=overloaded_error`） | 稍后普通 `resume`；worker 不计工作尝试 | `resume RUN` |
@@ -113,7 +116,7 @@
 | `checks-modified` | `verification/checks_modified_files` | 3 | 验证或依赖准备修改了受检文件 | 让验证只读；验证生成的文件在 `info/exclude` 加精确模式 | `resume RUN` |
 | `dirty-final` | `workspace_mismatch/dirty_final_workspace` | 1 | `整体审阅要求干净的已接受提交` | 清理未接受的修改后普通 `resume`（下一步是派生的指挥决定，不重抽整体审阅），或放弃 | `resume RUN`；`abandon RUN` |
 | `binding-changed` | `workspace_mismatch/binding_changed` | 1 | worktree 的 `.git` 指向被改 | 保留现场核对 | `abandon RUN` |
-| `process-incomplete` | `evidence/process_incomplete` | 1 | 指挥、审阅或验证进程结束了，但退出观察留下清理或持久化故障 | 核实进程已退出；确认修不好已记下的故障，`resume` 照样被拒 | 〔`!exit_unconfirmed`〕`abandon RUN`；〔`exit_unconfirmed`〕`abandon RUN --confirm-exited {dispatch_id}` |
+| `process-incomplete` | `evidence/process_incomplete` | 1 | 指挥、审阅或验证进程结束了，但退出观察留下清理或持久化故障 | 核实进程已退出。列出的只有放弃：确认退出修不好已记下的故障。按实际情形，`resume`（退出未确认时带 `--confirm-exited ID`）的结果不同：指挥或审阅进程正常结束、结果已返回而 outcome 未完整落盘时，`resume` 仍被拒；指挥或审阅调用没有返回结果（例如超时且清理出错）时，`resume` 丢弃无返回的意图并重新派发；验证命令进程（例如超时且清理出错）时，`resume` 重新执行验证 | 〔`!exit_unconfirmed`〕`abandon RUN`；〔`exit_unconfirmed`〕`abandon RUN --confirm-exited {dispatch_id}` |
 | `review-findings` | `budget/review_findings` | 3 | `待核验阻断问题超过单次审阅容量` | 合法历史下的容量阻塞：拆小任务另开 run | `abandon RUN` |
 | `runtime-io` | `runtime_failure/io` | 1 | 本地 I/O 失败（权限、句柄、设备、磁盘满） | 排查本地环境；证据未必损坏，不要“恢复原字节”；修好后重试原命令 | 无命令出口 |
 | `runtime-database` | `runtime_failure/database`（操作） | 1 | 记忆数据库错误 | 排查数据库；修好后重试原命令 | 无命令出口 |
@@ -122,7 +125,7 @@
 | `unclassified-exception` | `unclassified/unexpected_exception` | 1 | 未预期的异常 | 同上 | 无命令出口 |
 | `interrupted` | `interrupted/signal` | 130 | Ctrl-C、SIGTERM、SIGHUP | 确认中断原因；普通 `resume` 报出需要确认退出的确切派发 | `resume RUN`；〔`exits_confirmed`〕`abandon RUN` |
 | `input-arguments` | `invalid_input/cli_arguments`（操作） | 2 | 命令参数无效（例如 run ID 形式无效、run 不存在、目标为空） | 修正参数后重试 | 无命令出口 |
-| `input-file` | `invalid_input/input_schema`（操作） | 2 | 输入文件不合格（`--operator-decision`、`--environment-update` 等） | 修正文件后重试；拒绝发生在第一次写入之前时台账字节不变 | 无命令出口 |
+| `input-file` | `invalid_input/input_schema`（操作） | 2 | 输入文件不合格（`--operator-decision`、`--environment-update`、`--execution-guidance`、`--reject-continuation`、`prepare-run --manifest`），含文件不存在、读不出、不是 UTF-8 或不是 JSON | 修正文件后重试；读取与解析在任何写入之前，这些拒绝不改写台账（内容合法而之后的状态检查拒绝的，见各选项） | 无命令出口 |
 | `options` | `invalid_input/incompatible_options`（操作） | 2 | 选项不能同用（见[恢复选项与互斥](#恢复选项与互斥)） | 拆成合法的组合后重试 | 无命令出口 |
 | `stale-request` | `invalid_input/stale_request`（操作） | 2 | 输入针对的请求或来源已失效（未知请求、之后已有模型调用、已被新答复取代） | 用 `status RUN` 读当前请求后重答 | `status RUN` |
 | `run-state` | `invalid_input/run_state`（操作） | 2 | 该命令或选项不适用于 run 的当前状态（已放弃、已完成、有待处理阶段） | 用 `status RUN` 核对状态 | `status RUN` |
@@ -270,7 +273,7 @@ python3 -m harness --config /path/to/harness.toml --repo /path/to/project resume
 
 `completed` run 的普通 `resume` 返回保存结果，不派发；修改选项被拒绝。
 
-只支持台账版本 18。其他版本（含缺失或非整数的版本）的台账不迁移、不补默认值、不解释字段：`resume`、`abandon`、`prepare-run`、`cleanup-run`、`status RUN`（含 `--full`）、`watch`、`permission-diagnostics` 与观察网页的 run 详情都拒绝，worker 的命令 broker 与只读 MCP 读到这样的台账也拒绝，错误写明该 run 的台账版本与当前版本（`台账版本 N 不支持（当前版本 18）`；不是对象或缺版本时为“台账版本缺失或无效”），退出码 1，台账、工作树与检出都不改动。运行列表（不带 run 的 `status`、观察网页的列表）对这些目录只给出路径、版本和“不支持”；损坏或旧版本的目录不影响其他 run 的列出。原始 JSON 用文件工具查看。
+只支持台账版本 18。其他版本（含缺失或非整数的版本）的台账不迁移、不补默认值、不解释字段：`resume`、`abandon`、`prepare-run`、`cleanup-run`、`status RUN`（含 `--full`）、`watch`、`permission-diagnostics` 与观察网页的 run 详情都拒绝，worker 的命令 broker 与只读 MCP 读到这样的台账也拒绝，错误写明该 run 的台账版本与当前版本（`台账版本 N 不支持（当前版本 18）`；不是对象或缺版本时为“台账版本缺失或无效”），退出码 2（`cleanup-run` 仍为 1），台账、工作树与检出都不改动。运行列表（不带 run 的 `status`、观察网页的列表）对这些目录只给出路径、版本和“不支持”；损坏或旧版本的目录不影响其他 run 的列出。原始 JSON 用文件工具查看。
 
 旧版本 run 的工作树与验证检出不由当前版本清理：用对应版本的 Harness 清理，或人工核对后执行 `git worktree remove`。升级前应完成或放弃进行中的旧 run。
 

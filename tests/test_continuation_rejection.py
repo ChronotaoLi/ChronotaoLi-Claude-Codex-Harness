@@ -363,8 +363,8 @@ class RejectionLifecycleTests(RepoCase):
         engine, backend, path, _, _ = self.waiting(required_command=required)
         resumed = self.engine(backend)
         record = continuation.record_continuation_rejection
-        def revoke_after_record(context, rejection_path):
-            row = record(context, rejection_path)
+        def revoke_after_record(context, rejection_path, **kwargs):
+            row = record(context, rejection_path, **kwargs)
             # Model an in-process grant becoming unavailable after resume's
             # config compatibility check; task admission must still recheck.
             context.config.data['permissions']['worker_commands'].remove(required)

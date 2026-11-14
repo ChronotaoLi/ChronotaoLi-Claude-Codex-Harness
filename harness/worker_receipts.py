@@ -11,7 +11,7 @@ from . import git, stops
 from .contracts import judge_work, validate_work_core
 from .recovery import read_bound_result, snapshot_digest
 from .services import RuntimeService
-from .util import HarnessError, dump, read_json, write_json
+from .util import EvidenceError, HarnessError, dump, read_json, write_json
 from .worker_returns import inspect_return, validate_return_evidence
 
 # Worker inputs live beside the dispatch as immutable files; the ledger keeps
@@ -338,20 +338,20 @@ class WorkerReceipts(RuntimeService):
                 raise HarnessError('unsafe worker source reference')
             source = path.parent / name
             if any(parent.is_symlink() for parent in [source, *source.parents] if parent != path.parent and path.parent in parent.parents):
-                raise HarnessError('unsafe worker source evidence path', stop=stops.make("evidence", "runtime_integrity"))
+                raise EvidenceError('unsafe worker source evidence path', stop=stops.make("evidence", "runtime_integrity"))
             if source.is_symlink() or not source.is_file() or hashlib.sha256(source.read_bytes()).hexdigest() != expected:
-                raise HarnessError('worker source evidence changed', stop=stops.make("evidence", "runtime_integrity", source={"artifact": str(source)}))
+                raise EvidenceError('worker source evidence changed', stop=stops.make("evidence", "runtime_integrity", source={"artifact": str(source)}))
         if snapshot_digest(self.context.snapshot()) != record['candidate_digest']:
             raise HarnessError('worker candidate changed since sealed return', stop=stops.make("workspace_mismatch", "candidate_changed"))
         receipt.update(seal_digest=digest, phase='sealed')
         result = record['result']
         artifact = Path(receipt['artifact'])
         if artifact.is_symlink():
-            raise HarnessError('unsafe worker returned artifact', stop=stops.make("evidence", "runtime_integrity"))
+            raise EvidenceError('unsafe worker returned artifact', stop=stops.make("evidence", "runtime_integrity"))
         if artifact.exists():
             if (artifact.is_symlink() or read_json(artifact) != result or
                     receipt.get('artifact_digest', hashlib.sha256(artifact.read_bytes()).hexdigest()) != hashlib.sha256(artifact.read_bytes()).hexdigest()):
-                raise HarnessError('worker returned result changed', stop=stops.make("evidence", "runtime_integrity", source={"artifact": str(artifact)}))
+                raise EvidenceError('worker returned result changed', stop=stops.make("evidence", "runtime_integrity", source={"artifact": str(artifact)}))
         else:
             if 'artifact_digest' in receipt:
                 raise HarnessError('bound worker returned artifact missing')

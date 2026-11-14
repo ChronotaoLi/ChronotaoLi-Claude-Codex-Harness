@@ -130,6 +130,8 @@ class Scheduler(RuntimeService):
                     "plan_approval", "initial_plan",
                     data={"revision": plan["revision"], "task_count": len(self.context.run["tasks"])},
                     source={"artifact": plan["artifact"], "artifact_digest": plan["artifact_digest"]})
+                # Settled like every stop before its save: a load failure stops the run instead.
+                self.services.lifecycle.settle_publication("plan_approval", "initial_plan")
                 self.context.save()
                 self.context.checkpoint()
                 self.context.event("plan_awaiting_approval")

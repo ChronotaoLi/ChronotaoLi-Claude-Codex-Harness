@@ -127,9 +127,13 @@ def record_continuation(context, task_id, result, worker_source, snapshot, *, sa
     record = dict(run_id=context.run['id'], sequence=len(history) + 1, task_id=task_id,
                   source=deepcopy(worker_source), snapshot=deepcopy(snapshot),
                   snapshot_digest=snapshot_digest(snapshot), request=deepcopy(result['continuation_request']))
-    # The runtime's own prewrite: a conflicting unregistered file is changed evidence.
-    with stops.classify('evidence', 'runtime_integrity'):
+    # The runtime's own prewrite: a conflicting unregistered file is changed evidence (by class).
+    try:
         row = _write(context, 'continuations', record)
+    except HarnessError as error:
+        if error.stop is not None:
+            raise
+        raise EvidenceError(str(error), stop=stops.make('evidence', 'runtime_integrity')) from error
     context.run['continuation_history'] = [*history, row]
     context.run['pending_continuation'] = row['id']
     if save:
@@ -145,7 +149,7 @@ def continuation_gate(context, current_snapshot=None):
         return None
     rows = [r for r in history if r['id'] == pending]
     if len(rows) != 1:
-        raise HarnessError('pending continuation pointer invalid', stop=stops.make('runtime_failure', 'invariant'))
+        raise EvidenceError('pending continuation pointer invalid', stop=stops.make('evidence', 'runtime_integrity'))
     row = rows[0]
     if any(r['continuation_id'] == pending for r in rejections):
         raise HarnessError('rejected continuation cannot become pending again', stop=stops.make('runtime_failure', 'invariant'))
@@ -193,8 +197,8 @@ def resolve_continuation(context, current_snapshot=None):
         context.save()
 
 
-@stops.classifies("invalid_input", "input_schema", data={"option": "input file"})
 def _read_input(path, keys, text_key, label):
+    """Read one operator input file; its two readers classify the failures with their own option."""
     def unique(pairs):
         value = {}
         for key, item in pairs:
@@ -275,7 +279,9 @@ def _rejections(context, history=None):
         if any(entry.get('invoked', True) for entry in entries[source_position + 1:position]):
             raise HarnessError('continuation rejection source superseded')
         if context.run.get('pending_continuation') == original['id']:
-            raise HarnessError('rejected continuation cannot become pending again', stop=stops.make('runtime_failure', 'invariant'))
+            # A ledger that disagrees with its own evidence (load-checked): evidence by class.
+            raise EvidenceError('rejected continuation cannot become pending again',
+                                stop=stops.make('evidence', 'runtime_integrity'))
     identifiers = {row['id'] for row in records}
     if any('continuation_rejection_id' in entry and entry['continuation_rejection_id'] not in identifiers for entry in entries):
         raise HarnessError('continuation rejection consumption lacks evidence')
@@ -304,9 +310,15 @@ def validate_continuation_rejection(context, current_snapshot=None, worker_task=
     return active
 
 
-def record_continuation_rejection(context, path, current_snapshot=None):
-    value = _read_input(path, {'continuation_id', 'task_id', 'source_dispatch_id', 'source_snapshot_digest', 'reason'},
-                        'reason', 'continuation rejection')
+@stops.classifies("invalid_input", "input_schema", data={"option": "--reject-continuation"})
+def read_continuation_rejection(path):
+    return _read_input(path, {'continuation_id', 'task_id', 'source_dispatch_id', 'source_snapshot_digest', 'reason'},
+                       'reason', 'continuation rejection')
+
+
+def record_continuation_rejection(context, path, current_snapshot=None, *, value=None):
+    """``value`` is the file resume already read (one read, before any write); else the file is read here."""
+    value = read_continuation_rejection(path) if value is None else value
     history = _records(context, 'continuations', 'continuation_history')
     records, active = _rejections(context, history)
     if context.run.get('status') not in ('blocked', 'interrupted', 'paused'):
@@ -346,8 +358,9 @@ def record_continuation_rejection(context, path, current_snapshot=None):
     return deepcopy(rejection)
 
 
-def record_execution_guidance(context, path, current_snapshot=None):
-    value = read_execution_guidance(path)
+def record_execution_guidance(context, path, current_snapshot=None, *, value=None):
+    """``value`` is the file resume already read (one read, before any write); else the file is read here."""
+    value = read_execution_guidance(path) if value is None else value
     records = _records(context, 'execution-guidance', 'execution_guidance')
     task_id = value['task_id']
     if (context.run.get('status') in ('completed', 'abandoned', 'running')
@@ -401,7 +414,7 @@ def packet(context, task_id=None):
     guidance = _records(context, 'execution-guidance', 'execution_guidance')
     pending = context.run.get('pending_continuation')
     if pending is not None and pending not in {r['id'] for r in continuations}:
-        raise HarnessError('pending continuation pointer invalid', stop=stops.make('runtime_failure', 'invariant'))
+        raise EvidenceError('pending continuation pointer invalid', stop=stops.make('evidence', 'runtime_integrity'))
     relevant = lambda row: task_id is None or row['task_id'] == task_id
     def reference(row):
         return {k: deepcopy(v) for k, v in row.items() if k != 'directive'}

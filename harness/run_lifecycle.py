@@ -13,7 +13,8 @@ from .operations import warn
 from .input_projection import validate_dispatch_indexes as validate_input_dispatch_indexes
 from .path_evidence import validate_dispatch_indexes
 from .services import RuntimeService
-from .continuation import packet as continuation_packet, record_execution_guidance, record_continuation_rejection
+from .continuation import (packet as continuation_packet, read_continuation_rejection, read_execution_guidance,
+                           record_continuation_rejection, record_execution_guidance)
 from .shared import asset_digest, validate_mcp
 from .util import HarnessError, lock, uid, validate_command_directories
 
@@ -163,6 +164,34 @@ class RunLifecycle(RuntimeService):
         if isinstance(error, (KeyboardInterrupt, SystemExit)) or getattr(error, "_stop_settled", False):
             return stops.of(error)
         original = stops.of(error)
+        final, _ = self._settled(original, ident)
+        if final is not None:
+            try:
+                error.stop = final
+            except (AttributeError, TypeError):
+                pass
+        try:
+            error._stop_settled = True
+        except (AttributeError, TypeError):
+            pass
+        return stops.of(error)
+
+    def settle_publication(self, kind, reason, *, ident=None):
+        """Settle a stop published without an exception (the plan awaiting approval), the same way.
+
+        Called before that stop is saved (``ident`` None: the in-memory ledger that already
+        holds it) or reported again by resume (``ident``: the ledger on disk). A failure is
+        raised, already settled, as the load failure's own type with ``superseded`` naming
+        the publication; the caller's boundary then stops the run with it.
+        """
+        final, failure = self._settled({"kind": kind, "reason": reason}, ident)
+        if final is not None:
+            error = HarnessError(f"{failure}（未发布停止 {kind}/{reason}）", stop=final)
+            error._stop_settled = True
+            raise error from failure
+
+    def _settled(self, original, ident):
+        """Rerun the load checks: (None, None) when they pass, else (final value replacing ``original``, failure)."""
         try:
             if ident is None:
                 self.load_checks()      # the in-memory ledger the stop save is about to commit
@@ -174,15 +203,8 @@ class RunLifecycle(RuntimeService):
             final = stops.load_failure(failure)
             final["data"].pop("detail", None)
             final["data"]["superseded"] = {"kind": original["kind"], "reason": original["reason"]}
-            try:
-                error.stop = final
-            except (AttributeError, TypeError):
-                pass
-        try:
-            error._stop_settled = True
-        except (AttributeError, TypeError):
-            pass
-        return stops.of(error)
+            return final, failure
+        return None, None
 
     def validate_stop(self):
         """``stop`` exists exactly while the status is a stop, matches it, and is registered."""
@@ -394,6 +416,10 @@ class RunLifecycle(RuntimeService):
                         # A stop answer ends this resume before re-verification could happen.
                         raise HarnessError("--reverify 不能与 stop 答复合用",
                                            stop=incompatible("--operator-decision(stop)", "--reverify"))
+                # The other input files are read here too, once, before any write: a file that
+                # cannot be read or parsed is refused without rewriting the run.
+                guidance = read_execution_guidance(execution_guidance) if execution_guidance is not None else None
+                rejection = read_continuation_rejection(reject_continuation) if reject_continuation is not None else None
                 self.context.reverify_requested = reverify
                 with stops.classify("config_mismatch", "immutable_config"):
                     changes = self.context.config.resume_changes(self.context.run["config_snapshot"])
@@ -452,13 +478,15 @@ class RunLifecycle(RuntimeService):
                     self.context.save()
                 self.services.environment.record_environment_update(update)
                 if execution_guidance is not None:
-                    record_execution_guidance(runtime, execution_guidance)
+                    record_execution_guidance(runtime, execution_guidance, value=guidance)
                 if reject_continuation is not None:
-                    record_continuation_rejection(runtime, reject_continuation)
+                    record_continuation_rejection(runtime, reject_continuation, value=rejection)
                 self.services.planning.report_command_requirements()
                 if self.context.run["tasks"] and self.context.run["plan_approval_required"] and not self.context.run["plan_approved"]:
                     if not approve_plan and self.context.run["status"] == "awaiting_approval":
                         # Reported again, unchanged: the plan still waits for an explicit approval.
+                        # Settled first, as any reported stop: its exits must not meet a load failure.
+                        self.settle_publication("plan_approval", "initial_plan", ident=ident)
                         return self.context.run
                     if approve_plan:
                         self.context.run["plan_approved"] = True

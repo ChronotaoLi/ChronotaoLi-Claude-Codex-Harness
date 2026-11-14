@@ -18,9 +18,13 @@ from harness.run_context import RunContext
 from harness.run_lifecycle import RunLifecycle
 from harness.runtime import Runtime
 from harness.util import EvidenceError, HarnessError, ProcessStartError, ProcessTimeout, read_json, write_json
-from test_harness import ROOT, RepoCase
+from test_decide import DecideCase, Script, ask, block_first, blocked_by_task, implement, task
+from test_harness import (ROOT, RepoCase, cli_notice, crash_after_save, no_command_exit, refused_by_cli, run_cli,
+                          scratch)
 from test_runtime_changes import ScriptedBackend
+from test_stop_exits import final_answer, final_failure_scenario
 import test_checkpoint_declaration_failures as _checkpoints
+import test_decide_recovery as _ask_recovery
 
 
 def plan():
@@ -130,6 +134,33 @@ class StopLiteralGuard(unittest.TestCase):
             with self.subTest(sample=name):
                 module = "cli.py" if name == "operate branches" else "scheduler.py"
                 self.assertTrue(stop_violations(stop_literals(module, text)), name)
+
+
+# ---- G7's exemption rule: only exceptions raised by test code count as injected ---------------------
+class InjectionRule(unittest.TestCase):
+    @staticmethod
+    def caught(function):
+        try:
+            function()
+        except BaseException as error:  # the exception and its traceback are the subject
+            return error
+        raise AssertionError("nothing raised")
+
+    def test_test_frames_and_mock_side_effects_are_injected_runtime_and_library_frames_are_not(self):
+        from unittest.mock import Mock
+        from test_harness import injected
+
+        def raised_by_a_test():
+            raise HarnessError("raised by the test itself")
+        cases = {
+            "a frame under tests/": (raised_by_a_test, True),
+            "a mock side_effect": (Mock(side_effect=HarnessError("patched failure")), True),
+            "a standard library frame (json)": (lambda: json.loads("{not json"), False),
+            "a runtime frame (harness/stops.py)": (lambda: stops.validate({}), False),
+        }
+        for name, (function, expected) in cases.items():
+            with self.subTest(case=name):
+                self.assertIs(injected(self.caught(function)), expected)
 
 
 # ---- G12: construction never fails on values and never lists an exit it cannot fill ----
@@ -317,6 +348,63 @@ class LoadFailureClasses(RepoCase):
         value = self.resume_error(backend, engine.run["id"])
         self.assertEqual((value["kind"], value["reason"]), ("evidence", "load_integrity"))
 
+
+    def test_checkpoint_source_original_chain(self):
+        """The accepted worker result a registered checkpoint rests on is changed (code-4b 1).
+
+        Two tasks, the first accepted with a valid checkpoint, then ``--step`` pauses: only the
+        checkpoint's source check reads that result at load. A load failure, no exit listed.
+        """
+        from test_dispatch_events import two_tasks
+        case = _checkpoints.CheckpointDeclarationFailureTests
+        self.declaration = case.declaration.__get__(self)
+
+        def keep_valid(items, kwargs):
+            good = self.declaration(kwargs["cwd"], bad=False)
+            good["id"] = "first-valid"
+            items[:] = [good]
+        backend = case.backend(self, mutate=keep_valid)
+        engine = self.engine(backend)
+        saved = engine.start("Implement greet twice", two_tasks(), step=True)
+        self.assertEqual((saved["status"], len(saved["task_checkpoints"])), ("paused", 1))
+        original = engine.directory / "dispatches" / saved["checkpoint_batches"][0]["dispatch_id"] / "returned-result.json"
+        raw = original.read_bytes()
+        original.write_bytes(raw.replace(b"}", b" }", 1))  # the same JSON, other bytes
+        before = (engine.directory / "state.json").read_bytes()
+        for command in ("resume", "abandon"):
+            with self.subTest(command=command):
+                notice = refused_by_cli(self, backend, [command, saved["id"]], ("evidence", "load_integrity"), 1)
+                no_command_exit(self, notice, ("evidence", "load_integrity"))
+                self.assertEqual(notice["source"]["artifact"], str(original))
+        self.assertEqual((engine.directory / "state.json").read_bytes(), before)
+        original.write_bytes(raw)  # restoring the bytes is the way on
+        self.assertEqual(run_cli(self, backend, ["resume", saved["id"]])[0], 0)
+
+    def test_inconsistent_continuation_pointer_is_a_load_failure(self):
+        """A ledger whose pending continuation names no recorded request: load_integrity, not an invariant stop."""
+        backend, engine = self.blocked_run()
+        path = engine.directory / "state.json"
+        ledger = read_json(path)
+        ledger["pending_continuation"] = "continuations_" + "0" * 64
+        write_json(path, ledger)
+        for command in ("resume", "abandon"):
+            with self.subTest(command=command):
+                notice = refused_by_cli(self, backend, [command, ledger["id"]], ("evidence", "load_integrity"), 1)
+                no_command_exit(self, notice, ("evidence", "load_integrity"))
+
+    def test_rejected_continuation_made_pending_again_is_a_load_failure(self):
+        """A ledger that points its pending continuation back at a rejected one: load_integrity (code-4b 1 census)."""
+        from test_continuation_rejection import RejectionLifecycleTests
+        engine, backend, path, _, _ = RejectionLifecycleTests.waiting(self, second_request=True)
+        self.assertEqual(run_cli(self, backend, ["resume", engine.run["id"], "--reject-continuation", str(path)])[0], 3)
+        state = engine.directory / "state.json"
+        ledger = read_json(state)
+        rejected = ledger["continuation_rejections"][0]["continuation_id"]
+        self.assertNotEqual(ledger["pending_continuation"], rejected)
+        ledger["pending_continuation"] = rejected
+        write_json(state, ledger)
+        notice = refused_by_cli(self, backend, ["resume", engine.run["id"]], ("evidence", "load_integrity"), 1)
+        no_command_exit(self, notice, ("evidence", "load_integrity"))
 
 # ---- G17: settling (spec 2.2, 4.4) ----------------------------------------------------------
 class SettledStops(RepoCase):
@@ -600,8 +688,7 @@ class PreflightRefusals(RepoCase):
         return backend, engine
 
     def files(self, request):
-        folder = self.repo.parent / "inputs"
-        folder.mkdir(exist_ok=True)
+        folder = scratch(self)
         answer = {"schema_version": 1, "request_id": request["id"], "task_id": request["task_id"],
                   "decision": "continue", "summary": "Use the documented greeting."}
         paths = {"continue": answer, "stop": {**answer, "decision": "stop"},
@@ -747,6 +834,180 @@ class PreflightRefusals(RepoCase):
         self.check(backend, engine, ["--reverify"], ("invalid_input", "run_state"), 2)
 
 
+# ---- G10 and G7 see the approval publication and prepare-run (code-4b suggestion 2) ------------------
+class GuardCoverage(DecideCase):
+    def test_g10_sees_a_plan_awaiting_approval_published_over_a_load_failure(self):
+        from harness.packets import PacketBuilder
+        script, engine = ApprovalPublicationIsSettled.asked_while_planning(self)
+        original = PacketBuilder.preflight_final_context
+
+        def preflight_then_damage(builder, *args, **kwargs):
+            result = original(builder, *args, **kwargs)
+            ApprovalPublicationIsSettled.damage_the_registered_answer(builder.context)
+            return result
+        # Settling switched off in the test: G10 alone must notice the listed approval exit is blocked.
+        with patch.object(PacketBuilder, "preflight_final_context", preflight_then_damage), \
+                patch.object(RunLifecycle, "settle_publication", lambda *args, **kwargs: None):
+            result = self.engine(script).resume(engine.run["id"], operator_decision=self.answer(self.state(engine)))
+        self.assertEqual(result["status"], "awaiting_approval")
+        findings = self.stop_guard_findings["mismatches"]
+        self.assertIn(("exit listed but the load fails", "plan_approval", "initial_plan"), findings)
+        findings.clear()
+
+    def test_g7_sees_an_unclassified_prepare_run_failure(self):
+        from harness import workspace_inputs
+        engine = self.engine(ScriptedBackend())
+        engine.start("Implement greet", plan(), pause_after_plan=True)
+        manifest = scratch(self).resolve() / "manifest.json"
+        write_json(manifest, {"files": []})
+        # A failure raised by library code inside the operation (innermost frame json), not by the test.
+        with patch.object(workspace_inputs, "_manifest", lambda run, value: json.loads("{not json")):
+            code, _ = run_cli(self, ScriptedBackend(), ["prepare-run", engine.run["id"], "--manifest", str(manifest)])
+        self.assertEqual(code, 1)
+        findings = self.stop_guard_findings["unclassified"]
+        self.assertEqual([item[:2] for item in findings], [("unexpected_exception", "JSONDecodeError")])
+        findings.clear()
+
+
+# ---- A verification timeout whose cleanup failed is process evidence, not a timeout (code-4b 3) ------
+class VerificationProcessFacts(RepoCase):
+    def test_timeout_with_a_cleanup_failure_is_process_incomplete(self):
+        from harness.util import run_process
+        for scope in ("final", "greet"):
+            with self.subTest(verification=scope):
+                if scope != "final":
+                    self.setUp()
+                hit = {"n": 0}
+
+                def time_out_with_a_cleanup_failure(argv, cwd, log, **kwargs):
+                    if scope in Path(log).parts and hit["n"] == 0:
+                        hit["n"] += 1
+                        kwargs["on_start"](123)
+                        for suffix in (".stdout", ".stderr"):
+                            Path(log).with_suffix(suffix).write_text("")
+                        error = ProcessTimeout(1, Path(log))
+                        error.outcome = ProcessOutcome(
+                            started=True, startup_state="started", pid=123, pgid=123, exit_code=-9,
+                            termination_reason="timeout", exit_confirmed=True,
+                            errors=[failure("execution", error)], cleanup_errors=[failure("sigkill", PermissionError())])
+                        kwargs["on_outcome"](error.outcome)
+                        raise error
+                    return run_process(argv, cwd, log, **kwargs)
+                backend = ScriptedBackend()
+                with patch("harness.verification.run_process", side_effect=time_out_with_a_cleanup_failure):
+                    code, errors = run_cli(self, backend, ["run", "Implement greet", "--plan", str(ROOT / "examples" / "plan.json")])
+                notice = cli_notice(errors)
+                self.assertEqual((code, notice["kind"], notice["reason"]), (1, "evidence", "process_incomplete"), errors)
+                run_id = next((self.repo / ".harness" / "runs").iterdir()).name
+                saved = read_json(self.repo / ".harness" / "runs" / run_id / "state.json")
+                self.assertEqual((saved["stop"]["kind"], saved["stop"]["reason"]), ("evidence", "process_incomplete"))
+                self.assertEqual(stops.project_ledger(saved)["exits"], [f"abandon {run_id}"])
+                self.assertFalse(any(r.get("status") == "approved" for r in saved["final_history"]))
+
+
+# ---- Every operator file input that cannot be read is this call's input refusal (code-4b 4) ------------
+class FileInputRefusals(RepoCase):
+    """Bad JSON, bad encoding and a missing file: invalid_input/input_schema, exit 2, the run not rewritten."""
+
+    def broken_files(self):
+        folder = scratch(self).resolve()  # canonical: the manifest check rejects symlinked paths first
+        (folder / "bad-json.json").write_text("{ invalid")
+        (folder / "bad-encoding.json").write_bytes(b"\xff\xfe{")
+        return {"bad JSON": folder / "bad-json.json", "bad encoding": folder / "bad-encoding.json",
+                "missing": folder / "missing.json"}
+
+    def test_resume_inputs_are_refused_before_any_write(self):
+        self.config.data["runtime"]["max_agent_dispatches"] = 1
+        backend = ScriptedBackend()
+        engine = self.engine(backend)
+        with self.assertRaises(HarnessError):
+            engine.start("Implement greet", plan())
+        # A relaxed budget would be saved by this resume: the input must be refused before that write.
+        self.config.data["runtime"]["max_agent_dispatches"] = 50
+        state = engine.directory / "state.json"
+        before = state.read_bytes()
+        for option in ("--operator-decision", "--environment-update", "--execution-guidance", "--reject-continuation"):
+            for name, path in self.broken_files().items():
+                with self.subTest(option=option, file=name):
+                    notice = refused_by_cli(self, backend, ["resume", engine.run["id"], option, str(path)],
+                                            ("invalid_input", "input_schema"), 2)
+                    self.assertEqual((notice["data"]["option"], state.read_bytes()), (option, before))
+
+    def test_plan_file_is_refused_before_a_run_exists(self):
+        for name, path in self.broken_files().items():
+            with self.subTest(file=name):
+                refused_by_cli(self, ScriptedBackend(), ["run", "Implement greet", "--plan", str(path)],
+                               ("invalid_input", "input_schema"), 2)
+                self.assertFalse((self.repo / ".harness" / "runs").exists())
+
+    def test_prepare_run_manifest(self):
+        engine = self.engine(ScriptedBackend())
+        engine.start("Implement greet", plan(), pause_after_plan=True)
+        state = engine.directory / "state.json"
+        before = state.read_bytes()
+        for name, path in self.broken_files().items():
+            with self.subTest(file=name):
+                notice = refused_by_cli(self, ScriptedBackend(), ["prepare-run", engine.run["id"], "--manifest", str(path)],
+                                        ("invalid_input", "input_schema"), 2)
+                self.assertEqual((notice["data"]["option"], state.read_bytes()), ("manifest", before))
+
+
+# ---- The plan awaiting approval is settled like every other stop (code-4b 2) ------------------------
+class ApprovalPublicationIsSettled(DecideCase):
+    def asked_while_planning(self):
+        def decide(script, trigger, packet):
+            if trigger["kind"] == "plan" and "operator_answer" not in packet:
+                return ask("Which interface should the plan use?")
+            return None
+        script = Script(decide)
+        engine = self.engine(script)
+        with self.assertRaises(HarnessError):
+            engine.start("Implement greet", None, pause_after_plan=True)
+        return script, engine
+
+    @staticmethod
+    def damage_the_registered_answer(context):
+        Path(context.run["operator_decisions"][-1]["artifact"]).write_text("{}\n")  # a load-checked artifact
+
+    def test_damage_before_the_approval_save_stops_the_run_instead(self):
+        from harness.packets import PacketBuilder
+        script, engine = self.asked_while_planning()
+        original = PacketBuilder.preflight_final_context
+
+        def preflight_then_damage(builder, *args, **kwargs):
+            result = original(builder, *args, **kwargs)
+            self.damage_the_registered_answer(builder.context)  # after the capacity check, before the save
+            return result
+        with patch.object(PacketBuilder, "preflight_final_context", preflight_then_damage):
+            notice = refused_by_cli(self, script, ["resume", engine.run["id"], "--operator-decision",
+                                                   self.answer(self.state(engine))], ("evidence", "load_integrity"), 1)
+        saved = self.state(engine)
+        self.assertEqual((saved["status"], saved["stop"]["kind"], saved["stop"]["reason"]),
+                         ("blocked", "evidence", "load_integrity"))
+        self.assertEqual(saved["stop"]["data"]["superseded"], {"kind": "plan_approval", "reason": "initial_plan"})
+        self.assertEqual((notice["exits"], stops.project_ledger(saved)["exits"]), ([], []))
+        self.assertTrue(refused(self, saved["id"]))
+
+    def test_damage_before_the_approval_is_reported_again_is_a_load_failure(self):
+        from harness.planning import Planner
+        script, engine = self.asked_while_planning()
+        code, errors = run_cli(self, script, ["resume", engine.run["id"], "--operator-decision",
+                                              self.answer(self.state(engine))])
+        self.assertEqual((code, self.state(engine)["status"]), (0, "awaiting_approval"), errors)
+        before = (engine.directory / "state.json").read_bytes()
+        original = Planner.report_command_requirements
+
+        def report_then_damage(planner, *args, **kwargs):
+            result = original(planner, *args, **kwargs)
+            self.damage_the_registered_answer(planner.context)  # after the locked load, before the report
+            return result
+        with patch.object(Planner, "report_command_requirements", report_then_damage):
+            notice = refused_by_cli(self, script, ["resume", engine.run["id"]], ("evidence", "load_integrity"), 1)
+        self.assertEqual((notice["exits"], notice["data"]["superseded"]),
+                         ([], {"kind": "plan_approval", "reason": "initial_plan"}))
+        self.assertEqual((engine.directory / "state.json").read_bytes(), before)  # a refusal: the run is not rewritten
+
+
 # ---- G16: interrupted after the plan was registered, before the awaiting-approval save ------
 class PlanRegisteredBeforeApprovalSave(RepoCase):
     def test_plain_resume_reaches_awaiting_approval(self):
@@ -770,13 +1031,9 @@ class PlanRegisteredBeforeApprovalSave(RepoCase):
         self.assertEqual(backend.calls, [])
 
 
-if __name__ == "__main__":
-    unittest.main()
 
 
 # ---- G11: a settled stop is one value in the ledger, stderr and the operation record ---------
-from test_decide import DecideCase, Script, ask, block_first, blocked_by_task, implement, task
-from test_stop_exits import run_cli
 
 
 class SettledStopIsOneValue(DecideCase):
@@ -811,8 +1068,6 @@ class SettledStopIsOneValue(DecideCase):
 
 
 # ---- G5: an answer together with --reverify (spec 9.2-9.4) -----------------------------------------
-from test_harness import cli_notice, crash_after_save
-from test_stop_exits import final_answer, final_failure_scenario
 
 ANSWER_PREWRITTEN, ANSWERS_SAVED, RUNNING_SAVED, ATTEMPT_SAVED = (
     "answer file prewritten", "answers saved", "running saved", "new whole-run attempt saved")
@@ -958,7 +1213,6 @@ class AnswerWithReverify(RepoCase):
 
 
 # ---- An ask landed while HEAD moved: the question is kept, the stop says HEAD changed ----------
-import test_decide_recovery as _ask_recovery
 
 
 class AskWithHeadChange(DecideCase):
@@ -984,3 +1238,7 @@ class AskWithHeadChange(DecideCase):
                                         for text in stops.project_ledger(saved)["exits"]))
                 else:
                     self.assertIs(stop["data"]["candidate_changed"], True)
+
+
+if __name__ == "__main__":
+    unittest.main()

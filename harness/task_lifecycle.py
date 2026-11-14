@@ -295,7 +295,7 @@ class TaskLifecycle(RuntimeService):
                 source["artifact_digest"] = digest
                 self.context.save()
             if digest != source["artifact_digest"]:
-                raise HarnessError("审阅原始结果已改变；禁止通过候选变化丢弃证据", stop=stops.make("evidence", "runtime_integrity", source={"artifact": str(artifact)}))
+                raise EvidenceError("审阅原始结果已改变；禁止通过候选变化丢弃证据", stop=stops.make("evidence", "runtime_integrity", source={"artifact": str(artifact)}))
             dispatch_id = source.get("dispatch_id", artifact.parent.name)
             if any(item.get("dispatch_id") == dispatch_id for item in history):
                 continue
