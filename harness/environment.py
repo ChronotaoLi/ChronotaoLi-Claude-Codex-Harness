@@ -4,6 +4,7 @@ These records clarify task assumptions. They do not grant capabilities, amend
 task obligations, or turn a worker's evidence into an accepted result.
 """
 
+from . import stops
 from .versions import RUN_SCHEMA_VERSION
 from .services import RuntimeService
 from copy import deepcopy
@@ -17,7 +18,7 @@ from .contracts import validate_work_core
 from .worker_receipts import delivered_work_contract
 from .git_query import covers as git_query_covers
 from .recovery import RECOVERY_BUSY_KEYS, read_bound_result, snapshot_digest
-from .util import HarnessError, dump, write_json
+from .util import EvidenceError, HarnessError, dump, write_json
 
 
 def _text(value, label, limit):
@@ -83,6 +84,7 @@ def read_update(path):
 
 
 class EnvironmentRecovery(RuntimeService):
+    @stops.reads_evidence
     def validate_environment_links(self):
         updates = self.context.run.get("environment_updates", [])
         checks = self.context.run.get("environment_checks", [])
@@ -121,6 +123,7 @@ class EnvironmentRecovery(RuntimeService):
                     or row["artifact"] != str(self.context.directory / "environment" / name)):
                 raise HarnessError("环境检查产物路径无效")
 
+    @stops.reads_evidence
     def environment_context(self, *, include_reports=False):
         records = []
         for row in self.context.run.get("environment_updates", []):
@@ -169,10 +172,12 @@ class EnvironmentRecovery(RuntimeService):
         try:
             if not artifact.exists() and not artifact.is_symlink():
                 write_json(artifact, value)
+        except OSError as error:
+            raise HarnessError("cannot write environment index",
+                               stop=stops.make("runtime_failure", "io", data={"error_type": type(error).__name__})) from error
+        with stops.evidence_reads(source={"artifact": str(artifact)}):
             if artifact.is_symlink() or artifact.read_bytes() != raw:
                 raise HarnessError("environment index changed")
-        except OSError as error:
-            raise HarnessError("cannot read or write environment index") from error
         return {"artifact": str(artifact), "artifact_digest": digest,
                 "update_count": len(value["updates"]), "check_count": len(value["checks"])}
 
@@ -258,27 +263,27 @@ class EnvironmentRecovery(RuntimeService):
         task_id, dispatch_id = update["task_id"], update["blocker_dispatch_id"]
         feedback = self.context.run.get("feedback")
         if not isinstance(feedback, dict) or not isinstance(feedback.get("worker"), dict):
-            raise HarnessError("环境更新缺少当前 worker 环境阻断反馈")
+            raise HarnessError("环境更新缺少当前 worker 环境阻断反馈", stop=stops.make("invalid_input", "stale_request", data={"option": "--environment-update"}))
         # A pre-invocation interruption can leave interrupted/running status
         # without invalidating the saved blocker. Resume guards terminal runs;
         # the evidence and pending-state checks below guard this update boundary.
         if (self.context.run.get("current_task") != task_id
                 or task_id in self.context.run["accepted"] or feedback.get("task_id") != task_id):
-            raise HarnessError("--environment-update 仅用于当前未接受任务的环境阻断")
+            raise HarnessError("--environment-update 仅用于当前未接受任务的环境阻断", stop=stops.make("invalid_input", "run_state", data={"status": self.context.run.get("status")}))
         busy = RECOVERY_BUSY_KEYS
         if any(self.context.run.get(key) for key in busy):
-            raise HarnessError("已有待处理阶段、指令、receipt 或修正；不能用环境更新替换原请求")
+            raise HarnessError("已有待处理阶段、指令、receipt 或修正；不能用环境更新替换原请求", stop=stops.make("invalid_input", "run_state", data={"status": self.context.run.get("status")}))
         matches = [i for i, d in enumerate(self.context.run["dispatches"])
                    if d["id"] == dispatch_id and d["role"] == "worker" and d["task_id"] == task_id]
         if not matches or any(d.get("role") in ("worker", "commander", "reviewer")
                               and d.get("invoked", True) for d in self.context.run["dispatches"][matches[0] + 1:]):
-            raise HarnessError("环境阻断来源已过期；后续模型调用已开始，保留原恢复路径")
+            raise HarnessError("环境阻断来源已过期；后续模型调用已开始，保留原恢复路径", stop=stops.make("invalid_input", "stale_request", data={"option": "--environment-update"}))
         source = {"artifact": feedback.get("worker_artifact"), "artifact_digest": feedback.get("worker_artifact_digest")}
         result = self.environment_source(task_id, dispatch_id, source)
         stored = {k: v for k, v in result.items() if k not in ("task_id", "dispatch_id")}
         supplied = {k: v for k, v in feedback["worker"].items() if k not in ("task_id", "dispatch_id")}
         if stored != supplied:
-            raise HarnessError("当前环境反馈与原始 worker 证据不一致")
+            raise EvidenceError("当前环境反馈与原始 worker 证据不一致", stop=stops.make("evidence", "runtime_integrity"))
         task = next(t for t in self.context.run["tasks"] if t["id"] == task_id)
         self.services.tasks.check_task_scope(task)
         digest = snapshot_digest({"run_id": self.context.run["id"], "update": update})
@@ -286,7 +291,7 @@ class EnvironmentRecovery(RuntimeService):
         if any(row["id"] == ident for row in self.context.run.get("environment_updates", [])):
             return None
         if len(self.context.run.get("environment_updates", [])) >= 32:
-            raise HarnessError("环境更新最多 32 条；保留全部历史，不静默裁剪")
+            raise HarnessError("环境更新最多 32 条；保留全部历史，不静默裁剪", stop=stops.make("invalid_input", "input_schema", data={"option": "--environment-update"}))
         return {**update, "id": ident, "sequence": len(self.context.run.get("environment_updates", [])) + 1,
                 "source": source, "recorded_at": time.time(), "update_digest": digest}
 
@@ -299,6 +304,7 @@ class EnvironmentRecovery(RuntimeService):
             try:
                 existing = json.loads(artifact.read_bytes())
             except (OSError, ValueError, UnicodeError) as error:
+                stops.keep_local_io(error)
                 raise HarnessError("未登记环境更新产物损坏；保留证据") from error
             if not isinstance(existing, dict) or {k: v for k, v in existing.items() if k != "recorded_at"} != {
                     k: v for k, v in record.items() if k != "recorded_at"}:
@@ -354,4 +360,4 @@ class EnvironmentRecovery(RuntimeService):
         self.context.event("environment_checked", task_id=task_id, passed=report["passed"], artifact=str(artifact))
         if not report["passed"]:
             raise HarnessError(f"环境前置检查未通过；未派发本次 worker、未消耗本次 worker 尝试；"
-                               f"已发生的指挥调用仍计入派发预算。检查日志：{artifact}")
+                               f"已发生的指挥调用仍计入派发预算。检查日志：{artifact}", stop=stops.make("environment", "checks_failed", source={"task_id": task_id, "artifact": str(artifact)}))

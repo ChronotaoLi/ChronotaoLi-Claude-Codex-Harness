@@ -9,7 +9,7 @@ from harness.budgets import work_attempts
 from harness.cli import status_summary
 from harness.util import HarnessError, read_json, write_json
 from harness.versions import RUN_SCHEMA_VERSION
-from test_harness import ROOT, RepoCase
+from test_harness import ROOT, RepoCase, walk_exit
 from test_runtime_changes import ScriptedBackend, revised, trigger_kind
 
 
@@ -237,8 +237,8 @@ class EnvironmentUpdateTests(RepoCase):
             self.assertEqual(len(backend.calls), 1)
         path.unlink()
         marker.write_text('installed')
-        result = self.engine(backend).resume(engine.run['id'])
-        self.assertEqual(result['status'], 'completed')
+        result = walk_exit(self, engine.directory, ('environment', 'checks_failed'), backend=backend,
+                           expect_status='completed')
         self.assertEqual(len(result['environment_updates']), 1)
 
     def test_saved_update_is_hash_bound_on_ordinary_resume(self):

@@ -13,7 +13,7 @@ import sys
 from copy import deepcopy
 from pathlib import Path
 
-from . import git
+from . import git, stops
 from .budgets import work_attempts
 from .context import compact_feedback
 from .contracts import apply_revision, DECIDE, validate_decision, validate_plan
@@ -28,11 +28,14 @@ DECIDE_KEY = "commander:decide:run"
 
 def attempt_limit_error(task_id, limit):
     return HarnessError(f"{task_id} 已达尝试次数上限（runtime.max_attempts 当前值 {limit}）；"
-                        "先看 status 的 convergence 与审阅轮次，必要时提高 runtime.max_attempts 后普通 resume")
+                        "先看 status 的 convergence 与审阅轮次，必要时提高 runtime.max_attempts 后普通 resume", stop=stops.make("budget", "task_attempts", data={"config_key": "runtime.max_attempts", "limit": limit}, source={"task_id": task_id}))
 
 
-def directive_mismatch():
-    return HarnessError("待派发指令与已发布计划或候选不符；保留现场，未启动 worker、未扣预算")
+def directive_mismatch(task_id=None):
+    """The saved directive (for ``task_id``, the task it is checked against) disagrees with the plan or candidate."""
+    return HarnessError("待派发指令与已发布计划或候选不符；保留现场，未启动 worker、未扣预算",
+                        stop=stops.make("workspace_mismatch", "directive_mismatch",
+                                        source={"task_id": task_id} if task_id is not None else None))
 
 
 class Planner(RuntimeService):
@@ -60,13 +63,17 @@ class Planner(RuntimeService):
                       file=sys.stderr, flush=True)
         return missing
 
-    def require_task_commands(self, task_ids):
+    def require_task_commands(self, task_ids, reason):
+        """``reason`` is ``selected_task`` (one chosen task) or ``all_ready_tasks`` (none can run)."""
         missing = self.report_command_requirements()
         unmet = {tid: missing[tid] for tid in task_ids if tid in missing}
         if unmet:
+            source = {"task_id": task_ids[0]} if reason == "selected_task" else {}
             raise HarnessError("任务所需命令尚未授权：" + json.dumps(unmet, ensure_ascii=True)
                                + "；在 permissions.worker_commands 追加这些精确 argv 后普通 resume；"
-                                 "计划批准不授予命令权限，本检查不消耗 worker 尝试或模型派发额度")
+                                 "计划批准不授予命令权限，本检查不消耗 worker 尝试或模型派发额度",
+                               stop=stops.make("missing_commands", reason, source=source,
+                                               data={"config_key": "permissions.worker_commands", "missing": unmet}))
 
     def decide_returned(self):
         receipt = self.context.run["commander_receipts"].get(DECIDE_KEY)
@@ -77,12 +84,12 @@ class Planner(RuntimeService):
         patterns = list(patterns)
         for pattern in patterns:
             if not isinstance(pattern, str):
-                raise HarnessError("额外批准的文件范围必须是字符串")
+                raise HarnessError("额外批准的文件范围必须是字符串", stop=stops.make("invalid_input", "input_schema", data={"option": "--allow-scope"}))
             git.validate_scope_pattern(pattern)
         if not patterns:
             return
         if self.context.run["status"] in ("completed", "abandoned") or self.decide_returned():
-            raise HarnessError("--allow-scope 仅用于未完成的 run，且不能有已返回、尚未处理的指挥决定；先普通 resume")
+            raise HarnessError("--allow-scope 仅用于未完成的 run，且不能有已返回、尚未处理的指挥决定；先普通 resume", stop=stops.make("invalid_input", "run_state", data={"status": str(self.context.run.get("status"))}))
         approved = self.context.run.get("approved_scope", [])
         added = [pattern for pattern in dict.fromkeys(patterns) if pattern not in approved]
         if not added:
@@ -197,8 +204,19 @@ class Planner(RuntimeService):
         if changed:
             # Reported, never granted: later steps check their own snapshot and HEAD.
             self.context.event("commander_candidate_changed", dispatch_id=receipt["dispatch_id"], request_id=request["id"])
+            head = git.head(self.context.worktree, binding=self.context.run["worktree_binding"])
+            if head != self.context.run["expected_head"]:
+                # The answer must wait for HEAD: the resume gate refuses a moved HEAD before landing it.
+                stop = stops.make("workspace_mismatch", "head_changed",
+                                  data={"expected_head": self.context.run["expected_head"], "question_registered": True},
+                                  source={"request_id": request["id"], "task_id": request["task_id"]})
+            else:
+                stop = stops.make("operator_decision", "answer_required",
+                                  data={**{k: v for k, v in error.stop["data"].items() if k != "detail"},
+                                        "candidate_changed": True},
+                                  source=error.stop["source"])
             error = HarnessError(f"{error}；指挥调用期间候选代码或 HEAD 已改变（派发条目 candidate_changed），"
-                                 "提问照常登记、不认可这些改动，回答前请核对工作树")
+                                 "提问照常登记、不认可这些改动，回答前请核对工作树", stop=stop)
         raise error
 
     def land_returned_ask(self):
@@ -230,10 +248,12 @@ class Planner(RuntimeService):
                 raise HarnessError("计划文件写入后内容不符；保留现场")
         return {"revision": revision, "artifact": str(artifact), "artifact_digest": hashlib.sha256(raw).hexdigest()}
 
+    @stops.reads_evidence
     def read_plan(self, reference, label="计划文件"):
         try:
             raw = Path(reference["artifact"]).read_bytes()
         except OSError as error:
+            stops.keep_local_io(error)
             raise HarnessError(f"{label}缺失或无法读取；保留现场") from error
         if hashlib.sha256(raw).hexdigest() != reference["artifact_digest"]:
             raise HarnessError(f"{label}已改变；保留现场")
@@ -313,6 +333,7 @@ class Planner(RuntimeService):
         return self.apply_pending_revision()
 
     # ---- publication ---------------------------------------------------------
+    @stops.reads_evidence
     def check_revision_file(self, pending):
         """Before any archive, reset or publish: the file, its source and a replay agree."""
         run = self.context.run
@@ -340,7 +361,7 @@ class Planner(RuntimeService):
             raise HarnessError("待应用的计划文件与原件和当前台账不符；保留现场")
         head = git.head(self.context.worktree, binding=run["worktree_binding"])
         if content.get("head") != run["expected_head"] or head != run["expected_head"]:
-            raise HarnessError("应用修订前 HEAD 与已校验计划不符；保留现场")
+            raise HarnessError("应用修订前 HEAD 与已校验计划不符；保留现场", stop=stops.make("workspace_mismatch", "head_changed", data={"expected_head": run["expected_head"]}))
         return content
 
     def apply_pending_revision(self):
@@ -353,7 +374,7 @@ class Planner(RuntimeService):
         archive = None
         if content["candidate"] == "retain":
             if snapshot_digest(self.context.snapshot()) != content["snapshot_digest"]:
-                raise HarnessError("修订保留候选的代码或暂存区已变化；保留现场，禁止归档重置")
+                raise HarnessError("修订保留候选的代码或暂存区已变化；保留现场，禁止归档重置", stop=stops.make("workspace_mismatch", "candidate_changed"))
             self.services.tasks.check_task_scope(task)
             bound = content["snapshot_digest"]
         else:
@@ -400,19 +421,20 @@ class Planner(RuntimeService):
             return
         directive = saved["directive"]
         if directive.get("selected_task") != task_id or run.get("current_task") != task_id:
-            raise directive_mismatch()
+            raise directive_mismatch(task_id)
         if "revision" in saved:
             history = run["plan_history"]
             if saved["revision"] != len(history) - 1 or saved["revision"] < 1:
-                raise directive_mismatch()
+                raise directive_mismatch(task_id)
             content = self.read_plan(history[saved["revision"]])
             if content.get("directive") != directive or content.get("tasks") != run["tasks"]:
-                raise directive_mismatch()
+                raise directive_mismatch(task_id)
             if content.get("candidate") == "retain" and content.get("snapshot_digest") != saved["snapshot_digest"]:
-                raise directive_mismatch()
+                raise directive_mismatch(task_id)
         if snapshot_digest(snapshot) != saved["snapshot_digest"]:
-            raise HarnessError("待派发指令的代码快照已变化；请核对并恢复原快照")
+            raise HarnessError("待派发指令的代码快照已变化；请核对并恢复原快照", stop=stops.make("workspace_mismatch", "candidate_changed", source={"task_id": saved["directive"]["selected_task"]}))
 
+    @stops.reads_evidence
     def verify_plan_authority(self):
         """Every published plan version is intact, and the ledger's mirrors equal their files.
 

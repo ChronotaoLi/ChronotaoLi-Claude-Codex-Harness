@@ -4,7 +4,7 @@ from __future__ import annotations
 import sys
 from copy import deepcopy
 
-from . import git, git_query
+from . import git, git_query, stops
 from .command_server import command_id
 from .context import (
     capacity_report, compact_checks, compact_plan, compact_reviews, field_size_report, instruction_file_changes,
@@ -246,7 +246,7 @@ class PacketBuilder(RuntimeService):
         if report["status"] == "required_overflow":
             fields = "、".join(f"{row['field']} {row['chars']}" for row in report["largest_fields"])
             raise HarnessError(f"计划的整体审阅必要上下文 {report['required_chars']} 字符超过预算 "
-                               f"{report['budget_chars']}；最大的字段：{fields}；请增加 context_chars 后恢复，尚未派发 worker")
+                               f"{report['budget_chars']}；最大的字段：{fields}；请增加 context_chars 后恢复，尚未派发 worker", stop=stops.make("budget", "context_capacity", data={"config_key": "runtime.context_chars", "required_chars": report["required_chars"], "budget_chars": report["budget_chars"], "scope": "final_review"}))
         if report["status"] == "projected_overflow":
             print(f"[harness] 整体审阅预计上下文 {report['projected_chars']} 字符，超过预算 "
                   f"{report['budget_chars']}；建议提前增加 context_chars。此估计不保证后续历史容量。", file=sys.stderr, flush=True)

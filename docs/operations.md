@@ -45,7 +45,7 @@ python3 -m harness --repo /abs/project dashboard --port 8765
 - 用 `status`、`status RUN`、`status RUN --full`、`watch RUN` 和 `dashboard` 观察，读取目标项目 `.harness/` 下的台账、事件、dispatch 产物与操作记录；
 - 使用[阻塞状态与操作者出口](recovery.md#阻塞状态与操作者出口)中明确适用于当前状态的恢复出口，例如 `--approve-plan`、追加精确命令授权后的普通 `resume`、`--environment-update`、`--operator-decision`。
 
-遇到真正的新增权限（新的命令授权、范围扩展、预算或轮数提高）或需求选择（操作者决定、是否接受风险、是否放弃）时向用户请求，不自行代答。
+读停止时用退出码与 `stop.kind` 分流，不解析文字：3 按 `stop.exits` 中适用于当前状态的出口处理，涉及新增权限或需求选择时请示用户；2 修正本次调用的输入；1 停下报告（证据或现场不符、Harness 自身失败、未分类）；0 读结果 JSON 的 `status`（`completed`、`paused` 或待批准）；130 是中断。遇到真正的新增权限（新的命令授权、范围扩展、预算或轮数提高）或需求选择（操作者决定、是否接受风险、是否放弃）时向用户请求，不自行代答。
 
 不能做的事：
 
@@ -78,7 +78,7 @@ python3 -m harness --repo /abs/project dashboard --port 8765
 | `models` | 配置中 commander／fable／worker／reviewer 的 `cli`、`model`、`effort` 原样 |
 | `cli` | `claude`、`codex` 的 `path`（PATH 查找结果）与 `version`（`--version` 首个非空行，5 秒超时，失败为 null） |
 | `run_id`、`run_linked_at` | run 持久登记后立即写入；创建 run 前失败时为 null |
-| `exit_status`、`result_status`、`error`、`stop`、`error_omitted` | CLI 退出码（0／1／130）、最终 JSON 的 `status`、错误首行与停止投影（`kind`、`reason`、标题、退出码、出口命令、`data`、`source`、诊断摘录 `detail`；结束时 run 停在待批准上时也有）。本次调用含文件型输入（计划或恢复 JSON，包括执行指导与续作拒绝）且出错时，`error` 为 null 并写 `error_omitted: "file inputs present; see stderr"`，`stop` 去掉 `detail`、保留其余字段，因为校验错误可能引用文件中的字段值；错误全文仍输出到 stderr。无文件输入时 `error_omitted` 为 null |
+| `exit_status`、`result_status`、`error`、`stop`、`error_omitted` | CLI 退出码（0／2／3／1／130，见[退出码](recovery.md#退出码)）、最终 JSON 的 `status`、错误首行与停止投影（`kind`、`reason`、标题、退出码、出口命令、`data`、`source`、诊断摘录 `detail`；结束时 run 停在待批准上时也有）。本次调用含文件型输入（计划或恢复 JSON，包括执行指导与续作拒绝）且出错时，`error` 为 null 并写 `error_omitted: "file inputs present; see stderr"`，`stop` 去掉 `detail`、保留其余字段，因为校验错误可能引用文件中的字段值；错误全文仍输出到 stderr。无文件输入时 `error_omitted` 为 null |
 
 记录不保存环境变量值、凭据、计划或恢复 JSON 的文件内容或生成的 MCP 配置。
 

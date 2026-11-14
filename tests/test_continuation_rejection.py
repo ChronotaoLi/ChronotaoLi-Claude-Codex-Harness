@@ -14,7 +14,7 @@ from harness.cli import status_summary
 from harness.recovery import snapshot_digest
 from harness.util import HarnessError, read_json, write_json
 import harness.worker_receipts as worker_receipts_module
-from test_harness import RepoCase, ROOT, add_worker_dispatch, after_save, stopped
+from test_harness import RepoCase, ROOT, add_worker_dispatch, after_save, stopped, walk_exit
 from test_runtime_changes import ScriptedBackend
 
 
@@ -210,21 +210,22 @@ class RejectionLifecycleTests(RepoCase):
         with self.assertRaises(HarnessError):
             self.engine(backend).resume(engine.run['id'])
         self.assertEqual(len(backend.calls), calls)
-        resumed = self.engine(backend)
-        with self.assertRaises(HarnessError):
-            resumed.resume(engine.run['id'], reject_continuation=path)
-        self.assertEqual(resumed.run['attempts']['greet'], 2)
+        # The second listed exit: resume RUN --reject-continuation FILE; the fresh worker asks again.
+        rejected = walk_exit(self, engine.directory, ('continuation', 'commands_required'), backend=backend, choose=1,
+                             fill={'FILE': path}, expect_code=3, expect_status='blocked')
+        self.assertEqual(rejected['attempts']['greet'], 2)
         self.assertFalse(any(c['role'] == 'commander' for c in backend.calls))
         self.assertNotIn(old_command, self.config.data['permissions']['worker_commands'])
         self.assertNotIn(new_command, self.config.data['permissions']['worker_commands'])
-        self.assertIn('revised after operator rejection', (resumed.worktree / 'hello.py').read_text())
+        self.assertIn('revised after operator rejection', (engine.worktree / 'hello.py').read_text())
         calls = len(backend.calls)
         with self.assertRaises(HarnessError):
             self.engine(backend).resume(engine.run['id'])
         self.assertEqual(len(backend.calls), calls)
         self.config.data['permissions']['worker_commands'].append(new_command)
-        result = self.engine(backend).resume(engine.run['id'])
-        self.assertEqual(result['status'], 'completed')
+        # The first listed exit: plain resume once the exact command is granted.
+        result = walk_exit(self, engine.directory, ('continuation', 'commands_required'), backend=backend,
+                           expect_status='completed')
         self.assertEqual(sum(result['attempts'].values()), 3)
         workers = [d for d in result['dispatches'] if d['role'] == 'worker' and d.get('invoked')]
         self.assertEqual(len({d['id'] for d in workers}), 3)

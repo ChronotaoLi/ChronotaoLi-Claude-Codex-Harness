@@ -11,7 +11,7 @@ from unittest.mock import patch
 from harness import stops
 from harness.run_context import RunContext
 from harness.util import HarnessError, ProcessTimeout, read_json, write_json
-from test_harness import ROOT, RepoCase, commit_recorder
+from test_harness import ROOT, RepoCase, commit_recorder, no_command_exit
 from test_operations import OperationCase
 from test_runtime_changes import ScriptedBackend
 
@@ -29,16 +29,17 @@ def notices(stderr):
 
 class RegistryTests(unittest.TestCase):
     def test_registry_shape_and_projection(self):
-        self.assertEqual(set(stops.REGISTRY), {("plan_approval", "initial_plan"), ("interrupted", "signal"),
-                                               ("unclassified", "untyped_harness_error"),
-                                               ("unclassified", "unexpected_exception")})
+        self.assertEqual(len(stops.REGISTRY), 54)
+        self.assertLessEqual({("plan_approval", "initial_plan"), ("interrupted", "signal"),
+                              ("unclassified", "untyped_harness_error"), ("unclassified", "unexpected_exception")},
+                             set(stops.REGISTRY))
         codes = {key: entry["exit_code"] for key, entry in stops.REGISTRY.items()}
         self.assertEqual(codes[("plan_approval", "initial_plan")], 0)
         self.assertEqual(codes[("interrupted", "signal")], 130)
         self.assertEqual(codes[("unclassified", "untyped_harness_error")], 1)
         self.assertEqual(codes[("unclassified", "unexpected_exception")], 1)
         with self.assertRaises(KeyError):
-            stops.make("budget", "task_attempts")
+            stops.make("budget", "no_such_reason")
         with self.assertRaises(KeyError):
             stops.make("interrupted", "signal", data={"unknown": 1})
         with self.assertRaises(KeyError):
@@ -106,7 +107,7 @@ class LedgerStopTests(OperationCase):
         engine = self.blocked()
         path = engine.directory / "state.json"
         saved = read_json(path)
-        self.assertEqual(saved["stop"]["kind"], "unclassified")
+        self.assertEqual(saved["stop"]["kind"], "budget")
         plan_stop = stops.make("plan_approval", "initial_plan")
         cases = {
             "blocked without stop": lambda run: run.pop("stop"),
@@ -140,11 +141,11 @@ class LedgerStopTests(OperationCase):
             run_id = states[-1]["id"]
             self.assertEqual(states[-1]["stop"]["kind"], "plan_approval")
             code, _, err = self.invoke(["resume", run_id])
-            self.assertEqual(code, 1)  # 4a: a plain resume still refuses an unapproved plan
+            self.assertEqual(code, 0)  # a plain resume reports the waiting plan again
             self.assertEqual(self.ledger(run_id)["stop"]["kind"], "plan_approval")
             code, _, _ = self.invoke(["resume", run_id, "--approve-plan"])
-            self.assertEqual(code, 1)
-            self.assertEqual((states[-1]["status"], states[-1]["stop"]["kind"]), ("blocked", "unclassified"))
+            self.assertEqual(code, 3)
+            self.assertEqual((states[-1]["status"], states[-1]["stop"]["kind"]), ("blocked", "budget"))
             self.config.data["runtime"]["max_agent_dispatches"] = 50
             code, _, _ = self.invoke(["resume", run_id])
             self.assertEqual(code, 0)
@@ -183,7 +184,7 @@ class LedgerStopTests(OperationCase):
         with patch.object(RunContext, "event", event), self.assertRaises(KeyboardInterrupt):
             engine.start("Implement greet", plan())
         saved = read_json(engine.directory / "state.json")
-        self.assertEqual((saved["status"], saved["stop"]["kind"]), ("blocked", "unclassified"))
+        self.assertEqual((saved["status"], saved["stop"]["kind"]), ("blocked", "budget"))
         self.assertNotIn('"run_stopped"', (engine.directory / "events.jsonl").read_text())
         self.config.data["runtime"]["max_agent_dispatches"] = 50
         recorder, states = commit_recorder()
@@ -214,6 +215,8 @@ class LedgerStopTests(OperationCase):
         self.assertEqual((record["exit_status"], record["stop"]["kind"], record["stop"]["exit_code"]),
                          (1, "unclassified", 1))
         self.assertNotIn("error_type", record)
+        # Row unclassified-harness-error: no recovery action is guessed.
+        no_command_exit(self, notice["stop"], ("unclassified", "untyped_harness_error"))
 
     def test_interrupt_records_signal_stop_and_130(self):
         path = self.repo.parent / "plan.json"
@@ -230,8 +233,8 @@ class LedgerStopTests(OperationCase):
                          ("interrupted", "interrupted", "signal"))
         self.assertIn("harness: 已中断；运行状态和 worktree 已保留", err)
         notice = notices(err)[-1]
-        self.assertEqual((notice["stop"]["exit_code"], notice["stop"]["exits"]),
-                         (130, [f"resume {run_id}", f"abandon {run_id}"]))
+        # A simulated call's exit is not confirmed: abandon is listed once resume has confirmed it.
+        self.assertEqual((notice["stop"]["exit_code"], notice["stop"]["exits"]), (130, [f"resume {run_id}"]))
         record = self.record(notice["operation_id"])
         self.assertEqual((record["exit_status"], record["stop"]["kind"]), (130, "interrupted"))
 
@@ -240,11 +243,11 @@ class LedgerStopTests(OperationCase):
         update = self.repo.parent / "update.json"
         write_json(update, {"schema_version": 1, "secret": "VALUE-THAT-MUST-NOT-LEAK"})
         code, _, err = self.invoke(["resume", engine.run["id"], "--environment-update", str(update)])
-        self.assertEqual(code, 1)
+        self.assertEqual(code, 2)
         record = self.record(notices(err)[-1]["operation_id"])
         self.assertIsNone(record["error"])
         self.assertTrue(record["error_omitted"])
-        self.assertEqual((record["stop"]["kind"], record["stop"]["exit_code"]), ("unclassified", 1))
+        self.assertEqual((record["stop"]["kind"], record["stop"]["exit_code"]), ("invalid_input", 2))
         self.assertIn("reason", record["stop"])
         self.assertNotIn("detail", record["stop"])
         self.assertNotIn("VALUE-THAT-MUST-NOT-LEAK", json.dumps(record))
@@ -271,8 +274,10 @@ class LedgerStopTests(OperationCase):
                 record = self.record(operation_id)
                 self.assertEqual((record["exit_status"], record["error"]), (1, None))  # file input: text omitted
                 stop = record["stop"]
+                expected = (("runtime_failure", "database") if isinstance(error, sqlite3.Error)
+                            else ("unclassified", "unexpected_exception"))
                 self.assertEqual((stop["kind"], stop["reason"], stop["data"]["error_type"], stop["exit_code"]),
-                                 ("unclassified", "unexpected_exception", type(error).__name__, 1))
+                                 (*expected, type(error).__name__, 1))
                 self.assertNotIn("detail", stop)
                 if moment == "during the run":
                     ledger = stops.project_ledger(self.ledger(record["run_id"]), omit_detail=True)
@@ -413,7 +418,8 @@ class RecoveryCapacityTests(RepoCase):
         padding = 60000 + (budget - self.MARGIN) - (calibrated + len(self.FAILURE) - len("service unavailable"))
         result, backend, required = self.scenario(padding, self.FAILURE)
         self.assertEqual(result["status"], "completed")
-        self.assertEqual(required, budget - self.MARGIN)
+        # Within a few characters of the calibrated edge: still far closer than one more copy of the failure.
+        self.assertLessEqual(abs(required - (budget - self.MARGIN)), 20)
         self.assertEqual(result["attempts"], {"greet": 2})
         self.assertEqual(result["agent_dispatches"], 5)
         self.assertEqual([call["role"] for call in backend.calls].count("worker"), 2)

@@ -21,7 +21,7 @@ from pathlib import Path
 
 from . import git
 from .shared import asset_digest
-from .util import HarnessError, dump, uid, write_json
+from .util import _cli_arguments, HarnessError, dump, uid, write_json
 
 OPERATION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
 RUN_ID = re.compile(r"run_[A-Za-z0-9]+")
@@ -170,7 +170,7 @@ class OperationRecord:
         if operation_id is None:
             operation_id = uid("op")
         elif not OPERATION_ID.fullmatch(operation_id):
-            raise HarnessError("无效 --operation-id：以字母或数字开头，只含字母、数字、_ . -，最长 64 字符")
+            raise HarnessError("无效 --operation-id：以字母或数字开头，只含字母、数字、_ . -，最长 64 字符", stop=_cli_arguments("--operation-id"))
         started = time.time()
         record = {"operation_id": operation_id, "kind": kind, "status": "prepared",
                   "started_at": started, "started_at_utc": utc_text(started),
@@ -188,13 +188,15 @@ class OperationRecord:
         with private_state_lock(repo) as common:
             _path(directory, directory=True)
             if path.exists() or path.is_symlink():
-                raise HarnessError(f"操作记录已存在：{path}；每个 --operation-id 只能由一个进程使用")
+                raise HarnessError(f"操作记录已存在：{path}；每个 --operation-id 只能由一个进程使用",
+                                   stop=_cli_arguments("--operation-id"))
             initialize_private_state_locked(repo, state, common)
             directory.mkdir(parents=True, exist_ok=True)
             try:
                 descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
             except FileExistsError as error:
-                raise HarnessError(f"操作记录已存在：{path}；每个 --operation-id 只能由一个进程使用") from error
+                raise HarnessError(f"操作记录已存在：{path}；每个 --operation-id 只能由一个进程使用",
+                                   stop=_cli_arguments("--operation-id")) from error
             with os.fdopen(descriptor, "w", encoding="utf-8") as output:
                 output.write(dump(record) + "\n")
                 output.flush()

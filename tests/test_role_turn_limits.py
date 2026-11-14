@@ -13,7 +13,7 @@ from harness.config import Config
 from harness.permission_smoke import permission_smoke
 from harness.tool_smoke import tool_smoke
 from harness.util import HarnessError, read_json
-from test_harness import ROOT, RepoCase
+from test_harness import ROOT, RepoCase, walk_exit
 from test_provider_usage import FIXTURE_PROCESS, FixtureCLIBackend
 
 
@@ -151,8 +151,9 @@ class RoleTurnLimitRecoveryTests(RepoCase):
         self.assertEqual(len(backend.adapter_calls), 1)
         self.config.data["runtime"]["claude_max_turns_by_role"] = {"worker": 200}
         backend.options = {"worker": {"envelope": {"num_turns": 256}}}
-        result = self.engine(backend).resume(engine.run["id"])
-        self.assertEqual(result["status"], "completed")
+        # Row agent-turns: the listed plain resume after raising the worker's turn limit.
+        result = walk_exit(self, engine.directory, ("budget", "agent_turns"), backend=backend,
+                           expect_status="completed")
         self.assertEqual(result["attempts"], {"greet": 2})
         self.assertEqual(sum(result["attempts"].values()), 2)
         self.assertEqual(result["agent_dispatches"], 5)

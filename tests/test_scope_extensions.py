@@ -128,7 +128,7 @@ class ScopeExtensionRecoveryTests(RepoCase):
         calls = copy.deepcopy(backend.calls)
         code, engines, error = CLIControlsTests.invoke(
             self, ["resume", engine.run["id"], "--allow-scope", "support.txt"], backend)
-        self.assertEqual(code, 1)
+        self.assertEqual(code, 3)
         self.assertIn("等待操作者决定", error)
         self.assertEqual(engines[0].run["approved_scope"], ["support.txt"])
         self.assertEqual(backend.calls, calls)

@@ -137,6 +137,7 @@ class DispatchEventLifecycleTests(RepoCase):
         self.assertEqual(summary["remaining_model_calls"]["tasks"], {"greet": 2, "polish": 2})
         self.assertIn("至少还需 5 次", summary["stop"]["detail"])
         self.assertEqual(saved["config_snapshot"]["runtime"]["max_agent_dispatches"], 0)
+        self.assertEqual(saved["stop"]["data"]["minimum_remaining_calls"], 5)
 
     def test_dispatch_limit_stop_with_candidate_awaiting_review_reports_two(self):
         # Worker returns, local verification passes, then the task review exceeds the limit.

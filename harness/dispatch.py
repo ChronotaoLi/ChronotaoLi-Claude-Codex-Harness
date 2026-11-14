@@ -7,6 +7,7 @@ import uuid
 from copy import deepcopy
 from pathlib import Path
 
+from . import stops
 from .adapters import provider_usage, UndecodableOutput
 from .context import compose
 from .continuation import validate_continuation_rejection
@@ -21,6 +22,64 @@ from .util import group_alive, HarnessError, write_json
 
 MODEL_ROLES = ("commander", "worker", "reviewer")
 JUDGED = ("invalid", "invalid_rejected", "invalid_asked", "invalid_blocked")
+
+
+PERSISTENCE_STEPS = ("persist_outcome", "on_outcome", "persist_callback_failure", "persist_cancellation")
+
+
+def process_stop(failure, dispatch_id, task_id=None):
+    """Process facts first (spec 4.3): new cleanup or persistence faults, then an unconfirmed exit.
+
+    The supervisor records every primary exception as an ``execution`` error; that
+    record is the original failure, not a fault. Returns None when the facts say nothing.
+    """
+    outcome = getattr(failure, "outcome", None)
+    if outcome is None:
+        return None
+    source = {"dispatch_id": dispatch_id, **({"task_id": task_id} if task_id else {})}
+    faults = list(outcome.cleanup_errors) + [e for e in outcome.errors if e.get("step") in PERSISTENCE_STEPS]
+    if faults:
+        return stops.make("evidence", "process_incomplete", data={"exit_unconfirmed": not outcome.exit_confirmed},
+                          source=source)
+    if outcome.started and not outcome.exit_confirmed:
+        return stops.make("process_unconfirmed", "dispatch_exit", source={"dispatch_id": dispatch_id})
+    return None
+
+
+def invocation_stop(failure, *, job, role, provider, dispatch_id, task_id, timeout):
+    """The type of a failed provider invocation: process facts, then the original exception's facts."""
+    from .diagnostics import invocation_diagnostics
+    from .util import ProcessStartError, ProcessTimeout
+    value = process_stop(failure, dispatch_id, task_id)
+    if value is not None:
+        return value
+    outcome = getattr(failure, "outcome", None)
+    source = {"dispatch_id": dispatch_id, "task_id": task_id}
+    facts = {"role": role, "provider": provider}
+    if isinstance(failure, ProcessStartError) or (outcome is not None and not outcome.started):
+        return stops.make("provider_failure", "local_start", data=facts, source=source)
+    if isinstance(failure, ProcessTimeout):
+        return stops.make("budget", "agent_timeout", source=source, data={
+            "role": role, "config_key": "runtime.agent_timeout_seconds", "limit_seconds": timeout})
+    if provider == "claude" and _claude_subtype(job) == "error_max_turns":
+        return stops.make("budget", "agent_turns", data={"role": role, "config_key": "runtime.claude_max_turns"},
+                          source=source)
+    reported = invocation_diagnostics(job, provider, failure)["failure_class"] == "provider_reported"
+    if not reported and provider == "codex":
+        from .adapters import codex_error_summary
+        reported = bool(codex_error_summary(job / "process.stdout"))
+    return stops.make("provider_failure", "invocation_failed" if reported else "unknown", data=facts, source=source)
+
+
+def _claude_subtype(job):
+    import json
+    try:
+        with (Path(job) / "process.stdout").open("rb") as stream:
+            raw = stream.read(16 * 1024 * 1024 + 1)
+        envelope = json.loads(raw) if len(raw) <= 16 * 1024 * 1024 else None
+    except (OSError, ValueError, RecursionError):
+        return None
+    return envelope.get("subtype") if isinstance(envelope, dict) and envelope.get("type") == "result" else None
 
 
 def dispatch_key(entry):
@@ -108,12 +167,12 @@ class Dispatcher(RuntimeService):
     @staticmethod
     def stop_invalid(role, invalid):
         return HarnessError(f"{role} 输出连续两次无效：{invalid}；原件 {invalid.entry['invalid_output']['artifact']}；"
-                            "普通 resume 重新请求，或 abandon")
+                            "普通 resume 重新请求，或 abandon", stop=stops.make("invalid_output", "redo_exhausted", data={"role": role}, source={"dispatch_id": invalid.entry["id"], "task_id": invalid.entry["task_id"], "artifact": invalid.entry["invalid_output"]["artifact"], "artifact_digest": invalid.entry["invalid_output"]["artifact_digest"]}))
 
     def dispatch_once(self, role, kind, task_id, schema, packet, task=None, *, retry_of=None, previous_invalid=None):
         self.context.ensure_exited()
         if role == "worker":
-            self.services.planning.require_task_commands([task_id])
+            self.services.planning.require_task_commands([task_id], "selected_task")
             # Includes retries after local preparation failure, before either
             # invocation budget is consumed.
             self.services.environment.check_environment(task_id)
@@ -155,6 +214,9 @@ class Dispatcher(RuntimeService):
         except ContextCapacityError as error:
             report = {**error.report, "request_id": None}
             write_json(job / "context-report.json", report)
+            error.stop = stops.make("budget", "context_capacity", data={
+                key: value for key, value in error.stop["data"].items() if key != "detail"},
+                source={"artifact": str(job / "context-report.json")})
             raise
         write_json(job / "context-report.json", report)
         self.context.run["dispatches"].append({"id": dispatch_id, "role": role, "kind": kind, "task_id": task_id,
@@ -241,7 +303,7 @@ class Dispatcher(RuntimeService):
                 raise HarnessError(
                     f"已达 run 模型派发次数上限（已用 {self.context.run['agent_dispatches']}，上限 {limit}）；"
                     + (remaining["message"] + "；" if remaining else "")
-                    + "可显式增大 max_agent_dispatches 后恢复")
+                    + "可显式增大 max_agent_dispatches 后恢复", stop=stops.make("budget", "agent_dispatches", data={"config_key": "runtime.max_agent_dispatches", "used": self.context.run["agent_dispatches"], "limit": limit, **({"minimum_remaining_calls": remaining["lower_bound"]} if remaining else {})}))
             # Persist all invocation budgets together after local preparation.
             # Provider failures still count; local context/MCP/snapshot failures do not.
             if role == "worker":
@@ -284,9 +346,26 @@ class Dispatcher(RuntimeService):
             invoked = True
             # Only after the durable invoked=True; a failed append never blocks the call.
             self.context.observe("dispatch_started", task_id=task_id, dispatch_id=dispatch_id, role=role, invoked=True)
-            result = self.context.backend.invoke(role=role, model=self.context.config.role(role, self.context.commander), cwd=self.context.worktree,
-                                         job=job, schema=contract, prompt=prompt, run_path=self.context.directory / "state.json",
-                                         on_start=on_start, task=task, kind=kind, on_outcome=on_outcome)
+            try:
+                result = self.context.backend.invoke(role=role, model=self.context.config.role(role, self.context.commander), cwd=self.context.worktree,
+                                             job=job, schema=contract, prompt=prompt, run_path=self.context.directory / "state.json",
+                                             on_start=on_start, task=task, kind=kind, on_outcome=on_outcome)
+            except Exception as failure:
+                # The call boundary (spec 4.3): an untyped failure, or any failure carrying
+                # process facts, gets its type here; typed failures keep theirs.
+                if isinstance(failure, HarnessError) and failure.stop is not None:
+                    raise
+                if not isinstance(failure, HarnessError) and getattr(failure, "outcome", None) is None:
+                    raise
+                stop = invocation_stop(failure, job=job, role=role, dispatch_id=dispatch_id, task_id=task_id,
+                                       provider=self.context.config.role(role, self.context.commander)["cli"],
+                                       timeout=self.context.config.data["runtime"]["agent_timeout_seconds"])
+                if isinstance(failure, HarnessError):
+                    failure.stop = stop
+                    raise
+                typed = HarnessError(str(failure) or type(failure).__name__, stop=stop)
+                typed.outcome = failure.outcome
+                raise typed from failure
             # The synchronous backend has returned through run_process cleanup.
             # Receipt validation may itself check that all processes exited.
             if process_outcome is None:

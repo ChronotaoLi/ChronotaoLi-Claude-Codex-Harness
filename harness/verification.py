@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 import uuid
 from pathlib import Path
 
-from . import git
+from . import git, stops
 from .context import compact_checks
 from .recovery import snapshot_digest
 from .services import RuntimeService
@@ -135,10 +135,20 @@ class Verification(RuntimeService):
             if error is not None and not isinstance(error, ProcessTimeout):
                 self.context.run["feedback"] = {"task_id": task_id,
                     "verification_error": {"argv": command, "error": str(error), "log": str(log)}}
+                # The command boundary (spec 4.3 cells 1-2): process facts type an untyped failure.
+                from .dispatch import process_stop
+                stop = process_stop(error, entry["id"])
+                if stop is not None and not (isinstance(error, HarnessError) and error.stop is not None):
+                    if isinstance(error, HarnessError):
+                        error.stop = stop
+                    else:
+                        typed = HarnessError(str(error) or type(error).__name__, stop=stop)
+                        typed.outcome = error.outcome
+                        raise typed from error
                 raise error
             self.context.ensure_exited()
             if not result["exit_confirmed"]:
-                raise HarnessError("Verification process exit is unknown; inspect " + str(log))
+                raise HarnessError("Verification process exit is unknown; inspect " + str(log), stop=stops.make("process_unconfirmed", "dispatch_exit", source={"dispatch_id": entry["id"]}))
             if phase == "setup" and checks_failed(result):
                 break
         return results
@@ -165,7 +175,7 @@ class Verification(RuntimeService):
                                f"新增未跟踪文件：{changes['added']}；修改：{changes['modified']}；删除：{changes['deleted']}。"
                                "请配置构建/测试输出位置或显式忽略生成产物；不自动豁免文件。"
                                "运行中可在公共 Git 目录的 info/exclude 精确忽略新生成文件；"
-                               "这会改变后续快照可见范围，不豁免已跟踪文件，请先核对文件内容。")
+                               "这会改变后续快照可见范围，不豁免已跟踪文件，请先核对文件内容。", stop=stops.make("verification", "checks_modified_files", data={"scope": "task", "phase": "checks"}, source={"task_id": task_id, "artifact": str(folder / "file-changes.json")}))
         write_json(folder / "results.json", results)
         return results
 
@@ -198,11 +208,11 @@ class Verification(RuntimeService):
         setup = self.run_verification_commands(task_id, environment["setup_commands"], checkout,
                                                folder / "setup", binding, phase="setup")
         if git.snapshot(checkout, binding=binding) != baseline:
-            raise HarnessError(f"依赖准备修改了全新检出的受检文件；证据：{artifact}")
+            raise HarnessError(f"依赖准备修改了全新检出的受检文件；证据：{artifact}", stop=stops.make("verification", "checks_modified_files", data={"scope": "final", "phase": "setup"}, source={"artifact": str(artifact)}))
         if not checks_passed(setup):
             environment["status"] = "setup_failed"
             write_json(artifact, environment)
-            raise HarnessError(f"整体验证依赖准备失败；修复环境后 resume 将在另一全新检出重试。证据：{folder / 'setup/results.json'}")
+            raise HarnessError(f"整体验证依赖准备失败；修复环境后 resume 将在另一全新检出重试。证据：{folder / 'setup/results.json'}", stop=stops.make("verification", "setup_failed", data={"attempt": owner["attempt"]}, source={"artifact": str(folder / "setup/results.json")}))
         results = self.run_verification_commands(task_id, self.context.config.data["verification"]["commands"],
                                                  checkout, folder, binding)
         for result in results:
@@ -210,9 +220,9 @@ class Verification(RuntimeService):
         after = git.snapshot(checkout, binding=binding)
         if after != baseline:
             write_json(folder / "file-changes.json", git.snapshot_changes(baseline, after))
-            raise HarnessError(f"整体验证修改了全新检出的受检文件；证据：{folder / 'file-changes.json'}")
+            raise HarnessError(f"整体验证修改了全新检出的受检文件；证据：{folder / 'file-changes.json'}", stop=stops.make("verification", "checks_modified_files", data={"scope": "final", "phase": "checks"}, source={"artifact": str(folder / "file-changes.json")}))
         if self.context.snapshot() != source_snapshot:
-            raise HarnessError("整体验证期间原工作树发生变化；不能接受旧候选")
+            raise HarnessError("整体验证期间原工作树发生变化；不能接受旧候选", stop=stops.make("workspace_mismatch", "candidate_changed"))
         environment.update(status="verification_failed" if not checks_passed(results) else "verified",
                            snapshot_digest=snapshot_digest(after),
                            setup_artifact=str(folder / "setup/results.json"))

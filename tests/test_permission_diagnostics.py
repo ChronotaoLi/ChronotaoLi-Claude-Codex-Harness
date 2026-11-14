@@ -118,7 +118,7 @@ class PermissionDiagnosticsCliTests(RepoCase):
                 with contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
                     code = cli.main(['--config', str(ROOT / 'harness.toml'), '--repo', str(self.repo),
                                      'permission-diagnostics', self.RUN, self.DISPATCH])
-                self.assertEqual((code, output.getvalue()), (1, ''))
+                self.assertEqual((code, output.getvalue()), (2, ''))  # an unsupported ledger is an input refusal
                 self.assertIn(f'台账版本{shown}', errors.getvalue())
                 self.assertIn('不支持（当前版本 18）', errors.getvalue())
                 self.assertEqual(path.read_bytes(), before)

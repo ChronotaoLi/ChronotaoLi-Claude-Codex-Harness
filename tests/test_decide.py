@@ -12,7 +12,7 @@ from unittest import mock
 
 from harness.planning import Planner
 from harness.util import HarnessError, read_json
-from test_harness import RepoCase
+from test_harness import RepoCase, walk_exit
 from test_runtime_changes import ScriptedBackend
 
 KEY = "commander:decide:run"
@@ -282,8 +282,9 @@ class AskTests(DecideCase):
         run = self.state(engine)
         request = run["decision_requests"][-1]
         self.assertEqual((request["kind"], request["source_task_id"], request["task_id"]), ("commander", "run", "a"))
-        result = self.engine(script).resume(run["id"], operator_decision=[self.answer(run, summary=summary)])
-        self.assertEqual(result["status"], "completed")
+        # The listed exit (row operator-answer): resume RUN --operator-decision FILE.
+        walk_exit(self, engine.directory, ("operator_decision", "answer_required"), backend=script,
+                  fill={"FILE": self.answer(run, summary=summary)}, expect_status="completed")
         decides = script.of("commander", "decide")
         self.assertEqual(len(decides), 3)
         for call in decides[1:]:
@@ -314,15 +315,18 @@ class AskTests(DecideCase):
             engine.start("ask", {"tasks": [task("a"), task("b", ["a"])]})
         run = self.state(engine)
         request = run["decision_requests"][-1]
-        with self.assertRaisesRegex(HarnessError, "操作者决定停止"):
-            self.engine(script).resume(run["id"], operator_decision=[self.answer(run, "stop", "Not now.")])
+        # The answer exit with a stop answer saves it and stops (exit 3) without a model call.
         count = len(script.calls)
+        stopped = walk_exit(self, engine.directory, ("operator_decision", "answer_required"), backend=script,
+                            fill={"FILE": self.answer(run, "stop", "Not now.")}, expect_code=3, expect_status="blocked")
+        self.assertEqual((stopped["stop"]["reason"], len(script.calls)), ("operator_stopped", count))
         with self.assertRaisesRegex(HarnessError, "操作者已决定停止"):
             self.engine(script).resume(run["id"])
         self.assertEqual(len(script.calls), count)
         run = self.state(engine)
-        result = self.engine(script).resume(run["id"], operator_decision=[self.answer(run, request=request)])
-        self.assertEqual(result["status"], "completed")
+        # The listed exit (row operator-stopped): a new continue answer for the same request.
+        walk_exit(self, engine.directory, ("operator_decision", "operator_stopped"), backend=script,
+                  fill={"FILE": self.answer(run, request=request)}, expect_status="completed")
         self.assertEqual(len(script.of("commander", "decide")), 2)
 
     def test_malformed_question_still_registers_and_stops_without_redo(self):

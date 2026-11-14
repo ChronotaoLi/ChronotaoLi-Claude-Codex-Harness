@@ -1,5 +1,6 @@
 """Bound worker evidence for fresh dispatches; never an acceptance checkpoint."""
 
+from . import stops
 from .versions import RUN_SCHEMA_VERSION
 from .services import RuntimeService
 from copy import deepcopy
@@ -78,6 +79,7 @@ def _file_digest(path):
             for chunk in iter(lambda: stream.read(65536), b""):
                 digest.update(chunk)
     except OSError as error:
+        stops.keep_local_io(error)
         raise HarnessError(f"cannot read checkpoint file: {path}") from error
     return digest.hexdigest()
 
@@ -88,6 +90,7 @@ def _read(path, limit=None):
         with path.open("rb") as stream:
             raw = stream.read() if limit is None else stream.read(limit + 1)
     except OSError as error:
+        stops.keep_local_io(error)
         raise HarnessError(f"cannot read checkpoint file: {path}") from error
     if limit is not None and len(raw) > limit:
         raise HarnessError("checkpoint evidence exceeds 1 MiB")
@@ -132,7 +135,7 @@ class ProgressRecovery(RuntimeService):
             return _validation.sources[key]
         raw = _read(expected)
         if _digest(raw) != source["artifact_digest"]:
-            raise HarnessError("checkpoint original result changed")
+            raise HarnessError("checkpoint original result changed", stop=stops.make("evidence", "runtime_integrity"))
         try:
             result = json.loads(raw)
         except (ValueError, UnicodeError) as error:
@@ -378,6 +381,7 @@ class ProgressRecovery(RuntimeService):
         validation.records[key] = record, total
         return total
 
+    @stops.reads_evidence
     def validate_checkpoint_links(self):
         self._validated_checkpoint_links()
 

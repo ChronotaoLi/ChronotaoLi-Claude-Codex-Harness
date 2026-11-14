@@ -8,7 +8,7 @@ from pathlib import Path
 from harness.context import compact_plan, prompt_json
 from harness.contracts import apply_revision
 from harness.util import HarnessError, dump, read_json
-from test_harness import RepoCase, ROOT
+from test_harness import RepoCase, ROOT, walk_exit
 from test_runtime_changes import ScriptedBackend, finding, revised, trigger_kind
 
 
@@ -119,8 +119,10 @@ class FinalContextCapacityTests(RepoCase):
         self.assertEqual(sum(saved["attempts"].values()), 0)
         self.assertEqual(backend.calls, [])
         self.config.data["runtime"]["context_chars"] = report["projected_chars"] + 20000
-        result = self.engine(backend).resume(saved["id"])
-        self.assertEqual(result["status"], "completed")
+        self.assertEqual((saved["stop"]["data"]["scope"], saved["stop"]["source"]), ("final_review", {}))
+        # Row context-final: the listed plain resume after raising context_chars.
+        result = walk_exit(self, engine.directory, ("budget", "context_capacity"), backend=backend,
+                           expect_status="completed")
         self.assertEqual(len(result["plan_history"]), 1)
         self.assertEqual(sum(result["attempts"].values()), 1)
         self.assertFalse(any(call["role"] == "commander" for call in backend.calls))

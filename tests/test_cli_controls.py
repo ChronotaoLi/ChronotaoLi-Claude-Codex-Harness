@@ -7,7 +7,7 @@ from harness.adapters import DemoBackend
 from harness.cli import main
 from harness.runtime import Runtime
 from harness.util import read_json, write_json
-from test_harness import ROOT, RepoCase
+from test_harness import ROOT, RepoCase, walk_exit
 
 
 class CLIControlsTests(RepoCase):
@@ -36,14 +36,15 @@ class CLIControlsTests(RepoCase):
         run = engines[0].run
         self.assertEqual(run["status"], "awaiting_approval")
         self.assertFalse(any(d["role"] == "worker" for d in run["dispatches"]))
-        code, _, _ = self.invoke(["resume", run["id"]])
-        self.assertEqual(code, 1)
+        code, _, error = self.invoke(["resume", run["id"]])
+        self.assertEqual(code, 0, error)  # a plain resume reports the same stop again; it never approves
+        self.assertIn('"kind":"plan_approval","reason":"initial_plan"', error)
         state = read_json(engines[0].directory / "state.json")
-        self.assertEqual(state["status"], "awaiting_approval")
-        code, approved, error = self.invoke(["resume", run["id"], "--approve-plan"])
-        self.assertEqual(code, 0, error)
-        self.assertEqual(approved[0].run["status"], "completed")
-        reviewers = [d for d in approved[0].run["dispatches"] if d["role"] == "reviewer"]
+        self.assertEqual((state["status"], state["stop"]["kind"]), ("awaiting_approval", "plan_approval"))
+        # The listed exit (row plan-approval): resume RUN --approve-plan.
+        approved = walk_exit(self, engines[0].directory, ("plan_approval", "initial_plan"), backend=DemoBackend(),
+                             choose=1, expect_status="completed")
+        reviewers = [d for d in approved["dispatches"] if d["role"] == "reviewer"]
         self.assertEqual({d["task_id"] for d in reviewers}, {"greet", "final"})
 
     def test_step_pauses_after_one_acceptance_and_resumes(self):

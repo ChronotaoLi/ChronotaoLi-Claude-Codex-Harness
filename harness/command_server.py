@@ -23,7 +23,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .process_runtime import defer_cleanup_signals
-from . import git
+from . import git, stops
 from .util import HarnessError, ProcessStartError, ProcessTimeout, group_alive, lock, read_json, run_process, tail, write_json
 from .versions import read_current_ledger
 
@@ -174,7 +174,7 @@ def ensure_command_processes_exited(directory, parent_entry=None, *, observe=gro
             continue
         pgid = entry["pgid"]
         if (pgid is not None and observe(pgid)) or (pgid is None and entry["process_state"] != "prepared"):
-            raise HarnessError(f"Cannot confirm command process exited: {entry['id']}")
+            raise HarnessError(f"Cannot confirm command process exited: {entry['id']}", stop=stops.make("process_unconfirmed", "command_exit", data={"command_id": entry["id"]}, source={"dispatch_id": (parent_entry or {}).get("id")} if (parent_entry or {}).get("id") else {}))
     return records
 
 

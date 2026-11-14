@@ -23,7 +23,7 @@ from .operations import RUN_ID, OperationRecord, config_identity, digest_assets,
 from .runtime import Runtime
 from .shared import mcp_configs, toml_value
 from .util import HarnessError, dump, read_json, write_json
-from .versions import read_current_ledger, unsupported_ledger
+from .versions import read_current_ledger, require_current_ledger, unsupported_ledger
 
 
 def doctor(config):
@@ -217,7 +217,7 @@ def status_summary(run):
 def show_status(args, state):
     if args.run_id:
         if not args.run_id.startswith("run_") or not args.run_id[4:].isalnum():
-            raise HarnessError("无效 run ID")
+            raise HarnessError("无效 run ID", stop=stops.make("invalid_input", "cli_arguments", data={"option": "run_id"}))
         ledger = read_current_ledger(state / "runs" / args.run_id / "state.json")
         print(dump(ledger if args.full else status_summary(ledger)))
         return
@@ -385,7 +385,12 @@ def operate(args, config, repo, state):
         print(f"[harness] operation_id={operation.id} record={operation.path}", file=sys.stderr)
         if args.command == "run":
             engine = Runtime(config, repo, commander=args.commander, operation=operation)
-            result = engine.start(args.goal, read_json(args.plan) if args.plan else None,
+            try:
+                supplied = read_json(args.plan) if args.plan else None
+            except (OSError, ValueError) as error:
+                raise HarnessError(f"计划文件无法读取或不是有效 JSON：{error}",
+                                   stop=stops.make("invalid_input", "input_schema", data={"option": "--plan"})) from error
+            result = engine.start(args.goal, supplied,
                                   pause_after_plan=args.pause_after_plan, step=args.step)
             keys = ("id", "status", "branch", "worktree", "accepted")
         else:
@@ -557,13 +562,13 @@ def _main(argv=None):
         if args.command == "permission-diagnostics":
             from .permission_diagnostics import permission_diagnostics
             if not RUN_ID.fullmatch(args.run_id) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,119}", args.dispatch_id):
-                raise HarnessError("无效 run/dispatch ID")
+                raise HarnessError("无效 run/dispatch ID", stop=stops.make("invalid_input", "cli_arguments", data={"option": "run_id"}))
             state = git.repository(args.repo) / ".harness"
             try:
                 with observe.Observer(state, required=True) as observer:
                     run, error = observer._read_ledger(args.run_id)
-                    if error is None and (refusal := unsupported_ledger(run)) is not None:
-                        raise HarnessError(refusal)
+                    if error is None and unsupported_ledger(run) is not None:
+                        require_current_ledger(run)  # the shared typed refusal (exit 2)
                     if error or run.get("id") != args.run_id:
                         raise HarnessError(error or "运行 ID 不符")
                     entry = next((d for d in run.get("dispatches", []) if d.get("id") == args.dispatch_id), None)

@@ -793,7 +793,9 @@ APP_JS = r""""use strict";
     } else if (run.status === "blocked") {
       add("bad", "运行已阻断", [notice("台账状态为 blocked，可在调用记录和事件日志中查看原因。")]);
     }
-    if (run.status === "interrupted") { add("warn", "运行已中断", [notice("不会自动继续，需要显式恢复。")]); }
+    if (run.status === "interrupted" && !(stop && stop.kind === "interrupted")) {
+      add("warn", "运行已中断", [notice("不会自动继续，需要显式恢复。")]);
+    }
     if (run.status === "paused") { add("warn", "运行已暂停", [notice("不会自动继续，需要显式恢复。")]); }
     if (run.status === "awaiting_approval") {
       add("warn", "计划等待批准", [notice("普通恢复不会批准计划。"), resumeHint(data.id, "--approve-plan")]);

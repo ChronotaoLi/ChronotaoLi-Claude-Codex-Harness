@@ -3,7 +3,7 @@ import json
 from pathlib import Path
 from unittest.mock import patch
 
-from test_harness import ExitReportingBackend, RepoCase, ROOT, after_save
+from test_harness import ExitReportingBackend, RepoCase, ROOT, after_save, cli_notice, run_cli, walk_exit
 from harness.adapters import DemoBackend
 from harness.util import HarnessError, read_json
 import harness.worker_receipts as receipts_module
@@ -86,6 +86,18 @@ class WorkerReceiptTests(RepoCase):
         with self.assertRaisesRegex(HarnessError, 'before immutable seal'):
             engine.resume(engine.run['id'])
         self.assertEqual(engine.run['attempts']['greet'], 1)
+        # Row unsealed-return: confirming the exit does not unblock it ...
+        state = read_json(engine.directory / 'state.json')
+        worker = next(d for d in state['dispatches'] if d['role'] == 'worker')
+        code, errors = run_cli(self, ExitReportingBackend(), ['resume', state['id'], '--confirm-exited', worker['id']])
+        self.assertEqual((code, cli_notice(errors)['reason']), (1, 'unsealed_return'))
+        self.assertEqual(read_json(engine.directory / 'state.json')['attempts'], state['attempts'])
+        # ... the listed exit, abandon, is the way out; the evidence stays.
+        walk_exit(self, engine.directory, ('evidence', 'unsealed_return'), backend=ExitReportingBackend(),
+                  expect_status='abandoned')
+        evidence = read_json(engine.directory / 'state.json')['dispatches'][0]['worker_return_evidence']
+        job = engine.directory / 'dispatches' / worker['id']
+        self.assertTrue(all((job / name).is_file() for name, digest in evidence['sources'].items() if digest))
 
     def test_changed_candidate_and_tampered_seal_stop(self):
         engine = self.interrupted('after_seal')
@@ -181,11 +193,13 @@ class WorkerReceiptTests(RepoCase):
                     self.failed = True
                     raise HarnessError('provider unavailable; no returned result')
                 return super().invoke(**kwargs)
-        engine = self.engine(FailedThenReturned())
+        backend = FailedThenReturned()
+        engine = self.engine(backend)
         with self.assertRaises(HarnessError):
             engine.start('Implement greeting', self.plan())
-        run = engine.resume(engine.run['id'])
-        self.assertEqual(run['status'], 'completed')
+        # Row provider-unknown: the listed plain resume is a fresh counted attempt.
+        run = walk_exit(self, engine.directory, ('provider_failure', 'unknown'), backend=backend,
+                        expect_status='completed')
         workers = [entry for entry in run['dispatches'] if entry['role'] == 'worker']
         self.assertEqual(len(workers), 2)
         self.assertNotEqual(workers[0]['id'], workers[1]['id'])
@@ -395,8 +409,9 @@ class WorkerReceiptTests(RepoCase):
             engine.resume(engine.run['id'])
         self.assertEqual(backend.workers, 1)
         (engine.worktree / 'outside.txt').unlink()
-        run = engine.resume(engine.run['id'])
-        self.assertEqual(run['status'], 'completed')
+        # Row scope-violation: the listed plain resume after the cleanup.
+        run = walk_exit(self, engine.directory, ('scope_violation', 'candidate_outside_scope'), backend=backend,
+                        expect_status='completed')
         self.assertEqual(run['attempts']['greet'], 2)
         self.assertEqual(backend.workers, 2)
 

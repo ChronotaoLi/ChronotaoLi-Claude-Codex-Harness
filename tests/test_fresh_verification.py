@@ -8,7 +8,7 @@ import unittest
 from harness import git
 from harness.config import Config
 from harness.util import HarnessError, read_json
-from test_harness import RepoCase, ROOT
+from test_harness import RepoCase, ROOT, walk_exit
 from test_runtime_changes import ScriptedBackend
 
 
@@ -145,8 +145,9 @@ class FreshVerificationTests(RepoCase):
         self.assertEqual(len(engine.run["final_history"]), 1)
         self.assertEqual(engine.run["final_history"][-1]["phase"], "verifying")
         marker.write_text("ready")
-        result = self.engine(backend).resume(engine.run["id"])
-        self.assertEqual(result["status"], "completed")
+        # Row setup-failed: the listed plain resume uses a new checkout for the same attempt.
+        result = walk_exit(self, engine.directory, ("verification", "setup_failed"), backend=backend,
+                           expect_status="completed")
         self.assertEqual(len(result["final_history"]), 1)
         self.assertEqual(sum(result["attempts"].values()), 1)
         self.assertEqual(sum(call["role"] == "worker" for call in backend.calls), 1)

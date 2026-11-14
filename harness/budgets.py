@@ -1,5 +1,6 @@
 """Invocation accounting and evidence-bound exclusions from task work budgets."""
 
+from . import stops
 from .services import RuntimeService
 import re
 
@@ -31,6 +32,7 @@ class AttemptAccounting(RuntimeService):
     def task_budget_used(self, task_id):
         return work_attempts(self.context.run).get(task_id, 0)
 
+    @stops.reads_evidence
     def validate_attempt_accounting(self):
         attempts = self.context.run["attempts"]
         if any(not isinstance(k, str) or type(v) is not int or v < 0 for k, v in attempts.items()):

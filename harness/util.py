@@ -13,6 +13,8 @@ import time
 import uuid
 from pathlib import Path
 
+from . import stops
+
 
 PROCESS_HEARTBEAT_SECONDS = 60
 
@@ -26,6 +28,13 @@ class HarnessError(Exception):
         super().__init__(*args)
         if stop is not None:
             self.stop = stop
+
+
+class EvidenceError(HarnessError):
+    """A runtime-written artifact is missing, replaced or changed: never a model-output verdict.
+
+    Judgment code that catches HarnessError broadly lets this class through.
+    """
 
 
 class ProcessStartError(HarnessError):
@@ -102,13 +111,14 @@ def strict_json_loads(raw):
 
 
 @contextlib.contextmanager
-def lock(path: Path):
+def lock(path: Path, stop=None):
+    """An exclusive non-blocking lock; ``stop`` is the stop value a busy lock reports."""
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a+") as f:
         try:
             fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as e:
-            raise HarnessError(f"已有进程持有运行锁：{path}") from e
+            raise HarnessError(f"已有进程持有运行锁：{path}", stop=stop) from e
         try:
             yield
         finally:
@@ -135,6 +145,7 @@ def _dispatch_pgid(entry):
     return pgid
 
 
+@stops.reads_evidence
 def validate_command_directories(dispatches, run_dir):
     """Reject ledger paths that could redirect child-process supervision."""
     root = Path(run_dir)
@@ -170,6 +181,17 @@ def validate_command_directories(dispatches, run_dir):
                 raise HarnessError("命令退出确认身份或摘要无效")
 
 
+def _cli_arguments(option):
+    from . import stops
+    return stops.make("invalid_input", "cli_arguments", data={"option": option})
+
+
+def _exit_unconfirmed(entry):
+    from . import stops
+    ident = entry.get("id")
+    return stops.make("process_unconfirmed", "dispatch_exit", source={"dispatch_id": ident} if isinstance(ident, str) else {})
+
+
 def ensure_dispatches_exited(dispatches, *, observe=group_alive):
     """Use the same conservative exit gate for execution and cleanup.
 
@@ -189,10 +211,10 @@ def ensure_dispatches_exited(dispatches, *, observe=group_alive):
                 "已完成或已放弃的 run 使用 cleanup-run 的同名选项")
         if pgid is not None:
             if observe(pgid):
-                raise HarnessError(f"旧 dispatch {entry.get('id', '<unknown>')} 的进程组仍存在；{hint}")
+                raise HarnessError(f"旧 dispatch {entry.get('id', '<unknown>')} 的进程组仍存在；{hint}", stop=_exit_unconfirmed(entry))
             exited.append(entry)
         elif entry.get("process_state") != "prepared":
-            raise HarnessError(f"无法确认旧 dispatch {entry.get('id', '<unknown>')} 已退出；{hint}")
+            raise HarnessError(f"无法确认旧 dispatch {entry.get('id', '<unknown>')} 已退出；{hint}", stop=_exit_unconfirmed(entry))
     return exited
 
 
@@ -210,7 +232,7 @@ def confirm_dispatches_exited(dispatches, identifiers, *, audit, save, observe=g
         entries[entry["id"]] = entry
     unknown = set(identifiers) - entries.keys()
     if unknown:
-        raise HarnessError(f"未知 dispatch ID：{sorted(unknown)}")
+        raise HarnessError(f"未知 dispatch ID：{sorted(unknown)}", stop=_cli_arguments("--confirm-exited"))
     # Read and validate every selected journal before audit or mutation.
     from .command_server import command_processes
     children = {}

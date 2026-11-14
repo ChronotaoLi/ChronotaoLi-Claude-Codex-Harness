@@ -9,6 +9,7 @@ import subprocess
 from fnmatch import fnmatchcase
 from pathlib import Path
 
+from . import stops
 from .util import HarnessError, write_json
 
 
@@ -71,6 +72,7 @@ def _binding_file(path):
             raise HarnessError(f"worktree Git 绑定文件必须为普通文件：{path}")
         return path.read_bytes()
     except OSError as error:
+        stops.keep_local_io(error)
         raise HarnessError(f"worktree Git 绑定文件无法读取：{path}：{error}") from error
 
 
@@ -105,6 +107,7 @@ def capture_worktree_binding(worktree: Path, expected_branch: str | None):
     return binding
 
 
+@stops.classifies("workspace_mismatch", "binding_changed")
 def check_worktree_binding(worktree: Path, binding):
     """Refuse redirected metadata before any run-worktree Git command."""
     fields = ("worktree", "git_dir", "common_dir", "gitfile_sha256", "backlink_sha256", "commondir_sha256")
@@ -163,7 +166,7 @@ def clean(repo: Path, *, binding=None):
 def check_starting_checkout(repo: Path):
     """Require committed tracked files; untracked main-checkout files stay local."""
     if git(repo, "status", "--porcelain", "--untracked-files=no").strip():
-        raise HarnessError("目标仓库有已跟踪或暂存的未提交变更；请先保存提交，再创建隔离 worktree")
+        raise HarnessError("目标仓库有已跟踪或暂存的未提交变更；请先保存提交，再创建隔离 worktree", stop=stops.make("invalid_input", "cli_arguments", data={"option": "--repo"}))
     return [os.fsdecode(name) for name in
             git_bytes(repo, "ls-files", "--others", "--exclude-standard", "--directory", "-z").split(b"\0")
             if name]
@@ -199,7 +202,7 @@ def check_worktree_state(repo: Path, *, binding=None):
         check_worktree_binding(repo, binding)
     private = repo / ".harness"
     if private.exists() or private.is_symlink():
-        raise HarnessError("任务修改了受保护路径：.harness")
+        raise HarnessError("任务修改了受保护路径：.harness", stop=stops.make("scope_violation", "protected_path", data={"path": ".harness"}))
 
 
 def assert_removable_worktree(repo: Path, *, binding=None):
@@ -386,16 +389,23 @@ class ScopeViolation(HarnessError):
     """A validated Git candidate contains paths outside its task authority."""
 
 
-def check_scope(repo: Path, allowed: list[str], *, binding=None):
+def check_scope(repo: Path, allowed: list[str], *, binding=None, task_id=None):
+    """The candidate's changed paths; a scope stop names ``task_id`` (the task whose candidate it is)."""
+    source = {"task_id": task_id} if task_id is not None else {}
     for pattern in allowed:
         validate_scope_pattern(pattern)
-    check_worktree_state(repo, binding=binding)
+    try:
+        check_worktree_state(repo, binding=binding)
+    except HarnessError as error:
+        if source and error.stop is not None and error.stop["kind"] == "scope_violation":
+            error.stop = stops.make("scope_violation", error.stop["reason"], data=error.stop["data"], source=source)
+        raise
     paths = changed(repo, binding=binding)
     for path in paths:
         if path.split("/", 1)[0] in PROTECTED_ROOTS:
-            raise ScopeViolation(f"任务修改了受保护路径：{path}")
+            raise ScopeViolation(f"任务修改了受保护路径：{path}", stop=stops.make("scope_violation", "protected_path", data={"path": path}, source=source))
         if not any(path_matches(path, pattern) for pattern in allowed):
-            raise ScopeViolation(f"任务越界修改：{path}；允许范围：{allowed}")
+            raise ScopeViolation(f"任务越界修改：{path}；允许范围：{allowed}", stop=stops.make("scope_violation", "candidate_outside_scope", data={"path": path}, source=source))
     return paths
 
 

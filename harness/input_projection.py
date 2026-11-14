@@ -4,6 +4,7 @@ import hashlib
 import json
 from pathlib import Path
 
+from . import stops
 from .context import prompt_json
 from .util import HarnessError, dump, write_json
 
@@ -17,6 +18,7 @@ def _path(directory, digest):
     return path
 
 
+@stops.reads_evidence
 def validate_indexes(directory, references):
     if not isinstance(references, list):
         raise HarnessError('invalid input index references')
@@ -37,6 +39,7 @@ def validate_indexes(directory, references):
             raw = path.read_bytes()
             value = json.loads(raw)
         except (OSError, ValueError) as error:
+            stops.keep_local_io(error)
             raise HarnessError('input index missing or unreadable') from error
         if (hashlib.sha256(raw).hexdigest() != digest or not isinstance(value, dict)
                 or set(value) != {'version', 'records'} or type(value['version']) is not int or value['version'] != 1
@@ -133,6 +136,7 @@ def project_commands(packet, directory):
     return result if len(prompt_json(result)) < len(prompt_json(packet)) else deepcopy(packet)
 
 
+@stops.reads_evidence
 def validate_dispatch_indexes(directory, dispatches):
     """Read-only validation of every durable input projection on recovery."""
     for entry in dispatches:

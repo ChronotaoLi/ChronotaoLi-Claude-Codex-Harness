@@ -10,6 +10,7 @@ import hashlib
 import json
 from pathlib import Path
 
+from . import stops
 from .util import HarnessError, lock, write_json
 
 
@@ -62,6 +63,7 @@ class RunStore:
             self._revision = revision
             self._digest = hashlib.sha256(source).hexdigest() if source is not None else None
 
+    @stops.classifies("runtime_failure", "invariant")
     def check_current(self):
         """Reject stale authority before external effects; caller owns run.lock."""
         if self.run is None or self._path is None:
@@ -75,6 +77,7 @@ class RunStore:
             if digest != self._digest:
                 raise HarnessError("运行台账已被其他写入者修改；拒绝外部操作")
 
+    @stops.classifies("runtime_failure", "invariant")
     def commit(self):
         if self.run is None or self._path is None:
             raise HarnessError("没有已绑定的运行台账")

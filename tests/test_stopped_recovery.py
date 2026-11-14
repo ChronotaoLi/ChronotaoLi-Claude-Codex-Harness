@@ -7,7 +7,7 @@ from harness import git
 from harness.cleanup import cleanup_run
 from harness.process_runtime import ProcessOutcome
 from harness.util import HarnessError, read_json, run_process, write_json
-from test_harness import ROOT, RepoCase, crash_after_save, decide_bound
+from test_harness import ROOT, RepoCase, crash_after_save, decide_bound, walk_exit
 from test_runtime_changes import ScriptedBackend, finding, revised, trigger_kind
 
 
@@ -196,8 +196,9 @@ class StoppedRecoveryTests(RepoCase):
             engine.start("Implement greet", self.plan())
         with (self.repo / ".git" / "info" / "exclude").open("a") as output:
             output.write("\n/report.tmp\n")
-        result = self.engine(backend).resume(engine.run["id"])
-        self.assertEqual(result["status"], "completed")
+        # Row checks-modified: the listed plain resume after the exact local exclusion.
+        result = walk_exit(self, engine.directory, ("verification", "checks_modified_files"), backend=backend,
+                           expect_status="completed")
         self.assertEqual(sum(result["attempts"].values()), 1)
         self.assertEqual(len(result["final_history"]), 1)
         self.assertEqual(len(result["final_history"][0]["verification_rounds"]), 2)
@@ -233,6 +234,8 @@ class StoppedRecoveryTests(RepoCase):
         self.assertEqual(cleanup_run(self.repo, engine.run["id"], remove=True)["worktree"]["status"], "removed")
 
     def test_abandon_refuses_live_process_or_ignored_unsaved_file(self):
+        # The hand-made dispatch below has no ID, so the refusal cannot name one: its stop degrades to unclassified.
+        self.allow_unclassified = True
         engine = self.engine()
         engine.start("Implement greet", self.plan(), pause_after_plan=True)
         engine.run["dispatches"].append({"pgid": 123456, "exit_confirmed": False})

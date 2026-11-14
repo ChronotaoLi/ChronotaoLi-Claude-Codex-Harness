@@ -8,12 +8,12 @@ import sys
 import uuid
 from unittest.mock import patch
 
-from harness.adapters import CLIBackend, UndecodableOutput
+from harness.adapters import CLIBackend, DemoBackend, UndecodableOutput
 from harness.cli import main
 from harness.runtime import Runtime
 from harness.util import HarnessError, ProcessTimeout, dump, group_alive, read_json, run_process, write_json
 from harness.versions import RUN_SCHEMA_VERSION
-from test_harness import RepoCase, ROOT
+from test_harness import RepoCase, ROOT, walk_exit
 
 
 class ErrorRepairsTests(RepoCase):
@@ -50,6 +50,11 @@ class ErrorRepairsTests(RepoCase):
         self.assertEqual(saved["accepted"], {})
         self.assertEqual(saved["dispatches"][-1]["status"], "failed")
         self.assertTrue(saved["dispatches"][-1]["exit_confirmed"])
+        # Row provider-start: once a working CLI is back (here the demo backend), the listed
+        # plain resume is a new worker attempt.
+        after = walk_exit(self, engine.directory, ("provider_failure", "local_start"), backend=DemoBackend(),
+                          expect_status="completed")
+        self.assertEqual(sum(d["role"] == "worker" and d.get("invoked") for d in after["dispatches"]), 2)
 
     def test_process_group_permission_denial_never_allows_redispatch(self):
         with patch("harness.util.os.killpg", side_effect=PermissionError):

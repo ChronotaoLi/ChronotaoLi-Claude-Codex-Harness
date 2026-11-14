@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 from harness.process_runtime import ProcessOutcome
 from harness.util import HarnessError, ProcessTimeout, read_json, run_process, write_json
-from test_harness import RepoCase, ROOT, crash_after_save, decide_bound, review_bound
+from test_harness import RepoCase, ROOT, crash_after_save, decide_bound, review_bound, walk_exit
 from test_runtime_changes import ScriptedBackend, decided, finding, revised, trigger_kind
 
 
@@ -153,8 +153,9 @@ class FinalStageRecoveryTests(RepoCase):
         self.assertFalse(any(call["kind"] in ("final_review", "decide") for call in backend.calls))
         old_artifact = Path(failed["artifact"]).read_bytes()
         self.config.data["runtime"]["verify_timeout_seconds"] += 1
-        result = self.engine(backend).resume(engine.run["id"])
-        self.assertEqual(result["status"], "completed")
+        # Row final-timeout: the listed plain resume re-verifies the same snapshot.
+        result = walk_exit(self, engine.directory, ("verification", "final_timeout"), backend=backend,
+                           expect_status="completed")
         self.assertEqual([record["status"] for record in result["final_history"]], ["verification_failed", "approved"])
         self.assertEqual(result["final_history"][0]["snapshot_digest"], result["final_history"][1]["snapshot_digest"])
         self.assertEqual(Path(failed["artifact"]).read_bytes(), old_artifact)

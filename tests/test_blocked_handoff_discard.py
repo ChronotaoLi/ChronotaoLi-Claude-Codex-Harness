@@ -4,7 +4,7 @@ import json
 
 from harness.util import HarnessError, read_json, write_json
 from test_checkpoint_lifecycle import digest
-from test_harness import ROOT, RepoCase
+from test_harness import ROOT, RepoCase, walk_exit
 from test_runtime_changes import ScriptedBackend, decided, trigger_kind
 
 
@@ -76,8 +76,9 @@ class BlockedHandoffDiscardTests(RepoCase):
         request = engine.run['decision_requests'][0]
         write_json(answer, {'schema_version': 1, 'request_id': request['id'], 'task_id': 'greet',
                             'decision': 'continue', 'summary': 'Proceed'})
-        result = self.engine(backend).resume(engine.run['id'], operator_decision=answer)
-        self.assertEqual(result['status'], 'completed')
+        # The worker route of row operator-answer: the listed --operator-decision exit.
+        result = walk_exit(self, engine.directory, ('operator_decision', 'answer_required'), backend=backend,
+                           fill={'FILE': answer}, expect_status='completed')
         self.assertEqual(artifact.read_bytes(), raw)
         self.assertEqual(len(result['decision_requests']), 1)
 

@@ -174,18 +174,18 @@ python3 -m harness --repo /path/to/project cleanup-run RUN --remove --remove-ign
 
 | 情况 | 常用出口 |
 | --- | --- |
-| 等待计划批准 | `resume RUN --approve-plan` |
-| 精确命令未授权 | 追加配置后普通 `resume RUN` |
-| 续作请求需要先修正 | `resume RUN --reject-continuation FILE` |
-| 已保存 worker 环境阻断 | 修复条件后 `resume RUN --environment-update FILE` |
+| 等待计划批准（`plan_approval/initial_plan`） | `resume RUN --approve-plan` |
+| 精确命令未授权（`missing_commands/*`） | 追加配置后普通 `resume RUN` |
+| 续作请求需要先修正（`continuation/*`） | `resume RUN --reject-continuation FILE` |
+| 已保存 worker 环境阻断（`environment/worker_blocked`） | 修复条件后 `resume RUN --environment-update FILE` |
 | 等待用户决定 | 从 status 取 request ID，`resume RUN --operator-decision FILE`；可重复参数一次回答多项 |
 | 指挥提问 | 从 status 取 request ID，`resume RUN --operator-decision FILE` 回答；回答进入下一次指挥决定 |
-| 指挥修订越出已批准范围 | 核对后 `resume RUN --allow-scope 'config/**'`，或普通 `resume`；两者都是新的指挥决定 |
-| 最终验证普通非零退出 | 指挥决定修正或提问；指挥决定尚未返回（如额度或服务中断）而环境已修复时，可显式 `resume RUN --reverify`（已返回的指挥决定存在时拒绝） |
-| 模型派发上限用尽 | 按 `remaining_model_calls` 的下界提高 `max_agent_dispatches` 后普通 `resume RUN` |
-| 旧 dispatch 退出记录无法确认 | 人工核实后 `--confirm-exited DISPATCH_ID` |
+| 指挥修订越出已批准范围（`scope_extension/revision`） | 核对后 `resume RUN --allow-scope 'config/**'`，或普通 `resume`；两者都是新的指挥决定 |
+| 最终验证普通非零退出（`operator_decision/answer_required`） | 指挥提问时修复环境后 `resume RUN --operator-decision FILE --reverify` 一次答复并重验；指挥决定尚未返回（如额度或服务中断）而环境已修复时，可显式 `resume RUN --reverify`（已返回的指挥决定存在时拒绝） |
+| 模型派发上限用尽（`budget/agent_dispatches`） | 按 `remaining_model_calls` 的下界提高 `max_agent_dispatches` 后普通 `resume RUN` |
+| 旧 dispatch 退出记录无法确认（`process_unconfirmed/*`） | 人工核实后 `--confirm-exited DISPATCH_ID` |
 
-这些入口沿用原预算、范围、权限和接受条件，不能通用地丢弃已返回结果或拒绝。选项互斥见[恢复选项与互斥](docs/recovery.md#恢复选项与互斥)，各停止信息的出口见[阻塞状态与操作者出口](docs/recovery.md#阻塞状态与操作者出口)。环境更新严格 JSON 示例见[环境更新](docs/recovery.md#环境更新)，决定输入格式见[操作者决定](docs/recovery.md#操作者决定)。检查点只说明声明的输入未变且未过期，不代替验证或审阅（协议与限制见[检查点](docs/operations.md#检查点)）；操作者答复只允许对应问题继续，不增加命令权限。
+退出码由停止类型决定：0 完成或暂停（含计划待批准），3 有文档化的出口，2 输入不被接受，1 证据、现场或 Harness 自身的问题，130 中断（见[退出码](docs/recovery.md#退出码)）。这些入口沿用原预算、范围、权限和接受条件，不能通用地丢弃已返回结果或拒绝。选项互斥见[恢复选项与互斥](docs/recovery.md#恢复选项与互斥)，各停止信息的出口见[阻塞状态与操作者出口](docs/recovery.md#阻塞状态与操作者出口)。环境更新严格 JSON 示例见[环境更新](docs/recovery.md#环境更新)，决定输入格式见[操作者决定](docs/recovery.md#操作者决定)。检查点只说明声明的输入未变且未过期，不代替验证或审阅（协议与限制见[检查点](docs/operations.md#检查点)）；操作者答复只允许对应问题继续，不增加命令权限。
 
 `abandon RUN` 保留分支、工作树和证据并禁止恢复；它与 `resume` 一样先核验台账和加载时证据，这些证据损坏时同样被拒绝（见[证据损坏](docs/recovery.md#证据损坏)）。放弃不删除文件，移除工作树用之后的 `cleanup-run RUN --remove`。
 

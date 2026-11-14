@@ -18,7 +18,7 @@ from harness.process_runtime import ProcessOutcome
 from harness.recovery import worker_recovery_context
 from harness.util import HarnessError, ProcessTimeout, read_json, write_json
 from harness.worker_returns import SOURCES, inspect_return, validate_return_evidence
-from test_harness import RepoCase, ROOT
+from test_harness import RepoCase, ROOT, walk_exit
 import test_worker_receipts as receipt_tests
 import test_terminal_capture_recovery as terminal_tests
 
@@ -238,15 +238,18 @@ class WorkerReturnRecoveryTests(RepoCase):
                     cli.command = lambda *args: [sys.executable, '-c', 'import time; time.sleep(30)']
                     return cli.invoke(**kwargs)
                 return super().invoke(**kwargs)
-        engine = self.engine(TimeoutOnce())
+        backend = TimeoutOnce()
+        engine = self.engine(backend)
         with self.assertRaises(ProcessTimeout):
             engine.start('Implement greet', self.plan())
         first = engine.run['dispatches'][-1]
         job = engine.directory / 'dispatches' / first['id']
         self.assertEqual((job / 'process.stdout').read_bytes(), b'')
         self.assertFalse((job / 'capture-manifest.json').exists())
-        run = engine.resume(engine.run['id'])
-        self.assertEqual(run['status'], 'completed')
+        self.assertEqual(engine.run['stop']['data']['limit_seconds'], 1)
+        # Row agent-timeout: the listed plain resume is a new counted attempt.
+        run = walk_exit(self, engine.directory, ('budget', 'agent_timeout'), backend=backend,
+                        expect_status='completed')
         self.assertEqual(run['attempts'], {'greet': 2})
         entry = run['dispatches'][0]
         self.assertEqual((entry['worker_return_evidence']['state'], entry['worker_return_evidence']['reason']),
@@ -434,10 +437,13 @@ Runtime(config, repo, backend=Stub()).start('Implement greet', read_json(root / 
                     cli.command = lambda *args: [sys.executable, '-c', code]
                     return cli.invoke(**kwargs)
                 return super().invoke(**kwargs)
-        engine = self.engine(ErrorOnce())
+        backend = ErrorOnce()
+        engine = self.engine(backend)
         with self.assertRaisesRegex(HarnessError, 'CLI exit=1'):
             engine.start('Implement greet', self.plan())
-        run = engine.resume(engine.run['id'])
-        self.assertEqual(run['status'], 'completed')
+        self.assertEqual(engine.run['stop']['data']['provider'], 'claude')
+        # Row provider-failed: the listed plain resume is a new counted attempt.
+        run = walk_exit(self, engine.directory, ('provider_failure', 'invocation_failed'), backend=backend,
+                        expect_status='completed')
         self.assertEqual(run['attempts']['greet'], 2)
         self.assertEqual(run['dispatches'][0]['worker_return_evidence']['state'], 'retryable')

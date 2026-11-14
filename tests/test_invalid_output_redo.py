@@ -14,7 +14,7 @@ from harness.dispatch import Dispatcher
 from harness.memory import Memory
 from harness.util import HarnessError, read_json, write_json
 from test_engine_repairs import RecordingBackend
-from test_harness import RepoCase, ROOT, after_save, stopped
+from test_harness import RepoCase, ROOT, after_save, continues_without_stop, stopped, walk_exit
 from test_runtime_changes import ScriptedBackend, decided, finding, finding_key, trigger_kind
 from test_runtime_changes import revised as revised_
 from test_worker_return_recovery import stub_provider_clis
@@ -365,14 +365,16 @@ class CommanderDecisionTests(RepoCase):
         first = entries(saved, "commander", "decide")
         self.assertEqual(len(first), 1)
         self.assertEqual((first[0]["status"], first[0]["out_of_scope_paths"]), ("invalid", ["support.txt"]))
-        # Without authority an ordinary resume is a new decision, not a redo.
-        with self.assertRaisesRegex(HarnessError, "越出已批准的文件范围"):
-            self.engine(backend).resume(engine.run["id"])
-        second = entries(read_json(engine.directory / "state.json"), "commander", "decide")
+        # Without authority the second listed exit, an ordinary resume, is a new decision, not a redo.
+        after = walk_exit(self, engine.directory, ("scope_extension", "revision"), backend=backend, choose=1,
+                          expect_code=3, expect_status="blocked")
+        self.assertEqual((after["stop"]["kind"], after["stop"]["data"]["patterns"]), ("scope_extension", ["support.txt"]))
+        second = entries(after, "commander", "decide")
         self.assertEqual(len(second), 2)
         self.assertNotIn("retry_of", second[1])
-        run = self.engine(backend).resume(engine.run["id"], allow_scope=["support.txt"])
-        self.assertEqual(run["status"], "completed")
+        # The first listed exit (row scope-revision): resume RUN --allow-scope 'PATTERN'.
+        run = walk_exit(self, engine.directory, ("scope_extension", "revision"), backend=backend,
+                        fill={"PATTERN": "support.txt"}, expect_status="completed")
         third = entries(run, "commander", "decide")
         # The authorized revision lands; the original task is then selected by one more decide.
         self.assertEqual([entry["status"] for entry in third], ["invalid", "invalid", "completed", "completed"])
@@ -417,8 +419,11 @@ class WorkerInvalidOutputTests(RepoCase):
                         result["decision_requests"] = [{"id": "risk", "task_id": "greet", "question": "Proceed?"}]
 
                 backend = RecordingBackend(change)
-                run = self.engine(backend).start("Implement greet", plan())
+                engine = self.engine(backend)
+                run = engine.start("Implement greet", plan())
                 self.assertEqual(run["status"], "completed")
+                # Row invalid-worker-output: not a stop; the run never saved one.
+                continues_without_stop(self, engine.directory)
                 self.assertEqual(run["attempts"], {"greet": 2})
                 first, second = entries(run, "worker")
                 self.assertEqual((first["status"], first["worker_receipt_consumed"]), ("invalid", "result_rejected"))
@@ -438,14 +443,25 @@ class WorkerInvalidOutputTests(RepoCase):
         engine = self.engine(backend)
         with self.assertRaisesRegex(HarnessError, "尝试次数上限"):
             engine.start("Implement greet", plan())
-        self.assertEqual(engine.run["attempts"], {"greet": self.config.data["runtime"]["max_attempts"]})
-        self.assertEqual(len(calls(backend, "worker")), self.config.data["runtime"]["max_attempts"])
+        limit = self.config.data["runtime"]["max_attempts"]
+        self.assertEqual(engine.run["attempts"], {"greet": limit})
+        self.assertEqual(len(calls(backend, "worker")), limit)
+        # Row task-attempts, first listed exit: a raised max_attempts buys one new worker attempt
+        # (still invalid here, so the same stop at the new limit).
+        self.config.data["runtime"]["max_attempts"] = limit + 1
+        after = walk_exit(self, engine.directory, ("budget", "task_attempts"), backend=backend, expect_code=3,
+                          expect_status="blocked")
+        self.assertEqual((after["attempts"], after["stop"]["data"]["limit"]), ({"greet": limit + 1}, limit + 1))
+        self.assertEqual(len(calls(backend, "worker")), limit + 1)
+        # The second listed exit: abandon.
+        walk_exit(self, engine.directory, ("budget", "task_attempts"), backend=backend, choose=1,
+                  expect_status="abandoned")
 
     def test_invalid_environment_and_operator_blockers_keep_their_route_without_exemption(self):
         for kind in ("environment", "operator"):
             with self.subTest(kind=kind):
                 def change(backend, kwargs, packet, result, kind=kind):
-                    if kwargs["role"] == "worker":
+                    if kwargs["role"] == "worker" and len(calls(backend, "worker")) == 1:
                         result.update(status="blocked", blocker_kind=kind, blockers=["Need a choice"],
                                       summary="x" * 32001)
 
@@ -465,8 +481,23 @@ class WorkerInvalidOutputTests(RepoCase):
                     write_json(update, {"schema_version": 1, "task_id": "greet",
                                         "blocker_dispatch_id": worker["id"], "summary": "Restored"})
                     engine.services.environment.prepare_environment_update(update)
+                    self.assertIs(engine.run["stop"]["data"]["invalid_output"], True)
+                    # Row invalid-blocker-environment: the plain resume exit reaches a fresh worker
+                    # for the same task; the invalid blocker kept no exemption.
+                    after = walk_exit(self, engine.directory, ("environment", "worker_blocked"), backend=backend,
+                                      expect_status="completed")
                 else:
                     self.assertEqual([r["kind"] for r in engine.run["decision_requests"]], ["worker"])
+                    request = engine.run["decision_requests"][0]
+                    answer = self.repo / "answer.json"
+                    write_json(answer, {"schema_version": 1, "request_id": request["id"], "task_id": "greet",
+                                        "decision": "continue", "summary": "Proceed"})
+                    # Row invalid-blocker-operator: the answer exit reaches a fresh worker for the same task.
+                    after = walk_exit(self, engine.directory, ("operator_decision", "answer_required"), backend=backend,
+                                      fill={"FILE": answer}, expect_status="completed")
+                workers = entries(after, "worker")
+                self.assertEqual(([w["task_id"] for w in workers], after["attempts"]), (["greet", "greet"], {"greet": 2}))
+                self.assertFalse(any("attempt_exemption" in w for w in workers))
 
     def test_task_blockers_and_unreadable_blockers_go_to_the_commander(self):
         cases = {
@@ -903,8 +934,9 @@ class RedoBoundaryTests(RepoCase):
                 self.assertNotIn("invalid_output", review)
                 self.assertEqual(len(calls(backend, "reviewer", "review")), 1)
         # Once the group has exited, the same original is judged and redone as in J1.
-        run = self.engine(backend).resume(engine.run["id"])
-        self.assertEqual(run["status"], "completed")
+        # Row dispatch-exit: the listed exit, resume RUN --confirm-exited ID.
+        run = walk_exit(self, engine.directory, ("process_unconfirmed", "dispatch_exit"), backend=backend,
+                        expect_status="completed")
         first, second = entries(run, "reviewer", "review")
         self.assertEqual((first["status"], second["retry_of"]), ("invalid", first["id"]))
 

@@ -5,11 +5,11 @@ import sys
 from pathlib import Path
 from unittest.mock import patch
 
-from harness import git
+from harness import git, stops
 from harness.recovery import snapshot_digest
 from harness.memory import Memory
 from harness.util import HarnessError, read_json, write_json
-from test_harness import RepoCase, ROOT, crash_after_save
+from test_harness import RepoCase, ROOT, crash_after_save, no_command_exit
 from test_runtime_changes import ScriptedBackend, finding, revised, trigger_kind
 
 
@@ -252,6 +252,8 @@ class EngineRepairsTests(RepoCase):
                 else:
                     self.assertEqual((state["stop"]["kind"], state["stop"]["reason"], state["stop"]["data"]["error_type"]),
                                      ("unclassified", "unexpected_exception", "ValueError"))
+                    # Row unclassified-exception: no recovery action is guessed.
+                    no_command_exit(self, stops.project_ledger(state), ("unclassified", "unexpected_exception"))
 
     def test_real_verification_timeout_records_feedback_then_repairs(self):
         self.config.data["runtime"]["verify_timeout_seconds"] = 1
@@ -306,7 +308,10 @@ class EngineRepairsTests(RepoCase):
         state = read_json(engine.directory / "state.json")
         self.assertEqual(state["status"], "blocked")
         self.assertEqual((state["stop"]["kind"], state["stop"]["reason"], state["stop"]["data"]["error_type"]),
-                         ("unclassified", "unexpected_exception", "OSError"))
+                         ("runtime_failure", "io", "OSError"))
+        # Row runtime-io: no command exit to run; the diagnosis does not suggest restoring bytes.
+        no_command_exit(self, stops.project_ledger(state), ("runtime_failure", "io"))
+        self.assertNotIn("恢复原字节", stops.project_ledger(state)["title"])
         self.assertEqual(state["dispatches"], [])
         self.assertEqual(read_json(engine.directory / "handoff.json")["status"], "blocked")
 

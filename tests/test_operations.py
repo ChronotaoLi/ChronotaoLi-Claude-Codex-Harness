@@ -128,14 +128,14 @@ class OperationRecordTests(OperationCase):
     def test_failure_before_run_creation_leaves_record_without_run(self):
         (self.repo / "test_hello.py").write_text("print('tracked modification')\n")
         code, output, errors = self.invoke(["run", "Implement greet", "--operation-id", "op-b"])
-        self.assertEqual(code, 1)
+        self.assertEqual(code, 2)
         self.assertEqual(output, "")
         self.assertIn("已跟踪", errors)
         record = self.record("op-b")
         self.assertEqual((record["status"], record["run_id"], record["run_linked_at"], record["exit_status"]),
-                         ("finished", None, None, 1))
+                         ("finished", None, None, 2))
         self.assertEqual((record["result_status"], record["stop"]["kind"], record["stop"]["reason"]),
-                         (None, "unclassified", "untyped_harness_error"))
+                         (None, "invalid_input", "cli_arguments"))
         self.assertIn("已跟踪", record["error"])
         self.assertFalse((self.state / "runs").exists())
 
@@ -145,12 +145,12 @@ class OperationRecordTests(OperationCase):
                 raise HarnessError("simulated provider failure\nsecond line of detail")
 
         code, output, errors = self.invoke(["run", "Implement greet", "--operation-id", "op-c"], Failing())
-        self.assertEqual(code, 1)
+        self.assertEqual(code, 3)
         self.assertEqual(output, "")
         self.assertIn("harness: simulated provider failure", errors)
         record = self.record("op-c")
-        self.assertEqual((record["status"], record["exit_status"], record["result_status"]), ("finished", 1, None))
-        self.assertEqual((record["error"], record["stop"]["kind"]), ("simulated provider failure", "unclassified"))
+        self.assertEqual((record["status"], record["exit_status"], record["result_status"]), ("finished", 3, None))
+        self.assertEqual((record["error"], record["stop"]["kind"]), ("simulated provider failure", "provider_failure"))
         self.assertEqual(record["stop"]["detail"], "simulated provider failure\nsecond line of detail")
         ledger = self.ledger(record["run_id"])
         self.assertEqual((ledger["status"], ledger["created_by_operation"]), ("blocked", "op-c"))
@@ -187,14 +187,14 @@ class OperationRecordTests(OperationCase):
         before = ((directory / "state.json").read_bytes(), (directory / "events.jsonl").read_bytes())
         code, output, errors = self.invoke(["resume", run_id, "--confirm-exited", "dispatch_unknown",
                                             "--operation-id", "op-reject"])
-        self.assertEqual(code, 1)
+        self.assertEqual(code, 2)
         self.assertEqual(output, "")
         self.assertIn("dispatch_unknown", errors)
         self.assertEqual(((directory / "state.json").read_bytes(), (directory / "events.jsonl").read_bytes()), before)
         self.assertNotIn('"event":"run_resumed"', errors)
         record = self.record("op-reject")
         self.assertEqual((record["status"], record["run_id"], record["exit_status"], record["stop"]["kind"]),
-                         ("finished", run_id, 1, "unclassified"))
+                         ("finished", run_id, 2, "invalid_input"))
         self.assertEqual(record["arguments"]["confirm_exited"], ["dispatch_unknown"])
 
     def test_resume_stopped_before_dispatch_keeps_events_and_budgets(self):
@@ -206,7 +206,7 @@ class OperationRecordTests(OperationCase):
         backend.invoke.side_effect = AssertionError("Blocked commands must not dispatch a model")
         code, output, errors = self.invoke(["run", "Implement greet", "--plan", str(plan_path),
                                             "--operation-id", "op-missing"], backend)
-        self.assertEqual(code, 1, errors)
+        self.assertEqual(code, 3, errors)
         self.assertEqual(output, "")
         run_id = self.record("op-missing")["run_id"]
         directory = self.state / "runs" / run_id
@@ -216,7 +216,7 @@ class OperationRecordTests(OperationCase):
             before = self.ledger(run_id)
             events_before = events_path.read_bytes()
             code, output, errors = self.invoke(["resume", run_id, "--operation-id", operation_id], backend)
-            self.assertEqual(code, 1, errors)
+            self.assertEqual(code, 3, errors)
             self.assertEqual(output, "")
             self.assertIn(notice("run_resumed", run_id, operation_id), errors.splitlines())
             events_after = events_path.read_bytes()
@@ -231,7 +231,7 @@ class OperationRecordTests(OperationCase):
                 self.assertEqual(saved[key], before[key], key)
             record = self.record(operation_id)
             self.assertEqual((record["run_id"], record["status"], record["exit_status"]),
-                             (run_id, "finished", 1))
+                             (run_id, "finished", 3))
         backend.invoke.assert_not_called()
 
     def test_approval_rejection_keeps_prior_grant_audit_without_resume_notice(self):
@@ -256,8 +256,8 @@ class OperationRecordTests(OperationCase):
                 state_before, events_before = state_path.read_bytes(), events_path.read_bytes()
                 operation_id = f"op-approval-reject-{index}"
                 code, output, errors = self.invoke(["resume", run_id, "--operation-id", operation_id], backend)
-                self.assertEqual(code, 1, errors)
-                self.assertEqual(output, "")
+                self.assertEqual(code, 0, errors)
+                self.assertEqual(json.loads(output)["status"], "awaiting_approval")
                 self.assertNotIn('"event":"run_resumed"', errors)
                 saved = self.ledger(run_id)
                 self.assertFalse(saved["plan_approved"])
@@ -276,14 +276,14 @@ class OperationRecordTests(OperationCase):
                 else:
                     self.assertEqual((state_path.read_bytes(), events_path.read_bytes()), (state_before, events_before))
                 record = self.record(operation_id)
-                self.assertEqual((record["run_id"], record["exit_status"]), (run_id, 1))
+                self.assertEqual((record["run_id"], record["exit_status"]), (run_id, 0))
         backend.invoke.assert_not_called()
 
     def test_operation_id_is_validated_before_any_write(self):
         for invalid in ("", "-leading", "has space", "a/b", "x" * 65, "..", "opü"):
             with self.subTest(operation_id=invalid):
                 code, output, errors = self.invoke(["run", "Implement greet", f"--operation-id={invalid}"])
-                self.assertEqual(code, 1)
+                self.assertEqual(code, 2)
                 self.assertEqual(output, "")
                 self.assertIn("--operation-id", errors)
         self.assertFalse(self.state.exists())
@@ -296,7 +296,7 @@ class OperationRecordTests(OperationCase):
         for command in (["run", "Implement greet"], ["resume", "run_unknown"]):
             with self.subTest(command=command[0]):
                 code, output, errors = self.invoke([*command, "--operation-id", "taken"])
-                self.assertEqual(code, 1)
+                self.assertEqual(code, 2)
                 self.assertEqual(output, "")
                 self.assertIn("已存在", errors)
                 self.assertEqual(path.read_bytes(), b"original bytes that are not even JSON")
@@ -312,7 +312,7 @@ class OperationRecordTests(OperationCase):
         before = path.read_bytes()
         runs = sorted((self.state / "runs").iterdir())
         code, output, errors = self.invoke(["run", "Implement greet", "--operation-id", "custom.id-1"])
-        self.assertEqual(code, 1)
+        self.assertEqual(code, 2)
         self.assertEqual(output, "")
         self.assertIn("已存在", errors)
         self.assertEqual(path.read_bytes(), before)
@@ -347,7 +347,7 @@ class OperationRecordTests(OperationCase):
             run_id = json.loads(output)["id"]
             code, _, errors = self.invoke(["resume", run_id, "--operator-decision", str(answer),
                                            "--environment-update", str(answer), "--operation-id", "op-g2"])
-            self.assertEqual(code, 1, errors)
+            self.assertEqual(code, 2, errors)
         for name in ("op-g", "op-g2"):
             raw = (self.operations / f"{name}.json").read_bytes()
             self.assertNotIn(b"sentinel-xyz", raw)
@@ -570,7 +570,7 @@ class FileInputPrivacyTests(OperationCase):
             self.assertNotIn(sentinel.encode("utf-8"), raw)
         record = self.record(operation_id)
         self.assertEqual((record["status"], record["exit_status"], record["error"], record["stop"]["kind"],
-                          record["error_omitted"]), ("finished", 1, None, "unclassified", self.OMITTED))
+                          record["error_omitted"]), ("finished", 2, None, "invalid_input", self.OMITTED))
         self.assertNotIn("detail", record["stop"])
         return record
 
@@ -580,7 +580,7 @@ class FileInputPrivacyTests(OperationCase):
         plan_path = self.repo / "plan.json"
         write_json(plan_path, plan)
         code, output, errors = self.invoke(["run", "Implement greet", "--plan", str(plan_path), "--operation-id", "op-plan"])
-        self.assertEqual(code, 1)
+        self.assertEqual(code, 2)
         self.assertEqual(output, "")
         self.assertIn("FILE-CONTENT-SENTINEL", errors)
         record = self.assert_omitted("op-plan", ["FILE-CONTENT-SENTINEL"])
@@ -592,7 +592,7 @@ class FileInputPrivacyTests(OperationCase):
         update = self.repo / "update.json"
         update.write_text('{"schema_version": 1, "ENV-KEY-SENTINEL": "ENV-VALUE-SENTINEL", "ENV-KEY-SENTINEL": 2}')
         code, output, errors = self.invoke(["resume", run_id, "--environment-update", str(update), "--operation-id", "op-env"])
-        self.assertEqual(code, 1)
+        self.assertEqual(code, 2)
         self.assertEqual(output, "")
         self.assertIn("ENV-KEY-SENTINEL", errors)
         record = self.assert_omitted("op-env", ["ENV-KEY-SENTINEL", "ENV-VALUE-SENTINEL"])
@@ -605,7 +605,7 @@ class FileInputPrivacyTests(OperationCase):
         write_json(answer, {"schema_version": 1, "request_id": "DECISION-ID-SENTINEL", "task_id": "greet",
                             "decision": "continue", "summary": "DECISION-SUMMARY-SENTINEL"})
         code, output, errors = self.invoke(["resume", run_id, "--operator-decision", str(answer), "--operation-id", "op-decision"])
-        self.assertEqual(code, 1)
+        self.assertEqual(code, 2)
         self.assertEqual(output, "")
         self.assertIn("harness: ", errors)
         record = self.assert_omitted("op-decision", ["DECISION-ID-SENTINEL", "DECISION-SUMMARY-SENTINEL"])
@@ -615,7 +615,7 @@ class FileInputPrivacyTests(OperationCase):
     def test_error_text_is_kept_without_file_inputs(self):
         (self.repo / "test_hello.py").write_text("print('tracked modification')\n")
         code, _, _ = self.invoke(["run", "Implement greet", "--operation-id", "op-plain"])
-        self.assertEqual(code, 1)
+        self.assertEqual(code, 2)
         record = self.record("op-plain")
         self.assertIn("已跟踪", record["error"])
         self.assertIsNone(record["error_omitted"])

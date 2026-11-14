@@ -6,7 +6,7 @@ from unittest.mock import patch
 from harness.context import ContextCapacityError
 from harness.packets import PacketBuilder
 from harness.util import HarnessError, read_json
-from test_harness import RepoCase, ROOT
+from test_harness import RepoCase, ROOT, walk_exit
 from test_runtime_changes import ScriptedBackend, revised, trigger_kind
 
 
@@ -48,8 +48,10 @@ class ContextProjectionLifecycleTests(RepoCase):
             self.assertGreater(report['required_chars'], report['budget_chars'])
             self.assertFalse(any(c['kind'] == 'decide' for c in backend.calls))
             self.config.data['runtime']['context_chars'] = 200000
-            result = self.engine(backend).resume(engine.run['id'])
-        self.assertEqual(result['status'], 'completed')
+            self.assertEqual(state['stop']['source']['artifact'], str(reports[0]))
+            # Row context-dispatch: the listed plain resume after raising context_chars.
+            result = walk_exit(self, engine.directory, ('budget', 'context_capacity'), backend=backend,
+                               expect_status='completed')
         # The same decision is derived again: the next model call is the decide, not the worker.
         self.assertEqual(requests[0]['feedback'], requests[1]['feedback'])
         self.assertEqual([c['kind'] for c in backend.calls[:3]], ['implement', 'decide', 'implement'])

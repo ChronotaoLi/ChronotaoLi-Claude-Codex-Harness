@@ -49,14 +49,14 @@ class OperationalControlsTests(RepoCase):
         factory = lambda *args, **kwargs: self.engine(backend)
         calls = len(backend.calls)
         code, _, _ = self.invoke(["resume", engine.run["id"]], Runtime=factory)
-        self.assertEqual(code, 1)
+        self.assertEqual(code, 3)
         self.assertEqual(len(backend.calls), calls)
         state_path = engine.directory / "state.json"
         before = read_json(state_path)
         request = before["decision_requests"][-1]
         self.assertEqual(request["kind"], "commander")
         code, _, errors = self.invoke(["resume", engine.run["id"]], Runtime=factory)
-        self.assertEqual(code, 1)
+        self.assertEqual(code, 3)
         self.assertIn(request["id"], errors)
         self.assertIn("--operator-decision", errors)
         self.assertEqual(len(backend.calls), calls)
@@ -67,7 +67,7 @@ class OperationalControlsTests(RepoCase):
         write_json(answer, {"schema_version": 1, "request_id": request["id"], "task_id": "greet",
                             "decision": "continue", "summary": "Decide again with this answer"})
         code, _, _ = self.invoke(["resume", engine.run["id"], "--operator-decision", str(answer)], Runtime=factory)
-        self.assertEqual(code, 1)  # The demo commander asks again.
+        self.assertEqual(code, 3)  # The demo commander asks again.
         self.assertEqual(len(backend.calls), calls + 1)
         self.assertEqual(backend.calls[-1]["kind"], "decide")
         self.assertNotEqual(read_json(state_path)["decision_requests"][-1]["id"], request["id"])

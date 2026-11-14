@@ -6,6 +6,7 @@ import hashlib
 import json
 from pathlib import Path
 
+from . import stops
 from .util import HarnessError, dump, write_json
 
 
@@ -30,10 +31,11 @@ def _write_index(directory, paths):
         if artifact.is_symlink() or artifact.read_bytes() != raw:
             raise HarnessError(f"path evidence index changed: {ascii(str(artifact))}; preserve the original evidence")
     except OSError as error:
-        raise HarnessError(f"cannot read or write path evidence index: {ascii(str(artifact))}") from error
+        raise HarnessError(f"cannot read or write path evidence index: {ascii(str(artifact))}", stop=stops.make("runtime_failure", "io", data={"error_type": type(error).__name__})) from error
     return {"artifact": str(artifact), "artifact_digest": digest, "count": len(paths)}
 
 
+@stops.reads_evidence
 def validate_indexes(directory, references):
     """Verify durable references without recreating missing or damaged evidence."""
     if not isinstance(references, list):
@@ -57,6 +59,7 @@ def validate_indexes(directory, references):
                 raise HarnessError(f"path evidence index changed: {ascii(str(artifact))}")
             value = json.loads(raw)
         except (OSError, ValueError, UnicodeError) as error:
+            stops.keep_local_io(error)
             raise HarnessError(f"path evidence index missing or unreadable: {ascii(str(artifact))}") from error
         if (not isinstance(value, dict) or set(value) != {"version", "paths"}
                 or type(value["version"]) is not int or value["version"] != 1
@@ -66,6 +69,7 @@ def validate_indexes(directory, references):
             raise HarnessError(f"path evidence index content disagrees with reference: {ascii(str(artifact))}")
 
 
+@stops.reads_evidence
 def validate_dispatch_indexes(directory, dispatches):
     references, seen = [], set()
     for entry in dispatches:

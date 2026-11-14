@@ -11,6 +11,7 @@ import math
 from copy import deepcopy
 from pathlib import Path, PurePosixPath
 
+from . import stops
 from .context import prompt_json
 from .recovery import snapshot_digest
 from .review_progress import dispositions_usable
@@ -247,10 +248,12 @@ def finding_progress_packet(run, task_id, directory):
     try:
         if not artifact.exists():
             write_json(artifact, value)
+    except OSError as error:
+        raise HarnessError("cannot write finding progress index",
+                           stop=stops.make("runtime_failure", "io", data={"error_type": type(error).__name__})) from error
+    with stops.evidence_reads(source={"artifact": str(artifact)}):
         if not artifact.is_file() or artifact.read_bytes() != raw:
             raise HarnessError("finding progress index changed; preserve original evidence")
-    except OSError as error:
-        raise HarnessError("cannot read or write finding progress index") from error
     status_counts, severity_counts = {}, {}
     for row in progress["findings"]:
         status_counts[row["status"]] = status_counts.get(row["status"], 0) + 1

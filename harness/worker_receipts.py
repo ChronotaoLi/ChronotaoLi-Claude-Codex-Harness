@@ -7,7 +7,7 @@ from pathlib import Path
 import re
 import stat
 
-from . import git
+from . import git, stops
 from .contracts import judge_work, validate_work_core
 from .recovery import read_bound_result, snapshot_digest
 from .services import RuntimeService
@@ -19,6 +19,7 @@ from .worker_returns import inspect_return, validate_return_evidence
 INPUTS = {'packet': 'packet.json', 'schema': 'schema.json'}
 
 
+@stops.reads_evidence
 def read_worker_input(directory, entry, intent, field):
     """Read one referenced input after checking its path, file type and SHA256."""
     job = Path(directory) / 'dispatches' / entry['id']
@@ -31,6 +32,7 @@ def read_worker_input(directory, entry, intent, field):
     try:
         descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError as error:
+        stops.keep_local_io(error)
         raise HarnessError(f'worker {field} artifact missing or a symlink; preserve evidence: {path}') from error
     try:
         if not stat.S_ISREG(os.fstat(descriptor).st_mode):
@@ -39,6 +41,7 @@ def read_worker_input(directory, entry, intent, field):
             descriptor = None
             raw = stream.read()
     except OSError as error:
+        stops.keep_local_io(error)
         raise HarnessError(f'cannot read worker {field} artifact; preserve evidence: {path}') from error
     finally:
         if descriptor is not None:
@@ -78,7 +81,7 @@ class WorkerReceipts(RuntimeService):
                 if path.is_symlink() or not path.is_file() or path.read_bytes() != raw:
                     raise HarnessError(f'worker {field} artifact conflict; preserve evidence')
             except OSError as error:
-                raise HarnessError(f'cannot publish worker {field} before invocation; no budget was charged: {error}') from error
+                raise HarnessError(f'cannot publish worker {field} before invocation; no budget was charged: {error}', stop=stops.make("runtime_failure", "io", data={"error_type": type(error).__name__})) from error
             inputs[field + '_artifact'] = str(path)
             inputs[field + '_artifact_digest'] = hashlib.sha256(raw).hexdigest()
         return inputs
@@ -148,6 +151,7 @@ class WorkerReceipts(RuntimeService):
         read_worker_input(self.context.directory, entry, intent, 'packet')
         return read_worker_input(self.context.directory, entry, intent, 'schema')
 
+    @stops.reads_evidence
     def validate_links(self):
         receipts = self.context.run['worker_receipts']
         if not isinstance(receipts, dict) or len(receipts) > 1:
@@ -223,10 +227,11 @@ class WorkerReceipts(RuntimeService):
             job = Path(receipt['artifact']).parent
             # Classify first; the entry changes only when the verdict is published.
             evidence = entry.get('worker_return_evidence')
-            if evidence is None:
-                evidence = inspect_return(job)
-            else:
-                validate_return_evidence(job, evidence)
+            with stops.evidence_reads(source={"dispatch_id": entry["id"], "task_id": entry["task_id"]}):
+                if evidence is None:
+                    evidence = inspect_return(job)
+                else:
+                    validate_return_evidence(job, evidence)
             if evidence['state'] == 'retryable':
                 error = HarnessError(entry.get('error') or 'Worker invocation requires a fresh attempt: ' + evidence['reason'])
                 # Classification, failure provenance and receipt retirement share
@@ -244,7 +249,7 @@ class WorkerReceipts(RuntimeService):
             # The stop reason is saved with this evidence (pending's error handler).
             entry['worker_return_evidence'] = evidence
             raise HarnessError('worker return interrupted before immutable seal; ' + evidence['reason'] +
-                               '; preserve evidence; automatic retry forbidden')
+                               '; preserve evidence; automatic retry forbidden', stop=stops.make("evidence", "unsealed_return" if evidence["state"] == "returned" else "unsealed_unknown", data={"return_reason": stops.bounded(evidence["reason"])}, source={"dispatch_id": entry["id"], "task_id": entry["task_id"]}))
         return key
 
     def finish(self, key, task):
@@ -254,6 +259,7 @@ class WorkerReceipts(RuntimeService):
             self.services.receipts.record_receipt_error(self.context.run['worker_receipts'].get(key), error)
             raise
 
+    @stops.reads_evidence
     def sealed_record(self, receipt):
         """Read the immutable seal: path, bound digest (once bound), structure and content name.
 
@@ -312,20 +318,20 @@ class WorkerReceipts(RuntimeService):
                 raise HarnessError('unsafe worker source reference')
             source = path.parent / name
             if any(parent.is_symlink() for parent in [source, *source.parents] if parent != path.parent and path.parent in parent.parents):
-                raise HarnessError('unsafe worker source evidence path')
+                raise HarnessError('unsafe worker source evidence path', stop=stops.make("evidence", "runtime_integrity"))
             if source.is_symlink() or not source.is_file() or hashlib.sha256(source.read_bytes()).hexdigest() != expected:
-                raise HarnessError('worker source evidence changed')
+                raise HarnessError('worker source evidence changed', stop=stops.make("evidence", "runtime_integrity", source={"artifact": str(source)}))
         if snapshot_digest(self.context.snapshot()) != record['candidate_digest']:
-            raise HarnessError('worker candidate changed since sealed return')
+            raise HarnessError('worker candidate changed since sealed return', stop=stops.make("workspace_mismatch", "candidate_changed"))
         receipt.update(seal_digest=digest, phase='sealed')
         result = record['result']
         artifact = Path(receipt['artifact'])
         if artifact.is_symlink():
-            raise HarnessError('unsafe worker returned artifact')
+            raise HarnessError('unsafe worker returned artifact', stop=stops.make("evidence", "runtime_integrity"))
         if artifact.exists():
             if (artifact.is_symlink() or read_json(artifact) != result or
                     receipt.get('artifact_digest', hashlib.sha256(artifact.read_bytes()).hexdigest()) != hashlib.sha256(artifact.read_bytes()).hexdigest()):
-                raise HarnessError('worker returned result changed')
+                raise HarnessError('worker returned result changed', stop=stops.make("evidence", "runtime_integrity", source={"artifact": str(artifact)}))
         else:
             if 'artifact_digest' in receipt:
                 raise HarnessError('bound worker returned artifact missing')
@@ -335,7 +341,8 @@ class WorkerReceipts(RuntimeService):
         if git.head(self.context.worktree, binding=self.context.run['worktree_binding']) != record['head']:
             raise HarnessError('worker HEAD changed')
         try:
-            git.check_scope(self.context.worktree, task['allowed_paths'], binding=self.context.run['worktree_binding'])
+            git.check_scope(self.context.worktree, task['allowed_paths'], binding=self.context.run['worktree_binding'],
+                            task_id=task['id'])
         except git.ScopeViolation as error:
             self.reject(key, error, 'scope_rejected')
             raise
@@ -415,6 +422,7 @@ def delivered_work_contract(run, directory, dispatch_id):
     return read_worker_input(directory, entries[0], entries[0]['worker_receipt'], 'schema')
 
 
+@stops.reads_evidence
 def read_worker_source(context, task_id, source):
     """Authenticate a sealed worker result by its bound reference, then recheck its core contract.
 

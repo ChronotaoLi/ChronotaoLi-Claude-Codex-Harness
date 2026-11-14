@@ -7,7 +7,7 @@ from pathlib import Path
 
 from . import stops
 from .contracts import review_approved
-from .util import HarnessError, strict_json_loads
+from .util import EvidenceError, HarnessError, read_json, strict_json_loads
 
 
 # Shared pending lifecycle gates; each recovery entry keeps its own extra checks.
@@ -135,15 +135,35 @@ def worker_recovery_context(run, directory, task_id, *, feedback=None):
     return result
 
 
+def _evidence(message, receipt):
+    source = {"artifact": receipt["artifact"]} if isinstance(receipt.get("artifact"), str) else {}
+    if isinstance(receipt.get("artifact_digest"), str):
+        source["artifact_digest"] = receipt["artifact_digest"]
+    if isinstance(receipt.get("dispatch_id"), str):
+        source["dispatch_id"] = receipt["dispatch_id"]
+    return EvidenceError(message, stop=stops.make("evidence", "runtime_integrity", source=source))
+
+
+def read_evidence_json(path):
+    """Read runtime-written JSON evidence (verification results): changed or lost bytes are EvidenceError."""
+    with stops.evidence_reads(source={"artifact": str(path)}):
+        return read_json(path)
+
+
 def read_bound_bytes(receipt, label, *, bind=None):
-    """Read and bind original bytes before parsing or any later lifecycle gate."""
+    """Read and bind original bytes before parsing or any later lifecycle gate.
+
+    Path loss and changed bytes are EvidenceError; other local I/O stays itself.
+    The ``bind`` callback (a save) runs outside the evidence read.
+    """
     try:
         raw = Path(receipt["artifact"]).read_bytes()
     except OSError as error:
-        raise HarnessError(f"{label}原始结果缺失或无法读取；保留证据，禁止重新抽取结论") from error
+        stops.keep_local_io(error)
+        raise _evidence(f"{label}原始结果缺失或无法读取；保留证据，禁止重新抽取结论", receipt) from error
     digest = hashlib.sha256(raw).hexdigest()
     if receipt.get("artifact_digest", digest) != digest:
-        raise HarnessError(f"{label}原始结果已改变；保留证据，禁止重新抽取结论")
+        raise _evidence(f"{label}原始结果已改变；保留证据，禁止重新抽取结论", receipt)
     if "artifact_digest" not in receipt and bind is not None:
         receipt["artifact_digest"] = digest
         bind()
@@ -156,5 +176,5 @@ def read_bound_result(receipt, label, *, bind=None):
         # The runtime wrote this file; anything not strictly decodable was altered.
         result = strict_json_loads(raw)
     except (ValueError, UnicodeError, RecursionError) as error:
-        raise HarnessError(f"{label}原始结果不是有效 JSON") from error
+        raise _evidence(f"{label}原始结果不是有效 JSON", receipt) from error
     return result, digest

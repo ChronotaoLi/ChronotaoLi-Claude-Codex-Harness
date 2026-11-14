@@ -7,7 +7,7 @@ ledger, the worktree snapshot, the configured command grants and this process's
 from __future__ import annotations
 from collections import namedtuple
 from copy import deepcopy
-from .continuation import continuation_gate, resolve_continuation, validate_continuation_rejection
+from .continuation import continuation_gate, continuation_stop, resolve_continuation, validate_continuation_rejection
 from .finalization import needs_decision, same_snapshot_record
 from .planning import attempt_limit_error, DECIDE_KEY, directive_mismatch
 from .recovery import invalidate_acceptance_review, snapshot_digest
@@ -27,7 +27,7 @@ class Scheduler(RuntimeService):
         if self.context.run.get("pending_continuation"):
             blocker = continuation_gate(self.context)
             if blocker is not None:
-                raise HarnessError(f"等待续作条件：{blocker}")
+                raise HarnessError(f"等待续作条件：{blocker}", stop=continuation_stop(self.context, blocker))
             resolve_continuation(self.context)
 
     def next_step(self, *, step=False, accepted_this_call=0):
@@ -36,7 +36,7 @@ class Scheduler(RuntimeService):
         result = self._next_step(step=step, accepted_this_call=accepted_this_call)
         if (DECIDE_KEY in self.context.run["commander_receipts"] and result.kind in ADVANCING
                 and not (result.kind == "final_review" and self.context.reverify_requested)):
-            raise HarnessError("指挥决定回执与当前推导不符；保留现场")
+            raise HarnessError("指挥决定回执与当前推导不符；保留现场", stop=stops.make("runtime_failure", "invariant"))
         return result
 
     def _next_step(self, *, step, accepted_this_call):
@@ -59,7 +59,7 @@ class Scheduler(RuntimeService):
             if run.get("current_task"):
                 ready = [t for t in ready if t["id"] == run["current_task"]]
             if not ready:
-                raise HarnessError("没有可执行任务")
+                raise HarnessError("没有可执行任务", stop=stops.make("runtime_failure", "invariant"))
             runnable = [t for t in ready if workflow.task_decision_gate(t["id"]) is None]
             if not runnable:
                 raise workflow.decision_required(workflow.task_decision_gate(ready[0]["id"]))
@@ -71,7 +71,7 @@ class Scheduler(RuntimeService):
             if not run.get("pending_directive"):
                 runnable = [t for t in ready if t["id"] not in missing]
                 if not runnable:
-                    planning.require_task_commands([t["id"] for t in ready])
+                    planning.require_task_commands([t["id"] for t in ready], "all_ready_tasks")
                 ready = runnable
             current = run.get("current_task")
             limit = self.context.config.data["runtime"]["max_attempts"]
@@ -86,10 +86,10 @@ class Scheduler(RuntimeService):
             if saved:
                 task = next((t for t in ready if t["id"] == saved["directive"]["selected_task"]), None)
                 if task is None:
-                    raise directive_mismatch()
+                    raise directive_mismatch(saved["directive"].get("selected_task"))
                 return Step("worker", (task, saved["directive"]))
             if planning.published_directive_missing():
-                raise HarnessError("修订已发布但待派发指令缺失；保留现场")
+                raise HarnessError("修订已发布但待派发指令缺失；保留现场", stop=stops.make("runtime_failure", "invariant"))
             if len(ready) == 1 and not run.get("feedback") and not run["attempts"].get(ready[0]["id"]):
                 # Direct dispatch: the worker skill states the default; no commander text.
                 return Step("worker", (ready[0], {"selected_task": ready[0]["id"], "action": "implement",
@@ -119,7 +119,7 @@ class Scheduler(RuntimeService):
                 elif planned.kind == "decide":
                     self.services.planning.decide(planned.data)
                 else:
-                    raise HarnessError("首版计划尚未登记；保留现场")
+                    raise HarnessError("首版计划尚未登记；保留现场", stop=stops.make("runtime_failure", "invariant"))
             self.services.planning.report_command_requirements()
             if not self.context.run["attempts"] or self.context.run.get("environment_updates") or self.context.run.get("operator_decisions"):
                 self.services.packets.preflight_final_context()
@@ -164,7 +164,7 @@ class Scheduler(RuntimeService):
                     if self.services.finalization.final_review(reverify=self.context.reverify_requested):
                         break
                 else:
-                    raise HarnessError(f"调度推导出未知步骤：{action.kind}")
+                    raise HarnessError(f"调度推导出未知步骤：{action.kind}", stop=stops.make("runtime_failure", "invariant"))
             self.services.planning.verify_plan_authority()
             self.context.run["status"] = "completed"
             self.context.save()

@@ -10,7 +10,7 @@ from harness.runtime import Runtime
 from harness.requirements import missing_commands
 from harness.util import HarnessError, read_json
 import harness.worker_receipts as worker_receipts_module
-from test_harness import ROOT, RepoCase
+from test_harness import ROOT, RepoCase, walk_exit
 from test_runtime_changes import ScriptedBackend, revised, trigger_kind
 
 
@@ -69,8 +69,8 @@ class CommandRequirementsTests(RepoCase):
         self.assertEqual(backend.calls, [])
         self.assertEqual(self.config.data['permissions']['worker_commands'], [])
         self.config.data['permissions']['worker_commands'].append(self.command)
-        result = self.engine(backend).resume(engine.run['id'])
-        self.assertEqual(result['status'], 'completed')
+        result = walk_exit(self, engine.directory, ('missing_commands', 'all_ready_tasks'), backend=backend,
+                           expect_status='completed')
         self.assertEqual(result['attempts'], {'greet': 1})
         self.assertEqual(result['command_requirements']['missing'], {})
 
@@ -91,8 +91,8 @@ class CommandRequirementsTests(RepoCase):
         result = engine.start('Implement greet', self.plan([self.command]), pause_after_plan=True)
         self.assertEqual(status_summary(result)['missing_command_requirements'], {'greet': [self.command]})
         self.config.data['permissions']['worker_commands'].append(self.command)
-        with self.assertRaises(HarnessError):
-            self.engine(backend).resume(result['id'])
+        again = self.engine(backend).resume(result['id'])  # the plan still waits; status is refreshed
+        self.assertEqual(again['status'], 'awaiting_approval')
         saved = self.saved(engine)
         self.assertFalse(saved['plan_approved'])
         self.assertNotIn('missing_command_requirements', status_summary(saved))

@@ -4,10 +4,10 @@ from __future__ import annotations
 from copy import deepcopy
 from pathlib import Path
 
-from . import cleanup, git
+from . import cleanup, git, stops
 from .context import compact_checks, compact_feedback
 from .contracts import review_approved
-from .recovery import snapshot_digest
+from .recovery import read_evidence_json, snapshot_digest
 from .review_progress import bind_review_source, validate_review_source, required_findings, disposition_gaps
 from .services import RuntimeService
 from .verification import checks_failed
@@ -76,10 +76,10 @@ class FinalAcceptance(RuntimeService):
         self.context.reverify_requested = False
         git.check_worktree_state(self.context.worktree)
         if not git.clean(self.context.worktree, binding=self.context.run["worktree_binding"]):
-            raise HarnessError("整体审阅要求干净的已接受提交；未接受的修改不能用于完成 run")
+            raise HarnessError("整体审阅要求干净的已接受提交；未接受的修改不能用于完成 run", stop=stops.make("workspace_mismatch", "dirty_final_workspace"))
         snapshot = self.context.snapshot()
         if snapshot["head"] != self.context.run["expected_head"]:
-            raise HarnessError("整体审阅前 HEAD 与检查点不同；保留现场")
+            raise HarnessError("整体审阅前 HEAD 与检查点不同；保留现场", stop=stops.make("workspace_mismatch", "head_changed", data={"expected_head": self.context.run["expected_head"]}))
         digest = snapshot_digest(snapshot)
         history = self.context.run["final_history"]
         same_snapshot = [item for item in history
@@ -88,14 +88,14 @@ class FinalAcceptance(RuntimeService):
                          if item["status"] in ("rejected", "invalid_rejected")), None)
         if rejected:
             # The scheduler routes this snapshot to a decide; the review is never redrawn.
-            raise HarnessError("整体审阅已拒绝同一代码快照；必须先通过修正任务，不能恢复后重复抽取审阅")
+            raise HarnessError("整体审阅已拒绝同一代码快照；必须先通过修正任务，不能恢复后重复抽取审阅", stop=stops.make("runtime_failure", "invariant"))
         for item in same_snapshot:
             if item["status"] == "approved":
                 validate_review_source(self.context.run, "final", item, kind="final_review", candidate_digest=digest)
                 required = required_findings(self.context.run, "final", digest, whole_run=True,
                                              records=history[:history.index(item)])
                 if required != item.get("required_findings") or disposition_gaps(item["review"], required):
-                    raise HarnessError("整体批准缺少历史阻断问题的独立解决处置；禁止完成 run")
+                    raise HarnessError("整体批准缺少历史阻断问题的独立解决处置；禁止完成 run", stop=stops.make("runtime_failure", "invariant"))
         if any(item["status"] == "approved" for item in same_snapshot):
             # Approval is persisted only after all validation and snapshot gates.
             return True
@@ -103,7 +103,7 @@ class FinalAcceptance(RuntimeService):
         if not record or record["status"] != "running":
             if record and record["status"] == "verification_failed" and record["failure_kind"] != "timeout":
                 if not reverify:
-                    raise HarnessError("同一代码快照的整体验证曾失败；修复环境后使用 resume --reverify 显式重验")
+                    raise HarnessError("同一代码快照的整体验证曾失败；修复环境后使用 resume --reverify 显式重验", stop=stops.make("runtime_failure", "invariant"))
                 # An explicit re-verification replaces a decide that never
                 # returned; a returned one was refused before any write.
                 self.services.receipts.discard_unreturned("commander:decide:run")
@@ -122,12 +122,11 @@ class FinalAcceptance(RuntimeService):
         folder = Path(record["artifact"]).parent
         snapshot_artifact = Path(record["snapshot_artifact"])
         if snapshot_artifact.exists() or snapshot_artifact.is_symlink():
-            try:
+            with stops.evidence_reads(source={"artifact": str(snapshot_artifact)},
+                                      message="整体快照证据无法读取或已改变；保留原证据，禁止覆盖"):
                 saved_snapshot = read_json(snapshot_artifact)
-            except (OSError, ValueError) as error:
-                raise HarnessError("整体快照证据无法读取；保留原证据，禁止覆盖") from error
-            if saved_snapshot != snapshot:
-                raise HarnessError("整体快照证据与待恢复记录不符；保留原证据，禁止覆盖")
+                if saved_snapshot != snapshot:
+                    raise HarnessError("整体快照证据与待恢复记录不符；保留原证据，禁止覆盖")
         else:
             # The attempt and its recovery phase are durable before artifact I/O.
             write_json(snapshot_artifact, snapshot)
@@ -163,7 +162,7 @@ class FinalAcceptance(RuntimeService):
             write_json(folder / "final.json", record)
             self.context.save()
         else:
-            checks = read_json(Path(record["verification"]))
+            checks = read_evidence_json(Path(record["verification"]))
         if record["phase"] == "reviewing":
             # The verdict is durable: first entry and recovery try to reclaim at this one point.
             self.reclaim_verified_checkout(record)
@@ -171,7 +170,7 @@ class FinalAcceptance(RuntimeService):
                                     "--name-only", "--no-renames", "-z", self.context.run["base_commit"], "HEAD",
                                     binding=self.context.run["worktree_binding"]).split("\0")
             if "required_findings" not in record:
-                raise HarnessError("整体审阅缺少必需问题对照；保留证据")
+                raise HarnessError("整体审阅缺少必需问题对照；保留证据", stop=stops.make("runtime_failure", "invariant"))
             required = record["required_findings"]
             review, diagnostics = self.services.receipts.dispatch_review("final_review", "final",
                      self.services.packets.final_review_packet(
@@ -187,7 +186,7 @@ class FinalAcceptance(RuntimeService):
             if disposition_errors:
                 diagnostics = {**diagnostics, "disposition_errors": disposition_errors}
             if self.context.snapshot() != snapshot:
-                raise HarnessError("整体审阅后文件发生变化；禁止完成 run")
+                raise HarnessError("整体审阅后文件发生变化；禁止完成 run", stop=stops.make("runtime_failure", "invariant"))
             record.update(review=review, phase="finished", status="approved" if not diagnostics and review_approved(review) else "rejected")
             record.update(diagnostics)
             self.context.run.get("review_receipts", {}).pop("reviewer:final_review:final", None)
@@ -205,7 +204,7 @@ class FinalAcceptance(RuntimeService):
         if record["status"] == "verification_failed":
             self.context.event("final_verification_failed", attempt=attempt, failure_kind=record["failure_kind"])
             if record["failure_kind"] == "timeout":
-                raise HarnessError("整体验证超时；证据已保存，修复环境或增加验证超时后 resume 可重验")
+                raise HarnessError("整体验证超时；证据已保存，修复环境或增加验证超时后 resume 可重验", stop=stops.make("verification", "final_timeout", data={"config_key": "runtime.verify_timeout_seconds", "attempt": attempt}, source={"artifact": record["artifact"]}))
         else:
             self.context.event("final_review_rejected", attempt=attempt)
         return False

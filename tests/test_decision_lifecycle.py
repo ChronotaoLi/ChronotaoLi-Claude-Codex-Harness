@@ -272,10 +272,12 @@ class DecisionLifecycleTests(RepoCase):
         engine, backend = self.blocked()
         path = self.response(engine)
         before = (engine.directory / 'state.json').read_bytes()
-        for options in ({'environment_update': path}, {'reverify': True},
-                        {'allow_scope': ['extra.py']}):
+        stop_answer = Path(path).with_name('stop-answer.json')
+        write_json(stop_answer, {**read_json(path), 'decision': 'stop'})
+        for answer, options in ((path, {'environment_update': path}), (path, {'allow_scope': ['extra.py']}),
+                                (stop_answer, {'reverify': True})):  # a stop answer ends the resume before any re-verification
             with self.subTest(options=options), self.assertRaises(HarnessError):
-                self.engine(backend).resume(engine.run['id'], operator_decision=path, **options)
+                self.engine(backend).resume(engine.run['id'], operator_decision=answer, **options)
             self.assertEqual((engine.directory / 'state.json').read_bytes(), before)
         request = self.saved(engine)['decision_requests'][0]
         for source in (request['artifact'], request['source']['artifact']):

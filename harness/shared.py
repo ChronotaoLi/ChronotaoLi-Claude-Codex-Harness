@@ -6,6 +6,7 @@ import re
 import sys
 from pathlib import Path
 
+from . import stops
 from .util import HarnessError, read_json
 
 
@@ -62,6 +63,7 @@ def read_skill(root: Path, name: str):
     return path.read_text(encoding="utf-8")
 
 
+@stops.classifies("invalid_input", "input_schema", data={"option": "config"})
 def validate_mcp(config, roles=("commander", "worker", "reviewer")):
     """Read and validate active external servers without connecting or writing state."""
     path = config.asset("mcp")

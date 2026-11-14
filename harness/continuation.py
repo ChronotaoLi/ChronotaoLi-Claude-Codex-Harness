@@ -8,11 +8,11 @@ import hashlib
 import json
 from pathlib import Path
 
-from . import git
+from . import git, stops
 from .worker_receipts import read_worker_source
 from .git_query import covers as git_query_covers
 from .recovery import RECOVERY_BUSY_KEYS, read_bound_result, snapshot_digest
-from .util import HarnessError, dump, write_json
+from .util import EvidenceError, HarnessError, dump, write_json
 
 def _snapshot(context):
     if hasattr(context, 'snapshot'):
@@ -53,6 +53,7 @@ def _write(context, category, record):
     return {**_projection(value), 'artifact': str(path), 'artifact_digest': hashlib.sha256(raw).hexdigest()}
 
 
+@stops.reads_evidence
 def _complete(context, category, row):
     """Validate a ledger projection together with its referenced complete artifact."""
     if not isinstance(row, dict) or not isinstance(row.get('id'), str):
@@ -74,6 +75,7 @@ def _complete(context, category, row):
     return record
 
 
+@stops.reads_evidence
 def _records(context, category, key):
     records = context.run.get(key, [])
     if not isinstance(records, list):
@@ -110,22 +112,24 @@ def record_continuation(context, task_id, result, worker_source, snapshot, *, sa
     stored = read_worker_source(context, task_id, worker_source)
     content = lambda value: {k: v for k, v in value.items() if k not in ('task_id', 'dispatch_id')}
     if content(stored) != content(result) or result.get('status') != 'blocked' or result.get('blocker_kind') != 'continuation' or not result.get('continuation_request'):
-        raise HarnessError('continuation must bind the original blocked worker result')
+        raise HarnessError('continuation must bind the original blocked worker result', stop=stops.make("runtime_failure", "invariant"))
     if context.run.get('current_task') != task_id or task_id in context.run['accepted']:
-        raise HarnessError('continuation requires current unaccepted task')
+        raise HarnessError('continuation requires current unaccepted task', stop=stops.make("runtime_failure", "invariant"))
     for old in history:
         if old['source'] == worker_source:
             if any(row['continuation_id'] == old['id'] for row in rejections):
-                raise HarnessError('rejected continuation source cannot be replayed')
+                raise HarnessError('rejected continuation source cannot be replayed', stop=stops.make("runtime_failure", "invariant"))
             if old['snapshot_digest'] != snapshot_digest(snapshot):
-                raise HarnessError('continuation candidate changed')
+                raise HarnessError('continuation candidate changed', stop=stops.make("workspace_mismatch", "candidate_changed"))
             return old
     if context.run.get('pending_continuation'):
-        raise HarnessError('another continuation remains pending')
+        raise HarnessError('another continuation remains pending', stop=stops.make("runtime_failure", "invariant"))
     record = dict(run_id=context.run['id'], sequence=len(history) + 1, task_id=task_id,
                   source=deepcopy(worker_source), snapshot=deepcopy(snapshot),
                   snapshot_digest=snapshot_digest(snapshot), request=deepcopy(result['continuation_request']))
-    row = _write(context, 'continuations', record)
+    # The runtime's own prewrite: a conflicting unregistered file is changed evidence.
+    with stops.classify('evidence', 'runtime_integrity'):
+        row = _write(context, 'continuations', record)
     context.run['continuation_history'] = [*history, row]
     context.run['pending_continuation'] = row['id']
     if save:
@@ -141,16 +145,16 @@ def continuation_gate(context, current_snapshot=None):
         return None
     rows = [r for r in history if r['id'] == pending]
     if len(rows) != 1:
-        raise HarnessError('pending continuation pointer invalid')
+        raise HarnessError('pending continuation pointer invalid', stop=stops.make('runtime_failure', 'invariant'))
     row = rows[0]
     if any(r['continuation_id'] == pending for r in rejections):
-        raise HarnessError('rejected continuation cannot become pending again')
+        raise HarnessError('rejected continuation cannot become pending again', stop=stops.make('runtime_failure', 'invariant'))
     if (context.run.get('current_task') != row['task_id'] or row['task_id'] in context.run['accepted']
             or row['snapshot_digest'] != snapshot_digest(current_snapshot if current_snapshot is not None else _snapshot(context))):
-        raise HarnessError('pending continuation candidate or task changed')
+        raise HarnessError('pending continuation candidate or task changed', stop=stops.make("workspace_mismatch", "candidate_changed", source={"task_id": row["task_id"]}))
     source_index = next(i for i, d in enumerate(context.run['dispatches']) if d['id'] == row['source']['dispatch_id'])
     if any(d.get('invoked', True) for d in context.run['dispatches'][source_index + 1:]):
-        raise HarnessError('pending continuation superseded by a model invocation')
+        raise HarnessError('pending continuation superseded by a model invocation', stop=stops.make("runtime_failure", "invariant"))
     config, request = _config(context), row['request']
     if request['kind'] == 'commands':
         allowed = config['verification']['commands'] + config['permissions']['worker_commands']
@@ -163,19 +167,33 @@ def continuation_gate(context, current_snapshot=None):
         if config['runtime']['agent_timeout_seconds'] < minimum:
             return {'kind': 'budget', 'task_id': row['task_id'], 'minimum_timeout_seconds': minimum}
     else:
-        raise HarnessError('unknown continuation kind')
+        raise HarnessError('unknown continuation kind', stop=stops.make("runtime_failure", "invariant"))
     return None
+
+
+def continuation_stop(context, blocker):
+    """The typed stop for an unmet continuation condition reported by continuation_gate()."""
+    pending = context.run['pending_continuation']
+    row = next(r for r in _records(context, 'continuations', 'continuation_history') if r['id'] == pending)
+    source = {'continuation_id': pending, 'task_id': blocker['task_id'], 'dispatch_id': row['source']['dispatch_id']}
+    if blocker['kind'] == 'commands':
+        return stops.make('continuation', 'commands_required', data={'missing_commands': blocker['missing_commands']},
+                          source=source)
+    return stops.make('continuation', 'timeout_required', source=source, data={
+        'config_key': 'runtime.agent_timeout_seconds', 'minimum_timeout_seconds': blocker['minimum_timeout_seconds'],
+        'agent_timeout_seconds': _config(context)['runtime']['agent_timeout_seconds']})
 
 
 def resolve_continuation(context, current_snapshot=None):
     blocker = continuation_gate(context, current_snapshot)
     if blocker is not None:
-        raise HarnessError('continuation requirements remain unmet')
+        raise HarnessError('continuation requirements remain unmet', stop=stops.make("runtime_failure", "invariant"))
     if context.run.get('pending_continuation') is not None:
         context.run['pending_continuation'] = None
         context.save()
 
 
+@stops.classifies("invalid_input", "input_schema", data={"option": "input file"})
 def _read_input(path, keys, text_key, label):
     def unique(pairs):
         value = {}
@@ -202,6 +220,7 @@ def _read_input(path, keys, text_key, label):
     return value
 
 
+@stops.classifies("invalid_input", "input_schema", data={"option": "--execution-guidance"})
 def read_execution_guidance(path):
     return _read_input(path, {'task_id', 'source_dispatch_id', 'source_snapshot_digest', 'summary'},
                        'summary', 'execution guidance')
@@ -212,6 +231,7 @@ def _revision_directive(row):
             'snapshot_digest': row['snapshot_digest'], 'continuation_rejection_id': row['id']}
 
 
+@stops.reads_evidence
 def _rejections(context, history=None):
     """Validate resolutions and derive the guard from immutable, unconsumed history."""
     history = _records(context, 'continuations', 'continuation_history') if history is None else history
@@ -255,7 +275,7 @@ def _rejections(context, history=None):
         if any(entry.get('invoked', True) for entry in entries[source_position + 1:position]):
             raise HarnessError('continuation rejection source superseded')
         if context.run.get('pending_continuation') == original['id']:
-            raise HarnessError('rejected continuation cannot become pending again')
+            raise HarnessError('rejected continuation cannot become pending again', stop=stops.make('runtime_failure', 'invariant'))
     identifiers = {row['id'] for row in records}
     if any('continuation_rejection_id' in entry and entry['continuation_rejection_id'] not in identifiers for entry in entries):
         raise HarnessError('continuation rejection consumption lacks evidence')
@@ -278,9 +298,9 @@ def validate_continuation_rejection(context, current_snapshot=None, worker_task=
     if active:
         snapshot = current_snapshot if current_snapshot is not None else _snapshot(context)
         if active['snapshot_digest'] != snapshot_digest(snapshot):
-            raise HarnessError('continuation revision candidate changed')
+            raise HarnessError('continuation revision candidate changed', stop=stops.make("workspace_mismatch", "candidate_changed"))
         if worker_task is not None and worker_task != active['task_id']:
-            raise HarnessError('continuation revision requires its named worker')
+            raise HarnessError('continuation revision requires its named worker', stop=stops.make("runtime_failure", "invariant"))
     return active
 
 
@@ -290,21 +310,21 @@ def record_continuation_rejection(context, path, current_snapshot=None):
     history = _records(context, 'continuations', 'continuation_history')
     records, active = _rejections(context, history)
     if context.run.get('status') not in ('blocked', 'interrupted', 'paused'):
-        raise HarnessError('continuation rejection requires a safe pending task boundary')
+        raise HarnessError('continuation rejection requires a safe pending task boundary', stop=stops.make('invalid_input', 'run_state', data={'status': context.run.get('status')}))
     old = next((row for row in records if row['continuation_id'] == value['continuation_id']), None)
     if old is not None:
         if old['input'] != value or active is None or active['id'] != old['id']:
-            raise HarnessError('continuation rejection conflicts with prior input or was already consumed')
+            raise HarnessError('continuation rejection conflicts with prior input or was already consumed', stop=stops.make('invalid_input', 'conflicting_retry', data={'option': '--reject-continuation'}))
         validate_continuation_rejection(context, current_snapshot)
         return deepcopy(old)
     if active or any(context.run.get(key) for key in RECOVERY_BUSY_KEYS):
-        raise HarnessError('continuation rejection requires a safe pending task boundary')
+        raise HarnessError('continuation rejection requires a safe pending task boundary', stop=stops.make('invalid_input', 'run_state', data={'status': context.run.get('status')}))
     pending = context.run.get('pending_continuation')
     row = next((row for row in history if row['id'] == pending), None)
     if (row is None or value['continuation_id'] != pending or value['task_id'] != row['task_id']
             or value['source_dispatch_id'] != row['source']['dispatch_id']
             or value['source_snapshot_digest'] != row['snapshot_digest']):
-        raise HarnessError('continuation rejection must bind the current request and candidate')
+        raise HarnessError('continuation rejection must bind the current request and candidate', stop=stops.make('invalid_input', 'stale_request', data={'option': '--reject-continuation'}))
     # Check identity, source, candidate and dispatch order, without granting its requirements.
     continuation_gate(context, current_snapshot)
     # The complete rejection artifact keeps the original's whole snapshot.
@@ -315,7 +335,8 @@ def record_continuation_rejection(context, path, current_snapshot=None):
     # The directive carries data only: the operator's reason. How to revise a
     # rejected continuation is protocol, stated in the worker skill.
     record['directive'] = {'selected_task': row['task_id'], 'action': 'implement', 'instruction': value['reason']}
-    rejection = _write(context, 'continuation-rejections', record)
+    with stops.classify('invalid_input', 'conflicting_retry', data={'option': '--reject-continuation'}):
+        rejection = _write(context, 'continuation-rejections', record)
     context.run['continuation_rejections'] = [*records, rejection]
     context.run['pending_continuation'] = None
     context.run['pending_directive'] = _revision_directive(rejection)
@@ -332,12 +353,14 @@ def record_execution_guidance(context, path, current_snapshot=None):
     if (context.run.get('status') in ('completed', 'abandoned', 'running')
             or context.run.get('current_task') != task_id or task_id in context.run['accepted']
             or any(context.run.get(k) for k in RECOVERY_BUSY_KEYS)):
-        raise HarnessError('execution guidance requires a safe pending task boundary')
+        raise HarnessError('execution guidance requires a safe pending task boundary', stop=stops.make('invalid_input', 'run_state', data={'status': context.run.get('status')}))
     source = {'dispatch_id': value['source_dispatch_id'], 'artifact': str(Path(context.directory) / 'dispatches' / value['source_dispatch_id'] / 'returned-result.json')}
     try:
         source['artifact_digest'] = hashlib.sha256(Path(source['artifact']).read_bytes()).hexdigest()
     except OSError as error:
-        raise HarnessError('execution guidance worker source missing') from error
+        stops.keep_local_io(error)
+        raise EvidenceError('execution guidance worker source missing',
+                            stop=stops.make('evidence', 'runtime_integrity', source={'artifact': source['artifact']})) from error
     # Require an existing authoritative digest; never bless edited source bytes.
     continuation_records = _records(context, 'continuations', 'continuation_history')
     links = [r['source'] for r in continuation_records]
@@ -345,11 +368,11 @@ def record_execution_guidance(context, path, current_snapshot=None):
     if feedback.get('task_id') == task_id:
         links.append({'dispatch_id': value['source_dispatch_id'], 'artifact': feedback.get('worker_artifact'), 'artifact_digest': feedback.get('worker_artifact_digest')})
     if source not in links:
-        raise HarnessError('execution guidance source lacks authoritative binding')
+        raise HarnessError('execution guidance source lacks authoritative binding', stop=stops.make('invalid_input', 'stale_request', data={'option': '--execution-guidance'}))
     read_worker_source(context, task_id, source)
     position = next(i for i, d in enumerate(context.run['dispatches']) if d['id'] == source['dispatch_id'])
     if any(d.get('invoked', True) for d in context.run['dispatches'][position + 1:]):
-        raise HarnessError('execution guidance source superseded')
+        raise HarnessError('execution guidance source superseded', stop=stops.make('invalid_input', 'stale_request', data={'option': '--execution-guidance'}))
     snapshot = current_snapshot if current_snapshot is not None else _snapshot(context)
     bound_digests = [r['snapshot_digest'] for r in continuation_records if r['source'] == source]
     if feedback.get('task_id') == task_id and feedback.get('snapshot_digest'):
@@ -357,15 +380,16 @@ def record_execution_guidance(context, path, current_snapshot=None):
     if feedback.get('task_id') == task_id and feedback.get('snapshot') is not None:
         bound_digests.append(snapshot_digest(feedback['snapshot']))
     if value['source_snapshot_digest'] not in bound_digests:
-        raise HarnessError('execution guidance source candidate lacks authoritative binding')
+        raise HarnessError('execution guidance source candidate lacks authoritative binding', stop=stops.make('invalid_input', 'stale_request', data={'option': '--execution-guidance'}))
     if snapshot_digest(snapshot) != value['source_snapshot_digest']:
-        raise HarnessError('execution guidance candidate changed')
+        raise HarnessError('execution guidance candidate changed', stop=stops.make('invalid_input', 'stale_request', data={'option': '--execution-guidance'}))
     for old in records:
         if old['input'] == value:
             return old
     record = dict(run_id=context.run['id'], sequence=len(records) + 1, task_id=task_id,
                   source=source, snapshot=deepcopy(snapshot), snapshot_digest=snapshot_digest(snapshot), input=value)
-    row = _write(context, 'execution-guidance', record)
+    with stops.classify('invalid_input', 'conflicting_retry', data={'option': '--execution-guidance'}):
+        row = _write(context, 'execution-guidance', record)
     context.run['execution_guidance'] = [*records, row]
     context.save()
     return deepcopy(row)
@@ -377,7 +401,7 @@ def packet(context, task_id=None):
     guidance = _records(context, 'execution-guidance', 'execution_guidance')
     pending = context.run.get('pending_continuation')
     if pending is not None and pending not in {r['id'] for r in continuations}:
-        raise HarnessError('pending continuation pointer invalid')
+        raise HarnessError('pending continuation pointer invalid', stop=stops.make('runtime_failure', 'invariant'))
     relevant = lambda row: task_id is None or row['task_id'] == task_id
     def reference(row):
         return {k: deepcopy(v) for k, v in row.items() if k != 'directive'}

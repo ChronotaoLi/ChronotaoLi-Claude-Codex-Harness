@@ -1,5 +1,6 @@
 """Durable, task-scoped operator choices, independent of facts and acceptance."""
 
+from . import stops
 from .versions import RUN_SCHEMA_VERSION
 from .services import RuntimeService
 from copy import deepcopy
@@ -142,15 +143,24 @@ class DecisionRecovery(RuntimeService):
         return 'request_' + snapshot_digest({k: request[k] for k in
             ('run_id', 'task_id', 'source_task_id', 'kind', 'source', 'question', 'request_key')})
 
+    def _written_decision_artifact(self, record):
+        """The artifact an earlier, interrupted prewrite left for ``record``, or None; a different one conflicts."""
+        artifact = self.context.directory / 'decisions' / (record['id'] + '.json')
+        if not artifact.exists():
+            return None
+        try:
+            old = json.loads(artifact.read_bytes())
+        except (OSError, ValueError, UnicodeError) as error:
+            stops.keep_local_io(error)
+            raise HarnessError('unregistered decision artifact damaged') from error
+        if not isinstance(old, dict) or {k: v for k, v in old.items() if k != 'recorded_at'} != {k: v for k, v in record.items() if k != 'recorded_at'}:
+            raise HarnessError('immutable decision artifact conflict', stop=stops.make("invalid_input", "conflicting_retry", data={"option": "--operator-decision"}))
+        return old
+
     def _decision_artifact(self, record, category):
         artifact = self.context.directory / 'decisions' / (record['id'] + '.json')
-        if artifact.exists():
-            try:
-                old = json.loads(artifact.read_bytes())
-            except (OSError, ValueError, UnicodeError) as error:
-                raise HarnessError('unregistered decision artifact damaged') from error
-            if not isinstance(old, dict) or {k: v for k, v in old.items() if k != 'recorded_at'} != {k: v for k, v in record.items() if k != 'recorded_at'}:
-                raise HarnessError('immutable decision artifact conflict')
+        old = self._written_decision_artifact(record)
+        if old is not None:
             record = old
         else:
             write_json(artifact, record)
@@ -167,7 +177,8 @@ class DecisionRecovery(RuntimeService):
         """
         self.decision_context()
         question = decision_question(question, kind)
-        _text(question, 'question', 80019 if kind == 'worker' else 4000)
+        with stops.classify('runtime_failure', 'invariant'):  # registered questions are normalized first
+            _text(question, 'question', 80019 if kind == 'worker' else 4000)
         if not isinstance(request_key, str) or len(request_key) > 96 or '\0' in request_key:
             raise HarnessError('decision request key invalid')
         tasks = {t['id'] for t in self.context.run['tasks']}
@@ -264,6 +275,7 @@ class DecisionRecovery(RuntimeService):
         latest = {r['request_id']: r for r in responses}
         return [{**r, 'response': deepcopy(latest.get(r['id']))} for r in records]
 
+    @stops.reads_evidence
     def validate_decision_links(self):
         self.decision_context()
 
@@ -277,38 +289,42 @@ class DecisionRecovery(RuntimeService):
     def _prepare_decision(self, value):
         records = self.decision_context()
         if self.context.run.get('status') in ('completed', 'abandoned'):
-            raise HarnessError('terminal run rejects operator decisions')
+            raise HarnessError('terminal run rejects operator decisions', stop=stops.make("invalid_input", "run_state", data={"status": self.context.run.get("status")}))
         request = next((r for r in records if r['id'] == value['request_id']), None)
         if request is None or request['task_id'] != value['task_id'] or value['task_id'] in self.context.run['accepted']:
-            raise HarnessError('operator decision request unknown or task accepted')
+            raise HarnessError('operator decision request unknown or task accepted', stop=stops.make("invalid_input", "stale_request", data={"option": "--operator-decision"}))
         active = [key for key in RECOVERY_BUSY_KEYS if self.context.run.get(key)]
         if active:
-            raise HarnessError('pending lifecycle gates reject operator decisions: ' + ', '.join(active))
+            raise HarnessError('pending lifecycle gates reject operator decisions: ' + ', '.join(active), stop=stops.make("invalid_input", "run_state", data={"status": self.context.run.get("status")}))
         boundary = request['response']['dispatch_count'] if request['response'] else request['dispatch_count']
         if any(d.get('invoked', True) and (request['kind'] != 'handoff'
                    or d.get('task_id') == request['task_id'])
                for d in self.context.run['dispatches'][boundary:]):
-            raise HarnessError('operator decision request stale after subsequent model invocation')
+            raise HarnessError('operator decision request stale after subsequent model invocation', stop=stops.make("invalid_input", "stale_request", data={"option": "--operator-decision"}, source={"request_id": value["request_id"]}))
         ident = self._response_id(value)
         if any(r['id'] == ident for r in self.context.run.get('operator_decisions', [])):
             if request['response'] and request['response']['id'] == ident:
                 return None
-            raise HarnessError('operator decision was superseded; provide a new explicit summary')
+            raise HarnessError('operator decision was superseded; provide a new explicit summary', stop=stops.make("invalid_input", "stale_request", data={"option": "--operator-decision"}, source={"request_id": value["request_id"]}))
         return {**value, 'id': ident, 'sequence': len(self.context.run.get('operator_decisions', [])) + 1,
                 'dispatch_count': len(self.context.run['dispatches']), 'recorded_at': time.time()}
 
     def prepare_operator_decision(self, path):
         return self._prepare_decision(read_decision(path))
 
-    def prepare_operator_decisions(self, paths):
-        """Validate an entire submission before creating any decision artifacts."""
-        if isinstance(paths, (str, PathLike)):
-            paths = [paths]
-        values = [read_decision(path) for path in paths]
+    def prepare_operator_decisions(self, paths, values=None):
+        """Validate an entire submission before creating any decision artifacts.
+
+        ``values`` are the answers resume already read and parsed: one read per file.
+        """
+        if values is None:
+            if isinstance(paths, (str, PathLike)):
+                paths = [paths]
+            values = [read_decision(path) for path in paths]
         if not values:
-            raise HarnessError('operator decision batch must not be empty')
+            raise HarnessError('operator decision batch must not be empty', stop=stops.make("invalid_input", "input_schema", data={"option": "--operator-decision"}))
         if len({value['request_id'] for value in values}) != len(values):
-            raise HarnessError('duplicate operator decision request in batch')
+            raise HarnessError('duplicate operator decision request in batch', stop=stops.make('invalid_input', 'input_schema', data={'option': '--operator-decision'}))
         records = []
         for value in values:
             record = self._prepare_decision(value)
@@ -332,7 +348,7 @@ class DecisionRecovery(RuntimeService):
             value = validate_decision({k: record[k] for k in
                 ('schema_version', 'request_id', 'task_id', 'decision', 'summary')})
             if value['request_id'] in seen:
-                raise HarnessError('duplicate operator decision request in batch')
+                raise HarnessError('duplicate operator decision request in batch', stop=stops.make('invalid_input', 'input_schema', data={'option': '--operator-decision'}))
             seen.add(value['request_id'])
             prepared = self._prepare_decision(value)
             if prepared is None:
@@ -343,6 +359,10 @@ class DecisionRecovery(RuntimeService):
             prepared_records.append(record)
         if not prepared_records:
             return
+        # A conflicting retry (answers resubmitted in another order) is refused before
+        # any file is written, so the original order still matches afterwards.
+        for record in prepared_records:
+            self._written_decision_artifact(record)
         rows = [self._decision_artifact(record, 'operator_decision_recorded')
                 for record in prepared_records]
         old = self.context.run.get('operator_decisions', [])
@@ -367,10 +387,12 @@ class DecisionRecovery(RuntimeService):
         try:
             if not artifact.exists() and not artifact.is_symlink():
                 write_json(artifact, value)
+        except OSError as error:
+            raise HarnessError('cannot write decision index',
+                               stop=stops.make('runtime_failure', 'io', data={'error_type': type(error).__name__})) from error
+        with stops.evidence_reads(source={'artifact': str(artifact)}):
             if artifact.is_symlink() or artifact.read_bytes() != raw:
                 raise HarnessError('decision index changed')
-        except OSError as error:
-            raise HarnessError('cannot read or write decision index') from error
         return {'artifact': str(artifact), 'artifact_digest': digest, 'count': len(records)}
 
     def decision_packet(self, packet, *, task_id=None, role=None, kind=None):

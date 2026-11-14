@@ -4,7 +4,7 @@ import sys
 
 from harness.cli import status_summary
 from harness.util import HarnessError, read_json, write_json
-from test_harness import RepoCase, ROOT
+from test_harness import RepoCase, ROOT, walk_exit
 from test_runtime_changes import ScriptedBackend, finding
 
 
@@ -65,8 +65,8 @@ class RedesignIntegrationTests(RepoCase):
         self.assertEqual(len(backend.calls), calls)
         self.assertEqual(self.config.data["runtime"]["agent_timeout_seconds"], before)
         self.config.data["runtime"]["agent_timeout_seconds"] = before + 60
-        result = self.engine(backend).resume(engine.run["id"])
-        self.assertEqual(result["status"], "completed")
+        result = walk_exit(self, engine.directory, ("continuation", "timeout_required"), backend=backend,
+                           expect_status="completed")
         self.assertEqual(result["attempts"]["greet"], 2)
 
     def test_changed_candidate_does_not_reuse_continuation(self):
@@ -74,12 +74,20 @@ class RedesignIntegrationTests(RepoCase):
         engine = self.engine(backend)
         with self.assertRaises(HarnessError):
             engine.start("Implement greet", self.plan())
+        candidate = (engine.worktree / "hello.py").read_bytes()
         (engine.worktree / "hello.py").write_text("# changed while waiting\n")
         self.config.data["permissions"]["worker_commands"].append(command)
         calls = len(backend.calls)
         with self.assertRaisesRegex(HarnessError, "candidate"):
             self.engine(backend).resume(engine.run["id"])
         self.assertEqual(len(backend.calls), calls)
+        # Row continuation-candidate: restore the waiting candidate, then the listed plain resume
+        # continues it with a fresh worker.
+        (engine.worktree / "hello.py").write_bytes(candidate)
+        result = walk_exit(self, engine.directory, ("workspace_mismatch", "candidate_changed"), backend=backend,
+                           expect_status="completed")
+        self.assertEqual(len(result["continuation_history"]), 1)
+        self.assertEqual(sum(row["role"] == "worker" for row in result["dispatches"]), 2)
 
     def test_guidance_and_grants_are_distinct_on_resume(self):
         backend, command = self.waiting_backend()

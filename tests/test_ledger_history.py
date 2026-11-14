@@ -356,7 +356,8 @@ class UnsupportedLedgerTests(DashboardCase):
                                  ('cleanup-run', self.ident), ('cleanup-run', self.ident, '--remove'),
                                  ('prepare-run', self.ident, '--manifest', str(self.manifest))):
                         code, output, errors = self.cli(*argv)
-                        self.assertEqual((code, output), (1, ''), argv)
+                        # Version refusals are input errors (2); cleanup-run keeps its own 0/1 results.
+                        self.assertEqual((code, output), (1 if argv[0] == 'cleanup-run' else 2, ''), argv)
                         self.assertIn(refusal(version), errors)
                     # No ledger, lock, receipt, input copy or worktree file was written or removed.
                     self.assertEqual(self.tree(), before)

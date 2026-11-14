@@ -6,7 +6,7 @@ import json
 from copy import deepcopy
 from pathlib import Path
 
-from . import git
+from . import git, stops
 from .context import compact_checks, compact_feedback, compact_reviews, instruction_file_changes
 from .contracts import envelope, judge_review, review_approved, review_schema, WORK
 from .memory import Memory, validate_proposals
@@ -14,7 +14,7 @@ from .planning import attempt_limit_error
 from .input_projection import validate_dispatch_indexes as validate_input_dispatch_indexes
 from .path_evidence import validate_dispatch_indexes
 from .progress import CheckpointDeclarationError
-from .recovery import invalidate_acceptance_review, snapshot_digest, worker_recovery_context
+from .recovery import read_evidence_json, invalidate_acceptance_review, snapshot_digest, worker_recovery_context
 from .services import RuntimeService
 from .continuation import record_continuation
 from .review_progress import (
@@ -24,11 +24,23 @@ from .review_progress import (
 from .verification_plan import candidate_preflight
 from .verification import checks_passed
 from .worker_receipts import read_worker_source
-from .util import dump, HarnessError, read_json, write_json
+from .util import dump, EvidenceError, HarnessError, read_json, write_json
 
 # The environment-blocked stop message reaches the stop detail and run_stopped;
 # it carries an excerpt and the digest-bound full artifact.
 ENVIRONMENT_BLOCKER_EXCERPT_CHARS = 2000
+
+
+def environment_blocked(result, task_id, dispatch_id, artifact, digest, *, invalid_output):
+    """The environment-blocked stop: an excerpt in the text, the full artifact in the stop's source."""
+    return HarnessError(f"worker 环境受阻：{environment_blocker_excerpt(result)}。"
+                        f"完整 worker 结果：{artifact}（SHA256 {digest}）。"
+                        "若必要命令被拒绝，可在 permissions.worker_commands 追加精确 argv 后 resume；"
+                        "环境事实有变化可使用 --environment-update FILE 记录补充说明与本地检查；"
+                        "原尝试和派发预算仍保留。",
+                        stop=stops.make("environment", "worker_blocked", data={"invalid_output": invalid_output},
+                                        source={"task_id": task_id, "dispatch_id": dispatch_id,
+                                                "artifact": str(artifact), "artifact_digest": digest}))
 
 
 def environment_blocker_excerpt(result):
@@ -140,19 +152,23 @@ class TaskLifecycle(RuntimeService):
         # The handoff binds the candidate of the sealed return, never a later one.
         candidate_digest = self.services.worker_receipts.sealed_candidate(key)
         if snapshot_digest(self.context.snapshot()) != candidate_digest:
-            raise HarnessError("worker candidate changed before handoff publication")
+            raise HarnessError("worker candidate changed before handoff publication", stop=stops.make("workspace_mismatch", "candidate_changed", source={"task_id": tid}))
         attempt = self.context.run["worker_receipts"][key]["attempt"]
-        paths = git.check_scope(self.context.worktree, task["allowed_paths"], binding=self.context.run["worktree_binding"])
+        paths = git.check_scope(self.context.worktree, task["allowed_paths"], binding=self.context.run["worktree_binding"],
+                                task_id=tid)
         worker_dispatch = self.services.worker_receipts.entry(self.context.run["worker_receipts"][key])
         worker_artifact = self.context.directory / "dispatches" / worker_dispatch["id"] / "returned-result.json"
-        raw_worker = worker_artifact.read_bytes()
-        stored_worker = json.loads(raw_worker)
-        if (worker_dispatch["role"] != "worker" or worker_dispatch["task_id"] != tid
-                or stored_worker.get("dispatch_id") != worker_dispatch["id"]
-                or stored_worker.get("task_id") != tid
-                or {key: value for key, value in stored_worker.items()
-                    if key not in ("task_id", "dispatch_id")} != result):
-            raise HarnessError("worker 返回产物与当前任务结果不一致；保留现场")
+        with stops.evidence_reads(source={"artifact": str(worker_artifact), "dispatch_id": worker_dispatch["id"],
+                                          "task_id": tid}):
+            raw_worker = worker_artifact.read_bytes()
+            stored_worker = json.loads(raw_worker)
+            if (not isinstance(stored_worker, dict) or worker_dispatch["role"] != "worker"
+                    or worker_dispatch["task_id"] != tid
+                    or stored_worker.get("dispatch_id") != worker_dispatch["id"]
+                    or stored_worker.get("task_id") != tid
+                    or {key: value for key, value in stored_worker.items()
+                        if key not in ("task_id", "dispatch_id")} != result):
+                raise HarnessError("worker 返回产物与当前任务结果不一致；保留现场")
         worker_source = {"worker_artifact": str(worker_artifact),
                          "worker_artifact_digest": hashlib.sha256(raw_worker).hexdigest()}
         if result["status"] == "blocked" and result.get("decision_requests"):
@@ -182,11 +198,11 @@ class TaskLifecycle(RuntimeService):
                 "artifact": str(worker_artifact), "artifact_digest": worker_source["worker_artifact_digest"]})
             return False
         if snapshot_digest(self.context.snapshot()) != candidate_digest:
-            raise HarnessError("worker candidate changed during handoff preparation")
+            raise HarnessError("worker candidate changed during handoff preparation", stop=stops.make("workspace_mismatch", "candidate_changed", source={"task_id": tid}))
         if result["status"] == "blocked":
             snapshot = self.context.snapshot()
             if snapshot_digest(snapshot) != candidate_digest:
-                raise HarnessError("worker candidate changed before blocker publication")
+                raise HarnessError("worker candidate changed before blocker publication", stop=stops.make("workspace_mismatch", "candidate_changed", source={"task_id": tid}))
             self.context.run["feedback"] = {"task_id": tid, "worker": result, "attempt": attempt,
                                        "snapshot_digest": snapshot_digest(snapshot), **worker_source}
             if result["blocker_kind"] == "continuation":
@@ -205,11 +221,8 @@ class TaskLifecycle(RuntimeService):
                 self.services.workflow.synchronize_decision_requests()
                 raise self.services.workflow.decision_required(self.services.workflow.task_decision_gate(tid))
             if result["blocker_kind"] != "task":
-                raise HarnessError(f"worker 环境受阻：{environment_blocker_excerpt(result)}。"
-                                   f"完整 worker 结果：{worker_artifact}（SHA256 {worker_source['worker_artifact_digest']}）。"
-                                   "若必要命令被拒绝，可在 permissions.worker_commands 追加精确 argv 后 resume；"
-                                   "环境事实有变化可使用 --environment-update FILE 记录补充说明与本地检查；"
-                                   "原尝试和派发预算仍保留。")
+                raise environment_blocked(result, tid, worker_dispatch["id"], worker_artifact,
+                                          worker_source["worker_artifact_digest"], invalid_output=False)
             return False
         self.context.run["pending_task"] = {"task_id": tid, "attempt": attempt, "stage": "verifying",
             "snapshot_digest": candidate_digest,
@@ -250,20 +263,17 @@ class TaskLifecycle(RuntimeService):
             self.services.workflow.synchronize_decision_requests()
             raise self.services.workflow.decision_required(self.services.workflow.task_decision_gate(tid))
         if route == "environment":
-            raise HarnessError(f"worker 环境受阻：{environment_blocker_excerpt(result)}。"
-                               f"完整 worker 结果：{artifact}（SHA256 {digest}）。"
-                               "若必要命令被拒绝，可在 permissions.worker_commands 追加精确 argv 后 resume；"
-                               "环境事实有变化可使用 --environment-update FILE 记录补充说明与本地检查；"
-                               "原尝试和派发预算仍保留。")
+            raise environment_blocked(result, tid, entry["id"], artifact, digest, invalid_output=True)
         return None
 
     def check_task_scope(self, task):
         runtime = self.context
         try:
-            return git.check_scope(self.context.worktree, task["allowed_paths"], binding=self.context.run["worktree_binding"])
+            return git.check_scope(self.context.worktree, task["allowed_paths"], binding=self.context.run["worktree_binding"],
+                                   task_id=task["id"])
         except HarnessError as error:
             raise HarnessError(f"{error}。工作树：{self.context.worktree}；请先核对并清理越界修改，再 resume。"
-                               "现场与证据已保留，本次预检不会派发 worker。") from error
+                               "现场与证据已保留，本次预检不会派发 worker。", stop=error.stop) from error
 
     def preserve_invalidated_reviews(self, pending, key):
         """Keep evidence when a changed candidate invalidates its pending gate."""
@@ -278,13 +288,14 @@ class TaskLifecycle(RuntimeService):
             try:
                 raw = artifact.read_bytes()
             except OSError as error:
+                stops.keep_local_io(error)
                 raise HarnessError("审阅原始结果缺失或无法读取；禁止通过候选变化丢弃证据") from error
             digest = hashlib.sha256(raw).hexdigest()
             if "artifact_digest" not in source:
                 source["artifact_digest"] = digest
                 self.context.save()
             if digest != source["artifact_digest"]:
-                raise HarnessError("审阅原始结果已改变；禁止通过候选变化丢弃证据")
+                raise HarnessError("审阅原始结果已改变；禁止通过候选变化丢弃证据", stop=stops.make("evidence", "runtime_integrity", source={"artifact": str(artifact)}))
             dispatch_id = source.get("dispatch_id", artifact.parent.name)
             if any(item.get("dispatch_id") == dispatch_id for item in history):
                 continue
@@ -327,7 +338,7 @@ class TaskLifecycle(RuntimeService):
         task = next(t for t in self.context.run["tasks"] if t["id"] == tid)
         self.context.ensure_exited()
         if git.head(self.context.worktree, binding=self.context.run["worktree_binding"]) != self.context.run["expected_head"]:
-            raise HarnessError("任务恢复前 HEAD 与检查点不同；保留现场")
+            raise HarnessError("任务恢复前 HEAD 与检查点不同；保留现场", stop=stops.make("workspace_mismatch", "head_changed", data={"expected_head": self.context.run["expected_head"]}, source={"task_id": tid}))
         paths = self.check_task_scope(task)
         key = f"reviewer:review:{tid}"
         snapshot = self.context.snapshot()
@@ -384,6 +395,8 @@ class TaskLifecycle(RuntimeService):
             write_json(snapshot_artifact, snapshot)
             try:
                 proposals = validate_proposals(pending["worker_result"].get("proposed_memories", []), self.context.worktree)
+            except EvidenceError:
+                raise  # an optional proposal is discarded locally; changed evidence is not
             except HarnessError as error:
                 proposals = []
                 self.context.event("memory_proposals_discarded", task_id=tid, reason=str(error))
@@ -393,7 +406,7 @@ class TaskLifecycle(RuntimeService):
         evidence = Path(pending["diff_artifact"])
         snapshot_artifact = Path(pending["snapshot_artifact"])
         reviewed_digest = pending["snapshot_digest"]
-        checks = read_json(Path(pending["verification"]))
+        checks = read_evidence_json(Path(pending["verification"]))
         proposals = pending["proposals"]
         prior_reviews = pending["prior_reviews"]
         if "required_findings" not in pending:
@@ -434,6 +447,8 @@ class TaskLifecycle(RuntimeService):
         if not diagnostics and review_approved(review):
             try:
                 self.context.memory.check_proposals(proposals, approved_keys)
+            except EvidenceError:
+                raise  # an optional proposal is discarded locally; changed evidence is not
             except HarnessError as error:
                 approved_keys = []
                 self.context.event("memory_proposals_discarded", task_id=tid, reason=str(error))
@@ -442,6 +457,7 @@ class TaskLifecycle(RuntimeService):
             return False
         return self.accept_pending()
 
+    @stops.reads_evidence
     def review_worker_message(self, pending):
         """The commit message a task review sees, read from the sealed original of this phase.
 
@@ -458,6 +474,7 @@ class TaskLifecycle(RuntimeService):
             raise HarnessError("worker 结果台账与原件不同；保留现场")
         return deepcopy(original["commit_message"])
 
+    @stops.reads_evidence
     def approved_worker_message(self, pending):
         """The commit message of the worker result that the approving review bound.
 
@@ -503,14 +520,14 @@ class TaskLifecycle(RuntimeService):
         run = self.context.run
         if (run.get(field) is not pending or pending["task_id"] in run["accepted"]
                 or any(destination in run for destination in destinations)):
-            raise HarnessError("任务阶段转换冲突；保留原阶段和证据")
+            raise HarnessError("任务阶段转换冲突；保留原阶段和证据", stop=stops.make("runtime_failure", "invariant"))
 
     def _finish_review(self, pending, record, paths, approved_keys, diagnostics):
         """Save review history and its successor phase together, before acceptance."""
         runtime = self.context
         self._require_handoff("pending_task", pending, "pending_acceptance", "pending_post_accept")
         if pending["stage"] != "reviewing":
-            raise HarnessError("任务必须完成验证后才能登记审阅结果")
+            raise HarnessError("任务必须完成验证后才能登记审阅结果", stop=stops.make("runtime_failure", "invariant"))
         tid, review = pending["task_id"], record["review"]
         approved = not diagnostics and review_approved(review)
         if approved:
@@ -578,7 +595,7 @@ class TaskLifecycle(RuntimeService):
             Memory.validate_record(**self.task_memory_record(task, pending, "0" * len(self.context.run["expected_head"]),
                                                              pending["files"])[0])
         except HarnessError as error:
-            raise HarnessError(f"任务记忆记录不合格；未提交：{error}") from error
+            raise HarnessError(f"任务记忆记录不合格；未提交：{error}", stop=stops.make("runtime_failure", "invariant")) from error
         message = self.approved_worker_message(pending)
         # The one candidate check: after those reads, before the checks of run
         # evidence and scope that lead to the commit. A changed candidate voids
@@ -596,7 +613,8 @@ class TaskLifecycle(RuntimeService):
             return False
         validate_dispatch_indexes(self.context.directory, self.context.run["dispatches"])
         validate_input_dispatch_indexes(self.context.directory, self.context.run["dispatches"])
-        paths = git.check_scope(self.context.worktree, task["allowed_paths"], binding=self.context.run["worktree_binding"])
+        paths = git.check_scope(self.context.worktree, task["allowed_paths"], binding=self.context.run["worktree_binding"],
+                                task_id=tid)
         validate_review_source(self.context.run, tid, pending, candidate_digest=pending["snapshot_digest"])
         commit = git.accept(self.context.worktree, paths, self.context.run["id"], tid, message,
                             binding=self.context.run["worktree_binding"])

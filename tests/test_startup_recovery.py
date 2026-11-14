@@ -7,7 +7,7 @@ from harness import git
 from harness.cleanup import cleanup_run
 from harness.util import HarnessError, read_json, write_json
 from test_engine_repairs import RecordingBackend
-from test_harness import ROOT, RepoCase
+from test_harness import ROOT, RepoCase, refused_by_cli, walk_notice_exit
 
 
 class StartupRecoveryTests(RepoCase):
@@ -113,8 +113,8 @@ class StartupRecoveryTests(RepoCase):
         self.assertEqual(result["status"], "awaiting_approval")
         self.assertFalse(result["plan_approved"])
         self.assert_registered(result, plan, backend)
-        with self.assertRaises(HarnessError):
-            self.engine(backend).resume(saved["id"])
+        again = self.engine(backend).resume(saved["id"])  # reported again, never approved
+        self.assertEqual((again["status"], again["stop"]["kind"]), ("awaiting_approval", "plan_approval"))
         self.assertEqual(backend.calls, [])
 
     def fail_plan_artifact(self, engine, plan=None):
@@ -192,15 +192,15 @@ class StartupRecoveryTests(RepoCase):
     def assert_unbound_resume_rejected(self, engine, backend):
         saved = self.saved(engine)
         with patch("harness.git.capture_worktree_binding", side_effect=AssertionError("must not infer a new binding")):
-            with self.assertRaises(HarnessError) as caught:
-                self.engine(backend).resume(saved["id"])
-        self.assertIn("abandon", str(caught.exception))
+            notice = refused_by_cli(self, backend, ["resume", saved["id"]], ("workspace_mismatch", "binding_missing"), 1)
+        self.assertEqual(notice["exits"], [f"abandon {saved['id']}"])
         self.assertEqual(self.saved(engine), saved)
         with self.assertRaisesRegex(HarnessError, "绑定"):
             cleanup_run(self.repo, saved["id"], remove=True)
         self.assertEqual(self.saved(engine), saved)
-        result = self.engine(backend).abandon(saved["id"])
-        self.assertEqual(result["status"], "abandoned")
+        # Row binding-missing: the listed exit, abandon.
+        result = walk_notice_exit(self, notice, ("workspace_mismatch", "binding_missing"), backend=backend,
+                                  directory=engine.directory, expect_status="abandoned")
         self.assertEqual(result["original_tasks"], saved["original_tasks"])
         self.assertEqual(backend.calls, [])
 

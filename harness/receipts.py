@@ -5,11 +5,11 @@ import hashlib
 import json
 from pathlib import Path
 
-from . import git
+from . import git, stops
 from .contracts import envelope, judge_review, review_schema, ScopeExtensionRequired, validate
 from .recovery import read_bound_bytes, read_bound_result, snapshot_digest
 from .services import RuntimeService
-from .util import HarnessError, read_json, strict_json_loads
+from .util import EvidenceError, HarnessError, read_json, strict_json_loads
 
 # Error text carried into the next request's previous_invalid and events; the
 # dispatch entry keeps the full text.
@@ -31,8 +31,8 @@ class InvalidOutput(HarnessError):
 class ScopeStop(HarnessError):
     """A revision whose only defect is new scope: recorded invalid, consumed, never redrawn."""
 
-    def __init__(self, entry, error):
-        super().__init__(str(error))
+    def __init__(self, entry, error, stop=None):
+        super().__init__(str(error), stop=stop)
         self.entry = entry
 
 
@@ -77,7 +77,7 @@ class ResultReceipts(RuntimeService):
                     self.validate_terminal_capture(receipt)
                     if ((marker.exists() or receipt.get("terminal_capture_digest") or self.terminal_capture_required(outcome))
                             and snapshot_digest(self.context.snapshot()) != receipt["snapshot_digest"]):
-                        raise HarnessError("终端结果的代码快照已变化；保留证据，禁止重新抽取结论")
+                        raise HarnessError("终端结果的代码快照已变化；保留证据，禁止重新抽取结论", stop=stops.make("workspace_mismatch", "candidate_changed"))
 
     def validate_terminal_capture(self, receipt):
         """Keep failed cleanup distinct from the captured terminal decision.
@@ -96,9 +96,20 @@ class ResultReceipts(RuntimeService):
                 job, self.context.config.role(entry["role"], self.context.commander)["cli"], outcome, terminal_only=True)
         if not marker.exists():
             if receipt.get("terminal_capture_digest") or self.terminal_capture_required(outcome):
-                raise HarnessError("终端结果的进程证据不完整；保留证据，禁止重新抽取结论")
+                raise HarnessError("终端结果的进程证据不完整；保留证据，禁止重新抽取结论",
+                                   stop=stops.make("evidence", "process_incomplete", data={"exit_unconfirmed": False},
+                                                   source={"dispatch_id": entry["id"]}))
             return
         self.context.ensure_exited()
+        with stops.evidence_reads(source={"artifact": str(marker), "dispatch_id": entry["id"]},
+                                  message="终端结果证据缺失或改变；保留证据，禁止重新抽取结论"):
+            digest = self._verified_terminal(entry, job, marker, receipt, outcome)
+        if "terminal_capture_digest" not in receipt:
+            receipt["terminal_capture_digest"] = digest
+            self.context.save()  # outside the evidence read: a failed save stays local I/O
+
+    def _verified_terminal(self, entry, job, marker, receipt, outcome):
+        """Read and check the terminal capture and its sources; returns the capture digest."""
         try:
             if marker.is_symlink() or not marker.is_file() or marker.parent.resolve() != marker.parent:
                 raise ValueError("unsafe terminal capture path")
@@ -123,12 +134,12 @@ class ResultReceipts(RuntimeService):
                     or type(original.get("exit_code")) is not int or original["exit_code"] != 0
                     or original.get("termination_reason") != "normal"
                     or original.get("errors") or original.get("cleanup_errors")):
-                raise ValueError("terminal process did not complete normally")
-        except (OSError, ValueError, TypeError, KeyError) as error:
-            raise HarnessError("终端结果证据缺失、改变或进程未正常完成；保留证据，禁止重新抽取结论") from error
-        if "terminal_capture_digest" not in receipt:
-            receipt["terminal_capture_digest"] = digest
-            self.context.save()
+                raise HarnessError("终端结果的进程未正常完成；保留证据，禁止重新抽取结论",
+                                   stop=stops.make("evidence", "process_incomplete", data={"exit_unconfirmed": False},
+                                                   source={"dispatch_id": entry["id"]}))
+        except (TypeError, KeyError) as error:  # malformed capture content: a content-check failure
+            raise ValueError(f"invalid terminal capture: {error!r}") from error
+        return digest
 
     def record_receipt_error(self, receipt, error):
         if receipt is None:
@@ -197,7 +208,7 @@ class ResultReceipts(RuntimeService):
         if key != f"{entry['role']}:{entry['kind']}:{entry['task_id']}" or entry["role"] != "commander":
             raise HarnessError("指挥结果的派发身份与接收记录不符")
         if snapshot_digest(receipt["request"]) != receipt["request_digest"]:
-            raise HarnessError("指挥原始请求已改变；保留证据，禁止重新抽取结论")
+            raise EvidenceError("指挥原始请求已改变；保留证据，禁止重新抽取结论", stop=stops.make("evidence", "runtime_integrity", source={"dispatch_id": entry["id"]}))
         artifact = Path(receipt["artifact"])
         raw, _ = read_bound_bytes(receipt, "指挥", bind=self.context.save)
         try:
@@ -210,12 +221,14 @@ class ResultReceipts(RuntimeService):
         asked = (isinstance(result, dict) and result.get("action") == "ask"
                  and result.get("task_id") == entry["task_id"] and result.get("dispatch_id") == entry["id"])
         if not asked and self.candidate_changed(receipt):
-            raise HarnessError("指挥期间或之后修改了代码/HEAD；原指挥结果不能用于当前快照")
+            raise HarnessError("指挥期间或之后修改了代码/HEAD；原指挥结果不能用于当前快照", stop=stops.make("workspace_mismatch", "candidate_changed", source={"dispatch_id": entry["id"]}))
         if asked:
             payload = {k: v for k, v in result.items() if k not in ("task_id", "dispatch_id")}
             try:
                 validate(result, contract)
                 self.services.planning.check_decision(payload, packet)
+            except EvidenceError:
+                raise  # changed runtime evidence is never a verdict on the model's output
             except HarnessError as error:
                 # The landing save records invalid_asked with this error.
                 return Decision(payload, veto=str(error), candidate_changed=self.candidate_changed(receipt))
@@ -229,7 +242,12 @@ class ResultReceipts(RuntimeService):
                            "核对后可用 resume RUN --allow-scope 'PATTERN' 授权；授权与否，普通 resume 都发起新的指挥决定；"
                            f"原件 {artifact}")
                 invalid = self.record_invalid(key, message, out_of_scope_paths=error.patterns)
-                raise ScopeStop(invalid.entry, message) from error
+                raise ScopeStop(invalid.entry, message, stop=stops.make(
+                    "scope_extension", "revision", data={"patterns": list(error.patterns)},
+                    source={"dispatch_id": entry["id"], "artifact": str(artifact),
+                            "artifact_digest": receipt.get("artifact_digest")})) from error
+            except EvidenceError:
+                raise  # changed runtime evidence is never a verdict on the model's output
             except HarnessError as error:
                 raise self.record_invalid(key, error) from error
         entry["status"] = "completed"
@@ -272,10 +290,10 @@ class ResultReceipts(RuntimeService):
             receipt["artifact_digest"] = digest
             self.context.save()
         if digest != receipt["artifact_digest"]:
-            raise HarnessError("审阅原始结果已改变；保留证据，禁止重新抽取结论")
+            raise EvidenceError("审阅原始结果已改变；保留证据，禁止重新抽取结论", stop=stops.make("evidence", "runtime_integrity", source={"dispatch_id": entry["id"], "artifact": receipt["artifact"]}))
         if (git.head(self.context.worktree, binding=self.context.run["worktree_binding"]) != self.context.run["expected_head"]
                 or snapshot_digest(self.context.snapshot()) != receipt["snapshot_digest"]):
-            raise HarnessError("审阅期间或之后修改了代码/HEAD；原审阅结果不能用于当前快照")
+            raise HarnessError("审阅期间或之后修改了代码/HEAD；原审阅结果不能用于当前快照", stop=stops.make("workspace_mismatch", "candidate_changed", source={"dispatch_id": entry["id"]}))
         self.context.ensure_exited()
         judgment = judge_review(result, envelope(schema, entry["task_id"], entry["id"]))
         if judgment.state == "invalid":

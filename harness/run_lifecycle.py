@@ -22,12 +22,13 @@ class RunLifecycle(RuntimeService):
     def start(self, goal, plan=None, *, pause_after_plan=False, step=False):
         runtime = self.context
         if not goal.strip():
-            raise HarnessError("目标不能为空")
+            raise HarnessError("目标不能为空", stop=stops.make("invalid_input", "cli_arguments", data={"option": "goal"}))
         untracked = git.check_starting_checkout(self.context.repo)
         if not self.context.config.data["verification"]["commands"]:
             raise HarnessError("请先配置目标项目的 verification.commands")
         git.reject_submodules(self.context.repo)
-        supplied_tasks = self.services.planning.validate_tasks(plan) if plan is not None else []
+        with stops.classify("invalid_input", "input_schema", data={"option": "--plan"}):
+            supplied_tasks = self.services.planning.validate_tasks(plan) if plan is not None else []
         validate_mcp(self.context.config)
         if untracked:
             print("[harness] 主检出存在未跟踪文件；保留原处，不进入隔离 worktree："
@@ -54,7 +55,7 @@ class RunLifecycle(RuntimeService):
         self.context.directory.mkdir(parents=True, exist_ok=True)
         self.context.save()
         self.announce("run_created")
-        with lock(self.context.directory / "run.lock"):
+        with lock(self.context.directory / "run.lock", stop=stops.make("busy", "run_lock")):
             try:
                 git.git(self.context.repo, "worktree", "add", "-b", self.context.run["branch"], str(worktree), "HEAD")
                 self.context.run["worktree_binding"] = git.capture_worktree_binding(worktree, self.context.run["branch"])
@@ -90,15 +91,38 @@ class RunLifecycle(RuntimeService):
                 warn(f"{event} 的观察步骤 {name} 失败，不影响运行：{error}")
 
     def load_run(self, ident):
-        runtime = self.context
+        """Load a run; a failure is classified by its own nature (spec 2.2), never as one blanket type."""
         if not ident.startswith("run_") or not ident[4:].isalnum():
-            raise HarnessError("无效 run ID")
-        # Version and identity are checked on a local value: binding the store
-        # reads id and store_revision and locks the directory that id names.
-        run = read_current_ledger(self.context.state / "runs" / ident / "state.json")
-        if run.get("id") != ident:
-            raise HarnessError("运行台账字段缺失或类型无效；保留原文件并核对证据")
-        self.context.run = run
+            raise HarnessError("无效 run ID", stop=stops.make("invalid_input", "cli_arguments", data={"option": "run_id"}))
+        path = self.context.state / "runs" / ident / "state.json"
+        try:
+            # Version and identity are checked on a local value: binding the store
+            # reads id and store_revision and locks the directory that id names.
+            with stops.evidence_reads(source={"artifact": str(path)}):
+                run = read_current_ledger(path)
+                if run.get("id") != ident:
+                    raise HarnessError("运行台账字段缺失或类型无效；保留原文件并核对证据")
+            self.context.run = run
+            if isinstance(run.get("repo"), str) and run["repo"] != str(self.context.repo):
+                raise HarnessError("Run 属于另一个项目",
+                                   stop=stops.make("invalid_input", "cli_arguments", data={"option": "repo"}))
+            self.load_checks()
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as error:
+            value = stops.load_failure(error)
+            if isinstance(error, HarnessError):
+                error.stop = value
+                raise
+            raise HarnessError(str(error) or type(error).__name__, stop=value) from error
+
+    def load_checks(self):
+        """The read-only checks load_run applies after reading the ledger; settling reruns them."""
+        with stops.evidence_reads():
+            self._load_checks()
+
+    def _load_checks(self):
+        runtime = self.context
         required = {"id": str, "repo": str, "worktree": str, "status": str, "commander": str,
                     "goal": str, "branch": str, "expected_head": str, "base_commit": str,
                     "config_snapshot": dict, "tasks": list, "original_tasks": list,
@@ -111,12 +135,10 @@ class RunLifecycle(RuntimeService):
                     "environment_updates": list, "environment_checks": list,
                     "decision_requests": list, "operator_decisions": list, "task_checkpoints": list, "checkpoint_batches": list,
                     "continuation_history": list, "execution_guidance": list, "store_revision": int}
-        if (self.context.run.get("id") != ident or any(type(self.context.run.get(k)) is not t for k, t in required.items())
+        if (any(type(self.context.run.get(k)) is not t for k, t in required.items())
                 or any(not isinstance(d, dict) for d in self.context.run["dispatches"])):
             raise HarnessError("运行台账字段缺失或类型无效；保留原文件并核对证据")
         self.validate_stop()
-        if self.context.run["repo"] != str(self.context.repo):
-            raise HarnessError("Run 属于另一个项目")
         if self.context.run['config_snapshot'] != normalized(self.context.run['config_snapshot']):
             raise HarnessError('运行配置快照字段缺失；当前协议不补写旧版本默认值')
         if ("workspace_inputs" not in self.context.run
@@ -131,10 +153,42 @@ class RunLifecycle(RuntimeService):
         self.services.progress.validate_checkpoint_links()
         continuation_packet(runtime)
 
+    def settle_stop(self, error, *, ident=None):
+        """Settle a stop before it is saved or leaves (spec 2.2): rerun the load checks.
+
+        A failure makes the load failure the final value, recording the stop it
+        replaces in ``superseded``; the final value is written back to the error.
+        Interrupts are not settled. Returns the final value (``stops.of``).
+        """
+        if isinstance(error, (KeyboardInterrupt, SystemExit)) or getattr(error, "_stop_settled", False):
+            return stops.of(error)
+        original = stops.of(error)
+        try:
+            if ident is None:
+                self.load_checks()      # the in-memory ledger the stop save is about to commit
+            else:
+                self.load_run(ident)    # what the next resume or abandon will load from disk
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as failure:
+            final = stops.load_failure(failure)
+            final["data"].pop("detail", None)
+            final["data"]["superseded"] = {"kind": original["kind"], "reason": original["reason"]}
+            try:
+                error.stop = final
+            except (AttributeError, TypeError):
+                pass
+        try:
+            error._stop_settled = True
+        except (AttributeError, TypeError):
+            pass
+        return stops.of(error)
+
     def validate_stop(self):
         """``stop`` exists exactly while the status is a stop, matches it, and is registered."""
         stops.validate_ledger(self.context.run)
 
+    @stops.reads_evidence
     def validate_recovery_links(self):
         """Reject inconsistent recovery links before any resumed side effects.
 
@@ -265,108 +319,156 @@ class RunLifecycle(RuntimeService):
     def abandon(self, ident, *, confirm_exited=()):
         """Mark an unfinished run abandoned; the worktree is removed only by cleanup-run."""
         self.load_run(ident)
-        with lock(self.context.directory / "run.lock"):
+        with lock(self.context.directory / "run.lock", stop=stops.make("busy", "run_lock")):
             # Reload under the lock so a concurrent completion cannot be lost.
             self.load_run(ident)
-            if self.context.run["status"] == "completed":
-                raise HarnessError("已完成的 run 不能标记为放弃")
-            self.context.confirm_exited(confirm_exited)
-            self.context.ensure_exited()
-            if self.context.run["status"] != "abandoned":
-                self.context.run["status"] = "abandoned"
-                self.context.run.pop("stop", None)
-                self.context.save()
-                self.context.checkpoint()
-                self.context.event("run_abandoned")
-            return self.context.run
+            try:
+                if self.context.run["status"] == "completed":
+                    raise HarnessError("已完成的 run 不能标记为放弃",
+                                       stop=stops.make("invalid_input", "run_state", data={"status": "completed"}))
+                self.context.confirm_exited(confirm_exited)
+                self.context.ensure_exited()
+                if self.context.run["status"] != "abandoned":
+                    self.context.run["status"] = "abandoned"
+                    self.context.run.pop("stop", None)
+                    self.context.save()
+                    self.context.checkpoint()
+                    self.context.event("run_abandoned")
+                return self.context.run
+            except BaseException as error:
+                # The operation boundary: a refusal after a successful load is settled once.
+                self.settle_stop(error, ident=ident)
+                raise
 
     def resume(self, ident, *, step=False, approve_plan=False, reverify=False, confirm_exited=(),
                allow_scope=(), environment_update=None, operator_decision=None,
                execution_guidance=None, reject_continuation=None):
         runtime = self.context
         self.load_run(ident)
-        with lock(self.context.directory / "run.lock"):
+        with lock(self.context.directory / "run.lock", stop=stops.make("busy", "run_lock")):
             self.load_run(ident)
-            if self.context.run["status"] == "abandoned":
-                raise HarnessError("该 run 已放弃；保留分支、工作树与证据，不能继续派发")
-            self.context.commander = self.context.run["commander"]
-            if self.context.run["status"] == "completed":
-                if confirm_exited or allow_scope or environment_update is not None or operator_decision is not None or execution_guidance is not None or reject_continuation is not None:
-                    raise HarnessError("恢复修改选项仅用于未完成的 run（含 --reject-continuation 与 --execution-guidance）")
-                return self.context.run
-            if reject_continuation is not None and (operator_decision is not None or environment_update is not None
-                    or execution_guidance is not None or reverify or allow_scope):
-                raise HarnessError("--reject-continuation 不能与决定、环境更新、执行指导、重验或扩展范围合用")
-            if execution_guidance is not None and (operator_decision is not None or environment_update is not None
-                    or reverify or allow_scope):
-                raise HarnessError("--execution-guidance 不能与决定、环境更新、重验或扩展范围合用")
-            if operator_decision is not None and (environment_update is not None or reverify or allow_scope):
-                raise HarnessError("--operator-decision 不能与环境更新、重验或扩展范围合用")
-            if environment_update is not None and (reverify or allow_scope):
-                raise HarnessError("--environment-update 不能与 --reverify 或 --allow-scope 合用")
-            # Checked before any write, including an exit confirmation: a returned
-            # decision is never discarded by re-verification.
-            if reverify and self.services.planning.decide_returned():
-                raise HarnessError("--reverify 不能用于已返回、尚未处理的指挥决定；先普通 resume")
-            self.context.reverify_requested = reverify
-            changes = self.context.config.resume_changes(self.context.run["config_snapshot"])
-            if self.context.run.get("asset_digest") != asset_digest(self.context.config):
-                raise HarnessError("共享规则、skills 或 MCP 已改变；请恢复原版本后继续")
-            self.services.environment.environment_context()
-            # The published plan is the authority: checked before any write of
-            # this resume, the audited exit confirmation included.
-            self.services.planning.verify_plan_authority()
-            self.context.confirm_exited(confirm_exited)
-            self.context.ensure_exited()
-            if not self.context.run["worktree_binding"]:
-                raise HarnessError("缺少已保存的 worktree Git 绑定，无法安全恢复；"
-                                   f"使用 abandon {ident} 保留证据后重新运行；"
-                                   "若工作树或分支已创建，请核对后手工清理")
-            validate_dispatch_indexes(self.context.directory, self.context.run["dispatches"])
-            validate_input_dispatch_indexes(self.context.directory, self.context.run["dispatches"])
-            # A returned ask lands on the common preconditions alone, before the
-            # HEAD gate below; the run then stops at the question.
             try:
-                self.services.planning.land_returned_ask()
-            except BaseException as error:
-                self.services.workflow.stop(error)
-                raise
-            if git.head(self.context.worktree, binding=self.context.run["worktree_binding"]) != self.context.run["expected_head"]:
-                raise HarnessError("worktree HEAD 与检查点不同；请先核对提交，不自动重放")
-            from .workspace_inputs import validate_inputs
-            validate_inputs(self.context.run, self.context.directory)
-            self.services.worker_receipts.validate_links()
-            self.services.receipts.validate_pending_terminal_captures()
-            update = self.services.environment.prepare_environment_update(environment_update) if environment_update is not None else None
-            decision_values, decisions = (self.services.decisions.prepare_operator_decisions(operator_decision)
-                                          if operator_decision is not None else ([], []))
-            if allow_scope:
-                self.services.planning.approve_scope_extensions(allow_scope)
-            self.services.decisions.record_operator_decisions(decisions)
-            if operator_decision is not None:
-                if any(value["decision"] == "stop" for value in decision_values):
-                    error = HarnessError("操作者决定停止；决定与原证据已保存，未派发模型")
+                def state(status):
+                    return stops.make("invalid_input", "run_state", data={"status": status})
+
+                def incompatible(*options):
+                    return stops.make("invalid_input", "incompatible_options", data={"options": list(options)})
+                if self.context.run["status"] == "abandoned":
+                    raise HarnessError("该 run 已放弃；保留分支、工作树与证据，不能继续派发", stop=state("abandoned"))
+                self.context.commander = self.context.run["commander"]
+                if self.context.run["status"] == "completed":
+                    if confirm_exited or allow_scope or environment_update is not None or operator_decision is not None or execution_guidance is not None or reject_continuation is not None:
+                        raise HarnessError("恢复修改选项仅用于未完成的 run（含 --reject-continuation 与 --execution-guidance）",
+                                           stop=state("completed"))
+                    return self.context.run
+                if reject_continuation is not None and (operator_decision is not None or environment_update is not None
+                        or execution_guidance is not None or reverify or allow_scope):
+                    raise HarnessError("--reject-continuation 不能与决定、环境更新、执行指导、重验或扩展范围合用",
+                                       stop=incompatible("--reject-continuation", "--operator-decision", "--environment-update",
+                                                         "--execution-guidance", "--reverify", "--allow-scope"))
+                if execution_guidance is not None and (operator_decision is not None or environment_update is not None
+                        or reverify or allow_scope):
+                    raise HarnessError("--execution-guidance 不能与决定、环境更新、重验或扩展范围合用",
+                                       stop=incompatible("--execution-guidance", "--operator-decision", "--environment-update",
+                                                         "--reverify", "--allow-scope"))
+                if operator_decision is not None and (environment_update is not None or allow_scope):
+                    raise HarnessError("--operator-decision 不能与环境更新或扩展范围合用",
+                                       stop=incompatible("--operator-decision", "--environment-update", "--allow-scope"))
+                if environment_update is not None and (reverify or allow_scope):
+                    raise HarnessError("--environment-update 不能与 --reverify 或 --allow-scope 合用",
+                                       stop=incompatible("--environment-update", "--reverify", "--allow-scope"))
+                # Checked before any write, including an exit confirmation: a returned
+                # decision is never discarded by re-verification.
+                if reverify and self.services.planning.decide_returned():
+                    raise HarnessError("--reverify 不能用于已返回、尚未处理的指挥决定；先普通 resume",
+                                       stop=state(self.context.run["status"]))
+                parsed_decisions = None
+                if operator_decision is not None:
+                    # Read and parse the whole batch once, before any write; every later
+                    # check, the prewrite and the registration use these same values.
+                    from .decisions import read_decision
+                    paths = [operator_decision] if isinstance(operator_decision, (str, Path)) else list(operator_decision)
+                    with stops.classify("invalid_input", "input_schema", data={"option": "--operator-decision"}):
+                        parsed_decisions = [read_decision(path) for path in paths]
+                    if reverify and any(value["decision"] == "stop" for value in parsed_decisions):
+                        # A stop answer ends this resume before re-verification could happen.
+                        raise HarnessError("--reverify 不能与 stop 答复合用",
+                                           stop=incompatible("--operator-decision(stop)", "--reverify"))
+                self.context.reverify_requested = reverify
+                with stops.classify("config_mismatch", "immutable_config"):
+                    changes = self.context.config.resume_changes(self.context.run["config_snapshot"])
+                if self.context.run.get("asset_digest") != asset_digest(self.context.config):
+                    raise HarnessError("共享规则、skills 或 MCP 已改变；请恢复原版本后继续", stop=stops.make("config_mismatch", "shared_assets"))
+                self.services.environment.environment_context()
+                # The published plan is the authority: checked before any write of
+                # this resume, the audited exit confirmation included.
+                self.services.planning.verify_plan_authority()
+                self.context.confirm_exited(confirm_exited)
+                self.context.ensure_exited()
+                if not self.context.run["worktree_binding"]:
+                    raise HarnessError("缺少已保存的 worktree Git 绑定，无法安全恢复；"
+                                       f"使用 abandon {ident} 保留证据后重新运行；"
+                                       "若工作树或分支已创建，请核对后手工清理", stop=stops.make("workspace_mismatch", "binding_missing"))
+                validate_dispatch_indexes(self.context.directory, self.context.run["dispatches"])
+                validate_input_dispatch_indexes(self.context.directory, self.context.run["dispatches"])
+                # A returned ask lands on the common preconditions alone, before the
+                # HEAD gate below; the run then stops at the question.
+                try:
+                    self.services.planning.land_returned_ask()
+                except BaseException as error:
                     self.services.workflow.stop(error)
-                    raise error
-            self.context.memory.repo = self.context.worktree
-            self.context.memory.binding = self.context.run["worktree_binding"]
-            if changes:
-                self.context.run["config_snapshot"] = deepcopy(self.context.config.data)
-                self.context.event("resume_config_relaxed", changes=changes)
-                self.context.save()
-            self.services.environment.record_environment_update(update)
-            if execution_guidance is not None:
-                record_execution_guidance(runtime, execution_guidance)
-            if reject_continuation is not None:
-                record_continuation_rejection(runtime, reject_continuation)
-            self.services.planning.report_command_requirements()
-            if self.context.run["tasks"] and self.context.run["plan_approval_required"] and not self.context.run["plan_approved"]:
-                if not approve_plan:
-                    raise HarnessError("计划等待明确批准；使用 resume --approve-plan 继续")
-                self.context.run["plan_approved"] = True
-                self.context.event("plan_approved")
-                self.context.save()
-            # Announce after resume() gates pass; earlier explicit audit writes
-            # survive rejection. Stops inside execute() still emit run_stopped.
-            self.announce("run_resumed")
-            return self.services.scheduler.execute(step=step)
+                    raise
+                if git.head(self.context.worktree, binding=self.context.run["worktree_binding"]) != self.context.run["expected_head"]:
+                    raise HarnessError("worktree HEAD 与检查点不同；请先核对提交，不自动重放", stop=stops.make("workspace_mismatch", "head_changed", data={"expected_head": self.context.run["expected_head"]}))
+                from .workspace_inputs import validate_inputs
+                validate_inputs(self.context.run, self.context.directory)
+                self.services.worker_receipts.validate_links()
+                with stops.classify("invalid_input", "input_schema", data={"option": "--environment-update"}):
+                    update = (self.services.environment.prepare_environment_update(environment_update)
+                              if environment_update is not None else None)
+                decision_values, decisions = (self.services.decisions.prepare_operator_decisions(
+                                                  operator_decision, values=parsed_decisions)
+                                              if operator_decision is not None else ([], []))
+                # After the answers and the environment update are prepared: a rejected
+                # input never follows this possible digest save.
+                self.services.receipts.validate_pending_terminal_captures()
+                if allow_scope:
+                    self.services.planning.approve_scope_extensions(allow_scope)
+                self.services.decisions.record_operator_decisions(decisions)
+                if operator_decision is not None:
+                    stopped = next((value for value in decision_values if value["decision"] == "stop"), None)
+                    if stopped is not None:
+                        request = next(item for item in self.context.run["decision_requests"]
+                                       if item["id"] == stopped["request_id"])
+                        error = HarnessError("操作者决定停止；决定与原证据已保存，未派发模型",
+                                             stop=self.services.workflow.operator_stopped(request))
+                        self.services.workflow.stop(error)
+                        raise error
+                self.context.memory.repo = self.context.worktree
+                self.context.memory.binding = self.context.run["worktree_binding"]
+                if changes:
+                    self.context.run["config_snapshot"] = deepcopy(self.context.config.data)
+                    self.context.event("resume_config_relaxed", changes=changes)
+                    self.context.save()
+                self.services.environment.record_environment_update(update)
+                if execution_guidance is not None:
+                    record_execution_guidance(runtime, execution_guidance)
+                if reject_continuation is not None:
+                    record_continuation_rejection(runtime, reject_continuation)
+                self.services.planning.report_command_requirements()
+                if self.context.run["tasks"] and self.context.run["plan_approval_required"] and not self.context.run["plan_approved"]:
+                    if not approve_plan and self.context.run["status"] == "awaiting_approval":
+                        # Reported again, unchanged: the plan still waits for an explicit approval.
+                        return self.context.run
+                    if approve_plan:
+                        self.context.run["plan_approved"] = True
+                        self.context.event("plan_approved")
+                        self.context.save()
+                # Announce after resume() gates pass; earlier explicit audit writes
+                # survive rejection. Stops inside execute() still emit run_stopped.
+                self.announce("run_resumed")
+                return self.services.scheduler.execute(step=step)
+            except BaseException as error:
+                # The operation boundary: a refusal after a successful load is settled once.
+                self.settle_stop(error, ident=ident)
+                raise

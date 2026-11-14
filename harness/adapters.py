@@ -10,6 +10,7 @@ import time
 from copy import deepcopy
 from pathlib import Path
 
+from . import stops
 from .command_server import create_manifest
 from .shared import mcp_configs, toml_value
 from .util import HarnessError, dump, read_json, run_process, strict_json_loads, tail, write_json
@@ -289,7 +290,7 @@ class CLIBackend:
             # invocation. Only use it unchanged; never write or replace it here.
             if (contract.is_symlink() or not contract.is_file()
                     or contract.read_bytes() != (dump(schema) + "\n").encode("utf-8")):
-                raise HarnessError(f"worker 契约文件缺失或与本次调用不符；保留现场：{contract}")
+                raise HarnessError(f"worker 契约文件缺失或与本次调用不符；保留现场：{contract}", stop=stops.make("evidence", "runtime_integrity", source={"artifact": str(contract), "dispatch_id": Path(job).name}))
         else:
             write_json(contract, schema)
         (job / "prompt.txt").write_text(prompt, encoding="utf-8")
@@ -303,7 +304,7 @@ class CLIBackend:
         env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] = "1"
         remaining = parent_deadline - time.monotonic()
         if remaining <= 0:
-            raise HarnessError("Agent budget exhausted before CLI startup")
+            raise HarnessError("Agent budget exhausted before CLI startup", stop=stops.make("budget", "agent_timeout", data={"role": role, "config_key": "runtime.agent_timeout_seconds", "limit_seconds": self.config.data["runtime"]["agent_timeout_seconds"]}, source={"dispatch_id": Path(job).name, **({"task_id": task["id"]} if task else {})}))
         observed_outcome = None
         def record_outcome(value):
             nonlocal observed_outcome
@@ -381,6 +382,7 @@ class CLIBackend:
             try:
                 value = strict_json_loads(path.read_bytes())
             except OSError as e:
+                stops.keep_local_io(e)
                 raise HarnessError(f"Codex 结构化结果无法读取；日志：{path}") from e
             except (ValueError, UnicodeError, RecursionError) as e:
                 raise UndecodableOutput(path, f"Codex 结构化结果不能严格解码（{type(e).__name__}）；日志：{path}") from e
@@ -391,6 +393,7 @@ class CLIBackend:
         try:
             raw = path.read_bytes()
         except OSError as e:
+            stops.keep_local_io(e)
             raise HarnessError(f"Claude 未返回有效 JSON；日志：{path}") from e
         kind, envelope, value, detail = decode_terminal(raw)
         if isinstance(envelope, dict):
@@ -411,6 +414,7 @@ class CLIBackend:
         try:
             value = strict_json_loads(path.read_bytes())
         except (OSError, ValueError, UnicodeError, RecursionError) as e:
+            stops.keep_local_io(e)
             raise HarnessError(f"{provider} 未返回有效 JSON；日志：{path}") from e
         if not isinstance(value, dict):
             raise HarnessError(f"{provider} 结果必须为 JSON 对象；日志：{path}")

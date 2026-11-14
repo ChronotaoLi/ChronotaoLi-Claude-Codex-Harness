@@ -182,6 +182,224 @@ class ExitReportingBackend(DemoBackend):
         return result
 
 
+# ---- exit-table rows (spec 14.3): a stop, the exit its projection lists, the next state -----
+# A row test binds itself to its row by calling one of these with the row's (kind, reason);
+# the exit-table guard (G8, test_stop_guards) checks the binding with the AST.
+def run_cli(case, backend, argv):
+    """The real CLI path with a scripted backend; returns (code, stderr text).
+
+    Only ``cli.Runtime`` (to pass the backend) and ``cli.Config.load`` (the case's
+    configuration) are replaced; the parser, ``operate()`` and the operation record are real.
+    """
+    import contextlib
+    import io
+    import signal
+    from types import SimpleNamespace
+    from unittest.mock import patch
+    from harness import cli
+    runtime = lambda config, repo, **kwargs: Runtime(config, repo, backend=backend, **kwargs)
+    errors = io.StringIO()
+    previous = signal.getsignal(signal.SIGTERM)
+    try:
+        with patch.object(cli, "Runtime", runtime), \
+                patch.object(cli, "Config", SimpleNamespace(load=lambda path: case.config)), \
+                patch("harness.operations.probe_cli", return_value={"path": None, "version": None}), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(errors):
+            code = cli.main(["--repo", str(case.repo), *argv])
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+    return code, errors.getvalue()
+
+
+def cli_notice(errors):
+    """The last ``[harness-json]`` stop line of a CLI call's stderr."""
+    lines = [line for line in errors.splitlines() if line.startswith("[harness-json] ")]
+    body = json.loads(lines[-1].split(" ", 1)[1]) if lines else {}
+    return body.get("stop")
+
+
+def run_exit(case, text, *, backend, directory, expect_status, expect_code, fill):
+    import shlex
+    for placeholder, value in (fill or {}).items():
+        text = text.replace(placeholder, str(value))
+    code, errors = run_cli(case, backend, shlex.split(text))
+    case.assertEqual(code, expect_code, text + "\n" + errors)
+    after = read_json(Path(directory) / "state.json")
+    case.assertEqual(after["status"], expect_status, text + "\n" + errors)
+    return after
+
+
+def walk_exit(case, directory, row, *, backend, expect_status, expect_code=0, choose=0, fill=None):
+    """Assert the saved stop is ``row``, execute its listed exit number ``choose``, assert the next state.
+
+    The exit text comes from the ledger's projection, so an exit removed from the
+    registry, or changed to one that does not reach the next state, fails here.
+    """
+    from harness import stops
+    saved = read_json(Path(directory) / "state.json")
+    case.assertEqual((saved["stop"]["kind"], saved["stop"]["reason"]), tuple(row))
+    exits = stops.project_ledger(saved)["exits"]
+    case.assertTrue(len(exits) > choose, f"{row} lists no exit number {choose}: {exits}")
+    return run_exit(case, exits[choose], backend=backend, directory=directory, expect_status=expect_status,
+                    expect_code=expect_code, fill=fill)
+
+
+def refused_by_cli(case, backend, argv, row, code):
+    """An operation refusal through the real CLI: its exit code and stderr projection; returns the projection."""
+    result, errors = run_cli(case, backend, argv)
+    notice = cli_notice(errors)
+    case.assertIsNotNone(notice, errors)
+    case.assertEqual((result, notice["kind"], notice["reason"]), (code, *row), errors)
+    return notice
+
+
+def walk_notice_exit(case, notice, row, *, backend, directory, expect_status, expect_code=0, choose=0, fill=None):
+    """Execute exit number ``choose`` of a refusal's projection (stderr, operation record); assert the next state."""
+    case.assertEqual((notice["kind"], notice["reason"]), tuple(row))
+    case.assertTrue(len(notice["exits"]) > choose, f"{row} lists no exit number {choose}: {notice['exits']}")
+    return run_exit(case, notice["exits"][choose], backend=backend, directory=directory,
+                    expect_status=expect_status, expect_code=expect_code, fill=fill)
+
+
+def no_command_exit(case, value, row):
+    """A row without a command exit: the projection names ``row`` and lists nothing to run."""
+    from harness import stops
+    case.assertEqual((value["kind"], value["reason"]), tuple(row))
+    case.assertEqual(value["exits"], [])
+    case.assertEqual(value["exit_code"], stops.REGISTRY[tuple(row)]["exit_code"])
+    return value
+
+
+def continues_without_stop(case, directory, *, events_from=0):
+    """A non-stop row: the run never saved a stop and no ``run_stopped`` event was written."""
+    path = Path(directory)
+    saved = read_json(path / "state.json")
+    case.assertNotIn("stop", saved)
+    lines = (path / "events.jsonl").read_text().splitlines()[events_from:]
+    case.assertNotIn("run_stopped", [json.loads(line)["event"] for line in lines])
+    return saved
+
+
+# ---- stop guards (spec 14.4, G7 and G10), installed on every RepoCase ---------------------
+TESTS_DIR = Path(__file__).resolve().parent
+
+
+def injected(error):
+    """Whether the exception was raised by test code (a patched function), not by the runtime."""
+    tb = error.__traceback__
+    last = None
+    while tb is not None:
+        last = tb.tb_frame.f_code.co_filename
+        tb = tb.tb_next
+    if last is None:
+        return False
+    path = Path(last).resolve()
+    # A patched side_effect raises inside unittest.mock: test machinery, not the runtime.
+    return path.is_relative_to(TESTS_DIR) or (path.name == "mock.py" and path.parent.name == "unittest")
+
+
+def install_stop_guards(case):
+    """G7: no runtime stop is unclassified. G10: a stop's listed exits are not blocked by the load checks.
+
+    G7 wraps Workflow.stop and the resume/abandon/start operations; an
+    ``unclassified`` stop whose innermost frame is in the runtime (or the standard
+    library) fails the test, unless the class sets ``allow_unclassified``. G10, after
+    every saved stop, loads the run with a fresh Runtime: listed ``resume``/``abandon``
+    exits imply the load passes, ``load_integrity`` implies it is refused. In
+    ``addCleanup`` (after the body and tearDown, before the temporary directory is
+    removed), if the run still holds that saved stop, the first listed ``abandon``
+    exit is executed on the original fixture. Stops the test continued past are
+    skipped; operation refusals and CLI projections are guarded elsewhere.
+    """
+    import shlex
+    from unittest.mock import patch
+    from harness import stops
+    from harness.workflow import Workflow
+    unclassified, mismatches, seen = [], [], {}
+    original_stop = Workflow.stop
+
+    def note(error):
+        value = stops.of(error)
+        if value["kind"] == "unclassified" and not injected(error):
+            tb, where = error.__traceback__, None
+            while tb is not None:
+                where = f"{tb.tb_frame.f_code.co_filename}:{tb.tb_lineno}"
+                tb = tb.tb_next
+            unclassified.append((value["reason"], type(error).__name__, str(error)[:160], where))
+
+    def stop(workflow, error):
+        result = original_stop(workflow, error)
+        note(error)
+        run = workflow.context.run
+        value = run.get("stop") or {}
+        path = workflow.context.directory / "state.json"
+        if value.get("kind") and path.exists():
+            try:
+                Runtime(case.config, case.repo, backend=DemoBackend()).load_run(run["id"])
+                loads = True
+            except HarnessError:
+                loads = False
+            exits = stops.project(value, run["id"])["exits"]
+            if not loads and any(text.split()[0] in ("resume", "abandon") for text in exits):
+                mismatches.append(("exit listed but the load fails", value["kind"], value["reason"]))
+            if value["reason"] == "load_integrity" and loads:
+                mismatches.append(("load_integrity but the load passes", value["kind"], value["reason"]))
+            seen[run["id"]] = (value, path.read_bytes(), workflow.context.directory, case.config, case.repo)
+        return result
+
+    def operation(name):
+        original = getattr(Runtime, name)
+
+        def wrapped(runtime, *args, **kwargs):
+            try:
+                return original(runtime, *args, **kwargs)
+            except BaseException as error:
+                note(error)
+                raise
+        return wrapped
+
+    def walk_abandon():
+        for run_id, (value, saved, directory, config, repo) in seen.items():
+            state = directory / "state.json"
+            if not state.exists() or state.read_bytes() != saved:
+                continue
+            listed = [shlex.split(text) for text in stops.project(value, run_id)["exits"] if text.startswith("abandon ")]
+            runtime = Runtime(config, repo, backend=DemoBackend())
+            if listed:
+                try:
+                    runtime.load_run(run_id)
+                except HarnessError:
+                    continue  # the test changed evidence after the stop; settling held when it was saved
+            if not listed:
+                if value["reason"] == "load_integrity":
+                    try:
+                        runtime.abandon(run_id)
+                        mismatches.append(("abandon of load_integrity succeeded", value["kind"], value["reason"]))
+                    except HarnessError:
+                        pass
+                continue
+            words = listed[0]
+            confirmed = tuple(words[i + 1] for i, word in enumerate(words) if word == "--confirm-exited")
+            try:
+                status = runtime.abandon(run_id, confirm_exited=confirmed)["status"]
+            except HarnessError as error:
+                status = str(error)[:160]
+            if status != "abandoned":
+                mismatches.append(("listed abandon failed", value["kind"], value["reason"], " ".join(words), status))
+
+    patches = [patch.object(Workflow, "stop", stop)] + [
+        patch.object(Runtime, name, operation(name)) for name in ("start", "resume", "abandon")]
+    for item in patches:
+        item.start()
+    case.addCleanup(lambda: case.assertEqual(
+        [] if getattr(case, "allow_unclassified", False) else unclassified, [], "G7: unclassified stops"))
+    case.addCleanup(lambda: case.assertEqual(mismatches, [], "G10: exits blocked by the load checks"))
+    case.addCleanup(walk_abandon)
+    for item in patches:
+        case.addCleanup(item.stop)
+
+
+
 class RepoCase(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -194,6 +412,7 @@ class RepoCase(unittest.TestCase):
         git.git(self.repo, "-c", "user.name=Test", "-c", "user.email=test@localhost", "-c", "commit.gpgsign=false", "commit", "-m", "fixture")
         self.config = Config.load(ROOT / "harness.toml")
         self.config.data["verification"]["commands"] = [[sys.executable, "-m", "unittest", "-v"]]
+        install_stop_guards(self)
 
     def engine(self, backend=None):
         return Runtime(self.config, self.repo, backend=backend or DemoBackend())
@@ -472,6 +691,14 @@ class RuntimeTests(RepoCase):
         self.config.data["roles"]["reviewer"]["model"] = "changed-model"
         with self.assertRaisesRegex(HarnessError, "配置已改变"):
             self.engine().resume(engine.run["id"])
+        # Row config-changed: refused before any write (2); restoring the value, the listed resume works.
+        before = (engine.directory / "state.json").read_bytes()
+        notice = refused_by_cli(self, DemoBackend(), ["resume", engine.run["id"]],
+                                ("config_mismatch", "immutable_config"), 2)
+        self.assertEqual((engine.directory / "state.json").read_bytes(), before)
+        self.config.data["roles"]["reviewer"]["model"] = engine.run["config_snapshot"]["roles"]["reviewer"]["model"]
+        walk_notice_exit(self, notice, ("config_mismatch", "immutable_config"), backend=DemoBackend(),
+                         directory=engine.directory, expect_status="awaiting_approval")
 
 
 class IntegrationTests(RepoCase):

@@ -8,7 +8,7 @@ from harness import git
 from harness.cleanup import cleanup_run
 from harness.memory import Memory, validate_proposals
 from harness.util import HarnessError, read_json, write_json
-from test_harness import ROOT, RepoCase, after_save
+from test_harness import ROOT, RepoCase, after_save, walk_exit
 from test_runtime_changes import ScriptedBackend
 
 
@@ -200,7 +200,9 @@ class EngineWorktreeBindingTests(RepoCase):
         self.assertFalse((self.repo / "hello.py").exists())
         with self.assertRaisesRegex(HarnessError, "绑定"):
             self.engine(backend).resume(engine.run["id"])
-        self.assertEqual(self.engine(backend).abandon(engine.run["id"])["status"], "abandoned")
+        # Row binding-changed: the listed exit, abandon.
+        walk_exit(self, engine.directory, ("workspace_mismatch", "binding_changed"), backend=backend,
+                  expect_status="abandoned")
         removal = cleanup_run(self.repo, engine.run["id"], remove=True)["worktree"]
         self.assertEqual(removal["status"], "blocked")
         self.assertIn("绑定", removal["error"])

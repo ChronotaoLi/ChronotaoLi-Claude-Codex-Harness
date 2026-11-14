@@ -7,7 +7,7 @@ from unittest.mock import patch
 from harness import git
 from harness.util import HarnessError, read_json, write_json
 import harness.worker_receipts as worker_receipts_module
-from test_harness import ROOT, RepoCase
+from test_harness import ROOT, RepoCase, walk_exit
 from test_runtime_changes import ScriptedBackend, finding, revised, trigger_kind
 
 
@@ -341,8 +341,9 @@ class DescriptionReplanTests(RepoCase):
                     (engine.worktree / "hello.py").write_text(STAGED)
                     git.git(engine.worktree, "add", "hello.py")
                     (engine.worktree / "hello.py").write_text(CANDIDATE)
-                result = self.engine(backend).resume(engine.run["id"])
-                self.assertEqual(result["status"], "completed")
+                # Row candidate-changed: the listed plain resume after the restore.
+                walk_exit(self, engine.directory, ("workspace_mismatch", "candidate_changed"), backend=backend,
+                          expect_status="completed")
 
     def test_new_prerequisite_still_archives_candidate_before_other_task(self):
         backend = DescriptionBackend(self, prerequisite=True)

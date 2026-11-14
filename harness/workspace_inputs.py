@@ -13,7 +13,7 @@ import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from .versions import require_current_ledger
-from . import git
+from . import git, stops
 from .cleanup import _canonical, _regular_bytes
 from .path_evidence import validate_dispatch_indexes
 from .input_projection import validate_dispatch_indexes as validate_input_dispatch_indexes
@@ -26,8 +26,8 @@ _RESERVED = {'.git', '.harness', '.codex', '.claude', 'agents.md', 'claude.md'}
 _PENDING = ('pending_task', 'pending_acceptance', 'pending_post_accept',
             'pending_revision', 'pending_directive', 'worker_recovery', 'worker_receipts')
 
-def _fail(message):
-    raise HarnessError('workspace inputs: ' + message)
+def _fail(message, stop=None):
+    raise HarnessError('workspace inputs: ' + message, stop=stop)
 
 def _relative(value):
     if (not isinstance(value, str) or not value or '\\' in value or '\x00' in value
@@ -94,13 +94,14 @@ def _gate(run, directory, *, terminal=False):
         _canonical(p)
     if (directory != repo / '.harness' / 'runs' / run['id']
             or checkout != repo / '.harness' / 'worktrees' / run['id']):
-        _fail('run path binding mismatch')
+        _fail('run path binding mismatch', stops.make('workspace_mismatch', 'binding_changed'))
     if terminal:
         if run.get('status') not in ('completed', 'abandoned'):
             _fail('cleanup requires terminal run')
     elif (run.get('status') not in ('awaiting_approval', 'paused')
           or any(run.get(k) for k in _PENDING)):
-        _fail('prepare requires paused/awaiting_approval with no pending stage')
+        _fail('prepare requires paused/awaiting_approval with no pending stage',
+              stops.make('invalid_input', 'run_state', data={'status': str(run.get('status'))}))
     validate_command_directories(run['dispatches'], directory)
     validate_dispatch_indexes(directory, run['dispatches'])
     validate_input_dispatch_indexes(directory, run['dispatches'])
@@ -108,7 +109,7 @@ def _gate(run, directory, *, terminal=False):
     ensure_dispatches_exited(run['dispatches'], observe=group_alive)
     git.check_worktree_binding(checkout, run['worktree_binding'])
     if git.head(checkout, binding=run['worktree_binding']) != run['expected_head']:
-        _fail('HEAD changed')
+        _fail('HEAD changed', stops.make('workspace_mismatch', 'head_changed', data={'expected_head': run['expected_head']}))
     git.check_worktree_state(checkout, binding=run['worktree_binding'])
     return git.snapshot(checkout, binding=run['worktree_binding'])
 
@@ -179,6 +180,7 @@ def _registered(run, directory):
         _fail('input journal binding invalid')
     return manifest, journal
 
+@stops.reads_evidence
 def validate_inputs(run, directory, *, allow_removed=False):
     """Read-only gate, called on resume and after local preparation, before the worker is counted."""
     directory = Path(directory)
@@ -198,22 +200,24 @@ def prepare_run(repo, ident, manifest):
     """Prepare explicitly declared files. Acquires the run lock itself."""
     repo = git.repository(Path(repo))
     if not ident.startswith('run_') or not ident[4:].isalnum():
-        _fail('invalid run ID')
+        _fail('invalid run ID', stops.make('invalid_input', 'cli_arguments', data={'option': 'run_id'}))
     directory = repo / '.harness' / 'runs' / ident
     _canonical(directory)
     _canonical(directory / 'run.lock')
     from .private_state import ensure_private_state
     ensure_private_state(repo)
-    with lock(directory / 'run.lock'):
+    with lock(directory / 'run.lock', stop=stops.make('busy', 'run_lock')):
         run = _read(directory / 'state.json')
         require_current_ledger(run)
         if run.get('id') != ident or run.get('repo') != str(repo):
-            _fail('run ledger does not belong to this repository')
+            _fail('run ledger does not belong to this repository',
+                  stops.make('invalid_input', 'cli_arguments', data={'option': 'run_id'}))
         store = RunStore(repo / '.harness')
         store.attach(run)
         before = _gate(run, directory)
-        value = _read(Path(manifest).absolute()) if isinstance(manifest, (str, Path)) else manifest
-        value = _manifest(run, value)
+        with stops.classify('invalid_input', 'input_schema', data={'option': 'manifest'}):
+            value = _read(Path(manifest).absolute()) if isinstance(manifest, (str, Path)) else manifest
+            value = _manifest(run, value)
         frozen, journal = _registered(run, directory)
         journal_path = directory / 'workspace-inputs.json'
         if frozen is None:

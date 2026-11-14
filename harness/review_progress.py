@@ -8,7 +8,8 @@ the dispatch, so a model never writes an identity the runtime already owns.
 from copy import deepcopy
 from pathlib import PurePosixPath
 
-from .util import HarnessError
+from . import stops
+from .util import EvidenceError, HarnessError
 
 
 def dispositions_usable(record):
@@ -29,6 +30,7 @@ def _keyed(issues):
     return [{"key": f"f{number}", **row} for number, row in enumerate(issues.values(), 1)]
 
 
+@stops.reads_evidence
 def required_findings(run, task_id, candidate_digest, *, whole_run=False, records=None):
     """Open blocking findings for one candidate, keyed f1..fN in history order.
 
@@ -60,10 +62,11 @@ def required_findings(run, task_id, candidate_digest, *, whole_run=False, record
         for reference in closed:
             issues.pop(reference, None)
     if len(issues) > 60:
-        raise HarnessError("待核验阻断问题超过单次审阅容量；保留全部来源，需调整任务计划")
+        raise HarnessError("待核验阻断问题超过单次审阅容量；保留全部来源，需调整任务计划", stop=stops.make("budget", "review_findings", data={"open_findings": len(issues), "limit": 60}, source={"task_id": task_id}))
     return _keyed(issues)
 
 
+@stops.reads_evidence
 def delivered_worker_findings(context, task_id, dispatch_id):
     """The required findings one worker dispatch received, read from its published packet.json.
 
@@ -111,7 +114,7 @@ def delivered_worker_findings(context, task_id, dispatch_id):
             result.append({"key": row["key"], **original})
         return result
     except (HarnessError, ValueError, KeyError, TypeError, AttributeError) as error:
-        raise HarnessError("worker 实际交付的必需问题证据损坏；保留证据，禁止推断清单") from error
+        raise EvidenceError("worker 实际交付的必需问题证据损坏；保留证据，禁止推断清单", stop=stops.make("evidence", "runtime_integrity")) from error
 
 
 def claim_gaps(result, delivered, snapshot):
@@ -152,6 +155,7 @@ def claims_for_review(required, delivered, claims):
     return result
 
 
+@stops.reads_evidence
 def validate_review_source(run, task_id, record, *, kind="review", candidate_digest=None):
     """Authenticate the original returned body before trusting ledger copies."""
     from pathlib import Path

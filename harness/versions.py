@@ -22,11 +22,21 @@ def unsupported_ledger(run):
 def require_current_ledger(run):
     message = unsupported_ledger(run)
     if message is not None:
-        raise HarnessError(message)
+        from . import stops
+        version = run.get("schema_version") if isinstance(run, dict) else None
+        data = {"supported": RUN_SCHEMA_VERSION}
+        if type(version) is int and version >= 0:
+            data["schema_version"] = version
+        raise HarnessError(message, stop=stops.make("unsupported_ledger", "ledger_version", data=data))
 
 
 def read_current_ledger(path):
     """Read a run ledger file; refuse any other version before a field is interpreted."""
-    run = read_json(path)
+    from . import stops
+    try:
+        run = read_json(path)
+    except FileNotFoundError as error:
+        raise HarnessError(f"run 不存在：{path}",
+                           stop=stops.make("invalid_input", "cli_arguments", data={"option": "run_id"})) from error
     require_current_ledger(run)
     return run

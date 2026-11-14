@@ -3,6 +3,7 @@ import hashlib
 import json
 from pathlib import Path
 
+from . import stops
 from .util import HarnessError, dump
 
 
@@ -143,6 +144,7 @@ def review_view(review):
     return {key: deepcopy(value) for key, value in review.items() if key not in REVIEW_OPTIONAL}
 
 
+@stops.reads_evidence
 def compact_worker(worker, artifact, budget=WORKER_CONTEXT_CHARS, *, digest=None):
     """Bound worker feedback, retaining retrieval and the actual blocker decision.
 
@@ -158,6 +160,7 @@ def compact_worker(worker, artifact, budget=WORKER_CONTEXT_CHARS, *, digest=None
     try:
         raw = Path(artifact).read_bytes()
     except OSError as error:
+        stops.keep_local_io(error)
         raise HarnessError("worker 完整反馈产物缺失或无法读取；不能仅凭摘录继续") from error
     if hashlib.sha256(raw).hexdigest() != digest:
         raise HarnessError("worker 完整反馈产物已改变；不能仅凭摘录继续")
@@ -349,8 +352,13 @@ def compact_feedback(feedback, prior_reviews=()):
 class ContextCapacityError(HarnessError):
     """A failed preparation with a content-free, exact size diagnostic."""
     def __init__(self, report):
+        from . import stops
         self.report = report
-        super().__init__(f"任务必要上下文 {report['required_chars']} 字符超过预算 {report['budget_chars']}；提高 context_chars 后普通 resume；无法提高时保留现场后 abandon，用拆小任务的计划另开新 run")
+        super().__init__(f"任务必要上下文 {report['required_chars']} 字符超过预算 {report['budget_chars']}；"
+                         "提高 context_chars 后普通 resume；无法提高时保留现场后 abandon，用拆小任务的计划另开新 run",
+                         stop=stops.make("budget", "context_capacity", data={
+                             "config_key": "runtime.context_chars", "required_chars": report["required_chars"],
+                             "budget_chars": report["budget_chars"], "scope": "dispatch"}))
 
 
 def field_size_report(value):

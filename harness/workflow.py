@@ -8,13 +8,36 @@ from .services import RuntimeService
 
 class Workflow(RuntimeService):
     def stop(self, error):
-        """Save the status and its stop value in one commit, then report the projection."""
+        """Save the status and its settled stop value in one commit, then report the projection.
+
+        A non-interrupt stop is settled first (spec 2.2): the load checks run on the
+        ledger about to be saved, and a load failure becomes the final value, written
+        back to ``error`` so every later view shows the same stop.
+        """
+        interrupted = isinstance(error, (KeyboardInterrupt, SystemExit))
         value = stops.of(error)
-        self.context.run["status"] = "interrupted" if isinstance(error, (KeyboardInterrupt, SystemExit)) else "blocked"
+        self.context.run["status"] = "interrupted" if interrupted else "blocked"
+        if interrupted:
+            value["data"]["exits_confirmed"] = self.exits_confirmed()
         self.context.run["stop"] = value
+        if not interrupted:
+            try:
+                value = self.services.lifecycle.settle_stop(error)
+            except (KeyboardInterrupt, SystemExit) as signal:
+                value = stops.of(signal)
+                value["data"]["exits_confirmed"] = self.exits_confirmed()
+                self.context.run["status"], self.context.run["stop"] = "interrupted", value
+                self.context.save()
+                raise
+            self.context.run["stop"] = value
         self.context.save()
         self.context.checkpoint()
         self.context.event("run_stopped", stop=stops.project(value, self.context.run["id"]))
+
+    def exits_confirmed(self):
+        """Whether every dispatch that may have started has a confirmed exit (abandon needs no confirmation)."""
+        return all(entry.get("exit_confirmed") is True or entry.get("process_state") == "prepared"
+                   for entry in self.context.run.get("dispatches", []))
 
     def handoff_targets(self, task_id):
         """Project only unaccepted transitive descendants, in plan order."""
@@ -87,7 +110,12 @@ class Workflow(RuntimeService):
         if request["response"] is None:
             raise self.decision_required(request)
         raise HarnessError(f"操作者已决定停止：request_id={request['id']}；"
-                           "请使用 --operator-decision 显式更新为 continue")
+                           "请使用 --operator-decision 显式更新为 continue", stop=self.operator_stopped(request))
+
+    @staticmethod
+    def operator_stopped(request):
+        return stops.make("operator_decision", "operator_stopped", data={"request_kind": request["kind"]},
+                          source={"request_id": request["id"], "task_id": request["task_id"]})
 
     def worker_recovery(self, task_id, dispatch_id, job):
         """Build a worker recovery record without changing the ledger.
@@ -103,7 +131,26 @@ class Workflow(RuntimeService):
             recovery["inspection_error"] = str(inspection_error)
         return recovery
 
-    @staticmethod
-    def decision_required(request):
+    def decision_required(self, request):
+        data = {"request_kind": request["kind"]}
+        if request["kind"] == "commander" and request["task_id"] == "final":
+            data["reverify_available"] = self.reverify_available()
         return HarnessError(f"等待操作者决定：task_id={request['task_id']} request_id={request['id']}；"
-                            "使用 resume --operator-decision FILE 提供决定，不改变验收或工具权限")
+                            "使用 resume --operator-decision FILE 提供决定，不改变验收或工具权限",
+                            stop=stops.make("operator_decision", "answer_required", data=data,
+                                            source={"request_id": request["id"], "task_id": request["task_id"]}))
+
+    def reverify_available(self):
+        """Whether the same snapshot's whole-run record is an ordinary (non-timeout) verification failure.
+
+        Then answering the question together with ``--reverify`` re-verifies the same
+        snapshot; a rejection never offers it. A read-only computation, no save.
+        """
+        from .finalization import same_snapshot_record
+        from .recovery import snapshot_digest
+        try:
+            snapshot = self.context.snapshot()
+            record = same_snapshot_record(self.context.run["final_history"], snapshot_digest(snapshot), snapshot["head"])
+        except Exception:
+            return False
+        return bool(record and record["status"] == "verification_failed" and record.get("failure_kind") != "timeout")

@@ -66,7 +66,7 @@
 12. 任务接受同时要求：合法结果声明完成且无 blocker；任务的证据要求在候选中都是普通文件，由运行时检查并记录摘要，不取 worker 的声明；Git 绑定与 HEAD 未变，改动（含暂存区）在 `allowed_paths` 内；全部验证命令成功；新审阅实例批准、无 blocking finding，并且按固定键给出的必需问题处置全部为 resolved；接受前快照等于审阅时快照。必需问题由审阅历史在当前候选上推导：处置只在它的审阅快照等于该候选、且该审阅可用时关闭问题。
 13. 提交前重新哈希一次完整快照（含暂存区与 HEAD），不用 mtime、size 或 Git 的未变判断；与审阅时的快照不同时旧批准持久标为失效，任务重新执行、验证和审阅。这次核对在任务记忆记录预检与 worker 原件读取（都不读工作树）之后；它之后到 commit 之前，运行时只做索引、范围与审阅来源的只读核验。
 14. 提交与接受记录共用一道屏障：commit 后，`accepted`、`expected_head`、`pending_post_accept` 同次保存，同时清除 `pending_acceptance`、`current_task` 和反馈。提交消息取自 worker 原件里的 `commit_message`，台账不另存副本：原件由 `pending_acceptance.worker_source` 指定，这个来源必须与批准该候选的审阅记录中的来源、工作尝试和快照一致；提交前按摘要读一次，来源不完整、缺失、被改或不一致即停止、不提交。运行时只追加 `Harness-Run`、`Harness-Task` 两行 trailer，以固定作者与提交者、UTF-8 编码、不签名、不运行仓库 hooks、`--cleanup=verbatim` 原样提交。没有改动时不提交。commit 已落盘而台账未保存时，恢复因 HEAD 不符停止，不自动修复。
-15. 全部任务接受后重新验证，再由新审阅者审阅 base 到 HEAD 的完整 diff；最终快照不变才 `completed`。同一快照的整体拒绝不能靠 resume 重抽，只能由通过正常门禁的修正任务改变候选；同一快照的拒绝或非超时验证失败在新的修订落地之前持续触发 `decide`，空修正被接受后不重抽整体审阅。
+15. 全部任务接受后重新验证，再由新审阅者审阅 base 到 HEAD 的完整 diff；最终快照不变才 `completed`。同一快照的整体拒绝不能靠 resume 重抽，只能由通过正常门禁的修正任务改变候选；同一快照的拒绝或非超时验证失败在新的修订落地之前持续触发 `decide`，空修正被接受后不重抽整体审阅。例外只有一个：同一快照的整体**验证**以普通非零退出失败（不是超时）时，本次恢复显式 `--reverify` 在首次进入整体验收时开始新的整体尝试，而不派生决定；它可以与回答指挥提问的 `--operator-decision` 同用，答复先整批登记，再进入整体验收。`--reverify` 不绕过整体**审阅**的拒绝：同一快照被拒绝后，无论是否带 `--reverify`、是否同时答复，下一步都是派生的指挥决定，不重抽整体审阅。
 16. Git 绑定在创建工作树后按实际解析结果保存（`.git`、gitdir 反向链接、公共目录、预期分支）；每个工作树 Git 命令显式指定 git-dir 与 work-tree 并剔除 `GIT_*` 环境变量，操作前后核验绑定。接受、归档、恢复、移除和记忆来源核验都使用它。
 17. `allowed_paths` 从仓库根匹配，`*`、`?`、字符集只作用于单段，独立 `**` 段跨层级；`.git`、`.harness`、`.codex`、`.claude` 在规划和接受时都被拒绝，工作树内的 `.harness` 一律拒绝；索引含 gitlink 的仓库在创建工作树前拒绝。
 18. 接受记录和任务记忆用审阅者的摘要；提交消息由 worker 撰写、审阅者审查，不进接受记录和任务记忆。任务审阅包里的消息在每次构造包时从 `pending_task` 绑定的 worker 原件按摘要读出，台账结果与原件不同即停止、不派发审阅。记忆提案须审阅者逐项批准才写入 `knowledge:`；记忆都是参考（`reference_only`），不授予权限或替代决定。
@@ -106,7 +106,9 @@
 
 **停止**
 
-34. 停止是一个有限的值 `stop = {kind, reason, data, source}`，只在 `status` 为 `awaiting_approval`、`blocked`、`interrupted` 时存在，与 `status` 同一次保存，进入 `running` 或 `abandoned` 时同一次删除。`(kind, reason)` 必须是登记表（`stops.REGISTRY`）的一行；`data` 只含该行登记的有界字段与诊断摘录 `detail`（最多 2,000 字符），`source` 只含身份（任务、派发、请求、续作、产物路径与摘要）。文案、建议出口和退出码由登记表从这个值投影；`status`、`run_stopped`、操作记录、stderr 用同一个投影。运行时不读 `stop` 做调度、权限或恢复判断，恢复仍重跑全部门禁。未标注类型的异常记为 `unclassified`。
+34. 停止是一个有限的值 `stop = {kind, reason, data, source}`，只在 `status` 为 `awaiting_approval`、`blocked`、`interrupted` 时存在，与 `status` 同一次保存，进入 `running` 或 `abandoned` 时同一次删除。`(kind, reason)` 必须是登记表（`stops.REGISTRY`）的一行；`data` 只含该行登记的有界字段与诊断摘录 `detail`（最多 2,000 字符），`source` 只含身份（任务、派发、请求、续作、产物路径与摘要）。文案、建议出口和退出码由登记表从这个值投影；`status`、`run_stopped`、操作记录、stderr 用同一个投影。运行时不读 `stop` 做调度、权限或恢复判断，恢复仍重跑全部门禁。未标注类型的异常记为 `unclassified`。加载成功之后发出的每个停止或拒绝，在落盘或上抛之前重跑加载校验；校验失败时，最终的停止就是这次加载失败（证据不符是 `evidence/load_integrity`，本地 I/O 是 `runtime_failure/io`，两者都没有命令出口），原停止只记在 `superseded` 里，同一个最终值写回上抛的异常；所以已落盘或已上抛的停止列出的 `resume`／`abandon` 在那一刻不被加载核验挡住，`evidence/runtime_integrity` 表示证据有问题而加载核验通过。读不出但路径仍在（权限、句柄、设备、磁盘满）是本地 I/O 故障，不是证据故障；证据故障从不被当作模型输出无效。一个停止列出的每条出口所需的身份都在值里，缺了就整体记为 `unclassified`。恢复预检、`abandon` 的拒绝只进 stderr 与操作记录，不改 run 的 `status` 与 `stop`；每个输入文件每次恢复只读一次。
+
+35. 退出码由停止值的 `(kind, reason)` 查登记表得出：0 完成或操作者要求的暂停（`completed`、`paused`、计划待批准，含未带 `--approve-plan` 的普通 `resume`）；3 run 自洽、有文档化的操作者动作或外部条件可解开；2 本次调用的输入不被接受；1 证据或现场与台账不符、Harness 自身失败或未分类；130 中断。`cleanup-run` 例外，仍按逐资源结果返回 0／1。
 
 ## 状态转换
 

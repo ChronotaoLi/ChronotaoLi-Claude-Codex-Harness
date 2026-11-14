@@ -502,6 +502,9 @@ class DashboardPresentationTests(unittest.TestCase):
   for (const expected of ["停止：运行被中断（interrupted/signal）", "STOP-DETAIL-MARKER", "resume run_int", "abandon run_int"]) {
     assert.ok(shown.includes(expected), "stop item shows: " + expected);
   }
+  // One interrupt, one attention item: the typed stop replaces the generic interrupted notice.
+  assert.equal(all(tagIs("h3"), attention).length, 1, "an interrupt is shown once");
+  assert.ok(!shown.includes("运行已中断"), "no second, untyped interrupt item");
   assert.ok(byId.main.textContent.includes("停止类型"), "meta panel names the stop type");
   assert.ok(byId.main.textContent.includes("interrupted/signal"), "meta panel shows kind/reason");
   navigate("#/runs/run_wait");
