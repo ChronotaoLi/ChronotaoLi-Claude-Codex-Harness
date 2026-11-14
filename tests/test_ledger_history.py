@@ -212,7 +212,10 @@ class CurrentLedgerTests(RepoCase):
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
             self.assertEqual(cli.main(['--repo', str(self.repo), 'status', self.run['id']]), 0)
-        self.assertEqual(json.loads(output.getvalue()), json.loads(json.dumps(summary)))
+        shown = json.loads(output.getvalue())
+        quota = shown.pop('quota')  # saved quota samples only; a demo run has none
+        self.assertEqual(shown, json.loads(json.dumps(summary)))
+        self.assertEqual(quota['providers'], {'claude': {'state': 'no_samples'}, 'codex': {'state': 'no_samples'}})
         state = self.repo / '.harness'
         listing = observe.list_runs(state)
         self.assertEqual([(item['id'], item['schema_version']) for item in listing['runs']],

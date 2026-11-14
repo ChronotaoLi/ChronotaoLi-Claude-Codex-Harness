@@ -230,7 +230,13 @@ def show_status(args, state):
         if not args.run_id.startswith("run_") or not args.run_id[4:].isalnum():
             raise HarnessError("无效 run ID", stop=stops.make("invalid_input", "cli_arguments", data={"option": "run_id"}))
         ledger = read_current_ledger(state / "runs" / args.run_id / "state.json")
-        print(dump(ledger if args.full else status_summary(ledger)))
+        if args.full:
+            print(dump(ledger))
+            return
+        summary = status_summary(ledger)
+        # Read after the ledger's version gate; saved samples only, never a CLI.
+        summary["quota"] = observe.quota_status(state, args.run_id)
+        print(dump(summary))
         return
     # The read-only observation layer owns the list; stdout fields are unchanged.
     try:

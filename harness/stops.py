@@ -17,6 +17,7 @@ from __future__ import annotations
 import contextlib
 import errno
 import json
+import math
 import re
 import sqlite3
 import string
@@ -50,12 +51,19 @@ def _map_shape(v): return (type(v) is dict and all(_id(k) and type(x) is list
                                                     for k, x in v.items()))
 def _strings_map(v): return _map_shape(v) and _size(v) <= LIST_BYTES
 def _superseded(v): return type(v) is dict and set(v) == {"kind", "reason"} and all(_id(x) for x in v.values())
+def _quota_window(v):
+    return (type(v) is dict and set(v) == {"bucket", "used_percent", "resets_at"}
+            and type(v["bucket"]) is str and 0 < len(v["bucket"]) <= 160
+            and (type(v["used_percent"]) is int or (type(v["used_percent"]) is float and math.isfinite(v["used_percent"])))
+            and v["used_percent"] >= 0 and (v["resets_at"] is None or _text(v["resets_at"]) and len(v["resets_at"]) <= 40))
+def _quota_windows(v): return type(v) is list and len(v) <= 16 and all(_quota_window(x) for x in v) and _size(v) <= 4096
 
 
 SOURCE_TYPES = {"task_id": _id, "dispatch_id": _id, "request_id": _id, "continuation_id": _id,
                 "artifact": _artifact, "artifact_digest": _digest}
 COMMON_DATA = {"detail": _text, "dropped_fields": _strings, "superseded": _superseded}
-LIST_FIELDS = {"patterns", "missing_commands", "options", "scope", "gaps", "suggested_scope", "widened"}
+LIST_FIELDS = {"patterns", "missing_commands", "options", "scope", "gaps", "suggested_scope", "widened",
+               "full_windows"}
 # Room kept for the bounded detail (every character escaped) when several lists share one stop value.
 DETAIL_RESERVE = 6 * DETAIL_LIMIT + 64
 
@@ -132,13 +140,21 @@ _row("process_unconfirmed", "command_exit", 3, "命令子进程的退出无法�
      command_id=_id, returned_unsealed=_bool)
 # Classified call failures (spec-5): the failure original's path and digest in source.
 _FAILURE_SOURCE = ("dispatch_id", "task_id", "artifact", "artifact_digest")
+# A quota failure's account snapshot (spec-7 3.6), all optional: whether a sample was taken and
+# published, its file name, why it is unavailable, and the snapshot's windows at 100 % or more as
+# listed (an observation, not the failure's cause; no exit reads them).
+QUOTA_REASONS = ("not_installed", "timeout", "output_limit", "exited", "provider_error", "shape_mismatch",
+                 "not_zero_call", "probe_disabled", "internal_error")
+_QUOTA_DATA = {"quota_snapshot": _enum("available", "unavailable", "not_published"), "quota_sample": _id,
+               "quota_reason": _enum(*QUOTA_REASONS), "full_windows": _quota_windows}
 for _k, _r, _t in (("provider_quota", "usage_limit", "供应商额度用尽"), ("provider_quota", "rate_limit", "供应商限速"),
                    ("provider_failure", "overloaded", "供应商过载"),
                    ("provider_failure", "invocation_failed", "模型调用失败（CLI 报告错误）"),
                    ("provider_failure", "local_start", "模型 CLI 未能启动"),
                    ("provider_failure", "unknown", "模型调用失败（原因未识别）")):
     _row(_k, _r, 3, _t, ("resume {run}",), _FAILURE_SOURCE,
-         role=ROLE, provider=_enum("claude", "codex"), http_status=_int)
+         role=ROLE, provider=_enum("claude", "codex"), http_status=_int,
+         **(_QUOTA_DATA if _k == "provider_quota" else {}))
 _row("provider_failure", "authentication", 3, "账号认证或权限失败", ("doctor", "resume {run}"), _FAILURE_SOURCE,
      role=ROLE, provider=_enum("claude", "codex"), http_status=_int)
 _row("invalid_output", "redo_exhausted", 3, "输出连续两次无效", ("resume {run}", "abandon {run}"),

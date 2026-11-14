@@ -151,7 +151,7 @@ python3 -m harness --repo /path/to/project cleanup-run RUN --remove-ignored
 python3 -m harness --repo /path/to/project cleanup-run RUN --remove --remove-ignored
 ```
 
-`status RUN` 显示任务、预算、待答决定、续作、审阅轮次和停止投影 `stop`（类型、标题、出口命令与诊断摘录），`--full` 查看完整台账。失败的命令在 stderr 第二行输出 `[harness-json] {"event":"stop",…}`，与 `status RUN` 的 `stop` 同一投影。`resume` 使用保存的现场和全新 agent，不恢复供应商会话，也不清零累计预算。可增加上下文、超时、轮数、尝试与派发上限，或追加精确 worker argv；其余配置及共享资产必须一致。
+`status RUN` 显示任务、预算、待答决定、续作、审阅轮次、停止投影 `stop`（类型、标题、出口命令与诊断摘录）和账号额度的最近观测 `quota`（只读已保存的额度样本，账号级、包含本 run 以外的使用，见[额度样本](docs/operations.md#额度样本)），`--full` 查看完整台账。失败的命令在 stderr 第二行输出 `[harness-json] {"event":"stop",…}`，与 `status RUN` 的 `stop` 同一投影。`resume` 使用保存的现场和全新 agent，不恢复供应商会话，也不清零累计预算。可增加上下文、超时、轮数、尝试与派发上限，或追加精确 worker argv；其余配置及共享资产必须一致。
 
 只有两个预算旋钮，各自计数不同的东西：
 

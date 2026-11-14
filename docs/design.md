@@ -36,6 +36,7 @@
 | `shared.py`、`contracts.py`、`config.py`、`versions.py` | 共享资产摘要、MCP 校验；输出契约；配置；台账版本 |
 | `private_state.py`、`workspace_inputs.py` | `.harness` 私有根保护；依赖副本清单 |
 | `cleanup.py` | `cleanup-run`（唯一的显式清理入口）：共同门禁之后分别处理全新验证检出与分支工作树；检出删除步骤（含归属核验）也供整体验收在结论保存后尝试回收验证通过的检出 |
+| `quota.py` | 额度探测、归一化、样本与最近观测（只是观察） |
 | `observe.py`、`dashboard.py`、`dashboard_page.py`、`watch.py`、`watch_cli.py` | 只读观察：列表与详情、本地网页、原生文件通知 |
 | `operations.py`、`supervisor.py` | 操作记录；`supervise` |
 | `permission_diagnostics.py`、`permission_smoke.py`、`tool_smoke.py` | 权限诊断；真实账号联调入口 |
@@ -50,7 +51,7 @@
 
 1. 每次 worker、reviewer 和指挥调用都是新进程、新 `dispatch_id`，无效输出的重做也是新调用；Claude 用 `--no-session-persistence`，Codex 用 `--ephemeral`，原生子 agent 关闭，不恢复供应商会话。模型 ID、供应商和 effort 按配置原样使用，同一 run 内不变，出错不换模型。
 2. 调用身份与预算先于进程启动保存：本地准备（上下文、输入与路径索引、MCP、快照、待派发指令与上一份无效原件的核对、额度检查）成功后，`attempts`、`agent_dispatches`、接收意图和 `invoked=true` 同一次保存，然后才调用后端。本地准备失败不扣额度。后端失败照常计入 `attempts` 与 `agent_dispatches`；其中由 CLI 终止信封判为额度、限速、过载或认证的 worker 失败不计工作尝试（不变量 8、20、36），其余失败（超时、轮数用尽、启动失败、其他明确错误、读不出）照常计数。
-3. 退出未确认就不继续：恢复、放弃和清理要求父 dispatch 及其每个命令子进程都有退出证据；`starting` 或缺 pgid 且未确认的记录阻塞。`--confirm-exited` 是审计过的操作者断言，不补造退出码、输出或成功。
+3. 退出未确认就不继续：恢复、放弃和清理要求父 dispatch 及其每个命令子进程都有退出证据；`starting` 或缺 pgid 且未确认的记录阻塞。`--confirm-exited` 是审计过的操作者断言，不补造退出码、输出或成功。额度探测进程不登记进 `dispatches`，不受这道门禁约束：它在空临时目录里运行、不执行工具，结果只在本进程内读一次；每次探测有 5 秒查询时限与 3 秒计时的收尾（关闭描述符与删除临时目录不在计时内），任何退出路径都在回收领导进程之前对整个进程组 SIGTERM、SIGKILL，回收之后只观察；收尾后进程组仍未确认退出时，本进程不再启动该供应商的探测；收尾期间收到的第一次用户中断在收尾完成后照常传播。Harness 被强杀时可能留下一个不被追踪的只读探测进程。
 4. 领导进程正常退出后，同组后代最多观察 2 秒，仍未退出就停止消费结果，不向身份不明的进程组发信号。只有进程组查询报告“不存在”才算后代已退出；组内只剩等待回收的僵尸进程时（macOS 对此返回 EPERM）算作仍存在、继续观察，窗口结束时的查询仍被拒绝才记为清理错误。
 5. 台账的 `invoked` 是调用事实的权威。事件 `dispatch_prepared`（预算检查前）、`dispatch_started`（`invoked=true` 保存后）和带 `invoked` 的 `dispatch_finished` 只是尽力而为的观察：追加失败不阻止调用，崩溃可能缺事件且不补发；按 `dispatch_id` 去重，费用只按台账统计。验证检出的回收事件（`verification_checkout_reclaimed`、`verification_checkout_reclaim_failed`）同样经 `RunContext.observe()` 追加，追加失败不影响执行。
 
@@ -92,7 +93,8 @@
 27. 台账只经 `RunStore` 提交：在 `store.lock` 下比较已加载字节的摘要，拒绝旧写入，原子写入并递增 `store_revision`；外部动作前也核对当前权威。`run.lock` 保护生命周期。
 28. 只支持当前台账版本 18，只解释一种台账形状和一种配置形状：其他版本（含缺失或非整数的版本）不迁移、不补写默认值、不解释字段；`resume`、`abandon`、`prepare-run`、`cleanup-run`、`status RUN`（含 `--full`）、`watch`、`permission-diagnostics`、观察网页的 run 详情、命令 broker（建 manifest、执行与删除）和只读 MCP 都在读完版本、读任何其他字段之前拒绝，错误写明该 run 的台账版本与当前版本；非对象的台账同样按“不支持”处理；任务记忆的来源台账不是当前版本时来源状态为 `unsupported`，其任务历史不再召回；运行列表（不带 run 的 `status`、观察网页的列表）对其他版本只给出路径、版本和“不支持”，一个旧版本或损坏的目录不影响其他 run 的列出。配置的未知键（含已删除的键）一律报“未知配置键”，不给迁移提示。resume 另核对共享资产摘要和完整配置快照。
 29. 必要输入超过 `context_chars` 时不调用模型、不扣额度，报告仍写入 `context-report.json`；可选记忆按整条加入剩余空间。成功派发的报告保留根与顶层字段尺寸及最大的 30 个嵌套字段并给出省略数，超限报告保留全部明细。
-30. 观察层（`status`、`watch`、`dashboard`、操作记录、`supervise` 回执）不写台账、不取 `run.lock`、不参与恢复。它们显示的停止信息都是 `stop` 的投影，不解析文字。
+30. 观察层（`status`、`watch`、`dashboard`、操作记录与 `supervise` 回执的读取）不写台账、不取 `run.lock`、不参与恢复；额度只读 run 目录里已保存的样本，观察入口从不启动额度探测或任何供应商 CLI。（`run`／`resume` 创建操作记录时读取 CLI 的 `--version`，见 [操作与观察](operations.md)，那是执行入口的行为，不属于观察入口。）它们显示的停止信息都是 `stop` 的投影，不解析文字。
+39. 额度快照只是观察。只有真实的 `CLIBackend` 采样：每次 `run`／`resume` 里首次用到某供应商之前，额度失败停止之前，以及停止（中断除外）、暂停、完成、等待批准**确已保存**之后对本进程用过的供应商各一次，至多 5 次；每个采样点启动探测之前都要求退出门禁通过（没有未确认退出的模型进程或命令子进程）。每次写一个排他、原子发布的样本文件 `observations/quota/…`，文件名按（台账修订、相位、进程启动时刻、序号）排序；不进 `state.json`，不参与预算、回执、接受、恢复与 `load_run()`，缺失或损坏只是观察缺口。探测失败、超时、输出超限、形状不符只记“不可用＋原因”，从不改变调度、预算、回执与接受；用户中断照常传播。Claude 探测必须读到零调用的结果行（`num_turns`、`total_cost_usd`、`duration_api_ms` 为 0，`local_command` 为 `usage`），否则本进程内停用。`status RUN` 只给出每家、每个额度桶的最近观测：账号级，包含本 run 以外的使用，不相加、不合成总数。
 
 **身份**
 
@@ -184,6 +186,8 @@
 
 `recovery.py` 的 `RECOVERY_BUSY_KEYS` 列出共用的八个待处理键，环境更新、续作拒绝、执行指导和操作者决定在其中任一有值时拒绝（见[恢复选项](recovery.md#恢复选项与互斥)）。`load_run` 在任何副作用前检查这些对象的类型、所引 dispatch 的角色与任务、`plan_history` 与 `pending_revision` 的引用形状、`pending_revision` 不与任务阶段或待派发指令并存，失败时不改写台账。
 
+额度样本不在台账里：`runs/<id>/observations/quota/r<修订>-p<相位>-<进程启动时刻>-s<序号>-<供应商>-<触发>.json`，文件名按（台账修订、相位、进程启动时刻、序号）排序，排他发布、从不覆盖；只存归一化字段，不存 CLI 原始输出；缺失或损坏只是观察缺口（不变量 39）。
+
 清理状态不在台账里：检出的删除意图与完成记录写在检出证据旁的 `cleanup.json`（`by` 是这份记录的写入者——运行时回收或 `cleanup-run`；补写完成记录的一方可能不是执行删除的一方），任务工作树的写在 run 目录的 `worktree-cleanup.json`（含本次是否允许删除忽略文件 `remove_ignored` 与删除前重新列出的有界清单）；运行时回收与 `cleanup-run` 都不改写台账（`--confirm-exited` 的退出确认除外）。台账里与检出有关的只有整体验证结论那次保存的 `checkout_digest`，它是结论的证据绑定，不是清理状态。
 
 ## 参考项目
@@ -213,7 +217,10 @@ Orca 按本机 CLI 1.4.237 参考，不运行它；“一任务一实例”比 O
 - 接受时重建暂存区改变了已审阅的暂存区摘要、在 commit 前中断，恢复作废旧批准并消耗新的工作尝试。
 - 接受前只核对一次快照（不变量 13）：这次核对之后、commit 之前，并发的外部进程对候选的修改仍可能进入提交，运行时发现不了。
 - 待接受的候选已变、而 worker 原件同时缺失或被改时，先因原件错误停止；恢复原件之后，下一次恢复才作废旧批准并重新执行、验证和审阅。
-- 进程组监督不是完整的 OS 进程树隔离；`--confirm-exited` 依赖操作者核实。
+- 进程组监督不是完整的 OS 进程树隔离；`--confirm-exited` 依赖操作者核实。模型调用与验证命令的监督器在回收领导进程之后不再向进程组发信号：领导先退出、或领导被 SIGTERM 结束时，忽略 SIGTERM 的后代会留下来，退出门禁把它报成退出未确认（不是静默泄漏）。额度探测用自己的收尾（不变量 3），监督器的这一点留待后续修改。
+- 额度的两个接口（`claude -p /usage` 的 `usage_report`、`codex app-server` 的 `account/rateLimits/read`）都标 experimental，没有做过真实联调；变了就是“不可用＋原因”。Codex 探测不消耗额度只靠协议语义（只发三条消息、不开线程），没有零调用证据；`--max-turns 1` 只限制 Claude 误调用的规模，不能证明第一次误调用不会发生。
+- Harness 被强杀时，正在运行的额度探测进程（新会话）与它的空临时目录可能遗留；台账没有它的记录，恢复不知道它存在。`codex app-server` 在 stdin 关闭后是否自行退出没有核实。
+- 用 `setsid`／`setpgid` 离开探测进程组的后代不在收尾的组信号范围内；SIGKILL 之后卡在不可中断状态的进程使 `exit_confirmed=false`。
 - 快照每次全量哈希，成本随仓库增长；审阅包的忽略清单只列路径（目录折叠、最多 100 条与 8 KiB），不显示被忽略目录里的内容，不校验内容；全新检出验证不保证 hermetic 构建。
 - 结论未保存的验证轮次（准备失败、中断）没有台账摘要，`cleanup-run` 只凭检出记录里的归属与身份核对处理它们；能改写本 run 证据目录的人可以伪造归属。
 - 记忆检索是本地词法排序，没有 embedding 或语义冲突检测；来源 `matching` 不证明事实正确。

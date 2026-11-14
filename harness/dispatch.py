@@ -214,6 +214,8 @@ class Dispatcher(RuntimeService):
 
     def dispatch_once(self, role, kind, task_id, schema, packet, task=None, *, retry_of=None, previous_invalid=None):
         self.context.ensure_exited()
+        # Before this process's first call to the provider; nothing of this dispatch is in the ledger yet.
+        self.services.quota.before_use(self.context.config.role(role, self.context.commander)["cli"], role)
         if role == "worker":
             self.services.planning.require_task_commands([task_id], "selected_task")
             # Includes retries after local preparation failure, before either
@@ -386,6 +388,7 @@ class Dispatcher(RuntimeService):
                 entry["continuation_rejection_id"] = rejection["id"]
             self.context.save()
             invoked = True
+            self.services.quota.mark_used(self.context.config.role(role, self.context.commander)["cli"])
             # Only after the durable invoked=True; a failed append never blocks the call.
             self.context.observe("dispatch_started", task_id=task_id, dispatch_id=dispatch_id, role=role, invoked=True)
             try:

@@ -215,6 +215,18 @@ class CLIBackend:
     def __init__(self, config, state):
         self.config, self.state = config, state
 
+    @staticmethod
+    def process_environment():
+        """The environment of every provider CLI process this backend starts: model calls and quota probes alike."""
+        env = os.environ.copy()
+        env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] = "1"
+        return env
+
+    def quota_snapshot(self, provider):
+        """One model-free account quota probe (observation only). Having it is what makes a run sample."""
+        from .quota import snapshot
+        return snapshot(provider, self.process_environment())
+
     def command(self, role, model, cwd, job, schema, run_path, *, parent_deadline=None, delete_scope=None):
         if role == "worker" and model["cli"] == "codex":
             raise HarnessError("当前 Codex 适配器仅支持只读角色，不能配置为 worker")
@@ -289,8 +301,7 @@ class CLIBackend:
         finally:
             self._parent_deadline = None
         write_json(job / "command.json", argv)
-        env = os.environ.copy()
-        env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] = "1"
+        env = self.process_environment()
         remaining = parent_deadline - time.monotonic()
         if remaining <= 0:
             raise HarnessError("Agent budget exhausted before CLI startup", stop=stops.make("budget", "agent_timeout", data={"role": role, "config_key": "runtime.agent_timeout_seconds", "limit_seconds": self.config.data["runtime"]["agent_timeout_seconds"]}, source={"dispatch_id": Path(job).name, **({"task_id": task["id"]} if task else {})}))

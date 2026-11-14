@@ -443,6 +443,11 @@ class RepoCase(unittest.TestCase):
         self.config = Config.load(ROOT / "harness.toml")
         self.config.data["verification"]["commands"] = [[sys.executable, "-m", "unittest", "-v"]]
         install_stop_guards(self)
+        # Every PATH lookup of claude or codex in a repository test lands on a recording stub;
+        # quota probes are expected, any other call to either CLI fails the test.
+        import quota_stubs
+        self.quota_calls = quota_stubs.install(self)
+        self.addCleanup(lambda: self.assertEqual(self.quota_calls.unexpected(), []))
 
     def engine(self, backend=None):
         return Runtime(self.config, self.repo, backend=backend or DemoBackend())

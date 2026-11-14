@@ -76,7 +76,7 @@ python3 -m harness --repo /abs/project dashboard --port 8765
 | `config` | `path`、`sha256`（配置文件字节摘要） |
 | `asset_digest` | 共享资产摘要；失败为 null |
 | `models` | 配置中 commander／fable／worker／reviewer 的 `cli`、`model`、`effort` 原样 |
-| `cli` | `claude`、`codex` 的 `path`（PATH 查找结果）与 `version`（`--version` 首个非空行，5 秒超时，失败为 null） |
+| `cli` | `claude`、`codex` 的 `path`（PATH 查找结果）与 `version`（`--version` 首个非空行，5 秒超时，失败为 null）；这是创建记录时的读取，与额度探测无关 |
 | `run_id`、`run_linked_at` | run 持久登记后立即写入；创建 run 前失败时为 null |
 | `exit_status`、`result_status`、`error`、`stop`、`error_omitted` | CLI 退出码（0／2／3／1／130，见[退出码](recovery.md#退出码)）、最终 JSON 的 `status`、错误首行与停止投影（`kind`、`reason`、标题、退出码、出口命令、`data`、`source`、诊断摘录 `detail`；结束时 run 停在待批准上时也有）。本次调用含文件型输入（计划或恢复 JSON，包括执行指导与请求拒绝 `--reject-request`）且出错时，`error` 为 null 并写 `error_omitted: "file inputs present; see stderr"`，`stop` 去掉 `detail`、保留其余字段，因为校验错误可能引用文件中的字段值；错误全文仍输出到 stderr。无文件输入时 `error_omitted` 为 null |
 
@@ -150,7 +150,7 @@ python3 -m harness.dashboard --state /abs/project/.harness --port 8765
 
 它是只读、本机、单项目多 run 的视图：
 
-- 不启动、恢复或修改 run，不取 `run.lock`，不写任何文件，不启动子进程，不探测进程；启动前只解析一次 `--repo` 的仓库根，服务开始后不调用 Git。
+- 不启动、恢复或修改 run，不取 `run.lock`，不写任何文件，不启动子进程，不探测进程；启动前只解析一次 `--repo` 的仓库根，服务开始后不调用 Git。额度只读 run 目录里已保存的样本，刷新不启动任何 CLI。
 - 台账记为 `running` 不等于进程仍在工作；页面只显示 `process_state`、`exit_confirmed`、`pgid` 与最后事件时间。没有新日志不等于卡死；worker `completed` 不等于任务 `accepted`。
 - 各文件按请求逐个读取，显示采样时间而不是原子快照；运行中的 `events.jsonl` 最后一行可能未写完，页面标为未完成，不算错误。
 - Claude 的结构化输出可能在调用结束才出现：运行中的 dispatch 还没有返回结果或用量是正常的。
@@ -185,7 +185,15 @@ run 列表 → run 详情 → 文件查看。列表按最近事件排序，以�
 
 `invoked=true` 在进程启动前写入，不证明 CLI 已启动或供应商已收到请求；`process_state=starting` 另标“启动未确认”，不覆盖上述分类。
 
-事件日志里的派发事件：`dispatch_prepared` 在本地准备保存后、预算检查前写入；`dispatch_started` 在台账保存 `invoked=true` 之后写入；`dispatch_finished` 带 `invoked`、`status` 和 `provider_usage`。事件追加没有丢失时，`dispatch_started` 条数等于 `agent_dispatches`；追加失败会被吞掉，run 照常完成而少一条事件。事件是尽力而为的观察：写入失败不影响调用，崩溃可能缺一条，恢复不补发。计数与费用以台账为准。
+事件日志里的派发事件：`dispatch_prepared` 在本地准备保存后、预算检查前写入；`dispatch_started` 在台账保存 `invoked=true` 之后写入；`dispatch_finished` 带 `invoked`、`status` 和 `provider_usage`。事件追加没有丢失时，`dispatch_started` 条数等于 `agent_dispatches`；追加失败会被吞掉，run 照常完成而少一条事件。事件是尽力而为的观察：写入失败不影响调用，崩溃可能缺一条，恢复不补发。计数与费用以台账为准。`quota_sampled`（页面显示“额度样本”）在每次额度采样之后追加，带 `provider`、`trigger`、`available`、`reason`、样本文件名 `sample`（写入失败时为 null 并带 `write_error`）与 `dispatch_id`。
+
+### 额度样本
+
+真实 `CLIBackend` 的 `run`／`resume` 在这些时刻各取一份账号额度快照（不调用模型）：本进程首次用到某供应商之前（`before_use`），额度失败停止之前（`quota_failure`），以及停止、暂停、完成、等待批准确已保存之后，对本进程用过的供应商各一份（`stop`、`paused`、`completed`、`awaiting_approval`）；每次至多 5 份。`demo` 与离线后端不采样。探测：Claude 是 `claude -p /usage --output-format stream-json --verbose --no-session-persistence --setting-sources "" --strict-mcp-config --max-turns 1`，必须读到零调用的结果行（`num_turns`、`total_cost_usd`、`duration_api_ms` 为 0，`local_command` 为 `usage`），读不到就在本进程停用 Claude 探测；Codex 是 `codex app-server` 的三条 JSON-RPC 消息（`initialize`、`initialized`、`account/rateLimits/read`）。两者都在空临时目录、用与模型调用相同的环境运行，5 秒查询时限，收尾时整个进程组 SIGTERM 后 SIGKILL。
+
+样本写在 `runs/<id>/observations/quota/`，文件名 `r<修订>-p<相位>-<进程启动时刻>-s<序号>-<供应商>-<触发>.json` 就是它们的顺序，排他发布、从不覆盖，只存归一化字段（窗口的已用百分比与重置时刻、Codex 的 credits 余额原样字符串、`extra_usage`、进程事实），不存 CLI 原始输出或错误文字。探测失败只记“不可用＋原因”：`not_installed`、`timeout`、`output_limit`、`exited`、`provider_error`、`shape_mismatch`、`not_zero_call`、`probe_disabled`、`internal_error`；从不改变调度、预算、回执与接受，用户中断照常传播。
+
+`status RUN` 的 `quota` 块只读已保存的样本：每家的样本数、不可用原因计数、最近一份样本，以及每个额度桶（Claude 按 `kind` 与 scope，`weekly_scoped` 带模型显示名；Codex 按 limit、槽位与窗口长度）的最近观测和下次重置时刻，Codex 另有各 limit 最近的 credits 余额。这是账号级观测：包含本 run 以外的使用（含驱动 Harness 的会话），不是本 run 的消耗；桶与供应商不相加；样本里没有账号标识，换号认不出来。最多读最新 400 份，损坏、超大或名实不符的样本计入 `damaged_count` 并跳过。`--full` 只打印台账，不带 `quota`。两个接口都是 experimental，没有做过真实联调。
 
 ### 费用
 
@@ -199,7 +207,7 @@ run 列表 → run 详情 → 文件查看。列表按最近事件排序，以�
 
 ### 文件访问
 
-只能通过固定根读取 run 目录内的普通文件：顶层 `state.json`、`events.jsonl`、`handoff.json`、`worktree-cleanup.json`；目录 `plans/`、`dispatches/<uuid>/`（含 `commands/<32 位十六进制>/`）、`verification/`、`recovery/`、`decisions/`、`environment/`、`checkpoints/`、`path-indexes/`、`indexes/`、`batches/`。`mcp.json`、`run.lock`、`*.tmp` 与 `memory.sqlite3*` 被排除；符号链接与非普通文件一律拒绝，中间目录在检查后被替换为符号链接也无法逃出根目录；路径深度不超过 8。台账中的绝对路径只显示不打开。文件内容永远以 `text/plain`（或 `format=json`）返回，日志不会作为 HTML 执行。
+只能通过固定根读取 run 目录内的普通文件：顶层 `state.json`、`events.jsonl`、`handoff.json`、`worktree-cleanup.json`；目录 `plans/`、`dispatches/<uuid>/`（含 `commands/<32 位十六进制>/`）、`verification/`、`recovery/`、`decisions/`、`environment/`、`checkpoints/`、`path-indexes/`、`indexes/`、`batches/`、`observations/`（额度样本）。`mcp.json`、`run.lock`、`*.tmp` 与 `memory.sqlite3*` 被排除；符号链接与非普通文件一律拒绝，中间目录在检查后被替换为符号链接也无法逃出根目录；路径深度不超过 8。台账中的绝对路径只显示不打开。文件内容永远以 `text/plain`（或 `format=json`）返回，日志不会作为 HTML 执行。
 
 ### 限制
 
@@ -316,7 +324,7 @@ python3 -m harness.permission_smoke --config /path/to/harness.toml --repo /path/
 python3 -m harness.tool_smoke --config /path/to/harness.toml --repo /path/to/project
 ```
 
-- `smoke` 在临时 Git 仓库由真实指挥生成计划，再调用执行者、任务审阅者和整体审阅者，运行真实测试；不改动本仓库。
+- `smoke` 在临时 Git 仓库由真实指挥生成计划，再调用执行者、任务审阅者和整体审阅者，运行真实测试；不改动本仓库。它用真实的 `CLIBackend`，所以也运行两家的额度探测（见[额度样本](#额度样本)）；离线测试只用桩可执行文件，不证明探测在真实 CLI 上可用。
 - `permission_smoke` 在 `--repo` 的 `.harness/permission-smoke/` 建立专用现场，检查工作树内读写、精确命令、额外参数、工作树外读写和 `.git` 修改；通过要求实际工具调用、工具结果、对应的 `permission_denials` 和文件内容一致，模型自称“已拒绝”不算证据。专用命令替换项目命令，外部 MCP 关闭。默认超时 180 秒、最多 16 轮、预算参数 1 美元，可用 `--timeout`、`--max-turns`、`--max-budget-usd` 调整。
 - `tool_smoke` 让配置的 Claude worker 调用 broker、文件工具、`git_query`（`ls-tree`、`hash-object` 与一条被拒绝的 argv）和 `delete_path`（范围内删除与范围外拒绝），核对工具结果与文件；默认最多 20 轮。
 

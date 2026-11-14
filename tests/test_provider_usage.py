@@ -113,7 +113,8 @@ class ProviderUsageTests(RepoCase):
 
     def test_claude_invocation_has_one_output_mode_and_no_version_probe(self):
         from test_worker_return_recovery import stub_provider_clis
-        stub_provider_clis(self)
+        from harness.quota import CLAUDE_ARGV
+        clis = stub_provider_clis(self)
         original, probes = subprocess.run, []
 
         def recording(argv, *args, **kwargs):
@@ -124,6 +125,9 @@ class ProviderUsageTests(RepoCase):
             result = self.engine(self.backend()).start("Implement greet", self.plan())
         self.assertEqual(result["status"], "completed")
         self.assertEqual(probes, [])
+        # The only claude processes by PATH are quota probes (no model call, no --version).
+        self.assertEqual([call for call in clis.all() if call.get("version")], [])
+        self.assertEqual({tuple(call["argv"]) for call in clis.probes("claude")}, {CLAUDE_ARGV[1:]})
         worker = next(entry for entry in result["dispatches"] if entry["role"] == "worker")
         self.assertNotIn("source", worker["provider_usage"])
         job = self.repo / ".harness" / "runs" / result["id"] / "dispatches" / worker["id"]

@@ -3,7 +3,6 @@ import hashlib
 import json
 from copy import deepcopy
 import os
-import shutil
 import signal
 import subprocess
 import sys
@@ -24,18 +23,11 @@ import test_terminal_capture_recovery as terminal_tests
 
 
 def stub_provider_clis(case):
-    """Put recording claude/codex stubs first on PATH and require that neither runs."""
-    folder = Path(tempfile.mkdtemp())
-    log = folder / 'calls.log'
-    for name in ('claude', 'codex'):
-        stub = folder / name
-        stub.write_text(f'#!/bin/sh\necho {name} "$@" >> "{log}"\nexit 97\n', encoding='utf-8')
-        stub.chmod(0o755)
-    case.addCleanup(shutil.rmtree, folder, True)
-    case.addCleanup(lambda: case.assertFalse(log.exists(), log.read_text() if log.exists() else ''))
-    environment = patch.dict(os.environ, {'PATH': str(folder) + os.pathsep + os.environ.get('PATH', '')})
-    environment.start()
-    case.addCleanup(environment.stop)
+    """Recording claude/codex stubs first on PATH: quota probes may run, no model call may reach either CLI."""
+    import quota_stubs
+    calls = quota_stubs.install(case)
+    case.addCleanup(lambda: case.assertEqual(calls.unexpected(), []))
+    return calls
 
 
 OK = {'type': 'result', 'subtype': 'success', 'is_error': False, 'structured_output': {'status': 'completed'}}

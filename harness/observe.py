@@ -7,7 +7,9 @@ must fstat as a regular file. Nothing here constructs a Runtime, loads a run for
 recovery, takes run.lock, writes files, runs git or probes processes.
 
 Ledger interpretation stays in `harness.cli.status_summary`; this module only adds
-bounded projections (invocation classes, per-provider cost, event tails, files).
+bounded projections (invocation classes, per-provider cost, quota samples, event tails,
+files). Quota is read from the samples already saved under `observations/quota/`; no
+entry here starts a provider CLI.
 Only the current ledger version is interpreted: the list names any other version
 with its path and version alone, and the detail refuses it.
 """
@@ -24,6 +26,8 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+from . import quota
+from .util import strict_json_loads
 from .versions import unsupported_ledger
 
 
@@ -33,7 +37,7 @@ COMMAND_ID = re.compile(r"^[0-9a-f]{32}$")
 MAX_DEPTH = 8
 TOP_LEVEL_FILES = frozenset(("state.json", "events.jsonl", "handoff.json", "worktree-cleanup.json"))
 ROOT_DIRECTORIES = frozenset(("plans", "dispatches", "verification", "recovery", "decisions",
-                              "environment", "checkpoints", "path-indexes", "indexes", "batches"))
+                              "environment", "checkpoints", "path-indexes", "indexes", "batches", "observations"))
 EXCLUDED_NAMES = frozenset(("mcp.json", "run.lock"))
 DEFAULT_TAIL = 64 * 1024
 MAX_TAIL = 1024 * 1024
@@ -42,6 +46,8 @@ OPERATION_MAX_BYTES = 256 * 1024
 CLEANUP_RECEIPT_MAX_BYTES = 64 * 1024
 OPERATIONS_MAX_FILES = 1000
 FILE_INDEX_MAX = 2000
+QUOTA_SAMPLES_MAX = 400       # the newest samples by name (their total order); at most 5 per run/resume
+QUOTA_DAMAGED_LISTED = 20
 ERROR_CHARS = 200
 MAX_NUMBER = 2 ** 63  # Ledger numbers beyond this are treated as absent, never converted to float.
 MAX_COST_USD = 1_000_000_000
@@ -691,6 +697,45 @@ class Observer:
         detail["cost"] = cost_summary(rows)
         return detail
 
+    # ----- quota samples -----
+
+    def quota_samples(self, run_id):
+        """The saved quota samples, validated, in their total order (the file names): the newest QUOTA_SAMPLES_MAX.
+
+        Symbolic links, other entries and names outside the sample pattern are
+        ``skipped``; a sample that cannot be read, is too large, fails the schema, does
+        not match its own name or changes while read is ``damaged`` (names listed up
+        to QUOTA_DAMAGED_LISTED). Neither raises.
+        """
+        validate_run_id(run_id)
+        block = {"samples": [], "omitted": 0, "skipped": 0, "damaged": [], "damaged_count": 0}
+        try:
+            entries = self.reader.scandir(["runs", run_id, *quota.QUOTA_DIR])
+        except NotFound:
+            return block
+        names = []
+        for name, kind, _ in entries:
+            if kind == "file" and quota.NAME.fullmatch(name):
+                names.append(name)
+            else:
+                block["skipped"] += 1
+        block["omitted"] = max(0, len(names) - QUOTA_SAMPLES_MAX)
+        for name in names[block["omitted"]:]:
+            try:
+                read = self.reader.read(["runs", run_id, *quota.QUOTA_DIR, name], limit=quota.SAMPLE_MAX_BYTES)
+                if read["too_large"] or read["changed_while_reading"]:
+                    raise ValueError("unreadable sample")
+                sample = quota.validate_sample(strict_json_loads(read["data"]))
+                if quota.sample_name(sample) != name:
+                    raise ValueError("sample name differs from its content")
+            except Exception:
+                block["damaged_count"] += 1
+                if len(block["damaged"]) < QUOTA_DAMAGED_LISTED:
+                    block["damaged"].append(name)
+                continue
+            block["samples"].append(sample)
+        return block
+
     def _worktree_cleanup_removed(self, run_id):
         """cleanup-run's receipt: true once it records removal; null when unreadable."""
         try:
@@ -877,3 +922,18 @@ def list_runs(state):
 def run_detail(state, run_id):
     with Observer(state) as observer:
         return observer.run_detail(run_id)
+
+
+def quota_status(state, run_id):
+    """The ``status RUN`` quota block: the latest observation per provider and bucket from saved samples.
+
+    Never starts a CLI; any failure to read is ``{"error": <type>}`` and leaves the rest of status alone.
+    """
+    try:
+        with Observer(state) as observer:
+            block = observer.quota_samples(run_id)
+        view = quota.quota_view(block["samples"])
+        return {"notes": view["notes"], "damaged_count": block["damaged_count"], "omitted": block["omitted"],
+                "providers": view["providers"]}
+    except Exception as error:
+        return {"error": type(error).__name__}

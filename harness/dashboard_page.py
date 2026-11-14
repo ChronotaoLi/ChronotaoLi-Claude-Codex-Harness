@@ -255,6 +255,7 @@ APP_JS = r""""use strict";
     dispatch_prepared: "准备派发", dispatch_started: "开始调用", dispatch_finished: "派发结束", task_accepted: "任务已接受",
     review_rejected: "审阅要求修改", verification_failed: "验证失败",
     run_completed: "运行完成", run_paused: "运行暂停", run_stopped: "运行停止", run_abandoned: "运行已放弃",
+    quota_sampled: "额度样本",
     plan_awaiting_approval: "计划等待批准", plan_approved: "计划已批准", plan_revised: "计划已修订",
     revision_edits_archived: "修订前已归档未接受修改", commander_candidate_changed: "指挥调用期间候选已变化",
     final_verification_failed: "整体验证失败", final_review_rejected: "整体审阅拒绝",

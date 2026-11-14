@@ -133,6 +133,7 @@ class Scheduler(RuntimeService):
                 # Settled like every stop before its save: a load failure stops the run instead.
                 self.services.lifecycle.settle_publication("plan_approval", "initial_plan")
                 self.context.save()
+                self.services.quota.terminal_saved()
                 self.context.checkpoint()
                 self.context.event("plan_awaiting_approval")
                 return self.context.run
@@ -154,6 +155,7 @@ class Scheduler(RuntimeService):
                 elif action.kind == "pause":
                     self.context.run["status"] = "paused"
                     self.context.save()
+                    self.services.quota.terminal_saved()
                     self.context.checkpoint()
                     self.context.event("run_paused")
                     return self.context.run
@@ -170,9 +172,21 @@ class Scheduler(RuntimeService):
             self.services.planning.verify_plan_authority()
             self.context.run["status"] = "completed"
             self.context.save()
+            self.services.quota.terminal_saved()
             self.context.checkpoint()
             self.context.event("run_completed")
             return self.context.run
-        except BaseException as e:
-            self.services.workflow.stop(e)
-            raise
+        except BaseException as error:
+            # A quota failure takes its account snapshot before the stop is settled and saved;
+            # an interrupt during that probe becomes the error to stop with.
+            error = self.services.quota.annotate_failure(error)
+            revision = self.context.run.get("store_revision")
+            try:
+                self.services.workflow.stop(error)
+            finally:
+                if self.context.run.get("store_revision") != revision:
+                    self.services.quota.terminal_saved()
+            raise error
+        finally:
+            # After the terminal state is saved (never before): one sample per provider this process used.
+            self.services.quota.end_of_call()

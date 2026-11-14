@@ -549,7 +549,12 @@ class CLIWiringTests(RepoCase):
         self.assertNotIn("run_partial", output.replace("run_partial", "", 1))  # listed once
         code, output, errors = self.invoke(["status", ledger["id"]])
         self.assertEqual(code, 0, errors)
-        self.assertEqual(json.loads(output), status_summary(ledger))
+        shown = json.loads(output)
+        # status RUN adds the latest quota observation from saved samples; this run has none.
+        quota = shown.pop("quota")
+        self.assertEqual(shown, status_summary(ledger))
+        self.assertEqual(quota["providers"], {"claude": {"state": "no_samples"}, "codex": {"state": "no_samples"}})
+        self.assertEqual((quota["damaged_count"], quota["omitted"]), (0, 0))
         code, output, errors = self.invoke(["status", ledger["id"], "--full"])
         self.assertEqual(code, 0, errors)
         self.assertEqual(json.loads(output), ledger)

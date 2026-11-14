@@ -69,13 +69,18 @@ class SupervisorTests(unittest.TestCase):
         self.assert_receipt_only(saved)
 
     def test_actual_harness_early_failure_is_not_lost(self):
-        # Invalid run ID fails before a run/model invocation; real Harness CLI only.
+        # Invalid run ID fails before a run/model invocation; real Harness CLI only. Its operation
+        # record reads both CLIs' --version, which must reach the recording stubs.
+        import quota_stubs
+        calls = quota_stubs.install(self)
         receipt = supervise(self.repo, ['resume', 'invalid_run_id'])
         self.assertNotEqual(receipt['exit_code'], 0)
         self.assertEqual(receipt['process_observation'], 'exited')
         self.assertIsNone(receipt['run_id'])
         self.assertEqual(self.receipts(), [receipt])
         self.assert_receipt_only(receipt)
+        self.assertEqual(calls.unexpected(), [])
+        self.assertEqual(calls.probes(), [])  # refused before execute(): nothing samples
 
     def test_inbox_commands_are_gone_and_an_old_inbox_file_is_never_touched(self):
         import contextlib
