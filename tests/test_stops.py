@@ -119,6 +119,106 @@ class RegistryTests(unittest.TestCase):
         self.assertEqual(stops.of(error)["data"]["error_type"], "InvalidStop")
 
 
+class FitProperty(unittest.TestCase):
+    """The whole stop value fits 32 KiB without losing its type, exit code or registered exits (code-6 review)."""
+
+    # BMP, CJK, a supplementary character (12 escaped bytes), a lone surrogate and plain ASCII.
+    ALPHABET = ["a", "Z", "/", " ", "'", "-", "中", "é", "\U0001F600", "\U00010348", "\ud800", "x"]
+
+    def text(self, rng, low, high):
+        return "".join(rng.choice(self.ALPHABET) for _ in range(rng.randint(low, high)))
+
+    def ident(self, rng):
+        return rng.choice("Ab9") + "".join(rng.choice("abcXYZ019_.:-") for _ in range(rng.randint(0, 119)))
+
+    def value(self, rng, check):
+        """A well-formed, often oversized value of the type ``check``; single items stay within one field's limit."""
+        many = rng.choice((1, 5, 40, 200))
+        if check is stops._int:
+            return rng.randint(0, 10 ** 12)
+        if check is stops._bool:
+            return rng.choice((True, False))
+        if check is stops._id:
+            return self.ident(rng)
+        if check is stops._key:
+            return self.text(rng, 1, 120)
+        if check is stops._text:
+            return self.text(rng, 0, 2000)
+        if check is stops._relpath:
+            return "p" + self.text(rng, 0, 1023).replace("\0", "")
+        if check is stops._superseded:
+            return {"kind": self.ident(rng), "reason": self.ident(rng)}
+        if hasattr(check, "values"):
+            return rng.choice(check.values)
+        if check is stops._strings:
+            return [self.text(rng, 1, 600) for _ in range(many)]
+        if check is stops._argv_list:
+            return [[self.text(rng, 1, 60) for _ in range(rng.randint(1, 6))] for _ in range(many)]
+        if check is stops._argv_map:
+            return {self.ident(rng): self.value(rng, stops._argv_list) for _ in range(rng.randint(1, 6))}
+        if check is stops._strings_map:
+            return {self.ident(rng): [self.text(rng, 1, 600) for _ in range(many)] for _ in range(rng.randint(1, 6))}
+        if check is stops._quota_windows:
+            return [{"bucket": self.text(rng, 1, 160), "used_percent": rng.choice((100, 250.5)),
+                     "resets_at": rng.choice((None, self.text(rng, 1, 40)))} for _ in range(rng.choice((1, 16, 40)))]
+        raise AssertionError(f"no generator for {check}")
+
+    def source(self, rng, name):
+        if name == "artifact":
+            return "/" + self.text(rng, 0, 1023).replace("\0", "")
+        if name == "artifact_digest":
+            return "".join(rng.choice("0123456789abcdef") for _ in range(64))
+        return self.ident(rng)
+
+    def test_every_row_keeps_its_type_exit_code_and_exits(self):
+        rng = random.Random(20261114)
+        for key, entry in stops.REGISTRY.items():
+            conditions = [item[1] for item in entry["exits"] if isinstance(item, tuple)]
+            for trial in range(20):
+                data = {name: self.value(rng, check) for name, check in entry["data"].items()}
+                if rng.random() < 0.5:
+                    data["superseded"] = self.value(rng, stops._superseded)
+                source = {name: self.source(rng, name) for name in entry["source"]}
+                with self.subTest(row=key, trial=trial):
+                    made = stops.make(*key, data=copy.deepcopy(data), source=source)
+                    self.assertEqual((made["kind"], made["reason"]), key)
+                    # Half the diagnostics are supplementary characters only: 12 escaped bytes each.
+                    error = HarnessError(self.text(rng, 0, 5000) if trial % 2 else "\U0001F600" * rng.randint(1500, 5000))
+                    error.stop = made
+                    final = stops.of(error)
+                    stops.validate(final)
+                    self.assertLessEqual(len(json.dumps(final, ensure_ascii=True)), stops.STOP_LIMIT)
+                    self.assertEqual((final["kind"], final["reason"]), key)
+                    self.assertEqual(stops.exit_code(error), entry["exit_code"])
+                    # Every exit whose condition held in the input still applies, and every exit can be filled.
+                    for flag in conditions:
+                        name = flag.lstrip("!")
+                        held = data[name] is False if flag.startswith("!") else bool(data[name])
+                        self.assertEqual(stops._holds(final["data"], flag), held, (key, flag))
+                    filled = {**final["data"], **final["source"]}
+                    self.assertTrue(all(name in filled for name in stops.required_fields(*key, final["data"])))
+                    projected = stops.project(final, "run_x")
+                    self.assertEqual(len(projected["exits"]), len(list(stops.active_exits(entry, final["data"]))))
+
+    def test_shrinking_keeps_heads_and_counts_what_it_omits(self):
+        key = ("scope_extension", "revision")
+        smile = "\U0001F600"
+        gaps = {f"t{i}": [f"docs/{i}_{j}_" + smile * 50 + ".md" for j in range(30)] for i in range(3)}
+        suggested = ["docs/**", "notes/" + smile * 40 + "/**"]
+        made = stops.make(*key, data={"gaps": gaps, "suggested_scope": suggested, "scope": ["hello.py"],
+                                      "widened": ["docs/**"]})
+        error = HarnessError(smile * 5000)
+        error.stop = made
+        final = stops.of(error)
+        data = final["data"]
+        kept = [pattern for patterns in data["gaps"].values() for pattern in patterns]
+        flat = [pattern for patterns in gaps.values() for pattern in patterns]
+        self.assertEqual(kept, flat[:len(kept)])                    # a head, task order then pattern order
+        self.assertEqual(len(kept) + data["gaps_omitted"], len(flat))
+        self.assertEqual(data["suggested_scope"], suggested)          # the exit's field is the last to shrink
+        self.assertTrue(stops.project(final, "run_x")["exits"][0].startswith("resume run_x --scope='docs/**'"))
+
+
 class LedgerStopTests(OperationCase):
     def blocked(self):
         """A run stopped by the dispatch limit: blocked, with an unclassified stop in 4a."""

@@ -4,6 +4,7 @@ Every model call is the scripted offline backend; no test calls a real model or 
 """
 import copy
 import itertools
+import json
 import os
 import random
 import shlex
@@ -11,7 +12,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from harness import git, scope as boundary
+from harness import git, scope as boundary, stops
 from harness.context import compact_plan
 from harness.contracts import apply_revision, ScopeExtensionRequired
 from harness.recovery import read_bound_result
@@ -326,6 +327,52 @@ class InitialPlanHoldTests(RepoCase):
         self.assertEqual(summary["tasks"][0]["groups"], {".": [{"pattern": "hello.py", "in_scope": True}]})
         self.assertEqual(run_cli(self, backend, ["resume", engine.run["id"], "--approve-plan"])[0], 0)
         self.assertEqual(saved(engine)["status"], "completed")
+
+    def test_large_non_ascii_gaps_keep_the_typed_hold_and_its_exits(self):
+        """Code-6 review: 90 paths of 50 emoji each still hold as initial_plan with its listed exits (exit 3)."""
+        paths = [f"docs/{i}_" + "\U0001F600" * 50 + ".md" for i in range(90)]
+
+        def change(backend, kwargs, packet, result):
+            if trigger_kind(kwargs, packet) == "plan":
+                result["new_tasks"][0]["allowed_paths"] = ["hello.py", *paths]
+        backend = ScriptedBackend(change)
+        engine = self.engine(backend)
+        with self.assertRaisesRegex(HarnessError, "首版计划"):
+            engine.start("Implement greet", scope=["hello.py"], pause_after_plan=True)
+        run = saved(engine)
+        stop = run["stop"]
+        self.assertEqual((stop["kind"], stop["reason"]), ("scope_extension", "initial_plan"))
+        self.assertLessEqual(len(json.dumps(stop, ensure_ascii=True)), 32 * 1024)
+        suggested = stop["data"]["suggested_scope"]  # concrete paths: each suggestion is the path itself
+        self.assertEqual(suggested, paths[:len(suggested)])
+        self.assertGreater(len(suggested), 0)
+        kept = stop["data"]["gaps"].get("greet", [])
+        self.assertEqual(kept, paths[:len(kept)])
+        self.assertEqual(len(kept) + stop["data"].get("gaps_omitted", 0), 90)
+        projected = stops.project(stop, run["id"])
+        self.assertEqual((projected["exit_code"], projected["exits"][1:]),
+                         (3, [f"resume {run['id']} --reject-request FILE", f"status {run['id']}"]))
+        words = shlex.split(projected["exits"][0])
+        self.assertEqual([w[len("--scope="):] for w in words if w.startswith("--scope=")], suggested)
+        # The complete gaps stay readable in status, recomputed from the original.
+        from harness.cli import status_summary
+        self.assertEqual(status_summary(run)["scope"]["held"]["gaps"], {"greet": paths})
+        source, calls = run["commander_receipts"][DECIDE_KEY]["dispatch_id"], len(backend.calls)
+        result, errors = run_cli(self, backend, ["resume", run["id"]])
+        again = saved(engine)
+        self.assertEqual((result, again["stop"]["kind"], again["stop"]["reason"], len(backend.calls)),
+                         (3, "scope_extension", "initial_plan", calls))
+        # The listed exit widens by the suggested entries: the rest is still held, the same request, no call.
+        after = walk_exit(self, engine.directory, ("scope_extension", "initial_plan"), backend=backend,
+                          expect_code=3, expect_status="blocked")
+        self.assertEqual((after["stop"]["reason"], after["stop"]["source"]["request_id"], len(backend.calls)),
+                         ("initial_plan", stop["source"]["request_id"], calls))
+        self.assertEqual(status_summary(after)["scope"]["held"]["gaps"], {"greet": paths[len(suggested):]})
+        self.assertEqual(run_cli(self, backend, ["resume", run["id"], "--scope=docs/**"])[0], 0)
+        published = saved(engine)
+        self.assertEqual((published["status"], source_of(published, 0), len(backend.calls)),
+                         ("awaiting_approval", source, calls))
+        self.assertEqual(published["tasks"][0]["allowed_paths"], ["hello.py", *paths])
 
     def test_undeclared_scope_does_not_constrain_first_plan(self):
         run = self.engine(ScriptedBackend()).start("Implement greet", pause_after_plan=True)
@@ -1039,6 +1086,33 @@ class CrashWindowTests(HeldCase):
         calls = len(backend.calls)
         run = self.engine(backend).resume(engine.run["id"])
         self.assertEqual((run["status"], source_of(run, 0), len(backend.calls)), ("awaiting_approval", source, calls))
+
+    def test_i6_answer_scope_and_relaxation_saved_then_crash_before_scheduling(self):
+        """Code-6 review suggestion: die right after the one save of the three inputs; a plain resume goes on."""
+        def then(backend, packet, result):
+            if "support.txt" in packet["scope"]:
+                widen("support.txt")(backend, packet, result)
+            else:
+                decided(result, "implement", selected_task="greet", instruction="Finish greet")
+        engine, backend, reply = self.asked(then)
+        self.tighten()  # a configuration relaxation adopted by the same resume
+        resumed = self.engine(backend)
+        committed = lambda run: "support.txt" in run["scope"]
+        crash, fired = crash_after_save(resumed, committed)
+        calls = len(decides(backend))
+        with crash, self.assertRaises(KeyboardInterrupt):
+            resumed.resume(engine.run["id"], operator_decision=reply, scope=["support.txt"])
+        self.assertTrue(fired["fired"])
+        run = saved(engine)
+        self.assertEqual(("support.txt" in run["scope"], len(run["operator_decisions"]),
+                          self.COMMAND in run["config_snapshot"]["permissions"]["worker_commands"]), (True, 1, True))
+        self.assertEqual(len(decides(backend)), calls)  # nothing was scheduled before the death
+        after = self.engine(backend).resume(engine.run["id"])
+        self.assertEqual(after["status"], "completed")
+        packet = decides(backend)[calls]["packet"]
+        self.assertEqual((packet["operator_answer"]["request_id"], packet["scope"]),
+                         (run["operator_decisions"][0]["request_id"], ["hello.py", "support.txt"]))
+        self.assertEqual(after["tasks"][0]["allowed_paths"], ["hello.py", "support.txt"])
 
     def test_i7_rejection_file_written_then_crash(self):
         engine, backend = self.held(implement_after_rejection())

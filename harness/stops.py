@@ -38,34 +38,45 @@ def _int(v): return type(v) is int and v >= 0
 def _bool(v): return type(v) is bool
 def _key(v): return type(v) is str and 0 < len(v) <= 120
 def _text(v): return type(v) is str and len(v) <= DETAIL_LIMIT
-def _enum(*names): return lambda v: type(v) is str and v in names
+def _enum(*names):
+    def check(v): return type(v) is str and v in names
+    check.values = names
+    return check
 def _size(v): return len(json.dumps(v, ensure_ascii=True))
-def _strings(v): return (type(v) is list and all(type(x) is str and len(x) <= 4096 for x in v)
-                         and _size(v) <= LIST_BYTES)
-def _argv_list(v): return (type(v) is list and all(type(a) is list and all(type(x) is str for x in a) for a in v)
-                           and _size(v) <= LIST_BYTES)
-def _argv_map(v): return (type(v) is dict and all(_id(k) and _argv_list(x) for k, x in v.items())
-                          and _size(v) <= LIST_BYTES)
+
+
+def _bounded(shape, limit=LIST_BYTES, items=None):
+    """A list-like type: ``shape`` (every item well formed), at most ``items`` items, at most ``limit`` bytes.
+
+    Marked by ``shape``: an over-long value keeps its longest passing head (``make``, ``_fit``).
+    """
+    def check(v): return shape(v) and (items is None or len(_items(v)) <= items) and _size(v) <= limit
+    check.shape = shape
+    return check
+
+
+def _strings_shape(v): return type(v) is list and all(type(x) is str and len(x) <= 4096 for x in v)
+def _argv_list_shape(v): return type(v) is list and all(type(a) is list and all(type(x) is str for x in a) for a in v)
 def _map_shape(v): return (type(v) is dict and all(_id(k) and type(x) is list
                                                     and all(type(p) is str and len(p) <= 4096 for p in x)
                                                     for k, x in v.items()))
-def _strings_map(v): return _map_shape(v) and _size(v) <= LIST_BYTES
+def _argv_map_shape(v): return type(v) is dict and all(_id(k) and _argv_list_shape(x) for k, x in v.items())
 def _superseded(v): return type(v) is dict and set(v) == {"kind", "reason"} and all(_id(x) for x in v.values())
 def _quota_window(v):
     return (type(v) is dict and set(v) == {"bucket", "used_percent", "resets_at"}
             and type(v["bucket"]) is str and 0 < len(v["bucket"]) <= 160
             and (type(v["used_percent"]) is int or (type(v["used_percent"]) is float and math.isfinite(v["used_percent"])))
             and v["used_percent"] >= 0 and (v["resets_at"] is None or _text(v["resets_at"]) and len(v["resets_at"]) <= 40))
-def _quota_windows(v): return type(v) is list and len(v) <= 16 and all(_quota_window(x) for x in v) and _size(v) <= 4096
+_strings = _bounded(_strings_shape)
+_argv_list = _bounded(_argv_list_shape)
+_argv_map = _bounded(_argv_map_shape)
+_strings_map = _bounded(_map_shape)
+_quota_windows = _bounded(lambda v: type(v) is list and all(_quota_window(x) for x in v), 4096, items=16)
 
 
 SOURCE_TYPES = {"task_id": _id, "dispatch_id": _id, "request_id": _id, "continuation_id": _id,
                 "artifact": _artifact, "artifact_digest": _digest}
 COMMON_DATA = {"detail": _text, "dropped_fields": _strings, "superseded": _superseded}
-LIST_FIELDS = {"patterns", "missing_commands", "options", "scope", "gaps", "suggested_scope", "widened",
-               "full_windows"}
-# Room kept for the bounded detail (every character escaped) when several lists share one stop value.
-DETAIL_RESERVE = 6 * DETAIL_LIMIT + 64
 
 REGISTRY = {}
 
@@ -206,6 +217,9 @@ _row("config_mismatch", "immutable_config", 2, "配置与创建时不一致", ("
 _row("config_mismatch", "shared_assets", 2, "共享资产与创建时不一致", ("resume {run}",))
 _row("unsupported_ledger", "ledger_version", 2, "台账版本不受支持", (), (), schema_version=_int, supported=_int)
 _row("busy", "run_lock", 3, "另一个进程持有运行锁", ())
+# Fields of a list-like type in any row: an over-long value keeps its head and records ``<field>_omitted``.
+LIST_FIELDS = frozenset(name for entry in REGISTRY.values() for name, check in entry["data"].items()
+                        if hasattr(check, "shape"))
 
 
 def bounded(text):
@@ -240,25 +254,105 @@ class _ExitFormatter(string.Formatter):
         return super().format_field(value, format_spec)
 
 
-def _count(value):
-    return len(value) if type(value) is list else sum(len(x) for x in value.values())
+def _items(value):
+    """A list's items, or a map of lists flattened in key order, then item order."""
+    if type(value) is list:
+        return list(value)
+    return [(key, item) for key, items in value.items() for item in items]
+
+
+def _build(value, items):
+    """A head of ``value`` from a prefix of its ``_items``."""
+    if type(value) is list:
+        return list(items)
+    head = {}
+    for key, item in items:
+        head.setdefault(key, []).append(item)
+    return head
+
+
+def _longest(count, fits, minimum=0):
+    """The largest k in [minimum, count] with ``fits(k)``, for ``fits`` true up to some k; None when not even ``minimum``."""
+    if not fits(minimum):
+        return None
+    low, high = minimum, count
+    while low < high:
+        middle = (low + high + 1) // 2
+        if fits(middle):
+            low = middle
+        else:
+            high = middle - 1
+    return low
 
 
 def _head(value, check):
-    """The longest head of a list, or of a strings map (task order, then pattern order), that passes ``check``."""
-    if type(value) is list:
-        kept = list(value)
-        while kept and not check(kept):
-            kept.pop()
-        return kept
-    kept = {}
-    for key, items in value.items():
-        for item in items:
-            trial = {**kept, key: [*kept.get(key, []), item]}
-            if not check(trial):
-                return kept
-            kept = trial
-    return kept
+    """The longest head of a list, or of a map of lists (key order, then item order), that passes ``check``."""
+    items = _items(value)
+    return _build(value, items[:_longest(len(items), lambda k: check(_build(value, items[:k]))) or 0])
+
+
+def _total(value):
+    """The measure of the whole stop value: the same serialization ``validate`` limits."""
+    return len(json.dumps(value, ensure_ascii=True))
+
+
+def _fit(value, original_length=None):
+    """Shrink a stop value in place until its whole serialization fits ``STOP_LIMIT``; return it.
+
+    The measure is the complete value (diagnostic, omission counts and every other field
+    included), never an estimate. Order: list fields no exit reads, the later-registered
+    first (each keeps its longest head and records ``<field>_omitted``); then the diagnostic
+    ``detail`` (shortened, finally removed) and other free texts no exit reads; last the list
+    fields an exit reads or is conditioned on, which keep at least one item so their exit
+    stays listed. Raises ValueError when even that cannot fit (identity fields alone too large).
+    """
+    if _total(value) <= STOP_LIMIT:
+        return value
+    entry = REGISTRY[(value["kind"], value["reason"])]
+    data = value["data"]
+    used = set(required_fields(value["kind"], value["reason"], data))
+    used |= {item[1].lstrip("!") for item in entry["exits"] if isinstance(item, tuple)}
+    lists = [name for name in reversed(list(entry["data"]))
+             if hasattr(entry["data"][name], "shape") and type(data.get(name)) in (list, dict) and data[name]]
+
+    def shrink(name, minimum):
+        original, items = data[name], _items(data[name])
+        prior = data.pop(name + "_omitted", 0)
+
+        def fits(k):
+            data[name] = _build(original, items[:k])
+            if prior + len(items) - k:
+                data[name + "_omitted"] = prior + len(items) - k
+            else:
+                data.pop(name + "_omitted", None)
+            return _total(value) <= STOP_LIMIT
+        kept = _longest(len(items), fits, minimum)
+        fits(minimum if kept is None else kept)
+        return kept is not None
+
+    def shorten(name, length):
+        text = data[name]
+        note = f"…（已截断，原文 {length if length is not None else len(text)} 字符）"
+        kept = _longest(max(0, len(text) - len(note)), lambda k: data.__setitem__(name, text[:k] + note) or
+                        _total(value) <= STOP_LIMIT)
+        if kept is None and name == "detail":
+            del data[name]  # the diagnostic only; the full text is on stderr
+            return _total(value) <= STOP_LIMIT
+        data[name] = text[:kept or 0] + note
+        return kept is not None
+
+    for name in [name for name in lists if name not in used]:
+        if shrink(name, 0):
+            return value
+    texts = ["detail"] + [name for name in reversed(list(entry["data"]))
+                          if entry["data"][name] is _text and name not in used]
+    for name in [name for name in texts if type(data.get(name)) is str]:
+        if shorten(name, original_length if name == "detail" else None):
+            return value
+    for name in [name for name in lists if name in used]:
+        if shrink(name, 1):
+            return value
+    raise ValueError("stop value does not fit even with every list and text shortened")
 
 
 def required_fields(kind, reason, data):
@@ -287,9 +381,11 @@ def make(kind, reason, *, data=None, source=None):
             raise KeyError(f"{kind}/{reason} has no data field {name}")
         if name == "detail" and type(value) is str:
             value = bounded(value)
-        if name in LIST_FIELDS and (type(value) is list or _map_shape(value)) and not check(value):
+        # A list keeps its longest head that passes (an unfit item ends it); a map of lists does
+        # only when every key and item is well formed, else it is dropped like any unfit value.
+        if hasattr(check, "shape") and not check(value) and (type(value) is list or check.shape(value)):
             kept = _head(value, check)
-            clean_data[name + "_omitted"] = _count(value) - _count(kept)
+            clean_data[name + "_omitted"] = len(_items(value)) - len(_items(kept))
             value = kept
         if check(value):
             clean_data[name] = value
@@ -302,21 +398,6 @@ def make(kind, reason, *, data=None, source=None):
             clean_source[name] = value
         else:
             dropped.append(name)
-    # Several bounded lists may still exceed the whole value's limit: shrink the
-    # later-listed ones first, keeping room for the bounded detail.
-    for name in reversed([name for name in entry["data"] if name in LIST_FIELDS and name in clean_data]):
-        if _size({"data": clean_data, "source": clean_source}) + DETAIL_RESERVE <= STOP_LIMIT:
-            break
-        value = clean_data[name]
-        if type(value) is list or _map_shape(value):
-            room = STOP_LIMIT - DETAIL_RESERVE - _size({"data": {**clean_data, name: type(value)()},
-                                                        "source": clean_source})
-            kept = _head(value, lambda v: _size(v) <= room)
-            clean_data[name + "_omitted"] = clean_data.get(name + "_omitted", 0) + _count(value) - _count(kept)
-            clean_data[name] = kept
-        else:
-            dropped.append(name)
-            del clean_data[name]
     if dropped:
         clean_data["dropped_fields"] = sorted(set(dropped))
     missing = [name for name in required_fields(kind, reason, clean_data)
@@ -324,7 +405,12 @@ def make(kind, reason, *, data=None, source=None):
     if missing:
         return {"kind": "unclassified", "reason": "untyped_harness_error", "source": {},
                 "data": {"error_type": "IncompleteStop", "dropped_fields": sorted(set(dropped) | set(missing))}}
-    return {"kind": kind, "reason": reason, "data": clean_data, "source": clean_source}
+    try:
+        # Several bounded fields may still exceed the whole value's limit together.
+        return _fit({"kind": kind, "reason": reason, "data": clean_data, "source": clean_source})
+    except ValueError:
+        return {"kind": "unclassified", "reason": "untyped_harness_error", "source": {},
+                "data": {"error_type": "OversizedStop"}}
 
 
 def missing_or_replaced(error):
@@ -467,6 +553,8 @@ def of(error):
             value = ({**carried, "data": dict(carried["data"]), "source": dict(carried["source"])}
                      if carried is not None else _fallback(error))
         value["data"]["detail"] = bounded(text)
+        # The diagnostic is the last field added: fit the complete value, then check it.
+        value = _fit(value, len(text))
         validate(value)
     except Exception:
         # Only a programming error gets here; the boundary still reports a valid stop.
