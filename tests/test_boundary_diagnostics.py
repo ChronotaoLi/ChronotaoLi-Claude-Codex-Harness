@@ -196,8 +196,12 @@ class BoundaryDiagnosticsTests(unittest.TestCase):
                 return result
 
         engine = Runtime(self.config, self.repo, backend=HiddenStateBackend())
-        with self.assertRaisesRegex(HarnessError, "受保护"):
+        # The seal's snapshot refuses .harness, so the returned result is never sealed: the
+        # immediate judgment finds it unsealed (spec-5 4.1); the cause stays on the dispatch.
+        with self.assertRaisesRegex(HarnessError, "before immutable seal"):
             engine.start("Implement greet", self.plan())
+        self.assertEqual((engine.run["stop"]["kind"], engine.run["stop"]["reason"]), ("evidence", "unsealed_return"))
+        self.assertIn("受保护", engine.run["dispatches"][-1]["error"])
         self.assertEqual(engine.run["accepted"], {})
         self.assertEqual([d["role"] for d in engine.run["dispatches"]], ["worker"])
         self.assertEqual(git.head(engine.worktree), engine.run["base_commit"])

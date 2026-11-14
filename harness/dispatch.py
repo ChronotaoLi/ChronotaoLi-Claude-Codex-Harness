@@ -42,44 +42,58 @@ def process_stop(failure, dispatch_id, task_id=None):
         return stops.make("evidence", "process_incomplete", data={"exit_unconfirmed": not outcome.exit_confirmed},
                           source=source)
     if outcome.started and not outcome.exit_confirmed:
-        return stops.make("process_unconfirmed", "dispatch_exit", source={"dispatch_id": dispatch_id})
+        return stops.make("process_unconfirmed", "dispatch_exit", data={"returned_unsealed": False},
+                          source={"dispatch_id": dispatch_id})
     return None
 
 
+def failure_stop(code, http_status, *, role, provider, dispatch_id, task_id, timeout, artifacts):
+    """The stop of a classified call failure (spec-5 8.3); ``artifacts`` maps file name to digest or None."""
+    from .provider_failures import STOPS
+    kind, reason = STOPS[code]
+    decisive = ("process.outcome.json" if code in ("agent_timeout", "local_start") or not artifacts.get("process.stdout")
+                else "process.stdout")
+    source = {"dispatch_id": dispatch_id, "task_id": task_id}
+    if artifacts.get(decisive):
+        source.update(artifact=str(artifacts["job"] / decisive), artifact_digest=artifacts[decisive])
+    if code == "agent_timeout":
+        data = {"role": role, "config_key": "runtime.agent_timeout_seconds", "limit_seconds": timeout}
+    elif code == "agent_turns":
+        data = {"role": role, "config_key": "runtime.claude_max_turns"}
+    else:
+        data = {"role": role, "provider": provider}
+    if http_status is not None and code not in ("agent_timeout", "local_start"):
+        data["http_status"] = http_status
+    return stops.make(kind, reason, data=data, source=source)
+
+
 def invocation_stop(failure, *, job, role, provider, dispatch_id, task_id, timeout):
-    """The type of a failed provider invocation: process facts, then the original exception's facts."""
-    from .diagnostics import invocation_diagnostics
+    """The type of a failed commander or reviewer invocation (spec-4 4.3, spec-5 6.1).
+
+    Process facts first (persistence or cleanup faults, unconfirmed exit, start
+    failure, timeout); everything else is the shared byte classifier, which reads
+    Claude's envelope fields and never Codex's messages. A worker's failure is typed
+    by its judgment instead (``Dispatcher.judge_worker_failure``).
+    """
+    import hashlib
+    from .provider_failures import classify, read_for_boundary
     from .util import ProcessStartError, ProcessTimeout
     value = process_stop(failure, dispatch_id, task_id)
     if value is not None:
         return value
     outcome = getattr(failure, "outcome", None)
-    source = {"dispatch_id": dispatch_id, "task_id": task_id}
-    facts = {"role": role, "provider": provider}
     if isinstance(failure, ProcessStartError) or (outcome is not None and not outcome.started):
-        return stops.make("provider_failure", "local_start", data=facts, source=source)
-    if isinstance(failure, ProcessTimeout):
-        return stops.make("budget", "agent_timeout", source=source, data={
-            "role": role, "config_key": "runtime.agent_timeout_seconds", "limit_seconds": timeout})
-    if provider == "claude" and _claude_subtype(job) == "error_max_turns":
-        return stops.make("budget", "agent_turns", data={"role": role, "config_key": "runtime.claude_max_turns"},
-                          source=source)
-    reported = invocation_diagnostics(job, provider, failure)["failure_class"] == "provider_reported"
-    if not reported and provider == "codex":
-        from .adapters import codex_error_summary
-        reported = bool(codex_error_summary(job / "process.stdout"))
-    return stops.make("provider_failure", "invocation_failed" if reported else "unknown", data=facts, source=source)
-
-
-def _claude_subtype(job):
-    import json
-    try:
-        with (Path(job) / "process.stdout").open("rb") as stream:
-            raw = stream.read(16 * 1024 * 1024 + 1)
-        envelope = json.loads(raw) if len(raw) <= 16 * 1024 * 1024 else None
-    except (OSError, ValueError, RecursionError):
-        return None
-    return envelope.get("subtype") if isinstance(envelope, dict) and envelope.get("type") == "result" else None
+        code = "local_start"
+    elif isinstance(failure, ProcessTimeout):
+        code = "agent_timeout"
+    else:
+        code = None
+    raw = {name: read_for_boundary(Path(job) / name) for name in ("process.outcome.json", "process.stdout")}
+    found = classify(raw["process.outcome.json"], raw["process.stdout"] or b"", provider)
+    artifacts = {"job": Path(job), **{name: hashlib.sha256(data).hexdigest() if data is not None else None
+                                      for name, data in raw.items()}}
+    return failure_stop(code or found["code"], None if code else found["http_status"], role=role, provider=provider,
+                        dispatch_id=dispatch_id, task_id=task_id, timeout=timeout, artifacts=artifacts)
 
 
 def dispatch_key(entry):
@@ -144,11 +158,7 @@ class Dispatcher(RuntimeService):
                 return result
             except UndecodableOutput as error:
                 if role == "worker":
-                    # The same classification and consumption as a resume after a
-                    # crash: an undecodable complete output is an invalid delivery.
-                    if self.services.worker_receipts.pending() is not None:
-                        raise
-                    return None
+                    return self.judge_worker_failure(key, error)
                 self.context.ensure_exited()
                 invalid = self.services.receipts.record_invalid(key, error, artifact=error.artifact)
                 if invalid.entry.get("retry_of"):
@@ -159,10 +169,43 @@ class Dispatcher(RuntimeService):
             except (InvalidReviewRejection, ScopeStop):
                 raise
             except HarnessError as error:
+                if role == "worker" and key in self.context.run["worker_receipts"]:
+                    return self.judge_worker_failure(key, error)
                 # Also covers post-receipt process/index checks. Worker receipt
                 # entry points record their own errors before this outer boundary.
                 self.services.receipts.record_receipt_error(receipts.get(key), error)
                 raise
+
+    def judge_worker_failure(self, key, error):
+        """Judge a failed worker call at once, with the code a replay after a crash runs (spec-5 3.2).
+
+        The exit is confirmed first: unconfirmed, the original failure leaves with the
+        exit's type and nothing is judged. A sealed return is never judged here. An
+        invalid output continues scheduling; any other verdict (retryable) has already
+        saved its judgment, exemption and consumption, and stops with its provider type.
+        """
+        receipts = self.services.worker_receipts
+        dispatch_id = self.context.run["worker_receipts"][key]["dispatch_id"]
+        try:
+            self.context.ensure_exited()
+        except HarnessError as unconfirmed:
+            if unconfirmed.stop is None:
+                raise
+            error.stop = unconfirmed.stop
+            raise error
+        if receipts.pending() is not None:
+            self.services.receipts.record_receipt_error(self.context.run["worker_receipts"].get(key), error)
+            raise error
+        entry = next(d for d in self.context.run["dispatches"] if d.get("id") == dispatch_id)
+        if entry.get("worker_receipt_consumed") == "result_rejected":
+            return None
+        evidence = entry["worker_return_evidence"]
+        job = self.context.directory / "dispatches" / dispatch_id
+        error.stop = failure_stop(evidence["provider"]["code"], evidence["provider"]["http_status"], role="worker",
+                                  provider="claude", dispatch_id=dispatch_id, task_id=entry["task_id"],
+                                  timeout=self.context.config.data["runtime"]["agent_timeout_seconds"],
+                                  artifacts={"job": job, **evidence["sources"]})
+        raise error
 
     @staticmethod
     def stop_invalid(role, invalid):
@@ -272,7 +315,6 @@ class Dispatcher(RuntimeService):
 
         invoked = False
         startup_interrupted = False
-        invocation_error = None
         try:
             from .workspace_inputs import validate_inputs
             validate_inputs(self.context.run, self.context.directory)
@@ -352,14 +394,17 @@ class Dispatcher(RuntimeService):
                                              on_start=on_start, task=task, kind=kind, on_outcome=on_outcome)
             except Exception as failure:
                 # The call boundary (spec 4.3): an untyped failure, or any failure carrying
-                # process facts, gets its type here; typed failures keep theirs.
-                if isinstance(failure, HarnessError) and failure.stop is not None:
+                # process facts, gets its type here; typed failures keep theirs. A worker's
+                # failure is typed by its judgment (spec-5 3.2); here it only becomes a
+                # HarnessError that keeps its process facts.
+                if isinstance(failure, HarnessError) and (failure.stop is not None or role == "worker"):
                     raise
                 if not isinstance(failure, HarnessError) and getattr(failure, "outcome", None) is None:
                     raise
-                stop = invocation_stop(failure, job=job, role=role, dispatch_id=dispatch_id, task_id=task_id,
-                                       provider=self.context.config.role(role, self.context.commander)["cli"],
-                                       timeout=self.context.config.data["runtime"]["agent_timeout_seconds"])
+                stop = None if role == "worker" else invocation_stop(
+                    failure, job=job, role=role, dispatch_id=dispatch_id, task_id=task_id,
+                    provider=self.context.config.role(role, self.context.commander)["cli"],
+                    timeout=self.context.config.data["runtime"]["agent_timeout_seconds"])
                 if isinstance(failure, HarnessError):
                     failure.stop = stop
                     raise
@@ -388,12 +433,10 @@ class Dispatcher(RuntimeService):
             # Already judged: the entry carries its verdict, never "failed".
             raise
         except BaseException as error:
-            invocation_error = error
             startup_interrupted = (isinstance(error, (KeyboardInterrupt, SystemExit))
                                    and entry["process_state"] == "starting" and entry["pgid"] is None)
-            # Read and inspect first (Git, evidence digests); change the entry after.
-            recovery = (self.services.workflow.worker_recovery(task_id, dispatch_id, job)
-                        if role == "worker" and invoked else None)
+            # Read and inspect first (evidence digests); change the entry after. A worker's
+            # recovery record is published by its judgment (spec-5 7.1), not here.
             bound = {}
             receipt = None
             if role in ("reviewer", "commander"):
@@ -412,8 +455,6 @@ class Dispatcher(RuntimeService):
                 entry["error"] = str(error)
             if receipt is not None:
                 receipt.update(bound)
-            if recovery is not None:
-                self.context.run.setdefault("worker_recovery", {})[task_id] = recovery
             raise
         finally:
             if process_outcome is None:
@@ -427,7 +468,7 @@ class Dispatcher(RuntimeService):
                 # Telemetry is best effort and cannot change acceptance/recovery.
                 try:
                     from .diagnostics import invocation_diagnostics
-                    entry["diagnostics"] = invocation_diagnostics(job, self.context.config.role(role, self.context.commander)["cli"], invocation_error)
+                    entry["diagnostics"] = invocation_diagnostics(job, self.context.config.role(role, self.context.commander)["cli"])
                     usage = provider_usage(job, self.context.config.role(role, self.context.commander)["cli"])
                     if usage is not None:
                         entry["provider_usage"] = usage

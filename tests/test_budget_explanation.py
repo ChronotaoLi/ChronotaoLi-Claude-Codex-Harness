@@ -7,8 +7,10 @@ from harness.versions import RUN_SCHEMA_VERSION
 class BudgetExplanationTests(unittest.TestCase):
     def test_counts_unique_candidates_and_separate_failure_correction_dimensions(self):
         workers = [{'id': 'd'+str(i), 'role': 'worker', 'task_id': 'x', 'invoked': True, 'pgid': 100+i,
-                    'status': 'completed' if i < 3 else 'failed',
-                    'diagnostics': {'failure_class': 'provider_reported'}} for i in range(5)]
+                    'status': 'completed' if i < 3 else 'failed'} for i in range(5)]
+        for entry in workers[3:]:  # judged worker failures carry their provider classification
+            entry.update(worker_receipt_consumed='provider_failure', worker_return_evidence={
+                'state': 'retryable', 'provider': {'code': 'invocation_failed', 'http_status': None}})
         invalid = [{'id': 'c1', 'role': 'commander', 'kind': 'decide', 'task_id': 'run', 'invoked': True, 'status': 'invalid'},
                    {'id': 'r1', 'role': 'reviewer', 'task_id': 'x', 'invoked': True, 'status': 'invalid'}]
         records = [{'artifact': 'review'+str(i), 'worker_source': {'dispatch_id': 'd'+str(i),
@@ -22,7 +24,7 @@ class BudgetExplanationTests(unittest.TestCase):
         dimensions = report['dimensions']
         self.assertEqual(dimensions['actual_worker_invocations'], 5)
         self.assertEqual(dimensions['reviewed_worker_candidates'], 3)
-        self.assertEqual(dimensions['failed_worker_invocations']['provider_reported'], 2)
+        self.assertEqual(dimensions['worker_failure_verdicts']['invocation_failed'], 2)
         self.assertEqual(dimensions['invalid_outputs'], {'commander': 1, 'worker': 0, 'reviewer': 1})
         self.assertEqual(report['limits']['task_work']['x']['remaining'], 0)
         # There is no run-wide worker counter or limit to explain.
@@ -39,8 +41,10 @@ class BudgetExplanationTests(unittest.TestCase):
 
     def test_charged_start_failure_is_not_an_actual_process_start(self):
         run = {'dispatches': [{'id': 'failed', 'role': 'worker', 'invoked': True, 'pgid': None,
-                              'status': 'failed', 'diagnostics': {'failure_class': 'local_start'}}]}
+                              'status': 'failed', 'worker_receipt_consumed': 'provider_failure',
+                              'worker_return_evidence': {'state': 'retryable',
+                                                         'provider': {'code': 'local_start', 'http_status': None}}}]}
         dimensions = budget_explanation(run, {})['dimensions']
         self.assertEqual(dimensions['charged_worker_invocations'], 1)
         self.assertEqual(dimensions['actual_worker_invocations'], 0)
-        self.assertEqual(dimensions['failed_worker_invocations']['local_start'], 1)
+        self.assertEqual(dimensions['worker_failure_verdicts']['local_start'], 1)

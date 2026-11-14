@@ -189,7 +189,8 @@ def _cli_arguments(option):
 def _exit_unconfirmed(entry):
     from . import stops
     ident = entry.get("id")
-    return stops.make("process_unconfirmed", "dispatch_exit", source={"dispatch_id": ident} if isinstance(ident, str) else {})
+    return stops.make("process_unconfirmed", "dispatch_exit", data={"returned_unsealed": False},
+                      source={"dispatch_id": ident} if isinstance(ident, str) else {})
 
 
 def ensure_dispatches_exited(dispatches, *, observe=group_alive):

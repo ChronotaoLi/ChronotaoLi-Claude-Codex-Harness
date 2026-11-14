@@ -148,7 +148,7 @@ class Verification(RuntimeService):
                 raise error
             self.context.ensure_exited()
             if not result["exit_confirmed"]:
-                raise HarnessError("Verification process exit is unknown; inspect " + str(log), stop=stops.make("process_unconfirmed", "dispatch_exit", source={"dispatch_id": entry["id"]}))
+                raise HarnessError("Verification process exit is unknown; inspect " + str(log), stop=stops.make("process_unconfirmed", "dispatch_exit", data={"returned_unsealed": False}, source={"dispatch_id": entry["id"]}))
             if phase == "setup" and checks_failed(result):
                 break
         return results

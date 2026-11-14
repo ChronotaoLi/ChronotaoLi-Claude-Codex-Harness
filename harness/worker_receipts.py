@@ -207,13 +207,26 @@ class WorkerReceipts(RuntimeService):
                 raise HarnessError('invalid worker receipt identity')
 
     def pending(self):
+        """Judge an unsealed worker receipt: the one code for a failed call and its replay.
+
+        An unconfirmed exit stops before any judgment and before the error handler,
+        so the dispatch entry keeps its own failure text. A failed judgment records
+        its text only on an entry that has none, then saves (with any verdict
+        ``_pending`` set for a returned or unknown output).
+        """
+        self.context.ensure_exited()
         try:
             return self._pending()
         except HarnessError as error:
             receipts = self.context.run['worker_receipts']
-            if isinstance(receipts, dict) and len(receipts) == 1:
-                receipt = next(iter(receipts.values()))
-                self.services.receipts.record_receipt_error(receipt, error)
+            receipt = next(iter(receipts.values())) if isinstance(receipts, dict) and len(receipts) == 1 else None
+            if isinstance(receipt, dict):
+                matches = [e for e in self.context.run['dispatches']
+                           if isinstance(e, dict) and e.get('id') == receipt.get('dispatch_id')]
+                if len(matches) == 1:
+                    if not matches[0].get('error'):
+                        matches[0].update(status='failed', error=str(error))
+                    self.context.save()
             raise
 
     def _pending(self):
@@ -233,10 +246,17 @@ class WorkerReceipts(RuntimeService):
                 else:
                     validate_return_evidence(job, evidence)
             if evidence['state'] == 'retryable':
+                from .provider_failures import EXEMPT
                 error = HarnessError(entry.get('error') or 'Worker invocation requires a fresh attempt: ' + evidence['reason'])
-                # Classification, failure provenance and receipt retirement share
-                # one commit, including when a crash skipped dispatch.finally.
-                self.reject(key, error, 'provider_failure', evidence=evidence)
+                exemption = None
+                if evidence['provider']['code'] in EXEMPT:
+                    # Bound to the envelope the verdict read; rechecked at load and before every dispatch.
+                    exemption = {'basis': 'provider_error', 'code': evidence['provider']['code'],
+                                 'artifact': str(job / 'process.stdout'),
+                                 'artifact_digest': evidence['sources']['process.stdout']}
+                # Classification, exemption, failure provenance and receipt retirement
+                # share one commit, whether judged at once or on replay after a crash.
+                self.reject(key, error, 'provider_failure', evidence=evidence, exemption=exemption)
                 return None
             if evidence['state'] == 'invalid':
                 # A complete output that is not a decodable object result is an
@@ -360,7 +380,7 @@ class WorkerReceipts(RuntimeService):
         entry.update(worker_outcome=worker_outcome, status='completed')
         return {k: v for k, v in result.items() if k not in ('task_id', 'dispatch_id')}
 
-    def reject(self, key, error, reason, *, status='failed', invalid_output=None, evidence=None):
+    def reject(self, key, error, reason, *, status='failed', invalid_output=None, evidence=None, exemption=None):
         """Retire a deterministically rejected result without accepting it.
 
         An invalid output (status ``invalid``) is one spent work attempt: the
@@ -372,19 +392,15 @@ class WorkerReceipts(RuntimeService):
         receipt = self.context.run['worker_receipts'][key]
         entry = self.entry(receipt)
         job = Path(receipt['artifact']).parent
-        previous = self.context.run.get('worker_recovery', {}).get(entry['task_id'])
-        recovery = None
-        if reason != 'provider_failure' or not previous or previous.get('dispatch_id') != entry['id']:
-            # A later classification must not replace an observed timeout or
-            # cancellation with the generic recovery error used to retire it.
-            recovery = self.services.workflow.worker_recovery(entry['task_id'], entry['id'], job)
+        recovery = self.services.workflow.worker_recovery(entry['task_id'], entry['id'], job)
+        if exemption is not None:
+            entry['attempt_exemption'] = exemption
         if evidence is not None:
             entry['worker_return_evidence'] = evidence
         entry.update(status=status, error=str(error))
         if invalid_output is not None:
             entry['invalid_output'] = invalid_output
-        if recovery is not None:
-            self.context.run.setdefault('worker_recovery', {})[entry['task_id']] = recovery
+        self.context.run.setdefault('worker_recovery', {})[entry['task_id']] = recovery
         self.consume(key, reason)
         self.context.save()
         if status == 'invalid':
@@ -398,6 +414,26 @@ class WorkerReceipts(RuntimeService):
         rejection = reason in ('provider_failure', 'scope_rejected', 'result_rejected', 'invalid_blocker')
         if not rejection and recovery and recovery.get('dispatch_id') == receipt['dispatch_id']:
             self.context.run['worker_recovery'].pop(task_id)
+
+
+def returned_unsealed(run, directory, dispatch_id):
+    """Whether this dispatch is a worker whose object result was returned but never sealed.
+
+    ``response.json``/``returned-result.json`` exist only after the runtime decoded an
+    object result, and then the no-result judgment is ``returned`` whatever the
+    process still writes: confirming the exit can only lead to abandoning (spec-5 16.3).
+    A read-only look at the ledger and the dispatch directory.
+    """
+    receipts = run.get('worker_receipts')
+    receipt = next((r for r in receipts.values() if isinstance(r, dict) and r.get('dispatch_id') == dispatch_id),
+                   None) if isinstance(receipts, dict) else None
+    if receipt is None or not isinstance(dispatch_id, str) or not dispatch_id or '/' in dispatch_id:
+        return False
+    job = Path(directory) / 'dispatches' / dispatch_id
+    if any(job.glob('worker-seal.*.json')):
+        return False
+    return any((job / name).is_file() and not (job / name).is_symlink()
+               for name in ('response.json', 'returned-result.json'))
 
 
 def validate_worker_receipt_links(run, directory):

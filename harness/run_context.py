@@ -98,7 +98,17 @@ class RunContext:
 
     def ensure_exited(self):
         validate_command_directories(self.run["dispatches"], self.directory)
-        for entry in ensure_dispatches_exited(self.run["dispatches"], observe=group_alive):
+        try:
+            exited = ensure_dispatches_exited(self.run["dispatches"], observe=group_alive)
+        except HarnessError as error:
+            stop = error.stop
+            if isinstance(stop, dict) and stop.get("kind") == "process_unconfirmed":
+                # The exits listed depend on whether a returned result waits unsealed.
+                from .worker_receipts import returned_unsealed
+                stop["data"]["returned_unsealed"] = returned_unsealed(
+                    self.run, self.directory, stop["source"].get("dispatch_id"))
+            raise
+        for entry in exited:
             entry["exit_confirmed"] = True
 
     def confirm_exited(self, identifiers):

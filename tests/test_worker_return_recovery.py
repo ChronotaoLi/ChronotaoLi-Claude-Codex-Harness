@@ -102,7 +102,11 @@ class WorkerReturnClassificationTests(unittest.TestCase):
                     (job / filename).write_bytes(data if isinstance(data, bytes) else data.encode())
                 record = inspect_return(job)
                 self.assertEqual((record['state'], record['reason']), (state, reason))
-                self.assertEqual(set(record), {'version', 'state', 'reason', 'sources'})
+                self.assertEqual(set(record), {'version', 'state', 'reason', 'sources', 'provider'})
+                self.assertEqual(record['version'], 2)
+                # No process record in these rows: a retryable one is never provider-classified.
+                self.assertEqual(record['provider'],
+                                 {'code': 'unknown', 'http_status': None} if state == 'retryable' else None)
                 self.assertEqual(record['sources'], {
                     source: hashlib.sha256((job / source).read_bytes()).hexdigest() if (job / source).exists() else None
                     for source in SOURCES})
@@ -243,6 +247,7 @@ class WorkerReturnRecoveryTests(RepoCase):
         with self.assertRaises(ProcessTimeout):
             engine.start('Implement greet', self.plan())
         first = engine.run['dispatches'][-1]
+        self.assertEqual(first['worker_receipt_consumed'], 'provider_failure')  # judged at once, before any resume
         job = engine.directory / 'dispatches' / first['id']
         self.assertEqual((job / 'process.stdout').read_bytes(), b'')
         self.assertFalse((job / 'capture-manifest.json').exists())
@@ -255,11 +260,12 @@ class WorkerReturnRecoveryTests(RepoCase):
         self.assertEqual((entry['worker_return_evidence']['state'], entry['worker_return_evidence']['reason']),
                          ('retryable', 'direct JSON output is absent or empty after exit'))
         self.assertEqual(entry['worker_receipt_consumed'], 'provider_failure')
-        # Every invoked Claude dispatch now records diagnostics; the timeout is counted as one.
-        self.assertEqual(entry['diagnostics']['failure_class'], 'local_timeout')
+        # The failure was judged when it happened, from the process record: a counted timeout.
+        self.assertEqual(entry['worker_return_evidence']['provider'], {'code': 'agent_timeout', 'http_status': None})
+        self.assertNotIn('attempt_exemption', entry)
         from harness.cli import status_summary
-        failures = status_summary(run)['budget_explanation']['dimensions']['failed_worker_invocations']
-        self.assertEqual(failures['local_timeout'], 1)
+        verdicts = status_summary(run)['budget_explanation']['dimensions']['worker_failure_verdicts']
+        self.assertEqual(verdicts['agent_timeout'], 1)
 
     def test_unsealed_result_cannot_be_deleted_to_turn_into_retry(self):
         class ReturnedThenInterrupted(DemoBackend):
@@ -322,12 +328,16 @@ class Stub(DemoBackend):
             program = 'import sys; sys.exit(1)'
         if boundary == 'truncated':
             program = 'print(\'{"type":"result","subtype":"succ\', end="", flush=True)'
+        if boundary == 'quota':
+            quota = {'type': 'result', 'subtype': 'success', 'is_error': True, 'api_error': 'usage_limit_reached',
+                     'api_error_status': 429, 'result': 'SYNTHETIC'}
+            program = 'import sys; print(' + repr(json.dumps(quota)) + ', flush=True); sys.exit(1)'
         cli.command = lambda *args: [sys.executable, '-c', program]
         try:
             return cli.invoke(**kwargs)
         except HarnessError:
             # Killed after the adapter's verdict, before any judgment is saved.
-            if boundary in ('no_output', 'truncated'):
+            if boundary in ('no_output', 'truncated', 'quota'):
                 os.kill(os.getpid(), signal.SIGKILL)
             raise
 Runtime(config, repo, backend=Stub()).start('Implement greet', read_json(root / 'examples/plan.json'))
@@ -355,6 +365,21 @@ Runtime(config, repo, backend=Stub()).start('Implement greet', read_json(root / 
         result = engine.resume(run['id'])
         self.assertEqual(result['status'], 'completed')
         self.assertEqual(result['attempts']['greet'], 2)
+
+    def test_controller_death_after_quota_failure_reaches_the_same_exemption(self):
+        """Window A (spec-5 3.5): killed after the adapter raised, before the failure was even recorded."""
+        stub_provider_clis(self)
+        run, directory = self.crash_controller('quota')
+        first = run['dispatches'][0]
+        self.assertIn('worker:implement:greet', run['worker_receipts'])
+        self.assertNotIn('error', first)
+        result = self.engine().resume(run['id'])
+        self.assertEqual(result['status'], 'completed')
+        entry = result['dispatches'][0]
+        self.assertEqual(entry['worker_return_evidence']['provider'], {'code': 'usage_limit', 'http_status': 429})
+        self.assertEqual(entry['attempt_exemption']['code'], 'usage_limit')
+        self.assertTrue(entry['error'].startswith('Worker invocation requires a fresh attempt'))
+        self.assertEqual(result['attempts'], {'greet': 2})
 
     def test_success_terminal_survives_sigkill_before_publication(self):
         stub_provider_clis(self)
@@ -400,7 +425,8 @@ Runtime(config, repo, backend=Stub()).start('Implement greet', read_json(root / 
         evidence = entry['worker_return_evidence']
         self.assertEqual((evidence['state'], evidence['reason']),
                          ('invalid', 'worker output is not a decodable object result: JSONDecodeError'))
-        self.assertEqual(set(evidence), {'version', 'state', 'reason', 'sources'})
+        self.assertEqual(set(evidence), {'version', 'state', 'reason', 'sources', 'provider'})
+        self.assertIsNone(evidence['provider'])
         self.assertEqual(set(evidence['sources']), set(SOURCES))
         stdout = engine.directory / 'dispatches' / entry['id'] / 'process.stdout'
         self.assertEqual(evidence['sources']['process.stdout'], hashlib.sha256(stdout.read_bytes()).hexdigest())

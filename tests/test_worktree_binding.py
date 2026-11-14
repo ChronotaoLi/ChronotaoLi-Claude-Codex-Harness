@@ -5,6 +5,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from harness import git
+from harness.adapters import DemoBackend
 from harness.cleanup import cleanup_run
 from harness.memory import Memory, validate_proposals
 from harness.util import HarnessError, read_json, write_json
@@ -189,8 +190,12 @@ class EngineWorktreeBindingTests(RepoCase):
         backend = ScriptedBackend(redirect)
         engine = self.engine(backend)
         main_index = (self.repo / ".git" / "index").read_bytes()
-        with self.assertRaisesRegex(HarnessError, "绑定"):
+        # The redirect makes the seal's snapshot fail: the returned result is never sealed, so the
+        # immediate judgment stops at unsealed_return (spec-5 4.1); the cause stays on the dispatch.
+        with self.assertRaisesRegex(HarnessError, "before immutable seal"):
             engine.start("Implement greet", read_json(ROOT / "examples" / "plan.json"))
+        self.assertEqual((engine.run["stop"]["kind"], engine.run["stop"]["reason"]), ("evidence", "unsealed_return"))
+        self.assertIn("绑定", engine.run["dispatches"][-1]["error"])
         self.assertFalse(engine.run["accepted"])
         self.assertEqual(len(backend.calls), 1)
         self.assertEqual(sum(engine.run["attempts"].values()), 1)
@@ -199,9 +204,8 @@ class EngineWorktreeBindingTests(RepoCase):
         self.assertEqual((self.repo / ".git" / "index").read_bytes(), main_index)
         self.assertFalse((self.repo / "hello.py").exists())
         with self.assertRaisesRegex(HarnessError, "绑定"):
-            self.engine(backend).resume(engine.run["id"])
-        # Row binding-changed: the listed exit, abandon.
-        walk_exit(self, engine.directory, ("workspace_mismatch", "binding_changed"), backend=backend,
+            self.engine(backend).resume(engine.run["id"])  # the resume preflight reports the binding itself
+        walk_exit(self, engine.directory, ("evidence", "unsealed_return"), backend=backend,
                   expect_status="abandoned")
         removal = cleanup_run(self.repo, engine.run["id"], remove=True)["worktree"]
         self.assertEqual(removal["status"], "blocked")
@@ -227,6 +231,9 @@ class EngineWorktreeBindingTests(RepoCase):
         self.assertEqual(git.head(self.repo), base)
         self.assertEqual((self.repo / ".git" / "index").read_bytes(), main_index)
         self.assertEqual(git.git(self.repo, "rev-parse", engine.run["branch"]).strip(), base)
+        # Row binding-changed: the listed exit, abandon.
+        walk_exit(self, engine.directory, ("workspace_mismatch", "binding_changed"), backend=DemoBackend(),
+                  expect_status="abandoned")
 
 
 if __name__ == "__main__":

@@ -46,7 +46,7 @@ class RegistryGuard(unittest.TestCase):
         expected = {"evidence": 1, "workspace_mismatch": 1, "scope_violation": 1, "runtime_failure": 1,
                     "unclassified": 1, "interrupted": 130, "plan_approval": 0, "invalid_input": 2,
                     "config_mismatch": 2, "unsupported_ledger": 2}
-        self.assertEqual(len(stops.REGISTRY), 54)
+        self.assertEqual(len(stops.REGISTRY), 58)  # 54 from step 4, four provider types from step 5
         for (kind, reason), entry in stops.REGISTRY.items():
             with self.subTest(row=(kind, reason)):
                 self.assertEqual(entry["exit_code"], expected.get(kind, 3))
@@ -175,8 +175,9 @@ def with_outcome(error, **fields):
 
 
 class ProcessMatrix(unittest.TestCase):
+    """The commander/reviewer call boundary; a worker's failure is typed by its judgment (spec-5 2.7)."""
     def kind(self, error, job=Path("/nonexistent/job")):
-        value = invocation_stop(error, job=job, role="worker", provider="claude", dispatch_id="d1",
+        value = invocation_stop(error, job=job, role="commander", provider="claude", dispatch_id="d1",
                                 task_id="t1", timeout=600)
         return value["kind"] + "/" + value["reason"]
 
@@ -215,11 +216,18 @@ class ProcessMatrix(unittest.TestCase):
         import tempfile
         with tempfile.TemporaryDirectory() as folder:
             job = Path(folder)
+            # The envelope is read only after a normal, complete process end (spec-5 2.2).
+            (job / "process.outcome.json").write_text(json.dumps(ProcessOutcome(
+                started=True, startup_state="started", exit_code=1, exit_confirmed=True).to_dict()))
             (job / "process.stdout").write_text(json.dumps({"type": "result", "subtype": "error_max_turns", "is_error": True}))
             self.assertEqual(self.kind(HarnessError("exit=1"), job), "budget/agent_turns")
             (job / "process.stdout").write_text(json.dumps({"type": "result", "subtype": "error_during_execution",
                                                             "is_error": True}))
             self.assertEqual(self.kind(HarnessError("exit=1"), job), "provider_failure/invocation_failed")
+            (job / "process.stdout").write_text(json.dumps({"type": "result", "subtype": "error_max_turns", "is_error": True}))
+            (job / "process.outcome.json").write_text(json.dumps(ProcessOutcome(
+                started=True, exit_code=1, exit_confirmed=True, cleanup_errors=[{"step": "sigterm"}]).to_dict()))
+            self.assertEqual(self.kind(HarnessError("exit=1"), job), "provider_failure/unknown")  # incomplete record
 
     def test_unconfirmed_incomplete_process_lists_only_the_confirming_abandon(self):
         error = with_outcome(ProcessTimeout(1, Path("/x")), started=True, exit_confirmed=False,
@@ -364,7 +372,9 @@ class SettledStops(RepoCase):
             engine.start("Implement greet", plan())
         ledger = read_json(engine.directory / "state.json")["stop"]
         self.assertEqual((ledger["kind"], ledger["reason"]), ("evidence", "load_integrity"))
-        self.assertEqual(ledger["data"]["superseded"], {"kind": "evidence", "reason": "process_incomplete"})
+        # A worker's failure is judged (spec-5 2.7): the judgment's own load check finds the
+        # damaged packet first, and settling turns that evidence stop into the load failure.
+        self.assertEqual(ledger["data"]["superseded"], {"kind": "evidence", "reason": "runtime_integrity"})
         self.assertEqual(stops.of(caught.exception)["reason"], "load_integrity")
         self.assertTrue(refused(self, engine.run["id"]))
 

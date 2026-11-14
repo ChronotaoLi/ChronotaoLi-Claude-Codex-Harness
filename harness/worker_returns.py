@@ -1,7 +1,8 @@
 """Classify an exited worker's durable output without inventing a return.
 
-There is one transport: Claude's JSON output in process.stdout. These records
-never bind a candidate.
+There is one transport: Claude's JSON output in process.stdout. A retryable
+record also carries the provider classification of the failure (version 2,
+``provider``), derived from the same bytes. These records never bind a candidate.
 """
 import hashlib
 
@@ -85,24 +86,33 @@ def inspect_return(job):
     complete output that does not decode to an object result. A decodable
     object result without a candidate seal stays returned (it may be a blocker).
     """
+    from .provider_failures import classify
     sources = fingerprint(job, SOURCES)
+    provider = None
 
     def result(state, reason):
         # A writer or external edit must not race the classification.
         if fingerprint(job, SOURCES) != sources:
             raise HarnessError('worker return evidence changed during inspection')
-        return {'version': 1, 'state': state, 'reason': reason, 'sources': sources}
+        return {'version': 2, 'state': state, 'reason': reason, 'sources': sources,
+                'provider': provider if state == 'retryable' else None}
 
     if sources['returned-result.json'] is not None or sources['response.json'] is not None:
         return result('returned', 'worker result exists without a candidate seal')
     try:
         raw = _read_limited(job, 'process.stdout') if sources['process.stdout'] is not None else b''
         kind, envelope, _, detail = decode_terminal(raw)
+        outcome = (_read_limited(job, 'process.outcome.json')
+                   if sources['process.outcome.json'] is not None else None)
+        # Worker calls are Claude only (the configuration refuses a Codex worker).
+        provider = classify(outcome, raw, 'claude')
         if sources['provider-result.json'] is not None:
-            provider = strict_json_loads(_read_limited(job, 'provider-result.json'))
-            if envelope is None or provider != envelope:
+            published = strict_json_loads(_read_limited(job, 'provider-result.json'))
+            if envelope is None or published != envelope:
                 return result('unknown', 'provider result conflicts with original output')
-    except (OSError, ValueError, UnicodeError, RecursionError) as error:
+    except (ValueError, UnicodeError, RecursionError) as error:
+        # Over the limit or not strictly decodable: a property of the bytes. An
+        # OSError is not; it leaves (local I/O) and no verdict is recorded.
         return result('unknown', 'unreadable worker return evidence: ' + type(error).__name__)
     if kind == 'absent':
         return result('retryable', 'direct JSON output is absent or empty after exit')
@@ -113,9 +123,19 @@ def inspect_return(job):
     return result('invalid', 'worker output is not a decodable object result: ' + detail)
 
 
+def _provider_shape(record):
+    from .provider_failures import CODES
+    provider = record.get('provider')
+    if record.get('state') != 'retryable':
+        return provider is None
+    return (isinstance(provider, dict) and set(provider) == {'code', 'http_status'}
+            and provider['code'] in CODES
+            and (provider['http_status'] is None or type(provider['http_status']) is int))
+
+
 def validate_return_evidence(job, record):
-    if (not isinstance(record, dict) or set(record) != {'version', 'state', 'reason', 'sources'}
-            or record['version'] != 1 or record['state'] not in STATES
+    if (not isinstance(record, dict) or set(record) != {'version', 'state', 'reason', 'sources', 'provider'}
+            or record['version'] != 2 or record['state'] not in STATES or not _provider_shape(record)
             or not isinstance(record['reason'], str)
             or not isinstance(record['sources'], dict) or set(record['sources']) != set(SOURCES)):
         raise HarnessError('invalid worker return evidence record')

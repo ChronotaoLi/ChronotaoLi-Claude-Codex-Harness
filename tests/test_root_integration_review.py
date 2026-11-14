@@ -9,7 +9,8 @@ class RootIntegrationReviewTests(unittest.TestCase):
     def test_dimensions_deduplicate_and_preserve_unknown_candidates(self):
         workers = [dict(id=f'w{i}', role='worker', invoked=True, pgid=100+i, task_id='task', status='finished') for i in range(5)]
         for worker in workers[3:]:
-            worker.update(status='failed', diagnostics={'failure_class': 'provider_reported'})
+            worker.update(status='failed', worker_receipt_consumed='provider_failure', worker_return_evidence={
+                'state': 'retryable', 'provider': {'code': 'invocation_failed', 'http_status': None}})
         run = dict(id='run_abc', dispatches=workers + [copy.deepcopy(workers[0]),
                    dict(id='unlinked', role='worker', task_id='task')],
                    review_history={'task': [dict(artifact=f'review{i}', worker_source={
@@ -22,7 +23,7 @@ class RootIntegrationReviewTests(unittest.TestCase):
         dims = report['dimensions']
         self.assertEqual(dims['actual_worker_invocations'], 5)
         self.assertEqual(dims['reviewed_worker_candidates'], 3)
-        self.assertEqual(dims['failed_worker_invocations']['provider_reported'], 2)
+        self.assertEqual(dims['worker_failure_verdicts']['invocation_failed'], 2)
         self.assertEqual(dims['duplicate_dispatch_ids'], 1)
         self.assertEqual(dims['unlinked_review_records'], 1)
         self.assertEqual(report['limits']['task_work']['task']['remaining'], 0)

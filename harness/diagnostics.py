@@ -4,8 +4,6 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from .util import ProcessStartError, ProcessTimeout
-
 
 def _identifier(value):
     return value if isinstance(value, str) and 0 < len(value) <= 160 and all(
@@ -30,14 +28,9 @@ def permission_denial_projection(value):
     return projected
 
 
-def invocation_diagnostics(job, provider, error=None):
-    value = {'failure_class': None, 'permission_denials': {'status': 'unknown'}}
-    if isinstance(error, ProcessTimeout):
-        value['failure_class'] = 'local_timeout'
-    elif isinstance(error, ProcessStartError):
-        value['failure_class'] = 'local_start'
-    elif error is not None:
-        value['failure_class'] = 'unknown'
+def invocation_diagnostics(job, provider):
+    """Provider-reported permission denials; why a call failed is its stop and judgment record."""
+    value = {'permission_denials': {'status': 'unknown'}}
     if provider == 'claude':
         try:
             with (job / 'process.stdout').open('rb') as stream:
@@ -46,9 +39,6 @@ def invocation_diagnostics(job, provider, error=None):
                 envelope = json.loads(raw)
                 if isinstance(envelope, dict) and envelope.get('type') == 'result':
                     value['permission_denials'] = permission_denial_projection(envelope)
-                    if error is not None and (envelope.get('is_error') is True
-                            or envelope.get('subtype') not in (None, 'success')):
-                        value['failure_class'] = 'provider_reported'
         except (OSError, ValueError, RuntimeError):
             pass
     return value
@@ -132,20 +122,26 @@ def budget_explanation(run, work):
                 reviewed.add(ident)
             else:
                 unlinked.add((task_id, record.get('artifact')))
-    failures = dict.fromkeys(('provider_reported', 'local_timeout', 'local_start', 'unknown'), 0)
-    exemptions = dict.fromkeys(('environment', 'operator', 'unknown'), 0)
+    from .provider_failures import CODES, EXEMPT
+    # Judged worker failures, by the provider code their judgment record carries.
+    verdicts = dict.fromkeys((*CODES, 'malformed'), 0)
+    exemptions = dict.fromkeys(('environment', 'operator', *EXEMPT, 'unknown'), 0)
     for entry in workers.values():
-        diag = entry.get('diagnostics') or {}
-        if entry.get('status') == 'failed':
-            kind = diag.get('failure_class') if isinstance(diag, dict) else None
-            failures[kind if kind in failures else 'unknown'] += 1
+        if entry.get('worker_receipt_consumed') == 'provider_failure':
+            evidence = entry.get('worker_return_evidence')
+            provider = evidence.get('provider') if isinstance(evidence, dict) else None
+            code = provider.get('code') if isinstance(provider, dict) else None
+            verdicts[code if isinstance(code, str) and code in CODES else 'malformed'] += 1
         exempt = entry.get('attempt_exemption')
         if exempt:
-            kind = exempt.get('blocker_kind') if isinstance(exempt, dict) else None
+            kind = None
+            if isinstance(exempt, dict):
+                kind = exempt.get('code') if exempt.get('basis') == 'provider_error' else exempt.get('blocker_kind')
             bound = (isinstance(exempt, dict) and isinstance(exempt.get('artifact_digest'), str)
                      and len(exempt['artifact_digest']) == 64 and isinstance(exempt.get('artifact'), str)
                      and Path(exempt['artifact']).parent.name == entry['id'])
-            exemptions[kind if bound and kind in ('environment', 'operator') else 'unknown'] += 1
+            known = bound and isinstance(kind, str) and kind in exemptions and kind != 'unknown'
+            exemptions[kind if known else 'unknown'] += 1
     config = run.get('config_snapshot', {})
     limits = config.get('runtime', {}) if isinstance(config, dict) else {}
     limits = limits if isinstance(limits, dict) else {}
@@ -160,7 +156,7 @@ def budget_explanation(run, work):
                   'charged_worker_invocations': len(workers),
                   'process_start_unconfirmed': len(workers) - started,
                   'reviewed_worker_candidates': len(reviewed),
-                  'unlinked_review_records': len(unlinked), 'failed_worker_invocations': failures,
+                  'unlinked_review_records': len(unlinked), 'worker_failure_verdicts': verdicts,
                   'recorded_exemptions': exemptions,
                   'duplicate_dispatch_ids': duplicate}
     invalid = dict.fromkeys(('commander', 'worker', 'reviewer'), 0)

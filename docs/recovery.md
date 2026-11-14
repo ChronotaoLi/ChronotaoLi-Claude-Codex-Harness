@@ -73,15 +73,19 @@
 | `task-attempts` | `budget/task_attempts` | 3 | `… 已达尝试次数上限（runtime.max_attempts 当前值 N）` | 先看 `convergence` 与审阅轮次判断是否值得继续；必要时提高 `runtime.max_attempts` | `resume RUN`；`abandon RUN` |
 | `dispatch-limit` | `budget/agent_dispatches` | 3 | `已达 run 模型派发次数上限（已用 N，上限 M）；如果之后全部一次通过，至少还需 K 次模型调用（下界…）` | 按至少 K 次（`data.minimum_remaining_calls`）的余量提高 `max_agent_dispatches`；K 不含指挥决定、返工与重做 | `resume RUN`；`abandon RUN` |
 | `context-dispatch` | `budget/context_capacity` | 3 | `任务必要上下文 N 字符超过预算 M` | 提高 `context_chars`；看 `source.artifact` 指向的 `context-report.json`。超限发生在本地准备阶段，不产生 worker 尝试或反馈；唯一就绪、尚未尝试的任务在普通 `resume` 时仍直接派发 worker，不经过指挥，因此不能指望原 run 的指挥修订拆小它；无法提高时保留现场后放弃，用拆小后的计划另开新 run | `resume RUN`；`abandon RUN` |
-| `agent-timeout` | `budget/agent_timeout` | 3 | worker 超时（计入一次工作尝试） | 核对候选进展，再决定是否提高 `agent_timeout_seconds` | `resume RUN` |
-| `agent-turns` | `budget/agent_turns` | 3 | Claude 轮数用尽（计入一次工作尝试） | 核对候选进展，再决定是否提高 `claude_max_turns_by_role` | `resume RUN` |
+| `agent-timeout` | `budget/agent_timeout` | 3 | 调用超时（进程记录的 `termination_reason=timeout`；worker 的这次调用已当场判定并计一次工作尝试） | 核对候选进展，再决定是否提高 `agent_timeout_seconds` | `resume RUN` |
+| `agent-turns` | `budget/agent_turns` | 3 | Claude 轮数用尽（信封 `subtype=error_max_turns`，计一次工作尝试） | 核对候选进展，再决定是否提高 `claude_max_turns_by_role` | `resume RUN` |
 | `final-timeout` | `verification/final_timeout` | 3 | `整体验证超时` | 修复环境或提高 `verify_timeout_seconds`；普通 `resume` 在同一快照重验 | `resume RUN` |
-| `dispatch-exit` | `process_unconfirmed/dispatch_exit` | 3 | `旧 dispatch … 的进程组仍存在` 或 `无法确认旧 dispatch … 已退出` | 核实该进程及其命令子进程已退出，不终止无关进程；终态 run 用 `cleanup-run` 的同名选项 | `resume RUN --confirm-exited {dispatch_id}`；`abandon RUN --confirm-exited {dispatch_id}` |
-| `command-exit` | `process_unconfirmed/command_exit`（操作） | 3 | `Cannot confirm command process exited: …` | 同上；用父 dispatch ID（`source.dispatch_id`）确认 | `resume RUN --confirm-exited {dispatch_id}`；`abandon RUN --confirm-exited {dispatch_id}` |
-| `provider-failed` | `provider_failure/invocation_failed` | 3 | 模型调用失败，供应商报告了错误 | 修复原因；恢复时 worker 的这次调用判为可重试 | `resume RUN` |
-| `provider-unknown` | `provider_failure/unknown` | 3 | 模型调用失败，原因未识别 | 修复原因 | `resume RUN` |
+| `dispatch-exit` | `process_unconfirmed/dispatch_exit` | 3 | `旧 dispatch … 的进程组仍存在` 或 `无法确认旧 dispatch … 已退出` | 核实该进程及其命令子进程已退出，不终止无关进程；终态 run 用 `cleanup-run` 的同名选项。`data.returned_unsealed` 为真时，这是一个已返回对象结果、尚未封存的 worker：未封存的结果事后不补认，确认之后只能放弃，所以不列 `resume`；为假时，确认之后 worker 的这次调用按原件判定（可重试、无效输出或未封存结果都可能） | 〔`!returned_unsealed`〕`resume RUN --confirm-exited {dispatch_id}`；`abandon RUN --confirm-exited {dispatch_id}` |
+| `command-exit` | `process_unconfirmed/command_exit`（操作） | 3 | `Cannot confirm command process exited: …` | 同上；用父 dispatch ID（`source.dispatch_id`）确认 | 〔`!returned_unsealed`〕`resume RUN --confirm-exited {dispatch_id}`；`abandon RUN --confirm-exited {dispatch_id}` |
+| `provider-quota` | `provider_quota/usage_limit` | 3 | 供应商额度用尽（Claude 信封 `api_error=usage_limit_reached`；`source.artifact` 是失败原件 `process.stdout` 与摘要） | 等额度恢复后普通 `resume`；worker 的这次调用已当场判定，不计工作尝试，仍计入 `max_agent_dispatches`；额度未恢复时会再失败一次 | `resume RUN` |
+| `provider-rate-limit` | `provider_quota/rate_limit` | 3 | 供应商限速（`api_error=rate_limit_error`，或没有标签而 `api_error_status=429`） | 稍后普通 `resume`；worker 不计工作尝试 | `resume RUN` |
+| `provider-overloaded` | `provider_failure/overloaded` | 3 | 供应商过载（`api_error=overloaded_error`） | 稍后普通 `resume`；worker 不计工作尝试 | `resume RUN` |
+| `provider-authentication` | `provider_failure/authentication` | 3 | 账号认证或权限失败（`api_error` 为 `authentication_error` 或 `permission_error`） | 用 `doctor` 核对登录，修复后普通 `resume`；worker 不计工作尝试 | `doctor`；`resume RUN` |
+| `provider-failed` | `provider_failure/invocation_failed` | 3 | 模型调用失败，CLI 信封报告了其他错误（计一次工作尝试） | 修复原因；worker 的这次调用已当场判定为可重试 | `resume RUN` |
+| `provider-unknown` | `provider_failure/unknown` | 3 | 模型调用失败，原因未识别：没有进程记录或记录不完整、没有错误信封、Codex 的任何失败（计一次工作尝试） | 修复原因 | `resume RUN` |
 | `provider-start` | `provider_failure/local_start` | 3 | 模型 CLI 未能启动 | 恢复 CLI 后普通 `resume`（新的计费尝试） | `resume RUN` |
-| `unsealed-return` | `evidence/unsealed_return` | 1 | `worker return interrupted before immutable seal; …; automatic retry forbidden`：封存之前中断，输出能解码成对象结果 | `--confirm-exited` 解不开；保留证据后放弃 | `abandon RUN` |
+| `unsealed-return` | `evidence/unsealed_return` | 1 | `worker return interrupted before immutable seal; …; automatic retry forbidden`：输出能解码成对象结果，但没有封存——封存之前中断、CLI 非零退出、或封存前的本地检查失败（例如 worker 写了受保护的 `.harness`、或改了工作树的 Git 绑定；原因在派发条目的 `error`，恢复预检另行报告绑定变化）；当场判定与恢复时都停在这里 | `--confirm-exited` 解不开；保留证据后放弃 | `abandon RUN` |
 | `unsealed-unknown` | `evidence/unsealed_unknown` | 1 | 同上：返回证据冲突、超过读取上限或读不出文件（判为 unknown）；解不出对象的输出不会停在这里 | 同上 | `abandon RUN` |
 | `invalid-worker-output` | 非停止 | — | worker 输出无效（结构、语义、界限、交接目标非法，或解不出对象结果） | 不停止：计一次工作尝试、回执结局 `result_rejected`，下一次尝试经指挥选择；只在同一任务达到 `max_attempts` 时以 `task-attempts` 停止 | — |
 | `invalid-blocker-environment` | `environment/worker_blocked`（`invalid_output=true`） | 3 | worker 的 environment 阻断只有界限检查失败（条目 `invalid_blocked`，反馈带 `output_error`） | 原结果进入反馈的 `worker`，按 `environment-blocked` 处理；不给尝试豁免 | `resume RUN`；`resume RUN --environment-update FILE` |
@@ -216,7 +220,7 @@ python3 -m harness --config /path/to/harness.toml --repo /path/to/project resume
 
 - **指挥与审阅**：读不出否决的无效输出（含结构非法的审阅、不可解码的供应商输出）在同一次保存里记为 `status=invalid`、错误与原件摘要（`invalid_output`），回执消费，然后自动重做一次。重做是新派发，计入 `max_agent_dispatches`，条目记 `retry_of`，包里带 `previous_invalid`（上一次无效输出的引用与前 2,000 字符的错误；带上它会超出上下文预算时不带，条目记 `previous_invalid_omitted`）。重做仍无效即停止；之后的普通 `resume` 发起新请求，同样有一次重做。是否重做只看整个 run 的最后一次模型调用，所以重做调用之前的中断、或重做在本地准备时（额度、上下文、原件核对）停止，恢复后的那次调用仍是重做；重做已经调用、结果绑定之前被中断时，它按无返回处理，恢复后的调用是不带 `previous_invalid` 的新请求，这个新请求仍有自己的一次重做，与不中断相比最多多两次调用。
 - **带否决的无效输出**：审阅按拒绝返工（`invalid_rejected`），它的 blocking finding 成为下一轮必需项；指挥的 ask 照样登记提问并停止（`invalid_asked`，条目记错误）；worker 的 blocked 见上表。整体审阅的拒绝写入整体记录后同一快照不再审阅；无否决的无效整体审阅不写结论，同一快照可以重做。
-- **worker**：无效输出（含解不出对象的完整输出）计一次工作尝试，回执消费，调度继续，受 `max_attempts` 约束。
+- **worker**：无效输出（含解不出对象的完整输出）计一次工作尝试，回执消费，调度继续，受 `max_attempts` 约束。worker 调用失败而输出解不出对象时（例如 CLI 非零退出、输出截断）同样当场判为无效输出并继续，与退出码无关。
 - **可选产物**：worker 的 `checkpoints`、`proposed_memories` 与审阅的 `approved_memory_keys` 不合格只丢弃自身，记 `checkpoints_discarded`、`memory_proposals_discarded`，结果照常处理；之后的上下文只带它们经过校验的投影（登记后的检查点、整批合法时的提案 key，不带记忆批准），原件保留原值。worker 的 `decision_requests` 不合格则整份结果无效。
 - **只因越出已批准范围而无效的修订**：记为无效并停止，不自动重做（见上节）。
 
@@ -254,7 +258,7 @@ python3 -m harness --config /path/to/harness.toml --repo /path/to/project resume
 
 ### 证据损坏
 
-`load_run` 在 `resume` 和 `abandon` 做任何事之前核验以下证据的路径、类型与 SHA256：worker 派发的 `packet.json` 与 `schema.json`（`packet.json` 同时是该 worker 必需问题的键对照）；`attempt_exemption` 引用的原始 worker 结果；`decisions/` 下的请求与答复；检查点 manifest 与批次文件；`continuations/`、`continuation-rejections/`、`execution-guidance/` 下的完整产物。其中任一缺失、被改或换成符号链接时，`resume` 与 `abandon` 都在写入前拒绝。出口只有两个：把原字节恢复回去后照常 `resume` 或 `abandon`；或者保留 run 目录与工作树原样，另开新 run。`status`、`watch`、`dashboard` 不经过这些核验，仍可查看。
+`load_run` 在 `resume` 和 `abandon` 做任何事之前核验以下证据的路径、类型与 SHA256：worker 派发的 `packet.json` 与 `schema.json`（`packet.json` 同时是该 worker 必需问题的键对照）；`attempt_exemption` 引用的原始 worker 结果或失败原件（供应商豁免引用 `process.stdout`）；worker 判定记录 `worker_return_evidence` 绑定的五个来源文件（按字节重新推导判定与供应商分类）；`decisions/` 下的请求与答复；检查点 manifest 与批次文件；`continuations/`、`continuation-rejections/`、`execution-guidance/` 下的完整产物。其中任一缺失、被改或换成符号链接时，`resume` 与 `abandon` 都在写入前拒绝。出口只有两个：把原字节恢复回去后照常 `resume` 或 `abandon`；或者保留 run 目录与工作树原样，另开新 run。`status`、`watch`、`dashboard` 不经过这些核验，仍可查看。
 
 路径索引（`path-indexes/`）、输入索引（`input-indexes/`）和环境更新产物（`environment/`）在 `resume` 预检、派发或接受前核验，不在加载时核验：它们损坏会阻止继续，但不阻止 `abandon`。
 
@@ -277,10 +281,11 @@ python3 -m harness --config /path/to/harness.toml --repo /path/to/project resume
 1. **Git commit 之后、接受台账保存之前被杀**：恢复因 HEAD 不符停止，不会再提交一次。用 `git -c trailer.separators=: log --format='%H %(trailers:key=Harness-Task,valueonly)'` 核对含 `Harness-Run`／`Harness-Task` 的提交；它的消息就是 `pending_acceptance.worker_source` 指向的 worker 原件里的 `commit_message`。再决定恢复现场或 `abandon`。
 2. **接受时重建暂存区后、commit 之前中断**：恢复时的快照摘要与批准时不同，旧批准才失效，任务重新执行、验证、审阅并消耗一次工作尝试，预算用满时需先提高 `max_attempts`；摘要未变时照常提交。
 3. **worker 已有能解码成对象的原始输出、封存之前中断**：不能把恢复时的工作树补绑为原候选，也不自动重派；与原始输出冲突、超过读取上限或读不出文件（判为 unknown）同样阻塞，`--confirm-exited` 不能解开。保留证据后 `abandon`。对象不合契约时也停在这里，而不中断时它会作为无效输出进入下一次尝试。输出解不出对象（截断、非 JSON、重复键、不是对象）不在此列：无论是否中断，都作为无效输出进入下一次尝试。
-4. **调用前台账保存失败**：可能留下已扣预算、`invoked=true` 的条目；恢复按可重试处理，多计一次尝试。
-5. **派发 `starting` 后、pgid 落盘前中断**：缺 pgid 的记录不能证明未启动，需核实后 `--confirm-exited`。
-6. **启动时 `worktree_binding` 保存前中断**：没有可信绑定，只能 `abandon` 后重新运行，并手工清理已创建的工作树和分支。
-7. **`delete_path` 删除之后**：删除立即生效，接受门禁只决定候选是否被接受；需要恢复文件时从 Git 历史中取回。
-8. **`prepare-run` 在保存临时文件身份之前中断**：不能凭相同字节接管文件，需人工核对。
-9. **`command-staging/` 中的准备目录**：发布前失败或被杀时留下；运行时不枚举它们，也不回收，反复失败会累积磁盘占用。
-10. **指挥或审阅的供应商输出不可解码、判定保存之前中断**：回执里没有原件，恢复按无返回处理，发起没有 `retry_of` 的调用；与不中断相比最多多一次调用。
+4. **调用前台账保存失败**：可能留下已扣预算、`invoked=true` 的条目；恢复按原件判定（没有输出时可重试），多计一次尝试。
+5. **worker 调用失败、判定保存之前原件被改**：判定之前没有可比对的记录，恢复按改后的字节判定（包括额度类豁免）；判定保存之后再改，加载核验拒绝 `resume` 与 `abandon`。能写运行目录的人也能直接提高 `max_attempts`。
+6. **派发 `starting` 后、pgid 落盘前中断**：缺 pgid 的记录不能证明未启动，需核实后 `--confirm-exited`。
+7. **启动时 `worktree_binding` 保存前中断**：没有可信绑定，只能 `abandon` 后重新运行，并手工清理已创建的工作树和分支。
+8. **`delete_path` 删除之后**：删除立即生效，接受门禁只决定候选是否被接受；需要恢复文件时从 Git 历史中取回。
+9. **`prepare-run` 在保存临时文件身份之前中断**：不能凭相同字节接管文件，需人工核对。
+10. **`command-staging/` 中的准备目录**：发布前失败或被杀时留下；运行时不枚举它们，也不回收，反复失败会累积磁盘占用。
+11. **指挥或审阅的供应商输出不可解码、判定保存之前中断**：回执里没有原件，恢复按无返回处理，发起没有 `retry_of` 的调用；与不中断相比最多多一次调用。

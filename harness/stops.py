@@ -91,22 +91,34 @@ _row("budget", "context_capacity", 3, "必要上下文超过预算", ("resume {r
      config_key=_key, required_chars=_int, budget_chars=_int, scope=_enum("dispatch", "final_review"))
 _row("budget", "review_findings", 3, "待核验阻断问题超过单次审阅容量", ("abandon {run}",), ("task_id",),
      open_findings=_int, limit=_int)
-_row("budget", "agent_timeout", 3, "调用超过单次时限", ("resume {run}",), ("dispatch_id", "task_id"),
-     role=ROLE, config_key=_key, limit_seconds=_int)
-_row("budget", "agent_turns", 3, "Claude 轮数用尽", ("resume {run}",), ("dispatch_id", "task_id"), role=ROLE, config_key=_key)
+_row("budget", "agent_timeout", 3, "调用超过单次时限", ("resume {run}",),
+     ("dispatch_id", "task_id", "artifact", "artifact_digest"), role=ROLE, config_key=_key, limit_seconds=_int)
+_row("budget", "agent_turns", 3, "Claude 轮数用尽", ("resume {run}",),
+     ("dispatch_id", "task_id", "artifact", "artifact_digest"), role=ROLE, config_key=_key, http_status=_int)
 _row("verification", "final_timeout", 3, "整体验证超时", ("resume {run}",), ("artifact",), config_key=_key, attempt=_int)
 _row("verification", "setup_failed", 3, "全新检出的依赖准备失败", ("resume {run}",), ("artifact",), attempt=_int)
 _row("verification", "checks_modified_files", 3, "验证修改了受检文件", ("resume {run}",), ("task_id", "artifact"),
      scope=_enum("task", "final"), phase=_enum("setup", "checks"))
-_row("process_unconfirmed", "dispatch_exit", 3, "旧派发的退出无法确认",
-     ("resume {run} --confirm-exited {dispatch_id}", "abandon {run} --confirm-exited {dispatch_id}"), ("dispatch_id",))
-_row("process_unconfirmed", "command_exit", 3, "命令子进程的退出无法确认",
-     ("resume {run} --confirm-exited {dispatch_id}", "abandon {run} --confirm-exited {dispatch_id}"), ("dispatch_id",),
-     command_id=_id)
-for _r, _t in (("invocation_failed", "模型调用失败（供应商报告错误）"), ("local_start", "模型 CLI 未能启动"),
-               ("unknown", "模型调用失败（原因未识别）")):
-    _row("provider_failure", _r, 3, _t, ("resume {run}",), ("dispatch_id", "task_id"),
-         role=ROLE, provider=_enum("claude", "codex"))
+# A worker that already returned an object result but was never sealed cannot be
+# continued after confirming its exit (an unsealed result is never adopted later):
+# then only abandon is listed (``returned_unsealed``, spec-5 16.3).
+_UNCONFIRMED_EXITS = (("resume {run} --confirm-exited {dispatch_id}", "!returned_unsealed"),
+                      "abandon {run} --confirm-exited {dispatch_id}")
+_row("process_unconfirmed", "dispatch_exit", 3, "旧派发的退出无法确认", _UNCONFIRMED_EXITS, ("dispatch_id",),
+     returned_unsealed=_bool)
+_row("process_unconfirmed", "command_exit", 3, "命令子进程的退出无法确认", _UNCONFIRMED_EXITS, ("dispatch_id",),
+     command_id=_id, returned_unsealed=_bool)
+# Classified call failures (spec-5): the failure original's path and digest in source.
+_FAILURE_SOURCE = ("dispatch_id", "task_id", "artifact", "artifact_digest")
+for _k, _r, _t in (("provider_quota", "usage_limit", "供应商额度用尽"), ("provider_quota", "rate_limit", "供应商限速"),
+                   ("provider_failure", "overloaded", "供应商过载"),
+                   ("provider_failure", "invocation_failed", "模型调用失败（CLI 报告错误）"),
+                   ("provider_failure", "local_start", "模型 CLI 未能启动"),
+                   ("provider_failure", "unknown", "模型调用失败（原因未识别）")):
+    _row(_k, _r, 3, _t, ("resume {run}",), _FAILURE_SOURCE,
+         role=ROLE, provider=_enum("claude", "codex"), http_status=_int)
+_row("provider_failure", "authentication", 3, "账号认证或权限失败", ("doctor", "resume {run}"), _FAILURE_SOURCE,
+     role=ROLE, provider=_enum("claude", "codex"), http_status=_int)
 _row("invalid_output", "redo_exhausted", 3, "输出连续两次无效", ("resume {run}", "abandon {run}"),
      ("dispatch_id", "task_id", "artifact", "artifact_digest"), role=ROLE)
 _row("workspace_mismatch", "head_changed", 1, "工作树 HEAD 与检查点不同",

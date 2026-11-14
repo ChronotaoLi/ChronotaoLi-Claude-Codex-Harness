@@ -45,7 +45,7 @@ python3 -m harness --repo /abs/project dashboard --port 8765
 - 用 `status`、`status RUN`、`status RUN --full`、`watch RUN` 和 `dashboard` 观察，读取目标项目 `.harness/` 下的台账、事件、dispatch 产物与操作记录；
 - 使用[阻塞状态与操作者出口](recovery.md#阻塞状态与操作者出口)中明确适用于当前状态的恢复出口，例如 `--approve-plan`、追加精确命令授权后的普通 `resume`、`--environment-update`、`--operator-decision`。
 
-读停止时用退出码与 `stop.kind` 分流，不解析文字：3 按 `stop.exits` 中适用于当前状态的出口处理，涉及新增权限或需求选择时请示用户；2 修正本次调用的输入；1 停下报告（证据或现场不符、Harness 自身失败、未分类）；0 读结果 JSON 的 `status`（`completed`、`paused` 或待批准）；130 是中断。遇到真正的新增权限（新的命令授权、范围扩展、预算或轮数提高）或需求选择（操作者决定、是否接受风险、是否放弃）时向用户请求，不自行代答。
+读停止时用退出码与 `stop.kind` 分流，不解析文字：3 按 `stop.exits` 中适用于当前状态的出口处理，涉及新增权限或需求选择时请示用户；2 修正本次调用的输入；1 停下报告（证据或现场不符、Harness 自身失败、未分类）；0 读结果 JSON 的 `status`（`completed`、`paused` 或待批准）；130 是中断。供应商额度类停止（`provider_quota/*`）与 `provider_failure/{overloaded,authentication}` 都是 3：等额度恢复或修复登录后按 `stop.exits` 普通 `resume`，worker 的这次调用不计工作尝试；不要用正则匹配错误文字判断额度。遇到真正的新增权限（新的命令授权、范围扩展、预算或轮数提高）或需求选择（操作者决定、是否接受风险、是否放弃）时向用户请求，不自行代答。
 
 不能做的事：
 

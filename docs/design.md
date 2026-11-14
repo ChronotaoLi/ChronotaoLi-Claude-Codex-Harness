@@ -23,7 +23,8 @@
 | `scheduler.py`、`workflow.py` | 唯一调度循环与下一步的推导（`next_step`）；停止记账、交接目标、决定请求同步、指挥提问门禁、worker 失败来源 |
 | `planning.py`、`requirements.py` | 计划登记、`decide` 的组包与三种落地、修订的复核、归档与发布、待派发指令的复核、范围授权；任务命令前置条件 |
 | `dispatch.py`、`packets.py`、`context.py`、`input_projection.py`、`path_evidence.py` | 派发、预算、`invoked`、无效输出的重做；角色输入；上下文与容量报告；输入和路径索引 |
-| `receipts.py`、`worker_receipts.py`、`worker_returns.py`、`recovery.py` | 指挥与审阅回执与判定；worker 接收意图、封存、判定、交接；无结果判定；恢复忙碌键 |
+| `receipts.py`、`worker_receipts.py`、`worker_returns.py`、`recovery.py` | 指挥与审阅回执与判定；worker 接收意图、封存、判定、交接；无结果判定与供应商分类；恢复忙碌键 |
+| `provider_failures.py` | 失败调用的进程事实与 CLI 终止信封分类（纯函数）；四类豁免 |
 | `task_lifecycle.py`、`finalization.py`、`verification.py`、`verification_plan.py`、`review_progress.py` | 任务验证、审阅、接受；整体验收；验证命令；候选预检；必需问题与审阅来源 |
 | `budgets.py`、`diagnostics.py`、`convergence.py` | 工作尝试与豁免；预算解释与剩余调用下界；返工提示与审阅轮次 |
 | `continuation.py`、`environment.py`、`decisions.py`、`progress.py` | 续作、续作拒绝、执行指导；环境更新与前置检查；操作者决定；检查点 |
@@ -47,7 +48,7 @@
 **派发与进程**
 
 1. 每次 worker、reviewer 和指挥调用都是新进程、新 `dispatch_id`，无效输出的重做也是新调用；Claude 用 `--no-session-persistence`，Codex 用 `--ephemeral`，原生子 agent 关闭，不恢复供应商会话。模型 ID、供应商和 effort 按配置原样使用，同一 run 内不变，出错不换模型。
-2. 调用身份与预算先于进程启动保存：本地准备（上下文、输入与路径索引、MCP、快照、待派发指令与上一份无效原件的核对、额度检查）成功后，`attempts`、`agent_dispatches`、接收意图和 `invoked=true` 同一次保存，然后才调用后端。本地准备失败不扣额度，后端失败照常计数。
+2. 调用身份与预算先于进程启动保存：本地准备（上下文、输入与路径索引、MCP、快照、待派发指令与上一份无效原件的核对、额度检查）成功后，`attempts`、`agent_dispatches`、接收意图和 `invoked=true` 同一次保存，然后才调用后端。本地准备失败不扣额度。后端失败照常计入 `attempts` 与 `agent_dispatches`；其中由 CLI 终止信封判为额度、限速、过载或认证的 worker 失败不计工作尝试（不变量 8、20、36），其余失败（超时、轮数用尽、启动失败、其他明确错误、读不出）照常计数。
 3. 退出未确认就不继续：恢复、放弃和清理要求父 dispatch 及其每个命令子进程都有退出证据；`starting` 或缺 pgid 且未确认的记录阻塞。`--confirm-exited` 是审计过的操作者断言，不补造退出码、输出或成功。
 4. 领导进程正常退出后，同组后代最多观察 2 秒，仍未退出就停止消费结果，不向身份不明的进程组发信号。只有进程组查询报告“不存在”才算后代已退出；组内只剩等待回收的僵尸进程时（macOS 对此返回 EPERM）算作仍存在、继续观察，窗口结束时的查询仍被拒绝才记为清理错误。
 5. 台账的 `invoked` 是调用事实的权威。事件 `dispatch_prepared`（预算检查前）、`dispatch_started`（`invoked=true` 保存后）和带 `invoked` 的 `dispatch_finished` 只是尽力而为的观察：追加失败不阻止调用，崩溃可能缺事件且不补发；按 `dispatch_id` 去重，费用只按台账统计。验证检出的回收事件（`verification_checkout_reclaimed`、`verification_checkout_reclaim_failed`）同样经 `RunContext.observe()` 追加，追加失败不影响执行。
@@ -56,7 +57,7 @@
 
 6. 已返回的结果不重抽：调用前的接收意图绑定原请求、候选快照和返回位置；恢复时先处理已返回的原件，缺失或被改即停止。有效的指挥与审阅结论，以及从原件可靠读出的否决事实，不因重做或 resume 消失。否决事实包括审阅的 `request_changes`、blocking finding、批准中未 `resolved` 的必需项，指挥的 `ask`，以及 worker 的 `blocked`；可靠读出的公共前提是退出已确认、原件字节已绑定摘要、严格解码成对象（拒绝重复键与非有限数，包括溢出成无穷大的数值字面量）、envelope 身份相符。运行时只写严格解码能读回的 JSON：要写出非有限数时停止，而不是写出自己读不回的原件。审阅的否决另要求核心结构合法（拒绝要带着可编号的 findings 返工），不满足时按读不出否决处理；指挥的 `ask` 只要求公共前提（envelope 相符且 `action` 为 ask），其余字段不合格时仍登记提问，派发条目记 `invalid_asked`；调用期间候选或 HEAD 改变也不妨碍登记（条目记 `candidate_changed`）：已返回而未登记的提问（登记前中断）在 `resume` 的 HEAD 门禁之前完成登记；登记不认可这些改动，其他指挥决定在这种情况下不判定，执行、回答登记之后的每一步仍受 HEAD 与快照门禁约束。没有通过契约、也读不出否决的输出不是结果：原件保留，故障记在它的派发条目上，由同一角色的新进程重做（不变量 11）。
 7. worker 结果先封存再交接：确认 worker 与命令子进程退出后，把结果、来源文件摘要、返回后候选、HEAD、Git 绑定和进程事实写成内容寻址的 `worker-seal.<SHA256>.json`，再做契约、范围检查与交接。交接只认封存记录里的候选摘要：封存之后候选（含暂存区与 HEAD）的任何变化都在交接前被拒绝，不重新绑定。未封存的原始输出不补绑恢复时的工作树。
-8. 无结果判定绑定原始证据：确认退出后，按 Claude 的 JSON 输出（`process.stdout`）和派发目录中的结果文件把来源判为 retryable、invalid、returned 或 unknown。retryable（没有输出，或完整的显式错误）与 invalid（输出完整，但严格解码不出对象结果）都允许新的计费尝试：可能中断的步骤（分类、为恢复记录读取 Git）先完成，然后判定、判定证据、故障来源和回执消费同次保存，结局分别是 `provider_failure` 与 `result_rejected`；在此之前中断，条目与回执都保持判定前的样子。适配器当场遇到解不出的输出时，走与恢复相同的判定代码（适配器与判定共用一个解码函数），所以是否在判定保存之前中断不改变结局。returned（已有能解码成对象的结果但没有封存）或 unknown（与原始输出冲突、超过读取上限、读文件失败）时，判定与停止原因同次保存，回执保留，`--confirm-exited` 不能解开。判定记录所依据文件的 SHA256，证据删改后不能改判。
+8. 无结果判定绑定原始证据：确认 worker 与命令子进程退出后，按派发目录里的结果文件、Claude 的 JSON 输出（`process.stdout`）与进程记录（`process.outcome.json`）把来源判为 retryable、invalid、returned 或 unknown。worker 调用失败时当场判定（`Dispatcher.judge_worker_failure()`），主进程在判定保存之前死掉或被中断时由下一次 `resume` 判定，两者调用同一个 `WorkerReceipts.pending()`、读同样的字节，所以结局相同。retryable（没有输出，或完整的显式错误信封）另记供应商分类（判定记录版本 2 的 `provider: {code, http_status}`）：先看进程记录——超时、启动失败按进程事实，进程没有正常结束或记录不完整时不读信封——再按信封的 `subtype`、`api_error`、`api_error_status` 分为额度、限速、过载、认证、轮数用尽或其他错误；信封里的文字与 stderr 不参与。retryable 与 invalid（输出完整，但严格解码不出对象结果）都允许新的计费尝试：可能中断的步骤（分类、为恢复记录读取 Git）先完成，然后判定、判定证据、额度／限速／过载／认证的工作尝试豁免、恢复记录和回执消费同次保存，结局分别是 `provider_failure` 与 `result_rejected`；在此之前中断，条目与回执都保持判定前的样子。当场判定为 retryable 时按分类停下，为 invalid 时调度继续（与退出码无关）。returned（已有能解码成对象的结果但没有封存，包括封存之前的本地检查失败）或 unknown（与原始输出冲突、超过读取上限、解码失败）时，判定与停止原因保存，回执保留，`--confirm-exited` 不能解开。读文件时的系统错误不是字节的性质，不形成判定：原样上抛，回执保留，修好后重判。已封存的结果从不进入这个判定。判定记录所依据五个文件的 SHA256 与分类一起保存，加载时按字节重新推导核对，证据删改后不能改判。
 9. 不可变证据先发布，再登记引用：packet、契约、封存、续作类记录、环境更新、决定、检查点和计划先写成内容寻址或带 SHA256 的文件，再在台账存路径与摘要。计划写成 `plans/revision-N.json`（同字节复用，不同即停止），`plan_history` 与 `pending_revision` 只存修订号、路径与 SHA256。已发布的计划文件是执行字段的权威，在三处核对：`resume` 的任何写入之前（含显式退出确认，因此也先于批准计划与重放 worker 回执）、每次推导下一步之前、标记完成之前；全部版本都按摘要核对，最新版本的任务表必须等于 `tasks`，`revision-0` 的等于 `original_tasks`，缺失或不符即停止。只此三处：worker 运行期间被删改的计划要到下一步才发现，那时该任务的验证、审阅与接受可能已经完成；`prepare-run` 与只读入口不核对（之后的 `resume` 会拒绝）。每次核对的耗时随计划历史的总大小增长（实测每版约 40 KB 时，200 版约 19 ms、1,000 版约 102 ms）。文件写入失败时不登记引用；worker 输入写入失败时也不扣调用预算、不保存接收意图或 `invoked=true`，但此前保存的准备条目与随后的失败状态、诊断仍会落盘。未引用的遗留文件被忽略，同内容重试时复用。
 10. 台账对 worker 输入和续作类记录只存摘要与引用：接收意图存 `packet.json`、`schema.json` 的路径与 SHA256；续作、执行指导、续作拒绝行只存 `snapshot_digest`，整棵快照只在不可变文件里。引用文件缺失、被改或换成符号链接时，恢复停止并保留现场。
 11. 无效输出的重做有界。指挥或审阅的一次请求返回读不出否决的无效输出时，在同一次保存里记录错误与原件摘要（`status=invalid`、`invalid_output`）并消费回执，然后自动重做一次；是否重做由整个 run 最后一次模型调用推导（它是同一调用的无效输出且本身不是重做），重做条目记 `retry_of`，输入附上一份无效输出的引用与前 2,000 字符的错误（带上它超出上下文预算时去掉）；这份原件在本地准备之后、调用计费之前按摘要核对一次，缺失或被改即按证据损坏停止，留下一个未调用（`invoked=false`）的失败准备条目。重做仍无效则停止；此后的普通 resume 发起新请求，规则相同。worker 的无效输出记为一次工作尝试，回执消费，调度继续，受 `max_attempts` 约束；blocked 的输出保持约束力：核心结构与语义都合法、只有界限不合格的 environment／operator／task 阻断按原路由，原结果进入 feedback；结构或语义不合法的 blocked 输出按 task 阻断交给指挥决定，feedback 不带原结果；都不给尝试豁免。所有重做都计入 `max_agent_dispatches`；证据损坏或退出未确认时不重做。blocked 结果不产生提交，它的 `commit_message` 在每个校验入口（判定与历史复核）都被去掉，不影响判定、路由与豁免，也不进入后续上下文，原件保留原值。worker 的 `checkpoints`、`proposed_memories` 与审阅的 `approved_memory_keys` 不参与判定，不合格只丢弃自身并记事件；后续上下文只用它们经过校验、有界的投影（检查点只以登记后的 `task_checkpoints` 出现，记忆提案只投影整批合法时的 key，记忆批准只在接受时起作用、不进入后续上下文），被丢弃的部分不投影，原件保留原值；`decision_requests` 不合格即为无效输出。例外：只因越出已批准范围而无效的指挥修订，在同一次保存里记录错误、越界模式（`out_of_scope_paths`）并消费回执后停止，不自动重做；之后的普通 resume（授权与否）是新请求。
@@ -74,7 +75,7 @@
 **预算**
 
 19. 预算只增不减：`attempts`、`agent_dispatches` 累计保存，resume 不清零。修订号与整体尝试序号由 `plan_history`、`final_history` 的长度推导。恢复只允许提高超时、上下文、轮数、`max_attempts`、`max_agent_dispatches`，以及追加精确 `worker_commands`。
-20. `max_attempts`（默认 5）按每个任务的工作尝试计数：worker 调用数减去已完整校验、与反馈同次保存的 environment／operator 阻断（`attempt_exemption`），豁免在使用前复核原始结果。计划任务数、修订次数和整体尝试次数都没有单独的上限：每次模型调用都计入 `max_agent_dispatches`，它是总调用数唯一可靠的上界；计划大小由整体审阅的必要上下文约束，模型给出的计划超出即为无效输出，供给计划超出则停止。
+20. `max_attempts`（默认 5）按每个任务的工作尝试计数：worker 调用数减去两种已完整校验的豁免（`attempt_exemption`）——与反馈同次保存的 environment／operator 阻断，以及与判定同次保存、绑定 `process.stdout` 摘要的额度、限速、过载、认证失败（`basis: provider_error`）。豁免在加载与每次派发前复核原件，不依赖额度快照或账号的当前状态。计划任务数、修订次数和整体尝试次数都没有单独的上限：每次模型调用都计入 `max_agent_dispatches`，它是总调用数唯一可靠的上界；计划大小由整体审阅的必要上下文约束，模型给出的计划超出即为无效输出，供给计划超出则停止。
 21. 观察投影不改变预算：`status` 的 `budget_explanation`、`remaining_model_calls`（下界）、`convergence`、`review_rounds` 只读已保存事实。`convergence`、`review_rounds` 跨轮比较的是 finding 标签（审阅者写的 id），只作观察。
 
 **权限与工具**
@@ -110,6 +111,8 @@
 
 35. 退出码由停止值的 `(kind, reason)` 查登记表得出：0 完成或操作者要求的暂停（`completed`、`paused`、计划待批准，含未带 `--approve-plan` 的普通 `resume`）；3 run 自洽、有文档化的操作者动作或外部条件可解开；2 本次调用的输入不被接受；1 证据或现场与台账不符、Harness 自身失败或未分类；130 中断。`cleanup-run` 例外，仍按逐资源结果返回 0／1。
 
+36. 豁免只减工作尝试：被豁免的调用照常计入 `attempts` 与 `max_agent_dispatches`。一个派发条目最多一个豁免；只有四类供应商失败（额度、限速、过载、认证）与 environment／operator 阻断能得到豁免，其他失败与无效输出没有。
+
 ## 状态转换
 
 ### run 状态
@@ -139,12 +142,12 @@
 | `tasks`、`plan_history` | 首版计划登记；修订发布 | 不清除 | 先写 `plans/revision-N.json`；`plan_history` 每行只存修订号、路径与 SHA256；修订发布与 `current_task`、`pending_directive`、`feedback` 同次 | 按计划版本继续；修订的执行字段只在计划文件里 |
 | `plan_approval_required`、`plan_approved` | 创建时；`--approve-plan` | 不变 | 先写 `plan_approved` 再保存 | 普通 resume 不批准 |
 | `expected_head`、`accepted` | 任务接受 | 不清除 | 与 `pending_post_accept` 同次 | 工作树 HEAD 必须等于 `expected_head` |
-| `attempts`、`agent_dispatches` | 调用后端前 | 只增 | 与接收意图、`invoked` 同次 | 已记账的调用不退回 |
+| `attempts`、`agent_dispatches` | 调用后端前 | 只增 | 与接收意图、`invoked` 同次 | 已记账的调用不退回；豁免只作用于工作尝试的投影，计数本身不退回 |
 | `final_history` | 新的整体尝试追加 `running` 记录（尝试号是 `len(final_history)+1`），随后更新阶段与结论；进入 reviewing 时与阶段同次写入该次审阅的对照 `required_findings`（在验证开始前算出）；开启 `fresh_checkout` 时，验证结论那次保存同时写入该轮的 `checkout_digest`（`checkout.json` 字节的 SHA256） | 不清除 | 尝试记录先于快照产物；失败或拒绝与 `feedback` 同次；进入 reviewing 之后、整体审阅之前尝试回收最近一轮的检出（不写台账） | 同一快照：未完成则复用该尝试，已批准则完成，已拒绝或非超时验证失败则推导出整体阶段的 `decide` |
-| `dispatches` | 准备完成追加（`status=running`、`process_state=prepared`、`invoked=false`）；调用前 `process_state=starting`、`invoked=true`，重做另记 `retry_of`（去掉了提示时记 `previous_invalid_omitted`）；启动记 pgid；结束记进程事实与用量；读不出否决的无效输出记 `status=invalid`、错误与 `invalid_output`，否决类记 `invalid_rejected`、`invalid_asked` 或 `invalid_blocked`；只因越界而无效的修订另记 `out_of_scope_paths`；调用期间候选或 HEAD 已变的提问另记 `candidate_changed` | 不清除 | 准备条目先于本地准备门禁（输入、索引、MCP、快照、待派发指令与上一份无效原件的核对、额度），这些门禁失败时条目以 `invoked=false`、`status=failed` 收尾；`retry_of` 与预算同次；`invalid` 与回执消费同次；`candidate_changed`（与 `invalid_asked`）和提问登记、回执消费同次 | 退出门禁读进程事实；`worker_receipt_consumed` 记 worker 回执结局；`retry_of` 必须指向它之前最后一次模型调用 |
+| `dispatches` | 准备完成追加（`status=running`、`process_state=prepared`、`invoked=false`）；调用前 `process_state=starting`、`invoked=true`，重做另记 `retry_of`（去掉了提示时记 `previous_invalid_omitted`）；启动记 pgid；结束记进程事实与用量；读不出否决的无效输出记 `status=invalid`、错误与 `invalid_output`，否决类记 `invalid_rejected`、`invalid_asked` 或 `invalid_blocked`；只因越界而无效的修订另记 `out_of_scope_paths`；调用期间候选或 HEAD 已变的提问另记 `candidate_changed`；worker 调用失败的判定记录 `worker_return_evidence`（版本 2，带 `provider` 分类）与 `attempt_exemption`（阻断或供应商两种形状） | 不清除 | 准备条目先于本地准备门禁（输入、索引、MCP、快照、待派发指令与上一份无效原件的核对、额度），这些门禁失败时条目以 `invoked=false`、`status=failed` 收尾；`retry_of` 与预算同次；`invalid` 与回执消费同次；`candidate_changed`（与 `invalid_asked`）和提问登记、回执消费同次 | 退出门禁读进程事实；`worker_receipt_consumed` 记 worker 回执结局；`retry_of` 必须指向它之前最后一次模型调用 |
 | `feedback` | worker 阻断（含无效阻断，带 `output_error`；结构不可信时没有 `worker`）、审阅拒绝、验证或预检失败、候选变化、整体失败、修订发布 | 接受、整体批准时置 null | 与引起它的转换同次 | 下一次指挥与 worker 的输入 |
 | `review_history` | 任务审阅结束；候选变化前把已返回审阅存为 invalidated；每条记录带派发时的对照副本 `required_findings` | 不清除 | 与审阅后的阶段同次 | 返工输入、`review_rounds` 来源；处置只经副本映射，副本与重算清单不符即停止 |
-| `worker_receipts` | 调用前存意图（`invoking`、packet／契约引用；worker 的必需问题对照在 `packet.json`）；封存后 `sealed`，交接按封存记录里的候选摘要核对 | 交接时消费 | 封存文件先于 `sealed`；消费与后续阶段同次 | 未封存：retryable 或 invalid（不可解码的输出，结局 `result_rejected`）则消费并新开尝试，否则停止；封存文件已写而 `sealed` 未保存：找到并核验该文件后继续；已封存：复核后继续原门禁 |
+| `worker_receipts` | 调用前存意图（`invoking`、packet／契约引用；worker 的必需问题对照在 `packet.json`）；封存后 `sealed`，交接按封存记录里的候选摘要核对 | 交接时消费 | 封存文件先于 `sealed`；消费与后续阶段同次 | 未封存：调用失败时当场判定（主进程死掉则恢复时由同一代码判定）；retryable 或 invalid（不可解码的输出，结局 `result_rejected`）则消费，retryable 按供应商分类停止并可能豁免工作尝试，invalid 调度继续；否则停止；判定、豁免、恢复记录与消费同次保存；封存文件已写而 `sealed` 未保存：找到并核验该文件后继续；已封存：复核后继续原门禁 |
 | `review_receipts` | 调用前存意图；返回后绑定 `artifact_digest` | 审阅结束；候选变化（先存原文）；无返回时重派前；无效输出判定时同次移除 | 结果文件先于摘要 | 有结果则校验同一结果；无结果才新派发并计费 |
 | `commander_receipts` | 调用前存意图（含原请求与摘要；键 `commander:decide:run`） | `decide` 落地（待派发指令、`pending_revision`、首版计划或决定请求）时同次移除；无效输出判定时同次移除（越界的修订也是）；无返回的意图在重新派发前或 `--reverify` 时丢弃 | 同上 | 校验同一结果，不重抽 |
 | `approved_scope` | `--allow-scope` | 不清除 | 先写 `scope_extension_approved` 再保存 | 只扩大新任务可选范围 |
@@ -170,7 +173,7 @@
 | `pending_revision` | `decide` 的 revise 落地：计划文件先写，再与回执消费同次保存修订号、路径与 SHA256 | 修订发布 | 发布前复核文件与原件、重放修订；需要时归档、重置，再发布；其间任一点中断，普通 resume 从计划文件重来（见 recovery.md 的指挥提问、修订与范围） |
 | `pending_continuation` | 续作登记 | 条件满足或被拒绝时置 null | 条件未满足时停止并列出缺口 |
 | `continuation_rejections` | `--reject-continuation` | 不清除；由 worker dispatch 的 `continuation_rejection_id` 消费 | 拒绝文件先写；与 `pending_directive` 同次 |
-| `worker_recovery` | 已调用的 worker 失败、结果或交接被拒 | 同 dispatch 正常交接、接受、需归档的修订发布 | 后续指挥与 worker 的 `recovery` 输入；记录不含错误文字，组包时从来源派发条目读取错误摘录 |
+| `worker_recovery` | 已调用的 worker 被判定（无结果、无效、越界、无效阻断），与判定同次 | 同 dispatch 正常交接、接受、需归档的修订发布 | 后续指挥与 worker 的 `recovery` 输入；记录不含错误文字，组包时从来源派发条目读取错误摘录与失败类型（`source.failure`） |
 | `stop` | `Workflow.stop()`；进入 `awaiting_approval` | 进入 `running`；`abandon` | 与 `status` 同次保存，之后写 `run_stopped`；`load_run` 校验存在条件、登记与形状 |
 | `command_requirements` | 计划登记、恢复、调度时重算，变化才保存 | 不清除 | 只是诊断，派发前总是重算 |
 | `context_capacity` | 整体审阅容量预估，变化才保存 | 不清除 | 必要下界超限时提前停止 |

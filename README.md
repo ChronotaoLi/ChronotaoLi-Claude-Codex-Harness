@@ -160,7 +160,7 @@ python3 -m harness --repo /path/to/project cleanup-run RUN --remove --remove-ign
 | `max_attempts` | 每个任务的 worker 工作尝试；已完整校验的 environment／operator 阻断不计入 |
 | `max_agent_dispatches` | 整个 run 的模型调用次数，包括指挥、worker、任务审阅、整体审阅和无效输出的重做 |
 
-没有全 run 的 worker 尝试上限，计划任务数、修订次数和整体尝试次数也没有单独的上限：修订新增的任务各有自己的 `max_attempts`（默认 5），全局由 `max_agent_dispatches` 封顶；计划大小由整体审阅的必要上下文约束。模型调用数远多于任务数，例如一次 7 个任务的 run 用了 52 次模型调用。因派发上限停止时，停止信息和 `status RUN` 的 `remaining_model_calls` 给出“如果之后全部一次通过，至少还需 N 次模型调用”；N 是下界，不含指挥决定、返工和重做。`status RUN` 的 `budgets` 另给出 `work_attempts`（扣除豁免后的任务尝试）和 `attempts_total`（各任务 worker 调用之和）。
+没有全 run 的 worker 尝试上限，计划任务数、修订次数和整体尝试次数也没有单独的上限：修订新增的任务各有自己的 `max_attempts`（默认 5），全局由 `max_agent_dispatches` 封顶；计划大小由整体审阅的必要上下文约束。模型调用数远多于任务数，例如一次 7 个任务的 run 用了 52 次模型调用。因派发上限停止时，停止信息和 `status RUN` 的 `remaining_model_calls` 给出“如果之后全部一次通过，至少还需 N 次模型调用”；N 是下界，不含指挥决定、返工和重做。`status RUN` 的 `budgets` 另给出 `work_attempts`（扣除豁免后的任务尝试：环境或操作者阻断，以及额度、限速、过载、认证四类供应商失败）和 `attempts_total`（各任务 worker 调用之和）。
 
 `watch RUN` 用 macOS kqueue 或 Linux inotify 等待文件变化，只在观察结果改变时输出简短 JSONL；等待超时不重读台账。默认到阻塞、暂停、等待批准或终态后退出，`--follow` 可继续等待后续恢复。`watch RUN --state /path/to/.harness` 可以直接观察保留下来的运行证据，不要求该目录仍是 Git 工作树。不支持原生通知的平台会明确报错。观察值来自台账，不证明模型进程仍在工作。
 
@@ -170,7 +170,7 @@ python3 -m harness --repo /path/to/project cleanup-run RUN --remove --remove-ign
 
 运行详情默认通过事件订阅更新，列表和文件页使用手动刷新。连接心跳仅表示观察服务可用；订阅断开后显示断开提示，由刷新按钮重新连接，不退回定时轮询。
 
-同一快照上的已保存阶段可复用：验证中断只重跑验证，审阅调用故障只新派发 reviewer。worker 的完整接收记录绑定结果与返回后候选，恢复继续原校验及交接，复用封存结果本身不重新派发或扣除调用额度。已有能解码成对象的原始输出、尚未封存候选时中断则停止，不能把恢复时的文件补认原候选。调用结束且退出得到确认、却没有封存结果时，按原始输出判定：`process.stdout` 为空或是完整的供应商错误时重试；输出完整但解不出对象结果（截断、不能严格解码、不是 result 终态）是一次无效交付，记一次尝试后调度继续；与原始输出冲突或读不出时停止。判定、原件摘要、恢复信息和回执消费在同一次保存里发布。无效的结果保留原件并消费回执，下一次尝试是新的计费调用。代码变化使旧批准失效，进程未确认退出、HEAD／Git 绑定异常或证据损坏会停止；保存顺序见[设计：状态转换](docs/design.md#状态转换)。
+同一快照上的已保存阶段可复用：验证中断只重跑验证，审阅调用故障只新派发 reviewer。worker 的完整接收记录绑定结果与返回后候选，恢复继续原校验及交接，复用封存结果本身不重新派发或扣除调用额度。已有能解码成对象的原始输出、尚未封存候选时中断则停止，不能把恢复时的文件补认原候选。worker 调用失败时当场判定（主进程死掉则在恢复时用同一代码判定），先确认进程组退出，再按原始输出与进程记录判定：`process.stdout` 为空或是完整的供应商错误时重试，并按 CLI 终止信封的字段分类，额度、限速、过载、认证失败不计工作尝试（仍计入 `max_agent_dispatches`），以对应的停止类型停下；输出完整但解不出对象结果（截断、不能严格解码、不是 result 终态）是一次无效交付，记一次尝试后调度继续；与原始输出冲突或读不出时停止。判定、原件摘要、恢复信息和回执消费在同一次保存里发布。无效的结果保留原件并消费回执，下一次尝试是新的计费调用。代码变化使旧批准失效，进程未确认退出、HEAD／Git 绑定异常或证据损坏会停止；保存顺序见[设计：状态转换](docs/design.md#状态转换)。
 
 | 情况 | 常用出口 |
 | --- | --- |
@@ -178,6 +178,7 @@ python3 -m harness --repo /path/to/project cleanup-run RUN --remove --remove-ign
 | 精确命令未授权（`missing_commands/*`） | 追加配置后普通 `resume RUN` |
 | 续作请求需要先修正（`continuation/*`） | `resume RUN --reject-continuation FILE` |
 | 已保存 worker 环境阻断（`environment/worker_blocked`） | 修复条件后 `resume RUN --environment-update FILE` |
+| 供应商额度用尽、限速、过载或认证失败（`provider_quota/*`、`provider_failure/overloaded`、`provider_failure/authentication`） | 额度恢复或修复登录后普通 `resume RUN`；worker 的这次调用不计工作尝试 |
 | 等待用户决定 | 从 status 取 request ID，`resume RUN --operator-decision FILE`；可重复参数一次回答多项 |
 | 指挥提问 | 从 status 取 request ID，`resume RUN --operator-decision FILE` 回答；回答进入下一次指挥决定 |
 | 指挥修订越出已批准范围（`scope_extension/revision`） | 核对后 `resume RUN --allow-scope 'config/**'`，或普通 `resume`；两者都是新的指挥决定 |

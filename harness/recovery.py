@@ -80,6 +80,14 @@ def worker_recovery_context(run, directory, task_id, *, feedback=None):
         for key in ("invoked_at", "worker_outcome"):
             if key in entry:
                 value[key] = entry[key]
+        evidence = entry.get("worker_return_evidence")
+        provider = evidence.get("provider") if isinstance(evidence, dict) else None
+        if entry.get("worker_receipt_consumed") == "provider_failure" and isinstance(provider, dict):
+            # The judged failure's type, so the next worker knows what stopped it.
+            from .provider_failures import STOPS
+            if isinstance(provider.get("code"), str) and provider["code"] in STOPS:
+                kind, reason = STOPS[provider["code"]]
+                value["failure"] = {"kind": kind, "reason": reason}
         if entry["id"] in attempts:
             value["attempt"] = attempts[entry["id"]]
         return value

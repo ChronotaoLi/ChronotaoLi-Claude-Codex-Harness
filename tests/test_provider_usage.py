@@ -132,14 +132,16 @@ class ProviderUsageTests(RepoCase):
                           if path.name == "capture-manifest.json" or path.name.startswith("stream-")], [])
 
     def test_success_terminal_with_nonzero_exit_is_never_accepted(self):
-        """Two gates hold this: the adapter refuses a non-zero exit, the seal refuses it again."""
+        """The adapter refuses a non-zero exit; the immediate judgment then finds an unsealed result."""
         from test_worker_return_recovery import stub_provider_clis
         stub_provider_clis(self)
         backend = self.backend({"worker": {"exit_code": 9}})
         engine = self.engine(backend)
-        with self.assertRaisesRegex(HarnessError, "worker CLI exit=9"):
+        with self.assertRaisesRegex(HarnessError, "before immutable seal"):
             engine.start("Implement greet", self.plan())
         worker = engine.run["dispatches"][-1]
+        self.assertEqual((engine.run["stop"]["kind"], engine.run["stop"]["reason"]), ("evidence", "unsealed_return"))
+        self.assertIn("worker CLI exit=9", worker["error"])  # the call's own failure stays on its entry
         job = engine.directory / "dispatches" / worker["id"]
         self.assertEqual(read_json(job / "process.stdout")["subtype"], "success")
         self.assertFalse((job / "response.json").exists())
@@ -272,10 +274,17 @@ class ProviderUsageTests(RepoCase):
         self.assertEqual(len([event for event in self.events(engine) if event["dispatch_id"] == prior["id"]]), 1)
 
     def test_telemetry_errors_do_not_mask_cli_error_or_gate_acceptance(self):
+        from test_worker_return_recovery import stub_provider_clis
+        stub_provider_clis(self)
+        # Exit 7 with truncated output is an invalid delivery, judged at once; one attempt allowed.
+        self.config.data["runtime"]["max_attempts"] = 1
         engine = self.engine(self.backend({"worker": {"malformed": True, "exit_code": 7}}))
-        with self.assertRaisesRegex(HarnessError, "worker CLI exit=7"):
+        with self.assertRaisesRegex(HarnessError, "尝试次数上限"):
             engine.start("Implement greet", self.plan())
-        self.assertNotIn("provider_usage", engine.run["dispatches"][-1])
+        worker = engine.run["dispatches"][-1]
+        self.assertEqual((worker["worker_receipt_consumed"], worker["status"]), ("result_rejected", "invalid"))
+        self.assertNotIn("provider_usage", worker)
+        self.config.data["runtime"]["max_attempts"] = 5
         backend = self.backend()
         engine = self.engine(backend)
         original = engine.context.event

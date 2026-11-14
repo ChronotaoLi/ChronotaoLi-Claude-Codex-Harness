@@ -13,7 +13,8 @@ from .util import HarnessError
 def work_attempts(run):
     """Project saved accounting without changing the monotonic invocation totals.
 
-    Work counting spares only evidence-bound environment/operator waits.
+    Work counting spares only evidence-bound exemptions: environment/operator
+    waits and provider quota, rate-limit, overload and authentication failures.
     """
     attempts = dict(run.get("attempts", {}))
     for entry in run.get("dispatches", []):
@@ -43,6 +44,9 @@ class AttemptAccounting(RuntimeService):
                 continue
             exemption = entry["attempt_exemption"]
             task_id, dispatch_id = entry.get("task_id"), entry.get("id")
+            if isinstance(exemption, dict) and exemption.get("basis") == "provider_error":
+                self.validate_provider_exemption(entry, exemption, tasks)
+                continue
             if (entry.get("role") != "worker" or entry.get("invoked") is not True
                     or not isinstance(task_id, str) or task_id not in tasks or not isinstance(dispatch_id, str)
                     or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,119}", dispatch_id)
@@ -63,6 +67,33 @@ class AttemptAccounting(RuntimeService):
                 raise HarnessError("任务尝试豁免与原始阻断结果不符；保留台账")
         if any(value < 0 for value in work_attempts(self.context.run).values()):
             raise HarnessError("任务尝试豁免超过实际调用次数；保留台账")
+
+    def validate_provider_exemption(self, entry, exemption, tasks):
+        """A provider exemption stands only on the judged, digest-bound terminal envelope.
+
+        It rereads the five source files through the judgment record; no quota
+        snapshot, account state or configuration takes part.
+        """
+        from .provider_failures import EXEMPT
+        from .worker_returns import validate_return_evidence
+        task_id, dispatch_id = entry.get("task_id"), entry.get("id")
+        if (entry.get("role") != "worker" or entry.get("invoked") is not True
+                or not isinstance(task_id, str) or task_id not in tasks or not isinstance(dispatch_id, str)
+                or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,119}", dispatch_id)
+                or set(exemption) != {"basis", "code", "artifact", "artifact_digest"}
+                or exemption["code"] not in EXEMPT
+                or not isinstance(exemption["artifact_digest"], str)
+                or not re.fullmatch(r"[0-9a-f]{64}", exemption["artifact_digest"])
+                or exemption["artifact"] != str(self.context.directory / "dispatches" / dispatch_id / "process.stdout")
+                or entry.get("worker_receipt_consumed") != "provider_failure" or entry.get("status") != "failed"):
+            raise HarnessError("任务尝试豁免来源无效；保留台账")
+        evidence = entry.get("worker_return_evidence")
+        if not isinstance(evidence, dict) or evidence.get("state") != "retryable":
+            raise HarnessError("供应商失败豁免缺少可重试判定；保留台账")
+        validate_return_evidence(self.context.directory / "dispatches" / dispatch_id, evidence)
+        if (evidence["sources"]["process.stdout"] != exemption["artifact_digest"]
+                or evidence["provider"]["code"] != exemption["code"]):
+            raise HarnessError("任务尝试豁免与供应商失败判定不符；保留台账")
 
     def record_attempt_exemption(self, entry, result, source):
         """Only a fully validated, durably retained wait may spare the task budget.

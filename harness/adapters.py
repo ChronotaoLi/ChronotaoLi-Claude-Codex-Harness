@@ -12,6 +12,7 @@ from pathlib import Path
 
 from . import stops
 from .command_server import create_manifest
+from .provider_failures import claude_http_status
 from .shared import mcp_configs, toml_value
 from .util import HarnessError, dump, read_json, run_process, strict_json_loads, tail, write_json
 from .worker_returns import decode_terminal
@@ -125,18 +126,6 @@ def provider_usage(job, provider):
         return {"provider": provider, **metrics} if metrics else None
     except (OSError, ValueError, UnicodeError, RecursionError):
         return None
-
-
-def claude_http_status(value):
-    """Presence remains distinct even when missing and null share a label."""
-    if "api_error_status" not in value:
-        return {"state": "missing"}
-    status = value["api_error_status"]
-    if status is None:
-        return {"state": "null"}
-    if type(status) is int and 400 <= status <= 599:
-        return {"state": "valid", "value": status}
-    return {"state": "invalid"}
 
 
 def claude_error_summary(value):

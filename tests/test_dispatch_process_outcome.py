@@ -75,9 +75,24 @@ class DispatchProcessOutcomeTests(RepoCase):
                 kwargs['on_start'](123456)
                 raise ProcessTimeout(.1, kwargs['job'] / 'process')
         engine = self.engine(Backend())
+        from copy import deepcopy
+        from harness.run_store import RunStore
+        commits, original = [], RunStore.commit
+
+        def record(store):
+            revision = original(store)
+            commits.append(deepcopy(store.run))
+            return revision
+        # The fallback probe fails; the judgment's own exit check is a separate, later observation.
         with patch('harness.dispatch.group_alive', side_effect=PermissionError(errno.EPERM, 'probe')), \
-                self.assertRaises(ProcessTimeout):
+                patch('harness.run_context.group_alive', return_value=False), \
+                patch.object(RunStore, 'commit', record), self.assertRaises(ProcessTimeout):
             engine.start('Implement greet', read_json(ROOT / 'examples/plan.json'))
+        recorded = next(run['dispatches'][-1] for run in commits
+                        if run['dispatches'] and run['dispatches'][-1].get('status') == 'failed')
+        self.assertFalse(recorded['exit_confirmed'])  # the failed probe manufactured no confirmation
+        self.assertEqual(recorded['process_observation_error']['errno'], errno.EPERM)
         entry = read_json(engine.directory / 'state.json')['dispatches'][-1]
-        self.assertFalse(entry['exit_confirmed'])
+        self.assertTrue(entry['exit_confirmed'])  # confirmed only by the judgment's own observation
         self.assertEqual(entry['process_observation_error']['errno'], errno.EPERM)
+        self.assertEqual(entry['worker_receipt_consumed'], 'provider_failure')

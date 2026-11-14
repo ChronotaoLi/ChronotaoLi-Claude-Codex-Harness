@@ -240,7 +240,8 @@ class CurrentLedgerTests(RepoCase):
         self.assertFalse({'max_total_attempts', 'claude_output_mode'} & set(self.run['config_snapshot']['runtime']))
         self.assertFalse(any('capture' in entry['worker_receipt'] for entry in self.workers(self.run)))
         evidence = self.workers(self.run)[0]['worker_return_evidence']
-        self.assertEqual(set(evidence), {'version', 'state', 'reason', 'sources'})
+        self.assertEqual(set(evidence), {'version', 'state', 'reason', 'sources', 'provider'})
+        self.assertEqual(evidence['version'], 2)
         self.assertEqual(set(evidence['sources']), set(SOURCES))
         self.assertEqual(self.run['attempts'], {'greet': 3})
         handoff = read_json(self.directory / 'handoff.json')

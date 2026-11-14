@@ -92,6 +92,14 @@ ROW_COVERAGE = {
     "dispatch-exit": Row(("process_unconfirmed", "dispatch_exit"), RUN,
                          "test_invalid_output_redo.RedoBoundaryTests.test_unconfirmed_exit_blocks_judgment"),
     "command-exit": Row(("process_unconfirmed", "command_exit"), OPERATION, "test_stop_exits.ExitRowTests.test_command_exit"),
+    "provider-quota": Row(("provider_quota", "usage_limit"), RUN, "test_provider_failures.ImmediateJudgmentTests."
+                                                                   "test_quota_failure_is_judged_exempted_and_typed_at_once"),
+    "provider-rate-limit": Row(("provider_quota", "rate_limit"), RUN,
+                               "test_provider_failures.ImmediateJudgmentTests.test_rate_limit_row"),
+    "provider-overloaded": Row(("provider_failure", "overloaded"), RUN,
+                               "test_provider_failures.ImmediateJudgmentTests.test_overloaded_row"),
+    "provider-authentication": Row(("provider_failure", "authentication"), RUN,
+                                   "test_provider_failures.ImmediateJudgmentTests.test_authentication_row"),
     "provider-failed": Row(("provider_failure", "invocation_failed"), RUN,
                            "test_worker_return_recovery.WorkerReturnRecoveryTests.test_explicit_provider_error_allows_counted_retry"),
     "provider-unknown": Row(("provider_failure", "unknown"), RUN,
@@ -153,7 +161,7 @@ ROW_COVERAGE = {
     "dirty-final": Row(("workspace_mismatch", "dirty_final_workspace"), RUN, "test_stop_exits.WorkspaceRowTests.test_dirty_final"),
     "binding-changed": Row(("workspace_mismatch", "binding_changed"), RUN,
                            "test_worktree_binding.EngineWorktreeBindingTests."
-                           "test_worker_redirect_is_preserved_and_blocks_resume_and_removal"),
+                           "test_redirect_before_acceptance_cannot_commit_to_main"),
     "process-incomplete": Row(("evidence", "process_incomplete"), RUN, "test_stop_exits.ProcessRowTests.test_process_incomplete"),
     "review-findings": Row(("budget", "review_findings"), RUN, "test_stop_exits.ProcessRowTests.test_review_findings"),
     "runtime-io": Row(("runtime_failure", "io"), RUN,

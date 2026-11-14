@@ -1,5 +1,6 @@
 """Synthetic provider envelopes exercise diagnostics and real local CLI recovery."""
 import copy
+import hashlib
 import json
 import sys
 import tempfile
@@ -121,6 +122,11 @@ class DiagnosticFixtureBackend(FixtureCLIBackend):
 
 
 class ProviderErrorRecoveryTests(RepoCase):
+    def setUp(self):
+        super().setUp()
+        from test_worker_return_recovery import stub_provider_clis
+        stub_provider_clis(self)
+
     def test_provider_error_with_zero_exit_still_blocks_acceptance(self):
         backend = DiagnosticFixtureBackend(self.config, self.repo / ".harness", {
             "worker": {"envelope": usage_limit_envelope()}})
@@ -128,12 +134,16 @@ class ProviderErrorRecoveryTests(RepoCase):
         with self.assertRaisesRegex(HarnessError, "usage_limit_reached") as caught:
             engine.start("Implement greet", read_json(ROOT / "examples/plan.json"))
         self.assertNotIn("MODEL_PRIVATE_BODY", str(caught.exception))
+        self.assertEqual((engine.run["stop"]["kind"], engine.run["stop"]["reason"]), ("provider_quota", "usage_limit"))
         self.assertEqual(engine.run["accepted"], {})
-        self.assertEqual(work_attempts(engine.run), {"greet": 1})
+        # The call happened and counts as a dispatch; the quota failure spares the work attempt.
+        self.assertEqual((engine.run["attempts"], work_attempts(engine.run)), ({"greet": 1}, {"greet": 0}))
         self.assertEqual(engine.run["dispatches"][-1]["status"], "failed")
+        self.assertEqual(engine.run["dispatches"][-1]["attempt_exemption"]["code"], "usage_limit")
         self.assertEqual(len(backend.calls), 1)
 
     def test_nonzero_exit_keeps_usage_and_budget_then_recovers_with_new_dispatch(self):
+        """HF-20261112-01: a quota interruption no longer uses up the task's last work attempt."""
         self.config.data["runtime"]["max_attempts"] = 1
         backend = DiagnosticFixtureBackend(self.config, self.repo / ".harness", {
             "worker": {"exit_code": 1, "envelope": usage_limit_envelope()}})
@@ -146,20 +156,16 @@ class ProviderErrorRecoveryTests(RepoCase):
         artifact = engine.directory / "dispatches" / failed["id"] / "process.stdout"
         original = artifact.read_bytes()
         self.assertEqual(failed["provider_usage"]["reported_cost_usd"], 0.25)
-        self.assertEqual(work_attempts(engine.run), {"greet": 1})
-        self.assertNotIn("attempt_exemption", failed)
+        self.assertEqual((engine.run["attempts"], work_attempts(engine.run)), ({"greet": 1}, {"greet": 0}))
+        self.assertEqual(failed["attempt_exemption"]["artifact_digest"], hashlib.sha256(original).hexdigest())
         self.assertEqual(engine.run["accepted"], {})
         self.assertEqual(engine.run["agent_dispatches"], 1)
         backend.options = {}
-        with self.assertRaisesRegex(HarnessError, "尝试次数上限"):
-            self.engine(backend).resume(engine.run["id"])
-        self.assertEqual(len(backend.calls), 1)
-
-        self.config.data["runtime"]["max_attempts"] = 2
+        # max_attempts stays 1: the plain resume runs a fresh worker.
         result = self.engine(backend).resume(engine.run["id"])
         self.assertEqual(result["status"], "completed")
         self.assertEqual(sum(result["attempts"].values()), 2)
-        self.assertEqual(work_attempts(result), {"greet": 2})
+        self.assertEqual(work_attempts(result), {"greet": 1})
         self.assertEqual(result["agent_dispatches"], 5)
         workers = [call for call in backend.calls if call["role"] == "worker"]
         self.assertEqual(len(workers), 2)

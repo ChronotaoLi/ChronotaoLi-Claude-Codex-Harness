@@ -29,7 +29,7 @@ def notices(stderr):
 
 class RegistryTests(unittest.TestCase):
     def test_registry_shape_and_projection(self):
-        self.assertEqual(len(stops.REGISTRY), 54)
+        self.assertEqual(len(stops.REGISTRY), 58)
         self.assertLessEqual({("plan_approval", "initial_plan"), ("interrupted", "signal"),
                               ("unclassified", "untyped_harness_error"), ("unclassified", "unexpected_exception")},
                              set(stops.REGISTRY))
