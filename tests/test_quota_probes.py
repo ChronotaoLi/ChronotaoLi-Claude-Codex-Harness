@@ -337,6 +337,43 @@ class CleanupTests(ProbeCase):
         self.assertTrue(group_gone(calls.probes("claude")[-1]["pid"]))
 
 
+class OwnershipWindowTests(ProbeCase):
+    """No signal can fall between owning a resource and the cleanup that releases it (real SIGINT to this process)."""
+
+    def test_an_interrupt_right_after_the_directory_is_created_still_removes_it(self):
+        calls = quota_stubs.install(self)
+        temp = TrackTemp(self)
+        real = tempfile.mkdtemp
+
+        def created_then_interrupted(*args, **kwargs):
+            path = real(*args, **kwargs)   # the directory exists; the probe has not recorded it yet
+            os.kill(os.getpid(), signal.SIGINT)
+            return path
+        with patch("harness.quota.tempfile.mkdtemp", side_effect=created_then_interrupted), \
+                self.assertRaises(KeyboardInterrupt):
+            quota.snapshot("claude", environment())
+        self.assertEqual(calls.probes(), [])   # nothing is started after the interrupt
+        self.assertTrue(temp.removed(), temp.paths)
+
+    def test_an_interrupt_at_the_cleanup_entry_still_ends_the_group_and_removes_the_directory(self):
+        # The leader ignores EOF and its same-group child ignores SIGTERM: only a complete cleanup ends both.
+        for target in ("harness.quota.ProbeProcess._cleanup", "harness.quota._termination"):
+            with self.subTest(entry=target):
+                calls = quota_stubs.install(self, codex="leader_waits_child_ignores")
+                temp = TrackTemp(self)
+                module, _, name = target.rpartition(".")
+                owner = quota.ProbeProcess if module.endswith("ProbeProcess") else quota
+                real = getattr(owner, name)
+
+                def interrupted_first(*args, **kwargs):
+                    os.kill(os.getpid(), signal.SIGINT)
+                    return real(*args, **kwargs)
+                with patch(target, interrupted_first), self.assertRaises(KeyboardInterrupt):
+                    quota.snapshot("codex", environment())
+                self.assertEqual(len(calls.children("codex")), 1)
+                self.assert_clean(calls, temp, "codex")
+
+
 class SignalVerdictTests(ProbeCase):
     """The first user interrupt during cleanup propagates afterwards, whatever else is in flight."""
 

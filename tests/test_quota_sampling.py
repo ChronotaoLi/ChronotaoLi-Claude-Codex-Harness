@@ -8,6 +8,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import shutil
 import tempfile
 import time
@@ -25,13 +26,15 @@ from harness.util import HarnessError, read_json
 from test_dashboard import DashboardCase
 from test_harness import ROOT, RepoCase, walk_exit
 from test_provider_usage import FixtureCLIBackend
-from test_quota_probes import gone, group_gone
+from test_quota_probes import TrackTemp, gone, group_gone
 from test_runtime_changes import ScriptedBackend
 
 QUOTA_ENVELOPE = {"is_error": True, "terminal_reason": "api_error", "api_error": "usage_limit_reached",
                   "api_error_status": 429}
 FULL_WINDOW = [{"bucket": "weekly_scoped（Model Z）", "used_percent": 100, "resets_at": "2031-01-06T03:00:00+00:00"}]
 QUOTA_FIELDS = ("quota_snapshot", "quota_sample", "quota_reason", "full_windows")
+DISPATCH_FACTS = ("role", "kind", "task_id", "status", "invoked", "worker_receipt", "worker_receipt_consumed",
+                  "worker_outcome", "attempt_exemption", "worker_return_evidence", "retry_of", "invalid_output")
 
 
 def plan():
@@ -63,6 +66,21 @@ class DemoResultBackend(FixtureCLIBackend):
 
 
 class SamplingCase(RepoCase):
+    def setUp(self):
+        super().setUp()
+        self.probe_dirs = TrackTemp(self)
+
+    def tearDown(self):
+        # Whatever path a test took: every probe's group, every descendant a stub logged and
+        # every probe directory are gone once the run returned or raised.
+        for calls in self.__dict__.get("quota_installs", []):
+            for call in calls.probes():
+                self.assertTrue(group_gone(call["pid"]), call)
+            for pid in calls.children("claude") + calls.children("codex"):
+                self.assertTrue(gone(pid), pid)
+        self.assertFalse([path for path in self.probe_dirs.paths if os.path.lexists(path)])
+        super().tearDown()
+
     def backend(self, options=None):
         return DemoResultBackend(self.config, self.repo / ".harness", options)
 
@@ -87,18 +105,21 @@ class SamplingCase(RepoCase):
         return json.loads(output.getvalue())
 
     @staticmethod
-    def decisions(run):
-        """What scheduling, budgets, receipts and acceptance decided, without IDs or times."""
-        return {"status": run["status"],
-                "dispatches": [(entry["role"], entry.get("kind"), entry.get("task_id"), entry.get("status"),
-                                entry.get("invoked"), entry.get("worker_receipt_consumed"), entry.get("worker_outcome"))
-                               for entry in run["dispatches"]],
-                "attempts": run["attempts"], "agent_dispatches": run["agent_dispatches"],
-                "receipts": [sorted(run[key]) for key in ("worker_receipts", "review_receipts", "commander_receipts")],
-                "accepted": sorted(run["accepted"]),
-                "reviews": {key: [record.get("verdict") for record in value]
-                            for key, value in run["review_history"].items()},
-                "final": [record.get("status") for record in run["final_history"]]}
+    def decisions(run, directory):
+        """What scheduling, budgets, receipts, reviews and acceptance decided, in full.
+
+        Only this run's own identities are replaced: its ID and directory, dispatch IDs (by
+        position), SHA-256 digests and commit IDs.
+        """
+        kept = {"status": run["status"], "attempts": run["attempts"], "agent_dispatches": run["agent_dispatches"],
+                "dispatches": [{key: entry.get(key) for key in DISPATCH_FACTS} for entry in run["dispatches"]],
+                **{key: run[key] for key in ("worker_receipts", "review_receipts", "commander_receipts", "accepted",
+                                             "review_history", "final_history")}}
+        text = json.dumps(kept, sort_keys=True).replace(str(directory), "RUN_DIR").replace(run["id"], "RUN")
+        for index, entry in enumerate(run["dispatches"]):
+            text = text.replace(entry["id"], f"DISPATCH_{index}")
+        text = re.sub(r"\b[0-9a-f]{40}\b", "COMMIT", re.sub(r"\b[0-9a-f]{64}\b", "SHA256", text))
+        return json.loads(text)
 
     def assert_probes_gone(self, calls):
         probes = calls.probes()
@@ -144,13 +165,16 @@ class LifecycleTests(SamplingCase):
         self.assertEqual(self.quota_calls.all(), [])
 
     def test_probe_failures_change_no_decision(self):  # L3
-        base = self.decisions(self.engine(self.backend()).start("Implement greet", plan()))
+        engine = self.engine(self.backend())
+        base = self.decisions(engine.start("Implement greet", plan()), engine.directory)
+        self.assertEqual([entry["role"] for entry in base["dispatches"]], ["worker", "verification", "reviewer",
+                                                                         "verification", "reviewer"])
         for claude, codex in (("hang", "hang"), ("big", "rpc_error"), ("not_zero_call", "shape"), ("exit", "orphan"),
                               ("child_ignores_term_leader_exits", "leader_waits_child_ignores")):
             with self.subTest(claude=claude, codex=codex), patch.object(quota, "QUERY_SECONDS", 1.0):
                 calls = quota_stubs.install(self, claude=claude, codex=codex)
                 engine = self.engine(self.backend())
-                self.assertEqual(self.decisions(engine.start("Implement greet", plan())), base)
+                self.assertEqual(self.decisions(engine.start("Implement greet", plan()), engine.directory), base)
                 self.assertEqual(len(self.names(engine)), 4)   # every sampling point still wrote its sample
                 self.assert_probes_gone(calls)
 
@@ -197,6 +221,7 @@ class LifecycleTests(SamplingCase):
         sampled = self.events(engine)
         self.assertEqual([(record["sample"], record["write_error"]) for record in sampled], [(None, "OSError")] * 4)
         self.assertEqual(self.names(engine), [])
+        self.assertEqual(len(self.probe_dirs.paths), 4)   # four probes ran; tearDown checks each left nothing
 
     def test_an_interrupt_in_the_first_probe_stops_before_the_dispatch_exists(self):  # L7
         calls = quota_stubs.install(self, claude="sigint_parent")
@@ -669,6 +694,26 @@ class RegistrationTests(unittest.TestCase):
                          ("provider_quota", ["resume run_x"]))
         with self.assertRaises(KeyError):
             stops.make("provider_failure", "unknown", data={"quota_snapshot": "available"})
+
+    def test_a_large_quota_stop_keeps_its_type_and_exit_after_the_diagnostic(self):  # review suggestion 1
+        # A long path of CJK characters, a full and wide list of windows, a sample reference, then a
+        # 2,000-character diagnostic outside the BMP (twelve bytes each, escaped): all synthetic.
+        source = {"artifact": "/tmp/" + "/".join(["长" * 50] * 15) + "/process.stdout", "artifact_digest": "a" * 64,
+                  "dispatch_id": "d" * 36, "task_id": "greet"}
+        windows = [{"bucket": "窗" * 160, "used_percent": 100, "resets_at": None}] * 16
+        value = stops.make("provider_quota", "usage_limit", source=source, data={
+            "role": "worker", "provider": "claude", "http_status": 429, "quota_snapshot": "available",
+            "quota_sample": "r0000000003-p0-20310101T000000.000000Z-s0003-claude-quota_failure.json",
+            "full_windows": windows})
+        error = HarnessError("\U0001f600" * 2000, stop=value)
+        final = stops.of(error)
+        stops.validate(final)
+        self.assertEqual((final["kind"], final["reason"], stops.exit_code(error)), ("provider_quota", "usage_limit", 3))
+        self.assertEqual(stops.project(final, "run_x")["exits"], ["resume run_x"])
+        self.assertEqual((final["data"]["quota_snapshot"], final["data"]["quota_sample"], final["source"]),
+                         ("available", value["data"]["quota_sample"], source))
+        self.assertTrue(final["data"]["full_windows"])
+        self.assertEqual(len(final["data"]["full_windows"]) + final["data"]["full_windows_omitted"], 16)
 
 
 if __name__ == "__main__":

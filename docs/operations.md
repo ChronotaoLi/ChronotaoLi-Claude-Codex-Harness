@@ -189,7 +189,7 @@ run 列表 → run 详情 → 文件查看。列表按最近事件排序，以�
 
 ### 额度样本
 
-真实 `CLIBackend` 的 `run`／`resume` 在这些时刻各取一份账号额度快照（不调用模型）：本进程首次用到某供应商之前（`before_use`），额度失败停止之前（`quota_failure`），以及停止、暂停、完成、等待批准确已保存之后，对本进程用过的供应商各一份（`stop`、`paused`、`completed`、`awaiting_approval`）；每次至多 5 份。`demo` 与离线后端不采样。探测：Claude 是 `claude -p /usage --output-format stream-json --verbose --no-session-persistence --setting-sources "" --strict-mcp-config --max-turns 1`，必须读到零调用的结果行（`num_turns`、`total_cost_usd`、`duration_api_ms` 为 0，`local_command` 为 `usage`），读不到就在本进程停用 Claude 探测；Codex 是 `codex app-server` 的三条 JSON-RPC 消息（`initialize`、`initialized`、`account/rateLimits/read`）。两者都在空临时目录、用与模型调用相同的环境运行，5 秒查询时限，收尾时整个进程组 SIGTERM 后 SIGKILL。
+真实 `CLIBackend` 的 `run`／`resume` 在这些时刻各取一份账号额度快照（不调用模型）：本进程首次用到某供应商之前（`before_use`），额度失败停止之前（`quota_failure`），以及停止、暂停、完成、等待批准确已保存之后，对本进程用过的供应商各一份（`stop`、`paused`、`completed`、`awaiting_approval`）；每次至多 5 份。`demo` 与离线后端不采样。探测：Claude 是 `claude -p /usage --output-format stream-json --verbose --no-session-persistence --setting-sources "" --strict-mcp-config --max-turns 1`，必须读到零调用的结果行（`num_turns`、`total_cost_usd`、`duration_api_ms` 为 0，`local_command` 为 `usage`），读不到就在本进程停用 Claude 探测；Codex 是 `codex app-server` 的三条 JSON-RPC 消息（`initialize`、`initialized`、`account/rateLimits/read`）。两者都在空临时目录、用与模型调用相同的环境运行，5 秒查询时限，收尾时整个进程组 SIGTERM 后 SIGKILL；探测期间按 Ctrl-C，中断在约 0.1 秒内或收尾完成之后传播，临时目录与进程组照样清理。
 
 样本写在 `runs/<id>/observations/quota/`，文件名 `r<修订>-p<相位>-<进程启动时刻>-s<序号>-<供应商>-<触发>.json` 就是它们的顺序，排他发布、从不覆盖，只存归一化字段（窗口的已用百分比与重置时刻、Codex 的 credits 余额原样字符串、`extra_usage`、进程事实），不存 CLI 原始输出或错误文字。探测失败只记“不可用＋原因”：`not_installed`、`timeout`、`output_limit`、`exited`、`provider_error`、`shape_mismatch`、`not_zero_call`、`probe_disabled`、`internal_error`；从不改变调度、预算、回执与接受，用户中断照常传播。
 

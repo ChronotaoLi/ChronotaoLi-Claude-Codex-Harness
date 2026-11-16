@@ -329,52 +329,67 @@ def normalize_codex(initialize, answer):
 
 # ---------- the probe process ----------
 
-@contextlib.contextmanager
-def probe_cleanup_signals(primary):
-    """Defer SIGINT/SIGTERM/SIGHUP through a probe's startup or cleanup.
+class ProbeSignals:
+    """Record SIGINT/SIGTERM/SIGHUP for the whole life of a probe's resources; raise them only where safe.
 
-    The deferral itself is the one ``process_runtime.defer_cleanup_signals()`` uses
-    (handlers are swapped and restored with the signals blocked; signals pending at
-    the restore are collected too). Only the verdict differs: the first signal
-    captured here is raised as ``KeyboardInterrupt`` once the block is done unless
-    ``primary`` is already a user interrupt, whose own object then propagates. Neither
-    the probe's ordinary error (timeout, shape) nor an outer exception being
-    propagated can swallow it. Main thread only; elsewhere nothing is deferred.
+    Entered before the temporary directory is created and left after the cleanup
+    removed it, so no signal can land between owning a resource (directory, process
+    group) and the cleanup knowing about it, nor skip any step of the cleanup. Inside,
+    a signal only sets ``captured``: ``checkpoint()`` turns it into ``KeyboardInterrupt``
+    at the points the probe chooses (before starting the process, while reading or
+    writing), and a pending one cuts the cleanup's grace short. On leaving, handlers
+    are restored with the signals blocked and signals pending at the restore are
+    collected too (the deferral of ``process_runtime.defer_cleanup_signals()``); then,
+    unless the exception leaving is already a user interrupt (its own object
+    propagates), a captured signal is raised as ``KeyboardInterrupt``: neither the
+    probe's ordinary error (timeout, shape) nor an outer exception being propagated
+    can swallow it. Main thread only; elsewhere nothing is deferred.
     """
-    captured = []
+    SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
 
-    def remember(signum, frame):
-        if not captured:
-            captured.append(signum)
-    signals = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
-    interrupted = isinstance(primary, (KeyboardInterrupt, SystemExit))
-    main = threading.current_thread() is threading.main_thread()
-    old = {}
-    if main:
-        mask = signal.pthread_sigmask(signal.SIG_BLOCK, signals)
-        try:
-            for sig in signals:
-                old[sig] = signal.signal(sig, remember)
-        finally:
-            signal.pthread_sigmask(signal.SIG_SETMASK, mask)
-    try:
-        yield captured
-    finally:
-        if main:
-            mask = signal.pthread_sigmask(signal.SIG_BLOCK, signals)
+    def __init__(self):
+        self.captured, self.old = [], {}
+        self.main = threading.current_thread() is threading.main_thread()
+
+    def _remember(self, signum, frame):
+        if not self.captured:
+            self.captured.append(signum)
+
+    def pending(self):
+        return bool(self.captured)
+
+    def checkpoint(self):
+        if self.captured:
+            raise KeyboardInterrupt(f"quota probe signal {self.captured[0]}")
+
+    def __enter__(self):
+        if self.main:
+            mask = signal.pthread_sigmask(signal.SIG_BLOCK, self.SIGNALS)
             try:
-                for sig, handler in old.items():
+                for sig in self.SIGNALS:
+                    self.old[sig] = signal.signal(sig, self._remember)
+            finally:
+                signal.pthread_sigmask(signal.SIG_SETMASK, mask)
+        return self
+
+    def __exit__(self, kind, error, traceback):
+        interrupted = isinstance(error, (KeyboardInterrupt, SystemExit))
+        if self.main:
+            mask = signal.pthread_sigmask(signal.SIG_BLOCK, self.SIGNALS)
+            try:
+                for sig, handler in self.old.items():
                     signal.signal(sig, handler)
-                for sig in signal.sigpending().intersection(signals):
-                    remember(signal.sigwait({sig}), None)
+                for sig in signal.sigpending().intersection(self.SIGNALS):
+                    self._remember(signal.sigwait({sig}), None)
             finally:
                 try:
                     signal.pthread_sigmask(signal.SIG_SETMASK, mask)
                 except KeyboardInterrupt:
                     if not interrupted:  # a later request, after the restore; an existing interrupt is kept
                         raise
-        if captured and not interrupted:
-            raise KeyboardInterrupt(f"quota probe cleanup signal {captured[0]}")
+        if self.captured and not interrupted:
+            raise KeyboardInterrupt(f"quota probe signal {self.captured[0]}")
+        return False
 
 
 def _termination(primary):
@@ -400,7 +415,7 @@ class ProbeProcess:
 
     def __init__(self, argv, env, *, interactive):
         self.argv, self.env, self.interactive = list(argv), env, interactive
-        self.root = self.process = self.selector = None
+        self.root = self.process = self.selector = self.signals = None
         self.buffer, self.received, self.eof = b"", 0, False
         self.started_at = time.monotonic()
         self.deadline = self.started_at + QUERY_SECONDS
@@ -408,34 +423,37 @@ class ProbeProcess:
                       "temp_removed": True, "termination": "start_failed", "duration_ms": 0}
 
     def run(self, exchange):
-        primary = None
-        try:
-            self.root = Path(tempfile.mkdtemp(prefix="harness-quota-"))
-            (self.root / "cwd").mkdir()
-            self._start()
-            return exchange(self)
-        except BaseException as error:
-            primary = error
-            raise
-        finally:
-            self._cleanup(primary)
+        # One signal boundary from before the directory exists until the cleanup removed it:
+        # a resource is recorded on ``self`` in the same uninterruptible step that acquires it.
+        with ProbeSignals() as self.signals:
+            primary = None
+            try:
+                self.root = Path(tempfile.mkdtemp(prefix="harness-quota-"))
+                (self.root / "cwd").mkdir()
+                self.signals.checkpoint()   # an interrupt so far: no process is started
+                self._start()
+                return exchange(self)
+            except BaseException as error:
+                primary = error
+                raise
+            finally:
+                self._cleanup(primary)
 
     def _start(self):
-        # Ownership is recorded before any signal is handled: an interrupt arriving
-        # here is raised after the process object is kept, so cleanup still ends it.
-        with probe_cleanup_signals(None):
-            try:
-                process = subprocess.Popen(
-                    self.argv, cwd=self.root / "cwd", env=self.env,
-                    stdin=subprocess.PIPE if self.interactive else subprocess.DEVNULL,
-                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, start_new_session=True)
-            except (OSError, ValueError) as error:
-                raise _StartFailed(_name_of(error)) from error
-            self.process = process
-            self.facts.update(started=True, exit_confirmed=False, termination="normal")
+        try:
+            process = subprocess.Popen(
+                self.argv, cwd=self.root / "cwd", env=self.env,
+                stdin=subprocess.PIPE if self.interactive else subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, start_new_session=True)
+        except (OSError, ValueError) as error:
+            raise _StartFailed(_name_of(error)) from error
+        self.process = process
+        self.facts.update(started=True, exit_confirmed=False, termination="normal")
         os.set_blocking(self.process.stdout.fileno(), False)
+        self.signals.checkpoint()
 
     def send(self, message):
+        self.signals.checkpoint()
         try:
             self.process.stdin.write((json.dumps(message, ensure_ascii=True) + "\n").encode("ascii"))
             self.process.stdin.flush()
@@ -445,6 +463,7 @@ class ProbeProcess:
     def line(self):
         """The next stdout line, or None at EOF; raises at the query deadline or the output cap."""
         while True:
+            self.signals.checkpoint()
             if b"\n" in self.buffer:
                 line, self.buffer = self.buffer.split(b"\n", 1)
                 return line
@@ -457,7 +476,7 @@ class ProbeProcess:
             if self.selector is None:
                 self.selector = selectors.DefaultSelector()
                 self.selector.register(self.process.stdout.fileno(), selectors.EVENT_READ)
-            if not self.selector.select(min(remaining, 0.25)):
+            if not self.selector.select(min(remaining, 0.1)):
                 continue
             try:
                 chunk = os.read(self.process.stdout.fileno(), 65536)
@@ -472,25 +491,27 @@ class ProbeProcess:
             self.buffer += chunk
 
     def _cleanup(self, primary):
-        """One boundary: input closed, group signalled, leader reaped, group observed, descriptors and directory gone."""
+        """Input closed, group signalled, leader reaped, group observed, descriptors and directory gone.
+
+        Runs inside the probe's signal boundary (``run``), from its first line.
+        """
         if self.process is not None:
             self.facts["termination"] = _termination(primary)
-        with probe_cleanup_signals(primary) as deferred:
-            try:
-                if self.process is not None:
-                    self._stop_group(lambda: bool(deferred) or isinstance(primary, (KeyboardInterrupt, SystemExit)))
-            finally:
-                if self.selector is not None:
-                    self.selector.close()
-                if self.process is not None:
-                    for stream in (self.process.stdin, self.process.stdout):
-                        if stream is not None:
-                            with contextlib.suppress(OSError):
-                                stream.close()
-                if self.root is not None:
-                    shutil.rmtree(self.root, ignore_errors=True)
-                    self.facts["temp_removed"] = not os.path.lexists(self.root)
-                self.facts["duration_ms"] = int((time.monotonic() - self.started_at) * 1000)
+        try:
+            if self.process is not None:
+                self._stop_group(lambda: self.signals.pending() or isinstance(primary, (KeyboardInterrupt, SystemExit)))
+        finally:
+            if self.selector is not None:
+                self.selector.close()
+            if self.process is not None:
+                for stream in (self.process.stdin, self.process.stdout):
+                    if stream is not None:
+                        with contextlib.suppress(OSError):
+                            stream.close()
+            if self.root is not None:
+                shutil.rmtree(self.root, ignore_errors=True)
+                self.facts["temp_removed"] = not os.path.lexists(self.root)
+            self.facts["duration_ms"] = int((time.monotonic() - self.started_at) * 1000)
 
     def _stop_group(self, interrupted):
         pgid = self.process.pid
@@ -639,16 +660,18 @@ def publish_new_json(path, value):
     """Atomic and exclusive: written and synced under a temporary name, then linked; never replaces a file."""
     data = (dump(value) + "\n").encode("utf-8")
     temp = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
-    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o644)
-    try:
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(data)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.link(temp, path)   # FileExistsError when the name exists
-    finally:
-        with contextlib.suppress(FileNotFoundError):
-            os.unlink(temp)
+    # The temporary name is removed on every path; an interrupt is raised after that.
+    with ProbeSignals():
+        fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o644)
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.link(temp, path)   # FileExistsError when the name exists
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(temp)
 
 
 def bucket_label(provider, window):

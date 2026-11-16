@@ -250,4 +250,6 @@ def install(case, claude="ok", codex="ok", state=None):
     # Before anything starts: both names resolve to the stubs, never to an installed CLI.
     for name in ("claude", "codex"):
         case.assertEqual(shutil.which(name), str(folder / name))
-    return Calls(log)
+    calls = Calls(log)
+    case.__dict__.setdefault("quota_installs", []).append(calls)   # every install of this test, for leftover checks
+    return calls
