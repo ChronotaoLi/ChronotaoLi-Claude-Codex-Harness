@@ -158,6 +158,14 @@ QUOTA_REASONS = ("not_installed", "timeout", "output_limit", "exited", "provider
                  "not_zero_call", "probe_disabled", "internal_error")
 _QUOTA_DATA = {"quota_snapshot": _enum("available", "unavailable", "not_published"), "quota_sample": _id,
                "quota_reason": _enum(*QUOTA_REASONS), "full_windows": _quota_windows}
+# Why a usage-limit failure was not waited out in its process (harness.quota_wait), all optional:
+# the reason, the waits this process completed, and how far the decision got (the chosen window,
+# its reset, the seconds a wait would have needed, the configured limit, the uncertain windows).
+WAIT_REASONS = ("not_running", "provider", "unsaved_state", "disabled", "dispatch_budget", "no_sampler",
+                "exit_unconfirmed", "snapshot_unavailable", "window_uncertain", "no_blocking_window",
+                "reset_unknown", "reset_passed", "exceeds_limit", "record_invalid", "load_checks_failed")
+_WAIT_DATA = {"wait_reason": _enum(*WAIT_REASONS), "waits": _int, "window": _text, "resets_at": _text,
+              "wait_seconds": _int, "wait_limit_seconds": _int, "uncertain_windows": _strings}
 for _k, _r, _t in (("provider_quota", "usage_limit", "供应商额度用尽"), ("provider_quota", "rate_limit", "供应商限速"),
                    ("provider_failure", "overloaded", "供应商过载"),
                    ("provider_failure", "invocation_failed", "模型调用失败（CLI 报告错误）"),
@@ -165,7 +173,7 @@ for _k, _r, _t in (("provider_quota", "usage_limit", "供应商额度用尽"), (
                    ("provider_failure", "unknown", "模型调用失败（原因未识别）")):
     _row(_k, _r, 3, _t, ("resume {run}",), _FAILURE_SOURCE,
          role=ROLE, provider=_enum("claude", "codex"), http_status=_int,
-         **(_QUOTA_DATA if _k == "provider_quota" else {}))
+         **(_QUOTA_DATA if _k == "provider_quota" else {}), **(_WAIT_DATA if _r == "usage_limit" else {}))
 _row("provider_failure", "authentication", 3, "账号认证或权限失败", ("doctor", "resume {run}"), _FAILURE_SOURCE,
      role=ROLE, provider=_enum("claude", "codex"), http_status=_int)
 _row("invalid_output", "redo_exhausted", 3, "输出连续两次无效", ("resume {run}", "abandon {run}"),
@@ -216,7 +224,9 @@ _row("invalid_input", "run_state", 2, "该命令或选项不适用于 run 的当
 _row("config_mismatch", "immutable_config", 2, "配置与创建时不一致", ("resume {run}",))
 _row("config_mismatch", "shared_assets", 2, "共享资产与创建时不一致", ("resume {run}",))
 _row("unsupported_ledger", "ledger_version", 2, "台账版本不受支持", (), (), schema_version=_int, supported=_int)
-_row("busy", "run_lock", 3, "另一个进程持有运行锁", ())
+# While a quota wait holds the lock, resume/abandon point to its record (which proves no live process).
+_row("busy", "run_lock", 3, "另一个进程持有运行锁", (("status {run}", "quota_wait_recorded"),), (),
+     quota_wait_recorded=_bool, quota_wait_until=_text, quota_wait_recorded_at=_text, quota_wait_note=_text)
 # Fields of a list-like type in any row: an over-long value keeps its head and records ``<field>_omitted``.
 LIST_FIELDS = frozenset(name for entry in REGISTRY.values() for name, check in entry["data"].items()
                         if hasattr(check, "shape"))

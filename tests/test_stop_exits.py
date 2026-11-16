@@ -158,6 +158,8 @@ ROW_COVERAGE = {
                              "test_stop_exits.EvidenceRowTests.test_plan_file_damaged"),
     "revision-head": Row(("workspace_mismatch", "head_changed"), RUN, "test_stop_exits.WorkspaceRowTests.test_revision_head"),
     "shared-assets": Row(("config_mismatch", "shared_assets"), OPERATION, "test_stop_exits.OperationRowTests.test_shared_assets"),
+    "wake-shared-assets": Row(("config_mismatch", "shared_assets"), RUN,
+                              "test_quota_wait.GateTests.test_shared_skill_changed_during_wait_stops_before_any_model_call"),
     "config-changed": Row(("config_mismatch", "immutable_config"), OPERATION,
                           "test_harness.RuntimeTests.test_resume_rejects_changed_configuration"),
     "binding-missing": Row(("workspace_mismatch", "binding_missing"), OPERATION,
@@ -165,7 +167,8 @@ ROW_COVERAGE = {
                            "test_first_save_preserves_independent_plan_but_cannot_resume_without_binding"),
     "unsupported": Row(("unsupported_ledger", "ledger_version"), OPERATION,
                        "test_stop_exits.OperationRowTests.test_unsupported"),
-    "busy": Row(("busy", "run_lock"), OPERATION, "test_stop_exits.OperationRowTests.test_busy"),
+    "busy": Row(("busy", "run_lock"), OPERATION,
+                "test_quota_wait.ObservationTests.test_busy_while_waiting_points_to_the_record"),
     "setup-failed": Row(("verification", "setup_failed"), RUN,
                         "test_fresh_verification.FreshVerificationTests."
                         "test_failed_setup_resume_uses_new_checkout_same_attempt_and_no_extra_worker"),

@@ -13,6 +13,7 @@ DEFAULTS = {
         "max_attempts": 5, "max_agent_dispatches": 200,
         "context_chars": 100000, "claude_max_turns": 50,
         "claude_max_turns_by_role": {},
+        "quota_wait_max_seconds": 21600,
     },
     "permissions": {"worker_commands": []},
     "memory": {"task_ttl_days": 180, "knowledge_ttl_days": 180},
@@ -23,6 +24,8 @@ RESUME_INCREASES = (
     "claude_max_turns", "max_attempts", "max_agent_dispatches",
 )
 DISPATCH_ROLES = ("commander", "worker", "reviewer")
+# A wait policy, not a budget: a resume may raise, lower or disable it (0).
+QUOTA_WAIT_KEY = "quota_wait_max_seconds"
 
 
 def claude_turn_limit(runtime, role):
@@ -117,11 +120,14 @@ class Config:
         if data["roles"]["worker"]["cli"] == "codex":
             raise HarnessError("当前 Codex 适配器仅支持只读角色，不能配置为 worker")
         for key in DEFAULTS["runtime"]:
-            if key == "claude_max_turns_by_role":
+            if key in ("claude_max_turns_by_role", QUOTA_WAIT_KEY):
                 continue
             value = data["runtime"][key]
             if type(value) is not int or value <= 0:
                 raise HarnessError(f"runtime.{key} 必须为正整数")
+        value = data["runtime"][QUOTA_WAIT_KEY]
+        if type(value) is not int or value < 0:
+            raise HarnessError(f"runtime.{QUOTA_WAIT_KEY} 必须为非负整数；0 表示不等待")
         limits = data["runtime"].get("claude_max_turns_by_role", {})
         if not isinstance(limits, dict):
             raise HarnessError("runtime.claude_max_turns_by_role 必须为角色配置表")
@@ -146,7 +152,7 @@ class Config:
         validate_commands(data["permissions"]["worker_commands"], "permissions.worker_commands")
 
     def resume_changes(self, snapshot):
-        """Return budget increases and exact command grants without mutating inputs."""
+        """Return budget increases, exact command grants and quota wait changes without mutating inputs."""
         previous, current = copy.deepcopy(snapshot), normalized(self.data)
         if previous != normalized(previous):
             raise HarnessError('运行配置快照字段缺失；不补写旧版本默认值，请开始新 run')
@@ -164,6 +170,9 @@ class Config:
         new_limits = current["runtime"].pop("claude_max_turns_by_role")
         if new_limits != old_limits:
             changes["claude_max_turns_by_role"] = {"old": old_limits, "new": new_limits}
+        old, new = previous["runtime"].pop(QUOTA_WAIT_KEY), current["runtime"].pop(QUOTA_WAIT_KEY)
+        if new != old:
+            changes[QUOTA_WAIT_KEY] = {"old": old, "new": new}   # raised, lowered or disabled alike
         for key in RESUME_INCREASES:
             old, new = previous["runtime"].pop(key), current["runtime"].pop(key)
             if new < old:
@@ -185,7 +194,8 @@ class Config:
         if added:
             changes["worker_commands"] = {"old": old_commands, "new": new_commands, "added": added}
         if previous != current:
-            raise HarnessError("配置已改变：恢复只允许增大超时、上下文、轮数、尝试与派发预算或追加精确 worker 命令；其他配置必须保持一致")
+            raise HarnessError("配置已改变：恢复只允许增大超时、上下文、轮数、尝试与派发预算、追加精确 worker 命令"
+                               "或调整额度等待上限；其他配置必须保持一致")
         return changes
 
     @staticmethod

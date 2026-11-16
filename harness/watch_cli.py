@@ -41,6 +41,9 @@ def watch_run(state, run_id, *, follow=False, stdout=None):
                                          if summary.get("stop") else None),
                                 "active_dispatches": active[:20],
                                 "active_dispatch_count": len(active), "convergence": summary["convergence"],
+                                # A recorded quota wait (still running): when it ends and which window, not a liveness proof.
+                                "quota_wait": ({key: summary["quota_wait"][key] for key in ("window", "until", "recorded_at")}
+                                               if summary.get("quota_wait") else None),
                                 "process_observation": "ledger_only"}
                     encoded = json.dumps(snapshot, ensure_ascii=False, sort_keys=True)
                     if encoded != previous:

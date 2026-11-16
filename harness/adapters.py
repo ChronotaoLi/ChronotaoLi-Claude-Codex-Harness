@@ -218,8 +218,13 @@ class CLIBackend:
 
     @staticmethod
     def process_environment():
-        """The environment of every provider CLI process this backend starts: model calls and quota probes alike."""
+        """The environment of every provider CLI process this backend starts: model calls and quota probes alike.
+
+        Claude Code's own in-call quota wait is never inherited: the quota wait policy is
+        Harness's (``runtime.quota_wait_max_seconds``), and two layers must not stack.
+        """
         env = os.environ.copy()
+        env.pop("CLAUDE_CODE_RETRY_WATCHDOG", None)
         env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] = "1"
         return env
 

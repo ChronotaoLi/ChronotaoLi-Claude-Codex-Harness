@@ -1,7 +1,7 @@
 """Cross-stage policy for handoffs, decisions, and stopping."""
 from __future__ import annotations
 from pathlib import Path
-from . import git, stops
+from . import git, quota_wait, stops
 from .decisions import validate_handoff_question
 from .util import HarnessError
 from .services import RuntimeService
@@ -17,6 +17,7 @@ class Workflow(RuntimeService):
         interrupted = isinstance(error, (KeyboardInterrupt, SystemExit))
         value = stops.of(error)
         self.context.run["status"] = "interrupted" if interrupted else "blocked"
+        quota_wait.clear(self.context.run)   # a wait never outlives the stop that ends it
         if interrupted:
             value["data"]["exits_confirmed"] = self.exits_confirmed()
         self.context.run["stop"] = value

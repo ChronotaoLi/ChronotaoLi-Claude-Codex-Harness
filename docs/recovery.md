@@ -13,7 +13,7 @@
 - 先看 `status RUN`：它给出状态、停止投影 `stop`（类型、标题、出口命令与诊断摘录）、预算（`budgets`、`budget_explanation`、`remaining_model_calls`）、worker 结局计数 `worker_outcomes`、待答决定 `pending_decisions`、续作 `continuation`、缺失命令 `missing_command_requirements`、范围边界 `scope`（有已判定合格而未落地的提案时含即时重算的 `scope.held`）、最近环境阻断 `last_environment_blocker`、返工提示 `convergence` 和审阅轮次 `review_rounds`。`status RUN --full` 输出完整台账。
 - 每个出口都沿用同一 run 的累计预算、证据和接受条件。读得出的拒绝、停止和阻断不会被丢弃；读不出否决的无效输出不是结果，由新调用重做（见[无效输出与自动重做](#无效输出与自动重做)）。同一快照上重复 `resume` 只会得到同样的停止，或消耗新的调用。
 - 出口可以是继续，也可以是保留现场后 `abandon`。`abandon` 与 `resume` 一样先经过 `load_run`：加载时核验的证据（见[证据损坏](#证据损坏)）被删改时，两者都被拒绝。
-- `resume` 使用与 `run` 相同的 `--config`。恢复时只能提高 `agent_timeout_seconds`、`verify_timeout_seconds`、`context_chars`、`claude_max_turns`（及各角色实际生效的 `claude_max_turns_by_role`）、`max_attempts`、`max_agent_dispatches`，或在 `permissions.worker_commands` 追加精确 argv；其他配置、模型和共享资产必须与创建时一致。
+- `resume` 使用与 `run` 相同的 `--config`。恢复时只能提高 `agent_timeout_seconds`、`verify_timeout_seconds`、`context_chars`、`claude_max_turns`（及各角色实际生效的 `claude_max_turns_by_role`）、`max_attempts`、`max_agent_dispatches`，在 `permissions.worker_commands` 追加精确 argv，或任意调整额度等待上限 `quota_wait_max_seconds`（调高、调低、设 0 关闭；事件 `resume_config_changed`）；其他配置、模型和共享资产必须与创建时一致。
 - 恢复先确认旧进程退出、核对 Git 绑定与 HEAD，再做其他事；这些检查失败时不写入任何恢复输入。例外：已返回而未登记的指挥提问在 HEAD 门禁之前完成登记（见[指挥提问、修订与范围](#指挥提问修订与范围)），之后的回答与执行仍先过 HEAD 门禁。
 - 外层自动化会话的权限边界见[外层 agent 操作说明](operations.md#外层-agent-操作说明)：新增权限、预算或需求选择要向用户请求。
 
@@ -87,7 +87,7 @@
 | `final-timeout` | `verification/final_timeout` | 3 | `整体验证超时` | 修复环境或提高 `verify_timeout_seconds`；普通 `resume` 在同一快照重验 | `resume RUN` |
 | `dispatch-exit` | `process_unconfirmed/dispatch_exit` | 3 | `旧 dispatch … 的进程组仍存在` 或 `无法确认旧 dispatch … 已退出` | 核实该进程及其命令子进程已退出，不终止无关进程；终态 run 用 `cleanup-run` 的同名选项。`data.returned_unsealed` 为真时，这是一个已返回对象结果、尚未封存的 worker：未封存的结果事后不补认，确认之后只能放弃，所以不列 `resume`；为假时，确认之后 worker 的这次调用按原件判定（可重试、无效输出或未封存结果都可能） | 〔`!returned_unsealed`〕`resume RUN --confirm-exited {dispatch_id}`；`abandon RUN --confirm-exited {dispatch_id}` |
 | `command-exit` | `process_unconfirmed/command_exit`（操作） | 3 | `Cannot confirm command process exited: …`。本行是恢复预检的拒绝；运行中发现时（例如 worker 返回、封存之前）同一类型作为 run 停止写入台账 | 同上；用父 dispatch ID（`source.dispatch_id`）确认 | 〔`!returned_unsealed`〕`resume RUN --confirm-exited {dispatch_id}`；`abandon RUN --confirm-exited {dispatch_id}` |
-| `provider-quota` | `provider_quota/usage_limit` | 3 | 供应商额度用尽（Claude 信封 `api_error=usage_limit_reached`；`source.artifact` 是失败原件 `process.stdout` 与摘要）。真实 CLI 的 run 另带额度样本：`data.quota_snapshot`（`available`、`unavailable`、`not_published`）、样本文件名 `quota_sample`、不可用原因 `quota_reason`，以及快照里已满（≥100%）的窗口与重置时刻 `full_windows`——账号观察，不是失败原因，不按失败模型挑选，也不是等待依据 | 等额度恢复后普通 `resume`；worker 的这次调用已当场判定，不计工作尝试，仍计入 `max_agent_dispatches`；额度未恢复时会再失败一次 | `resume RUN` |
+| `provider-quota` | `provider_quota/usage_limit` | 3 | 供应商额度用尽（Claude 信封 `api_error=usage_limit_reached`；`source.artifact` 是失败原件 `process.stdout` 与摘要），而且没有在进程内等过去（见[额度等待](#额度等待)）：`data.wait_reason` 写明为什么没等，`data.waits` 是本进程已完成的等待次数，判断走到哪一步就带到哪一步（`window` 选中的窗口、`resets_at` 它的重置时刻、`wait_seconds` 需要的秒数、`wait_limit_seconds` 配置的上限、`uncertain_windows` 对应不明的满窗口）。真实 CLI 的 run 另带额度样本：`data.quota_snapshot`（`available`、`unavailable`、`not_published`）、样本文件名 `quota_sample`、不可用原因 `quota_reason`，以及快照里已满（≥100%）的窗口与重置时刻 `full_windows`——账号观察，不是失败原因 | 等额度恢复后普通 `resume`；worker 的这次调用已当场判定，不计工作尝试，仍计入 `max_agent_dispatches`；额度未恢复时会再失败一次（那次失败照常先判断能否等待）。`exceeds_limit`：可调高 `quota_wait_max_seconds` 后普通 `resume`，不会“补等”这一次；`dispatch_budget`：先提高 `max_agent_dispatches`；`window_uncertain`、`reset_unknown`、`no_blocking_window`：快照证明不了该等到何时，自行判断时刻后 `resume`；`record_invalid`：快照里的时刻超出等待记录的范围；`not_running`：首版规划阶段的失败不等 | `resume RUN` |
 | `provider-rate-limit` | `provider_quota/rate_limit` | 3 | 供应商限速（`api_error=rate_limit_error`，或没有标签而 `api_error_status=429`）；额度样本字段同上 | 稍后普通 `resume`；worker 不计工作尝试 | `resume RUN` |
 | `provider-overloaded` | `provider_failure/overloaded` | 3 | 供应商过载（`api_error=overloaded_error`） | 稍后普通 `resume`；worker 不计工作尝试 | `resume RUN` |
 | `provider-authentication` | `provider_failure/authentication` | 3 | 账号认证或权限失败（`api_error` 为 `authentication_error` 或 `permission_error`） | 用 `doctor` 核对登录，修复后普通 `resume`；worker 不计工作尝试 | `doctor`；`resume RUN` |
@@ -115,10 +115,11 @@
 | `plan-file-damaged` | `evidence/runtime_integrity`（操作） | 1 | `待应用的计划文件缺失或无法读取`、`…已改变`、`已发布的计划文件（revision-N）缺失或无法读取`、`…已改变`、`台账任务表与已发布的计划文件不符` | 恢复计划文件的原字节后普通 `resume`；`abandon` 不需要计划文件 | `resume RUN`；`abandon RUN` |
 | `revision-head` | `workspace_mismatch/head_changed` | 1 | `应用修订前 HEAD 与已校验计划不符` | 恢复原 HEAD 后普通 `resume`（修订照常发布），或放弃 | `resume RUN`；`abandon RUN`；〔`question_registered`〕`resume RUN --operator-decision FILE` |
 | `shared-assets` | `config_mismatch/shared_assets`（操作） | 2 | `共享规则、skills 或 MCP 已改变` | 恢复原版本的共享资产 | `resume RUN` |
+| `wake-shared-assets` | `config_mismatch/shared_assets` | 2 | 同上，额度等待醒来后的前提核对发现的（等待期间改了共享资产）；之后没有调用任何模型 | 恢复原版本的共享资产后普通 `resume`；醒来后的核对与手工 `resume` 是同一组函数，HEAD、Git 绑定、计划文件、索引、加载核验的不符也按各自的行处理 | `resume RUN` |
 | `config-changed` | `config_mismatch/immutable_config`（操作） | 2 | `配置已改变：…` | 恢复不可放宽的配置值 | `resume RUN` |
 | `binding-missing` | `workspace_mismatch/binding_missing`（操作） | 1 | `缺少已保存的 worktree Git 绑定` | 启动在绑定保存前中断；放弃后重新 `run`，核对后手工 `git worktree remove` 并删除 `harness/<run>` 分支 | `abandon RUN` |
 | `unsupported` | `unsupported_ledger/ledger_version`（操作） | 2 | `台账版本 N 不支持（当前版本 18）` | 当前版本不恢复、不放弃、不准备、不清理、不解释这份台账（见[终态与其他版本的台账](#终态与其他版本的台账)）；运行列表仍显示路径与版本；开始新 run，原始 JSON 用文件工具查看 | 无命令出口 |
-| `busy` | `busy/run_lock`（操作） | 3 | `已有进程持有运行锁` | 等另一个 `run`／`resume`／`abandon` 结束后重试原命令 | 无命令出口 |
+| `busy` | `busy/run_lock`（操作） | 3 | `已有进程持有运行锁`。额度等待期间 `resume`／`abandon` 也会遇到：锁外读到的台账有 `quota_wait` 时，停止值带 `quota_wait_until`、`quota_wait_recorded_at` 与固定说明 `quota_wait_note`（记录不证明持锁的进程仍在等待），并列出 `status RUN` | 等另一个 `run`／`resume`／`abandon` 结束后重试原命令；看 `status RUN` 的 `quota_wait` 判断是否在等额度；要取消等待就中断那个进程（Ctrl-C 或 SIGTERM），再按 `interrupted` 处理。`cleanup-run` 遇到锁被占按逐资源结果返回 1 | 〔`quota_wait_recorded`〕`status RUN` |
 | `setup-failed` | `verification/setup_failed` | 3 | `整体验证依赖准备失败` | 修复环境；普通 `resume` 用另一全新检出，同一尝试 | `resume RUN` |
 | `checks-modified` | `verification/checks_modified_files` | 3 | 验证或依赖准备修改了受检文件 | 让验证只读；验证生成的文件在 `info/exclude` 加精确模式 | `resume RUN` |
 | `dirty-final` | `workspace_mismatch/dirty_final_workspace` | 1 | `整体审阅要求干净的已接受提交` | 清理未接受的修改后普通 `resume`（下一步是派生的指挥决定，不重抽整体审阅），或放弃 | `resume RUN`；`abandon RUN` |
@@ -250,6 +251,33 @@ python3 -m harness --config /path/to/harness.toml --repo /path/to/project resume
 
 开启 `verification.fresh_checkout` 时，整体验证在系统临时目录的全新 detached worktree 中执行；准备失败或中断后，普通 `resume` 在另一个新检出重试当前最终尝试。验证通过、结论（连同检出记录 `checkout.json` 的摘要）已保存的检出，由运行时在整体审阅派发之前尝试回收（首次进入与恢复同一处）；删除失败只记事件 `verification_checkout_reclaim_failed`，不改变结论、不重跑验证或审阅，检出留给 `cleanup-run`。准备失败、验证失败或中断的检出保留供诊断。验证中产生未忽略的新文件时，核对后可在 `git rev-parse --git-common-dir` 指向的公共目录的 `info/exclude` 中加入精确模式，再恢复；不要用宽泛模式掩盖待交付代码。
 
+### 额度等待
+
+Claude 担任的角色（worker、`--commander fable` 的指挥、配置成 Claude 的审阅者）在执行循环里遇到已判定的 `provider_quota/usage_limit` 时，默认先在同一进程里等到快照给出的重置时刻再继续，不停止、不退出。条件、选窗口的规则与不等时的原因见设计的不变量 40；配置键 `runtime.quota_wait_max_seconds`（默认 21,600 秒，0 关闭），单次最多这么久，余量 60 秒；没有命令行参数。Codex 的失败、首版规划阶段的失败、限速与其他失败从不等待。
+
+- **等待期间**：状态保持 `running`，台账另有只供观察的 `quota_wait`（来源调用、窗口、重置时刻、等到何时、记录时刻、上限、失败样本），`status RUN` 的 `quota_wait` 与观察网页的关注项“等待额度恢复”显示它，`watch` 的快照带 `quota_wait`，退出条件不变。进程持有 `run.lock`：另一个 `resume`／`abandon` 得到 `busy/run_lock`（提示里有等待记录的时刻，记录不证明持锁的进程仍在等待）。事件 `quota_wait_started`、`quota_wait_finished`；失败时与醒来时各取一份额度样本（触发 `quota_failure`、`wake`）。
+- **醒来之后**：先删除 `quota_wait`（单独一次保存），再重跑 `resume` 预检里只读的前提核对，与手工 `resume` 调用同一组函数：盘上台账仍是本进程刚提交的那份、加载核验、共享资产摘要、环境产物、计划文件、Git 绑定、路径与输入索引、HEAD、依赖副本、回执链接。任何一项不符就停止，类型与 `resume` 遇到同样情况时相同（例如 `head-changed` 的 `workspace_mismatch/head_changed`、`wake-shared-assets`、`load-integrity`），之后不调用任何模型。不重跑带写入的预检步骤（退出确认、登记已返回的提问、补终端摘要、恢复输入），也不重读配置文件：等待期间改了 `harness.toml`，本进程照旧用启动时加载的配置，改动由下一次 `resume` 按通用规则接受或拒绝。核对通过后回到调度循环开头，重跑全部调度门禁，下一步照常推导：worker 失败之后是一次新的指挥决定，指挥或审阅失败之后是同一种调用的新请求（新进程、新 dispatch，不带 `retry_of`），不是重试同一个调用。
+- **取消**：中断这个进程（Ctrl-C 或 SIGTERM），台账记 `interrupted/signal`（退出码 130），`quota_wait` 与中断同次删除；之后普通 `resume` 或 `abandon`。等待中改小或关闭上限只能这样：中断后带新配置 `resume`，新值只影响之后的额度失败。
+- **主进程被强杀**：台账留着 `running` 与 `quota_wait`，读法与被强杀的 `running` 相同——记录不证明进程存活，不会自动继续。普通 `resume` 进入执行时删除它、照常推导下一步，不续等；`abandon` 同样删除它。
+- **有界**：每次等待之前都有一次计入 `max_agent_dispatches` 的失败调用，并且要求 `agent_dispatches` 仍小于上限；所以等待次数受派发预算约束，但累计等待时长不受单次上限约束（默认 200 次 × 6 小时）。
+
+保证：
+
+- 等待之前，失败调用的判定、豁免、计数与退出确认都已保存，内存里没有别的未保存改动；`quota_wait` 的那次保存只改这一个键，并且只发布满足它自己加载契约的记录，所以强杀之后 `resume`／`abandon` 总能加载。
+- 每次等待的单调时长不超过判断时需要的秒数，后者不超过配置的上限；系统休眠醒来后目标时刻已过就不再睡（最多晚一个 60 秒的分段），墙钟回拨不延长等待。
+- 醒来后、调用任何模型之前，重跑 `resume` 的只读前提核对与全部调度门禁；每次模型调用仍是新进程、新 dispatch。
+- 不等时的结局与没有等待机制时相同（额度停止退出 3；定稿换成加载失败时是加载失败自己的类型），只多 `data` 里的等待字段。
+- 能证明属于另一个家族或另一个完整版本的 `weekly_scoped` 窗口到 100% 既不阻止等待，也不会被当成等待目标；证明不了的到 100% 窗口一律不等。重置时刻只来自快照，从不来自失败文字。
+
+不保证：
+
+- 准点恢复：醒来时额度不一定已恢复（再失败一次、再判断一次，每次计入派发预算）。
+- 显示名与模型 ID 的对应正确：它是对显示文字的词法判断，两个方向都可能误判，没有真实样本验证。
+- 主进程死亡后自动继续；等待期间不中断进程就能从外部取消（`resume`／`abandon` 都是 `busy/run_lock`）。
+- 等待期间对配置文件的修改被本进程采用；醒来核对与派发之间的外部改动被发现（与手工 `resume` 的预检相同）。
+- `quota_wait_started`／`quota_wait_finished` 事件与失败、醒来样本文件一定存在（尽力而为；没有采样器、退出未确认、探测中断或发布失败时没有样本）。
+- 关掉 CLI 自己默认开启的调用内等待：只删除继承来的 `CLAUDE_CODE_RETRY_WATCHDOG`。
+
 ### 进程退出确认
 
 `--confirm-exited DISPATCH_ID` 用于 `resume`、`abandon`、`cleanup-run`，可重复。运行时在运行锁内校验全部 ID，先写审计事件（含当时的进程组探测与组长身份），再只更新指定记录；命令子进程用父 dispatch ID 确认，审计绑定子日志摘要。确认不终止进程、不放宽 HEAD、快照、Git 绑定或清理门禁，也不证明调用成功或没有结果。
@@ -309,3 +337,4 @@ python3 -m harness --config /path/to/harness.toml --repo /path/to/project resume
 9. **`prepare-run` 在保存临时文件身份之前中断**：不能凭相同字节接管文件，需人工核对。
 10. **`command-staging/` 中的准备目录**：发布前失败或被杀时留下；运行时不枚举它们，也不回收，反复失败会累积磁盘占用。
 11. **指挥或审阅的供应商输出不可解码、判定保存之前中断**：回执里没有原件，恢复按无返回处理，发起没有 `retry_of` 的调用；与不中断相比最多多一次调用。
+12. **额度等待中主进程被杀**：不会自动继续；台账留着 `running` 与 `quota_wait`（不证明进程存活），普通 `resume` 进入执行时删除记录并照常推导下一步，不续等。

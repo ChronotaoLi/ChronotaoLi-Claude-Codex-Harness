@@ -152,7 +152,8 @@ class LifecycleTests(SamplingCase):
         self.assertLessEqual({entry["role"] for entry in result["dispatches"]},
                              {"commander", "worker", "reviewer", "verification"})
         ledger = (directory / "state.json").read_text()
-        self.assertNotIn("quota", ledger)
+        # The only quota text in the ledger is the configured wait limit inside the configuration snapshot.
+        self.assertNotIn("quota", ledger.replace('"quota_wait_max_seconds"', ""))
         self.assertNotIn("observations", ledger)
 
     def test_offline_backends_never_probe(self):  # L2
@@ -345,7 +346,8 @@ class QuotaFailureTests(SamplingCase):
     def test_an_unavailable_failure_sample_still_lets_the_stop_save(self):  # L13
         calls, engine = self.quota_failure(claude="hang_after:1")
         marks = {}
-        annotate, commit = quota.QuotaSampler.annotate_failure, RunStore.commit
+        # The failure sample is taken first by the quota wait decision (harness.quota_wait), whatever follows.
+        annotate, commit = quota.QuotaSampler.failure_sample, RunStore.commit
 
         def timed_annotate(sampler, error):
             marks.setdefault("raised", time.monotonic())
@@ -356,7 +358,7 @@ class QuotaFailureTests(SamplingCase):
             if store.run.get("status") == "blocked":
                 marks.setdefault("saved", time.monotonic())
             return value
-        with patch.object(quota.QuotaSampler, "annotate_failure", timed_annotate), \
+        with patch.object(quota.QuotaSampler, "failure_sample", timed_annotate), \
                 patch.object(RunStore, "commit", timed_commit), self.assertRaises(HarnessError):
             engine.start("Implement greet", plan())
         stop = read_json(engine.directory / "state.json")["stop"]

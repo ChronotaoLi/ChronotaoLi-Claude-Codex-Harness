@@ -132,7 +132,7 @@ class ResumeConfigurationIntegrationTests(RepoCase):
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["config_snapshot"]["permissions"]["worker_commands"], [command])
         events = [json.loads(line) for line in (engine.directory / "events.jsonl").read_text().splitlines()]
-        changes = [item["changes"] for item in events if item["event"] == "resume_config_relaxed"]
+        changes = [item["changes"] for item in events if item["event"] == "resume_config_changed"]
         self.assertEqual(changes, [{"worker_commands": {"old": [], "new": [command], "added": [command]}}])
 
     def test_relocated_identical_shared_resources_can_resume_the_same_run(self):

@@ -430,6 +430,59 @@ def install_stop_guards(case):
 
 
 
+class FakeClock:
+    """Stands in for ``harness.quota_wait``'s ``time`` module, so no test ever sleeps for real.
+
+    ``time()`` and ``monotonic()`` read two counters; ``sleep(seconds)`` records the slice, runs
+    ``on_sleep(clock, seconds)`` when set (raise an interrupt, read the disk, try a lock, change
+    a file, jump the wall clock) and then advances both clocks. With ``expect_sleep`` false any
+    sleep fails the test at once. The wall clock is published as ``QUOTA_STUB_NOW`` (inside a
+    stub install's environment) so a stub's ``reset_in`` windows follow this clock.
+    """
+    RUNAWAY = 20000
+
+    def __init__(self, start=None, *, expect_sleep=True):
+        self.mono, self.sleeps, self.on_sleep, self.expect_sleep = 1000.0, [], None, expect_sleep
+        self.wall = time.time() if start is None else start
+
+    @property
+    def wall(self):
+        return self._wall
+
+    @wall.setter
+    def wall(self, value):
+        self._wall = value
+        os.environ["QUOTA_STUB_NOW"] = repr(value)
+
+    def time(self):
+        return self.wall
+
+    def monotonic(self):
+        return self.mono
+
+    def sleep(self, seconds):
+        if not self.expect_sleep:
+            raise AssertionError(f"a quota wait slept {seconds}s in a test that expects none")
+        if not seconds > 0:
+            raise AssertionError(f"a quota wait slept {seconds}s")
+        self.sleeps.append(seconds)
+        if len(self.sleeps) > self.RUNAWAY:
+            raise AssertionError("fake clock: runaway quota wait")
+        if self.on_sleep is not None:
+            self.on_sleep(self, seconds)
+        self.mono += seconds
+        self.wall += seconds
+
+
+def install_clock(case, clock):
+    """Replace ``harness.quota_wait.time`` with ``clock`` for the rest of the test."""
+    from unittest.mock import patch
+    patcher = patch("harness.quota_wait.time", clock)
+    patcher.start()
+    case.addCleanup(patcher.stop)
+    return clock
+
+
 class RepoCase(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -448,6 +501,8 @@ class RepoCase(unittest.TestCase):
         import quota_stubs
         self.quota_calls = quota_stubs.install(self)
         self.addCleanup(lambda: self.assertEqual(self.quota_calls.unexpected(), []))
+        # A quota wait never sleeps for real: a test that expects one installs its own clock.
+        self.quota_clock = install_clock(self, FakeClock(expect_sleep=False))
 
     def engine(self, backend=None):
         return Runtime(self.config, self.repo, backend=backend or DemoBackend())

@@ -255,7 +255,7 @@ APP_JS = r""""use strict";
     dispatch_prepared: "准备派发", dispatch_started: "开始调用", dispatch_finished: "派发结束", task_accepted: "任务已接受",
     review_rejected: "审阅要求修改", verification_failed: "验证失败",
     run_completed: "运行完成", run_paused: "运行暂停", run_stopped: "运行停止", run_abandoned: "运行已放弃",
-    quota_sampled: "额度样本",
+    quota_sampled: "额度样本", quota_wait_started: "开始等待额度", quota_wait_finished: "额度等待结束",
     plan_awaiting_approval: "计划等待批准", plan_approved: "计划已批准", plan_revised: "计划已修订",
     revision_edits_archived: "修订前已归档未接受修改", commander_candidate_changed: "指挥调用期间候选已变化",
     final_verification_failed: "整体验证失败", final_review_rejected: "整体审阅拒绝",
@@ -266,7 +266,7 @@ APP_JS = r""""use strict";
     pending_task_invalidated: "待处理任务作废", pending_acceptance_invalidated: "待接受结果作废",
     broad_scope_warning: "范围过宽提示", scope_extended: "范围边界已扩大", proposal_rejected: "指挥提案已拒绝",
     proposal_plan_archived: "已归档被拒提案的计划文件",
-    resume_config_relaxed: "恢复时放宽配置"
+    resume_config_changed: "恢复时调整配置"
   };
 
   function freshUi(runId) {
@@ -796,6 +796,15 @@ APP_JS = r""""use strict";
       add("warn", "运行已中断", [notice("不会自动继续，需要显式恢复。")]);
     }
     if (run.status === "paused") { add("warn", "运行已暂停", [notice("不会自动继续，需要显式恢复。")]); }
+    var wait = summary.quota_wait;
+    if (wait) {
+      // A record, not a liveness proof: a killed process leaves it behind until the next resume.
+      add("warn", "等待额度恢复：" + show(wait.window), [
+        line("item-sub", "等到 " + show(wait.until) + " · 重置时刻 " + show(wait.resets_at) + " · 来源调用 ",
+          mono(wait.source_dispatch_id)),
+        notice("记录于 " + show(wait.recorded_at) + "；台账不证明 Harness 进程仍在等待（被强杀时遗留，下一次进入执行时清除）。", "hint"),
+        notice("要取消等待：中断该进程（Ctrl-C 或 SIGTERM），之后普通 resume。", "hint")]);
+    }
     if (run.status === "awaiting_approval") {
       var bounds = summary.scope;
       add("warn", "计划等待批准", [notice("普通恢复不会批准计划。"),

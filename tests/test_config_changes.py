@@ -101,13 +101,23 @@ class ConfigChangesTests(unittest.TestCase):
 
     def test_runtime_budgets_reject_boolean_zero_and_negative_values(self):
         for key in self.data["runtime"]:
-            if key == "claude_max_turns_by_role":
+            if key in ("claude_max_turns_by_role", "quota_wait_max_seconds"):
                 continue
             for value in (True, False, -1, 0):
                 data = copy.deepcopy(self.data)
                 data["runtime"][key] = value
                 with self.subTest(key=key, value=value), self.assertRaises(HarnessError):
                     self.load(data)
+        # The quota wait limit is a policy, not a budget: 0 disables it; it is otherwise a non-negative integer.
+        for value in (True, False, -1, 1.5, "60"):
+            data = copy.deepcopy(self.data)
+            data["runtime"]["quota_wait_max_seconds"] = value
+            with self.subTest(key="quota_wait_max_seconds", value=value), self.assertRaises(HarnessError):
+                self.load(data)
+        for value in (0, 1, 21600):
+            data = copy.deepcopy(self.data)
+            data["runtime"]["quota_wait_max_seconds"] = value
+            self.assertEqual(self.load(data).data["runtime"]["quota_wait_max_seconds"], value)
 
     def test_memory_ttl_allows_disabled_expiry_but_rejects_invalid_values(self):
         self.data["memory"] = {"task_ttl_days": 0, "knowledge_ttl_days": 0}

@@ -270,7 +270,7 @@ class OperationRecordTests(OperationCase):
                     self.assertTrue(events_path.read_bytes().startswith(events_before))
                     appended = [json.loads(line) for line in events_path.read_bytes()[len(events_before):].splitlines()]
                     self.assertEqual([event["event"] for event in appended],
-                                     ["resume_config_relaxed", "command_requirements_checked"])
+                                     ["resume_config_changed", "command_requirements_checked"])
                     self.assertEqual(saved["config_snapshot"]["permissions"]["worker_commands"], [command])
                     self.assertEqual(saved["command_requirements"], {"missing": {}})
                 else:

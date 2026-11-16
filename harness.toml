@@ -31,6 +31,9 @@ claude_max_turns = 50
 # 单次 Claude 派发的轮数保护，不是任务工具总次数；未列角色沿用上面的值。
 # worker 的 200 是长任务起始配置，需按实际到限率、验收和重复工作校准。
 claude_max_turns_by_role = { worker = 200 }
+# Claude 角色额度用尽（usage_limit）后在同一进程里等到快照给出的重置时刻再继续，单次最多这么多秒；0 关闭。
+# 这是等待策略不是预算：恢复时可调高、调低或设 0；每次等待之前都有一次计入 max_agent_dispatches 的失败调用。
+quota_wait_max_seconds = 21600
 
 [permissions]
 # 额外授权给 Claude worker 的精确 argv，由命令 MCP 按 ID 执行；* 和换行按字面传入。

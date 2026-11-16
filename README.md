@@ -151,7 +151,9 @@ python3 -m harness --repo /path/to/project cleanup-run RUN --remove-ignored
 python3 -m harness --repo /path/to/project cleanup-run RUN --remove --remove-ignored
 ```
 
-`status RUN` 显示任务、预算、待答决定、续作、审阅轮次、停止投影 `stop`（类型、标题、出口命令与诊断摘录）和运行期间账号额度的观测变化 `quota`（只读已保存的额度样本：每个额度桶的最近观测与按重置周期分段的变化，Codex 的 credits 余额净变化；账号级、包含本 run 以外的使用，不相加，见[额度](docs/operations.md#额度)），`--full` 查看完整台账。失败的命令在 stderr 第二行输出 `[harness-json] {"event":"stop",…}`，与 `status RUN` 的 `stop` 同一投影。`resume` 使用保存的现场和全新 agent，不恢复供应商会话，也不清零累计预算。可增加上下文、超时、轮数、尝试与派发上限，或追加精确 worker argv；其余配置及共享资产必须一致。
+`status RUN` 显示任务、预算、待答决定、续作、审阅轮次、停止投影 `stop`（类型、标题、出口命令与诊断摘录）和运行期间账号额度的观测变化 `quota`（只读已保存的额度样本：每个额度桶的最近观测与按重置周期分段的变化，Codex 的 credits 余额净变化；账号级、包含本 run 以外的使用，不相加，见[额度](docs/operations.md#额度)），`--full` 查看完整台账。失败的命令在 stderr 第二行输出 `[harness-json] {"event":"stop",…}`，与 `status RUN` 的 `stop` 同一投影。`resume` 使用保存的现场和全新 agent，不恢复供应商会话，也不清零累计预算。可增加上下文、超时、轮数、尝试与派发上限，追加精确 worker argv，或调整额度等待上限（可调高、调低、设 0）；其余配置及共享资产必须一致。
+
+**额度用尽时的进程内等待。** Claude 担任的角色（worker、`--commander fable` 的指挥、配置成 Claude 的审阅者）在执行循环里遇到额度用尽（`provider_quota/usage_limit`）时，默认在同一进程里等到额度快照给出的重置时刻（加 60 秒）再继续，单次最多 `runtime.quota_wait_max_seconds` 秒（默认 21,600，即 6 小时；0 关闭）。它不是恢复：不重启进程，等待期间状态保持 `running`、持有运行锁（另一个 `resume`／`abandon` 得到 `busy/run_lock`，提示里有等待记录），`status RUN` 的 `quota_wait` 显示等到何时与哪个窗口——这只是台账记录，不证明进程仍在等待。醒来后先像 `resume` 一样重跑只读的前提核对（HEAD、Git 绑定、共享资产、计划文件、索引与加载核验），任何一项不符就按同样的类型停止，不调用模型；然后重过全部调度门禁，worker 失败之后是一次新的指挥决定。只看对失败模型适用的窗口，快照不可用、窗口对应不明、超过上限、派发预算用尽时不等，停止值的 `data.wait_reason` 写明原因。每次最多等这么久，不等于整个 run 最多等这么久：累计时长只受派发预算约束。按 Ctrl-C 或 SIGTERM 取消（记为中断）；进程被杀就不会自动继续，之后普通 `resume`。规则见[额度等待](docs/recovery.md#额度等待)。
 
 只有两个预算旋钮，各自计数不同的东西：
 
@@ -178,7 +180,7 @@ python3 -m harness --repo /path/to/project cleanup-run RUN --remove --remove-ign
 | 精确命令未授权（`missing_commands/*`） | 追加配置后普通 `resume RUN` |
 | 续作请求需要先修正（`continuation/*`） | `resume RUN --reject-request FILE` |
 | 已保存 worker 环境阻断（`environment/worker_blocked`） | 修复条件后 `resume RUN --environment-update FILE` |
-| 供应商额度用尽、限速、过载或认证失败（`provider_quota/*`、`provider_failure/overloaded`、`provider_failure/authentication`） | 额度恢复或修复登录后普通 `resume RUN`；worker 的这次调用不计工作尝试 |
+| 供应商额度用尽、限速、过载或认证失败（`provider_quota/*`、`provider_failure/overloaded`、`provider_failure/authentication`） | 额度恢复或修复登录后普通 `resume RUN`；worker 的这次调用不计工作尝试；额度用尽时先看 `data.wait_reason`（为什么没有在进程内等待） |
 | 等待用户决定 | 从 status 取 request ID，`resume RUN --operator-decision FILE`；可重复参数一次回答多项 |
 | 指挥提问 | 从 status 取 request ID，`resume RUN --operator-decision FILE` 回答；回答进入下一次指挥决定 |
 | 指挥提案越出范围边界，已持有（`scope_extension/revision`、`scope_extension/initial_plan`） | 核对 `gaps` 与建议后执行停止信息给出的 `resume RUN --scope=…`，或 `resume RUN --reject-request FILE`；都不重抽提案 |

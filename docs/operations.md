@@ -45,7 +45,7 @@ python3 -m harness --repo /abs/project dashboard --port 8765
 - 用 `status`、`status RUN`、`status RUN --full`、`watch RUN` 和 `dashboard` 观察，读取目标项目 `.harness/` 下的台账、事件、dispatch 产物与操作记录；
 - 使用[阻塞状态与操作者出口](recovery.md#阻塞状态与操作者出口)中明确适用于当前状态的恢复出口，例如 `--approve-plan`、追加精确命令授权后的普通 `resume`、`--environment-update`、`--operator-decision`。
 
-读停止时用退出码与 `stop.kind` 分流，不解析文字：3 按 `stop.exits` 中适用于当前状态的出口处理，涉及新增权限或需求选择时请示用户；2 修正本次调用的输入；1 停下报告（证据或现场不符、Harness 自身失败、未分类）；0 读结果 JSON 的 `status`（`completed`、`paused` 或待批准）；130 是中断。供应商额度类停止（`provider_quota/*`）与 `provider_failure/{overloaded,authentication}` 都是 3：等额度恢复或修复登录后按 `stop.exits` 普通 `resume`，worker 的这次调用不计工作尝试；不要用正则匹配错误文字判断额度。遇到真正的新增权限（新的命令授权、范围扩展、预算或轮数提高）或需求选择（操作者决定、是否接受风险、是否放弃）时向用户请求，不自行代答。指挥提案被持有（`scope_extension/*`）时，`resume --scope` 扩大边界与 `--reject-request` 拒绝提案都要向用户请求：边界是持续、跨任务的授权，停止给出的建议条目可能比缺口宽（`data.widened`），完整缺口在 `status RUN` 的 `scope.held`。
+读停止时用退出码与 `stop.kind` 分流，不解析文字：3 按 `stop.exits` 中适用于当前状态的出口处理，涉及新增权限或需求选择时请示用户；2 修正本次调用的输入；1 停下报告（证据或现场不符、Harness 自身失败、未分类）；0 读结果 JSON 的 `status`（`completed`、`paused` 或待批准）；130 是中断。供应商额度类停止（`provider_quota/*`）与 `provider_failure/{overloaded,authentication}` 都是 3：等额度恢复或修复登录后按 `stop.exits` 普通 `resume`，worker 的这次调用不计工作尝试；不要用正则匹配错误文字判断额度。Claude 角色的额度用尽默认由 Harness 在进程内等待（`runtime.quota_wait_max_seconds`，见[额度等待](recovery.md#额度等待)）：外层不要自己睡眠后循环 `resume`；停在 `provider_quota/usage_limit` 时先读 `stop.data.wait_reason`。`resume`／`abandon` 返回 `busy/run_lock` 可能是那个进程正在等额度：看 `status RUN` 的 `quota_wait`（等到何时、哪个窗口），记录不证明进程仍在；要取消就中断那个进程。遇到真正的新增权限（新的命令授权、范围扩展、预算或轮数提高）或需求选择（操作者决定、是否接受风险、是否放弃）时向用户请求，不自行代答。指挥提案被持有（`scope_extension/*`）时，`resume --scope` 扩大边界与 `--reject-request` 拒绝提案都要向用户请求：边界是持续、跨任务的授权，停止给出的建议条目可能比缺口宽（`data.widened`），完整缺口在 `status RUN` 的 `scope.held`。
 
 不能做的事：
 
@@ -151,7 +151,7 @@ python3 -m harness.dashboard --state /abs/project/.harness --port 8765
 它是只读、本机、单项目多 run 的视图：
 
 - 不启动、恢复或修改 run，不取 `run.lock`，不写任何文件，不启动子进程，不探测进程；启动前只解析一次 `--repo` 的仓库根，服务开始后不调用 Git。额度只读 run 目录里已保存的样本，刷新不启动任何 CLI。
-- 台账记为 `running` 不等于进程仍在工作；页面只显示 `process_state`、`exit_confirmed`、`pgid` 与最后事件时间。没有新日志不等于卡死；worker `completed` 不等于任务 `accepted`。
+- 台账记为 `running` 不等于进程仍在工作；页面只显示 `process_state`、`exit_confirmed`、`pgid` 与最后事件时间。没有新日志不等于卡死；worker `completed` 不等于任务 `accepted`。额度等待期间状态仍是 `running`，“需要处理”区多一项“等待额度恢复：<窗口>”，写明等到何时、重置时刻、来源调用与记录时刻；它是台账记录，不证明进程仍在等待（被强杀时遗留，下一次进入执行时清除）。
 - 各文件按请求逐个读取，显示采样时间而不是原子快照；运行中的 `events.jsonl` 最后一行可能未写完，页面标为未完成，不算错误。
 - Claude 的结构化输出可能在调用结束才出现：运行中的 dispatch 还没有返回结果或用量是正常的。
 
@@ -169,7 +169,7 @@ run 列表 → run 详情 → 文件查看。列表按最近事件排序，以�
 
 `GET /api/runs/<run_id>/stream` 提供 SSE，HEAD 返回 405。`ready` 与 `change` 只发送 run ID、原生后端和采样时间，页面随后读取当前投影；`unavailable` 表示订阅不可用并关闭连接。每 15 秒的注释心跳仅用于连接维护，不读取台账，也不证明模型进程存活。默认最多 2 个订阅，占用总计 8 个连接额度；断连、写入超时和服务关闭都会释放订阅。
 
-命令行 `watch RUN` 先订阅，再输出简短 JSONL 状态；后续仅在投影变化时输出。到达 completed、abandoned、blocked、interrupted、paused 或 awaiting_approval 后退出；`--follow` 可跨越这些状态继续等待，Ctrl-C 结束。`watch RUN --state /abs/archive/.harness` 可观察归档状态，不要求 Git 仓库或配置。macOS 使用 kqueue，Linux 使用 inotify 与 `/proc/self/fd`；平台不支持或订阅失败时明确报错，不回退到轮询。输出的 `process_observation=ledger_only` 表示只读台账，未探测模型进程。
+命令行 `watch RUN` 先订阅，再输出简短 JSONL 状态；后续仅在投影变化时输出。快照带 `quota_wait`（额度等待记录的 `window`、`until`、`recorded_at`，没有时为 null），等待开始与结束各引起一次输出；等待期间状态仍是 `running`，`watch` 不退出。到达 completed、abandoned、blocked、interrupted、paused 或 awaiting_approval 后退出；`--follow` 可跨越这些状态继续等待，Ctrl-C 结束。`watch RUN --state /abs/archive/.harness` 可观察归档状态，不要求 Git 仓库或配置。macOS 使用 kqueue，Linux 使用 inotify 与 `/proc/self/fd`；平台不支持或订阅失败时明确报错，不回退到轮询。输出的 `process_observation=ledger_only` 表示只读台账，未探测模型进程。
 
 ### 调用阶段分类
 
@@ -185,11 +185,11 @@ run 列表 → run 详情 → 文件查看。列表按最近事件排序，以�
 
 `invoked=true` 在进程启动前写入，不证明 CLI 已启动或供应商已收到请求；`process_state=starting` 另标“启动未确认”，不覆盖上述分类。
 
-事件日志里的派发事件：`dispatch_prepared` 在本地准备保存后、预算检查前写入；`dispatch_started` 在台账保存 `invoked=true` 之后写入；`dispatch_finished` 带 `invoked`、`status` 和 `provider_usage`。事件追加没有丢失时，`dispatch_started` 条数等于 `agent_dispatches`；追加失败会被吞掉，run 照常完成而少一条事件。事件是尽力而为的观察：写入失败不影响调用，崩溃可能缺一条，恢复不补发。计数以台账为准。`quota_sampled`（页面显示“额度样本”）在每次额度采样之后追加，带 `provider`、`trigger`、`available`、`reason`、样本文件名 `sample`（写入失败时为 null 并带 `write_error`）与 `dispatch_id`。
+事件日志里的派发事件：`dispatch_prepared` 在本地准备保存后、预算检查前写入；`dispatch_started` 在台账保存 `invoked=true` 之后写入；`dispatch_finished` 带 `invoked`、`status` 和 `provider_usage`。事件追加没有丢失时，`dispatch_started` 条数等于 `agent_dispatches`；追加失败会被吞掉，run 照常完成而少一条事件。事件是尽力而为的观察：写入失败不影响调用，崩溃可能缺一条，恢复不补发。计数以台账为准。`quota_sampled`（页面显示“额度样本”）在每次额度采样之后追加，带 `provider`、`trigger`、`available`、`reason`、样本文件名 `sample`（写入失败时为 null 并带 `write_error`）与 `dispatch_id`。额度等待写 `quota_wait_started`（“开始等待额度”：`dispatch_id`、`role`、`window`、`resets_at`、`until`、`wait_seconds`、`limit_seconds`、`sample`）与 `quota_wait_finished`（“额度等待结束”：`dispatch_id`、`waits`、`woke_at`），都是尽力而为，等待被中断时没有 `finished`。恢复时调整了配置写 `resume_config_changed`（“恢复时调整配置”，字段 `changes`）。
 
 ### 额度
 
-**样本。** 真实 `CLIBackend` 的 `run`／`resume` 在这些时刻各取一份账号额度快照（不调用模型）：本进程首次用到某供应商之前（`before_use`），额度失败停止之前（`quota_failure`），以及停止、暂停、完成、等待批准确已保存之后，对本进程用过的供应商各一份（`stop`、`paused`、`completed`、`awaiting_approval`）；每次至多 5 份。`demo` 与离线后端不采样。探测：Claude 是 `claude -p /usage --output-format stream-json --verbose --no-session-persistence --setting-sources "" --strict-mcp-config --max-turns 1`，必须读到零调用的结果行（`num_turns`、`total_cost_usd`、`duration_api_ms` 为 0，`local_command` 为 `usage`），读不到就在本进程停用 Claude 探测；Codex 是 `codex app-server` 的三条 JSON-RPC 消息（`initialize`、`initialized`、`account/rateLimits/read`）。两者都在空临时目录、用与模型调用相同的环境运行，5 秒查询时限，收尾时整个进程组 SIGTERM 后 SIGKILL；探测期间按 Ctrl-C，中断在约 0.1 秒内或收尾完成之后传播，临时目录与进程组照样清理。
+**样本。** 真实 `CLIBackend` 的 `run`／`resume` 在这些时刻各取一份账号额度快照（不调用模型）：本进程首次用到某供应商之前（`before_use`），额度失败之后、判断是否等待或停止之前（`quota_failure`），额度等待醒来之后（`wake`），以及停止、暂停、完成、等待批准确已保存之后，对本进程用过的供应商各一份（`stop`、`paused`、`completed`、`awaiting_approval`）；不计额度等待时每次至多 5 份，额度等待每等一次另加一份失败样本与一份醒来样本（受派发预算约束）。`demo` 与离线后端不采样。探测：Claude 是 `claude -p /usage --output-format stream-json --verbose --no-session-persistence --setting-sources "" --strict-mcp-config --max-turns 1`，必须读到零调用的结果行（`num_turns`、`total_cost_usd`、`duration_api_ms` 为 0，`local_command` 为 `usage`），读不到就在本进程停用 Claude 探测；Codex 是 `codex app-server` 的三条 JSON-RPC 消息（`initialize`、`initialized`、`account/rateLimits/read`）。两者都在空临时目录、用与模型调用相同的环境运行，5 秒查询时限，收尾时整个进程组 SIGTERM 后 SIGKILL；探测期间按 Ctrl-C，中断在约 0.1 秒内或收尾完成之后传播，临时目录与进程组照样清理。
 
 样本写在 `runs/<id>/observations/quota/`，文件名 `r<修订>-p<相位>-<进程启动时刻>-s<序号>-<供应商>-<触发>.json` 就是它们的顺序，排他发布、从不覆盖，只存归一化字段（窗口的已用百分比与重置时刻、Codex 的 credits 余额原样字符串、`extra_usage`、进程事实），不存 CLI 原始输出或错误文字。探测失败只记“不可用＋原因”：`not_installed`、`timeout`、`output_limit`、`exited`、`provider_error`、`shape_mismatch`、`not_zero_call`、`probe_disabled`、`internal_error`；从不改变调度、预算、回执与接受，用户中断照常传播。
 

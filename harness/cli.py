@@ -12,7 +12,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from . import dashboard, git, observe, scope as boundary, stops
+from . import dashboard, git, observe, quota_wait, scope as boundary, stops
 from .adapters import DemoBackend
 from .budgets import attempts_total, work_attempts
 from .cleanup import blocked, cleanup_run
@@ -196,6 +196,9 @@ def status_summary(run):
     stop = stops.project_ledger(run)
     if stop is not None:
         result["stop"] = stop
+    waiting = quota_wait.project(run)   # an observation: it does not prove the process is alive
+    if waiting is not None:
+        result["quota_wait"] = waiting
     declared = run.get("scope")
     if isinstance(declared, list):
         # Read-only projections: they authorize nothing and take no part in recovery.

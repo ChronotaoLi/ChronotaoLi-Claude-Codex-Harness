@@ -8,7 +8,7 @@ from pathlib import Path
 
 from .versions import RUN_SCHEMA_VERSION, read_current_ledger
 from .config import normalized
-from . import git, scope as boundary, stops
+from . import git, quota_wait, scope as boundary, stops
 from .operations import warn
 from .input_projection import validate_dispatch_indexes as validate_input_dispatch_indexes
 from .path_evidence import validate_dispatch_indexes
@@ -151,6 +151,7 @@ class RunLifecycle(RuntimeService):
                 or any(not isinstance(d, dict) for d in self.context.run["dispatches"])):
             raise HarnessError("运行台账字段缺失或类型无效；保留原文件并核对证据")
         self.validate_stop()
+        self.validate_quota_wait()
         try:
             if boundary.operator_entries(self.context.run["scope"]) != self.context.run["scope"]:
                 raise HarnessError("duplicate entry")
@@ -225,6 +226,59 @@ class RunLifecycle(RuntimeService):
     def validate_stop(self):
         """``stop`` exists exactly while the status is a stop, matches it, and is registered."""
         stops.validate_ledger(self.context.run)
+
+    def validate_quota_wait(self):
+        """A quota wait record exists only while running and has exactly its shape (harness.quota_wait)."""
+        quota_wait.validate_ledger(self.context.run)
+
+    # ---- resume()'s read-only preconditions; a quota wait reruns them in its process on waking ----
+    def verify_assets_and_plan(self):
+        """The shared assets the run was created with, the environment artifacts and the published plans."""
+        if self.context.run.get("asset_digest") != asset_digest(self.context.config):
+            raise HarnessError("共享规则、skills 或 MCP 已改变；请恢复原版本后继续", stop=stops.make("config_mismatch", "shared_assets"))
+        self.services.environment.environment_context()
+        # The published plan is the authority.
+        self.services.planning.verify_plan_authority()
+
+    def verify_binding_and_indexes(self):
+        """The saved worktree Git binding exists; the dispatches' path and input indexes are intact."""
+        if not self.context.run["worktree_binding"]:
+            raise HarnessError("缺少已保存的 worktree Git 绑定，无法安全恢复；"
+                               f"使用 abandon {self.context.run['id']} 保留证据后重新运行；"
+                               "若工作树或分支已创建，请核对后手工清理", stop=stops.make("workspace_mismatch", "binding_missing"))
+        validate_dispatch_indexes(self.context.directory, self.context.run["dispatches"])
+        validate_input_dispatch_indexes(self.context.directory, self.context.run["dispatches"])
+
+    def verify_head_and_inputs(self):
+        """The worktree HEAD is the checkpoint (through the binding), prepared inputs and receipt links are intact."""
+        if git.head(self.context.worktree, binding=self.context.run["worktree_binding"]) != self.context.run["expected_head"]:
+            raise HarnessError("worktree HEAD 与检查点不同；请先核对提交，不自动重放", stop=stops.make("workspace_mismatch", "head_changed", data={"expected_head": self.context.run["expected_head"]}))
+        from .workspace_inputs import validate_inputs
+        validate_inputs(self.context.run, self.context.directory)
+        self.services.worker_receipts.validate_links()
+
+    def wake_checks(self):
+        """After a quota wait, before the scheduling loop: resume()'s read-only preconditions, in its order.
+
+        The ledger on disk is still the one this process just committed (``check_current``),
+        and the load checks run on it as ``load_run`` would; a load failure is the settled
+        stop itself. Then the three functions resume() calls. Nothing is written: the steps
+        of resume() that write (exit confirmation, landing a returned ask, terminal capture
+        digests, recovery inputs) and the configuration comparison (this process never
+        reloads its configuration) are not part of it.
+        """
+        self.context.store.check_current()
+        try:
+            self.load_checks()
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as failure:
+            error = HarnessError(str(failure) or type(failure).__name__, stop=stops.load_failure(failure))
+            error._stop_settled = True   # the load failure is already the final value
+            raise error from failure
+        self.verify_assets_and_plan()
+        self.verify_binding_and_indexes()
+        self.verify_head_and_inputs()
 
     @stops.reads_evidence
     def validate_recovery_links(self):
@@ -370,7 +424,8 @@ class RunLifecycle(RuntimeService):
     def abandon(self, ident, *, confirm_exited=()):
         """Mark an unfinished run abandoned; the worktree is removed only by cleanup-run."""
         self.load_run(ident)
-        with lock(self.context.directory / "run.lock", stop=stops.make("busy", "run_lock")):
+        # A busy lock points to a wait the ledger read outside the lock records.
+        with lock(self.context.directory / "run.lock", stop=quota_wait.busy_stop(self.context.run)):
             # Reload under the lock so a concurrent completion cannot be lost.
             self.load_run(ident)
             try:
@@ -382,6 +437,7 @@ class RunLifecycle(RuntimeService):
                 if self.context.run["status"] != "abandoned":
                     self.context.run["status"] = "abandoned"
                     self.context.run.pop("stop", None)
+                    quota_wait.clear(self.context.run)   # a killed process's leftover record
                     self.context.save()
                     self.context.checkpoint()
                     self.context.event("run_abandoned")
@@ -396,7 +452,8 @@ class RunLifecycle(RuntimeService):
                execution_guidance=None, reject_request=None):
         runtime = self.context
         self.load_run(ident)
-        with lock(self.context.directory / "run.lock", stop=stops.make("busy", "run_lock")):
+        # A busy lock points to a wait the ledger read outside the lock records.
+        with lock(self.context.directory / "run.lock", stop=quota_wait.busy_stop(self.context.run)):
             self.load_run(ident)
             try:
                 def state(status):
@@ -459,20 +516,11 @@ class RunLifecycle(RuntimeService):
                 self.context.reverify_requested = reverify
                 with stops.classify("config_mismatch", "immutable_config"):
                     changes = self.context.config.resume_changes(self.context.run["config_snapshot"])
-                if self.context.run.get("asset_digest") != asset_digest(self.context.config):
-                    raise HarnessError("共享规则、skills 或 MCP 已改变；请恢复原版本后继续", stop=stops.make("config_mismatch", "shared_assets"))
-                self.services.environment.environment_context()
-                # The published plan is the authority: checked before any write of
-                # this resume, the audited exit confirmation included.
-                self.services.planning.verify_plan_authority()
+                # Checked before any write of this resume, the audited exit confirmation included.
+                self.verify_assets_and_plan()
                 self.context.confirm_exited(confirm_exited)
                 self.context.ensure_exited()
-                if not self.context.run["worktree_binding"]:
-                    raise HarnessError("缺少已保存的 worktree Git 绑定，无法安全恢复；"
-                                       f"使用 abandon {ident} 保留证据后重新运行；"
-                                       "若工作树或分支已创建，请核对后手工清理", stop=stops.make("workspace_mismatch", "binding_missing"))
-                validate_dispatch_indexes(self.context.directory, self.context.run["dispatches"])
-                validate_input_dispatch_indexes(self.context.directory, self.context.run["dispatches"])
+                self.verify_binding_and_indexes()
                 # A returned ask lands on the common preconditions alone, before the
                 # HEAD gate below; the run then stops at the question.
                 try:
@@ -480,11 +528,7 @@ class RunLifecycle(RuntimeService):
                 except BaseException as error:
                     self.services.workflow.stop(error)
                     raise
-                if git.head(self.context.worktree, binding=self.context.run["worktree_binding"]) != self.context.run["expected_head"]:
-                    raise HarnessError("worktree HEAD 与检查点不同；请先核对提交，不自动重放", stop=stops.make("workspace_mismatch", "head_changed", data={"expected_head": self.context.run["expected_head"]}))
-                from .workspace_inputs import validate_inputs
-                validate_inputs(self.context.run, self.context.directory)
-                self.services.worker_receipts.validate_links()
+                self.verify_head_and_inputs()
                 with stops.classify("invalid_input", "input_schema", data={"option": "--environment-update"}):
                     update = (self.services.environment.prepare_environment_update(environment_update)
                               if environment_update is not None else None)
@@ -506,7 +550,7 @@ class RunLifecycle(RuntimeService):
                 self.services.decisions.commit_resume_inputs(
                     decisions, scope_added=added, relaxed_config=self.context.config.data if changes else None)
                 if changes:
-                    self.context.event("resume_config_relaxed", changes=changes)
+                    self.context.event("resume_config_changed", changes=changes)
                 if added:
                     print("[harness] 范围边界已扩大：" + json.dumps(added, ensure_ascii=False)
                           + "；当前与之后的提案都可复用这些条目", file=sys.stderr, flush=True)

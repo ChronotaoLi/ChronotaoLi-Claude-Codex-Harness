@@ -12,7 +12,7 @@ from .finalization import needs_decision, same_snapshot_record
 from .planning import attempt_limit_error, DECIDE_KEY, directive_mismatch
 from .recovery import invalidate_acceptance_review, snapshot_digest
 from .util import HarnessError
-from . import stops
+from . import quota_wait, stops
 from .services import RuntimeService
 
 Step = namedtuple("Step", "kind data")
@@ -117,7 +117,12 @@ class Scheduler(RuntimeService):
                     plan = supplied_plan if supplied_plan is not None else planned.data
                     self.services.planning.record_plan(self.services.planning.validate_tasks(plan), "Initial plan")
                 elif planned.kind == "decide":
-                    self.services.planning.decide(planned.data)
+                    try:
+                        self.services.planning.decide(planned.data)
+                    except HarnessError as error:
+                        # Not yet running: a quota failure of the first plan stops, saying why it did not wait.
+                        self.services.quota_wait.decline(error, "not_running")
+                        raise
                 else:
                     raise HarnessError("首版计划尚未登记；保留现场", stop=stops.make("runtime_failure", "invariant"))
             self.services.planning.report_command_requirements()
@@ -139,6 +144,7 @@ class Scheduler(RuntimeService):
                 return self.context.run
             self.context.run["status"] = "running"
             self.context.run.pop("stop", None)
+            quota_wait.clear(self.context.run)   # a killed process's wait is never inherited
             self.context.save()
             accepted_this_call = int(bool(replayed)) + int(self.services.tasks.finish_post_accept())
             if self.context.run.get("pending_acceptance"):
@@ -147,28 +153,35 @@ class Scheduler(RuntimeService):
             while True:
                 self.admission()
                 action = self.next_step(step=step, accepted_this_call=accepted_this_call)
-                if action.kind == "apply_revision":
-                    self.services.planning.apply_pending_revision()
-                elif action.kind == "continue_task":
-                    if self.services.tasks.continue_task():
-                        accepted_this_call += 1
-                elif action.kind == "pause":
-                    self.context.run["status"] = "paused"
-                    self.context.save()
-                    self.services.quota.terminal_saved()
-                    self.context.checkpoint()
-                    self.context.event("run_paused")
-                    return self.context.run
-                elif action.kind == "worker":
-                    if self.services.tasks.task_attempt(*action.data):
-                        accepted_this_call += 1
-                elif action.kind == "decide":
-                    self.services.planning.decide(action.data)
-                elif action.kind == "final_review":
-                    if self.services.finalization.final_review(reverify=self.context.reverify_requested):
-                        break
-                else:
-                    raise HarnessError(f"调度推导出未知步骤：{action.kind}", stop=stops.make("runtime_failure", "invariant"))
+                try:
+                    if action.kind == "apply_revision":
+                        self.services.planning.apply_pending_revision()
+                    elif action.kind == "continue_task":
+                        if self.services.tasks.continue_task():
+                            accepted_this_call += 1
+                    elif action.kind == "pause":
+                        self.context.run["status"] = "paused"
+                        self.context.save()
+                        self.services.quota.terminal_saved()
+                        self.context.checkpoint()
+                        self.context.event("run_paused")
+                        return self.context.run
+                    elif action.kind == "worker":
+                        if self.services.tasks.task_attempt(*action.data):
+                            accepted_this_call += 1
+                    elif action.kind == "decide":
+                        self.services.planning.decide(action.data)
+                    elif action.kind == "final_review":
+                        if self.services.finalization.final_review(reverify=self.context.reverify_requested):
+                            break
+                    else:
+                        raise HarnessError(f"调度推导出未知步骤：{action.kind}", stop=stops.make("runtime_failure", "invariant"))
+                except HarnessError as error:
+                    # A Claude role's committed usage-limit failure may be waited out in this process
+                    # (harness.quota_wait); then every gate runs again and the next step is derived anew.
+                    if self.services.quota_wait.after_failure(error):
+                        continue
+                    raise
             self.services.planning.verify_plan_authority()
             self.context.run["status"] = "completed"
             self.context.save()

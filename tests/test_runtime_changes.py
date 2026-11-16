@@ -318,7 +318,7 @@ class RuntimeChangesTests(RepoCase):
         self.assertEqual(result["attempts"]["greet"], 2)
         self.assertEqual(sum(result["attempts"].values()), 2)
         events = [json.loads(line) for line in (engine.directory / "events.jsonl").read_text().splitlines()]
-        change = next(event for event in events if event["event"] == "resume_config_relaxed")
+        change = next(event for event in events if event["event"] == "resume_config_changed")
         self.assertEqual(change["changes"]["context_chars"], {"old": old_budget, "new": old_budget + 100})
 
     def test_unknown_memory_approval_is_discarded_and_the_task_is_accepted(self):

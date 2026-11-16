@@ -8,6 +8,8 @@ argv is logged as unexpected and exits 97, so a model call that reached a stub f
 once and leaves a trace. Every number below is invented; only field names, nesting and
 value types follow the CLIs.
 
+``QUOTA_STUB_WINDOWS`` (JSON rows ``{kind, percent, model?, reset_in? | resets_at?}``) replaces
+Claude's windows, a reset_in counted from ``QUOTA_STUB_NOW`` (a test's fake clock publishes it).
 Modes (the environment variables ``QUOTA_STUB_CLAUDE`` and ``QUOTA_STUB_CODEX``) shape one
 probe's behaviour; ``…_after:N`` modes apply only once more than N probes of that CLI were
 logged. Stubs signal nobody but their own parent (the probing test process). A descendant
@@ -63,7 +65,8 @@ if argv == ["--version"]:
 probe = argv == ["-p", "/usage", "--output-format", "stream-json", "--verbose", "--no-session-persistence",
                  "--setting-sources", "", "--strict-mcp-config", "--max-turns", "1"]
 record(cli="claude", probe=probe, argv=argv, pid=os.getpid(), cwd=os.getcwd(),
-       auto_memory=os.environ.get("CLAUDE_CODE_DISABLE_AUTO_MEMORY"))
+       auto_memory=os.environ.get("CLAUDE_CODE_DISABLE_AUTO_MEMORY"),
+       retry_watchdog=os.environ.get("CLAUDE_CODE_RETRY_WATCHDOG"))
 if not probe:
     sys.exit(97)
 state = os.environ.get("QUOTA_STUB_STATE")
@@ -74,7 +77,7 @@ if state:
         with open(path) as handle:
             ledger = json.load(handle)
         seen.append({"status": ledger.get("status"), "stop": ledger.get("stop"),
-                     "store_revision": ledger.get("store_revision"),
+                     "store_revision": ledger.get("store_revision"), "quota_wait": "quota_wait" in ledger,
                      "dispatches": [{"role": entry.get("role"), "status": entry.get("status"),
                                      "consumed": entry.get("worker_receipt_consumed")}
                                     for entry in ledger.get("dispatches", [])]})
@@ -107,6 +110,20 @@ limits = [
      "scope": None, "severity": "sev-2", "is_active": False},
     {"kind": "weekly_scoped", "group": "weekly", "percent": 100, "resets_at": "2031-01-06T03:00:00Z",
      "scope": {"model": {"display_name": "Model Z"}, "surface": None}, "severity": "sev-2", "is_active": False}]
+custom = os.environ.get("QUOTA_STUB_WINDOWS")
+if custom:
+    # The test's own windows: reset_in counts from QUOTA_STUB_NOW (the test's fake clock), resets_at is absolute.
+    from datetime import datetime, timezone
+    now = float(os.environ.get("QUOTA_STUB_NOW") or time.time())
+    limits = []
+    for row in json.loads(custom):
+        reset = row.get("resets_at")
+        if reset is None and row.get("reset_in") is not None:
+            reset = datetime.fromtimestamp(now + row["reset_in"], timezone.utc).isoformat()
+        limits.append({"kind": row["kind"], "group": "synthetic", "percent": row["percent"], "resets_at": reset,
+                       "scope": ({"model": {"display_name": row["model"]}, "surface": None}
+                                 if row.get("model") is not None else None),
+                       "severity": "sev-1", "is_active": True})
 if mode == "shape":
     limits[0]["percent"] = "37"
 if mode == "unknown_kind":

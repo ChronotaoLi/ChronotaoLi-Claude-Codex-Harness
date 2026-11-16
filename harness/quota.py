@@ -61,7 +61,8 @@ ROLES = ("commander", "worker", "reviewer")
 # Samples taken after a saved stop, pause, completion or plan approval wait, by the saved status.
 END_TRIGGERS = {"blocked": "stop", "paused": "paused", "completed": "completed",
                 "awaiting_approval": "awaiting_approval"}
-TRIGGERS = ("before_use", "quota_failure", *END_TRIGGERS.values())
+# ``wake``: after a quota wait's clearing save (harness.quota_wait), before the wake-up checks.
+TRIGGERS = ("before_use", "quota_failure", "wake", *END_TRIGGERS.values())
 REASONS = stops.QUOTA_REASONS
 TERMINATIONS = ("start_failed", "normal", "timeout", "output_limit", "interrupted", "error")
 NAME = re.compile(r"^r([0-9]{10})-p([01])-([0-9]{8}T[0-9]{6}\.[0-9]{6}Z)-s([0-9]{4})-(claude|codex)-([a-z_]{1,24})\.json$")
@@ -726,7 +727,9 @@ class QuotaSampler(RuntimeService):
     Only a backend with ``quota_snapshot`` (the real ``CLIBackend``) samples; for any
     other backend every entry point does nothing. At most five probes per process:
     before each provider's first use, one for a quota failure, and after a saved stop,
-    pause, completion or plan approval wait for each provider this process used.
+    pause, completion or plan approval wait for each provider this process used; a
+    quota wait (harness.quota_wait) adds one failure sample per waited-out failure and
+    one wake sample per wait, both bounded by the dispatch budget.
     """
 
     def __init__(self, context, services=None):
@@ -769,26 +772,36 @@ class QuotaSampler(RuntimeService):
         sample fields when one was taken), or the user interrupt that arrived during
         the probe.
         """
+        try:
+            self.failure_sample(error)
+        except (KeyboardInterrupt, SystemExit) as interrupt:
+            return interrupt
+        return error
+
+    def failure_sample(self, error):
+        """Take a provider_quota failure's sample once and attach its fields to ``error.stop``.
+
+        The record (with ``file``), or None when the error does not qualify: not a
+        provider_quota stop of a known provider, already sampled (``quota_snapshot`` in
+        its data), no sampler, or a model process still alive. A user interrupt raises.
+        """
         if not self.enabled() or not isinstance(error, util.HarnessError):
-            return error
+            return None
         value = error.stop
         if not isinstance(value, dict) or value.get("kind") != "provider_quota":
-            return error
+            return None
         data, source = dict(value.get("data") or {}), dict(value.get("source") or {})
         provider = data.get("provider")
         if provider not in PROVIDERS or "quota_snapshot" in data or not self.no_live_model_process():
-            return error
+            return None
         dispatch_id = source.get("dispatch_id")
-        try:
-            record = self.sample(provider, "quota_failure", dispatch_id=dispatch_id if type(dispatch_id) is str else None)
-        except (KeyboardInterrupt, SystemExit) as interrupt:
-            return interrupt
+        record = self.sample(provider, "quota_failure", dispatch_id=dispatch_id if type(dispatch_id) is str else None)
         self.used.discard(provider)  # the stop that follows does not sample this provider again
         try:
             error.stop = stops.make(value["kind"], value["reason"], data={**data, **stop_fields(record)}, source=source)
         except Exception:
             pass  # the stop stays as constructed; the sample file is an unreferenced observation
-        return error
+        return record
 
     def end_of_call(self):
         """From ``Scheduler.execute``'s finally: sample each used provider once if the terminal state was saved.

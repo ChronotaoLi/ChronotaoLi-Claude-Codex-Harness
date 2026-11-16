@@ -20,6 +20,7 @@ class Services:
         from .planning import Planner
         from .progress import ProgressRecovery
         from .quota import QuotaSampler
+        from .quota_wait import QuotaWait
         from .receipts import ResultReceipts
         from .run_lifecycle import RunLifecycle
         from .scheduler import Scheduler
@@ -36,6 +37,7 @@ class Services:
         self.planning = Planner(context, self)
         self.progress = ProgressRecovery(context, self)
         self.quota = QuotaSampler(context, self)
+        self.quota_wait = QuotaWait(context, self)
         self.receipts = ResultReceipts(context, self)
         self.worker_receipts = WorkerReceipts(context, self)
         self.lifecycle = RunLifecycle(context, self)

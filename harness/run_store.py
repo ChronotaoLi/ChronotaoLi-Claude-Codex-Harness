@@ -11,7 +11,7 @@ import json
 from pathlib import Path
 
 from . import stops
-from .util import HarnessError, lock, write_json
+from .util import HarnessError, dump, lock, write_json
 
 
 class RunStore:
@@ -76,6 +76,20 @@ class RunStore:
             digest = hashlib.sha256(source).hexdigest() if source is not None else None
             if digest != self._digest:
                 raise HarnessError("运行台账已被其他写入者修改；拒绝外部操作")
+
+    def matches_commit(self):
+        """Whether the live ledger is exactly what this store last committed (no staged change).
+
+        Read-only: it serializes the live dictionary as ``commit`` writes it and compares
+        the digest with the last committed source; it neither reads the disk nor locks.
+        """
+        if self.run is None or self._digest is None:
+            return False
+        try:
+            text = dump(self.run) + "\n"
+        except HarnessError:
+            return False
+        return hashlib.sha256(text.encode("utf-8")).hexdigest() == self._digest
 
     @stops.classifies("runtime_failure", "invariant")
     def commit(self):

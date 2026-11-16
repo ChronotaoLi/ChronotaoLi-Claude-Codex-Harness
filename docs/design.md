@@ -37,6 +37,7 @@
 | `private_state.py`、`workspace_inputs.py` | `.harness` 私有根保护；依赖副本清单 |
 | `cleanup.py` | `cleanup-run`（唯一的显式清理入口）：共同门禁之后分别处理全新验证检出与分支工作树；检出删除步骤（含归属核验）也供整体验收在结论保存后尝试回收验证通过的检出 |
 | `quota.py` | 额度探测、归一化、样本与观测变化（只是观察） |
+| `quota_wait.py` | Claude 角色额度失败后的有界等待：判断、选窗口、睡眠、醒来后的前提核对与观察记录 `quota_wait` |
 | `observe.py`、`dashboard.py`、`dashboard_page.py`、`watch.py`、`watch_cli.py` | 只读观察：列表与详情、本地网页、原生文件通知 |
 | `operations.py`、`supervisor.py` | 操作记录；`supervise` |
 | `permission_diagnostics.py`、`permission_smoke.py`、`tool_smoke.py` | 权限诊断；真实账号联调入口 |
@@ -76,9 +77,10 @@
 
 **预算**
 
-19. 预算只增不减：`attempts`、`agent_dispatches` 累计保存，resume 不清零。修订号与整体尝试序号由 `plan_history`、`final_history` 的长度推导。恢复只允许提高超时、上下文、轮数、`max_attempts`、`max_agent_dispatches`，以及追加精确 `worker_commands`。
+19. 预算只增不减：`attempts`、`agent_dispatches` 累计保存，resume 不清零。修订号与整体尝试序号由 `plan_history`、`final_history` 的长度推导。恢复只允许提高超时、上下文、轮数、`max_attempts`、`max_agent_dispatches`，以及追加精确 `worker_commands`；额度等待上限 `quota_wait_max_seconds` 是等待策略而不是预算，恢复时可以调高、调低或设为 0。
 20. `max_attempts`（默认 5）按每个任务的工作尝试计数：worker 调用数减去两种已完整校验的豁免（`attempt_exemption`）——与反馈同次保存的 environment／operator 阻断，以及与判定同次保存、绑定 `process.stdout` 摘要的额度、限速、过载、认证失败（`basis: provider_error`）。豁免在加载与每次派发前复核原件，不依赖额度快照或账号的当前状态。计划任务数、修订次数和整体尝试次数都没有单独的上限：每次模型调用都计入 `max_agent_dispatches`，它是总调用数唯一可靠的上界；计划大小由整体审阅的必要上下文约束，模型给出的计划在首次判定时超出即为无效输出；已判定合格的原件在重放时超出（配置放宽或新的记录可能加长必要输入）则停止并保留原件（`budget/proposal_capacity`）；供给计划超出则停止。
 21. 观察投影不改变预算：`status` 的 `budget_explanation`、`remaining_model_calls`（下界）、`convergence`、`review_rounds` 只读已保存事实。`convergence`、`review_rounds` 跨轮比较的是 finding 标签（审阅者写的 id），只作观察。
+40. 额度等待是同一进程里的有界等待，不是恢复。只有 Claude 担任的角色、只在执行循环里（`running`）、只对已经判定并保存的 `provider_quota/usage_limit` 失败才考虑：内存里没有未提交的改动（`RunStore.matches_commit()`）、配置 `runtime.quota_wait_max_seconds` 不为 0、`agent_dispatches` 仍小于 `max_agent_dispatches`、失败供应商的额度快照可用；只看对失败模型适用的窗口（`session`、`weekly_all`、显示名能唯一对应失败模型 ID 的 `weekly_scoped`：同一家族，且显示名不带版本或版本完整相等），到 100% 的取最晚的重置时刻，`0 < 重置时刻 + 60 秒 − 当前时间 ≤ 上限` 才等；任何到 100% 的窗口对应不明（不能证明是另一个家族或另一个完整版本）、阻塞窗口缺重置时刻、将要写入的等待记录不满足它的加载契约、加载校验此刻不通过，都不等。失败原因只来自失败原件，快照只提供时刻，从不读失败文字。等待期间持有 `run.lock`、不持有 `store.lock`，状态保持 `running`，台账的 `quota_wait` 只是观察：与其他改动分开、单独一次保存写入，醒来时单独一次保存删除，中断时随中断的停止一并删除，进入执行、放弃或任何停止时删除，恢复从不读它；进程死亡就不会继续等。醒来后先重跑 `resume` 预检里的只读前提核对（盘上台账仍是本进程刚提交的那份、加载校验、共享资产摘要、环境产物、计划权威、Git 绑定与派发索引、HEAD、输入与回执链接；与 `resume()` 调用同一组函数），不符就按 `resume` 遇到同样情况时的类型停止，不重跑带写入的预检步骤（退出确认、登记已返回的提问、补摘要、恢复输入），也不重读配置文件；再回到调度循环开头，重跑全部调度门禁，下一步照常推导（worker 失败之后是指挥决定），每次模型调用仍是新进程、新 dispatch。每次等待之前都有一次计入派发预算的失败调用，所以等待次数受 `max_agent_dispatches` 约束，累计时长不受单次上限约束。不等时，停止值的 `data.wait_reason` 写明原因；进入执行循环之前（首版规划）的额度失败不等（`not_running`）。
 
 **权限与工具**
 
@@ -93,8 +95,8 @@
 27. 台账只经 `RunStore` 提交：在 `store.lock` 下比较已加载字节的摘要，拒绝旧写入，原子写入并递增 `store_revision`；外部动作前也核对当前权威。`run.lock` 保护生命周期。
 28. 只支持当前台账版本 18，只解释一种台账形状和一种配置形状：其他版本（含缺失或非整数的版本）不迁移、不补写默认值、不解释字段；`resume`、`abandon`、`prepare-run`、`cleanup-run`、`status RUN`（含 `--full`）、`watch`、`permission-diagnostics`、观察网页的 run 详情、命令 broker（建 manifest、执行与删除）和只读 MCP 都在读完版本、读任何其他字段之前拒绝，错误写明该 run 的台账版本与当前版本；非对象的台账同样按“不支持”处理；任务记忆的来源台账不是当前版本时来源状态为 `unsupported`，其任务历史不再召回；运行列表（不带 run 的 `status`、观察网页的列表）对其他版本只给出路径、版本和“不支持”，一个旧版本或损坏的目录不影响其他 run 的列出。配置的未知键（含已删除的键）一律报“未知配置键”，不给迁移提示。resume 另核对共享资产摘要和完整配置快照。
 29. 必要输入超过 `context_chars` 时不调用模型、不扣额度，报告仍写入 `context-report.json`；可选记忆按整条加入剩余空间。成功派发的报告保留根与顶层字段尺寸及最大的 30 个嵌套字段并给出省略数，超限报告保留全部明细。
-30. 观察层（`status`、`watch`、`dashboard`、操作记录与 `supervise` 回执的读取）不写台账、不取 `run.lock`、不参与恢复；额度只读 run 目录里已保存的样本，观察入口从不启动额度探测或任何供应商 CLI。（`run`／`resume` 创建操作记录时读取 CLI 的 `--version`，见 [操作与观察](operations.md)，那是执行入口的行为，不属于观察入口。）它们显示的停止信息都是 `stop` 的投影，不解析文字。
-39. 额度快照只是观察。只有真实的 `CLIBackend` 采样：每次 `run`／`resume` 里首次用到某供应商之前，额度失败停止之前，以及停止（中断除外）、暂停、完成、等待批准**确已保存**之后对本进程用过的供应商各一次，至多 5 次；每个采样点启动探测之前都要求退出门禁通过（没有未确认退出的模型进程或命令子进程）。每次写一个排他、原子发布的样本文件 `observations/quota/…`，文件名按（台账修订、相位、进程启动时刻、序号）排序；不进 `state.json`，不参与预算、回执、接受、恢复与 `load_run()`，缺失或损坏只是观察缺口。探测失败、超时、输出超限、形状不符只记“不可用＋原因”，从不改变调度、预算、回执与接受；用户中断照常传播。Claude 探测必须读到零调用的结果行（`num_turns`、`total_cost_usd`、`duration_api_ms` 为 0，`local_command` 为 `usage`），否则本进程内停用。统计口径是“运行期间账号额度的观测变化”：同一额度桶、同一重置周期内的首尾差（百分点）；周期以锚点重置时刻划分，观测时刻越过重置时刻即为新周期，报告的重置时刻已经过期的观测不参与差值；未知不当零；账号级，包含本 run 以外的使用，不相加、不合成总数；credits 用独立的 64 位十进制上下文精确计算余额净变化。
+30. 观察层（`status`、`watch`、`dashboard`、操作记录与 `supervise` 回执的读取）不写台账、不取 `run.lock`、不参与恢复；额度只读 run 目录里已保存的样本，观察入口从不启动额度探测或任何供应商 CLI。（`run`／`resume` 创建操作记录时读取 CLI 的 `--version`，见 [操作与观察](operations.md)，那是执行入口的行为，不属于观察入口。）它们显示的停止信息都是 `stop` 的投影，不解析文字。额度等待记录 `quota_wait` 也只是投影：台账不证明进程仍在等待。
+39. 额度快照只是观察。只有真实的 `CLIBackend` 采样：每次 `run`／`resume` 里首次用到某供应商之前，额度失败停止之前，以及停止（中断除外）、暂停、完成、等待批准**确已保存**之后对本进程用过的供应商各一次，至多 5 次；额度等待（不变量 40）另取每次失败的失败样本与每次醒来的醒来样本，次数受派发预算约束；每个采样点启动探测之前都要求退出门禁通过（没有未确认退出的模型进程或命令子进程）。每次写一个排他、原子发布的样本文件 `observations/quota/…`，文件名按（台账修订、相位、进程启动时刻、序号）排序；不进 `state.json`，不参与预算、回执、接受、恢复与 `load_run()`，缺失或损坏只是观察缺口。探测失败、超时、输出超限、形状不符只记“不可用＋原因”，从不改变调度、预算、回执与接受；用户中断照常传播。Claude 探测必须读到零调用的结果行（`num_turns`、`total_cost_usd`、`duration_api_ms` 为 0，`local_command` 为 `usage`），否则本进程内停用。统计口径是“运行期间账号额度的观测变化”：同一额度桶、同一重置周期内的首尾差（百分点）；周期以锚点重置时刻划分，观测时刻越过重置时刻即为新周期，报告的重置时刻已经过期的观测不参与差值；未知不当零；账号级，包含本 run 以外的使用，不相加、不合成总数；credits 用独立的 64 位十进制上下文精确计算余额净变化。
 
 **身份**
 
@@ -127,7 +129,7 @@
 | --- | --- | --- |
 | `planning` | 首次保存 | 计划登记后进入 `running` 或 `awaiting_approval` |
 | `awaiting_approval` | `--pause-after-plan` 且计划未批准；与 `stop`（`plan_approval/initial_plan`）同次保存 | `resume --approve-plan` |
-| `running` | 每次进入执行循环，同时删除 `stop` | 停止、暂停或完成 |
+| `running` | 每次进入执行循环，同时删除 `stop` 与遗留的 `quota_wait`；额度等待期间保持 `running` | 停止、暂停或完成 |
 | `paused` | `--step` 下本次已接受一个任务 | 普通 `resume` |
 | `blocked` | 执行中出错：先在一次保存里写状态与 `stop`，再写 `run_stopped` | 对应恢复出口或 `abandon` |
 | `interrupted` | Ctrl-C、SIGTERM、SIGHUP；与 `stop`（`interrupted/signal`）同次保存 | 普通 `resume` 或 `abandon` |
@@ -141,7 +143,7 @@
 | 键 | 设置与更新 | 清除 | 持久化顺序 | 恢复 |
 | --- | --- | --- | --- | --- |
 | `schema_version`、`id`、`repo`、`goal`、`commander`、`branch`、`worktree`、`base_commit`、`config_path`、`asset_digest`、`created_by_operation` | 首次保存 | 不变 | 早于创建工作树 | 要求版本 18、ID 与仓库一致；比较共享资产摘要 |
-| `config_snapshot` | 首次保存；resume 接受合法放宽后替换 | 不清除 | 与答复、`scope` 一次保存，之后写 `resume_config_relaxed` | 与当前配置比较，只许放宽 |
+| `config_snapshot` | 首次保存；resume 接受合法放宽或额度等待上限的调整后替换 | 不清除 | 与答复、`scope` 一次保存，之后写 `resume_config_changed` | 与当前配置比较，只许放宽；`quota_wait_max_seconds` 可任意调整 |
 | `status` | 见上表 | — | 先保存再写 `run_stopped` | 终态拒绝修改选项 |
 | `worktree_binding` | 首次保存为空；`git worktree add` 后第二次保存填入 | 不清除 | 第一次保存在创建工作树前 | 绑定为空时 resume 拒绝，只能 `abandon` |
 | `original_tasks` | 供给计划在首次保存；模型计划与首版计划同次 | 不变 | 供给计划的副本早于 `tasks` 登记；模型写的首版计划与 `tasks`、`plan_history` 同次保存 | `tasks` 为空时：有供给计划则重新校验并登记同一计划，否则推导出规划的 `decide`（回执已返回则重放同一原件） |
@@ -181,6 +183,7 @@
 | `continuation_rejections` | `--reject-request`（续作） | 不清除；由 worker dispatch 的 `continuation_rejection_id` 消费 | 拒绝文件先写；与 `pending_directive` 同次 |
 | `worker_recovery` | 已调用的 worker 被判定（无结果、无效、越界、无效阻断），与判定同次 | 同 dispatch 正常交接、接受、需归档的修订发布 | 后续指挥与 worker 的 `recovery` 输入；记录不含错误文字，组包时从来源派发条目读取错误摘录与失败类型（`source.failure`） |
 | `stop` | `Workflow.stop()`；进入 `awaiting_approval` | 进入 `running`；`abandon` | 与 `status` 同次保存，之后写 `run_stopped`；`load_run` 校验存在条件、登记与形状 |
+| `quota_wait` | 额度等待开始，单独一次保存；只发布满足加载契约（`quota_wait.valid_record()`）的记录：来源 dispatch、角色、窗口、重置时刻、目标时刻、记录时刻、上限、失败样本名 | 醒来（单独一次保存）；中断与任何停止（与停止同次）；进入 `running`；`abandon` | 只在 `running` 时存在，`load_run` 用同一个函数校验形状；恢复不读它，强杀后遗留不证明进程存活（普通 resume 进入执行时删除） |
 | `command_requirements` | 计划登记、恢复、调度时重算，变化才保存 | 不清除 | 只是诊断，派发前总是重算 |
 | `context_capacity` | 整体审阅容量预估，变化才保存 | 不清除 | 必要下界超限时提前停止 |
 
@@ -218,6 +221,9 @@ Orca 按本机 CLI 1.4.237 参考，不运行它；“一任务一实例”比 O
 - 接受前只核对一次快照（不变量 13）：这次核对之后、commit 之前，并发的外部进程对候选的修改仍可能进入提交，运行时发现不了。
 - 待接受的候选已变、而 worker 原件同时缺失或被改时，先因原件错误停止；恢复原件之后，下一次恢复才作废旧批准并重新执行、验证和审阅。
 - 进程组监督不是完整的 OS 进程树隔离；`--confirm-exited` 依赖操作者核实。模型调用与验证命令的监督器在回收领导进程之后不再向进程组发信号：领导先退出、或领导被 SIGTERM 结束时，忽略 SIGTERM 的后代会留下来，退出门禁把它报成退出未确认（不是静默泄漏）。额度探测用自己的收尾（不变量 3），监督器的这一点留待后续修改。
+- 额度等待（不变量 40）每次最多 `quota_wait_max_seconds` 秒，不等于整个 run 最多等这么久：累计时长只受派发预算约束（默认 200 次 × 6 小时）。
+- 显示名与模型 ID 的对应是对显示文字的词法判断，不是供应商的映射，两个方向都可能误判：供应商用不带版本的家族名指某一个版本时，无关窗口可能被当成适用（多等，或因超过上限而不等）；供应商用另一个家族名作显示名时，适用窗口可能被当成无关（只按 `session`／`weekly_all` 等、提前醒来、再失败一次，受派发预算封顶）。没有真实样本验证。
+- Claude Code 自带的 `CLAUDE_CODE_RETRY_WATCHDOG` 从每个 Claude／Codex 子进程的环境里删除；它的默认值没有查到，若某个 CLI 版本默认开启这种调用内等待，删除变量关不掉它（那时调用会等到 `agent_timeout_seconds` 被杀，结局 `budget/agent_timeout`，不与 Harness 的等待叠加）。
 - 额度的两个接口（`claude -p /usage` 的 `usage_report`、`codex app-server` 的 `account/rateLimits/read`）都标 experimental，没有做过真实联调；变了就是“不可用＋原因”。Codex 探测不消耗额度只靠协议语义（只发三条消息、不开线程），没有零调用证据；`--max-turns 1` 只限制 Claude 误调用的规模，不能证明第一次误调用不会发生。
 - Harness 被强杀时，正在运行的额度探测进程（新会话）与它的空临时目录可能遗留；台账没有它的记录，恢复不知道它存在。`codex app-server` 在 stdin 关闭后是否自行退出没有核实。
 - 用 `setsid`／`setpgid` 离开探测进程组的后代不在收尾的组信号范围内；SIGKILL 之后卡在不可中断状态的进程使 `exit_confirmed=false`。
