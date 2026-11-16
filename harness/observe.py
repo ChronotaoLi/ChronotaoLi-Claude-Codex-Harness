@@ -7,9 +7,10 @@ must fstat as a regular file. Nothing here constructs a Runtime, loads a run for
 recovery, takes run.lock, writes files, runs git or probes processes.
 
 Ledger interpretation stays in `harness.cli.status_summary`; this module only adds
-bounded projections (invocation classes, per-provider cost, quota samples, event tails,
-files). Quota is read from the samples already saved under `observations/quota/`; no
-entry here starts a provider CLI.
+bounded projections (invocation classes, account quota observed during the run, event
+tails, files). Quota is read from the samples already saved under `observations/quota/`;
+no entry here starts a provider CLI. No money is aggregated: a dispatch's
+`provider_usage.reported_cost_usd` is the CLI's nominal estimate, shown per row only.
 Only the current ledger version is interpreted: the list names any other version
 with its path and version alone, and the detail refuses it.
 """
@@ -50,14 +51,10 @@ QUOTA_SAMPLES_MAX = 400       # the newest samples by name (their total order); 
 QUOTA_DAMAGED_LISTED = 20
 ERROR_CHARS = 200
 MAX_NUMBER = 2 ** 63  # Ledger numbers beyond this are treated as absent, never converted to float.
-MAX_COST_USD = 1_000_000_000
 _PARSE_ERRORS = (ValueError, RecursionError)  # json.loads on damaged or absurdly nested input
 
 MODEL_ROLES = ("commander", "worker", "reviewer")
 PROVIDERS = ("claude", "codex", "unknown")
-PROVIDER_LABELS = {"claude": "CLI 报告的估算费用，非账户账单",
-                   "codex": "供应商未报告美元费用",
-                   "unknown": "无法确定供应商"}
 INVOCATION_CLASSES = ("usage_recorded", "invoked_no_usage", "known_not_invoked", "unknown", "verification")
 
 _DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
@@ -398,31 +395,14 @@ def _provider_and_model(entry, roles, commander):
     return provider, model_id
 
 
-def _reported_cost(usage):
-    if not isinstance(usage, dict):
-        return None
-    cost = usage.get("reported_cost_usd")
-    if type(cost) is int:
-        return cost if 0 <= cost <= MAX_COST_USD else None
-    return cost if type(cost) is float and math.isfinite(cost) and 0 <= cost <= MAX_COST_USD else None
-
-
 def _group():
     return {"dispatches": 0, "invoked": 0, "usage_recorded": 0, "invoked_no_usage": 0,
-            "known_not_invoked": 0, "unknown": 0,
-            "reported_cost_usd": dict.fromkeys(PROVIDERS),
-            "reported_cost_dispatches": dict.fromkeys(PROVIDERS, 0)}
+            "known_not_invoked": 0, "unknown": 0}
 
 
-def _add_cost(target, bucket, cost):
-    target["reported_cost_usd"][bucket] = (target["reported_cost_usd"][bucket] or 0) + cost
-    target["reported_cost_dispatches"][bucket] += 1
-
-
-def cost_summary(rows):
-    """Accumulate once per ledger dispatch ID; never add event telemetry on top."""
-    providers = {name: {"invoked": 0, "usage_recorded": 0, "invoked_no_usage": 0, "reported_cost_usd": None,
-                        "reported_cost_dispatches": 0, "label": PROVIDER_LABELS[name]} for name in PROVIDERS}
+def invocation_summary(rows):
+    """Invocation classes, once per ledger dispatch ID; never event telemetry, never money."""
+    providers = {name: {"invoked": 0, "usage_recorded": 0, "invoked_no_usage": 0} for name in PROVIDERS}
     result = {"by_provider": providers, "known_not_invoked": 0, "unknown_invocation": 0, "startup_unconfirmed": 0,
               "by_group": {"coordination": _group(), "tasks": {}, "verification": {"dispatches": 0}},
               "duplicate_dispatch_ids": [], "counted_dispatches": 0}
@@ -459,12 +439,6 @@ def cost_summary(rows):
         providers[bucket][klass] += 1
         if group is not None:
             group["invoked"] += 1
-        cost = _reported_cost(row["provider_usage"])
-        if cost is not None:
-            providers[bucket]["reported_cost_usd"] = (providers[bucket]["reported_cost_usd"] or 0) + cost
-            providers[bucket]["reported_cost_dispatches"] += 1
-            if group is not None:
-                _add_cost(group, bucket, cost)
     return result
 
 
@@ -654,7 +628,8 @@ class Observer:
                   "ledger_error": ledger_error, "summary": None, "summary_error": None,
                   "schema_version": None, "unavailable": [], "run": None, "budgets": None,
                   "tasks": [], "invalid_tasks": 0, "dispatches": [], "invalid_dispatches": 0,
-                  "cost": cost_summary([]), "timing": None, "events": None, "operations": None,
+                  "invocations": invocation_summary([]), "quota": None, "timing": None, "events": None,
+                  "operations": None,
                   "notes": {"invoked": "invoked=true 在进程启动前写入；它不证明 CLI 已启动或供应商已收到请求",
                             "process": "首版不探测进程；台账记为 running 与进程是否仍在工作是两回事",
                             "events": ("事件只是观察，计数以台账为准：dispatch_prepared 在预算检查前写入，"
@@ -685,7 +660,7 @@ class Observer:
         if model_unavailable:
             unavailable.append("model_id")
         # Events only add an end time, at most one per ledger dispatch ID; invocation
-        # facts and cost stay with the ledger row, never with event counts.
+        # facts stay with the ledger row, never with event counts.
         finished = {}
         for record in detail["events"]["records"]:
             if record.get("event") == "dispatch_finished" and isinstance(record.get("dispatch_id"), str):
@@ -694,7 +669,8 @@ class Observer:
             row["finished_at"] = finished.get(row["id"])
             row["files"] = self._dispatch_files(run_id, row["id"])
         detail["dispatches"] = rows
-        detail["cost"] = cost_summary(rows)
+        detail["invocations"] = invocation_summary(rows)
+        detail["quota"] = self.quota_block(run_id)
         return detail
 
     # ----- quota samples -----
@@ -735,6 +711,16 @@ class Observer:
                 continue
             block["samples"].append(sample)
         return block
+
+    def quota_block(self, run_id):
+        """The observed account quota from saved samples (``quota.quota_view``); a read failure is ``{"error": type}``."""
+        try:
+            block = self.quota_samples(run_id)
+            view = quota.quota_view(block["samples"], truncated=block["omitted"] > 0)
+            return {"notes": view["notes"], "damaged_count": block["damaged_count"], "omitted": block["omitted"],
+                    "providers": view["providers"]}
+        except Exception as error:
+            return {"error": type(error).__name__}
 
     def _worktree_cleanup_removed(self, run_id):
         """cleanup-run's receipt: true once it records removal; null when unreadable."""
@@ -925,15 +911,12 @@ def run_detail(state, run_id):
 
 
 def quota_status(state, run_id):
-    """The ``status RUN`` quota block: the latest observation per provider and bucket from saved samples.
+    """The ``status RUN`` quota block, the same as the run detail's: saved samples only, never a CLI.
 
-    Never starts a CLI; any failure to read is ``{"error": <type>}`` and leaves the rest of status alone.
+    Any failure to read is ``{"error": <type>}`` and leaves the rest of status alone.
     """
     try:
         with Observer(state) as observer:
-            block = observer.quota_samples(run_id)
-        view = quota.quota_view(block["samples"])
-        return {"notes": view["notes"], "damaged_count": block["damaged_count"], "omitted": block["omitted"],
-                "providers": view["providers"]}
+            return observer.quota_block(run_id)
     except Exception as error:
         return {"error": type(error).__name__}

@@ -222,11 +222,11 @@ class EventObservationTests(StateCase):
         rows = {row["id"]: row for row in detail["dispatches"]}
         self.assertEqual(rows[invoked["id"]]["finished_at"], 2.0)
         self.assertEqual(rows[prepared["id"]]["invocation_class"], "known_not_invoked")
-        # Cost and invocation counts come only from the two ledger rows.
-        self.assertEqual(detail["cost"]["counted_dispatches"], 2)
-        self.assertEqual(detail["cost"]["by_provider"]["claude"]["invoked"], 1)
-        self.assertEqual(detail["cost"]["by_provider"]["claude"]["reported_cost_usd"], 0.5)
-        self.assertEqual(detail["cost"]["known_not_invoked"], 1)
+        # Invocation counts come only from the two ledger rows; the row keeps its own usage as written.
+        self.assertEqual(detail["invocations"]["counted_dispatches"], 2)
+        self.assertEqual(detail["invocations"]["by_provider"]["claude"]["invoked"], 1)
+        self.assertEqual(detail["invocations"]["known_not_invoked"], 1)
+        self.assertEqual(rows[invoked["id"]]["provider_usage"]["reported_cost_usd"], 0.5)
         self.assertIn("dispatch_prepared", detail["notes"]["events"])
         output = io.StringIO()
         with patch("harness.watch_cli.RunWatcher") as watcher:

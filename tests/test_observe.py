@@ -1,4 +1,4 @@
-"""Read-only observation data layer: ledger projection, cost classes, events, operations."""
+"""Read-only observation data layer: ledger projection, invocation classes, events, operations."""
 import contextlib
 import errno
 import io
@@ -108,10 +108,12 @@ class DemoRunObservationTests(RepoCase):
         self.assertEqual(len(verification), 2)
         self.assertTrue(all(row["invocation_class"] == "verification" and row["provider"] is None
                             and row["model_id"] is None and row["kind"] is None for row in verification))
-        self.assertEqual(detail["cost"]["by_group"]["verification"]["dispatches"], 2)
-        self.assertEqual(detail["cost"]["by_group"]["coordination"]["dispatches"], 1)
-        self.assertEqual(detail["cost"]["by_provider"]["claude"]["invoked_no_usage"], 1)
-        self.assertIsNone(detail["cost"]["by_provider"]["claude"]["reported_cost_usd"])
+        self.assertEqual(detail["invocations"]["by_group"]["verification"]["dispatches"], 2)
+        self.assertEqual(detail["invocations"]["by_group"]["coordination"]["dispatches"], 1)
+        self.assertEqual(detail["invocations"]["by_provider"]["claude"]["invoked_no_usage"], 1)
+        self.assertNotIn("cost", detail)
+        self.assertEqual(detail["quota"]["providers"], {"claude": {"state": "no_samples"},
+                                                        "codex": {"state": "no_samples"}})
         self.assertEqual(detail["timing"]["first_event_time"], events[0]["time"])
         self.assertEqual(detail["timing"]["last_event_time"], events[-1]["time"])
         self.assertFalse(detail["events"]["unparsed_tail"])
@@ -160,23 +162,21 @@ class InvocationClassTests(StateCase):
         self.assertIsNone(by_id[rows["missing_invoked"]["id"]]["invoked"])
         self.assertEqual(detail["invalid_dispatches"], 2)
         self.assertEqual(detail["summary_error"], None)
-        cost = detail["cost"]
+        cost = detail["invocations"]
         self.assertEqual(cost["known_not_invoked"], 2)
         self.assertEqual(cost["unknown_invocation"], 6)
         self.assertEqual(cost["startup_unconfirmed"], 1)
         self.assertEqual(cost["by_group"]["verification"]["dispatches"], 1)
         claude = cost["by_provider"]["claude"]
         self.assertEqual((claude["invoked"], claude["usage_recorded"], claude["invoked_no_usage"]), (2, 1, 1))
-        self.assertEqual(claude["reported_cost_usd"], 0.5)
-        self.assertEqual(claude["reported_cost_dispatches"], 1)
         self.assertEqual(cost["by_provider"]["codex"]["invoked"], 1)
         total_model = sum(p["invoked"] for p in cost["by_provider"].values())
         self.assertEqual(total_model + cost["known_not_invoked"] + cost["unknown_invocation"] + 1, cost["counted_dispatches"])
         self.assertEqual(cost["by_group"]["coordination"]["dispatches"], 1)
 
 
-class CostSummaryTests(StateCase):
-    def test_by_provider_sums_null_rule_duplicates_and_role_based_groups(self):
+class InvocationSummaryTests(StateCase):
+    def test_duplicates_null_rule_and_role_based_groups_without_money(self):
         first = dispatch(provider_usage={"provider": "claude", "reported_cost_usd": 0.25, "num_turns": 4})
         rows = [
             first,
@@ -192,42 +192,31 @@ class CostSummaryTests(StateCase):
             dispatch(role="commander", kind="replan", task_id="greet", invoked=False, process_state="prepared",
                      status="running"),
             dispatch(task_id="planning", provider_usage={"provider": "claude", "reported_cost_usd": 0.3}),
-            dispatch(provider_usage={"provider": "claude", "reported_cost_usd": -1}),  # invalid cost ignored
-            dispatch(provider_usage={"provider": "claude", "reported_cost_usd": True}),  # bool is not a cost
+            dispatch(provider_usage={"provider": "claude", "reported_cost_usd": -1}),
+            dispatch(provider_usage={"provider": "claude", "reported_cost_usd": True}),
         ]
         detail, _ = self.rows(ledger("run_cost", dispatches=rows))
-        cost = detail["cost"]
-        self.assertEqual(cost["duplicate_dispatch_ids"], [first["id"]])
-        self.assertEqual(cost["counted_dispatches"], len(rows) - 1)
-        claude = cost["by_provider"]["claude"]
+        calls = detail["invocations"]
+        self.assertEqual(calls["duplicate_dispatch_ids"], [first["id"]])
+        self.assertEqual(calls["counted_dispatches"], len(rows) - 1)
+        claude = calls["by_provider"]["claude"]
         self.assertEqual((claude["invoked"], claude["usage_recorded"], claude["invoked_no_usage"]), (7, 6, 1))
-        self.assertAlmostEqual(claude["reported_cost_usd"], 1.15)
-        self.assertEqual(claude["reported_cost_dispatches"], 4)
-        self.assertEqual(claude["label"], "CLI 报告的估算费用，非账户账单")
-        codex = cost["by_provider"]["codex"]
+        codex = calls["by_provider"]["codex"]
         self.assertEqual((codex["invoked"], codex["usage_recorded"], codex["invoked_no_usage"]), (3, 2, 1))
-        self.assertIsNone(codex["reported_cost_usd"])
-        self.assertEqual(codex["reported_cost_dispatches"], 0)
-        self.assertEqual(codex["label"], "供应商未报告美元费用")
-        self.assertIsNone(cost["by_provider"]["unknown"]["reported_cost_usd"])
-        self.assertEqual(cost["by_provider"]["unknown"]["invoked"], 0)
-        self.assertNotIn("total", cost)
-        coordination = cost["by_group"]["coordination"]
+        self.assertEqual(calls["by_provider"]["unknown"]["invoked"], 0)
+        coordination = calls["by_group"]["coordination"]
         self.assertEqual((coordination["dispatches"], coordination["invoked"], coordination["usage_recorded"],
                           coordination["invoked_no_usage"], coordination["known_not_invoked"]), (3, 2, 1, 1, 1))
-        self.assertAlmostEqual(coordination["reported_cost_usd"]["claude"], 0.1)
-        self.assertIsNone(coordination["reported_cost_usd"]["codex"])
-        planning = cost["by_group"]["tasks"]["planning"]
-        self.assertEqual(planning["dispatches"], 1)
-        self.assertAlmostEqual(planning["reported_cost_usd"]["claude"], 0.3)
-        greet = cost["by_group"]["tasks"]["greet"]
-        self.assertEqual(greet["dispatches"], 6)
-        self.assertAlmostEqual(greet["reported_cost_usd"]["claude"], 0.75)
-        self.assertIsNone(greet["reported_cost_usd"]["codex"])
-        self.assertEqual(greet["reported_cost_dispatches"]["codex"], 0)
-        self.assertEqual(cost["by_group"]["tasks"]["final"]["invoked"], 1)
+        self.assertEqual(calls["by_group"]["tasks"]["planning"]["dispatches"], 1)
+        self.assertEqual(calls["by_group"]["tasks"]["greet"]["dispatches"], 6)
+        self.assertEqual(calls["by_group"]["tasks"]["final"]["invoked"], 1)
+        # No money is aggregated anywhere; each row keeps the CLI's own fields as reported.
+        text = json.dumps(calls)
+        for word in ("reported_cost", "label", "total"):
+            self.assertNotIn(word, text)
         rows_by_id = {row["id"]: row for row in detail["dispatches"]}
         self.assertEqual(rows_by_id[rows[4]["id"]]["provider_usage"]["tokens"], {"input_tokens": 10})
+        self.assertEqual(rows_by_id[rows[1]["id"]]["provider_usage"]["reported_cost_usd"], 0.5)
 
 
 class ProviderModelTests(StateCase):
@@ -254,7 +243,7 @@ class ProviderModelTests(StateCase):
         self.assertIsNone(by_id[rows[1]["id"]]["model_id"])
         self.assertEqual(by_id[rows[3]["id"]]["provider"], "codex")
         self.assertEqual(by_id[rows[3]["id"]]["invocation_class"], "usage_recorded")
-        self.assertEqual(detail["cost"]["by_provider"]["unknown"]["invoked"], 3)
+        self.assertEqual(detail["invocations"]["by_provider"]["unknown"]["invoked"], 3)
 
 
 class EventsAndDamageTests(StateCase):
@@ -438,8 +427,7 @@ class DamageIsolationTests(StateCase):
         self.assertIsNone(projected["finished_at"])
         self.assertEqual(projected["pgid"], huge)
         self.assertEqual(projected["invocation_class"], "usage_recorded")
-        self.assertIsNone(detail["cost"]["by_provider"]["claude"]["reported_cost_usd"])
-        self.assertEqual(detail["cost"]["by_provider"]["claude"]["usage_recorded"], 1)
+        self.assertEqual(detail["invocations"]["by_provider"]["claude"]["usage_recorded"], 1)
         self.assertEqual(detail["budgets"]["agent_dispatches"], huge)  # Compared as an integer, never via float.
         self.assertIsNotNone(detail["summary"])
         json.dumps(detail)  # The whole projection stays serializable.
@@ -459,8 +447,9 @@ class DamageIsolationTests(StateCase):
                 self.assertIsNone(by_id[rows[1]["id"]]["model_id"])
                 self.assertEqual(by_id[rows[2]["id"]]["model_id"], "claude-opus-5-5")
                 self.assertIn("model_id", detail["unavailable"])
-                self.assertEqual(detail["cost"]["by_group"]["coordination"]["dispatches"], 2)
-                self.assertAlmostEqual(detail["cost"]["by_provider"]["claude"]["reported_cost_usd"], 0.2)
+                self.assertEqual(detail["invocations"]["by_group"]["coordination"]["dispatches"], 2)
+                # The commander row's provider comes from its own usage; the worker's from the config.
+                self.assertEqual(detail["invocations"]["by_provider"]["claude"]["invoked"], 2)
 
 
 class FileIndexCapTests(StateCase):

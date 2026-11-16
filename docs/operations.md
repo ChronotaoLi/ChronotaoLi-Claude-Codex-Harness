@@ -157,7 +157,7 @@ python3 -m harness.dashboard --state /abs/project/.harness --port 8765
 
 ### 页面
 
-run 列表 → run 详情 → 文件查看。列表按最近事件排序，以卡片显示台账状态、目标摘要、分支与最近事件时间，并汇总需要关注／进行中／已结束的数量。详情首屏只放判断所需的信息：目标摘要与状态标记；“需要处理”区（停止的类型、诊断摘录与出口命令（计划待批准另有专项）、摘要或台账读取失败、等待操作者决定、当前环境阻断、缺失命令授权、续作请求、返工提示、当前任务最近一次调用的错误，并附常用出口），没有问题时不显示该区；台账状态、已接受／总任务进度、当前任务、最近观测与待处理数量；任务列表与最近活动。长目标、决定问题和事件字段默认只显示有界摘要，“查看完整原文”展开后显示未截断的原文。预算与费用、调用记录（逐行展开查看进程、用量与产物文件链接）、事件日志、操作记录、运行信息（工作树、台账版本、操作记录、worker 结果计数、历史环境阻断等）和文件索引（可按路径筛选）收在标签页中，可用方向键、Home、End 切换；“如何理解这些状态”展开后给出台账与进程、完成与接受的区别。同一 run 的事件刷新和手动刷新保留当前标签、已展开项、文件筛选、页面与原文框／标签栏／表格的滚动位置以及键盘焦点（隐藏标签或收起项中的位置在再次显示时恢复；同一文件的刷新保留阅读位置）；切换到其他 run 或文件时恢复默认。文件查看显示文本尾部，默认 64 KiB，最大 1 MiB，可调整。详情默认开启“跟随运行变化”，收到原生文件通知后刷新；列表与文件查看使用刷新按钮，不定时轮询。连接断开会显示提示，手动刷新可重新订阅。界面为中文，跟随系统浅色／深色并适配窄屏；`status`（无 run ID）的列表与网页读同一份投影，stdout 字段不变。不是当前台账版本（18）的 run 目录不进入列表：列表页的台账诊断与 `status` 的 stderr 只给出它的路径、版本和“不支持”，不读其他字段；打开它的详情返回 409，页面显示同一句拒绝。
+run 列表 → run 详情 → 文件查看。列表按最近事件排序，以卡片显示台账状态、目标摘要、分支与最近事件时间，并汇总需要关注／进行中／已结束的数量。详情首屏只放判断所需的信息：目标摘要与状态标记；“需要处理”区（停止的类型、诊断摘录与出口命令（计划待批准另有专项）、摘要或台账读取失败、等待操作者决定、当前环境阻断、缺失命令授权、续作请求、返工提示、当前任务最近一次调用的错误，并附常用出口），没有问题时不显示该区；台账状态、已接受／总任务进度、当前任务、最近观测与待处理数量；任务列表与最近活动。长目标、决定问题和事件字段默认只显示有界摘要，“查看完整原文”展开后显示未截断的原文。预算与额度、调用记录（逐行展开查看进程、用量与产物文件链接）、事件日志、操作记录、运行信息（工作树、台账版本、操作记录、worker 结果计数、历史环境阻断等）和文件索引（可按路径筛选）收在标签页中，可用方向键、Home、End 切换；“如何理解这些状态”展开后给出台账与进程、完成与接受的区别。同一 run 的事件刷新和手动刷新保留当前标签、已展开项、文件筛选、页面与原文框／标签栏／表格的滚动位置以及键盘焦点（隐藏标签或收起项中的位置在再次显示时恢复；同一文件的刷新保留阅读位置）；切换到其他 run 或文件时恢复默认。文件查看显示文本尾部，默认 64 KiB，最大 1 MiB，可调整。详情默认开启“跟随运行变化”，收到原生文件通知后刷新；列表与文件查看使用刷新按钮，不定时轮询。连接断开会显示提示，手动刷新可重新订阅。界面为中文，跟随系统浅色／深色并适配窄屏；`status`（无 run ID）的列表与网页读同一份投影，stdout 字段不变。不是当前台账版本（18）的 run 目录不进入列表：列表页的台账诊断与 `status` 的 stderr 只给出它的路径、版本和“不支持”，不读其他字段；打开它的详情返回 409，页面显示同一句拒绝。
 
 返工提示来自已有台账：未接受任务的有效工作尝试达到 3 次，或最近两次连续拒绝审阅出现相同的 blocking finding 标签（审阅者写的 id）时提示；整体验收累计拒绝至少 2 次且最新结果尚未批准时也提示。`status RUN`、`watch RUN` 与详情中的 `convergence` 都是建议，不自动改变预算、范围、派发或接受条件；completed／abandoned 不显示返工警告。
 
@@ -181,29 +181,32 @@ run 列表 → run 详情 → 文件查看。列表按最近事件排序，以�
 | `invoked_no_usage` | 已进入后端调用但 CLI 未留下用量（超时、CLI 失败、输出损坏等）；已消耗本地派发预算，不断言供应商是否计费 |
 | `known_not_invoked` | 已知未进入调用：准备中的记录，或本地准备门禁（输入、MCP、快照、待派发指令与原件核对、预算）失败后的收尾状态 |
 | `unknown` | `invoked` 字段缺失、不是布尔值，或与 `pgid`／`process_state` 矛盾；页面悬停显示原因 |
-| `verification` | 验证进程，不计入模型费用 |
+| `verification` | 验证进程，不是模型调用 |
 
 `invoked=true` 在进程启动前写入，不证明 CLI 已启动或供应商已收到请求；`process_state=starting` 另标“启动未确认”，不覆盖上述分类。
 
-事件日志里的派发事件：`dispatch_prepared` 在本地准备保存后、预算检查前写入；`dispatch_started` 在台账保存 `invoked=true` 之后写入；`dispatch_finished` 带 `invoked`、`status` 和 `provider_usage`。事件追加没有丢失时，`dispatch_started` 条数等于 `agent_dispatches`；追加失败会被吞掉，run 照常完成而少一条事件。事件是尽力而为的观察：写入失败不影响调用，崩溃可能缺一条，恢复不补发。计数与费用以台账为准。`quota_sampled`（页面显示“额度样本”）在每次额度采样之后追加，带 `provider`、`trigger`、`available`、`reason`、样本文件名 `sample`（写入失败时为 null 并带 `write_error`）与 `dispatch_id`。
+事件日志里的派发事件：`dispatch_prepared` 在本地准备保存后、预算检查前写入；`dispatch_started` 在台账保存 `invoked=true` 之后写入；`dispatch_finished` 带 `invoked`、`status` 和 `provider_usage`。事件追加没有丢失时，`dispatch_started` 条数等于 `agent_dispatches`；追加失败会被吞掉，run 照常完成而少一条事件。事件是尽力而为的观察：写入失败不影响调用，崩溃可能缺一条，恢复不补发。计数以台账为准。`quota_sampled`（页面显示“额度样本”）在每次额度采样之后追加，带 `provider`、`trigger`、`available`、`reason`、样本文件名 `sample`（写入失败时为 null 并带 `write_error`）与 `dispatch_id`。
 
-### 额度样本
+### 额度
 
-真实 `CLIBackend` 的 `run`／`resume` 在这些时刻各取一份账号额度快照（不调用模型）：本进程首次用到某供应商之前（`before_use`），额度失败停止之前（`quota_failure`），以及停止、暂停、完成、等待批准确已保存之后，对本进程用过的供应商各一份（`stop`、`paused`、`completed`、`awaiting_approval`）；每次至多 5 份。`demo` 与离线后端不采样。探测：Claude 是 `claude -p /usage --output-format stream-json --verbose --no-session-persistence --setting-sources "" --strict-mcp-config --max-turns 1`，必须读到零调用的结果行（`num_turns`、`total_cost_usd`、`duration_api_ms` 为 0，`local_command` 为 `usage`），读不到就在本进程停用 Claude 探测；Codex 是 `codex app-server` 的三条 JSON-RPC 消息（`initialize`、`initialized`、`account/rateLimits/read`）。两者都在空临时目录、用与模型调用相同的环境运行，5 秒查询时限，收尾时整个进程组 SIGTERM 后 SIGKILL；探测期间按 Ctrl-C，中断在约 0.1 秒内或收尾完成之后传播，临时目录与进程组照样清理。
+**样本。** 真实 `CLIBackend` 的 `run`／`resume` 在这些时刻各取一份账号额度快照（不调用模型）：本进程首次用到某供应商之前（`before_use`），额度失败停止之前（`quota_failure`），以及停止、暂停、完成、等待批准确已保存之后，对本进程用过的供应商各一份（`stop`、`paused`、`completed`、`awaiting_approval`）；每次至多 5 份。`demo` 与离线后端不采样。探测：Claude 是 `claude -p /usage --output-format stream-json --verbose --no-session-persistence --setting-sources "" --strict-mcp-config --max-turns 1`，必须读到零调用的结果行（`num_turns`、`total_cost_usd`、`duration_api_ms` 为 0，`local_command` 为 `usage`），读不到就在本进程停用 Claude 探测；Codex 是 `codex app-server` 的三条 JSON-RPC 消息（`initialize`、`initialized`、`account/rateLimits/read`）。两者都在空临时目录、用与模型调用相同的环境运行，5 秒查询时限，收尾时整个进程组 SIGTERM 后 SIGKILL；探测期间按 Ctrl-C，中断在约 0.1 秒内或收尾完成之后传播，临时目录与进程组照样清理。
 
 样本写在 `runs/<id>/observations/quota/`，文件名 `r<修订>-p<相位>-<进程启动时刻>-s<序号>-<供应商>-<触发>.json` 就是它们的顺序，排他发布、从不覆盖，只存归一化字段（窗口的已用百分比与重置时刻、Codex 的 credits 余额原样字符串、`extra_usage`、进程事实），不存 CLI 原始输出或错误文字。探测失败只记“不可用＋原因”：`not_installed`、`timeout`、`output_limit`、`exited`、`provider_error`、`shape_mismatch`、`not_zero_call`、`probe_disabled`、`internal_error`；从不改变调度、预算、回执与接受，用户中断照常传播。
 
-`status RUN` 的 `quota` 块只读已保存的样本：每家的样本数、不可用原因计数、最近一份样本，以及每个额度桶（Claude 按 `kind` 与 scope，`weekly_scoped` 带模型显示名；Codex 按 limit、槽位与窗口长度）的最近观测和下次重置时刻，Codex 另有各 limit 最近的 credits 余额。这是账号级观测：包含本 run 以外的使用（含驱动 Harness 的会话），不是本 run 的消耗；桶与供应商不相加；样本里没有账号标识，换号认不出来。最多读最新 400 份，损坏、超大或名实不符的样本计入 `damaged_count` 并跳过。`--full` 只打印台账，不带 `quota`。两个接口都是 experimental，没有做过真实联调。
+**口径：运行期间账号额度的观测变化。** `status RUN` 的 `quota` 块与网页“预算与额度”标签里的额度区块是同一份投影，只读已保存的样本（最新 400 份），刷新从不启动任何 CLI：
 
-### 费用
+- 这是账号级观测：包含本 run 以外的使用（含驱动 Harness 的会话），不是本 run 的消耗；样本里没有账号标识，换号认不出来。
+- 每个额度桶分开：Claude 按 `kind` 与 scope（`weekly_all` 与各个 `weekly_scoped（模型显示名）` 各是一个桶，无关模型的周窗口到 100% 也只是它自己那一行）；Codex 按 limit、槽位与样本报告的窗口长度（不把 `primary` 当成固定的 5 小时窗口）。桶与桶不相加，两家不合成总数，输出里没有任何合计。单位是百分点。
+- 每个桶写最近观测（不是“当前”）、观测时间与下次重置时刻，再按重置周期分段，只在同一周期内给首尾差：一段以首个观测的有效重置时刻为锚点；之后的观测时刻达到或越过 min(锚点, 上一份的重置时刻) 就是新周期，重置时刻与锚点相差超过容差也是新周期（与锚点比，连续的小漂移也会累积分段）。容差为 min(120 秒, 窗口长度的 1/60)，窗口长度未知（Claude）时 60 秒；三个取值是设计值，待真实联调复核。
+- 一份观测报告的重置时刻只有晚于它自己的观测时刻才算有效：已经过期的值不作锚点、不参与同周期判断与差值，该段的变化为未知，标“报告的重置时刻已过期”。
+- 不跨段相减，不假定旧周期用到 100%。只有一个观测、或有效重置时刻未知的段，变化写“变化未知”（不当作 0）。段内下降照算并标“下降（修正或异常）”；因重置时刻偏离锚点而分出的新段标“重置时刻在周期内改变”。
+- 不完整的段写明原因：首个可用观测（之前的样本不可用或没有这个桶，不称“run 开始值”）、较早样本未读取（读取端截掉了更早的样本）、重置之后、重置之前、之后的样本不可用或未报告。不可用的样本不打断分段，只计入每家的不可用原因计数。
+- Codex 的 credits 放在卡片第一行：最近观测的余额（原样十进制字符串），以及运行期间的净变化——连续的、有余额且不是 unlimited 的观测为一段，用独立的 64 位十进制上下文精确相减（对 Inexact、Rounded 等设陷阱，结果是字符串；陷阱触发或只有一个观测时为 null，显示“变化未知”）；净变化含充值、赠送、过期，不是消费账单，不加货币符号。unlimited 时不计算差值，余额未报告时写“余额未报告”；某份样本没有报告 credits 不断开一段。
+- 样本时刻倒退（时钟回拨）时标出，先后仍按台账修订排序；损坏、超大或名实不符的样本计入 `damaged_count` 并跳过；截掉的较早样本计入 `omitted`，第一段的开头标为不完整。`--full` 只打印台账，不带 `quota`。
 
-费用按供应商分列，以台账 dispatch ID 为唯一累计单位；事件中的用量不再相加，重复的 dispatch ID 只计一次并列出。
+不保证：两个接口都是 experimental，没有做过真实联调；整数百分比能反映每次调用的消耗；跨重置没有缺口；credits 的净变化等于消费；账号没有被切换；运行中的显示是新鲜的（一次长调用里可能停留在开始时的值，页面写观测时刻）。
 
-- Claude 显示的是 CLI 报告的估算费用，不是账户账单。
-- Codex 不报告美元费用，显示“不可用”。
-- 没有任何合法费用字段时显示“不可用”而不是 0；不给全 run 合计。
-- token 只在 dispatch 行逐条显示原字段，不跨 dispatch 或供应商相加。
-- 按组：协调开销（role 为 commander 的 `decide`，按角色识别）、各任务（worker／reviewer 按 `task_id`）、验证。失败或超时的调用只要有合法报告费用也计入。
+**用量与名义费用。** 调用分类按台账 dispatch ID 计数，重复的 ID 只计一次并列出；事件里的用量不再相加。token 与 CLI 报告的 `reported_cost_usd`（Claude 的名义估算，不是账户账单，也不是订阅额度；Codex 不报告）只在调用记录里逐条显示原字段，不跨 dispatch 或供应商汇总。
 
 ### 文件访问
 
@@ -324,7 +327,7 @@ python3 -m harness.permission_smoke --config /path/to/harness.toml --repo /path/
 python3 -m harness.tool_smoke --config /path/to/harness.toml --repo /path/to/project
 ```
 
-- `smoke` 在临时 Git 仓库由真实指挥生成计划，再调用执行者、任务审阅者和整体审阅者，运行真实测试；不改动本仓库。它用真实的 `CLIBackend`，所以也运行两家的额度探测（见[额度样本](#额度样本)）；离线测试只用桩可执行文件，不证明探测在真实 CLI 上可用。
+- `smoke` 在临时 Git 仓库由真实指挥生成计划，再调用执行者、任务审阅者和整体审阅者，运行真实测试；不改动本仓库。它用真实的 `CLIBackend`，所以也运行两家的额度探测（见[额度](#额度)）；离线测试只用桩可执行文件，不证明探测在真实 CLI 上可用。
 - `permission_smoke` 在 `--repo` 的 `.harness/permission-smoke/` 建立专用现场，检查工作树内读写、精确命令、额外参数、工作树外读写和 `.git` 修改；通过要求实际工具调用、工具结果、对应的 `permission_denials` 和文件内容一致，模型自称“已拒绝”不算证据。专用命令替换项目命令，外部 MCP 关闭。默认超时 180 秒、最多 16 轮、预算参数 1 美元，可用 `--timeout`、`--max-turns`、`--max-budget-usd` 调整。
 - `tool_smoke` 让配置的 Claude worker 调用 broker、文件工具、`git_query`（`ls-tree`、`hash-object` 与一条被拒绝的 argv）和 `delete_path`（范围内删除与范围外拒绝），核对工具结果与文件；默认最多 20 轮。
 

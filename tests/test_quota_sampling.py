@@ -506,12 +506,18 @@ class ObservationTests(DashboardCase, SamplingCase):
         run_id, folder = self.completed()
         name = sorted(path.name for path in folder.iterdir())[0]
         calls = quota_stubs.install(self)
-        self.assertIn("quota", self.status(run_id))
-        observe.run_detail(self.repo / ".harness", run_id)
+        shown = self.status(run_id)["quota"]
+        # One projection for status and the page (V-详情): quota and invocation classes, no money.
+        detail = observe.run_detail(self.repo / ".harness", run_id)
+        self.assertEqual(detail["quota"], shown)
+        self.assertEqual(shown["providers"]["codex"]["credits"]["codex"]["latest"]["balance"], "41.25")
         server = self.start_server()
-        for path in (f"/api/runs/{run_id}", f"/api/runs/{run_id}/files",
-                     f"/api/runs/{run_id}/files/observations/quota/{name}"):
-            self.assertEqual(self.request(server, path)[0], 200, path)
+        for _ in range(3):   # every refresh reads the saved samples again, never a CLI
+            for path in (f"/api/runs/{run_id}", f"/api/runs/{run_id}/files", f"/api/runs/{run_id}/events",
+                         f"/api/runs/{run_id}/files/observations/quota/{name}"):
+                self.assertEqual(self.request(server, path)[0], 200, path)
+        served = json.loads(self.request(server, f"/api/runs/{run_id}")[2])
+        self.assertEqual((served["quota"], "cost" in served, "invocations" in served), (shown, False, True))
         self.assertEqual(calls.all(), [])
 
     def test_damaged_samples_change_neither_recovery_nor_the_rest_of_status(self):  # L18
@@ -540,7 +546,7 @@ class ObservationTests(DashboardCase, SamplingCase):
     def test_status_shows_the_latest_observation_per_provider_and_bucket(self):  # L19
         run_id, _ = self.completed(codex="rpc_error")
         shown = self.status(run_id)["quota"]
-        self.assertEqual(shown["notes"], list(quota.NOTES))
+        self.assertEqual(shown["notes"], list(quota.NOTES) + list(quota.VIEW_NOTES))
         claude, codex = shown["providers"]["claude"], shown["providers"]["codex"]
         self.assertEqual((claude["state"], claude["samples"], claude["unavailable"]), ("available", 2, {}))
         self.assertEqual({key: claude["latest_sample"][key] for key in ("trigger", "available", "reason")},

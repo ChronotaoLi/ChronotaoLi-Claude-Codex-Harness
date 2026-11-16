@@ -664,7 +664,7 @@ class PageScriptTests(RepoCase):
         shown = phases[f"#/runs/{run_id}"]
         self.assertEqual(shown["requested"], [f"/api/runs/{run_id}", f"/api/runs/{run_id}/files"])
         # Values from the real projection stay reachable (some inside closed tabs/disclosures).
-        for expected in (run_id, detail["cost"]["by_provider"]["claude"]["label"], worker, "Implement greet",
+        for expected in (run_id, "运行期间账号额度的观测变化", detail["quota"]["notes"][0], worker, "Implement greet",
                          detail["notes"]["invoked"]):
             self.assertIn(expected, shown["text"])
         self.assertNotIn("读取失败", shown["text"])

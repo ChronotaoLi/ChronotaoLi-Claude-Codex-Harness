@@ -83,8 +83,9 @@ def _usage_counts(value, fields):
 def provider_usage(job, provider):
     """Read bounded diagnostics from the CLI, never from the model's response.
 
-    Missing/invalid metrics stay unknown. The CLI's cost is its reported estimate,
-    not an account bill; none of these observations affect execution budgets.
+    Missing/invalid metrics stay unknown. ``reported_cost_usd`` is the CLI's nominal
+    estimate, not an account bill or the subscription's quota; it is kept per dispatch and
+    never summed. None of these observations affect execution budgets.
     """
     try:
         with (job / "process.stdout").open("rb") as stream:

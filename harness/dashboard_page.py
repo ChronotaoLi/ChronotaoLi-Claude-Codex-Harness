@@ -365,9 +365,6 @@ APP_JS = r""""use strict";
     if (seconds < 86400) { return Math.floor(seconds / 3600) + " 小时前"; }
     return Math.floor(seconds / 86400) + " 天前";
   }
-  function fmtCost(value) {
-    return typeof value === "number" ? "$" + value.toFixed(4) : UNAVAILABLE;
-  }
   function fmtBytes(value) {
     if (typeof value !== "number") { return UNAVAILABLE; }
     if (value < 1024) { return value + " B"; }
@@ -1019,7 +1016,7 @@ APP_JS = r""""use strict";
       { id: "dispatches", label: "调用记录", badge: errored ? dispatches.length + " · " + errored + " 错误" : dispatches.length,
         tone: errored ? "bad" : null, node: dispatchPanel(data, dispatches, tasks) },
       { id: "events", label: "事件日志", badge: records.length, node: eventsPanel(data, records) },
-      { id: "cost", label: "预算与费用", node: costPanel(data, summary) },
+      { id: "budget", label: "预算与额度", node: budgetPanel(data, summary) },
       { id: "operations", label: "操作记录", badge: data.operations ? data.operations.records.length : 0,
         node: operationsPanel(data) },
       { id: "meta", label: "运行信息", node: metaPanel(data, run, summary) },
@@ -1175,7 +1172,8 @@ APP_JS = r""""use strict";
         ["耗时（按台账与事件）", fmtDuration(row.invoked_at, row.finished_at)],
         ["pgid", row.pgid], ["退出已确认", row.exit_confirmed], ["调用分类", klassText],
         ["worker 结果", row.worker_outcome], ["供应商", row.provider], ["模型", row.model_id],
-        ["用量（原字段）", usageText(row.provider_usage)], ["错误", row.error],
+        ["用量（原字段；reported_cost_usd 是 CLI 的名义估算，不汇总）", usageText(row.provider_usage)],
+        ["错误", row.error],
         ["文件", row.files.length ? files : "无"]
       ]));
       box.appendChild(body);
@@ -1244,11 +1242,136 @@ APP_JS = r""""use strict";
 
   function groupRow(name, group) {
     return [name, group.dispatches, group.invoked, group.usage_recorded, group.invoked_no_usage,
-      group.known_not_invoked, group.unknown, fmtCost(group.reported_cost_usd.claude),
-      fmtCost(group.reported_cost_usd.codex), fmtCost(group.reported_cost_usd.unknown)];
+      group.known_not_invoked, group.unknown];
   }
 
-  function costPanel(data, summary) {
+  // Account quota observed during the run. Balances and their changes are the decimal strings
+  // the view computed; they are shown as text and never converted to numbers here.
+  var QUOTA_START = { first_available_observation: "首个可用观测", older_samples_not_read: "较早样本未读取",
+    after_reset: "重置之后" };
+  var QUOTA_END = { before_reset: "重置之前", later_samples_missing_bucket_or_unavailable: "之后的样本不可用或未报告" };
+  var QUOTA_FLAGS = { decrease: "下降（修正或异常）", resets_at_unknown: "重置时刻未知",
+    reset_already_passed: "报告的重置时刻已过期", reset_changed_within_cycle: "重置时刻在周期内改变" };
+
+  function quotaSegment(segment) {
+    var text;
+    if (segment.observations === 1) {
+      text = show(segment.first.used_percent) + "%（只有一个观测）";
+    } else {
+      text = show(segment.first.used_percent) + "% → " + show(segment.last.used_percent) + "%";
+      var points = segment.change_points;
+      text += points === null || points === undefined ? "（变化未知）" :
+        points > 0 ? "（增加 " + points + " 个百分点）" : points < 0 ? "（减少 " + (-points) + " 个百分点）" : "（无变化）";
+    }
+    var missing = [];
+    if (segment.incomplete_start) { missing.push(QUOTA_START[segment.incomplete_start] || segment.incomplete_start); }
+    if (segment.incomplete_end) { missing.push(QUOTA_END[segment.incomplete_end] || segment.incomplete_end); }
+    if (missing.length) { text += "（不完整：" + missing.join("／") + "）"; }
+    if (segment.flags && segment.flags.length) {
+      text += "［" + segment.flags.map(function (flag) { return QUOTA_FLAGS[flag] || flag; }).join("、") + "］";
+    }
+    return text;
+  }
+
+  function quotaReasons(unavailable) {
+    return Object.keys(unavailable || {}).map(function (reason) { return reason + "×" + unavailable[reason]; }).join("、");
+  }
+
+  function quotaCredits(limit, credits) {
+    var latest = credits.latest || {};
+    var node = el("div", "quota-credits");
+    attr(node, "data-credits", limit);
+    var head;
+    if (latest.unlimited === true) {
+      head = "credits（" + limit + "）：unlimited，不计算差值";
+    } else if (typeof latest.balance !== "string") {
+      head = "credits（" + limit + "）：余额未报告";
+    } else {
+      head = "credits 余额（" + limit + "，最近观测 " + show(latest.observed_at) + "）：" + latest.balance;
+    }
+    node.appendChild(el("p", "metric-value", head));
+    (credits.runs || []).forEach(function (run) {
+      var text = run.observations === 1 ? "运行期间只有一个余额观测：" + run.first :
+        "运行期间净变化 " + (typeof run.net_change === "string" ? run.net_change : "变化未知") +
+        "（" + run.first + " → " + run.last + "，含充值、赠送、过期；不是消费账单）";
+      var item = el("p", "metric-note", text);
+      attr(item, "data-net-change", typeof run.net_change === "string" ? run.net_change : "unknown");
+      node.appendChild(item);
+    });
+    return node;
+  }
+
+  function quotaProvider(name, entry) {
+    var box = el("div", "mini quota-provider");
+    attr(box, "data-quota-provider", name);
+    box.appendChild(el("h3", null, name === "codex" ? "Codex" : "Claude"));
+    if (!entry || entry.state === "no_samples") {
+      box.appendChild(notice("没有样本"));
+      return box;
+    }
+    if (name === "codex") {
+      Object.keys(entry.credits || {}).forEach(function (limit) { box.appendChild(quotaCredits(limit, entry.credits[limit])); });
+    }
+    var reasons = quotaReasons(entry.unavailable);
+    if (entry.state === "all_unavailable") {
+      box.appendChild(notice("全部 " + entry.samples + " 个样本不可用：" + reasons, "warn"));
+    } else if (reasons) {
+      box.appendChild(notice("不可用的样本：" + reasons, "hint"));
+    }
+    if (entry.unavailable && entry.unavailable.probe_disabled) {
+      box.appendChild(notice("本次调用中已停用该探测，原因见更早的样本", "hint"));
+    }
+    if (entry.clock_rollback) {
+      box.appendChild(notice("样本时刻出现回拨，先后按台账修订排序", "warn"));
+    }
+    if ((entry.buckets || []).length) {
+      box.appendChild(table(["额度桶", "最近观测", "观测时间", "下次重置", "运行期间变化"],
+        entry.buckets.map(function (bucket) {
+          return [bucket.bucket, show(bucket.latest.used_percent) + "%", show(bucket.latest.observed_at),
+            bucket.latest.resets_at ? bucket.latest.resets_at : "未知",
+            (bucket.segments || []).map(quotaSegment).join("；")];
+        }), "quota:" + name));
+    }
+    if (name === "codex" && entry.state === "available") {
+      box.appendChild(notice("普通用量允许（最近观测）：" + show(entry.ordinary_usage_allowed), "metric-note"));
+    }
+    if (name === "claude" && entry.state === "available") {
+      var extra = entry.extra_usage;
+      box.appendChild(notice(!extra ? "额外用量：未报告" : extra.is_enabled === false ? "额外用量：未启用" :
+        "额外用量：monthly_limit=" + show(extra.monthly_limit) + "；used_credits=" + show(extra.used_credits) +
+        "；utilization=" + show(extra.utilization) + "；currency=" + show(extra.currency), "metric-note"));
+    }
+    return box;
+  }
+
+  function quotaSection(quota) {
+    var section = el("div", "quota-section");
+    attr(section, "data-quota", "panel");
+    section.appendChild(el("h3", null, "运行期间账号额度的观测变化"));
+    if (!quota) {
+      section.appendChild(notice("额度样本未读取（台账不可读）"));
+      return section;
+    }
+    if (quota.error) {
+      section.appendChild(notice("额度样本读取失败：" + quota.error, "warn"));
+      return section;
+    }
+    (quota.notes || []).forEach(function (text) { section.appendChild(notice(text, "hint")); });
+    if (quota.damaged_count) { section.appendChild(notice(quota.damaged_count + " 个样本损坏或超大，已跳过", "warn")); }
+    if (quota.omitted) { section.appendChild(notice("较早的 " + quota.omitted + " 个样本未读取", "hint")); }
+    var providers = quota.providers || {};
+    if (["codex", "claude"].every(function (name) { return !providers[name] || providers[name].state === "no_samples"; })) {
+      section.appendChild(notice("没有额度样本：本 run 没有经过真实 CLI 的调用，或样本尚未写入"));
+      return section;
+    }
+    var cards = el("div", "grid-cards");
+    // Codex first: its credits balance change is the one money-like figure the account reports.
+    ["codex", "claude"].forEach(function (name) { cards.appendChild(quotaProvider(name, providers[name])); });
+    section.appendChild(cards);
+    return section;
+  }
+
+  function budgetPanel(data, summary) {
     var panel = el("div");
     var b = data.budgets || {};
     var limits = b.limits || {};
@@ -1275,35 +1398,35 @@ APP_JS = r""""use strict";
       ["单次调用超时（秒）", limits.agent_timeout_seconds]
     ]));
 
-    var cost = data.cost;
-    panel.appendChild(el("h3", null, "费用（按供应商分列）"));
-    panel.appendChild(notice("以台账 dispatch ID 为唯一累计单位；不提供跨供应商合计；token 不跨 dispatch 或供应商相加；没有合法费用字段时显示“不可用”。", "hint"));
+    panel.appendChild(quotaSection(data.quota));
+
+    var calls = data.invocations;
+    panel.appendChild(el("h3", null, "调用分类（按供应商）"));
+    panel.appendChild(notice("以台账 dispatch ID 为唯一计数单位；token 与 CLI 报告的名义费用只在调用记录里逐条显示，不汇总。", "hint"));
     var providers = el("div", "grid-cards");
     ["claude", "codex", "unknown"].forEach(function (name) {
-      var item = cost.by_provider[name];
+      var item = calls.by_provider[name];
       var box = el("div", "mini");
       attr(box, "data-provider", name);
       box.appendChild(el("h3", null, name === "unknown" ? "未知供应商" : name));
-      box.appendChild(el("div", "metric-value", fmtCost(item.reported_cost_usd)));
-      box.appendChild(el("p", "metric-note", item.label));
       box.appendChild(el("p", "metric-note", "已调用 " + item.invoked + " · 有用量 " + item.usage_recorded +
-        " · 无用量 " + item.invoked_no_usage + " · 计费 dispatch " + item.reported_cost_dispatches));
+        " · 无用量 " + item.invoked_no_usage));
       providers.appendChild(box);
     });
     panel.appendChild(providers);
-    panel.appendChild(kv([["已知未调用", cost.known_not_invoked], ["调用阶段未知", cost.unknown_invocation],
-      ["启动未确认（starting）", cost.startup_unconfirmed], ["计入 dispatch 数", cost.counted_dispatches],
-      ["重复 dispatch ID", cost.duplicate_dispatch_ids.length ? cost.duplicate_dispatch_ids.join("、") : "无"],
-      ["验证进程", cost.by_group.verification.dispatches + " 次，不计入模型费用"]]));
-    var groups = disclosure("cost:groups", "按组明细（协调与各任务）", "block");
-    var rows = [groupRow("协调（指挥）", cost.by_group.coordination)];
-    Object.keys(cost.by_group.tasks).sort().forEach(function (task) {
-      rows.push(groupRow("任务 " + (task || "（无 task_id）"), cost.by_group.tasks[task]));
+    panel.appendChild(kv([["已知未调用", calls.known_not_invoked], ["调用阶段未知", calls.unknown_invocation],
+      ["启动未确认（starting）", calls.startup_unconfirmed], ["计入 dispatch 数", calls.counted_dispatches],
+      ["重复 dispatch ID", calls.duplicate_dispatch_ids.length ? calls.duplicate_dispatch_ids.join("、") : "无"],
+      ["验证进程", calls.by_group.verification.dispatches + " 次，不是模型调用"]]));
+    var groups = disclosure("budget:groups", "按组明细（协调与各任务）", "block");
+    var rows = [groupRow("协调（指挥）", calls.by_group.coordination)];
+    Object.keys(calls.by_group.tasks).sort().forEach(function (task) {
+      rows.push(groupRow("任务 " + (task || "（无 task_id）"), calls.by_group.tasks[task]));
     });
-    groups.appendChild(table(["组", "dispatch", "已调用", "有用量", "无用量", "已知未调用", "未知", "Claude 费用", "Codex 费用", "未知供应商费用"], rows, "cost-groups"));
+    groups.appendChild(table(["组", "dispatch", "已调用", "有用量", "无用量", "已知未调用", "未知"], rows, "budget-groups"));
     panel.appendChild(groups);
     if (summary.budget_explanation) {
-      var explanation = disclosure("cost:dimensions", "调用与候选事实（独立计数维度）", "block");
+      var explanation = disclosure("budget:dimensions", "调用与候选事实（独立计数维度）", "block");
       var dimensions = summary.budget_explanation.dimensions || {};
       explanation.appendChild(notice("计数来自台账关联；完成调用不代表接受，来源缺失保留未知。无效输出与失败分开计数。", "hint"));
       explanation.appendChild(kv(Object.keys(dimensions).map(function (key) {

@@ -151,7 +151,7 @@ python3 -m harness --repo /path/to/project cleanup-run RUN --remove-ignored
 python3 -m harness --repo /path/to/project cleanup-run RUN --remove --remove-ignored
 ```
 
-`status RUN` 显示任务、预算、待答决定、续作、审阅轮次、停止投影 `stop`（类型、标题、出口命令与诊断摘录）和账号额度的最近观测 `quota`（只读已保存的额度样本，账号级、包含本 run 以外的使用，见[额度样本](docs/operations.md#额度样本)），`--full` 查看完整台账。失败的命令在 stderr 第二行输出 `[harness-json] {"event":"stop",…}`，与 `status RUN` 的 `stop` 同一投影。`resume` 使用保存的现场和全新 agent，不恢复供应商会话，也不清零累计预算。可增加上下文、超时、轮数、尝试与派发上限，或追加精确 worker argv；其余配置及共享资产必须一致。
+`status RUN` 显示任务、预算、待答决定、续作、审阅轮次、停止投影 `stop`（类型、标题、出口命令与诊断摘录）和运行期间账号额度的观测变化 `quota`（只读已保存的额度样本：每个额度桶的最近观测与按重置周期分段的变化，Codex 的 credits 余额净变化；账号级、包含本 run 以外的使用，不相加，见[额度](docs/operations.md#额度)），`--full` 查看完整台账。失败的命令在 stderr 第二行输出 `[harness-json] {"event":"stop",…}`，与 `status RUN` 的 `stop` 同一投影。`resume` 使用保存的现场和全新 agent，不恢复供应商会话，也不清零累计预算。可增加上下文、超时、轮数、尝试与派发上限，或追加精确 worker argv；其余配置及共享资产必须一致。
 
 只有两个预算旋钮，各自计数不同的东西：
 
@@ -166,7 +166,7 @@ python3 -m harness --repo /path/to/project cleanup-run RUN --remove --remove-ign
 
 状态和网页提供只读返工提示：未接受任务达到三次工作尝试，或连续两次审阅出现同一阻断标签时提示；整体拒绝两次也会提示。任务接受或 run 结束后不再把历史问题显示为当前提示。`review_rounds` 按任务列出每一轮审阅首次出现的 blocking 标签（审阅者写的 id，可以重复，同名不一定是同一个问题）、来源审阅 dispatch 和候选摘要，不推断成因。这些信息用于判断范围和方案复杂度，不增加预算、不启动恢复、不改变验收。
 
-`dashboard` 在 127.0.0.1 启动只读观察网页，stdout 只打印访问地址，Ctrl-C 停止；与 `status` 一样不加载配置。它不启动、恢复或修改 run，不取锁、不写文件、不探测进程：台账记为 running 不等于进程仍在工作，Claude 的结构化输出可能在调用结束才出现。费用按供应商分列，Claude 为 CLI 报告的估算费用而非账户账单，Codex 不报告美元。页面区块、调用阶段分类与文件访问边界见[观察网页用法与限制](docs/operations.md#观察网页用法与限制)。
+`dashboard` 在 127.0.0.1 启动只读观察网页，stdout 只打印访问地址，Ctrl-C 停止；与 `status` 一样不加载配置。它不启动、恢复或修改 run，不取锁、不写文件、不探测进程：台账记为 running 不等于进程仍在工作，Claude 的结构化输出可能在调用结束才出现。“预算与额度”标签给出运行期间账号额度的观测变化（与 `status RUN` 的 `quota` 同一投影，刷新不启动任何 CLI）；美元不汇总，Claude 的 `reported_cost_usd` 是 CLI 的名义估算，只在调用记录里逐条显示。页面区块、调用阶段分类与文件访问边界见[观察网页用法与限制](docs/operations.md#观察网页用法与限制)。
 
 运行详情默认通过事件订阅更新，列表和文件页使用手动刷新。连接心跳仅表示观察服务可用；订阅断开后显示断开提示，由刷新按钮重新连接，不退回定时轮询。
 
@@ -301,7 +301,7 @@ claude_max_turns_by_role = { worker = 200 }
 
 首次私有写入前，运行时保留 Git 公共目录 `info/exclude` 原字节并补充 `/.harness/`，同时建立私有根 `.harness/.gitignore` 的 `*` 保护；不改项目已跟踪 `.gitignore`。已有冲突控制文件、符号链接或被跟踪的私有状态会拒绝，不覆盖现场。`.harness/` 属于被忽略的私有运行目录，不要提交运行现场、凭据或生成 MCP 配置；日志可能包含代码与业务内容。离线开发验证产物集中到 `.harness/validation/<批次>/`，登记结果并被后续验证覆盖后可清理，当前 `.harness/refactor/` 不迁移；详见[验证记录](docs/validation.md)。
 
-`status RUN --full` 的 `provider_usage` 及 `dispatch_finished` 事件记录供应商实际返回的用量，缺失用量不当作零，报告成本不等于实际账单。长进程每 60 秒提示仍在运行，实际超时独立生效。错误、中断、Git 提交与检查点之间的窗口见[不能自动恢复的窗口](docs/recovery.md#不能自动恢复的窗口)。派发事件 `dispatch_prepared`、`dispatch_started`、`dispatch_finished` 的含义见[观察网页用法与限制](docs/operations.md#观察网页用法与限制)；调用计数以台账 `invoked` 为准。
+`status RUN --full` 的 `provider_usage` 及 `dispatch_finished` 事件记录供应商实际返回的用量，缺失用量不当作零；其中的 `reported_cost_usd` 是 CLI 的名义估算，不是账单或订阅额度，只逐条显示、不汇总。长进程每 60 秒提示仍在运行，实际超时独立生效。错误、中断、Git 提交与检查点之间的窗口见[不能自动恢复的窗口](docs/recovery.md#不能自动恢复的窗口)。派发事件 `dispatch_prepared`、`dispatch_started`、`dispatch_finished` 的含义见[观察网页用法与限制](docs/operations.md#观察网页用法与限制)；调用计数以台账 `invoked` 为准。
 
 ## 参考与边界
 

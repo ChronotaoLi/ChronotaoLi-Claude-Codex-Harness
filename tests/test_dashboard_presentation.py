@@ -12,7 +12,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from harness import observe
+from harness import observe, quota
 from harness.dashboard_page import APP_JS
 from harness.versions import RUN_SCHEMA_VERSION
 from test_dashboard_page_events import BROWSER_JS
@@ -108,7 +108,13 @@ def stop_value(detail_text, kind="unclassified", reason="untyped_harness_error",
             "data": {}, "source": {}, "detail": detail_text}
 
 
-def detail(run_id, goal, *, status="running", summary=None, dispatches=(), events=(), stop=None):
+def quota_block(samples=(), *, truncated=False, damaged=0, omitted=0):
+    """The run detail's quota block, as observe.Observer.quota_block() builds it from saved samples."""
+    view = quota.quota_view(list(samples), truncated)
+    return {"notes": view["notes"], "damaged_count": damaged, "omitted": omitted, "providers": view["providers"]}
+
+
+def detail(run_id, goal, *, status="running", summary=None, dispatches=(), events=(), stop=None, quota_view=None):
     rows = list(dispatches)
     records = list(events)
     last = records[-1]["time"] if records else None
@@ -131,7 +137,9 @@ def detail(run_id, goal, *, status="running", summary=None, dispatches=(), event
                         "limits": {"max_attempts": 4, "max_agent_dispatches": 40, "agent_timeout_seconds": 600}},
             "tasks": [{"id": "t1", "title": "Prepare schema", "depends_on": [], "accepted": True},
                       {"id": "t2", "title": "Build service", "depends_on": ["t1"], "accepted": False}],
-            "invalid_tasks": 0, "dispatches": rows, "invalid_dispatches": 0, "cost": observe.cost_summary(rows),
+            "invalid_tasks": 0, "dispatches": rows, "invalid_dispatches": 0,
+            "invocations": observe.invocation_summary(rows),
+            "quota": quota_view if quota_view is not None else quota_block(),
             "timing": {"first_event_time": 900.0, "last_event_time": last, "basis": "events"},
             "events": {"exists": True, "tail_bytes": 65536, "size": 4096, "truncated": False,
                        "changed_while_reading": False, "records": records, "unparsed_tail": False,
@@ -232,9 +240,9 @@ class DashboardPresentationTests(unittest.TestCase):
   fire(tabs.at(-1), "keydown", key("ArrowRight"));
   assert.equal(document.activeElement, tabs[0], "arrow navigation wraps");
   fire(tabs[0], "keydown", key("Home"));
-  const cost = one(attrIs("data-tab", "cost"));
+  const cost = one(attrIs("data-tab", "budget"));
   fire(cost, "click");
-  const costPanel = one(attrIs("data-panel", "cost"));
+  const costPanel = one(attrIs("data-panel", "budget"));
   assert.equal(costPanel.hidden, false);
   assert.equal(cost.getAttribute("aria-controls"), costPanel.id);
   // Open disclosures, type a file filter, scroll, and keep focus on a tab.
@@ -254,9 +262,9 @@ class DashboardPresentationTests(unittest.TestCase):
   await respond("/api/runs/run_one", D.second);
   assert.equal(attached(cost), false, "content was re-rendered");
   assert.ok(visibleText(byId.main).includes("任务已接受"), "new activity is visible");
-  const cost2 = one(attrIs("data-tab", "cost"));
+  const cost2 = one(attrIs("data-tab", "budget"));
   assert.equal(cost2.getAttribute("aria-selected"), "true", "selected tab retained");
-  assert.equal(one(attrIs("data-panel", "cost")).hidden, false);
+  assert.equal(one(attrIs("data-panel", "budget")).hidden, false);
   assert.equal(document.activeElement, cost2, "keyboard focus retained");
   assert.equal(one(attrIs("data-ui-key", "dispatch:" + D.first.dispatches[0].id)).open, true, "open disclosure retained");
   assert.equal(one(attrIs("data-ui-key", "goal")).open, true);
@@ -545,10 +553,15 @@ class DashboardPresentationTests(unittest.TestCase):
   }
 ''')
 
-    def test_ledger_and_cost_semantics_are_not_overstated(self):
+    def test_ledger_and_quota_semantics_are_not_overstated(self):
+        from test_quota_view import T, WEEK, claude, codex
         rows = [dispatch(WORKER, cost=0.25, provider="claude"),
                 dispatch(REVIEWER, role="reviewer", provider="codex")]
-        data = {"detail": detail("run_cost", "Cost goal", dispatches=rows,
+        samples = [codex(T, [("primary", WEEK, 70, T + 90000)], (False, "41.25")),
+                   claude(T + 1, [("weekly_all", 42, T + 90000), ("weekly_scoped", 100, T + 90000, "Model Y")]),
+                   codex(T + 60, [("primary", WEEK, 73, T + 90000)], (False, "38.75")),
+                   claude(T + 61, [("weekly_all", 47, T + 90000), ("weekly_scoped", 100, T + 90000, "Model Y")])]
+        data = {"detail": detail("run_cost", "Cost goal", dispatches=rows, quota_view=quota_block(samples),
                                  events=[event(1995.0, "dispatch_finished", dispatch_id=REVIEWER)])}
         self.run_browser(data, r'''
   navigate("#/runs/run_cost");
@@ -558,25 +571,83 @@ class DashboardPresentationTests(unittest.TestCase):
   assert.equal(one(attrIs("data-task", "t1")).getAttribute("data-state"), "accepted");
   const progress = one(attrIs("data-progress", "tasks"));
   assert.deepEqual([progress.value, progress.max], [1, 2]);
-  // Unknown cost stays unavailable; providers are never summed.
-  const codex = one(attrIs("data-provider", "codex"));
-  assert.ok(codex.textContent.includes("不可用"));
-  assert.ok(!codex.textContent.includes("$"));
-  assert.ok(one(attrIs("data-provider", "unknown")).textContent.includes("不可用"));
-  assert.ok(one(attrIs("data-provider", "claude")).textContent.includes("$0.2500"));
-  const amounts = byId.main.textContent.match(/\$\d+\.\d{4}/g) || [];
-  assert.deepEqual(amounts, ["$0.2500", "$0.2500"], "provider card and task group only, no total");
-  // Cost detail lives in a tab, not in the default view.
-  assert.ok(!visibleText(byId.main).includes("$0.2500"));
+  // The quota lives in its tab, not in the default view; no money anywhere.
+  assert.ok(!visibleText(byId.main).includes("运行期间账号额度的观测变化"));
+  fire(one(attrIs("data-tab", "budget")), "click");
+  const panel = visibleText(one(attrIs("data-panel", "budget")));
+  assert.ok(!byId.main.textContent.includes("$"), "no currency anywhere");
+  // Codex first, its credits balance change first in its card, as the decimal strings given.
+  const cards = all(function (n) { return typeof n.getAttribute === "function" && n.getAttribute("data-quota-provider"); });
+  assert.deepEqual(cards.map(function (n) { return n.getAttribute("data-quota-provider"); }), ["codex", "claude"]);
+  const credits = one(attrIs("data-credits", "codex"));
+  assert.equal(cards[0].childNodes[1], credits, "credits lead the Codex card");
+  assert.ok(credits.textContent.includes("38.75") && credits.textContent.includes("41.25 → 38.75"));
+  one(attrIs("data-net-change", "-2.50"));
+  assert.ok(credits.textContent.includes("-2.50"));
+  // Latest observation, never "current"; percentage points per bucket, never summed.
+  assert.ok(panel.includes("最近观测"));
+  assert.ok(!panel.includes("当前"));
+  assert.ok(panel.includes("42% → 47%（增加 5 个百分点）"));
+  assert.ok(panel.includes("weekly_scoped（Model Y）"), "an unrelated model's full window is its own row");
+  for (const word of ["合计", "总计", "total"]) { assert.ok(!panel.includes(word), word); }
+  for (const note of D.detail.quota.notes) { assert.ok(panel.includes(note), note); }
+  // Invocation classes stay; the CLI's nominal cost is not summed.
+  assert.ok(one(attrIs("data-provider", "claude")).textContent.includes("已调用 1"));
 ''')
+
+    def test_quota_empty_states_and_unknown_changes(self):
+        from test_quota_view import T, claude, codex
+        unknown = quota_block([codex(T, credits=(False, "5.00")), codex(T + 10, credits=(False, "4.00"))])
+        unknown["providers"]["codex"]["credits"]["codex"]["runs"][0]["net_change"] = None   # a trapped difference
+        cases = {
+            "none": quota_block(),
+            "codex_only": quota_block([codex(T, [("primary", 300, 10, T + 600)])]),
+            "all_unavailable": quota_block([codex(T, available=False, reason="timeout"),
+                                            codex(T + 1, available=False, reason="timeout"),
+                                            codex(T + 2, available=False, reason="exited"),
+                                            claude(T + 3, [("session", 5, T + 600)])], damaged=2, omitted=3,
+                                           truncated=True),
+            "unknown": unknown,
+        }
+        data = {name: detail("run_" + name.replace("_", ""), "Quota", quota_view=value) for name, value in cases.items()}
+        self.run_browser(data, r'''
+  async function panelOf(name) {
+    const id = "run_" + name.replace(/_/g, "");
+    navigate("#/runs/" + id);
+    await respond("/api/runs/" + id, D[name]);
+    fire(one(attrIs("data-tab", "budget")), "click");
+    return one(attrIs("data-quota", "panel"));
+  }
+  let section = await panelOf("none");
+  assert.ok(visibleText(section).includes("没有额度样本"));
+  section = await panelOf("codex_only");
+  assert.ok(visibleText(one(attrIs("data-quota-provider", "claude"))).includes("没有样本"));
+  assert.ok(visibleText(one(attrIs("data-quota-provider", "codex"))).includes("10%（只有一个观测）"));
+  section = await panelOf("all_unavailable");
+  const text = visibleText(section);
+  assert.ok(text.includes("全部 3 个样本不可用：timeout×2、exited×1"));
+  assert.ok(text.includes("2 个样本损坏或超大，已跳过") && text.includes("较早的 3 个样本未读取"));
+  assert.ok(text.includes("较早样本未读取"), "the first segment's start is incomplete");
+  section = await panelOf("unknown");
+  const change = one(attrIs("data-net-change", "unknown"));
+  assert.ok(change.textContent.includes("变化未知"));
+  assert.ok(!/净变化 0/.test(change.textContent), "unknown is never shown as zero");
+''')
+
+    def test_balances_stay_text_in_the_page_script(self):
+        # The quota part of the page never turns a balance or a change into a number.
+        start = APP_JS.index("var QUOTA_START")
+        script = APP_JS[start:APP_JS.index("function budgetPanel")]
+        for conversion in ("Number(", "parseFloat(", "parseInt(", "+run.", "+latest.", "toFixed("):
+            self.assertNotIn(conversion, script)
 
     def test_budget_panel_shows_attempt_sum_without_run_wide_limit(self):
         data = {"current": detail("run_new", "Current")}
         self.run_browser(data, r'''
   navigate("#/runs/run_new");
   await respond("/api/runs/run_new", D.current);
-  fire(one(attrIs("data-tab", "cost")), "click");
-  const panel = visibleText(one(attrIs("data-panel", "cost")));
+  fire(one(attrIs("data-tab", "budget")), "click");
+  const panel = visibleText(one(attrIs("data-panel", "budget")));
   assert.ok(panel.includes("worker 尝试总数"), "the summed attempts are shown");
   assert.ok(panel.includes("各任务 attempts 之和"));
   assert.ok(panel.includes("5 / 40"), "model dispatches against their limit");
@@ -628,7 +699,7 @@ class DashboardPresentationTests(unittest.TestCase):
   for (const label of ["准备派发", "派发结束（未调用）", "开始调用", "调用结束"]) {
     assert.ok(shown.includes(label), "event label shown: " + label);
   }
-  fire(one(attrIs("data-tab", "cost")), "click");
+  fire(one(attrIs("data-tab", "budget")), "click");
   const bound = one(attrIs("data-remaining-calls", "2"));
   assert.ok(visibleText(bound).includes("BOUND-TEXT"));
   fire(one(attrIs("data-tab", "meta")), "click");

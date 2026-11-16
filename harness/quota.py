@@ -18,6 +18,7 @@ Both interfaces are experimental (``claude -p /usage`` and ``codex app-server``'
 from __future__ import annotations
 
 import contextlib
+import decimal
 import json
 import math
 import os
@@ -995,55 +996,196 @@ def validate_sample(value):
     return value
 
 
-# ---------- the latest view (pure; the observation layer reads saved samples only) ----------
+# ---------- the observed change during a run (pure; the observation layer reads saved samples only) ----------
 
-def quota_view(samples):
-    """Per provider and bucket, the latest observation of samples already in their total order.
+RESET_TOLERANCE_CAP_SECONDS = 120     # design values, to be checked against real CLIs
+RESET_TOLERANCE_UNKNOWN_SECONDS = 60
+# Its own context: never the process default (28 digits). Balances have at most 30+30 digits, so a
+# difference has at most 61 and is always exact; a trap gives "unknown", never an approximation.
+DECIMAL_CONTEXT = decimal.Context(prec=64, rounding=decimal.ROUND_HALF_EVEN,
+                                  traps=[decimal.InvalidOperation, decimal.Inexact, decimal.Rounded,
+                                         decimal.Overflow, decimal.DivisionByZero])
+VIEW_NOTES = ("单位是百分点；重叠的额度桶不相加，两家不合成总数",)
+TRUNCATED_NOTE = "较早的样本未读取，第一段的开头不完整"
 
-    No sums: buckets and providers stay apart.
+
+def reset_tolerance(window):
+    """How far a reported reset may move and still be the same cycle: 1/60 of the window, at most 120 s."""
+    minutes = window.get("window_minutes")
+    if type(minutes) is int and minutes > 0:
+        return min(RESET_TOLERANCE_CAP_SECONDS, minutes)   # minutes * 60 s / 60
+    return RESET_TOLERANCE_UNKNOWN_SECONDS
+
+
+def effective_reset(observation):
+    """A reported reset counts only while it is later than its own observation; else unknown."""
+    _, sample, window = observation
+    reset = window["resets_at"]
+    return reset if reset is not None and reset > sample["observed_at"] else None
+
+
+def decimal_difference(last, first):
+    """``last - first`` of two balance strings, exact, as a fixed-point string; None if not exact."""
+    try:
+        value = DECIMAL_CONTEXT.subtract(decimal.Decimal(last), decimal.Decimal(first))
+    except (decimal.DecimalException, TypeError, ValueError):
+        return None
+    if not value.is_finite():
+        return None
+    return format(value.copy_abs() if value.is_zero() else value, "f")
+
+
+def _points(last, first):
+    """Percentage points between two reported values; floats subtract as their decimal text."""
+    if type(last) is int and type(first) is int:
+        return last - first
+    value = decimal.Decimal(repr(last)) - decimal.Decimal(repr(first))
+    return int(value) if value == value.to_integral_value() else float(value)
+
+
+def quota_view(samples, truncated=False):
+    """The ``quota`` block of ``status RUN`` and the run detail, from samples in their total order.
+
+    Per provider and bucket: the latest observation and the observed change split into reset
+    cycles; Codex credits as exact balance changes. Nothing is summed across buckets, segments
+    or providers. ``truncated``: older samples were not read.
     """
-    view = {"notes": list(NOTES), "providers": {}}
+    view = {"notes": list(NOTES) + list(VIEW_NOTES) + ([TRUNCATED_NOTE] if truncated else []), "providers": {}}
     for provider in PROVIDERS:
         rows = [sample for sample in samples if sample["provider"] == provider]
         if not rows:
             view["providers"][provider] = {"state": "no_samples"}
             continue
-        usable = [sample for sample in rows if sample["available"]]
+        usable = [(position, sample) for position, sample in enumerate(rows) if sample["available"]]
         unavailable = {}
         for sample in rows:
             if not sample["available"]:
                 unavailable[sample["reason"]] = unavailable.get(sample["reason"], 0) + 1
-        last, latest = rows[-1], (usable[-1] if usable else None)
+        last, latest = rows[-1], (usable[-1][1] if usable else None)
         entry = {"state": "available" if usable else "all_unavailable", "samples": len(rows),
                  "unavailable": unavailable,
                  "latest_sample": {"observed_at": _utc(last["observed_at"], "seconds"), "trigger": last["trigger"],
                                    "available": last["available"], "reason": last["reason"]},
-                 "buckets": _latest_buckets(provider, usable)}
+                 "clock_rollback": any(later["observed_at"] < earlier["observed_at"]
+                                       for earlier, later in zip(rows, rows[1:])),
+                 "buckets": _buckets(provider, usable, len(rows) - 1, truncated)}
         if provider == "claude":
             entry["extra_usage"] = latest["extra_usage"] if latest else None
         else:
-            entry["credits"] = _latest_credits(usable)
+            entry["credits"] = _credits(usable)
             entry["ordinary_usage_allowed"] = latest["ordinary_usage_allowed"] if latest else None
+            entry["limits"] = ({limit["limit_id"]: {key: limit[key] for key in
+                                                     ("limit_name", "rate_limit_reached_type", "spend_control_reached")}
+                                for limit in latest["limits"]} if latest else {})
         view["providers"][provider] = entry
     return view
 
 
-def _latest_buckets(provider, usable):
+def _buckets(provider, usable, last_position, truncated):
     found = {}
-    for sample in usable:
+    for position, sample in usable:
         for window in sample["windows"]:
-            found[bucket_key(provider, window)] = (sample, window)   # keeps first-appearance order
-    return [{"bucket": bucket_label(provider, window), "identity": list(key),
-             "latest": {"used_percent": window["used_percent"], "observed_at": _utc(sample["observed_at"], "seconds"),
-                        "resets_at": _utc(window["resets_at"], "seconds") if window["resets_at"] is not None else None}}
-            for key, (sample, window) in found.items()]
+            found.setdefault(bucket_key(provider, window), []).append((position, sample, window))
+    result = []
+    for key, observations in found.items():
+        _, sample, window = observations[-1]
+        result.append({"bucket": bucket_label(provider, window), "identity": list(key),
+                       "latest": {"used_percent": window["used_percent"],
+                                  "observed_at": _utc(sample["observed_at"], "seconds"),
+                                  "resets_at": _iso(window["resets_at"])},
+                       "segments": _segments(observations, last_position, truncated)})
+    return result
 
 
-def _latest_credits(usable):
-    credits = {}
-    for sample in usable:
+def _iso(epoch):
+    return _utc(epoch, "seconds") if epoch is not None else None
+
+
+def _split(segment, observation):
+    """None when ``observation`` continues ``segment``'s cycle, else why a new cycle starts."""
+    anchor, previous, current = effective_reset(segment[0]), effective_reset(segment[-1]), effective_reset(observation)
+    if anchor is None or current is None:
+        return None if anchor is None and current is None else "reset_unknown"
+    if observation[1]["observed_at"] >= min(anchor, previous):
+        return "reset_reached"
+    if abs(current - anchor) > reset_tolerance(observation[2]):
+        return "reset_changed"
+    return None
+
+
+def _segments(observations, last_position, truncated):
+    """One bucket's observations ``(position, sample, window)`` split into reset cycles (spec-7 3.8)."""
+    groups, reasons = [], []
+    for observation in observations:
+        reason = _split(groups[-1], observation) if groups else "first"
+        if reason is None:
+            groups[-1].append(observation)
+        else:
+            groups.append([observation])
+            reasons.append(reason)
+    result = []
+    for index, group in enumerate(groups):
+        anchored = effective_reset(group[0]) is not None
+        values = [window["used_percent"] for _, _, window in group]
+        if index > 0:
+            start = "after_reset"
+        elif group[0][0] != 0:
+            start = "first_available_observation"
+        elif truncated:
+            start = "older_samples_not_read"
+        else:
+            start = None
+        end = ("before_reset" if index < len(groups) - 1 else
+               "later_samples_missing_bucket_or_unavailable" if group[-1][0] != last_position else None)
+        flags = []
+        if anchored and any(later < earlier for earlier, later in zip(values, values[1:])):
+            flags.append("decrease")
+        if reasons[index] == "reset_changed":
+            flags.append("reset_changed_within_cycle")
+        if any(item[2]["resets_at"] is not None and effective_reset(item) is None for item in group):
+            flags.append("reset_already_passed")
+        elif not anchored:
+            flags.append("resets_at_unknown")
+        result.append({
+            "first": {"used_percent": values[0], "observed_at": _utc(group[0][1]["observed_at"], "seconds")},
+            "last": {"used_percent": values[-1], "observed_at": _utc(group[-1][1]["observed_at"], "seconds")},
+            "observations": len(group),
+            "resets_at": _iso(effective_reset(group[-1])),
+            # Unknown is never zero: a single observation or an unknown cycle has no change.
+            "change_points": _points(values[-1], values[0]) if anchored and len(group) > 1 else None,
+            "complete": start is None and end is None,
+            "incomplete_start": start, "incomplete_end": end, "flags": flags})
+    return result
+
+
+def _credits(usable):
+    """Per limit: the latest credits and runs of known balances with their exact net change.
+
+    A run is consecutive observations with ``unlimited`` false and a balance; ``unlimited``
+    true or unknown, or no balance, ends it. A sample that does not report the limit's
+    credits neither ends nor joins a run.
+    """
+    found = {}
+    for _, sample in usable:
         for limit in sample["limits"]:
-            if limit["credits"] is not None:   # a limit without credits says nothing about the balance
-                credits[limit["limit_id"]] = {"latest": {**limit["credits"],
-                                                         "observed_at": _utc(sample["observed_at"], "seconds")}}
-    return credits
+            if limit["credits"] is not None:
+                found.setdefault(limit["limit_id"], []).append((sample, limit["credits"]))
+    result = {}
+    for limit_id, observations in found.items():
+        runs, current = [], None
+        for sample, credits in observations:
+            if credits["unlimited"] is not False or credits["balance"] is None:
+                current = None
+                continue
+            if current is None:
+                current = {"first": credits["balance"], "first_at": _utc(sample["observed_at"], "seconds"),
+                           "observations": 0}
+                runs.append(current)
+            current.update(last=credits["balance"], last_at=_utc(sample["observed_at"], "seconds"))
+            current["observations"] += 1
+        for run in runs:
+            run["net_change"] = decimal_difference(run["last"], run["first"]) if run["observations"] > 1 else None
+        sample, credits = observations[-1]
+        result[limit_id] = {"latest": {**credits, "observed_at": _utc(sample["observed_at"], "seconds")},
+                            "runs": runs}
+    return result
