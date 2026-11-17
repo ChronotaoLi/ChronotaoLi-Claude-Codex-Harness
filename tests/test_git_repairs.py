@@ -243,11 +243,9 @@ class GitBoundaryRepairsTests(unittest.TestCase):
         self.assertIn(b"non-UTF8 \xff", raw)
         self.assertIn(b"new text \xfe", raw)
         self.assertIn(b"GIT binary patch", raw)
-        self.assertIn("\ufffd", git.diff(self.repo))
         git.accept(self.repo, git.changed(self.repo), "run_bytes", "bytes", ACCEPT_MESSAGE)
         whole = git.range_diff_bytes(self.repo, base)
         self.assertIn(b"non-UTF8 \xff", whole)
-        self.assertIn("\ufffd", git.range_diff(self.repo, base))
         evidence = self.root / "evidence.diff"
         evidence.write_bytes(whole)
         git.git(self.repo, "reset", "--hard", base)

@@ -62,7 +62,6 @@ _PARSE_ERRORS = (ValueError, RecursionError)  # json.loads on damaged or absurdl
 
 MODEL_ROLES = ("commander", "worker", "reviewer")
 PROVIDERS = ("claude", "codex", "unknown")
-INVOCATION_CLASSES = ("usage_recorded", "invoked_no_usage", "known_not_invoked", "unknown", "verification")
 
 _DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 _FILE_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC

@@ -68,7 +68,7 @@ def git_bytes(repo: Path, *args: str, binding=None) -> bytes:
 
 
 def git(repo: Path, *args: str, binding=None) -> str:
-    """Keep filesystem bytes reversible; use diff() for a display-safe preview."""
+    """Keep filesystem bytes reversible."""
     return os.fsdecode(git_bytes(repo, *args, binding=binding))
 
 
@@ -433,17 +433,9 @@ def diff_bytes(repo: Path, *, binding=None):
     return value
 
 
-def diff(repo: Path, *, binding=None):
-    return diff_bytes(repo, binding=binding).decode("utf-8", errors="replace")
-
-
 def range_diff_bytes(repo: Path, base: str, *, binding=None):
     """The whole committed result, independent of task boundaries."""
     return git_bytes(repo, "diff", "--binary", "--no-ext-diff", "--no-textconv", "--no-renames", base, "HEAD", "--", binding=binding)
-
-
-def range_diff(repo: Path, base: str, *, binding=None):
-    return range_diff_bytes(repo, base, binding=binding).decode("utf-8", errors="replace")
 
 
 def archive_and_reset(repo: Path, expected_head: str, archive: Path, owned_root: Path, *, binding=None):
