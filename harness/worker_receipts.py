@@ -118,11 +118,16 @@ class WorkerReceipts(RuntimeService):
                 if path.is_symlink() or not path.is_file():
                     raise HarnessError('unsafe worker source evidence')
                 sources[name] = hashlib.sha256(path.read_bytes()).hexdigest()
+        candidate_digest = snapshot_digest(self.context.snapshot())
+        # Read after the candidate, so a commit during the snapshot is caught here: a seal binding
+        # another HEAD could never be handed off, so such a return stays unsealed and is abandoned.
+        head = git.head(self.context.worktree, binding=self.context.run['worktree_binding'])
+        if head != self.context.run['expected_head']:
+            raise HarnessError('worker call left HEAD different from the checkpoint; result not sealed')
         record = {'dispatch_id': entry['id'], 'task_id': entry['task_id'],
                   'intent': deepcopy(entry['worker_receipt']), 'result': deepcopy(result),
                   'result_digest': snapshot_digest(result), 'sources': sources,
-                  'candidate_digest': snapshot_digest(self.context.snapshot()),
-                  'head': git.head(self.context.worktree, binding=self.context.run['worktree_binding']),
+                  'candidate_digest': candidate_digest, 'head': head,
                   'git_binding': deepcopy(self.context.run['worktree_binding']),
                   'process': {field: deepcopy(entry.get(field)) for field in
                               ('exit_confirmed', 'process_state', 'process_outcome', 'pgid')}}

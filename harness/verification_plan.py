@@ -11,7 +11,7 @@ import math
 from copy import deepcopy
 from pathlib import Path, PurePosixPath
 
-from . import stops
+from . import git, stops
 from .context import prompt_json
 from .recovery import snapshot_digest
 from .review_progress import dispositions_usable
@@ -153,7 +153,7 @@ def candidate_preflight(task, worker_result, *, worktree, candidate_snapshot, cu
         path = PurePosixPath(expected)
         failure = {"code": "evidence_invalid", "requirement_id": identity, "path": expected}
         if (path.is_absolute() or ".." in path.parts or not path.parts
-                or any(p in {".git", ".harness", ".codex", ".claude"} for p in path.parts)):
+                or any(git.protected_name(p) for p in path.parts)):
             failures.append({**failure, "reason": "unsafe_path"})
             continue
         root = Path(worktree)

@@ -8,7 +8,7 @@ from pathlib import PurePosixPath
 
 from . import git
 from .config import validate_commands
-from .util import HarnessError
+from .util import HarnessError, fold_name
 
 
 def obj(**fields):
@@ -422,8 +422,15 @@ def validate_plan(plan):
     validate_structure(plan, PLAN)
     tasks = plan["tasks"]
     ids = [t["id"] for t in tasks]
-    if not tasks or len(set(ids)) != len(ids):
-        raise HarnessError("计划必须至少有 1 个任务，且 ID 唯一")
+    # Task IDs name evidence directories (verification/tasks/<id>, preflight/<id>): IDs one
+    # filesystem may resolve to one entry are duplicates, judged by name on every platform.
+    spellings = {}
+    for ident in ids:
+        spellings.setdefault(fold_name(ident), []).append(ident)
+    clashes = [group for group in spellings.values() if len(group) > 1]
+    if not tasks or clashes:
+        raise HarnessError("计划必须至少有 1 个任务，且 ID 唯一（不区分大小写等折叠后比较）"
+                           + (f"：重复的 ID {clashes}" if clashes else ""))
     reserved = sorted(set(ids) & set(RESERVED_TASK_IDS))
     if reserved:
         raise HarnessError(f"任务 ID 不得使用保留名：{reserved}")
@@ -444,7 +451,7 @@ def validate_plan(plan):
                     or not 0 <= requirement["acceptance_index"] < len(task["acceptance"])
                     or not parts or PurePosixPath(path).is_absolute() or ".." in parts
                     or path != str(PurePosixPath(path)) or "\\" in path
-                    or any(p in (".git", ".harness", ".codex", ".claude") for p in parts)):
+                    or any(git.protected_name(p) for p in parts)):
                 raise HarnessError("任务证据要求必须有唯一 ID、有效验收索引和普通相对文件路径")
             requirement_ids.add(requirement["id"])
         if not re.fullmatch(TASK_ID["pattern"], task["id"]):

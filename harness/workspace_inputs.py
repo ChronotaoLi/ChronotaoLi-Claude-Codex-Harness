@@ -19,10 +19,10 @@ from .path_evidence import validate_dispatch_indexes
 from .input_projection import validate_dispatch_indexes as validate_input_dispatch_indexes
 from .worker_receipts import validate_worker_receipt_links
 from .run_store import RunStore
-from .util import (HarnessError, ensure_dispatches_exited, group_alive, lock,
+from .util import (HarnessError, ensure_dispatches_exited, fold_name, group_alive, lock,
                    validate_command_directories, write_json)
 
-_RESERVED = {'.git', '.harness', '.codex', '.claude', 'agents.md', 'claude.md'}
+_RESERVED = frozenset(map(fold_name, (*git.PROTECTED_ROOTS, 'agents.md', 'claude.md')))
 _PENDING = ('pending_task', 'pending_acceptance', 'pending_post_accept',
             'pending_revision', 'pending_directive', 'worker_recovery', 'worker_receipts')
 
@@ -32,7 +32,7 @@ def _fail(message, stop=None):
 def _relative(value):
     if (not isinstance(value, str) or not value or '\\' in value or '\x00' in value
             or any(p in ('', '.', '..') for p in value.split('/'))
-            or Path(value).is_absolute() or any(p.lower() in _RESERVED for p in value.split('/'))):
+            or Path(value).is_absolute() or any(fold_name(p) in _RESERVED for p in value.split('/'))):
         _fail('invalid or reserved relative path')
     return value
 

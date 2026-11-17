@@ -256,11 +256,11 @@ run 列表 → run 详情 → 文件查看。列表按最近事件排序，以�
 
 ### 检查点
 
-WORK 结果可以带可选的 `checkpoints`，每项为 `{id, summary, inputs, evidence, freshness, max_age_seconds}`，`inputs`、`evidence` 是 `{path, sha256}` 列表。运行时把 evidence 原文私有复制到 `checkpoints/<dispatch_id>/`，之后按声明的输入和有效期在角色输入中标为 `reusable` 或 `stale`。
+WORK 结果可以带可选的 `checkpoints`，每项为 `{id, summary, inputs, evidence, freshness, max_age_seconds}`，`inputs`、`evidence` 是 `{path, sha256}` 列表。运行时把 evidence 原文私有复制到 `checkpoints/<dispatch_id>/`，之后按声明的输入和有效期在角色输入中标为 `reusable` 或 `stale`；同一任务里，后一次 dispatch 的同名检查点（按折叠后的 ID 判断，`Build` 与 `build` 同名）取代前一次的成为当前项，前一次的转入 `checkpoint_history`（历史合计超过 4,000 字符时列表留空，只在 `checkpoint_history_omitted` 记条数）。
 
 | 限制 | 值 |
 | --- | --- |
-| 每个结果的检查点 | 最多 16 项，ID 在本结果内唯一 |
+| 每个结果的检查点 | 最多 16 项，ID 在本结果内唯一，折叠后（不区分大小写等）相同也算重复 |
 | 每项 `inputs`／`evidence` | 各最多 8 个，`evidence` 至少 1 个 |
 | 单个 evidence 文件 | 1 MiB |
 | 一次结果的 evidence 副本合计 | 16 MiB |
@@ -269,10 +269,10 @@ WORK 结果可以带可选的 `checkpoints`，每项为 `{id, summary, inputs, e
 
 - `freshness="content"` 必须绑定至少一个 input，且 `max_age_seconds=0`；任一输入的实际 SHA256 变化即为 stale。
 - `freshness="volatile"` 的有效期从来源 worker 调用开始计时（dispatch 的 `invoked_at`），worker 自己的执行时间也算在内，结果落盘或恢复都不重新计时；`max_age_seconds=0` 表示每次都要重新检查；缺少有效调用时间的记录一律 stale。
-- 路径不得含 `..` 或 `.git`、`.harness`、`.codex`、`.claude` 段，不能是符号链接。唯一例外：evidence 可以引用当前 worker dispatch `commands/` 下的普通文件（broker 返回的 stdout／stderr 路径）。新的 worker 尝试是新的 dispatch，不能重新登记原 dispatch 的 broker 输出；旧证据也不能靠重新登记刷新有效期，需要时重跑可安全重复的检查。
+- 路径不得含 `..` 或 `.git`、`.harness`、`.codex`、`.claude` 段（按折叠后的名称比较，`.CLAUDE` 这类别名写法同样算），不能是符号链接。唯一例外：evidence 可以引用当前 worker dispatch `commands/` 下的普通文件（broker 返回的 stdout／stderr 路径）。新的 worker 尝试是新的 dispatch，不能重新登记原 dispatch 的 broker 输出；旧证据也不能靠重新登记刷新有效期，需要时重跑可安全重复的检查。
 - `reusable` 只表示声明的输入未变且未过期，不证明依赖完整、结论正确或任务已接受；检查点不替代验证、审阅或接受门禁。
 
-声明被丢弃与证据损坏是两回事。检查点是可选产物，不参与 worker 结果的契约判定：单项的声明核对失败（字段缺失或超长、空 evidence、SHA256 格式非法、content 缺输入或有效期非零、路径不允许、实际摘要不符、超出大小）只丢弃该项，超过 16 项或重复 ID 丢弃整批；结果、blocker 和其余有效项照常登记，写 `checkpoints_discarded` 事件，blocked 反馈带前 2,000 字符原因。无效的 worker 结果（见[无效输出与自动重做](recovery.md#无效输出与自动重做)）不登记检查点；交接请求非法的 completed 结果例外，它在检查点登记之后才被判为无效，合格的检查点保留给下一次 worker。原始结果、台账行、manifest、`checkpoints/batches/` 下的批次文件或私有副本被删改，以及私有写入失败，都直接停止并保留现场，不按丢弃处理。
+声明被丢弃与证据损坏是两回事。检查点是可选产物，不参与 worker 结果的契约判定：单项的声明核对失败（字段缺失或超长、空 evidence、SHA256 格式非法、content 缺输入或有效期非零、路径不允许、实际摘要不符、超出大小）只丢弃该项，超过 16 项或重复 ID 丢弃整批；ID 是 `checkpoints/<dispatch_id>/` 下的文件名，所以按 `harness.util.fold_name` 比较，`Build` 与 `build` 这类折叠后相同的 ID 与完全相同的 ID 一样，在写出任何文件之前整批丢弃；结果、blocker 和其余有效项照常登记，写 `checkpoints_discarded` 事件，blocked 反馈带前 2,000 字符原因。无效的 worker 结果（见[无效输出与自动重做](recovery.md#无效输出与自动重做)）不登记检查点；交接请求非法的 completed 结果例外，它在检查点登记之后才被判为无效，合格的检查点保留给下一次 worker。原始结果、台账行、manifest、`checkpoints/batches/` 下的批次文件或私有副本被删改，以及私有写入失败，都直接停止并保留现场，不按丢弃处理。
 
 ### 决定请求与审阅问题
 
@@ -338,7 +338,7 @@ WORK 结果可以带可选的 `checkpoints`，每项为 `{id, summary, inputs, e
 
 只有 worker 有 `harness_commands` MCP，worker 应优先用它执行命令。Claude worker 另有 CLI 层的 Bash 许可：只读前缀（参数只能接在 `--` 之后）以及已配置命令中不含 `*`、换行的精确 argv；这些 Bash 调用不经 broker、不留命令记录，也不是 OS 隔离。`list_commands` 列出已授权的命令 ID 与 argv；`run_command({command_id})` 执行 `verification.commands` 和 `permissions.worker_commands` 中与 ID 对应的完整 argv，每次调用都是新的执行，不能附加参数或覆盖 cwd、env，不经 shell。字面 `*` 和换行原样传递；管道或重定向需要显式授权完整的 `["/bin/sh", "-c", "固定脚本"]`。每条命令的超时取 `runtime.verify_timeout_seconds`，且不超过父派发截止时间减 2 秒收尾余量。
 
-`delete_path({path})` 只在 worker 派发有当前任务范围时出现，删除一个文件：`path` 是字面的仓库相对路径，必须精确等于 HEAD 中已跟踪的普通文件（模式 `100644` 或 `100755`），并匹配任务的 `allowed_paths`。路径最多 4,096 字符；拒绝绝对路径、空段、`.`／`..` 段、NUL、首段为 `.git`、`.harness`、`.codex`、`.claude` 或任一段为 `.git` 的路径（不分大小写，并按 Unicode 规范化比较），以及未跟踪文件、目录、符号链接和子模块；不删除目录或空的父目录，也不移动文件。
+`delete_path({path})` 只在 worker 派发有当前任务范围时出现，删除一个文件：`path` 是字面的仓库相对路径，必须精确等于 HEAD 中已跟踪的普通文件（模式 `100644` 或 `100755`），并匹配任务的 `allowed_paths`。路径最多 4,096 字符；拒绝绝对路径、空段、`.`／`..` 段、NUL、首段为 `.git`、`.harness`、`.codex`、`.claude` 或任一段为 `.git` 的路径（按折叠后的名称比较：不分大小写，并按 Unicode 规范化；与规划和接受时的受保护根判定是同一条规则），以及未跟踪文件、目录、符号链接和子模块；不删除目录或空的父目录，也不移动文件。
 
 删除立即生效，审阅和接受门禁只决定候选能否被接受，不能撤销删除。保证见[设计的不变量 26](design.md#不变量)，不保证（并发改名）见[仍需明确的限制](design.md#隔离与进程)。
 

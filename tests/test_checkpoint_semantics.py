@@ -14,7 +14,8 @@ from test_runtime_changes import ScriptedBackend
 
 
 class CheckpointSemanticsTests(RepoCase):
-    variants = ('empty_inputs', 'content_ttl', 'duplicate_ids')
+    variants = ('empty_inputs', 'content_ttl', 'duplicate_ids', 'folded_ids')
+    whole_batch = ('duplicate_ids', 'folded_ids')
 
     def backend(self, variant, blocker=None, *, always=False):
         def change(backend, kwargs, packet, result):
@@ -34,6 +35,8 @@ class CheckpointSemanticsTests(RepoCase):
                 bad['max_age_seconds'] = 1
             elif variant == 'duplicate_ids':
                 bad['id'] = good['id']
+            elif variant == 'folded_ids':
+                bad['id'] = good['id'].upper()
             elif variant == 'over_limit':
                 result['checkpoints'] = [dict(good, id=f'item_{i}') for i in range(17)]
             else:
@@ -52,7 +55,7 @@ class CheckpointSemanticsTests(RepoCase):
     def assert_discard(self, engine, variant):
         run = engine.run
         self.assertEqual([r['checkpoint_id'] for r in run.get('task_checkpoints', [])],
-                         [] if variant == 'duplicate_ids' else ['valid'])
+                         [] if variant in self.whole_batch else ['valid'])
         worker = next(d for d in run['dispatches'] if d['role'] == 'worker')
         self.assertEqual(worker['status'], 'completed')
         original = read_json(engine.directory / 'dispatches' / worker['id'] / 'returned-result.json')
@@ -60,7 +63,7 @@ class CheckpointSemanticsTests(RepoCase):
         self.assertNotIn('worker_recovery', run)
         events = [json.loads(line) for line in (engine.directory / 'events.jsonl').read_text().splitlines()]
         self.assertTrue(any(e.get('event') == 'checkpoints_discarded' for e in events))
-        if variant != 'duplicate_ids':
+        if variant not in self.whole_batch:
             batch = run['checkpoint_batches'][0]
             resolution = read_json(Path(batch['artifact']))
             self.assertEqual([d['index'] for d in resolution['discarded']], [0])

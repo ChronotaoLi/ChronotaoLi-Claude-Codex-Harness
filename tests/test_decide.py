@@ -502,6 +502,68 @@ class ReservedNameTests(DecideCase):
                 self.assertNotIn(name, {t["id"] for t in result["tasks"]})
 
 
+class FoldedIdTests(DecideCase):
+    """IDs equal under harness.util.fold_name (one evidence directory on a case-insensitive filesystem)
+    take the path of an exact duplicate ID, judged by name on every platform."""
+
+    def test_model_plan_with_ids_equal_after_folding_is_invalid_and_redone(self):
+        outcomes = {}
+        for twin in ("a", "A"):
+            with self.subTest(twin=twin):
+                self.setUp()
+
+                unpublished = []
+
+                def decide(script, trigger, packet, twin=twin, unpublished=unpublished):
+                    if trigger["kind"] == "plan":
+                        if "previous_invalid" in packet:  # the redo starts right after the invalid plan was judged
+                            run = self.state(engine)
+                            unpublished.append((run["plan_history"], run["tasks"], "pending_revision" in run,
+                                                (engine.directory / "plans" / "revision-0.json").exists()))
+                        second = "b" if "previous_invalid" in packet else twin
+                        return revise(reason="plan", new_tasks=[task("a"), task(second, deps=["a"], paths=["b.txt"])])
+                    return None
+                engine = self.engine(Script(decide))
+                result = engine.start("folded", None)
+                self.assertEqual(result["status"], "completed")
+                self.assertEqual(unpublished, [([], [], False, False)])
+                entries = self.commander_entries(result)
+                self.assertIn(repr(["a", twin]), entries[0]["error"])
+                self.assertEqual(([t["id"] for t in result["tasks"]], len(result["plan_history"])), (["a", "b"], 1))
+                outcomes[twin] = ([d["status"] for d in entries], "invalid_output" in entries[0], result["status"])
+        self.assertEqual(outcomes["A"], (["invalid", "completed"], True, "completed"))
+        self.assertEqual(outcomes["A"], outcomes["a"])
+
+    def test_revision_adding_an_id_equal_after_folding_publishes_no_revision(self):
+        # A new task folds to the accepted a or to the unaccepted current b, or two new tasks fold to each other;
+        # the same IDs with exact spellings are the controls.
+        outcomes = {}
+        for names, clash in ((("A",), ["a", "A"]), (("B",), ["b", "B"]), (("c", "C"), ["c", "C"]),
+                             (("a",), ["a", "a"]), (("b",), ["b", "b"]), (("c", "c"), ["c", "c"])):
+            with self.subTest(names=names):
+                self.setUp()
+
+                def decide(script, trigger, packet, names=names):
+                    if trigger["kind"] == "task" and blocked_by_task(trigger["feedback"]):
+                        return revise(selected="b", instruction="continue b",
+                                      new_tasks=[task(name, paths=["b.txt"]) for name in names])
+                    return None
+                engine = self.engine(Script(decide, block_first("b")))
+                with self.assertRaisesRegex(HarnessError, "连续两次无效"):
+                    engine.start("folded", {"tasks": [task("a"), task("b", deps=["a"])]})
+                run = self.state(engine)
+                entries = self.commander_entries(run)
+                self.assertTrue(all(repr(clash) in d["error"] for d in entries))
+                self.assertEqual((list(run["accepted"]), [t["id"] for t in run["tasks"]], len(run["plan_history"])),
+                                 (["a"], ["a", "b"], 1))
+                self.assertNotIn("pending_revision", run)
+                self.assertFalse((engine.directory / "plans" / "revision-1.json").exists())
+                outcomes[names] = ((run["stop"]["kind"], run["stop"]["reason"]), [d["status"] for d in entries])
+        self.assertEqual(outcomes[("A",)], (("invalid_output", "redo_exhausted"), ["invalid", "invalid"]))
+        for names, value in outcomes.items():
+            self.assertEqual(value, outcomes[("A",)], names)
+
+
 class BudgetConfigTests(DecideCase):
     def test_removed_budget_keys_are_unknown_keys(self):
         from harness.config import Config

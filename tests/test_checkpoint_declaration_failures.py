@@ -1,5 +1,6 @@
 """Optional evidence failures preserve lifecycle gates; all calls are simulated."""
 import copy
+import json
 from pathlib import Path
 from unittest.mock import patch
 
@@ -108,6 +109,59 @@ class CheckpointDeclarationFailureTests(RepoCase):
         result = engine.start('Implement greet', read_json(ROOT / 'examples' / 'plan.json'))
         self.assertEqual(set(result['accepted']), {'greet'})
         self.assertEqual([r['checkpoint_id'] for r in result['task_checkpoints']], ['first-valid'])
+
+    @staticmethod
+    def folded_ids(items, kwargs):
+        # Both valid on their own; where case is ignored they would share one manifest file.
+        items[0]['inputs'][0]['sha256'] = digest(kwargs['cwd'] / 'hello.py')
+        items[0]['id'] = 'Build'
+        items.append(dict(copy.deepcopy(items[0]), id='build', summary='Same computation, other spelling'))
+
+    def assert_folded_batch_discarded(self, engine, backend):
+        run = read_json(engine.directory / 'state.json')
+        worker = next(d for d in run['dispatches'] if d['role'] == 'worker')
+        self.assertEqual(sum(c['role'] == 'worker' for c in backend.calls), 1)
+        self.assertEqual((run['task_checkpoints'], run['checkpoint_batches']), ([], []))
+        self.assertFalse((engine.directory / 'checkpoints' / worker['id']).exists())
+        self.assertFalse((engine.directory / 'checkpoints' / 'batches' / (worker['id'] + '.json')).exists())
+        events = [json.loads(line) for line in (engine.directory / 'events.jsonl').read_text().splitlines()]
+        discards = [e for e in events if e.get('event') == 'checkpoints_discarded']
+        self.assertEqual([e['dispatch_id'] for e in discards], [worker['id']])
+        self.assertIn('"Build"', discards[0]['reason'])
+        self.assertIn('"build"', discards[0]['reason'])
+        original = read_json(engine.directory / 'dispatches' / worker['id'] / 'returned-result.json')
+        self.assertEqual([item['id'] for item in original['checkpoints']], ['Build', 'build'])
+        self.assertEqual(run['status'], 'completed')
+        self.assertEqual(set(run['accepted']), {'greet'})
+        self.assertEqual(run['attempts'], {'greet': 1})
+        for target in ('greet', 'final'):
+            self.assertTrue(any(d['role'] == 'verification' and d['task_id'] == target for d in run['dispatches']))
+        self.assertEqual([c['kind'] for c in backend.calls if c['role'] == 'reviewer'], ['review', 'final_review'])
+
+    def test_ids_equal_after_folding_discard_the_batch_before_publishing(self):
+        # A pure name rule: the same outcome on case-sensitive filesystems.
+        backend = self.backend(mutate=self.folded_ids)
+        engine = self.engine(backend)
+        engine.start('Implement greet', read_json(ROOT / 'examples' / 'plan.json'))
+        self.assert_folded_batch_discarded(engine, backend)
+
+    def test_replayed_folded_ids_are_discarded_again_without_another_worker(self):
+        backend = self.backend(mutate=self.folded_ids)
+        engine = self.engine(backend)
+        original_record = engine.services.progress.record_checkpoints
+
+        def die(*args, **kwargs):
+            with self.assertRaises(CheckpointDeclarationError):
+                original_record(*args, **kwargs)
+            raise KeyboardInterrupt()  # the result is sealed; the handoff has saved nothing
+        with patch.object(engine.services.progress, 'record_checkpoints', side_effect=die):
+            with self.assertRaises(KeyboardInterrupt):
+                engine.start('Implement greet', read_json(ROOT / 'examples' / 'plan.json'))
+        saved = read_json(engine.directory / 'state.json')
+        self.assertEqual([r['phase'] for r in saved['worker_receipts'].values()], ['sealed'])
+        self.assertFalse(any(d['role'] in ('verification', 'reviewer') for d in saved['dispatches']))
+        self.assertEqual(self.engine(backend).resume(saved['id'])['status'], 'completed')
+        self.assert_folded_batch_discarded(engine, backend)
 
     def test_unsafe_missing_oversize_and_invalid_fields_are_declarations(self):
         mutations = [

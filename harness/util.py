@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import unicodedata
 import uuid
 from pathlib import Path
 
@@ -50,6 +51,18 @@ class ProcessTimeout(HarnessError):
 
 def uid(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:16]}"
+
+
+def fold_name(segment: str) -> str:
+    """A path segment's comparison key: segments that may name one directory entry fold equal.
+
+    Strict on purpose, for any filesystem Harness may run on: drops format
+    characters some filesystems ignore, then applies NFKC, case folding and
+    strips trailing dots and spaces. Only compare with it; paths keep their
+    original spelling everywhere else.
+    """
+    kept = "".join(char for char in segment if unicodedata.category(char) != "Cf")
+    return unicodedata.normalize("NFKC", kept).casefold().rstrip(". ")
 
 
 def dump(value) -> str:

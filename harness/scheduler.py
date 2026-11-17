@@ -107,7 +107,12 @@ class Scheduler(RuntimeService):
     def execute(self, supplied_plan=None, *, step=False):
         try:
             self.admission()
-            replayed = self.services.tasks.replay_worker()
+            try:
+                replayed = self.services.tasks.replay_worker()
+            except HarnessError as error:
+                # Not yet running: a quota failure of a replayed worker result's review stops, saying why it did not wait.
+                self.services.quota_wait.decline(error, "not_running")
+                raise
             if invalidate_acceptance_review(self.context.run):
                 self.context.save()
             self.services.workflow.synchronize_decision_requests()

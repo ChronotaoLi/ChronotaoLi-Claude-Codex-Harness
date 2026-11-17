@@ -10,15 +10,20 @@ import random
 import shlex
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from harness import git, scope as boundary, stops
+from harness.command_server import Broker, create_manifest
 from harness.context import compact_plan
-from harness.contracts import apply_revision, ScopeExtensionRequired
+from harness.contracts import apply_revision, ScopeExtensionRequired, validate_plan
+from harness.progress import ProgressRecovery
 from harness.recovery import read_bound_result
+from harness.review_progress import claim_gaps
 from harness.run_store import RunStore
 from harness.scope import proposal_request_id
 from harness.util import HarnessError, read_json, write_json
+from harness.verification_plan import candidate_preflight
 from test_harness import (ROOT, RepoCase, commit_recorder, crash_after_save, crash_point, decide_bound, refused_by_cli,
                           run_cli, scratch, walk_exit, walk_notice_exit)
 from test_runtime_changes import ScriptedBackend, decided, revised, trigger_kind, update
@@ -627,6 +632,185 @@ class MoreGuaranteesTests(RepoCase):
             engine.start("Implement greet", tasks, scope=["**"])
         run = saved(engine)
         self.assertEqual((run["stop"]["kind"], run["stop"]["reason"]), ("scope_violation", "protected_path"))
+
+
+# ---- Protected roots are judged by folded name, on every platform -------------------------------------
+# Spellings some filesystem may resolve to a protected root: letter case, a trailing dot or space,
+# a format character, a compatibility form.
+ALIASES = (".CLAUDE", ".Codex", ".GIT", ".Harness", ".claude.", ".codex ", ".cl​aude", "．claude")
+
+
+def case_insensitive(folder):
+    marker = Path(folder) / "CaSe-PrObE"
+    marker.write_text("x")
+    try:
+        return (Path(folder) / "case-probe").exists()
+    finally:
+        marker.unlink()
+
+
+class ProtectedAliasTests(RepoCase):
+    def runs(self):
+        folder = self.repo / ".harness" / "runs"
+        return sorted(folder.iterdir()) if folder.exists() else []
+
+    def test_alias_names_are_refused_by_name_and_wildcards_fall_to_the_candidate_check(self):
+        def with_evidence(folder):
+            tasks = plan()
+            tasks["tasks"][0]["evidence_requirements"] = [{"id": "settings", "acceptance_index": 0, "kind": "static",
+                                                           "path": "src/" + folder + "/settings.json"}]
+            return tasks
+        validate_plan(with_evidence("settings"))
+        for root in ALIASES:
+            with self.subTest(root=root):
+                with self.assertRaisesRegex(HarnessError, "受保护路径"):
+                    git.validate_scope_pattern(root + "/**")
+                with self.assertRaises(HarnessError):
+                    validate_plan(with_evidence(root))
+        # A wildcard first segment is not inferred at the pattern level; the candidate check refuses
+        # what it matches, under the original spelling.
+        (self.repo / ".Claude").mkdir()
+        (self.repo / ".Claude" / "settings.json").write_text("{}\n")
+        for pattern in ("**", "*/**", ".[cC]laude/**"):
+            with self.subTest(pattern=pattern):
+                git.validate_scope_pattern(pattern)
+                with self.assertRaises(git.ScopeViolation) as caught:
+                    git.check_scope(self.repo, [pattern])
+                self.assertEqual((caught.exception.stop["reason"], caught.exception.stop["data"]),
+                                 ("protected_path", {"path": ".Claude/settings.json"}))
+        (self.repo / ".Claude" / "settings.json").unlink()
+        (self.repo / ".Claude").rmdir()
+        for root in (".claudes", "claude", "x.git"):  # not a protected name in any spelling
+            (self.repo / root).mkdir()
+            (self.repo / root / "settings.json").write_text("{}\n")
+        self.assertEqual(git.check_scope(self.repo, ["**"]),
+                         [".claudes/settings.json", "claude/settings.json", "x.git/settings.json"])
+
+    def test_alias_entries_are_refused_before_a_run_or_a_revision_exists(self):
+        path = scratch(self) / "plan.json"
+        for root in ALIASES:
+            with self.subTest(entry="supplied plan", root=root):
+                tasks = plan()
+                tasks["tasks"][0]["allowed_paths"] = ["hello.py", root + "/**"]
+                write_json(path, tasks)
+                notice = refused_by_cli(self, ScriptedBackend(), ["run", "Implement greet", "--plan", str(path)],
+                                        ("invalid_input", "input_schema"), 2)
+                self.assertEqual(notice["data"]["option"], "--plan")
+                self.assertEqual(self.runs(), [])
+            with self.subTest(entry="run --scope", root=root):
+                notice = refused_by_cli(self, ScriptedBackend(), ["run", "Implement greet", f"--scope={root}/**"],
+                                        ("invalid_input", "scope_pattern"), 2)
+                self.assertEqual(notice["data"]["patterns"], [root + "/**"])
+                self.assertEqual(self.runs(), [])
+        backend = ScriptedBackend()
+        engine = self.engine(backend)
+        engine.start("Implement greet", plan(), pause_after_plan=True)
+        raw = (engine.directory / "state.json").read_bytes()
+        for root in ALIASES:
+            with self.subTest(entry="resume --scope", root=root):
+                refused_by_cli(self, backend, ["resume", engine.run["id"], f"--scope={root}/settings.json"],
+                               ("invalid_input", "scope_pattern"), 2)
+                self.assertEqual((engine.directory / "state.json").read_bytes(), raw)
+
+    def test_revision_appending_an_alias_is_invalid_and_publishes_no_revision(self):
+        backend = blocked_then(widen(".Claude/**"))
+        engine = self.engine(backend)
+        with self.assertRaisesRegex(HarnessError, "连续两次无效"):
+            engine.start("Implement greet", plan(), scope=["**"])
+        run = saved(engine)
+        self.assertEqual((run["stop"]["kind"], run["stop"]["reason"]), ("invalid_output", "redo_exhausted"))
+        replans = [d for d in run["dispatches"] if (d["role"], d["kind"]) == ("commander", "decide")]
+        self.assertEqual([d["status"] for d in replans], ["invalid", "invalid"])
+        self.assertTrue(all("受保护路径" in d["error"] for d in replans))
+        self.assertEqual((len(run["plan_history"]), run["tasks"][0]["allowed_paths"]), (1, ["hello.py"]))
+        self.assertFalse((engine.directory / "plans" / "revision-1.json").exists())
+
+    def write_then_refused(self, target, check=None):
+        """A ``**`` task whose worker writes ``target``: refused at acceptance under that spelling, nothing accepted."""
+        def change(backend, kwargs, packet, result):
+            if kwargs["role"] == "worker":
+                written = Path(kwargs["cwd"]) / target
+                written.parent.mkdir(parents=True, exist_ok=True)
+                written.write_text("{}\n")
+                if check:
+                    check(Path(kwargs["cwd"]))
+        tasks = plan()
+        tasks["tasks"][0]["allowed_paths"] = ["**"]
+        head = git.head(self.repo)
+        backend = ScriptedBackend(change)
+        engine = self.engine(backend)
+        with self.assertRaisesRegex(HarnessError, "受保护路径"):
+            engine.start("Implement greet", tasks, scope=["**"])
+        run = saved(engine)
+        self.assertEqual((run["stop"]["kind"], run["stop"]["reason"], run["stop"]["data"]["path"]),
+                         ("scope_violation", "protected_path", target))
+        self.assertEqual((run["accepted"], git.head(engine.worktree, binding=run["worktree_binding"])), ({}, head))
+        worker = next(d for d in run["dispatches"] if d["role"] == "worker")
+        self.assertEqual(worker["worker_receipt_consumed"], "scope_rejected")
+        calls = len(backend.calls)
+        with self.assertRaisesRegex(HarnessError, "受保护路径"):
+            self.engine(backend).resume(engine.run["id"])
+        self.assertEqual((len(backend.calls), saved(engine)["accepted"]), (calls, {}))
+
+    def test_double_star_candidate_writing_an_alias_is_refused_by_name(self):
+        self.write_then_refused(".CLAUDE/settings.json")
+
+    def test_alias_that_is_the_same_file_is_refused(self):
+        if not case_insensitive(self.repo):
+            self.skipTest("needs a case-insensitive filesystem")
+        seen = []
+
+        def same_file(cwd):
+            seen.append((cwd / ".CLAUDE" / "settings.json").samefile(cwd / ".claude" / "settings.json"))
+        self.write_then_refused(".CLAUDE/settings.json", same_file)
+        self.assertEqual(seen, [True])
+
+    def test_every_gate_judges_protected_names_through_the_one_shared_rule(self):
+        """A local copy of the rule answers like the rule, so widen the shared rule by one name: every gate must follow."""
+        (self.repo / "vendor").mkdir()
+        (self.repo / "vendor" / "lib.py").write_text("x = 1\n")
+        git.git(self.repo, "add", ".")
+        git.git(self.repo, "-c", "user.name=Test", "-c", "user.email=test@localhost", "-c", "commit.gpgsign=false",
+                "commit", "-qm", "vendor")
+        (self.repo / "vendor" / "new.py").write_text("y = 2\n")
+        tasks = plan()
+        tasks["tasks"][0]["evidence_requirements"] = [{"id": "lib", "acceptance_index": 0, "kind": "static",
+                                                       "path": "vendor/lib.py"}]
+        job = scratch(self).resolve() / "worker"
+        manifest = create_manifest(self.config, self.repo, job, delete_scope={"task_id": "t", "allowed_paths": ["**"]})
+        broker = Broker(manifest["artifact"], manifest["artifact_digest"])
+
+        def refused(call):
+            try:
+                call()
+            except HarnessError as error:
+                return error.stop["reason"] if error.stop else True
+            return False
+
+        def verdicts():
+            # Planning, acceptance, the readers of worker-named paths, and delete_path last: it unlinks.
+            preflight = candidate_preflight(tasks["tasks"][0], {}, worktree=self.repo, candidate_snapshot={},
+                                            current_snapshot={}, worker_artifact=job / "absent", worker_artifact_digest="")
+            return {"scope pattern": refused(lambda: git.validate_scope_pattern("vendor/**")),
+                    "evidence requirement": refused(lambda: validate_plan(tasks)),
+                    "candidate": refused(lambda: git.check_scope(self.repo, ["**"])),
+                    "evidence preflight": [f["reason"] for f in preflight["failures"] if f["code"] == "evidence_invalid"],
+                    "repair claim": claim_gaps({"repair_claims": {"k": {"evidence_paths": ["vendor/lib.py"]}}}, [],
+                                               {"files": {"vendor/lib.py": ""}}) != [],
+                    "checkpoint source": refused(lambda: ProgressRecovery(SimpleNamespace(worktree=self.repo))
+                                                 ._checkpoint_path("vendor/lib.py")),
+                    "delete_path": broker.delete_path({"path": "vendor/lib.py"})["outcome"]}
+
+        shared = git.protected_name
+        with patch.object(git, "protected_name", lambda segment: shared(segment) or segment == "vendor"):
+            self.assertEqual(verdicts(), {"scope pattern": True, "evidence requirement": True, "candidate": "protected_path",
+                                          "evidence preflight": ["unsafe_path"], "repair claim": True,
+                                          "checkpoint source": True, "delete_path": "refused"})
+        self.assertTrue((self.repo / "vendor" / "lib.py").is_file())
+        # The same calls without the widening: nothing but the shared rule refused the name.
+        self.assertEqual(verdicts(), {"scope pattern": False, "evidence requirement": False, "candidate": False,
+                                      "evidence preflight": ["outside_candidate"], "repair claim": False,
+                                      "checkpoint source": False, "delete_path": "deleted"})
 
 
 # ---- T6-16, T6-17: an operator answer lives until a decide lands ---------------------------------------

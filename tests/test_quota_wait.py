@@ -26,7 +26,9 @@ from harness.quota_wait import QuotaWait, choose, parse_display, parse_model, re
 from harness.run_lifecycle import RunLifecycle
 from harness.run_store import RunStore
 from harness.runtime import Runtime
+from harness.task_lifecycle import TaskLifecycle
 from harness.util import HarnessError, lock, read_json, write_json
+from harness.worker_receipts import WorkerReceipts
 from test_harness import (ROOT, FakeClock, RepoCase, cli_notice, commit_recorder, crash_after_save,
                           install_clock, run_cli, walk_exit)
 
@@ -392,6 +394,32 @@ class WaitTests(WaitCase):
                 if reason == "snapshot_unavailable":
                     self.assertEqual((data["quota_snapshot"], data["quota_reason"]), ("unavailable", "shape_mismatch"))
                 os.environ["QUOTA_STUB_CLAUDE"] = "ok"
+
+    def test_decline_with_more_full_windows_than_the_stop_lists_through_the_cli(self):
+        # Seventeen windows at 100 %, one more than full_windows holds; the session resets beyond the limit.
+        self.windows(window("session", 100, 30000),
+                     *[window("weekly_scoped", 100, 600, model=f"Zeta {n}") for n in range(1, 17)])
+        code, errors = run_cli(self, self.backend("worker"), ["run", "Implement greet", "--plan",
+                                                              str(ROOT / "examples" / "plan.json")])
+        self.assertEqual(code, 3, errors)
+        self.assertNotIn("Traceback", errors)
+        notice = cli_notice(errors)
+        self.assertEqual((notice["kind"], notice["reason"], notice["data"]["wait_reason"]),
+                         ("provider_quota", "usage_limit", "exceeds_limit"))
+        (run_id,) = [path.name for path in (self.repo / ".harness" / "runs").iterdir()]
+        saved = read_json(self.repo / ".harness" / "runs" / run_id / "state.json")
+        self.assertEqual(self.clock.sleeps, [])
+        self.assertEqual((saved["status"], saved["stop"]["kind"], saved["stop"]["reason"]),
+                         ("blocked", "provider_quota", "usage_limit"))
+        stops.validate(saved["stop"])
+        data = saved["stop"]["data"]
+        self.assertEqual((data["wait_reason"], data["window"], data["quota_snapshot"]), ("exceeds_limit", "session", "available"))
+        self.assertEqual((len(data["full_windows"]), data["full_windows_omitted"]), (16, 1))
+        self.assertEqual(data["full_windows"][0]["bucket"], "session")
+        # The listed exit continues the run once the session window has reset.
+        self.windows(window("session", 100, 600))
+        walk_exit(self, self.repo / ".harness" / "runs" / run_id, ("provider_quota", "usage_limit"),
+                  backend=self.backend(), expect_status="completed")
 
     def test_delay_equal_to_the_limit_waits(self):  # T8-7
         self.windows(window("session", 100, 21600 - 60))
@@ -816,6 +844,68 @@ class RoleTests(WaitCase):
         self.assertNotIn("wait_limit_seconds", saved["stop"]["data"])
         self.assertEqual(stops.exit_code(self.error), 3)
         self.assertEqual(self.triggers(engine).count("quota_failure"), 1)   # the stop boundary's sample
+
+    def test_replayed_review_failure_does_not_wait(self):  # T8-19 (replay of a sealed worker result)
+        """``resume`` replays a sealed worker result that was never handed off before the scheduling loop.
+
+        A Claude reviewer's usage-limit failure there stops without waiting and says why; the listed
+        ``resume`` then meets the same failure inside the loop, where it waits. Two ways to leave such a
+        result: an interrupt between the seal and the handoff's save, and a typed stop whose exit is resume.
+        """
+        self.config.data["roles"]["reviewer"] = {"cli": "claude", "model": "claude-sonnet-9-1", "effort": "high"}
+        publish, finish = TaskLifecycle.publish_worker_result, WorkerReceipts._finish
+
+        def interrupted(lifecycle, *args, **kwargs):
+            if not getattr(lifecycle, "interrupted", False):
+                lifecycle.interrupted = True
+                raise KeyboardInterrupt()
+            return publish(lifecycle, *args, **kwargs)
+
+        def stray_after_seal(receipts, key, task):   # the handoff then sees another candidate
+            result = finish(receipts, key, task)
+            if not getattr(receipts, "touched", False):
+                receipts.touched = True
+                (receipts.context.worktree / "stray.txt").write_text("stray\n")
+            return result
+        entries = [(patch.object(TaskLifecycle, "publish_worker_result", interrupted), KeyboardInterrupt,
+                    ("interrupted", "signal")),
+                   (patch.object(WorkerReceipts, "_finish", stray_after_seal), HarnessError,
+                    ("workspace_mismatch", "candidate_changed"))]
+        for patcher, raised, row in entries:
+            with self.subTest(row=row):
+                self.clock.sleeps.clear()
+                self.windows(window("session", 100, 600))
+                engine = self.engine()
+                with patcher, self.assertRaises(raised):
+                    engine.start("Implement greet", plan())
+                first = read_json(engine.directory / "state.json")
+                self.assertEqual((first["stop"]["kind"], first["stop"]["reason"]), row)
+                self.assertEqual([receipt["phase"] for receipt in first["worker_receipts"].values()], ["sealed"])
+                self.assertNotIn("pending_task", first)
+                (Path(first["worktree"]) / "stray.txt").unlink(missing_ok=True)
+                backend, seen = self.backend("reviewer"), []
+                invoke = backend.invoke
+
+                def watched(**kwargs):
+                    seen.append((kwargs["role"], kwargs["kind"], read_json(engine.directory / "state.json")["status"]))
+                    return invoke(**kwargs)
+                backend.invoke = watched
+                saved = walk_exit(self, engine.directory, row, backend=backend, expect_status="blocked", expect_code=3)
+                # The review was this resume's only model call, made before the run was running again.
+                self.assertEqual(seen, [("reviewer", "review", first["status"])])
+                self.assertEqual(self.clock.sleeps, [])
+                self.assertNotIn("quota_wait", saved)
+                data = saved["stop"]["data"]
+                self.assertEqual((saved["stop"]["kind"], saved["stop"]["reason"], data["wait_reason"], data["waits"]),
+                                 ("provider_quota", "usage_limit", "not_running", 0))
+                self.assertNotIn("wait_limit_seconds", data)
+                stops.validate(saved["stop"])
+                self.assertEqual(stops.project_ledger(saved)["exits"], [f"resume {first['id']}"])
+                # The same failure one resume later is inside the loop: waited out, then a fresh review.
+                walk_exit(self, engine.directory, ("provider_quota", "usage_limit"), backend=self.backend("reviewer"),
+                          expect_status="completed")
+                self.assertEqual(sum(self.clock.sleeps), 660)
+                self.assertEqual([event["role"] for event in self.events(engine, "quota_wait_started")], ["reviewer"])
 
     def test_codex_failure_never_waits(self):  # T8-20
         self.windows(window("session", 100, 600))

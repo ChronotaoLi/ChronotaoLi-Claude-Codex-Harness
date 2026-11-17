@@ -4,9 +4,16 @@ from pathlib import Path
 from unittest.mock import patch
 
 from test_harness import ExitReportingBackend, RepoCase, ROOT, after_save, cli_notice, run_cli, walk_exit
+from harness import git, stops
 from harness.adapters import DemoBackend
 from harness.util import HarnessError, read_json
 import harness.worker_receipts as receipts_module
+
+
+def commit(cwd):
+    git.git(cwd, 'add', '-A')
+    git.git(cwd, '-c', 'user.name=w', '-c', 'user.email=w@localhost', '-c', 'commit.gpgsign=false',
+            'commit', '-m', 'worker commit')
 
 
 class WorkerReceiptTests(RepoCase):
@@ -98,6 +105,79 @@ class WorkerReceiptTests(RepoCase):
         evidence = read_json(engine.directory / 'state.json')['dispatches'][0]['worker_return_evidence']
         job = engine.directory / 'dispatches' / worker['id']
         self.assertTrue(all((job / name).is_file() for name, digest in evidence['sources'].items() if digest))
+
+    def assert_unsealed(self, engine):
+        saved = read_json(engine.directory / 'state.json')
+        self.assertEqual((saved['stop']['kind'], saved['stop']['reason']), ('evidence', 'unsealed_return'))
+        self.assertEqual(stops.project_ledger(saved)['exits'], [f"abandon {saved['id']}"])
+        worker = next(d for d in saved['dispatches'] if d['role'] == 'worker')
+        self.assertEqual(next(iter(saved['worker_receipts'].values()))['phase'], 'invoking')
+        self.assertEqual(list((engine.directory / 'dispatches' / worker['id']).glob('worker-seal.*.json')), [])
+        self.assertIn('HEAD different from the checkpoint', worker['error'])
+        self.assertEqual(saved['attempts'], {'greet': 1})
+        return saved
+
+    def test_head_moved_during_the_worker_call_leaves_the_return_unsealed(self):
+        class Committing(DemoBackend):
+            calls = 0
+            def invoke(self, **kwargs):
+                self.calls += 1
+                result = super().invoke(**kwargs)
+                if kwargs['role'] == 'worker':
+                    commit(kwargs['cwd'])
+                return result
+        backend = Committing()
+        engine = self.engine(backend)
+        with self.assertRaisesRegex(HarnessError, 'before immutable seal') as caught:
+            engine.start('Implement greeting', self.plan())
+        calls, run_id = backend.calls, engine.run['id']
+        self.assertEqual(stops.of(caught.exception)['reason'], 'unsealed_return')
+        saved = self.assert_unsealed(engine)
+        self.assertNotEqual(git.head(engine.worktree), saved['expected_head'])
+        # The resume preflight reports the moved HEAD first, without touching the saved stop.
+        with self.assertRaises(HarnessError) as moved:
+            self.engine(backend).resume(run_id)
+        self.assertEqual((stops.of(moved.exception)['kind'], stops.of(moved.exception)['reason']),
+                         ('workspace_mismatch', 'head_changed'))
+        self.assert_unsealed(engine)
+        # Restoring the checkpoint HEAD reaches the same typed stop: the return is never sealed later.
+        git.git(engine.worktree, 'reset', '--soft', saved['expected_head'])
+        with self.assertRaisesRegex(HarnessError, 'before immutable seal') as restored:
+            self.engine(backend).resume(run_id)
+        self.assertEqual(stops.of(restored.exception)['reason'], 'unsealed_return')
+        self.assert_unsealed(engine)
+        self.assertEqual(backend.calls, calls)
+        run = walk_exit(self, engine.directory, ('evidence', 'unsealed_return'), backend=backend,
+                        expect_status='abandoned')
+        self.assertEqual(sum(d['role'] == 'worker' and d['invoked'] for d in run['dispatches']), 1)
+        self.assertEqual(backend.calls, calls)
+
+    def test_head_moved_while_the_seal_takes_the_candidate_leaves_the_return_unsealed(self):
+        # HEAD is compared after the candidate snapshot, so a commit landing during it is caught too;
+        # comparing first would seal a HEAD that the candidate no longer matches.
+        engine = self.engine(DemoBackend())
+        service, snapshot, entered, moved = engine.services.worker_receipts, engine.context.snapshot, [], []
+        seal = service.seal
+
+        def committing_snapshot():
+            if not moved:
+                commit(engine.worktree)
+                moved.append(git.head(engine.worktree))
+            return snapshot()
+
+        def sealing(entry, result):
+            entered.append(git.head(engine.worktree))
+            with patch.object(engine.context, 'snapshot', committing_snapshot):
+                return seal(entry, result)
+        with patch.object(service, 'seal', sealing), \
+                self.assertRaisesRegex(HarnessError, 'before immutable seal') as caught:
+            engine.start('Implement greeting', self.plan())
+        self.assertEqual(stops.of(caught.exception)['reason'], 'unsealed_return')
+        saved = self.assert_unsealed(engine)
+        self.assertEqual(entered, [saved['expected_head']])
+        self.assertEqual(moved, [git.head(engine.worktree)])
+        self.assertNotEqual(moved[0], saved['expected_head'])
+        self.assertEqual(sum(d['role'] == 'worker' and d['invoked'] for d in saved['dispatches']), 1)
 
     def test_changed_candidate_and_tampered_seal_stop(self):
         engine = self.interrupted('after_seal')

@@ -3,6 +3,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from harness import git
+from harness.recovery import snapshot_digest
 from harness.util import HarnessError, ProcessTimeout, read_json, run_process
 from test_engine_repairs import RecordingBackend
 from test_harness import RepoCase, ROOT, interrupt_started_agent
@@ -82,6 +83,40 @@ class TaskStageRecoveryTests(RepoCase):
         self.assertNotEqual(Path(result["accepted"]["greet"]["verification"]).parent, old_folder)
         for name, contents in old_logs.items():
             self.assertEqual((old_folder / name).read_bytes(), contents)
+
+    def test_later_task_and_its_recovery_leave_the_earlier_tasks_registered_evidence_intact(self):
+        plan = self.plan()
+        second = deepcopy(plan["tasks"][0])
+        second.update(id="polish", depends_on=["greet"])
+        plan["tasks"].append(second)
+        keys = ("verification", "snapshot_artifact", "diff_artifact", "artifact")
+        before = {}
+
+        def change(backend, kwargs, packet, result):
+            tid = kwargs["schema"]["properties"]["task_id"]["enum"][0]
+            if kwargs["role"] == "worker":
+                if tid == "polish":
+                    record = read_json(kwargs["run_path"])["review_history"]["greet"][-1]
+                    before.update({key: Path(record[key]).read_bytes() for key in keys})
+                with (kwargs["cwd"] / "hello.py").open("a") as stream:
+                    stream.write(f"# {tid}\n")
+            elif kwargs["kind"] == "review" and tid == "polish" and len([c for c in backend.calls if c["kind"] == "review"]) == 2:
+                interrupt_started_agent(kwargs)
+
+        backend = RecordingBackend(change)
+        engine = self.engine(backend)
+        with self.assertRaises(KeyboardInterrupt):
+            engine.start("Implement greet, then polish it", plan)
+        self.assertEqual((list(engine.run["accepted"]), engine.run["pending_task"]["stage"]), (["greet"], "reviewing"))
+        result = self.engine(backend).resume(engine.run["id"])
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual([c["task_id"] for c in backend.calls if c["kind"] == "review"], ["greet", "polish", "polish"])
+        record = result["review_history"]["greet"][-1]
+        self.assertEqual(set(before), set(keys))
+        self.assertEqual({key: Path(record[key]).read_bytes() for key in keys}, before)
+        self.assertEqual(snapshot_digest(read_json(Path(record["snapshot_artifact"]))), record["snapshot_digest"])
+        self.assertEqual(read_json(Path(record["artifact"]))["dispatch_id"], record["dispatch_id"])
+        self.assertEqual(result["accepted"]["greet"]["verification"], record["verification"])
 
     def test_changed_candidate_invalidates_pending_review_and_requires_new_worker(self):
         def unavailable_once(backend, kwargs, packet, result):

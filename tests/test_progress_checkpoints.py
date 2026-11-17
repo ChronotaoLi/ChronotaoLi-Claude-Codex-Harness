@@ -7,7 +7,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from harness.progress import ProgressRecovery
+from harness.progress import CheckpointDeclarationError, ProgressRecovery, validate_checkpoints
 from harness.util import HarnessError, write_json
 from harness.versions import RUN_SCHEMA_VERSION
 from test_harness import add_worker_dispatch
@@ -45,19 +45,19 @@ class ProgressTests(unittest.TestCase):
         (self.runtime.context.worktree / 'input').write_bytes(b'input bytes')
         (self.runtime.context.worktree / 'output').write_bytes(b'raw\x00output\xff\n')
 
-    def record(self, dispatch='worker1', freshness='content', age=0, invoked_at='now'):
+    def record(self, dispatch='worker1', freshness='content', age=0, invoked_at='now', checkpoint_id='check', task='task'):
         rt = self.runtime
-        item = {'id': 'check', 'summary': 'computation', 'inputs': [{'path': 'input', 'sha256': sha(b'input bytes')}],
+        item = {'id': checkpoint_id, 'summary': 'computation', 'inputs': [{'path': 'input', 'sha256': sha(b'input bytes')}],
                 'evidence': [{'path': 'output', 'sha256': sha(b'raw\x00output\xff\n')}],
                 'freshness': freshness, 'max_age_seconds': age}
         result = {'status': 'blocked', 'blocker_kind': 'environment', 'blockers': ['offline'],
                   'summary': 'blocked', 'evidence': [], 'proposed_memories': [], 'checkpoints': [item]}
         path = rt.context.directory / 'dispatches' / dispatch / 'returned-result.json'
-        write_json(path, {**result, 'task_id': 'task', 'dispatch_id': dispatch})
-        add_worker_dispatch(rt.context.run, rt.context.directory, dispatch, 'task',
+        write_json(path, {**result, 'task_id': task, 'dispatch_id': dispatch})
+        add_worker_dispatch(rt.context.run, rt.context.directory, dispatch, task,
                             invoked_at=time.time() if invoked_at == 'now' else invoked_at)
         source = {'artifact': str(path), 'artifact_digest': sha(path.read_bytes())}
-        self.last_discarded = rt.record_checkpoints('task', dispatch, result, source)
+        self.last_discarded = rt.record_checkpoints(task, dispatch, result, source)
         return result, source
 
     def test_raw_copy_reuse_without_original_evidence_and_input_invalidation(self):
@@ -99,6 +99,36 @@ class ProgressTests(unittest.TestCase):
         self.assertFalse({'task_checkpoints', 'checkpoint_history', 'checkpoint_sources'} & set(unrelated))
         self.assertIn('checkpoint_index', unrelated)
 
+    def test_later_dispatch_replaces_checkpoint_with_folded_same_id(self):
+        # Build and build are one checkpoint of the task: only the later one is current,
+        # while the ledger, manifests and index keep both in their original spelling.
+        rt = self.runtime
+        self.record(checkpoint_id='Build')
+        self.record('worker2', freshness='volatile', age=0, checkpoint_id='build')
+        packet = rt.progress_packet({}, task_id='task')
+        self.assertEqual([(c['id'], c['dispatch_id'], c['status']) for c in packet['task_checkpoints']],
+                         [('build', 'worker2', 'stale')])
+        self.assertEqual([(r['checkpoint_id'], r['dispatch_id']) for r in packet['checkpoint_history']], [('Build', 'worker1')])
+        self.assertEqual(set(packet['checkpoint_sources']), {'worker2'})
+        rows = rt.context.run['task_checkpoints']
+        self.assertEqual([(r['checkpoint_id'], r['dispatch_id']) for r in rows], [('Build', 'worker1'), ('build', 'worker2')])
+        for row in rows:
+            self.assertEqual(json.loads(Path(row['artifact']).read_bytes())['checkpoint']['id'], row['checkpoint_id'])
+        self.assertEqual(json.loads(Path(packet['checkpoint_index']['artifact']).read_bytes())['checkpoints'], rows)
+
+    def test_folded_same_ids_of_different_tasks_stay_separate(self):
+        rt = self.runtime
+        rt.context.run['tasks'].append({'id': 'other'})
+        self.record(checkpoint_id='Build')
+        self.record('worker2', checkpoint_id='build', task='other')
+        for task, expected in (('task', ('Build', 'worker1')), ('other', ('build', 'worker2'))):
+            packet = rt.progress_packet({}, task_id=task)
+            self.assertEqual([(c['id'], c['dispatch_id']) for c in packet['task_checkpoints']], [expected])
+            self.assertEqual(packet['checkpoint_history'], [])
+        both = rt.progress_packet({'trigger': {'kind': 'task', 'ready': ['task', 'other']}}, kind='decide')
+        self.assertEqual({(c['task_id'], c['id']) for c in both['task_checkpoints']}, {('task', 'Build'), ('other', 'build')})
+        self.assertEqual(both['checkpoint_history'], [])
+
     def test_cached_tampering_and_source_digest_required(self):
         result, source = self.record()
         rt = self.runtime
@@ -120,6 +150,33 @@ class ProgressTests(unittest.TestCase):
         rt.record_checkpoints('task', 'worker1', result, source)
         self.assertEqual(rt.context.run['task_checkpoints'], [row])
         self.assertEqual(Path(row['artifact']).read_bytes(), original)
+
+    def test_changed_unregistered_manifest_is_damage_not_a_declaration(self):
+        # Published before the batch file and ledger, then changed: evidence damage stops
+        # registration; only colliding declarations are discarded before publication.
+        result, source = self.record()
+        rt = self.runtime
+        artifact = Path(rt.context.run['task_checkpoints'][0]['artifact'])
+        rt.context.run['task_checkpoints'] = []
+        rt.context.run['checkpoint_batches'] = []
+        (rt.context.directory / 'checkpoints' / 'batches' / 'worker1.json').unlink()
+        manifest = json.loads(artifact.read_bytes())
+        manifest['checkpoint']['summary'] = 'changed after publication'
+        write_json(artifact, manifest)
+        with self.assertRaisesRegex(HarnessError, 'recovery artifact conflict') as error:
+            rt.record_checkpoints('task', 'worker1', result, source)
+        self.assertNotIsInstance(error.exception, CheckpointDeclarationError)
+        self.assertEqual((rt.context.run['task_checkpoints'], rt.context.run['checkpoint_batches']), ([], []))
+        self.assertFalse((rt.context.directory / 'checkpoints' / 'batches' / 'worker1.json').exists())
+
+    def test_ids_equal_after_folding_are_one_id(self):
+        item = {'id': 'Build', 'summary': 'computation', 'inputs': [{'path': 'input', 'sha256': sha(b'input bytes')}],
+                'evidence': [{'path': 'output', 'sha256': sha(b'raw\x00output\xff\n')}],
+                'freshness': 'content', 'max_age_seconds': 0}
+        validate_checkpoints([item, dict(item, id='build2')])
+        for other in ('Build', 'build', 'BUILD.'):
+            with self.subTest(other=other), self.assertRaisesRegex(HarnessError, 'duplicate'):
+                validate_checkpoints([item, dict(item, id=other)])
 
     def test_source_result_tampering_fails_closed(self):
         _, source = self.record()

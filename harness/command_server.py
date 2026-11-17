@@ -17,14 +17,14 @@ import signal
 import stat
 import sys
 import time
-import unicodedata
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
 from .process_runtime import defer_cleanup_signals
 from . import git, stops
-from .util import HarnessError, ProcessStartError, ProcessTimeout, group_alive, lock, read_json, run_process, tail, write_json
+from .util import (HarnessError, ProcessStartError, ProcessTimeout, fold_name, group_alive, lock, read_json,
+                   run_process, tail, write_json)
 from .versions import read_current_ledger
 
 
@@ -34,7 +34,6 @@ MAX_DELETE_PATH_CHARS = 4096
 # Call folders are prepared here, beside commands/, and renamed into it once
 # their journal is complete. Nothing enumerates this directory.
 STAGING_DIRECTORY = "command-staging"
-_PROTECTED_FOLDED = frozenset(root.casefold() for root in git.PROTECTED_ROOTS)
 
 
 def _file_digest(path):
@@ -510,13 +509,6 @@ class _DeleteRefused(Exception):
     """An admitted delete_path call refused before anything was unlinked."""
 
 
-def _fold(segment):
-    # Compare protected names strictly: ignore format characters that some
-    # filesystems drop, compatibility forms, letter case and trailing dots.
-    kept = "".join(char for char in segment if unicodedata.category(char) != "Cf")
-    return unicodedata.normalize("NFKC", kept).casefold().rstrip(". ")
-
-
 def _delete_syntax(path):
     shown = repr(path[:160])
     if not path:
@@ -528,8 +520,7 @@ def _delete_syntax(path):
     segments = path.split("/")
     if any(segment in ("", ".", "..") for segment in segments):
         raise _DeleteRefused(f"empty, '.' or '..' segment in {shown}")
-    folded = [_fold(segment) for segment in segments]
-    if folded[0] in _PROTECTED_FOLDED or ".git" in folded:
+    if git.protected_name(segments[0]) or ".git" in map(fold_name, segments):
         raise _DeleteRefused(f"protected path {shown}: .git, .harness, .codex and .claude are refused in any letter case")
 
 

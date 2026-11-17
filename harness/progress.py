@@ -1,6 +1,6 @@
 """Bound worker evidence for fresh dispatches; never an acceptance checkpoint."""
 
-from . import stops
+from . import git, stops
 from .versions import RUN_SCHEMA_VERSION
 from .services import RuntimeService
 from copy import deepcopy
@@ -14,11 +14,10 @@ import time
 
 from .contracts import validate_work_core
 from .worker_receipts import delivered_work_contract
-from .util import EvidenceError, HarnessError, dump, write_json
+from .util import EvidenceError, HarnessError, dump, fold_name, write_json
 
 _SHA = re.compile(r"[0-9a-f]{64}\Z")
 _SAFE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,119}\Z")
-_RESERVED = {".git", ".harness", ".codex", ".claude"}
 
 
 class CheckpointDeclarationError(HarnessError):
@@ -41,9 +40,9 @@ def validate_checkpoints(items):
     for item in items:
         if not isinstance(item, dict) or set(item) != {"id", "summary", "inputs", "evidence", "freshness", "max_age_seconds"}:
             raise HarnessError("invalid checkpoint fields")
-        if not isinstance(item["id"], str) or not _SAFE.fullmatch(item["id"]) or item["id"] in ids:
+        if not isinstance(item["id"], str) or not _SAFE.fullmatch(item["id"]) or fold_name(item["id"]) in ids:
             raise HarnessError("invalid or duplicate checkpoint id")
-        ids.add(item["id"])
+        ids.add(fold_name(item["id"]))
         if not isinstance(item["summary"], str) or not item["summary"].strip() or len(item["summary"]) > 4000 or "\0" in item["summary"]:
             raise HarnessError("invalid checkpoint summary")
         age = item["max_age_seconds"]
@@ -114,7 +113,7 @@ class ProgressRecovery(RuntimeService):
             checked = source
         if ".." in checked.parts:
             raise HarnessError("checkpoint source uses reserved or unsafe path")
-        if any(p in _RESERVED for p in checked.parts):
+        if any(git.protected_name(p) for p in checked.parts):
             # Only the current worker's command evidence can cross the private
             # state boundary. Check symlinks before canonicalizing the path.
             if source.is_absolute() and evidence_dispatch is not None:
@@ -175,9 +174,14 @@ class ProgressRecovery(RuntimeService):
         items = result.get("checkpoints", [])
         if not isinstance(items, list) or len(items) > 16:
             raise CheckpointDeclarationError("checkpoints must be an array of at most 16 entries")
-        ids = [item.get("id") for item in items if isinstance(item, dict) and isinstance(item.get("id"), str)]
-        if len(ids) != len(set(ids)):
-            raise CheckpointDeclarationError("invalid or duplicate checkpoint id")
+        # Each ID names files in one folder: IDs one filesystem may treat as the
+        # same name are duplicates, found before anything is published.
+        ids = {}
+        for value in (item["id"] for item in items if isinstance(item, dict) and isinstance(item.get("id"), str)):
+            if fold_name(value) in ids:
+                raise CheckpointDeclarationError("duplicate checkpoint id (compared as file names, ignoring case): "
+                                                 + json.dumps([ids[fold_name(value)][:120], value[:120]]))
+            ids[fold_name(value)] = value
         if not items:
             return []
         folder = self.context.directory / "checkpoints" / dispatch_id
@@ -400,7 +404,7 @@ class ProgressRecovery(RuntimeService):
                 raise HarnessError("invalid checkpoint ledger row")
             if not all(isinstance(row[k], str) for k in row) or not _SAFE.fullmatch(row["dispatch_id"]) or not _SAFE.fullmatch(row["checkpoint_id"]):
                 raise HarnessError("invalid checkpoint ledger identity")
-            key = row["dispatch_id"], row["checkpoint_id"]
+            key = row["dispatch_id"], fold_name(row["checkpoint_id"])
             folder = self.context.directory / "checkpoints" / row["dispatch_id"]
             if key in seen or row["task_id"] not in tasks or row["artifact"] != str(folder / (row["checkpoint_id"] + ".json")):
                 raise HarnessError("checkpoint ledger reference invalid")
@@ -460,13 +464,17 @@ class ProgressRecovery(RuntimeService):
             relevant = set()
         if relevant is None:
             relevant = {t["id"] for t in self.context.run["tasks"] if t["id"] not in self.context.run.get("accepted", {})}
-        latest = {(r["task_id"], r["checkpoint_id"]): r for r in rows}
+        def key(row):
+            # A later dispatch's checkpoint replaces an earlier one of its task under the
+            # same ID, compared as within a batch; entries keep their original spelling.
+            return row["task_id"], fold_name(row["checkpoint_id"])
+        latest = {key(r): r for r in rows}
         current, history, sources = [], [], {}
         relevant_count = sum(1 for tid, _ in latest if tid in relevant)
         summary_limit = min(500, 4000 // max(1, relevant_count))
         inline_limit = 4000 // max(1, relevant_count)
         for row in rows:
-            selected = latest[row["task_id"], row["checkpoint_id"]] == row
+            selected = latest[key(row)] == row
             if not selected and row["task_id"] in relevant:
                 history.append(row)
             if not selected or row["task_id"] not in relevant:

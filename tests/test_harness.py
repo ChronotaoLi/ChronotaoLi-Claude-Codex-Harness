@@ -543,7 +543,7 @@ class ContractTests(unittest.TestCase):
         return read_json(ROOT / "examples" / "plan.json")
 
     def test_rejects_cycle_unknown_dependency_duplicate_id(self):
-        for mode in ("cycle", "unknown", "duplicate"):
+        for mode in ("cycle", "unknown", "duplicate", "folded"):
             plan = self.plan()
             second = copy.deepcopy(plan["tasks"][0])
             second["id"] = "other"
@@ -553,8 +553,10 @@ class ContractTests(unittest.TestCase):
                 second["depends_on"] = ["greet"]
             elif mode == "unknown":
                 second["depends_on"] = ["missing"]
-            else:
+            elif mode == "duplicate":
                 second["id"] = "greet"
+            else:  # one evidence directory on a case-insensitive filesystem
+                second.update(id="GREET", depends_on=["greet"])
             with self.subTest(mode=mode), self.assertRaises(HarnessError):
                 validate_plan(plan)
 

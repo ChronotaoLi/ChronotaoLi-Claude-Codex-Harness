@@ -118,6 +118,31 @@ class RegistryTests(unittest.TestCase):
         error = HarnessError("text", stop={"kind": "nonsense"})
         self.assertEqual(stops.of(error)["data"]["error_type"], "InvalidStop")
 
+    def test_omission_counts_belong_to_this_rows_list_fields(self):
+        key, base = ("provider_quota", "usage_limit"), {"role": "worker", "provider": "claude"}
+        windows = [{"bucket": f"b{n}", "used_percent": 100, "resets_at": None} for n in range(3)]
+        for bad in (-1, True, "2", 1.5, None):
+            with self.subTest(count=bad):
+                value = stops.make(*key, data={**base, "full_windows": windows, "full_windows_omitted": bad})
+                stops.validate(value)
+                self.assertEqual((value["data"]["full_windows"], value["data"]["dropped_fields"]),
+                                 (windows, ["full_windows_omitted"]))
+                self.assertNotIn("full_windows_omitted", value["data"])
+        # Only a list field of this row carries a count: not a scalar, the common dropped_fields, or another row's list.
+        for row, name in ((key, "role_omitted"), (key, "dropped_fields_omitted"),
+                          (("budget", "agent_dispatches"), "full_windows_omitted")):
+            with self.subTest(row=row, field=name), self.assertRaises(KeyError):
+                stops.make(*row, data={name: 1})
+        foreign = stops.make("budget", "agent_dispatches", data={"used": 1, "limit": 1})
+        foreign["data"]["full_windows_omitted"] = 1
+        with self.assertRaises(HarnessError):
+            stops.validate(foreign)
+        # An over-long dropped_fields is dropped like any unfit value, never shortened into a count no row accepts.
+        value = stops.make(*key, data={**base, "dropped_fields": ["x" * 4000] * 3})
+        stops.validate(value)
+        self.assertEqual(value["data"]["dropped_fields"], ["dropped_fields"])
+        self.assertEqual(stops.make(*key, data=value["data"]), value)
+
 
 class FitProperty(unittest.TestCase):
     """The whole stop value fits 32 KiB without losing its type, exit code or registered exits (code-6 review)."""
@@ -217,6 +242,75 @@ class FitProperty(unittest.TestCase):
         self.assertEqual(len(kept) + data["gaps_omitted"], len(flat))
         self.assertEqual(data["suggested_scope"], suggested)          # the exit's field is the last to shrink
         self.assertTrue(stops.project(final, "run_x")["exits"][0].startswith("resume run_x --scope='docs/**'"))
+
+    def long(self, check, start):
+        """Forty distinct items of the list type ``check``, more than any list keeps; a map has ten per key."""
+        texts = [f"item/{i}/" + "x" * 300 for i in range(start, start + 40)]
+        if check is stops._strings:
+            return texts
+        if check is stops._argv_list:
+            return [["cmd", text] for text in texts]
+        if check is stops._quota_windows:
+            return [{"bucket": text[:160], "used_percent": 100, "resets_at": None} for text in texts]
+        if check is stops._strings_map:
+            return {f"t{start + k}": texts[10 * k:10 * k + 10] for k in range(4)}
+        if check is stops._argv_map:
+            return {f"t{start + k}": [["cmd", text] for text in texts[10 * k:10 * k + 10]] for k in range(4)}
+        raise AssertionError(f"no items for {check}")
+
+    @staticmethod
+    def count(value):
+        """A list's items; a map's are the entries under all its keys, the unit ``<field>_omitted`` counts."""
+        return sum(len(entries) for entries in value.values()) if type(value) is dict else len(value)
+
+    def assertHead(self, kept, offered):
+        """A list's first items; a map's first keys, all whole but the last, which keeps its first entries."""
+        if type(offered) is list:
+            self.assertEqual(kept, offered[:len(kept)])
+            return
+        keys = list(kept)
+        self.assertEqual(keys, list(offered)[:len(keys)])
+        for key in keys[:-1]:
+            self.assertEqual(kept[key], offered[key])
+        if keys:
+            self.assertEqual(kept[keys[-1]], offered[keys[-1]][:len(kept[keys[-1]])])
+
+    def test_a_made_value_is_made_again_unchanged_and_omissions_add_up(self):
+        # Callers rebuild a stop from its own data (the quota wait's decision, the failure sample).
+        rng = random.Random(20261117)
+        rows = {key: [name for name, check in entry["data"].items() if hasattr(check, "shape")]
+                for key, entry in stops.REGISTRY.items()}
+        rows = {key: names for key, names in rows.items() if names}
+        self.assertIn(("provider_quota", "usage_limit"), rows)
+        for key, names in rows.items():
+            entry = stops.REGISTRY[key]
+            data = {name: (self.long(check, 0) if name in names else self.value(rng, check))
+                    for name, check in entry["data"].items()}
+            source = {name: self.source(rng, name) for name in entry["source"]}
+            with self.subTest(row=key):
+                made = stops.make(*key, data=copy.deepcopy(data), source=source)
+                stops.validate(made)
+                self.assertEqual((made["kind"], made["reason"]), key)
+                for name in names:
+                    self.assertHead(made["data"][name], data[name])
+                    self.assertEqual(self.count(made["data"][name]) + made["data"][f"{name}_omitted"], 40)
+                again = stops.make(*key, data=copy.deepcopy(made["data"]), source=dict(made["source"]))
+                stops.validate(again)
+                self.assertEqual(again, made)
+                # Each list grows again (a map by new keys): the count adds what this call cuts to what the input carried.
+                grown = copy.deepcopy(made["data"])
+                for name in names:
+                    more = self.long(entry["data"][name], 1000)
+                    grown[name] = {**grown[name], **more} if type(more) is dict else grown[name] + more
+                remade = stops.make(*key, data=copy.deepcopy(grown), source=dict(made["source"]))
+                stops.validate(remade)
+                self.assertEqual((remade["kind"], remade["reason"]), key)
+                for name in names:
+                    kept, offered = remade["data"][name], grown[name]
+                    self.assertHead(kept, offered)
+                    self.assertGreater(self.count(offered), self.count(kept))
+                    self.assertEqual(remade["data"][f"{name}_omitted"],
+                                     made["data"][f"{name}_omitted"] + self.count(offered) - self.count(kept))
 
 
 class LedgerStopTests(OperationCase):

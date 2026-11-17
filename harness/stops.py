@@ -55,6 +55,11 @@ def _bounded(shape, limit=LIST_BYTES, items=None):
     return check
 
 
+def _listed(entry, name):
+    """``name`` is a list-like data field of this row: the only fields that are shortened and may carry ``<name>_omitted``."""
+    return hasattr(entry["data"].get(name), "shape")
+
+
 def _strings_shape(v): return type(v) is list and all(type(x) is str and len(x) <= 4096 for x in v)
 def _argv_list_shape(v): return type(v) is list and all(type(a) is list and all(type(x) is str for x in a) for a in v)
 def _map_shape(v): return (type(v) is dict and all(_id(k) and type(x) is list
@@ -227,9 +232,6 @@ _row("unsupported_ledger", "ledger_version", 2, "台账版本不受支持", (), 
 # While a quota wait holds the lock, resume/abandon point to its record (which proves no live process).
 _row("busy", "run_lock", 3, "另一个进程持有运行锁", (("status {run}", "quota_wait_recorded"),), (),
      quota_wait_recorded=_bool, quota_wait_until=_text, quota_wait_recorded_at=_text, quota_wait_note=_text)
-# Fields of a list-like type in any row: an over-long value keeps its head and records ``<field>_omitted``.
-LIST_FIELDS = frozenset(name for entry in REGISTRY.values() for name, check in entry["data"].items()
-                        if hasattr(check, "shape"))
 
 
 def bounded(text):
@@ -323,7 +325,7 @@ def _fit(value, original_length=None):
     used = set(required_fields(value["kind"], value["reason"], data))
     used |= {item[1].lstrip("!") for item in entry["exits"] if isinstance(item, tuple)}
     lists = [name for name in reversed(list(entry["data"]))
-             if hasattr(entry["data"][name], "shape") and type(data.get(name)) in (list, dict) and data[name]]
+             if _listed(entry, name) and type(data.get(name)) in (list, dict) and data[name]]
 
     def shrink(name, minimum):
         original, items = data[name], _items(data[name])
@@ -381,21 +383,29 @@ def required_fields(kind, reason, data):
 def make(kind, reason, *, data=None, source=None):
     """Build a registered stop. Unknown combinations or field names are programming errors
     (KeyError); an unfit field value is dropped and named in ``data.dropped_fields``, an
-    over-long list keeps its head and records ``<field>_omitted``. A value that cannot fill
+    over-long list keeps its head and records ``<field>_omitted``, added to the count the
+    input already carries, so a made value can be made again. A value that cannot fill
     the exits it would list becomes ``unclassified`` instead."""
     entry = REGISTRY[(kind, reason)]
     clean_data, clean_source, dropped = {}, {}, []
     for name, value in (data or {}).items():
         check = entry["data"].get(name) or COMMON_DATA.get(name)
+        if check is None and name.endswith("_omitted") and _listed(entry, name[:-len("_omitted")]):
+            if _int(value):
+                clean_data[name] = clean_data.get(name, 0) + value
+            else:
+                dropped.append(name)
+            continue
         if check is None:
             raise KeyError(f"{kind}/{reason} has no data field {name}")
         if name == "detail" and type(value) is str:
             value = bounded(value)
         # A list keeps its longest head that passes (an unfit item ends it); a map of lists does
         # only when every key and item is well formed, else it is dropped like any unfit value.
-        if hasattr(check, "shape") and not check(value) and (type(value) is list or check.shape(value)):
+        if _listed(entry, name) and not check(value) and (type(value) is list or check.shape(value)):
             kept = _head(value, check)
-            clean_data[name + "_omitted"] = len(_items(value)) - len(_items(kept))
+            clean_data[name + "_omitted"] = (clean_data.get(name + "_omitted", 0)
+                                             + len(_items(value)) - len(_items(kept)))
             value = kept
         if check(value):
             clean_data[name] = value
@@ -525,7 +535,7 @@ def validate(value):
         raise HarnessError("停止记录字段无效")
     for name, item in value["data"].items():
         check = entry["data"].get(name) or COMMON_DATA.get(name)
-        if check is None and name.endswith("_omitted") and name[:-len("_omitted")] in LIST_FIELDS:
+        if check is None and name.endswith("_omitted") and _listed(entry, name[:-len("_omitted")]):
             check = _int
         if check is None or not check(item):
             raise HarnessError(f"停止记录字段无效：data.{name}")

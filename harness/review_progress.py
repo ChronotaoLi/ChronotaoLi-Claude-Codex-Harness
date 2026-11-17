@@ -8,7 +8,7 @@ the dispatch, so a model never writes an identity the runtime already owns.
 from copy import deepcopy
 from pathlib import PurePosixPath
 
-from . import stops
+from . import git, stops
 from .util import EvidenceError, HarnessError
 
 
@@ -128,7 +128,7 @@ def claim_gaps(result, delivered, snapshot):
         for path in claim["evidence_paths"]:
             parts = PurePosixPath(path).parts
             if (not parts or PurePosixPath(path).is_absolute() or ".." in parts
-                    or any(p in (".git", ".harness", ".codex", ".claude") for p in parts)
+                    or any(git.protected_name(p) for p in parts)
                     or path not in snapshot.get("files", {})):
                 failures.append({"code": "repair_evidence_outside_candidate", "key": key, "path": path})
     return failures

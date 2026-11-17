@@ -17,7 +17,7 @@ from .continuation import (packet as continuation_packet, prepare_continuation_r
                            publish_continuation_rejection, read_execution_guidance, read_request_rejection,
                            record_execution_guidance)
 from .shared import asset_digest, validate_mcp
-from .util import HarnessError, lock, uid, validate_command_directories
+from .util import HarnessError, fold_name, lock, uid, validate_command_directories
 
 
 class RunLifecycle(RuntimeService):
@@ -323,13 +323,15 @@ class RunLifecycle(RuntimeService):
         if "pending_revision" in self.context.run:
             plan_reference(self.context.run["pending_revision"], "pending_revision", len(history))
 
-        task_ids = set()
+        task_ids, folded_ids = set(), set()
         for index, task in enumerate(self.context.run["tasks"]):
             field = f"tasks[{index}]"
             ident = mapping(task, field).get("id")
-            if not isinstance(ident, str) or not ident or ident in task_ids:
-                fail(field + ".id 缺失、类型无效或重复")
+            # validate_plan's rule: IDs equal under fold_name name one evidence directory.
+            if not isinstance(ident, str) or not ident or fold_name(ident) in folded_ids:
+                fail(field + ".id 缺失、类型无效或重复（不区分大小写等折叠后比较）")
             task_ids.add(ident)
+            folded_ids.add(fold_name(ident))
 
         def task_reference(ident, field):
             if not isinstance(ident, str) or ident not in task_ids:

@@ -10,10 +10,16 @@ from fnmatch import fnmatchcase
 from pathlib import Path
 
 from . import stops
-from .util import HarnessError, write_json
+from .util import HarnessError, fold_name, write_json
 
 
 PROTECTED_ROOTS = frozenset((".git", ".harness", ".codex", ".claude"))
+_PROTECTED_FOLDED = frozenset(map(fold_name, PROTECTED_ROOTS))
+
+
+def protected_name(segment: str) -> bool:
+    """Whether a path segment names a protected root in any spelling that may alias it (fold_name)."""
+    return fold_name(segment) in _PROTECTED_FOLDED
 
 
 def _git_environment(binding=None):
@@ -356,7 +362,7 @@ def validate_scope_pattern(pattern: str):
     parts = pattern.split("/")
     if not pattern.strip() or "\0" in pattern or any(part in ("", ".", "..") for part in parts):
         raise HarnessError(f"无效文件范围：{pattern}")
-    if parts[0] in PROTECTED_ROOTS:
+    if protected_name(parts[0]):
         raise HarnessError(f"文件范围包含受保护路径：{pattern}")
 
 
@@ -402,7 +408,7 @@ def check_scope(repo: Path, allowed: list[str], *, binding=None, task_id=None):
         raise
     paths = changed(repo, binding=binding)
     for path in paths:
-        if path.split("/", 1)[0] in PROTECTED_ROOTS:
+        if protected_name(path.split("/", 1)[0]):
             raise ScopeViolation(f"任务修改了受保护路径：{path}", stop=stops.make("scope_violation", "protected_path", data={"path": path}, source=source))
         if not any(path_matches(path, pattern) for pattern in allowed):
             raise ScopeViolation(f"任务越界修改：{path}；允许范围：{allowed}", stop=stops.make("scope_violation", "candidate_outside_scope", data={"path": path}, source=source))

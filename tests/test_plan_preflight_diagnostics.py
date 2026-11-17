@@ -6,8 +6,8 @@ from unittest.mock import patch
 
 from harness import git
 from harness.cleanup import cleanup_run
-from harness.util import HarnessError, read_json
-from test_harness import ROOT, RepoCase
+from harness.util import HarnessError, read_json, write_json
+from test_harness import ROOT, RepoCase, cli_notice, run_cli, scratch
 from test_runtime_changes import ScriptedBackend, current_tasks, trigger_kind, revised as revised_
 
 
@@ -35,6 +35,64 @@ class PlanPreflightDiagnosticsTests(RepoCase):
         result = engine.start("Implement greet", self.plan())
         self.assertEqual(result["status"], "completed")
         self.assertFalse(any(call["role"] == "commander" for call in backend.calls))
+
+    def test_task_ids_equal_after_folding_are_refused_like_duplicates_before_a_run_exists(self):
+        # greet and GREET name one evidence directory on a case-insensitive filesystem; judged by name everywhere.
+        path = scratch(self) / "plan.json"
+        original_refs = git.git(self.repo, "show-ref")
+        original_worktrees = git.git(self.repo, "worktree", "list", "--porcelain")
+        backend = ScriptedBackend()
+        refusals = {}
+        for twin in ("greet", "GREET"):
+            with self.subTest(twin=twin):
+                plan = self.plan()
+                second = copy.deepcopy(plan["tasks"][0])
+                second.update(id=twin, depends_on=["greet"])
+                plan["tasks"].append(second)
+                write_json(path, plan)
+                code, errors = run_cli(self, backend, ["run", "Implement greet", "--plan", str(path)])
+                notice = cli_notice(errors)
+                refusals[twin] = (code, notice["kind"], notice["reason"], notice["data"], notice["exits"])
+                self.assertIn(repr(["greet", twin]), errors)
+                self.assertFalse((self.repo / ".harness" / "runs").exists())
+                self.assertEqual(git.git(self.repo, "show-ref"), original_refs)
+                self.assertEqual(git.git(self.repo, "worktree", "list", "--porcelain"), original_worktrees)
+                self.assertEqual(backend.calls, [])
+        self.assertEqual(refusals["GREET"], (2, "invalid_input", "input_schema", {"option": "--plan"}, []))
+        self.assertEqual(refusals["GREET"], refusals["greet"])
+
+    def test_a_ledger_holding_task_ids_equal_after_folding_is_refused_at_load_like_an_exact_duplicate(self):
+        # A ledger written under raw-spelling uniqueness at both enforcement points (plan admission, ledger
+        # load), as an earlier version or an edit leaves it: greet -> GREET published, paused before any worker.
+        plan = self.plan()
+        second = copy.deepcopy(plan["tasks"][0])
+        second.update(id="GREET", depends_on=["greet"])
+        plan["tasks"].append(second)
+        backend = ScriptedBackend()
+        engine = self.engine(backend)
+        with patch("harness.contracts.fold_name", str), patch("harness.run_lifecycle.fold_name", str, create=True):
+            paused = engine.start("Implement greet", plan, pause_after_plan=True)
+        self.assertEqual((paused["status"], [t["id"] for t in paused["tasks"]]), ("awaiting_approval", ["greet", "GREET"]))
+        state_file = engine.directory / "state.json"
+        folded = state_file.read_bytes()
+        exact = read_json(state_file)
+        exact["tasks"][1]["id"] = "greet"  # the control: the same ledger with an exact duplicate
+        write_json(state_file, exact)
+        refusals = {}
+        for name, raw in (("exact", state_file.read_bytes()), ("folded", folded)):
+            state_file.write_bytes(raw)
+            for argv in (["resume", paused["id"], "--approve-plan"], ["resume", paused["id"]], ["abandon", paused["id"]]):
+                with self.subTest(ledger=name, argv=argv):
+                    code, errors = run_cli(self, backend, argv)
+                    notice = cli_notice(errors)
+                    self.assertIsNotNone(notice, errors)
+                    refusals.setdefault(name, []).append(
+                        (code, notice["kind"], notice["reason"], notice["data"], notice["source"], notice["exits"]))
+                    self.assertEqual(state_file.read_bytes(), raw)
+        self.assertEqual(refusals["exact"], [(1, "evidence", "load_integrity", {}, {}, [])] * 3)
+        self.assertEqual(refusals["folded"], refusals["exact"])
+        self.assertEqual(backend.calls, [])
+        self.assertFalse((engine.directory / "verification").exists())
 
     def test_broad_scope_is_audited_without_relaxing_protected_paths(self):
         plan = self.plan()
