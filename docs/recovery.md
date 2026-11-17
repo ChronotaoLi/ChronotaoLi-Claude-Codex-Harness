@@ -14,14 +14,14 @@
 - 每个出口都沿用同一 run 的累计预算、证据和接受条件。读得出的拒绝、停止和阻断不会被丢弃；读不出否决的无效输出不是结果，由新调用重做（见[无效输出与自动重做](#无效输出与自动重做)）。同一快照上重复 `resume` 只会得到同样的停止，或消耗新的调用。
 - 出口可以是继续，也可以是保留现场后 `abandon`。`abandon` 与 `resume` 一样先经过 `load_run`：加载时核验的证据（见[证据损坏](#证据损坏)）被删改时，两者都被拒绝。
 - `resume` 使用与 `run` 相同的 `--config`。恢复时只能提高 `agent_timeout_seconds`、`verify_timeout_seconds`、`context_chars`、`claude_max_turns`（及各角色实际生效的 `claude_max_turns_by_role`）、`max_attempts`、`max_agent_dispatches`，在 `permissions.worker_commands` 追加精确 argv，或任意调整额度等待上限 `quota_wait_max_seconds`（调高、调低、设 0 关闭；事件 `resume_config_changed`）；其他配置、模型和共享资产必须与创建时一致。
-- 恢复先确认旧进程退出、核对 Git 绑定与 HEAD，再做其他事；这些检查失败时不写入任何恢复输入。例外：已返回而未登记的指挥提问在 HEAD 门禁之前完成登记（见[指挥提问、修订与范围](#指挥提问修订与范围)），之后的回答与执行仍先过 HEAD 门禁。
+- 恢复先核对共享资产与计划文件，记下 `--confirm-exited` 的确认，再确认旧进程退出、核对 Git 绑定、索引与 HEAD，之后才登记本次的其他恢复输入；这些检查失败时，答复、范围、配置放宽、环境更新、执行指导与拒绝都不写入，但同一条命令里已经保存的退出确认与审计照常保留。例外：已返回而未登记的指挥提问在 HEAD 门禁之前完成登记（见[指挥提问、修订与范围](#指挥提问修订与范围)），之后的回答与执行仍先过 HEAD 门禁。
 - 外层自动化会话的权限边界见[外层 agent 操作说明](operations.md#外层-agent-操作说明)：新增权限、预算或需求选择要向用户请求。
 
 ## 恢复选项与互斥
 
 | 选项 | 用途 |
 | --- | --- |
-| `--approve-plan` | 批准已发布、等待确认的首版；首版未发布时拒绝（`plan-unpublished`），不写任何东西 |
+| `--approve-plan` | 批准已发布、等待确认的首版；首版未发布时拒绝（`plan-unpublished`），不改写 run |
 | `--step` | 最多接受一个任务后暂停 |
 | `--confirm-exited DISPATCH_ID` | 记录操作者核实的退出确认，可重复 |
 | `--environment-update FILE` | 登记环境事实与只读检查 |
@@ -46,7 +46,7 @@
 
 “停止信息”是 `status RUN` 的 `stop.detail` 或 stderr 的第一行（节选）。每个停止都有类型 `stop.kind/stop.reason`；外层按类型选择下表的行，`stop.exits` 给出可直接执行的出口命令，`data`、`source` 给出出口所需的身份（请求号、任务、派发、原件路径与摘要）。行标识是稳定的名字，`tests/test_stop_exits.py` 用它把行与走完出口的用例绑在一起；同一类型因情形不同（例如环境阻断的两条路由）分成几行。
 
-表的读法：类型后标“（操作）”的行是本次调用被拒或失败，停止只在 stderr 与操作记录里，不写入台账；其余行写入台账（`status RUN` 可见）。这个标记说的是该行的情形，同一类型在别的情形可能落在另一个边界（例如 `command-exit`、`head-changed`）。“出口命令”一列就是登记表给出的 `stop.exits` 模板：`RUN` 换成 run ID，`{dispatch_id}` 取自 `source.dispatch_id`，`FILE`、`PATTERN` 由操作者填写；带〔`flag`〕的只在 `data.flag` 为真时列出，〔`!flag`〕只在为假时列出。“无命令出口”表示不给可执行的命令，按“操作者该做什么”处理；“非停止”的行不停止 run。
+表的读法：类型后标“（操作）”的行是本次调用被拒或失败，停止值只在 stderr 与操作记录里，不写入台账（同一条命令里此前已保存的退出确认与审计照常保留）；其余行写入台账（`status RUN` 可见）。这个标记说的是该行的情形，同一类型在别的情形可能落在另一个边界（例如 `command-exit`、`head-changed`）。“出口命令”一列就是登记表给出的 `stop.exits` 模板：`RUN` 换成 run ID，`{dispatch_id}` 取自 `source.dispatch_id`，`FILE`、`PATTERN` 由操作者填写；带〔`flag`〕的只在 `data.flag` 为真时列出，〔`!flag`〕只在为假时列出。“无命令出口”表示不给可执行的命令，按“操作者该做什么”处理；“非停止”的行不停止 run。
 
 停止在落盘、上抛或重报之前会“定稿”：加载核验重跑一次，若此刻台账或加载核验的证据已不符，最终的停止就是那次加载失败（`evidence/load_integrity` 或 `runtime_failure/io`，`data.superseded` 记下原来的停止）。进入计划待批准的保存与普通 `resume` 对它的重报同样定稿：失败时本次调用以那次加载失败结束（退出 1），不是待批准、不是 0。
 
@@ -60,9 +60,9 @@
 | --- | --- | --- | --- | --- | --- |
 | `plan-file` | `invalid_input/input_schema`（操作） | 2 | `--plan` 文件被拒绝（此时没有创建 run） | 修正计划文件后重新 `run` | 无命令出口 |
 | `plan-approval` | `plan_approval/initial_plan` | 0 | `计划等待明确批准` | 用 `status RUN --full` 审阅保存的计划；普通 `resume` 只重报同一停止（退出 0），不批准 | `status RUN --full`；`resume RUN --approve-plan` |
-| `plan-unpublished` | `invalid_input/plan_unpublished`（操作） | 2 | `首版计划尚未发布，--approve-plan 无可批准的计划` | `--approve-plan` 只批准已发布的首版；首版持有或尚未登记时先处理它（扩大范围、拒绝或普通 `resume`），进入计划待批准后再批准。被拒的调用不写任何东西 | `status RUN` |
+| `plan-unpublished` | `invalid_input/plan_unpublished`（操作） | 2 | `首版计划尚未发布，--approve-plan 无可批准的计划` | `--approve-plan` 只批准已发布的首版；首版持有或尚未登记时先处理它（扩大范围、拒绝或普通 `resume`），进入计划待批准后再批准。被拒的调用不改写 run | `status RUN` |
 | `plan-outside-scope` | `invalid_input/plan_outside_scope`（操作） | 2 | `--plan` 的模式无法证明在 `--scope` 声明的边界内（`data.gaps`、`data.suggested_scope`；此时没有创建 run、台账或工作树） | 修正计划，或调整 `--scope` 后重新 `run` | 无命令出口 |
-| `scope-pattern` | `invalid_input/scope_pattern`（操作） | 2 | `--scope` 的条目不是具体路径、字面子树 `p/…/**` 或 `**`，或以受保护根开头（`data.patterns` 列出被拒的条目；整批拒绝，什么都不写） | 改成合法形式后重试；一般 glob 的缺口用停止信息给出的建议条目 | 无命令出口 |
+| `scope-pattern` | `invalid_input/scope_pattern`（操作） | 2 | `--scope` 的条目不是具体路径、字面子树 `p/…/**` 或 `**`，或以受保护根开头（`data.patterns` 列出被拒的条目；整批拒绝，不创建或改写 run） | 改成合法形式后重试；一般 glob 的缺口用停止信息给出的建议条目 | 无命令出口 |
 | `plan-approval-after-capacity` | `budget/context_capacity` | 3 | 带 `--pause-after-plan` 启动后，计划的整体审阅必要上下文超过预算（计划已登记、尚未批准） | 提高 `context_chars`；之后普通 `resume` 重新预检，通过即进入计划待批准（退出 0），未提高时仍是同一停止 | `resume RUN`；`abandon RUN` |
 | `commands-all-ready` | `missing_commands/all_ready_tasks` | 3 | `任务所需命令尚未授权`（全部就绪任务都缺），或 `missing_command_requirements` 非空 | 在 `permissions.worker_commands` 追加精确 argv；`git_query` 形式表内的 Git 查询无需授权；停止期间不扣尝试与派发预算 | `resume RUN` |
 | `commands-selected` | `missing_commands/selected_task` | 3 | 已选中的任务（待派发指令保留）在派发前缺少命令授权 | 同上；授权后同一指令派发，不重新决定 | `resume RUN` |
@@ -73,7 +73,7 @@
 | `operator-answer` | `operator_decision/answer_required` | 3 | `等待操作者决定：task_id=… request_id=…` | 从 `pending_decisions` 读问题与来源，做出选择；指挥提问（种类 `commander`）也是这一行，未答或答 stop 时不调度任何模型 | `resume RUN --operator-decision FILE`；〔`reverify_available`〕`resume RUN --operator-decision FILE --reverify` |
 | `operator-answer-reverify` | `operator_decision/answer_required`（`reverify_available=true`） | 3 | 整体验证普通失败（不是超时）后指挥就此提问 | 修复环境后一次完成答复与同一快照重验；整体审阅的拒绝不给这条出口 | `resume RUN --operator-decision FILE`；〔`reverify_available`〕`resume RUN --operator-decision FILE --reverify` |
 | `ask-head-changed` | `workspace_mismatch/head_changed`（`question_registered=true`） | 1 | 指挥提问期间 HEAD 被改：提问已登记，但恢复门禁先拒绝改动的 HEAD | 先恢复 HEAD（未恢复时答复被 HEAD 门禁拒绝），再答复 | `resume RUN`；`abandon RUN`；〔`question_registered`〕`resume RUN --operator-decision FILE` |
-| `decision-conflict` | `invalid_input/conflicting_retry`（操作） | 2 | 提交多个决定时中断，之后换序重交出现 `immutable decision artifact conflict` | 用原来的文件、按原来的顺序重新提交（被拒的重交不写任何文件） | 无命令出口 |
+| `decision-conflict` | `invalid_input/conflicting_retry`（操作） | 2 | 提交多个决定时中断，之后换序重交出现 `immutable decision artifact conflict` | 用原来的文件、按原来的顺序重新提交（被拒的重交不写任何答复文件，也不登记答复） | 无命令出口 |
 | `operator-stopped` | `operator_decision/operator_stopped` | 3 | `操作者已决定停止：request_id=…` | 要继续就对同一请求提交新的 continue | `resume RUN --operator-decision FILE` |
 | `scope-revision` | `scope_extension/revision` | 3 | `指挥修订有模式无法证明在范围边界内（当前规则无法证明包含）：{…}；提案已持有，未调用模型` | 提案已判定合格、只缺范围：回执保留，普通 `resume` 只重报同一停止（同一 `request_id`，不调用模型）。核对 `data.gaps` 与 `data.suggested_scope`（建议条目可能比缺口宽，`data.widened` 标出；完整缺口见 `status RUN` 的 `scope.held`）后执行扩大命令，同一原件随后落地；或拒绝它（文件 `{request_id, reason}`，`request_id` 取 `source.request_id`），下一次指挥决定带 `rejected_revision` | 〔`suggested_scope`〕`resume RUN {suggested_scope:scope_args}`；`resume RUN --reject-request FILE`；`status RUN` |
 | `scope-initial-plan` | `scope_extension/initial_plan` | 3 | `指挥首版计划有模式无法证明在范围边界内…；提案已持有，未调用模型` | 同上；首版尚未发布，`--approve-plan` 被拒（`plan-unpublished`）。扩大后首版发布（带 `--pause-after-plan` 时进入计划待批准）；拒绝时这份首版预写过的计划文件归档到 `plans/rejected/` | 〔`suggested_scope`〕`resume RUN {suggested_scope:scope_args}`；`resume RUN --reject-request FILE`；`status RUN` |
@@ -91,7 +91,7 @@
 | `provider-overloaded` | `provider_failure/overloaded` | 3 | 供应商过载（`api_error=overloaded_error`） | 稍后普通 `resume`；worker 不计工作尝试 | `resume RUN` |
 | `provider-authentication` | `provider_failure/authentication` | 3 | 账号认证或权限失败（`api_error` 为 `authentication_error` 或 `permission_error`） | 用 `doctor` 核对登录，修复后普通 `resume`；worker 不计工作尝试 | `doctor`；`resume RUN` |
 | `provider-failed` | `provider_failure/invocation_failed` | 3 | 模型调用失败，CLI 信封报告了其他错误（计一次工作尝试） | 修复原因；worker 的这次调用已当场判定为可重试 | `resume RUN` |
-| `provider-unknown` | `provider_failure/unknown` | 3 | 模型调用失败，原因未识别：没有进程记录或记录不完整、没有错误信封、Codex 的任何失败（计一次工作尝试） | 修复原因 | `resume RUN` |
+| `provider-unknown` | `provider_failure/unknown` | 3 | 模型调用失败，原因未识别：没有进程记录或记录不完整、没有错误信封，或 Codex 角色的调用失败（Codex 不读信封；超时与启动失败仍按进程事实分别是 `agent-timeout`、`provider-start`）；worker 计一次工作尝试 | 修复原因 | `resume RUN` |
 | `provider-start` | `provider_failure/local_start` | 3 | 模型 CLI 未能启动 | 恢复 CLI 后普通 `resume`（新的计费尝试） | `resume RUN` |
 | `unsealed-return` | `evidence/unsealed_return` | 1 | `worker return interrupted before immutable seal; …; automatic retry forbidden`：输出能解码成对象结果，但没有封存——封存之前中断、CLI 非零退出、或封存前的本地检查失败（例如 worker 写了受保护的 `.harness`、或改了工作树的 Git 绑定；原因在派发条目的 `error`，恢复预检另行报告绑定变化）；当场判定与恢复时都停在这里 | `--confirm-exited` 解不开；保留证据后放弃 | `abandon RUN` |
 | `unsealed-unknown` | `evidence/unsealed_unknown` | 1 | 同上：返回证据互相冲突、超过读取上限或字节无法严格解码（判为 unknown）；解不出对象结果的输出不会停在这里，读文件时的系统错误也不会（见 `runtime-io`） | 同上 | `abandon RUN` |
@@ -132,7 +132,7 @@
 | `unclassified-exception` | `unclassified/unexpected_exception` | 1 | 未预期的异常 | 同上 | 无命令出口 |
 | `interrupted` | `interrupted/signal` | 130 | Ctrl-C、SIGTERM、SIGHUP | 确认中断原因；普通 `resume` 报出需要确认退出的确切派发 | `resume RUN`；〔`exits_confirmed`〕`abandon RUN` |
 | `input-arguments` | `invalid_input/cli_arguments`（操作） | 2 | 命令参数无效（例如 run ID 形式无效、run 不存在、目标为空） | 修正参数后重试 | 无命令出口 |
-| `input-file` | `invalid_input/input_schema`（操作） | 2 | 输入文件不合格（`--operator-decision`、`--environment-update`、`--execution-guidance`、`--reject-request`、`prepare-run --manifest`），含文件不存在、读不出、不是 UTF-8 或不是 JSON | 修正文件后重试；读取与解析在任何写入之前，这些拒绝不改写台账（内容合法而之后的状态检查拒绝的，见各选项） | 无命令出口 |
+| `input-file` | `invalid_input/input_schema`（操作） | 2 | 输入文件不合格（`--operator-decision`、`--environment-update`、`--execution-guidance`、`--reject-request`、`prepare-run --manifest`），含文件不存在、读不出、不是 UTF-8 或不是 JSON | 修正文件后重试。`--operator-decision`、`--execution-guidance`、`--reject-request` 与 `prepare-run --manifest` 的读取与解析在任何写入之前，这些拒绝不改写台账；`--environment-update` 的文件在退出确认之后才读取，同一条命令里先前保存的 `--confirm-exited` 确认与审计会保留，其他恢复输入都不写入（内容合法而之后的状态检查拒绝的，见各选项） | 无命令出口 |
 | `options` | `invalid_input/incompatible_options`（操作） | 2 | 选项不能同用（见[恢复选项与互斥](#恢复选项与互斥)） | 拆成合法的组合后重试 | 无命令出口 |
 | `stale-request` | `invalid_input/stale_request`（操作） | 2 | 输入针对的请求或来源已失效（未知请求、之后已有模型调用、已被新答复取代；`--reject-request` 的 `request_id` 不是已判定合格而未落地的提案或当前续作） | 用 `status RUN` 读当前请求后重答 | `status RUN` |
 | `run-state` | `invalid_input/run_state`（操作） | 2 | 该命令或选项不适用于 run 的当前状态（已放弃、已完成、有待处理阶段） | 用 `status RUN` 核对状态 | `status RUN` |
@@ -141,7 +141,7 @@
 
 ### 计划批准与分步
 
-`run "目标" --pause-after-plan` 保存计划后进入 `awaiting_approval`。启动时可以用 `--scope PATTERN`（可重复）声明范围边界，首版计划受它约束（见[指挥提问、修订与范围](#指挥提问修订与范围)）；启动后才第一次声明时，尚未发布的首版同样受约束。`status RUN` 在等待首版批准时给出 `scope_summary`：每个任务的具体路径与通配模式计数、按顶层目录分组的模式（分组只做导航）及各自是否在边界内（未声明时为 `null`）；“在边界内”是确定性检查，“足以满足验收”仍要人判断。普通 `resume` 不会批准，它返回 0 并重报同一个 `plan_approval/initial_plan` 停止；未批准但处于其他状态（例如计划登记后、待批准保存前被中断）的 run，普通 `resume` 重新经过预检后进入待批准；`resume RUN --approve-plan` 批准已发布的首版后继续，可与 `--step` 合用；首版尚未发布时（首版持有、规划提问未答，或首版登记之前中断）它被拒绝且不写任何东西。规划阶段的指挥提问先于计划批准，`--approve-plan` 不回答提问。`--step` 最多接受一个任务后进入 `paused`，最后一个任务之后仍执行整体验收。批准不授予命令权限。
+`run "目标" --pause-after-plan` 保存计划后进入 `awaiting_approval`。启动时可以用 `--scope PATTERN`（可重复）声明范围边界，首版计划受它约束（见[指挥提问、修订与范围](#指挥提问修订与范围)）；启动后才第一次声明时，尚未发布的首版同样受约束。`status RUN` 在等待首版批准时给出 `scope_summary`：每个任务的具体路径与通配模式计数、按顶层目录分组的模式（分组只做导航）及各自是否在边界内（未声明时为 `null`）；“在边界内”是确定性检查，“足以满足验收”仍要人判断。普通 `resume` 不会批准，它返回 0 并重报同一个 `plan_approval/initial_plan` 停止；未批准但处于其他状态（例如计划登记后、待批准保存前被中断）的 run，普通 `resume` 重新经过预检后进入待批准；`resume RUN --approve-plan` 批准已发布的首版后继续，可与 `--step` 合用；首版尚未发布时（首版持有、规划提问未答，或首版登记之前中断）它被拒绝，不改写 run。规划阶段的指挥提问先于计划批准，`--approve-plan` 不回答提问。`--step` 最多接受一个任务后进入 `paused`，最后一个任务之后仍执行整体验收。批准不授予命令权限。
 
 ### 命令授权与前置命令
 
