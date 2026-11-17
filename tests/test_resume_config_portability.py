@@ -201,7 +201,7 @@ class ResumeConfigurationFilesTests(RepoCase):
             "budget lowered by the project file": lambda: self.project.write_bytes(
                 project + b"\n[runtime]\nmax_attempts = 4\n"),
             "reviewer model": lambda: self.operator.write_bytes(
-                operator.replace(b'model = "gpt-6.1-sol"', b'model = "gpt-6.1-sol-other"')),
+                operator.replace(b'model = "gpt-6.2-sol"', b'model = "gpt-6.2-sol-other"')),
             "memory expiry": lambda: self.operator.write_bytes(
                 operator.replace(b"task_ttl_days = 180", b"task_ttl_days = 90")),
         }

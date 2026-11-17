@@ -613,7 +613,7 @@ class ContextMemoryTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.memory = Memory(Path(self.temp.name) / "memory.sqlite3")
 
-    def remember(self, key="model", text="Use gpt-6-astra", ttl=None):
+    def remember(self, key="model", text="Use gpt-6.2-astra", ttl=None):
         return self.memory.remember(key=key, abstract="模型选择", overview=text, detail="证据 " + text, source="operator", ttl_days=ttl)
 
     def test_supersession_retains_history_and_retrieves_current(self):
@@ -622,7 +622,7 @@ class ContextMemoryTests(unittest.TestCase):
         self.assertFalse(self.memory.read(old)["active"])
         self.assertEqual(self.memory.read(new)["supersedes"], old)
         self.assertEqual(self.memory.search("模型选择")[0]["id"], new)
-        self.assertEqual(self.memory.search("gpt-6-astra"), [])
+        self.assertEqual(self.memory.search("gpt-6.2-astra"), [])
 
     def test_expiry_filters_recall_without_deleting_history(self):
         ident = self.remember(ttl=1)

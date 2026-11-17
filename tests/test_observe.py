@@ -19,10 +19,10 @@ from harness.util import read_json, write_json
 from harness.versions import RUN_SCHEMA_VERSION
 from test_harness import RepoCase
 
-ROLES = {"commander": {"cli": "codex", "model": "gpt-6-astra", "effort": "high"},
+ROLES = {"commander": {"cli": "codex", "model": "gpt-6.2-astra", "effort": "high"},
          "fable": {"cli": "claude", "model": "claude-fable-5-2", "effort": "high"},
          "worker": {"cli": "claude", "model": "claude-opus-5-5", "effort": "high"},
-         "reviewer": {"cli": "codex", "model": "gpt-6.1-sol", "effort": "high"}}
+         "reviewer": {"cli": "codex", "model": "gpt-6.2-sol", "effort": "high"}}
 
 
 def ledger(run_id, **fields):
@@ -224,14 +224,14 @@ class ProviderModelTests(StateCase):
         rows = [dispatch(role="commander", kind="plan", task_id="planning"),
                 dispatch(), dispatch(role="reviewer", kind="review"),
                 dispatch(provider_usage={"provider": "codex", "completed_turns": 1})]
-        for commander, expected in (("astra", ("codex", "gpt-6-astra")), ("fable", ("claude", "claude-fable-5-2"))):
+        for commander, expected in (("astra", ("codex", "gpt-6.2-astra")), ("fable", ("claude", "claude-fable-5-2"))):
             with self.subTest(commander=commander):
                 detail, by_id = self.rows(ledger("run_" + commander, commander=commander, dispatches=rows))
                 self.assertEqual((by_id[rows[0]["id"]]["provider"], by_id[rows[0]["id"]]["model_id"]), expected)
                 self.assertEqual((by_id[rows[1]["id"]]["provider"], by_id[rows[1]["id"]]["model_id"]),
                                  ("claude", "claude-opus-5-5"))
                 self.assertEqual((by_id[rows[2]["id"]]["provider"], by_id[rows[2]["id"]]["model_id"]),
-                                 ("codex", "gpt-6.1-sol"))
+                                 ("codex", "gpt-6.2-sol"))
                 self.assertEqual((by_id[rows[3]["id"]]["provider"], by_id[rows[3]["id"]]["model_id"]),
                                  ("codex", "claude-opus-5-5"))  # usage provider wins; model stays configured
                 self.assertNotIn("model_id", detail["unavailable"])
