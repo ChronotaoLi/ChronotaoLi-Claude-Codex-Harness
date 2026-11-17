@@ -1290,20 +1290,32 @@ APP_JS = r""""use strict";
     var latest = credits.latest || {};
     var node = el("div", "quota-credits");
     attr(node, "data-credits", limit);
-    var head;
+    // Each balance is its own element holding the reported decimal string as it is.
+    function amount(role, text) { return attr(el("span", "mono", text), "data-balance", role); }
+    var head = el("p", "metric-value");
     if (latest.unlimited === true) {
-      head = "credits（" + limit + "）：unlimited，不计算差值";
+      put(head, "credits（" + limit + "）：unlimited，不计算差值");
     } else if (typeof latest.balance !== "string") {
-      head = "credits（" + limit + "）：余额未报告";
+      put(head, "credits（" + limit + "）：余额未报告");
     } else {
-      head = "credits 余额（" + limit + "，最近观测 " + show(latest.observed_at) + "）：" + latest.balance;
+      put(head, "credits 余额（" + limit + "，最近观测 " + show(latest.observed_at) + "）：");
+      head.appendChild(amount("latest", latest.balance));
     }
-    node.appendChild(el("p", "metric-value", head));
+    node.appendChild(head);
     (credits.runs || []).forEach(function (run) {
-      var text = run.observations === 1 ? "运行期间只有一个余额观测：" + run.first :
-        "运行期间净变化 " + (typeof run.net_change === "string" ? run.net_change : "变化未知") +
-        "（" + run.first + " → " + run.last + "，含充值、赠送、过期；不是消费账单）";
-      var item = el("p", "metric-note", text);
+      var item = el("p", "metric-note");
+      if (run.observations === 1) {
+        put(item, "运行期间只有一个余额观测：");
+        item.appendChild(amount("first", run.first));
+      } else {
+        put(item, "运行期间净变化 ");
+        item.appendChild(amount("net", typeof run.net_change === "string" ? run.net_change : "变化未知"));
+        put(item, "（");
+        item.appendChild(amount("first", run.first));
+        put(item, " → ");
+        item.appendChild(amount("last", run.last));
+        put(item, "，含充值、赠送、过期；不是消费账单）");
+      }
       attr(item, "data-net-change", typeof run.net_change === "string" ? run.net_change : "unknown");
       node.appendChild(item);
     });
@@ -1319,7 +1331,12 @@ APP_JS = r""""use strict";
       return box;
     }
     if (name === "codex") {
-      Object.keys(entry.credits || {}).forEach(function (limit) { box.appendChild(quotaCredits(limit, entry.credits[limit])); });
+      var limits = Object.keys(entry.credits || {});
+      limits.forEach(function (limit) { box.appendChild(quotaCredits(limit, entry.credits[limit])); });
+      if (!limits.length && entry.state === "available") {
+        // No available sample reported credits at all: say so instead of leaving a blank.
+        box.appendChild(attr(el("p", "metric-value", "credits：余额未报告"), "data-credits", "unreported"));
+      }
     }
     var reasons = quotaReasons(entry.unavailable);
     if (entry.state === "all_unavailable") {

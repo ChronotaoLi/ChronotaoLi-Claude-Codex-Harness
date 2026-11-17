@@ -6,6 +6,7 @@ They check progressive disclosure, tab keyboard navigation, UI-state retention a
 same-run event refreshes, prominence of actionable problems and projection semantics.
 """
 import json
+import re
 import shutil
 import subprocess
 import tempfile
@@ -623,6 +624,8 @@ class DashboardPresentationTests(unittest.TestCase):
   section = await panelOf("codex_only");
   assert.ok(visibleText(one(attrIs("data-quota-provider", "claude"))).includes("没有样本"));
   assert.ok(visibleText(one(attrIs("data-quota-provider", "codex"))).includes("10%（只有一个观测）"));
+  // No available sample reported credits: the card says so instead of leaving it blank.
+  assert.equal(visibleText(one(attrIs("data-credits", "unreported"))), "credits：余额未报告");
   section = await panelOf("all_unavailable");
   const text = visibleText(section);
   assert.ok(text.includes("全部 3 个样本不可用：timeout×2、exited×1"));
@@ -630,8 +633,41 @@ class DashboardPresentationTests(unittest.TestCase):
   assert.ok(text.includes("较早样本未读取"), "the first segment's start is incomplete");
   section = await panelOf("unknown");
   const change = one(attrIs("data-net-change", "unknown"));
-  assert.ok(change.textContent.includes("变化未知"));
-  assert.ok(!/净变化 0/.test(change.textContent), "unknown is never shown as zero");
+  assert.equal(one(attrIs("data-balance", "net"), change).textContent, "变化未知", "unknown is never shown as zero");
+  assert.equal(all(attrIs("data-credits", "unreported")).length, 0, "credits were reported here");
+''')
+
+    def test_high_precision_balances_are_shown_verbatim_element_by_element(self):
+        from test_quota_view import T, codex
+        small = "0.123456789012345678901234567891"                                  # 30 decimals
+        negative = "-999999999999999999999999999999.999999999999999999999999999999"  # 30 + 30 digits, other sign
+        large = "123456789012345678901234567890.000000000000000000000000000001"
+        view = quota_block([codex(T, credits=(False, small)), codex(T + 10, credits=(False, negative)),
+                            codex(T + 20, credits=(True, "5")), codex(T + 30, credits=(False, large))])
+        runs = view["providers"]["codex"]["credits"]["codex"]["runs"]
+        expected = {"latest": large, "first": small, "last": negative, "net": runs[0]["net_change"], "single": large}
+        self.assertEqual(expected["net"], "-1000000000000000000000000000000.123456789012345678901234567890")
+        self.assertEqual([(run["observations"], run["net_change"]) for run in runs], [(2, expected["net"]), (1, None)])
+        data = {"detail": detail("run_precise", "Precise", quota_view=view), "expected": expected}
+        self.run_browser(data, r'''
+  navigate("#/runs/run_precise");
+  await respond("/api/runs/run_precise", D.detail);
+  fire(one(attrIs("data-tab", "budget")), "click");
+  const credits = one(attrIs("data-credits", "codex"));
+  // Each value is compared verbatim in its own element, never searched for in the card's text.
+  assert.equal(one(attrIs("data-balance", "latest"), credits).textContent, D.expected.latest);
+  const rows = all(function (n) { return typeof n.getAttribute === "function" && n.getAttribute("data-net-change") !== null; },
+                   credits);
+  assert.equal(rows.length, 2);
+  assert.equal(rows[0].getAttribute("data-net-change"), D.expected.net);
+  assert.equal(one(attrIs("data-balance", "net"), rows[0]).textContent, D.expected.net);
+  assert.equal(one(attrIs("data-balance", "first"), rows[0]).textContent, D.expected.first);
+  assert.equal(one(attrIs("data-balance", "last"), rows[0]).textContent, D.expected.last);
+  // A run of one observation shows that balance and no change.
+  assert.equal(rows[1].getAttribute("data-net-change"), "unknown");
+  assert.equal(one(attrIs("data-balance", "first"), rows[1]).textContent, D.expected.single);
+  assert.equal(all(attrIs("data-balance", "net"), rows[1]).length, 0);
+  assert.ok(visibleText(rows[1]).startsWith("运行期间只有一个余额观测："));
 ''')
 
     def test_balances_stay_text_in_the_page_script(self):
@@ -640,6 +676,8 @@ class DashboardPresentationTests(unittest.TestCase):
         script = APP_JS[start:APP_JS.index("function budgetPanel")]
         for conversion in ("Number(", "parseFloat(", "parseInt(", "+run.", "+latest.", "toFixed("):
             self.assertNotIn(conversion, script)
+        # A supplement only: the element-by-element test above is what catches any conversion.
+        self.assertIsNone(re.search(r"(Number|parseFloat|parseInt)\s*\(|(balance|first|last|net_change)\s*[-*/]", script))
 
     def test_budget_panel_shows_attempt_sum_without_run_wide_limit(self):
         data = {"current": detail("run_new", "Current")}

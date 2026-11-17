@@ -216,13 +216,16 @@ class LifecycleTests(SamplingCase):
         self.assertEqual(self.sample(engine, "codex-completed.json")["reason"], "probe_disabled")
 
     def test_a_sample_write_failure_is_an_observation_gap(self):  # L6
+        reference = self.engine(self.backend())
+        base = self.decisions(reference.start("Implement greet", plan()), reference.directory)
         engine = self.engine(self.backend())
         with patch("harness.quota.publish_new_json", side_effect=OSError("synthetic")):
-            self.assertEqual(engine.start("Implement greet", plan())["status"], "completed")
+            result = engine.start("Implement greet", plan())
+        self.assertEqual(self.decisions(result, engine.directory), base)   # the same run, decision for decision
         sampled = self.events(engine)
         self.assertEqual([(record["sample"], record["write_error"]) for record in sampled], [(None, "OSError")] * 4)
         self.assertEqual(self.names(engine), [])
-        self.assertEqual(len(self.probe_dirs.paths), 4)   # four probes ran; tearDown checks each left nothing
+        self.assertEqual(len(self.probe_dirs.paths), 8)   # four probes per run; tearDown checks each left nothing
 
     def test_an_interrupt_in_the_first_probe_stops_before_the_dispatch_exists(self):  # L7
         calls = quota_stubs.install(self, claude="sigint_parent")

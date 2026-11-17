@@ -9,6 +9,7 @@ import os
 import signal
 import subprocess
 import tempfile
+import threading
 import time
 import unittest
 from datetime import datetime, timezone
@@ -372,6 +373,38 @@ class OwnershipWindowTests(ProbeCase):
                     quota.snapshot("codex", environment())
                 self.assertEqual(len(calls.children("codex")), 1)
                 self.assert_clean(calls, temp, "codex")
+
+
+class InterruptLatencyTests(ProbeCase):
+    def test_an_interrupt_while_waiting_for_output_propagates_within_a_checkpoint(self):
+        # Stubs that read and never answer: only the read loop's checkpoint can act on the signal
+        # before the 5 s query deadline. The bound is loose for slow machines.
+        for provider in ("claude", "codex"):
+            with self.subTest(provider=provider):
+                calls = quota_stubs.install(self, **{provider: "hang"})
+                temp = TrackTemp(self)
+                sent = []
+
+                def interrupt_once_reading():
+                    until = time.monotonic() + 10
+                    while time.monotonic() < until and not (calls.probes(provider) and
+                                                             (provider == "claude" or calls.rpc())):
+                        time.sleep(0.01)
+                    time.sleep(0.2)   # the probe is waiting in its read loop
+                    sent.append(time.monotonic())
+                    os.kill(os.getpid(), signal.SIGINT)
+                sender = threading.Thread(target=interrupt_once_reading)
+                sender.start()
+                try:
+                    with self.assertRaises(KeyboardInterrupt):
+                        quota.snapshot(provider, environment())
+                    raised = time.monotonic()
+                finally:
+                    sender.join()
+                self.assertEqual(len(sent), 1)
+                self.assertLess(raised - sent[0], 2.0)
+                self.assertLess(raised - sent[0], quota.QUERY_SECONDS)
+                self.assert_clean(calls, temp, provider)
 
 
 class SignalVerdictTests(ProbeCase):

@@ -189,7 +189,7 @@ run 列表 → run 详情 → 文件查看。列表按最近事件排序，以�
 
 ### 额度
 
-**样本。** 真实 `CLIBackend` 的 `run`／`resume` 在这些时刻各取一份账号额度快照（不调用模型）：本进程首次用到某供应商之前（`before_use`），额度失败之后、判断是否等待或停止之前（`quota_failure`），额度等待醒来之后（`wake`），以及停止、暂停、完成、等待批准确已保存之后，对本进程用过的供应商各一份（`stop`、`paused`、`completed`、`awaiting_approval`）；不计额度等待时每次至多 5 份，额度等待每等一次另加一份失败样本与一份醒来样本（受派发预算约束）。`demo` 与离线后端不采样。探测：Claude 是 `claude -p /usage --output-format stream-json --verbose --no-session-persistence --setting-sources "" --strict-mcp-config --max-turns 1`，必须读到零调用的结果行（`num_turns`、`total_cost_usd`、`duration_api_ms` 为 0，`local_command` 为 `usage`），读不到就在本进程停用 Claude 探测；Codex 是 `codex app-server` 的三条 JSON-RPC 消息（`initialize`、`initialized`、`account/rateLimits/read`）。两者都在空临时目录、用与模型调用相同的环境运行，5 秒查询时限，收尾时整个进程组 SIGTERM 后 SIGKILL；探测期间按 Ctrl-C，中断在约 0.1 秒内或收尾完成之后传播，临时目录与进程组照样清理。
+**样本。** 真实 `CLIBackend` 的 `run`／`resume` 在这些时刻各取一份账号额度快照（不调用模型）：本进程首次用到某供应商之前（`before_use`），额度失败之后、判断是否等待或停止之前（`quota_failure`），额度等待醒来之后（`wake`），以及停止、暂停、完成、等待批准确已保存之后，对本进程用过的供应商各一份（`stop`、`paused`、`completed`、`awaiting_approval`）；不计额度等待时每次至多 5 份，额度等待每等一次另加一份失败样本与一份醒来样本（受派发预算约束）。`demo` 与离线后端不采样。探测：Claude 是 `claude -p /usage --output-format stream-json --verbose --no-session-persistence --setting-sources "" --strict-mcp-config --max-turns 1`，必须读到零调用的结果行（`num_turns`、`total_cost_usd`、`duration_api_ms` 为 0，`local_command` 为 `usage`），读不到就在本进程停用 Claude 探测；Codex 是 `codex app-server` 的三条 JSON-RPC 消息（`initialize`、`initialized`、`account/rateLimits/read`）。两者都在空临时目录、用与模型调用相同的环境运行，5 秒查询时限，收尾时整个进程组 SIGTERM 后 SIGKILL；探测期间按 Ctrl-C，读写中的探测在约 0.1 秒内由检查点转为中断，其余时刻在收尾完成之后传播（收尾计时至多 3 秒），临时目录与进程组照样清理。
 
 样本写在 `runs/<id>/observations/quota/`，文件名 `r<修订>-p<相位>-<进程启动时刻>-s<序号>-<供应商>-<触发>.json` 就是它们的顺序，排他发布、从不覆盖，只存归一化字段（窗口的已用百分比与重置时刻、Codex 的 credits 余额原样字符串、`extra_usage`、进程事实），不存 CLI 原始输出或错误文字。探测失败只记“不可用＋原因”：`not_installed`、`timeout`、`output_limit`、`exited`、`provider_error`、`shape_mismatch`、`not_zero_call`、`probe_disabled`、`internal_error`；从不改变调度、预算、回执与接受，用户中断照常传播。
 
@@ -199,9 +199,9 @@ run 列表 → run 详情 → 文件查看。列表按最近事件排序，以�
 - 每个额度桶分开：Claude 按 `kind` 与 scope（`weekly_all` 与各个 `weekly_scoped（模型显示名）` 各是一个桶，无关模型的周窗口到 100% 也只是它自己那一行）；Codex 按 limit、槽位与样本报告的窗口长度（不把 `primary` 当成固定的 5 小时窗口）。桶与桶不相加，两家不合成总数，输出里没有任何合计。单位是百分点。
 - 每个桶写最近观测（不是“当前”）、观测时间与下次重置时刻，再按重置周期分段，只在同一周期内给首尾差：一段以首个观测的有效重置时刻为锚点；之后的观测时刻达到或越过 min(锚点, 上一份的重置时刻) 就是新周期，重置时刻与锚点相差超过容差也是新周期（与锚点比，连续的小漂移也会累积分段）。容差为 min(120 秒, 窗口长度的 1/60)，窗口长度未知（Claude）时 60 秒；三个取值是设计值，待真实联调复核。
 - 一份观测报告的重置时刻只有晚于它自己的观测时刻才算有效：已经过期的值不作锚点、不参与同周期判断与差值，该段的变化为未知，标“报告的重置时刻已过期”。
-- 不跨段相减，不假定旧周期用到 100%。只有一个观测、或有效重置时刻未知的段，变化写“变化未知”（不当作 0）。段内下降照算并标“下降（修正或异常）”；因重置时刻偏离锚点而分出的新段标“重置时刻在周期内改变”。
+- 不跨段相减，不假定旧周期用到 100%。有效重置时刻未知、有多个观测的段，变化写“变化未知”；只有一个观测的段写“只有一个观测”；两者都不当作 0。段内下降照算并标“下降（修正或异常）”；因重置时刻偏离锚点而分出的新段标“重置时刻在周期内改变”。
 - 不完整的段写明原因：首个可用观测（之前的样本不可用或没有这个桶，不称“run 开始值”）、较早样本未读取（读取端截掉了更早的样本）、重置之后、重置之前、之后的样本不可用或未报告。不可用的样本不打断分段，只计入每家的不可用原因计数。
-- Codex 的 credits 放在卡片第一行：最近观测的余额（原样十进制字符串），以及运行期间的净变化——连续的、有余额且不是 unlimited 的观测为一段，用独立的 64 位十进制上下文精确相减（对 Inexact、Rounded 等设陷阱，结果是字符串；陷阱触发或只有一个观测时为 null，显示“变化未知”）；净变化含充值、赠送、过期，不是消费账单，不加货币符号。unlimited 时不计算差值，余额未报告时写“余额未报告”；某份样本没有报告 credits 不断开一段。
+- Codex 的 credits 放在卡片第一行：最近观测的余额（原样十进制字符串），以及运行期间的净变化——连续的、有余额且不是 unlimited 的观测为一段，用独立的 64 位十进制上下文精确相减（对 Inexact、Rounded 等设陷阱，结果是字符串；陷阱触发时为 null，显示“变化未知”；一段只有一个余额观测时也为 null，显示“只有一个余额观测”）；净变化含充值、赠送、过期，不是消费账单，不加货币符号。unlimited 时不计算差值，余额未报告时写“余额未报告”（可用样本都没有报告 credits 时也这样写；`status` 的 JSON 里此时 `credits` 是空对象，不补造条目）；某份样本没有报告 credits 不断开一段。
 - 样本时刻倒退（时钟回拨）时标出，先后仍按台账修订排序；损坏、超大或名实不符的样本计入 `damaged_count` 并跳过；截掉的较早样本计入 `omitted`，第一段的开头标为不完整。`--full` 只打印台账，不带 `quota`。
 
 不保证：两个接口都是 experimental，没有做过真实联调；整数百分比能反映每次调用的消耗；跨重置没有缺口；credits 的净变化等于消费；账号没有被切换；运行中的显示是新鲜的（一次长调用里可能停留在开始时的值，页面写观测时刻）。
