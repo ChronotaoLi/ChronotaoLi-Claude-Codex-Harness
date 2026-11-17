@@ -81,6 +81,23 @@ class QuotaFailingBackend(DemoBackend):
         return backend.invoke(**kwargs)
 
 
+class TypedCodexQuota(QuotaFailingBackend):
+    """The Codex reviewer fails with a typed usage-limit stop (none is produced today); the rest is the offline demo."""
+
+    def invoke(self, **kwargs):
+        if kwargs["role"] == "reviewer":
+            self.calls.append((kwargs["role"], kwargs["kind"], kwargs["job"].name))
+            raise HarnessError("SYNTHETIC codex usage limit", stop=stops.make(
+                "provider_quota", "usage_limit", data={"role": "reviewer", "provider": "codex"},
+                source={"dispatch_id": kwargs["job"].name}))
+        return super().invoke(**kwargs)
+
+
+class WithoutSampler(QuotaFailingBackend):
+    """The same scripted calls through a backend that cannot take quota snapshots."""
+    quota_snapshot = None
+
+
 class WaitCase(RepoCase):
     def setUp(self):
         super().setUp()
@@ -790,16 +807,7 @@ class RoleTests(WaitCase):
         self.assertEqual(self.clock.sleeps, [])
         self.assertNotIn("quota_failure", self.triggers(engine, "claude") + self.triggers(engine, "codex"))
         # A typed Codex usage-limit stop (none is produced today) is still never waited for.
-
-        class CodexQuota(QuotaFailingBackend):
-            def invoke(self, **kwargs):
-                if kwargs["role"] == "reviewer":
-                    self.calls.append((kwargs["role"], kwargs["kind"], kwargs["job"].name))
-                    raise HarnessError("SYNTHETIC codex usage limit", stop=stops.make(
-                        "provider_quota", "usage_limit", data={"role": "reviewer", "provider": "codex"},
-                        source={"dispatch_id": kwargs["job"].name}))
-                return super().invoke(**kwargs)
-        engine, saved = self.start(CodexQuota(self.config, self.repo), expect=HarnessError)
+        engine, saved = self.start(TypedCodexQuota(self.config, self.repo), expect=HarnessError)
         self.declined(saved, "provider")
         self.assertNotIn("wait_limit_seconds", saved["stop"]["data"])
         self.assertEqual(self.triggers(engine, "claude").count("quota_failure"), 0)
@@ -1095,68 +1103,120 @@ class ContractTests(WaitCase):
         self.assertEqual(len(writes), 1)
 
     def test_not_waiting_matches_the_settled_result_without_the_waiter(self):  # T8-25
-        """Every way of not waiting ends as the waiter-less code path would, through the real CLI."""
+        """Every reason not to wait ends as the waiter-less code path would, through the real CLI.
+
+        Each registered reason (``stops.WAIT_REASONS``) runs twice: with the decision, and with it
+        bypassed (``after_failure`` answering False, or for the first plan ``decline`` doing nothing).
+        The settled ledger, stop type, exit code, listed exits and operation record are the same; the
+        decision only adds its own ``data`` fields. A reason without a scenario fails the test.
+        """
         import test_quota_sampling
         commit = RunStore.commit
 
-        def damaging(store):   # a load-checked original damaged right after the judgment's save
-            result = commit(store)
-            entry = next((entry for entry in store.run["dispatches"]
-                          if entry.get("worker_receipt_consumed") == "provider_failure"), None)
-            if entry is not None and not getattr(store, "damaged", False):
-                store.damaged = True
-                Path(entry["worker_receipt"]["packet_artifact"]).write_text("{}\n")
-            return result
-        scenarios = [
-            ("exceeds_limit", {}, (window("session", 100, 21600 + 600),), False),
-            ("window_uncertain", {}, (window("session", 100, 600), window("weekly_scoped", 100, 600, "Opus 5")), False),
-            ("disabled", {"quota_wait_max_seconds": 0}, (window("session", 100, 600),), False),
-            ("dispatch_budget", {"max_agent_dispatches": 1}, (window("session", 100, 600),), False),
-            ("evidence damaged after the judgment", {}, (window("session", 100, 600),), True),
-        ]
+        def damaging(bypass):   # a load-checked original damaged right after the judgment's save
+            def damage(store):
+                result = commit(store)
+                entry = next((entry for entry in store.run["dispatches"]
+                              if entry.get("worker_receipt_consumed") == "provider_failure"), None)
+                if entry is not None and not getattr(store, "damaged", False):
+                    store.damaged = True
+                    Path(entry["worker_receipt"]["packet_artifact"]).write_text("{}\n")
+                return result
+            return [patch.object(RunStore, "commit", damage)]
 
-        def outcome(runtime, rows, damage, bypass):
+        def staged(bypass):     # a change nobody committed is in memory when the failure arrives
+            real = QuotaWait.after_failure
+
+            def after_failure(waiter, error):
+                waiter.context.run["synthetic_unsaved"] = True
+                return False if bypass else real(waiter, error)
+            return [patch.object(QuotaWait, "after_failure", after_failure)]
+
+        def exits_unconfirmed(bypass):   # the probe gate: not reachable after a real judgment (the exit is confirmed first)
+            return [patch.object(quota.QuotaSampler, "no_live_model_process", return_value=False)]
+        full, plan_argv = (window("session", 100, 600),), ["--plan", str(ROOT / "examples" / "plan.json")]
+        scenarios = {
+            "not_running": dict(script=("commander",), argv=["--commander", "fable"], bypass="decline"),
+            "provider": dict(backend=TypedCodexQuota, script=()),
+            "unsaved_state": dict(patches=staged, bypass=None),
+            "disabled": dict(runtime={"quota_wait_max_seconds": 0}),
+            "dispatch_budget": dict(runtime={"max_agent_dispatches": 1}),
+            "no_sampler": dict(backend=WithoutSampler),
+            "exit_unconfirmed": dict(patches=exits_unconfirmed),
+            "snapshot_unavailable": dict(stub="shape"),
+            "window_uncertain": dict(rows=(window("session", 100, 600), window("weekly_scoped", 100, 600, "Opus 5"))),
+            "no_blocking_window": dict(rows=(window("session", 99, 600),)),
+            "reset_unknown": dict(rows=(window("session", 100, None),)),
+            "reset_passed": dict(rows=(window("session", 100, -60),)),
+            "exceeds_limit": dict(rows=(window("session", 100, 21600 + 600),)),
+            "record_invalid": dict(rows=(window("session", 100, resets_at="9999-12-31T23:59:59+00:00"),),
+                                   runtime={"quota_wait_max_seconds": 10 ** 12}),
+            "load_checks_failed": dict(patches=damaging),
+        }
+        # Every registered reason has a scenario here (none is unreachable under this comparison).
+        self.assertEqual(set(scenarios), set(stops.WAIT_REASONS))
+
+        def outcome(reason, scenario, bypass):
             config, original = copy.deepcopy(self.config), self.config
-            config.data["runtime"].update(runtime)
+            config.data["runtime"].update(scenario.get("runtime", {}))
             self.config = config
-            self.windows(*rows)
+            self.windows(*scenario.get("rows", full))
+            os.environ["QUOTA_STUB_CLAUDE"] = scenario.get("stub", "ok")
             runs = self.repo / ".harness" / "runs"
             before = set(runs.iterdir()) if runs.exists() else set()
-            patches = [patch.object(QuotaWait, "after_failure", return_value=False)] if bypass else []
-            patches += [patch.object(RunStore, "commit", damaging)] if damage else []
+            reasons, annotate = [], QuotaWait._annotate
+
+            def recorded(waiter, error, decision):
+                reasons.append(decision["reason"])
+                return annotate(waiter, error, decision)
+            patches = [patch.object(QuotaWait, "_annotate", recorded)]
+            patches += scenario["patches"](bypass) if "patches" in scenario else []
+            target = scenario.get("bypass", "after_failure")
+            if bypass and target is not None:
+                patches.append(patch.object(QuotaWait, target, return_value=None if target == "decline" else False))
+            backend = scenario.get("backend", QuotaFailingBackend)(self.config, self.repo, scenario.get("script", ("worker",)))
             for item in patches:
                 item.start()
             try:
-                code, errors = run_cli(self, self.backend("worker"),
-                                       ["run", "Implement greet", "--plan", str(ROOT / "examples" / "plan.json")])
+                code, errors = run_cli(self, backend, ["run", "Implement greet", *scenario.get("argv", plan_argv)])
             finally:
                 for item in reversed(patches):
                     item.stop()
                 self.config = original
+                os.environ["QUOTA_STUB_CLAUDE"] = "ok"
             (directory,) = set(runs.iterdir()) - before
             saved = read_json(directory / "state.json")
             records = [read_json(path) for path in (self.repo / ".harness" / "operations").glob("*.json")]
             record = next(record for record in records if record.get("run_id") == saved["id"])
             stop = copy.deepcopy(saved["stop"])
+            keys = set(stop["data"])
             for key in (*WAIT_FIELDS, *SAMPLE_FIELDS, "detail"):
                 stop["data"].pop(key, None)
-            text = json.dumps(stop).replace(saved["id"], "RUN").replace(str(directory), "RUN_DIR")
+            exits = stops.project_ledger(saved)["exits"]
+            text = json.dumps([stop, exits]).replace(saved["id"], "RUN").replace(str(directory), "RUN_DIR")
             for position, entry in enumerate(saved["dispatches"]):
                 text = text.replace(entry["id"], f"DISPATCH_{position}")
             text = re.sub(r"\b[0-9a-f]{64}\b", "SHA256", text)
+            stop, exits = json.loads(text)
             return {"decisions": test_quota_sampling.SamplingCase.decisions(saved, directory),
-                    "stop": json.loads(text), "exit": code, "status": saved["status"],
-                    "record": (record["exit_status"], record["stop"]["kind"], record["stop"]["reason"])}
+                    "stop": stop, "exits": exits, "exit": code, "status": saved["status"],
+                    "record": (record["exit_status"], record["stop"]["kind"], record["stop"]["reason"])}, keys, reasons
 
-        for name, runtime, rows, damage in scenarios:
-            with self.subTest(case=name):
-                waited, bypassed = outcome(runtime, rows, damage, False), outcome(runtime, rows, damage, True)
+        for reason, scenario in scenarios.items():
+            with self.subTest(reason=reason):
+                waited, waited_keys, decided = outcome(reason, scenario, False)
+                bypassed, bypassed_keys, skipped = outcome(reason, scenario, True)
+                self.assertEqual((decided, skipped), ([reason], []))
                 self.assertEqual(waited, bypassed)
+                # The decision adds only its own data fields (a load failure drops them with the original stop).
+                self.assertLessEqual(bypassed_keys, waited_keys)
+                self.assertLessEqual(waited_keys - bypassed_keys, set(WAIT_FIELDS))
                 self.assertEqual(self.clock.sleeps, [])
-                expected = (("evidence", "load_integrity", 1) if damage else ("provider_quota", "usage_limit", 3))
+                expected = (("evidence", "load_integrity", 1) if reason == "load_checks_failed"
+                            else ("provider_quota", "usage_limit", 3))
                 self.assertEqual((waited["stop"]["kind"], waited["stop"]["reason"], waited["exit"]), expected)
                 self.assertEqual(waited["record"], (expected[2], *expected[:2]))
-                if damage:
+                if reason == "load_checks_failed":
                     self.assertEqual(waited["stop"]["data"]["superseded"],
                                      {"kind": "provider_quota", "reason": "usage_limit"})
 
@@ -1292,6 +1352,129 @@ class WakeCheckTests(WaitCase):
                 self.assertRaises(HarnessError) as caught:
             self.engine(self.backend()).resume(engine.run["id"])
         self.assertEqual(stops.of(caught.exception)["reason"], "head_changed")
+
+
+class RealEvidenceTests(WaitCase):
+    """T8-33 with real files: an index or a dependency copy the run produced is damaged during the wait.
+
+    The run makes the evidence itself (a large changed-path list projected into a path index, a long
+    granted command projected into an input index, a prepared dependency copy); the fake clock damages
+    it during the sleep. Waking stops before the scheduling loop prepares anything (no dispatch is even
+    entered), nothing is called afterwards, and a manual ``resume`` reports the same type.
+    """
+
+    def dispatches(self):
+        """The roles ``Dispatcher.dispatch`` is entered with from now on."""
+        from harness.dispatch import Dispatcher
+        real, roles = Dispatcher.dispatch, []
+
+        def counting(dispatcher, role, *args, **kwargs):
+            roles.append(role)
+            return real(dispatcher, role, *args, **kwargs)
+        patcher = patch.object(Dispatcher, "dispatch", counting)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return roles
+
+    def stops_on_waking(self, engine, backend, run, damage, roles_before_waking):
+        roles = self.dispatches()
+        self.clock.on_sleep = lambda clock, seconds: damage() if len(clock.sleeps) == 1 else None
+        with self.assertRaises(HarnessError) as caught:
+            run()
+        value = stops.of(caught.exception)
+        self.assertEqual((value["kind"], value["reason"], stops.exit_code(caught.exception)),
+                         ("evidence", "runtime_integrity", 1))
+        self.assertEqual(len(self.events(engine, "quota_wait_finished")), 1)   # it did wait, then woke
+        self.assertEqual(roles, roles_before_waking)                          # nothing prepared after waking
+        self.assertEqual([call[0] for call in backend.calls], roles_before_waking)   # nothing called after waking
+        saved = read_json(engine.directory / "state.json")
+        self.assertEqual((saved["status"], saved["stop"]["kind"], saved["stop"]["reason"]),
+                         ("blocked", "evidence", "runtime_integrity"))
+        return value
+
+    def resume_reports_the_same(self, engine, value):
+        path = engine.directory / "state.json"
+        raw, roles, backend = path.read_bytes(), self.dispatches(), self.backend()
+        with self.assertRaises(HarnessError) as caught:
+            self.engine(backend).resume(engine.run["id"])
+        manual = stops.of(caught.exception)
+        self.assertEqual((manual["kind"], manual["reason"], stops.exit_code(caught.exception)),
+                         (value["kind"], value["reason"], 1))
+        self.assertEqual(stops.project(manual, engine.run["id"])["exits"], stops.project(value, engine.run["id"])["exits"])
+        self.assertEqual((roles, backend.calls), ([], []))
+        self.assertEqual(path.read_bytes(), raw)   # a preflight refusal rewrites nothing
+
+    def test_damaged_path_index_on_waking(self):
+        from harness import git
+        names = [f"legacy/{index:03}-" + "x" * 110 + ".md" for index in range(60)]
+        (self.repo / "legacy").mkdir()
+        for name in names:
+            (self.repo / name).write_text("historical document\n")
+        git.git(self.repo, "add", "legacy")
+        git.git(self.repo, "-c", "user.name=Test", "-c", "user.email=test@localhost", "-c", "commit.gpgsign=false",
+                "commit", "-m", "old documents")
+        value = plan()
+        value["tasks"][0]["allowed_paths"].append("legacy/**")
+        self.windows(window("session", 100, 600))
+        # The first worker deletes the old documents and returns an invalid output: its recovery record's
+        # changed paths are projected into a path index for the commander and the next worker.
+        backend = self.backend(("worker", "invalid"), "worker")
+        real = backend.invoke
+
+        def invoke(**kwargs):
+            if kwargs["role"] == "worker" and not any(call[0] == "worker" for call in backend.calls):
+                for name in names:
+                    (kwargs["cwd"] / name).unlink()
+            return real(**kwargs)
+        backend.invoke = invoke
+        engine = self.engine(backend)
+
+        def damage():
+            failed = [entry for entry in engine.run["dispatches"] if entry["role"] == "worker"][-1]
+            self.assertTrue(failed.get("path_evidence"))
+            Path(failed["path_evidence"][0]["artifact"]).write_text("{}\n")
+        stopped = self.stops_on_waking(engine, backend, lambda: engine.start("Replace legacy docs and implement greet", value),
+                                       damage, ["worker", "commander", "worker"])
+        self.resume_reports_the_same(engine, stopped)
+
+    def test_damaged_input_index_on_waking(self):
+        # A long granted command is projected into an input index of the worker's packet.
+        self.config.data["permissions"]["worker_commands"] = [["echo", "synthetic " + "y" * 4200]]
+        self.windows(window("session", 100, 600))
+        backend = self.backend("worker")
+        engine = self.engine(backend)
+
+        def damage():
+            failed = [entry for entry in engine.run["dispatches"] if entry["role"] == "worker"][-1]
+            self.assertTrue(failed.get("input_evidence"))
+            Path(failed["input_evidence"][0]["artifact"]).write_text("{}\n")
+        stopped = self.stops_on_waking(engine, backend, lambda: engine.start("Implement greet", plan()), damage, ["worker"])
+        self.resume_reports_the_same(engine, stopped)
+
+    def test_damaged_dependency_copy_on_waking(self):
+        import hashlib
+        from harness import git, workspace_inputs
+        (self.repo / ".gitignore").write_text("__pycache__/\nvendor/\ndeps/\n")
+        git.git(self.repo, "add", ".gitignore")
+        git.git(self.repo, "-c", "user.name=Test", "-c", "user.email=test@localhost", "-c", "commit.gpgsign=false",
+                "commit", "-m", "ignore dependency inputs")
+        (self.repo / "deps").mkdir()
+        (self.repo / "deps" / "input").write_bytes(b"synthetic dependency")
+        saved = self.engine(self.backend()).start("Implement greet", plan(), pause_after_plan=True)
+        self.assertEqual(saved["status"], "awaiting_approval")
+        workspace_inputs.prepare_run(self.repo, saved["id"], {
+            "schema_version": 1, "run_id": saved["id"], "head": saved["expected_head"], "source_root": ".",
+            "max_files": 1, "max_bytes": 99,
+            "files": [{"source": "deps/input", "destination": "vendor/input", "type": "file", "mode": 0o644,
+                       "sha256": hashlib.sha256(b"synthetic dependency").hexdigest(), "ownership": "input_copy"}]})
+        copy_path = Path(saved["worktree"]) / "vendor" / "input"
+        self.assertEqual(copy_path.read_bytes(), b"synthetic dependency")
+        self.windows(window("session", 100, 600))
+        backend = self.backend("worker")
+        engine = self.engine(backend)
+        stopped = self.stops_on_waking(engine, backend, lambda: engine.resume(saved["id"], approve_plan=True),
+                                       lambda: copy_path.write_bytes(b"changed during the wait"), ["worker"])
+        self.resume_reports_the_same(engine, stopped)
 
 
 if __name__ == "__main__":
