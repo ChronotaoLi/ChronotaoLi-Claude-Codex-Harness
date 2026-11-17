@@ -9,7 +9,6 @@ owned by exactly one process.
 """
 from __future__ import annotations
 
-import hashlib
 import os
 import re
 import shutil
@@ -88,12 +87,17 @@ def harness_identity():
 
 
 def config_identity(config):
-    identity = {"path": str(config.path), "sha256": None}
-    try:
-        identity["sha256"] = hashlib.sha256(Path(config.path).read_bytes()).hexdigest()
-    except (OSError, TypeError, ValueError):
-        pass
-    return identity
+    """The files this configuration was loaded from, with the digests of the bytes then parsed; never reads them again.
+
+    A provenance probe never raises: anything but a loaded value is recorded as null.
+    """
+    def digest(name):
+        value = getattr(config, name, None)
+        return value if isinstance(value, str) else None
+
+    project = getattr(config, "project_path", None)
+    return {"path": str(config.path), "sha256": digest("sha256"),
+            "project": {"path": str(project), "sha256": digest("project_sha256")} if isinstance(project, Path) else None}
 
 
 def shared_paths(config):

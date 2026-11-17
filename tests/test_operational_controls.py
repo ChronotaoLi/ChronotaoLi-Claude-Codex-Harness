@@ -1,6 +1,7 @@
 import contextlib
 import io
 import json
+import subprocess
 from unittest.mock import Mock, patch
 
 from harness.cli import main
@@ -78,13 +79,15 @@ class OperationalControlsTests(RepoCase):
     def test_doctor_checks_only_configured_provider_clis(self):
         for role in self.config.data["roles"].values():
             role["cli"] = "claude"
-        process = Mock(return_value=Mock(returncode=0, stdout="test-version"))
+        run = subprocess.run   # Git runs for real: doctor locates the target's project file
+        process = Mock(side_effect=lambda command, *args, **kwargs: run(command, *args, **kwargs) if command[0] == "git"
+                       else Mock(returncode=0, stdout="test-version"))
         with patch("harness.cli.shutil.which", side_effect=lambda cli: "/tools/claude" if cli == "claude" else None), \
                 patch("harness.cli.subprocess.run", process):
             code, output, errors = self.invoke(["doctor"])
         self.assertEqual(code, 0, errors)
         self.assertEqual(set(json.loads(output)["checks"]), {"claude"})
-        self.assertTrue(all(call.args[0][0] == "claude" for call in process.call_args_list))
+        self.assertTrue(all(call.args[0][0] in ("claude", "git") for call in process.call_args_list))
 
     def test_cli_does_not_hide_programming_key_errors(self):
         self.engine()  # Existing database; absent read-only queries need no Memory instance.

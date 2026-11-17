@@ -1,6 +1,6 @@
 # 跨仓库操作、操作记录与观察网页
 
-本文说明从 Harness 源码目录对其他项目执行任务的统一入口、外层 agent 的操作边界、自动操作记录与人工补充模板、问题报告模板、证据归属、run 目录的文件布局、本地只读观察网页、角色工具接口、依赖副本、单次监督和真实账号联调。日常命令见 [README](../README.md)，停止后的出口见[恢复与操作者出口](recovery.md)，观察层边界见[设计：不变量](design.md#不变量)。
+本文说明对其他项目执行任务的统一入口（各命令读哪份配置）、外层 agent 的操作边界与它可加载的 skill、自动操作记录与人工补充模板、问题报告模板、证据归属、run 目录的文件布局、本地只读观察网页、角色工具接口、依赖副本、单次监督和真实账号联调。日常命令见 [README](../README.md)，停止后的出口见[恢复与操作者出口](recovery.md)，观察层边界见[设计：不变量](design.md#不变量)。
 
 - [统一入口](#统一入口)
 - [外层 agent 操作说明](#外层-agent-操作说明)
@@ -17,36 +17,66 @@
 
 ## 统一入口
 
-在 Harness 源码目录执行，所有路径使用绝对路径：
+editable 安装（见 [README](../README.md#安装入口)）之后在目标项目里直接调用 `harness`；在 Harness 源码目录里调用时用 `python3 -m harness` 并写 `--repo`，两者等价：
 
 ```bash
-cd /abs/harness
-python3 -m harness --config /abs/harness.toml doctor
-python3 -m harness --config /abs/harness.toml --repo /abs/project run "目标描述"
-python3 -m harness --config /abs/harness.toml --repo /abs/project resume RUN
-python3 -m harness --repo /abs/project status
-python3 -m harness --repo /abs/project watch RUN
-python3 -m harness --repo /abs/project dashboard --port 8765
+cd /abs/project
+harness doctor
+harness run "目标描述" --scope 'src/**' --scope 'tests/**'
+harness resume RUN
+harness status
+harness watch RUN
+harness dashboard --port 8765
+
+cd <Harness 源码目录>
+python3 -m harness --repo /abs/project run "目标描述" --scope 'src/**'
 ```
 
-`pip install -e .` 后，`harness` 命令等价于 `python3 -m harness`（`pyproject.toml` 的 `[project.scripts]`）。无论哪种方式都固定使用同一个解释器：`doctor` 与操作记录的 `harness.python`／`harness.executable` 记录实际解释器，换解释器可能加载另一份安装的 `harness` 包。
+无论哪种方式都固定使用同一个解释器：`doctor` 与操作记录的 `harness.python`／`harness.executable` 记录实际解释器，换解释器可能加载另一份安装的 `harness` 包。
 
-- `--config`、`--repo` 是全局参数，必须写在子命令之前；写在子命令之后会被 argparse 当作未识别参数拒绝。
-- 未传 `--config` 时使用 Harness 源码目录的默认 `harness.toml`，不会按 `--repo` 自动选择目标项目的配置。`run` 启动时在 stderr 回显 `[harness] config=...` 与 `[harness] verification=...`，后续 `resume` 应使用同一份配置。
-- 共享资源（rules、skills、mcp）相对配置文件所在目录解析；复制配置到其他位置时同步修正这些路径。`doctor` 的 `shared` 字段显示解析后的绝对路径。
-- 启动前用 `doctor` 核对实际加载的包与配置：`harness.package`（包目录）、`harness.revision`（包目录上级是 Git 检出根时的 HEAD，否则 null）、`harness.runtime_modified`（`harness/` 下有已修改或未跟踪文件时为 true）、`config.path`／`config.sha256`、`asset_digest`（共享资产摘要；失败为 null 并另给 `asset_error`）。同名模块、site-packages 中的另一份安装或改过的工作副本都会在这里显现。`doctor` 的退出码仍只取决于配置引用的 CLI 是否已登录。
-- 启动前核对目标仓库：已有提交，已跟踪文件与暂存区没有未提交修改，`verification.commands` 与依赖在工作树中可用，生成产物已忽略。这些要求见 [README](../README.md#对自己的项目执行任务)。
+- `--config`、`--repo` 是全局参数，必须写在子命令之前；写在子命令之后会被 argparse 当作未识别参数拒绝。`--repo` 默认是当前目录，指向仓库里的任何目录都按它的 Git 根目录处理。
+- `--config` 只选操作者配置，不传时是 Harness 源码目录的 `harness.toml`；项目配置固定在 `<目标仓库 Git 根目录>/.harness/project.toml`，没有参数能改。两份配置的内容与合并规则见 [README](../README.md#两份配置)。各命令读取的文件：
+
+| 命令 | 操作者配置 | 项目配置 |
+| --- | --- | --- |
+| `run`、`resume`、`permission-diagnostics` | 读 | 读，必须存在 |
+| `abandon` | 读 | 不读 |
+| `doctor` | 读 | 读取并校验，只为报告顶层的 `project` 字段，不进入 `doctor` 的有效配置 |
+| `demo`、`smoke`、`sync`，以及 `python3 -m harness.permission_smoke`、`python3 -m harness.tool_smoke` | 读 | 不读 |
+| `status`、`watch`、`dashboard`、`memory`、`prepare-run`、`cleanup-run`、`supervise` | 不读 | 不读 |
+
+- 项目配置不存在时，`run`、`resume`、`permission-diagnostics` 拒绝：退出码 2，停止类型 `invalid_input/cli_arguments`，`data.option` 为 `--repo`，错误信息给出期望的绝对路径并指向 `examples/project.toml`。这个拒绝在任何写入之前：没有操作记录，不安装 `.harness/` 的忽略保护，不创建 run、分支或工作树，不调用模型。项目配置存在但读不出、不是合法 TOML 或内容不合格时，与操作者配置无效时一样报错（退出码 1），同样在任何写入之前。
+- `abandon` 不读项目配置，项目配置缺失或损坏时照常可用。`demo`、`smoke` 与两个独立联调入口自己设置验证命令和 worker 命令，目标仓库里即使有项目配置也不读取、不执行其中的命令。`supervise` 把 `--config` 原样传给它启动的子进程。
+- `run` 启动时在 stderr 依次回显三条：`[harness] config=<操作者配置路径>`、`[harness] project=<项目配置路径>`、`[harness] verification=<验证命令>`。`verification` 这一条的值是缩进排版的 JSON，可以跨多行（续行没有 `[harness]` 前缀）。项目配置显示的总是固定位置：它是符号链接时也不显示链接目标。
+- 共享资源（rules、skills、mcp）相对操作者配置所在目录解析；复制操作者配置到其他位置时同步修正这些路径。`doctor` 的 `shared` 字段显示解析后的绝对路径。
+- 启动前用 `doctor` 核对实际加载的包与配置：`harness.package`（包目录）、`harness.revision`（包目录上级是 Git 检出根时的 HEAD，否则 null）、`harness.runtime_modified`（`harness/` 下有已修改或未跟踪文件时为 true）、`config`、`project`（见下）、`asset_digest`（共享资产摘要；失败为 null 并另给 `asset_error`）。同名模块、site-packages 中的另一份安装或改过的工作副本都会在这里显现。`doctor` 的退出码仍只取决于配置引用的 CLI 是否已登录，项目配置缺失或无效不会让它失败。
+  - `config` 是 `{path, sha256, project}`，字段含义与[操作记录](#自动记录的字段)相同；`doctor` 不把项目配置当作有效配置，所以这里的 `config.project` 总是 null。
+  - `project` 报告 `--repo`（默认当前目录）对应的项目配置：`{path, exists, sha256, error}`，`path` 总是期望的绝对路径；`--repo` 不在 Git 仓库里时整个字段为 null。文件不存在：`exists=false`，`sha256` 与 `error` 为 null。存在且能与当前操作者配置一起加载：`exists=true`，有摘要，`error=null`。存在但读不出：`exists=true`，`sha256=null`，`error` 是错误首行。读得出但不是合法 TOML 或内容不合格：`exists=true`，有摘要，`error` 是错误首行。摘要与错误来自同一次读取，描述的是同一份字节。
+- 启动前核对目标仓库：已有提交，已跟踪文件与暂存区没有未提交修改，`verification.commands` 与依赖在工作树中可用，生成产物已忽略。这些要求见 [README](../README.md#执行)。
 - 每次 `run`／`resume` 自动写一份操作记录，可用 `--operation-id ID` 指定记录 ID；见[操作记录与记录模板](#操作记录与记录模板)。
 
 ## 外层 agent 操作说明
 
-外层 agent 指替操作者调用上述入口的自动化会话（例如另一个 Claude Code 或 Codex 会话）。它在已有授权内可以：
+外层 agent 指替所有者调用上述入口的自动化会话（例如在目标项目里打开的另一个 Claude Code 或 Codex 会话）。本节的规则另有可加载的形式，即[外层 skill](#外层-skill)，两者内容一致；停止后的出口以[恢复与操作者出口](recovery.md)为准。
 
-- 启动 `run`，并为每次调用指定可追溯的 `--operation-id`；启动前先与用户确认允许改动的区域（目录级）、必要的测试与生成文件的位置，再用 `run --scope` 提交为范围边界（没有声明时 `status RUN` 的 `scope.note` 会写明首版不受约束）；
+**首次在一个项目里使用。** `harness` 不在 `PATH` 上时，外层会话不自己安装，把 `uv tool install --editable <Harness 源码目录>` 交给所有者。先运行 `doctor`（不调用模型），核对 `harness.package`、`harness.revision` 是预期的 Harness，`checks.<cli>.logged_in` 为 true，再看 `project`。`project.exists` 为 false 时，外层会话以 `examples/project.toml` 为起点起草完整的项目配置，把完整内容和绝对路径（`project.path`）给所有者看，所有者确认后才写入（Git 根目录下还没有 `.harness/` 时先建这个目录）：其中的验证命令与 worker 命令授权就是授予 worker 的执行能力。所有者已经明确给出内容时不必再问。`project.error` 非空时，把错误给所有者看，经同意修好之后再 `run`。不要 `git add` 或提交 `.harness/`（见 [README](../README.md#两份配置)）。
+
+它在已有授权内可以：
+
+- 启动 `run`，并为每次 `run`／`resume` 指定可追溯的 `--operation-id`；启动前先与所有者确认允许改动的区域（目录级）、必要的测试与夹具、生成文件的位置，再用 `run --scope` 提交为范围边界（没有声明时 `status RUN` 的 `scope.note` 会写明首版不受约束）；启动后核对 stderr 回显的两份配置与验证命令；
 - 用 `status`、`status RUN`、`status RUN --full`、`watch RUN` 和 `dashboard` 观察，读取目标项目 `.harness/` 下的台账、事件、dispatch 产物与操作记录；
-- 使用[阻塞状态与操作者出口](recovery.md#阻塞状态与操作者出口)中明确适用于当前状态的恢复出口，例如 `--approve-plan`、追加精确命令授权后的普通 `resume`、`--environment-update`、`--operator-decision`。
+- 使用[阻塞状态与操作者出口](recovery.md#阻塞状态与操作者出口)中明确适用于当前状态的恢复出口，例如 `--approve-plan`、追加精确命令授权后的普通 `resume`、`--environment-update`、带着所有者答复的 `--operator-decision`。
 
-读停止时用退出码与 `stop.kind` 分流，不解析文字：3 按 `stop.exits` 中适用于当前状态的出口处理，涉及新增权限或需求选择时请示用户；2 修正本次调用的输入；1 停下报告（证据或现场不符、Harness 自身失败、未分类）；0 读结果 JSON 的 `status`（`completed`、`paused` 或待批准）；130 是中断。供应商额度类停止（`provider_quota/*`）与 `provider_failure/{overloaded,authentication}` 都是 3：等额度恢复或修复登录后按 `stop.exits` 普通 `resume`，worker 的这次调用不计工作尝试；不要用正则匹配错误文字判断额度。Claude 角色的额度用尽默认由 Harness 在进程内等待（`runtime.quota_wait_max_seconds`，见[额度等待](recovery.md#额度等待)）：外层不要自己睡眠后循环 `resume`；停在 `provider_quota/usage_limit` 时先读 `stop.data.wait_reason`。`resume`／`abandon` 返回 `busy/run_lock` 可能是那个进程正在等额度：看 `status RUN` 的 `quota_wait`（等到何时、哪个窗口），记录不证明进程仍在；要取消就中断那个进程。遇到真正的新增权限（新的命令授权、范围扩展、预算或轮数提高）或需求选择（操作者决定、是否接受风险、是否放弃）时向用户请求，不自行代答。指挥提案被持有（`scope_extension/*`）时，`resume --scope` 扩大边界与 `--reject-request` 拒绝提案都要向用户请求：边界是持续、跨任务的授权，停止给出的建议条目可能比缺口宽（`data.widened`），完整缺口在 `status RUN` 的 `scope.held`。
+**长任务与受限沙箱。** `run` 和需要继续执行的 `resume` 可能运行很久：用外层工具自己的后台任务启动，再用 `status RUN`、`watch RUN` 观察。`&`、`nohup` 不保证进程存活，不要依赖它们。外层工具没有可靠的后台任务，或者它的沙箱不允许联网、写 `.git`、启动 `claude`／`codex` 子进程时，这两类命令都交给所有者在普通终端里运行：外层会话给出完整命令，自己负责观察、准备输入文件（操作者决定、环境更新、请求拒绝）和提出下一条命令。普通 `resume RUN` 在退出证据齐全时会直接继续执行，所以中断（130）之后的它也按这条规则启动。
+
+读停止时用退出码与 `stop.kind` 分流，不解析文字：3 按 `stop.exits` 中适用于当前状态的出口处理，涉及新增权限或需求选择时请示所有者；2 修正本次调用的输入（例如补上缺失的项目配置）；1 停下报告（证据或现场不符、Harness 自身失败、未分类）；0 读结果 JSON 的 `status`（`completed`、`paused` 或待批准）；130 是中断。本次调用失败时先读它自己的停止，即 stderr 里以 `[harness-json] ` 开头、`event` 为 `stop` 的那一行；`status RUN` 显示的是台账里的停止，标“（操作）”的拒绝不改台账，所以那里可能还是更早的停止，没有创建 run 的拒绝则根本没有台账。供应商额度类停止（`provider_quota/*`）与 `provider_failure/{overloaded,authentication}` 都是 3：等额度恢复，或由所有者修好认证与权限（`doctor` 只检查、不修复）之后，按 `stop.exits` 普通 `resume`，worker 的这次调用不计工作尝试；不要用正则匹配错误文字判断额度。Claude 角色的额度用尽默认由 Harness 在进程内等待（`runtime.quota_wait_max_seconds`，见[额度等待](recovery.md#额度等待)）：外层不要自己睡眠后循环 `resume`；停在 `provider_quota/usage_limit` 时先读 `stop.data.wait_reason`。`resume`／`abandon` 返回 `busy/run_lock` 可能是那个进程正在等额度：看 `status RUN` 的 `quota_wait`（等到何时、哪个窗口），记录不证明进程仍在；要取消就中断那个进程。
+
+先请示所有者，不自行代答：
+
+- 新增权限：项目配置 `permissions.worker_commands` 里的命令授权、范围扩展、提高预算、超时、轮数或上下文上限；
+- 需求选择：答复 `pending_decisions`、是否接受风险、是否放弃；
+- 指挥提案被持有（`scope_extension/*`）时，`resume --scope` 扩大边界与 `--reject-request` 拒绝提案：边界是持续、跨任务的授权，停止给出的建议条目可能比缺口宽（`data.widened`），完整缺口在 `status RUN` 的 `scope.held`；
+- 创建或修改 `.harness/project.toml`，以及启动前的范围；两次调用之间对任一份配置的修改只能是[通用规则](recovery.md#通用规则)允许的那些。
 
 不能做的事：
 
@@ -54,13 +84,26 @@ python3 -m harness --repo /abs/project dashboard --port 8765
 - 自动增加预算、超时、轮数或上下文上限来“解除”停止。
 - 更换模型、供应商或 effort。
 - 修改 `state.json`、`events.jsonl`、dispatch 产物或记忆库。
-- 自行 merge／cherry-pick run 分支；最终集成由用户完成。
+- 自行 merge／cherry-pick run 分支；最终集成由所有者完成。
+- 代所有者回答操作者问题。
 
-内部的 worker／reviewer 不调用该入口：它们在隔离工作树内完成一个任务或一次审阅，不启动新的 `run` 或 `resume`。
+内部的 worker／reviewer 不调用该入口，也不使用外层 skill：它们在隔离工作树内完成一个任务或一次审阅，不启动新的 `run` 或 `resume`。
+
+### 外层 skill
+
+`operator/harness-operator/SKILL.md`（frontmatter 的 `name` 是 `harness-operator`）是上面这些规则的可加载形式，供 Claude Code 或 Codex 的外层会话使用：正文用英文（与 `shared/skills/` 下的角色 skill 相同），`description` 带中文触发词。分发方式是把这个目录链接进两家的用户级 skill 目录，没有安装子命令：
+
+```bash
+mkdir -p ~/.claude/skills ~/.codex/skills
+ln -s <Harness 源码目录>/operator/harness-operator ~/.claude/skills/harness-operator
+ln -s <Harness 源码目录>/operator/harness-operator ~/.codex/skills/harness-operator
+```
+
+它不放在 `shared/skills/` 下：那个目录会作为技能目录提供给内部角色（`skill_list`、`skill_read`），也计入共享资产摘要。它不替代本文与[恢复与操作者出口](recovery.md)。Harness 启动的角色在启动参数里关闭这份 skill：Claude 担任的角色带 `--disable-slash-commands`，Codex 担任的角色带 `-c 'skills.config=[{"name" = "harness-operator", "enabled" = false}]'`；保证与不保证见[设计的不变量 27](design.md#不变量)，不保证的部分与真实账号下的检查见[隔离与进程](design.md#隔离与进程)。
 
 ## 操作记录与记录模板
 
-每次 `run`／`resume` 在加载配置之后、构造引擎之前，于 `<目标项目>/.harness/operations/<operation_id>.json` 独占创建一份记录。ID 默认自动生成（`op_` 加 16 位十六进制），也可用 `--operation-id ID` 指定：以字母或数字开头，只含 `A-Za-z0-9_.-`，最长 64 字符。同名记录已存在时拒绝并退出 1，不覆盖已有记录，也不写台账、不创建 run、不改 `.git/info/exclude`；重复 ID 检查在公共 Git 锁内、保护规则变更前完成。stderr 输出 `[harness] operation_id=<id> record=<路径>`；stdout 仍是单个 JSON，新增 `operation_id` 键。
+每次 `run`／`resume` 在加载两份配置之后、构造引擎之前，于 `<目标项目>/.harness/operations/<operation_id>.json` 独占创建一份记录。ID 默认自动生成（`op_` 加 16 位十六进制），也可用 `--operation-id ID` 指定：以字母或数字开头，只含 `A-Za-z0-9_.-`，最长 64 字符。ID 形式不合格或同名记录已存在时以 `invalid_input/cli_arguments`（`data.option` 为 `--operation-id`）拒绝，退出码 2，不覆盖已有记录，也不写台账、不创建 run、不改 `.git/info/exclude`；重复 ID 检查在公共 Git 锁内、保护规则变更前完成。stderr 输出 `[harness] operation_id=<id> record=<路径>`；stdout 仍是单个 JSON，新增 `operation_id` 键。
 
 记录不是第二套执行真相：它不取 `run.lock`、不写 run 台账，也不参与任何恢复判断。记录更新失败只在 stderr 打印 `[harness] 警告：...`，不改变运行、保存顺序或退出码。
 
@@ -74,7 +117,7 @@ python3 -m harness --repo /abs/project dashboard --port 8765
 | `arguments` | `run`：`goal`、`plan`（路径或 null）、`commander`、`pause_after_plan`、`step`、`scope`（列表）；`resume`：`run_id`、`approve_plan`、`step`、`reverify`、`confirm_exited`、`environment_update`、`execution_guidance`、`reject_request`（后三项为路径或 null）、`operator_decision`（路径列表）、`scope`（列表）。文件型选项只记路径 |
 | `repo`、`repo_head` | 目标项目绝对路径与当时 HEAD；取不到为 null |
 | `harness` | `package`、`revision`、`runtime_modified`、`python`、`executable`，与 `doctor` 回显相同 |
-| `config` | `path`、`sha256`（配置文件字节摘要） |
+| `config` | `path`、`sha256`：操作者配置的路径与字节摘要；`project`：本次加载读了项目配置时是 `{path, sha256}`（路径是固定位置），否则 null（`run`／`resume` 总会读）。摘要都来自加载时解析的那一份字节，记录时不再读文件，所以加载之后文件再被改写，记录里仍是当时的摘要 |
 | `asset_digest` | 共享资产摘要；失败为 null |
 | `models` | 配置中 commander／fable／worker／reviewer 的 `cli`、`model`、`effort` 原样 |
 | `cli` | `claude`、`codex` 的 `path`（PATH 查找结果）与 `version`（`--version` 首个非空行，5 秒超时，失败为 null）；这是创建记录时的读取，与额度探测无关 |
@@ -85,9 +128,9 @@ python3 -m harness --repo /abs/project dashboard --port 8765
 
 run 身份的关联：`run` 的首次台账保存随同写入可选字段 `created_by_operation`（不是额外一次保存），保存成功后追加 `run_created` 事件（带 `operation_id`）、在 stderr 输出一行 `[harness-json] {"event":"run_created","run_id":"...","operation_id":"..."}`，并立即把 `run_id` 写进记录，长时间运行或被强制终止时也能关联。`resume` 在自身预检门禁（含计划批准）通过后、进入 `execute()` 前同样追加 `run_resumed` 事件与通知。
 
-`run_resumed` 不表示已经派发模型：缺少命令授权、等待操作者决定等执行阶段门禁仍可使它紧接一条 `run_stopped`（携带停止投影 `stop`）。命令失败时，stderr 里 `harness: ` 加错误全文之后紧跟一行 `[harness-json] {"event":"stop","run_id":…,"operation_id":…,"stop":…}`（与 `status RUN` 的 `stop` 同一投影，不含 `detail`）；写这一行失败不改变退出码与操作记录。这两部分之前有 `[harness] config=…`、`[harness] operation_id=…`、运行事件与 `run_created` 通知等行，之后还可能有输出（例如 `supervise` 的监督回执），所以外层脚本应找以 `[harness-json] ` 开头、`event` 为 `stop` 的那一行，不按行号读。恢复预检拒绝时不写 `run_resumed`、不输出该通知，但之前保存的退出确认审计、配置放宽、命令授权检查等记录仍保留。已完成 run 的普通 resume 不写运行事件，台账与事件文件保持不变。操作记录缺失、损坏或与台账不一致都不影响 resume、abandon 或清理。
+`run_resumed` 不表示已经派发模型：缺少命令授权、等待操作者决定等执行阶段门禁仍可使它紧接一条 `run_stopped`（携带停止投影 `stop`）。命令失败时，stderr 里 `harness: ` 加错误全文之后紧跟一行 `[harness-json] {"event":"stop","run_id":…,"operation_id":…,"stop":…}`（与 `status RUN` 的 `stop` 同一投影，不含 `detail`）；写这一行失败不改变退出码与操作记录。这两部分之前有 `[harness] config=…`、`[harness] project=…`、`[harness] operation_id=…`、运行事件与 `run_created` 通知等行，之后还可能有输出（例如 `supervise` 的监督回执），所以外层脚本应找以 `[harness-json] ` 开头、`event` 为 `stop` 的那一行，不按行号读。恢复未进入执行时不发布 `run_resumed`。已保存的退出确认审计仍保留；前置门禁失败不会采纳本次配置放宽。前置门禁通过后若仍等待计划批准，已采纳的配置放宽和命令授权检查记录也保留。已完成 run 的普通 resume 不写运行事件，台账与事件文件保持不变。操作记录缺失、损坏或与台账不一致都不影响 resume、abandon 或清理。
 
-上述拒绝或已完成返回只要对应台账文件存在，操作记录结束时仍关联参数中的 run ID。加载配置失败时没有记录（记录在 `Config.load` 之后才创建）；创建 run 之前失败（仓库基线不满足、计划非法等）时记录保留但没有 `run_id`；resume 在预检阶段被强制终止时记录也可能没有 `run_id`。
+上述拒绝或已完成返回只要对应台账文件存在，操作记录结束时仍关联参数中的 run ID。加载配置失败（含项目配置缺失或无效）时没有记录（记录在 `Config.load` 之后才创建）；创建 run 之前失败（仓库基线不满足、计划非法等）时记录保留但没有 `run_id`；resume 在预检阶段被强制终止时记录也可能没有 `run_id`。
 
 限制：非 Git 检出或包目录上级不是检出根时 `revision`／`runtime_modified` 为 null；`runtime_modified` 也会因 `harness/` 下的未跟踪文件为 true；`cli.version` 是启动时 PATH 中的 CLI，不证明派发实际使用了同一个二进制。
 
@@ -136,6 +179,7 @@ run 身份的关联：`run` 的首次台账保存随同写入可选字段 `creat
 
 ```text
 <project>/.harness/
+  project.toml             # 项目配置（操作者维护，运行时只读）
   memory.sqlite3           # 项目记忆
   generated/               # sync 生成的 MCP 客户端配置
   operations/<op_id>.json  # 每次 run/resume 的自动操作记录
@@ -351,9 +395,11 @@ WORK 结果可以带可选的 `checkpoints`，每项为 `{id, summary, inputs, e
 ```bash
 python3 -m harness smoke
 python3 -m harness smoke --commander fable
-python3 -m harness.permission_smoke --config /path/to/harness.toml --repo /path/to/project
-python3 -m harness.tool_smoke --config /path/to/harness.toml --repo /path/to/project
+python3 -m harness.permission_smoke --repo /abs/project
+python3 -m harness.tool_smoke --repo /abs/project
 ```
+
+这四个入口都只读操作者配置（`--config`，默认是源码目录的 `harness.toml`），不读项目配置，验证命令与 worker 命令由各自设置。
 
 - `smoke` 在临时 Git 仓库由真实指挥生成计划，再调用执行者、任务审阅者和整体审阅者，运行真实测试；不改动本仓库。它用真实的 `CLIBackend`，所以也运行两家的额度探测（见[额度](#额度)）；离线测试只用桩可执行文件，不证明探测在真实 CLI 上可用。
 - `permission_smoke` 在 `--repo` 的 `.harness/permission-smoke/` 建立专用现场，检查工作树内读写、精确命令、额外参数、工作树外读写和 `.git` 修改；通过要求实际工具调用、工具结果、对应的 `permission_denials` 和文件内容一致，模型自称“已拒绝”不算证据。专用命令替换项目命令，外部 MCP 关闭。默认超时 180 秒、最多 16 轮、预算参数 1 美元，可用 `--timeout`、`--max-turns`、`--max-budget-usd` 调整。

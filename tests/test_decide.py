@@ -574,8 +574,10 @@ class BudgetConfigTests(DecideCase):
             with self.subTest(key=key):
                 path = self.repo.parent / f"{key}.toml"
                 path.write_text(text.replace("[runtime]\n", f"[runtime]\n{key} = 3\n", 1))
-                with self.assertRaisesRegex(HarnessError, f"^未知配置键：runtime.{key}$"):
+                with self.assertRaises(HarnessError) as raised:
                     Config.load(path)
+                self.assertIn(f"runtime.{key}", str(raised.exception))
+                self.assertIn(str(path.resolve()), str(raised.exception))
 
     def test_attempt_limit_names_the_key_and_its_value_before_any_decide(self):
         self.config.data["runtime"]["max_attempts"] = 1

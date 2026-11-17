@@ -14,7 +14,7 @@ from harness.cleanup import cleanup_run
 from harness.config import Config
 from harness.shared import toml_value
 from harness.util import HarnessError, read_json
-from test_harness import ROOT, RepoCase
+from test_harness import ROOT, RepoCase, write_project_config
 from test_runtime_changes import ScriptedBackend
 
 
@@ -23,11 +23,16 @@ class UnknownConfigTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.path = Path(self.temp.name) / "harness.toml"
+        self.project = Path(self.temp.name) / "target" / ".harness" / "project.toml"
+        self.project.parent.mkdir(parents=True)
         self.data = Config.load(ROOT / "harness.toml").data
 
     def load(self, data):
-        self.path.write_text("\n".join(f"{key} = {toml_value(value)}" for key, value in data.items()))
-        return Config.load(self.path)
+        # The project file holds verification and permissions; every other section is the operator's.
+        for path, project in ((self.path, False), (self.project, True)):
+            path.write_text("\n".join(f"{key} = {toml_value(value)}" for key, value in data.items()
+                                      if (key in ("verification", "permissions")) == project))
+        return Config.load(self.path, self.project)
 
     def test_unknown_keys_fail_before_typo_can_silently_use_default_budget(self):
         cases = [
@@ -117,6 +122,7 @@ class IndependentCLICommandsTests(RepoCase):
         self.assertIn(str(self.repo / "installed" / "harness.toml"), errors)
 
     def test_cli_passes_repeated_dispatch_exit_confirmations_to_recovery(self):
+        write_project_config(self.repo)
         result = {"id": "run_test", "status": "paused", "branch": "harness/run_test", "worktree": "worktree"}
         for command in ("resume", "abandon"):
             engine = Mock()

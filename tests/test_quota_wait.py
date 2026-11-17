@@ -30,7 +30,7 @@ from harness.task_lifecycle import TaskLifecycle
 from harness.util import HarnessError, lock, read_json, write_json
 from harness.worker_receipts import WorkerReceipts
 from test_harness import (ROOT, FakeClock, RepoCase, cli_notice, commit_recorder, crash_after_save,
-                          install_clock, run_cli, walk_exit)
+                          install_clock, run_cli, scratch, walk_exit, write_operator_config, write_project_config)
 
 T0 = 1925000000.0   # a synthetic start, late 2030
 QUOTA = {"type": "result", "subtype": "success", "is_error": True, "num_turns": 3,
@@ -1000,6 +1000,48 @@ class ConfigTests(WaitCase):
         self.assertEqual(result["status"], "completed")
         self.assertEqual(engine.services.quota_wait.waits, 2)   # the second decision used the loaded value
         self.assertEqual(Config.load(path).data["runtime"]["quota_wait_max_seconds"], 0)
+
+    def test_neither_file_is_read_again_after_waking(self):  # T8-21 (both files, loaded by the CLI)
+        from harness import config as config_module
+        folder = scratch(self)
+        operator = write_operator_config(folder / "harness.toml")
+        loaded = self.config.data["verification"]["commands"]
+        project = write_project_config(self.repo, loaded)
+        # Every file read through the configuration loader, with the quota sleeps taken so far: a re-read
+        # after waking fails the test even when its result is thrown away.
+        reads, real = [], config_module.read_layer
+
+        def spy(path, *args):
+            reads.append((Path(path), len(self.clock.sleeps)))
+            return real(path, *args)
+        reader = patch.object(config_module, "read_layer", side_effect=spy)
+        reader.start()
+        self.addCleanup(reader.stop)
+        marker = folder / "rewritten-command-ran"
+        rewritten = [[sys.executable, "-c", f"import pathlib, sys; pathlib.Path({str(marker)!r}).write_text('ran'); sys.exit(1)"]]
+
+        def rewrite(clock, seconds):
+            if len(clock.sleeps) == 1:
+                operator.write_text(operator.read_text(encoding="utf-8").replace(
+                    "quota_wait_max_seconds = 21600", "quota_wait_max_seconds = 0"), encoding="utf-8")
+                write_project_config(self.repo, rewritten)
+        self.clock.on_sleep = rewrite
+        self.windows(window("session", 100, 600))
+        code, errors = run_cli(self, self.backend("worker", "worker"),
+                               ["--config", str(operator), "run", "Implement greet", "--plan", str(ROOT / "examples" / "plan.json")],
+                               load=True)
+        self.assertEqual(code, 0, errors)
+        # Only the CLI's start-up load read the two files, once each and before the first sleep.
+        self.assertEqual(reads, [(operator.resolve(), 0), (project.resolve(), 0)])
+        (directory,) = (self.repo / ".harness" / "runs").iterdir()
+        saved = read_json(directory / "state.json")
+        self.assertEqual(saved["status"], "completed")
+        events = [json.loads(line) for line in (directory / "events.jsonl").read_text().splitlines()]
+        # The second failure waited under the loaded limit; verification ran the loaded commands.
+        self.assertEqual(len([item for item in events if item["event"] == "quota_wait_finished"]), 2)
+        self.assertFalse(marker.exists())
+        self.assertEqual(saved["config_snapshot"]["verification"]["commands"], loaded)
+        self.assertEqual(Config.load(operator).data["runtime"]["quota_wait_max_seconds"], 0)   # the rewrite happened
 
     def test_inherited_retry_watchdog_is_removed_from_cli_environments(self):  # T8-22
         captured = {}

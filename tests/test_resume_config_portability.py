@@ -17,7 +17,8 @@ from harness.config import Config, normalized
 from harness.runtime import Runtime
 from harness.shared import asset_digest
 from harness.util import HarnessError, group_alive, read_json, run_process, write_json
-from test_harness import ROOT, RepoCase
+from test_harness import (ROOT, RepoCase, cli_notice, run_cli, scratch, write_operator_config,
+                          write_project_config)
 
 
 class ResumeConfigurationTests(unittest.TestCase):
@@ -144,6 +145,103 @@ class ResumeConfigurationIntegrationTests(RepoCase):
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["asset_digest"], asset_digest(config))
 
+
+
+class ResumeConfigurationFilesTests(RepoCase):
+    """Resume loads both files as run does; only the effective configuration is compared with the snapshot (spec 2.5)."""
+
+    def setUp(self):
+        super().setUp()
+        self.folder = scratch(self)
+        self.operator = write_operator_config(self.folder / "first" / "harness.toml")
+        self.project = write_project_config(self.repo, self.config.data["verification"]["commands"])
+        code, errors = self.cli("run", "Implement greet", "--plan", str(ROOT / "examples" / "plan.json"),
+                                "--pause-after-plan")
+        self.assertEqual(code, 0, errors)
+        (self.directory,) = (self.repo / ".harness" / "runs").iterdir()
+        self.ledger = self.directory / "state.json"
+
+    def cli(self, *argv, config=None):
+        return run_cli(self, DemoBackend(), ["--config", str(config or self.operator), *argv], load=True)
+
+    def resume(self, *options, config=None):
+        return self.cli("resume", self.directory.name, *options, config=config)
+
+    def changes(self):
+        events = [json.loads(line) for line in (self.directory / "events.jsonl").read_text().splitlines()]
+        return [item["changes"] for item in events if item["event"] == "resume_config_changed"]
+
+    def test_relaxations_in_either_file_are_adopted(self):
+        created = read_json(self.ledger)
+        # The ledger keeps its fields: the operator file's path and the effective configuration.
+        self.assertEqual(created["config_path"], str(self.operator.resolve()))
+        self.assertEqual(created["config_snapshot"]["verification"]["commands"], self.config.data["verification"]["commands"])
+        command = [sys.executable, "--version"]
+        self.operator.write_bytes(self.operator.read_bytes().replace(b"max_attempts = 5", b"max_attempts = 6"))
+        write_project_config(self.repo, self.config.data["verification"]["commands"], [command])
+        with self.project.open("a", encoding="utf-8") as output:
+            output.write("\n[runtime]\nmax_agent_dispatches = 300\n")
+        code, errors = self.resume("--approve-plan")
+        self.assertEqual(code, 0, errors)
+        saved = read_json(self.ledger)
+        self.assertEqual(saved["status"], "completed")
+        snapshot = saved["config_snapshot"]
+        self.assertEqual((snapshot["runtime"]["max_attempts"], snapshot["runtime"]["max_agent_dispatches"],
+                          snapshot["permissions"]["worker_commands"]), (6, 300, [command]))
+        self.assertEqual(self.changes(), [{"max_attempts": {"old": 5, "new": 6},
+                                           "max_agent_dispatches": {"old": 200, "new": 300},
+                                           "worker_commands": {"old": [], "new": [command], "added": [command]}}])
+
+    def test_other_differences_are_refused_and_leave_the_ledger_unchanged(self):
+        operator, project = self.operator.read_bytes(), self.project.read_bytes()
+        changes = {
+            "verification commands": lambda: write_project_config(self.repo, [[sys.executable, "-c", "pass"]]),
+            "fresh checkout": lambda: self.project.write_bytes(
+                project.replace(b"[verification]\n", b"[verification]\nfresh_checkout = true\n")),
+            "budget lowered by the project file": lambda: self.project.write_bytes(
+                project + b"\n[runtime]\nmax_attempts = 4\n"),
+            "reviewer model": lambda: self.operator.write_bytes(
+                operator.replace(b'model = "gpt-6.1-sol"', b'model = "gpt-6.1-sol-other"')),
+            "memory expiry": lambda: self.operator.write_bytes(
+                operator.replace(b"task_ttl_days = 180", b"task_ttl_days = 90")),
+        }
+        for name, change in changes.items():
+            with self.subTest(change=name):
+                change()
+                self.assertNotEqual((self.operator.read_bytes(), self.project.read_bytes()), (operator, project))
+                saved = self.ledger.read_bytes()
+                code, errors = self.resume("--approve-plan")
+                self.assertEqual(code, 2, errors)
+                stop = cli_notice(errors)
+                self.assertEqual((stop["kind"], stop["reason"]), ("config_mismatch", "immutable_config"))
+                self.assertEqual(self.ledger.read_bytes(), saved)
+                self.operator.write_bytes(operator)
+                self.project.write_bytes(project)
+        code, errors = self.resume("--approve-plan")
+        self.assertEqual(code, 0, errors)
+        self.assertEqual(read_json(self.ledger)["status"], "completed")
+        self.assertEqual(self.changes(), [])
+
+    def test_moved_operator_file_and_comment_edits_resume_as_before(self):
+        # No gate on the file path or digest: the same effective configuration resumes.
+        moved = self.folder / "second" / "harness.toml"
+        moved.parent.mkdir()
+        moved.write_bytes(self.operator.read_bytes())
+        edits = (("operator file moved", lambda: None),
+                 ("comment in the operator file", lambda: moved.write_bytes(b"# annotated\n" + moved.read_bytes())),
+                 ("comment in the project file", lambda: self.project.write_bytes(
+                     self.project.read_bytes() + b"# annotated\n")))
+        for name, edit in edits:
+            with self.subTest(edit=name):
+                edit()
+                code, errors = self.resume(config=moved)
+                self.assertEqual(code, 0, errors)
+                # Reported again as before, not refused: the plan still waits for approval.
+                self.assertEqual(cli_notice(errors)["kind"], "plan_approval")
+        code, errors = self.resume("--approve-plan", config=moved)
+        self.assertEqual(code, 0, errors)
+        self.assertEqual(read_json(self.ledger)["status"], "completed")
+        self.assertEqual(self.changes(), [])
 
 class CLIBoundaryTests(RepoCase):
     def invoke(self, args, **patches):

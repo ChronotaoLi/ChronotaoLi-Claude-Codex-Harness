@@ -12,21 +12,48 @@ import sys
 import tempfile
 from pathlib import Path
 
-from . import dashboard, git, observe, quota_wait, scope as boundary, stops
+from . import config as layers, dashboard, git, observe, quota_wait, scope as boundary, stops
 from .adapters import DemoBackend
 from .budgets import attempts_total, work_attempts
 from .cleanup import blocked, cleanup_run
 from .config import Config
 from .convergence import convergence_summary, review_rounds
 from .memory import Memory, bind_source_files
-from .operations import RUN_ID, OperationRecord, config_identity, digest_assets, harness_identity, shared_paths
+from .operations import RUN_ID, OperationRecord, config_identity, digest_assets, first_line, harness_identity, shared_paths
 from .runtime import Runtime
 from .shared import mcp_configs, toml_value
 from .util import HarnessError, dump, read_json, write_json
 from .versions import read_current_ledger, require_current_ledger, unsupported_ledger
 
 
-def doctor(config):
+def project_report(config, location):
+    """The project file at its fixed place, checked over this loaded operator configuration only to report on it.
+
+    It is read once, so the digest and the error describe the same bytes; the operator file is not read again.
+    It is never doctor's configuration and never fails doctor; None outside a Git repository.
+    """
+    try:
+        repo = git.repository(location)
+    except HarnessError:
+        return None
+    path = repo / ".harness" / "project.toml"
+    report = {"path": str(path), "exists": True, "sha256": None, "error": None}
+    try:
+        raw, report["sha256"] = layers.read_layer(path)
+    except FileNotFoundError:   # as run treats it: a dangling link there is a missing file
+        report["exists"] = False
+        return report
+    except OSError as error:
+        report["error"] = first_line(error)
+        return report
+    try:
+        Config.effective(config.data, layers.parse_layer(raw, path, layers.PROJECT_LABEL, layers.PROJECT_SECTIONS))
+    except (HarnessError, ValueError, RecursionError) as error:   # tomllib recurses per nested array, so a deep enough file raises RecursionError
+        report["error"] = first_line(error)
+    return report
+
+
+def doctor(config, location):
     result = {"python": sys.version.split()[0], "models": config.data["roles"], "checks": {}}
     for cli in sorted({config.data["roles"][name]["cli"] for name in ("commander", "worker", "reviewer", "fable")}):
         if not shutil.which(cli):
@@ -42,6 +69,7 @@ def doctor(config):
     # configuration copy is visible before any run.
     result["harness"] = harness_identity()
     result["config"] = config_identity(config)
+    result["project"] = project_report(config, location)
     result["asset_digest"], asset_error = digest_assets(config)
     if asset_error is not None:
         result["asset_error"] = asset_error
@@ -396,6 +424,7 @@ def operate(args, config, repo, state):
     """Run or resume under an exclusive operation record; the record never alters the exit code."""
     if args.command == "run":
         print(f"[harness] config={config.path}", file=sys.stderr)
+        print(f"[harness] project={config.project_path}", file=sys.stderr)
         print(f"[harness] verification={dump(config.data['verification']['commands'])}", file=sys.stderr)
     operation = OperationRecord.create(state, kind=args.command, arguments=operation_arguments(args),
                                        config=config, repo=repo, operation_id=args.operation_id,
@@ -453,7 +482,8 @@ def _command(group, name, text):
 def _main(argv=None):
     parser = argparse.ArgumentParser(description="Personal Harness — fresh task agents, independent review")
     parser.add_argument("--config", default=str(Path(__file__).resolve().parent.parent / "harness.toml"),
-                        help="Harness 配置文件；默认是源码目录下的 harness.toml")
+                        help="操作者配置文件（模型、预算、记忆、共用资源）；默认是源码目录下的 harness.toml。"
+                             "run、resume、permission-diagnostics 另读目标仓库 Git 根目录下的 .harness/project.toml")
     parser.add_argument("--repo", type=Path, default=Path.cwd(), help="目标项目的 Git 仓库；默认当前目录")
     sub = parser.add_subparsers(dest="command", required=True)
     commander = "指挥：astra 或 fable，用配置里同名角色的模型；默认 astra"
@@ -588,18 +618,26 @@ def _main(argv=None):
             else:
                 manage_memory(args, repo, state)
             return 0
+        # Only these commands act on the target repository's verification and permissions;
+        # its project file has one fixed place: no upward search, no fallback, no option.
+        repo = git.repository(args.repo) if args.command in ("run", "resume", "permission-diagnostics") else None
+        project = repo / ".harness" / "project.toml" if repo is not None else None
+        # Loading writes nothing, so every refusal below comes before the operation record and private state.
         try:
-            config = Config.load(args.config)
+            config = Config.load(args.config, project)
         except FileNotFoundError as e:
+            if project is not None and e.filename == str(project):
+                raise HarnessError(f"找不到项目配置文件 {project}；请按 Harness 源码中的 examples/project.toml 在该位置创建它",
+                                   stop=stops.make("invalid_input", "cli_arguments", data={"option": "--repo"})) from e
             raise HarnessError(f"找不到配置文件 {Path(args.config).resolve()}；请通过 --config 指定配置文件，"
                                "默认 harness.toml 和 shared 资源仅随源码仓库提供") from e
         if args.command == "doctor":
-            return doctor(config)
+            return doctor(config, args.repo)
         if args.command == "permission-diagnostics":
             from .permission_diagnostics import permission_diagnostics
             if not RUN_ID.fullmatch(args.run_id) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,119}", args.dispatch_id):
                 raise HarnessError("无效 run/dispatch ID", stop=stops.make("invalid_input", "cli_arguments", data={"option": "run_id"}))
-            state = git.repository(args.repo) / ".harness"
+            state = repo / ".harness"
             try:
                 with observe.Observer(state, required=True) as observer:
                     run, error = observer._read_ledger(args.run_id)
@@ -634,7 +672,7 @@ def _main(argv=None):
         if args.command in ("demo", "smoke"):
             demo(config, live=args.command == "smoke", commander=getattr(args, "commander", "astra"))
             return 0
-        repo = git.repository(args.repo)
+        repo = repo if repo is not None else git.repository(args.repo)
         state = repo / ".harness"
         if args.command in ("run", "resume"):
             return operate(args, config, repo, state)

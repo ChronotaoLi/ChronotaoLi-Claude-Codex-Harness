@@ -34,7 +34,7 @@ from harness.watch_cli import watch_run
 from harness.workspace_inputs import prepare_run
 from harness.worker_returns import SOURCES
 from test_dashboard import DashboardCase, tree_snapshot
-from test_harness import ROOT, RepoCase
+from test_harness import ROOT, RepoCase, write_project_config
 from test_runtime_changes import ScriptedBackend
 
 INPUTS = {'packet': 'packet.json', 'schema': 'schema.json'}
@@ -304,6 +304,7 @@ class UnsupportedLedgerTests(DashboardCase):
         self.ident, self.path = run['id'], self.runtime.directory / 'state.json'
         self.current = self.path.read_bytes()
         self.runs = self.repo / '.harness' / 'runs'
+        write_project_config(self.repo)  # resume and permission-diagnostics load it before reading the ledger
         folder = tempfile.TemporaryDirectory()
         self.addCleanup(folder.cleanup)
         self.manifest = Path(folder.name).resolve() / 'inputs.json'

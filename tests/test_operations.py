@@ -5,22 +5,26 @@ import io
 import json
 import os
 import re
+import subprocess
 import sys
+import tomllib
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
 import harness.run_context
 from harness import stops
+from harness import config as config_module
 from harness import git
 from harness.adapters import DemoBackend
 from harness.cli import main
+from harness.config import Config
 from harness.runtime import Runtime
 from harness.operations import OperationRecord
 from harness.shared import asset_digest
 from harness.util import HarnessError, read_json, write_json
 from harness.versions import RUN_SCHEMA_VERSION
-from test_harness import ROOT, RepoCase
+from test_harness import ROOT, RepoCase, scratch, write_operator_config, write_project_config
 
 
 def fake_probe(name):
@@ -52,11 +56,14 @@ class OperationCase(RepoCase):
         self.state = self.repo / ".harness"
         self.operations = self.state / "operations"
 
-    def invoke(self, args, backend=None, errors=None, **patches):
-        """Real CLI and Engine with a simulated model backend; provider CLIs are never executed."""
+    def invoke(self, args, backend=None, errors=None, *, load=None, **patches):
+        """Real CLI and Engine with a simulated model backend; provider CLIs are never executed.
+
+        ``load`` replaces the case's configuration with a loader of files (``Config.load`` itself or a wrapper).
+        """
         output, errors = io.StringIO(), io.StringIO() if errors is None else errors
         with contextlib.ExitStack() as stack:
-            stack.enter_context(patch("harness.cli.Config.load", return_value=self.config))
+            stack.enter_context(patch("harness.cli.Config.load", **({"return_value": self.config} if load is None else {"new": load})))
             stack.enter_context(patch("harness.run_context.CLIBackend", return_value=backend or DemoBackend()))
             stack.enter_context(patch("harness.operations.probe_cli", side_effect=fake_probe))
             for name, value in patches.items():
@@ -111,7 +118,7 @@ class OperationRecordTests(OperationCase):
         self.assertEqual(record["harness"]["package"], str(ROOT / "harness"))
         self.assertEqual(record["harness"]["python"], sys.version.split()[0])
         self.assertEqual(record["harness"]["executable"], sys.executable)
-        self.assertEqual(record["config"], {"path": str(self.config.path),
+        self.assertEqual(record["config"], {"path": str(self.config.path), "project": None,
                                             "sha256": hashlib.sha256(self.config.path.read_bytes()).hexdigest()})
         self.assertEqual(record["asset_digest"], asset_digest(self.config))
         self.assertEqual(record["models"], self.config.data["roles"])
@@ -124,6 +131,56 @@ class OperationRecordTests(OperationCase):
         created = self.events(run_id, "run_created")
         self.assertEqual([(event["run_id"], event["operation_id"]) for event in created], [(run_id, "op-a")])
         self.assertIn(notice("run_created", run_id, "op-a"), errors.splitlines())
+
+    def run_from_files(self, operation_id, changed=None):
+        """``run`` loading an operator file and the project file itself; ``changed`` gets new bytes right after loading.
+
+        Returns (record, digests of the bytes loaded, operator path, project place, stderr lines).
+        """
+        operator = write_operator_config(scratch(self) / "harness.toml")
+        place = git.repository(self.repo) / ".harness" / "project.toml"
+        if not place.exists():
+            write_project_config(self.repo)
+        loaded = {"operator": hashlib.sha256(operator.read_bytes()).hexdigest(),
+                  "project": hashlib.sha256(place.read_bytes()).hexdigest()}
+        real = Config.load
+
+        def load(path, project=None):
+            config = real(path, project)
+            if changed is not None:
+                with {"operator": operator, "project": place}[changed].open("a", encoding="utf-8") as stream:
+                    stream.write("# changed after loading\n")
+            return config
+
+        code, output, errors = self.invoke(["--config", str(operator), "run", "Implement greet", "--pause-after-plan",
+                                            "--operation-id", operation_id], load=load)
+        self.assertEqual(code, 0, errors)
+        if changed is not None:
+            self.assertNotEqual(hashlib.sha256({"operator": operator, "project": place}[changed].read_bytes()).hexdigest(),
+                                loaded[changed])
+        return self.record(operation_id), loaded, operator.resolve(), place, errors.splitlines()
+
+    def assert_loaded_files(self, record, loaded, operator, place, lines):
+        # The digests are of the bytes the load parsed, whatever the files hold by the time the record is made.
+        self.assertEqual(record["config"], {"path": str(operator), "sha256": loaded["operator"],
+                                            "project": {"path": str(place), "sha256": loaded["project"]}})
+        self.assertEqual(lines[:2], [f"[harness] config={operator}", f"[harness] project={place}"])
+        self.assertTrue(lines[2].startswith("[harness] verification="), lines)
+
+    def test_record_keeps_the_operator_digest_loaded_before_the_file_changed(self):
+        self.assert_loaded_files(*self.run_from_files("op-operator-changed", "operator"))
+
+    def test_record_keeps_the_project_digest_loaded_before_the_file_changed(self):
+        self.assert_loaded_files(*self.run_from_files("op-project-changed", "project"))
+
+    def test_a_linked_project_file_is_recorded_and_echoed_at_its_fixed_place(self):
+        target = write_project_config(scratch(self))
+        place = git.repository(self.repo) / ".harness" / "project.toml"
+        place.parent.mkdir()
+        place.symlink_to(target)
+        record, loaded, operator, place, lines = self.run_from_files("op-linked")
+        self.assertEqual(loaded["project"], hashlib.sha256(target.read_bytes()).hexdigest())
+        self.assert_loaded_files(record, loaded, operator, place, lines)
 
     def test_failure_before_run_creation_leaves_record_without_run(self):
         (self.repo / "test_hello.py").write_text("print('tracked modification')\n")
@@ -622,12 +679,20 @@ class FileInputPrivacyTests(OperationCase):
 
 
 class DoctorEchoTests(OperationCase):
-    def doctor(self):
-        process = Mock(return_value=Mock(returncode=0, stdout="test-version"))
-        with patch("harness.cli.shutil.which", side_effect=lambda cli: "/tools/claude" if cli == "claude" else None), \
-                patch("harness.cli.subprocess.run", process):
-            code, output, errors = self.invoke(["doctor"])
-        self.assertTrue(all(call.args[0][0] == "claude" for call in process.call_args_list))
+    def doctor(self, argv=(), *, logged_in=True, load=None):
+        """doctor through the real CLI: claude and codex are stubs that never run, Git runs for real."""
+        run, providers = subprocess.run, []
+
+        def process(command, *args, **kwargs):
+            if command[0] == "git":
+                return run(command, *args, **kwargs)
+            providers.append(command[0])
+            return Mock(returncode=0 if logged_in else 1, stdout="test-version")
+
+        code, output, errors = self.invoke([*argv, "doctor"], load=load, **{
+            "harness.cli.shutil.which": lambda cli: f"/tools/{cli}" if cli in ("claude", "codex") else None,
+            "harness.cli.subprocess.run": process})
+        self.assertLessEqual(set(providers), {"claude", "codex"})
         return code, json.loads(output) if output else None, errors
 
     def test_doctor_echoes_runtime_identity_configuration_and_shared_assets(self):
@@ -642,7 +707,7 @@ class DoctorEchoTests(OperationCase):
         self.assertIsInstance(report["harness"]["runtime_modified"], bool)
         self.assertEqual((report["harness"]["python"], report["harness"]["executable"]),
                          (sys.version.split()[0], sys.executable))
-        self.assertEqual(report["config"], {"path": str(self.config.path),
+        self.assertEqual(report["config"], {"path": str(self.config.path), "project": None,
                                             "sha256": hashlib.sha256(self.config.path.read_bytes()).hexdigest()})
         self.assertEqual(report["asset_digest"], asset_digest(self.config))
         self.assertNotIn("asset_error", report)
@@ -657,14 +722,172 @@ class DoctorEchoTests(OperationCase):
     def test_doctor_exit_status_still_follows_login_checks(self):
         for role in self.config.data["roles"].values():
             role["cli"] = "claude"
-        process = Mock(return_value=Mock(returncode=1, stdout="test-version"))
-        with patch("harness.cli.shutil.which", side_effect=lambda cli: "/tools/claude" if cli == "claude" else None), \
-                patch("harness.cli.subprocess.run", process):
-            code, output, errors = self.invoke(["doctor"])
+        code, report, errors = self.doctor(logged_in=False)
         self.assertEqual(code, 1)
-        report = json.loads(output)
         self.assertFalse(report["checks"]["claude"]["logged_in"])
         self.assertEqual(report["harness"]["package"], str(ROOT / "harness"))
+
+    def test_doctor_reports_the_project_file_without_using_it(self):
+        operator = write_operator_config(scratch(self) / "harness.toml")
+        outside = scratch(self)
+        place = git.repository(self.repo) / ".harness" / "project.toml"
+        place.parent.mkdir()
+        digest = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
+        cases = [  # name, how the fixed place is filled, exists, digested, error mentions
+            ("missing", lambda: None, False, False, None),
+            ("dangling link", lambda: place.symlink_to(outside / "nowhere.toml"), False, False, None),
+            ("valid", lambda: write_project_config(self.repo, [["make", "check"]]), True, True, None),
+            ("link to a valid file", lambda: place.symlink_to(write_project_config(outside / "kept")), True, True, None),
+            ("directory", place.mkdir, True, False, ""),
+            ("unreadable", lambda: write_project_config(self.repo).chmod(0), True, False, ""),
+            ("not TOML", lambda: place.write_text("[verification\n"), True, True, ""),
+            ("not UTF-8", lambda: place.write_bytes(b"\xff\xfe"), True, True, ""),
+            ("operator section", lambda: place.write_text('[roles.worker]\ncli = "claude"\n'), True, True, "roles"),
+            ("unknown key", lambda: place.write_text("[verification]\ncommand = []\n"), True, True, "verification.command"),
+            ("invalid value", lambda: place.write_text("[runtime]\nmax_attempts = 0\n"), True, True, "runtime.max_attempts"),
+        ]
+        for name, fill, exists, digested, error in cases:
+            if name == "unreadable" and os.geteuid() == 0:
+                continue  # root reads a file whatever its mode
+            fill()
+            try:
+                for logged_in in (True, False):
+                    with self.subTest(case=name, logged_in=logged_in):
+                        code, report, errors = self.doctor(["--config", str(operator)], logged_in=logged_in,
+                                                           load=Config.load)
+                        # Neither a missing nor a broken project file fails doctor: only the login checks decide.
+                        self.assertEqual(code, 0 if logged_in else 1, errors)
+                        # doctor's configuration is the operator file alone.
+                        self.assertEqual(report["config"], {"path": str(operator.resolve()), "sha256": digest(operator),
+                                                            "project": None})
+                        project = report["project"]
+                        self.assertEqual({key: project[key] for key in ("path", "exists", "sha256")},
+                                         {"path": str(place), "exists": exists,
+                                          "sha256": digest(place) if digested else None})
+                        if error is None:
+                            self.assertIsNone(project["error"])
+                        else:
+                            self.assertIsInstance(project["error"], str)
+                            self.assertTrue(project["error"])
+                            self.assertNotIn("\n", project["error"])
+                            self.assertIn(error, project["error"])
+            finally:
+                if place.is_dir() and not place.is_symlink():
+                    place.rmdir()
+                elif os.path.lexists(place):
+                    place.unlink()
+
+    def test_doctor_reports_a_project_file_nested_too_deep_to_parse(self):
+        operator = write_operator_config(scratch(self) / "harness.toml")
+        place = git.repository(self.repo) / ".harness" / "project.toml"
+        place.parent.mkdir()
+        # Nesting as deep as the recursion limit is enough only because the current tomllib recurses per nested array;
+        # a parser that stops recursing fails the assertRaises below, and this test then needs rewriting.
+        depth = sys.getrecursionlimit()
+        text = "[runtime]\nmax_attempts = " + "[" * depth + "]" * depth + "\n"
+        with self.assertRaises(RecursionError):   # the file really is one the TOML parser cannot finish
+            tomllib.loads(text)
+        place.write_text(text)
+        for logged_in in (True, False):
+            with self.subTest(logged_in=logged_in):
+                code, report, errors = self.doctor(["--config", str(operator)], logged_in=logged_in, load=Config.load)
+                self.assertEqual(code, 0 if logged_in else 1, errors)
+                project = report["project"]
+                self.assertEqual({key: project[key] for key in ("path", "exists", "sha256")},
+                                 {"path": str(place), "exists": True,
+                                  "sha256": hashlib.sha256(place.read_bytes()).hexdigest()})
+                self.assertIsInstance(project["error"], str)
+                self.assertTrue(project["error"])
+                self.assertNotIn("\n", project["error"])
+
+    def test_doctor_outside_a_git_repository_reports_no_project_file(self):
+        outside = scratch(self)
+        operator = write_operator_config(outside / "harness.toml")
+        for logged_in in (True, False):
+            with self.subTest(logged_in=logged_in):
+                code, report, errors = self.doctor(["--repo", str(outside), "--config", str(operator)],
+                                                   logged_in=logged_in, load=Config.load)
+                self.assertEqual(code, 0 if logged_in else 1, errors)
+                self.assertIn("project", report)
+                self.assertIsNone(report["project"])
+
+    def test_doctor_keeps_the_operator_digest_loaded_before_the_file_changed(self):
+        operator = write_operator_config(scratch(self) / "harness.toml")
+        loaded, real = hashlib.sha256(operator.read_bytes()).hexdigest(), Config.load
+        write_project_config(self.repo)
+
+        def load(path, project=None):
+            config = real(path, project)
+            if project is None:  # doctor's own load, not the project file's check
+                with operator.open("a", encoding="utf-8") as stream:
+                    stream.write("# changed after loading\n")
+            return config
+
+        code, report, errors = self.doctor(["--config", str(operator)], load=load)
+        self.assertEqual(code, 0, errors)
+        self.assertNotEqual(hashlib.sha256(operator.read_bytes()).hexdigest(), loaded)
+        self.assertEqual(report["config"], {"path": str(operator.resolve()), "sha256": loaded, "project": None})
+        self.assertEqual((report["project"]["exists"], report["project"]["error"]), (True, None))
+
+    def test_doctor_reads_the_project_file_once_and_never_the_operator_file_again(self):
+        operator = write_operator_config(scratch(self) / "harness.toml")
+        place = git.repository(self.repo) / ".harness" / "project.toml"
+        place.parent.mkdir()
+        # Every file read through the configuration loader, the CLI's own load included.
+        reads, real = [], config_module.read_layer
+
+        def spy(path, *args):
+            reads.append(Path(path))
+            return real(path, *args)
+        cases = [("valid", None, None), ("not TOML", b"[verification\n", ""),
+                 ("invalid value", b"[runtime]\nmax_attempts = 0\n", "runtime.max_attempts")]
+        for name, content, error in cases:
+            if content is None:
+                write_project_config(self.repo)
+            else:
+                place.write_bytes(content)
+            reads.clear()
+            with self.subTest(case=name), patch.object(config_module, "read_layer", side_effect=spy):
+                code, report, errors = self.doctor(["--config", str(operator)], load=Config.load)
+                self.assertEqual(code, 0, errors)
+                # doctor's load read the operator file; checking the project file read only that file, once.
+                self.assertEqual(reads, [operator.resolve(), place])
+                self.assertEqual(report["project"]["sha256"], hashlib.sha256(place.read_bytes()).hexdigest())
+                if error is None:
+                    self.assertIsNone(report["project"]["error"])
+                else:
+                    self.assertIsNotNone(report["project"]["error"])
+                    self.assertIn(error, report["project"]["error"])
+
+    def test_doctor_digest_and_error_describe_the_same_read_of_the_project_file(self):
+        operator = write_operator_config(scratch(self) / "harness.toml")
+        place = git.repository(self.repo) / ".harness" / "project.toml"
+        valid, invalid = write_project_config(self.repo).read_bytes(), b"[runtime]\nmax_attempts = 0\n"
+        real = Path.read_bytes
+        for name, first, then, error in (("valid, then broken", valid, invalid, None),
+                                         ("broken, then valid", invalid, valid, "runtime.max_attempts")):
+            place.write_bytes(first)
+            seen = []
+
+            def read_bytes(path):
+                data = real(path)
+                # The file changes as soon as it has first been read, by whichever function reads it.
+                if path == place and not seen:
+                    seen.append(data)
+                    place.write_bytes(then)
+                return data
+            with self.subTest(case=name):
+                with patch.object(Path, "read_bytes", read_bytes):
+                    code, report, errors = self.doctor(["--config", str(operator)], load=Config.load)
+                self.assertEqual(code, 0, errors)
+                self.assertEqual((seen, place.read_bytes()), ([first], then))   # the rewrite happened
+                # Both fields describe the bytes read before the change, not the file as it now is.
+                self.assertEqual(report["project"]["sha256"], hashlib.sha256(first).hexdigest())
+                if error is None:
+                    self.assertIsNone(report["project"]["error"])
+                else:
+                    self.assertIsNotNone(report["project"]["error"])
+                    self.assertIn(error, report["project"]["error"])
 
 
 if __name__ == "__main__":

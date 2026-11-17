@@ -7,7 +7,7 @@ from copy import deepcopy
 from pathlib import Path
 
 from .versions import RUN_SCHEMA_VERSION, read_current_ledger
-from .config import normalized
+from .config import PROJECT_FILE, normalized
 from . import git, quota_wait, scope as boundary, stops
 from .operations import warn
 from .input_projection import validate_dispatch_indexes as validate_input_dispatch_indexes
@@ -28,7 +28,7 @@ class RunLifecycle(RuntimeService):
         scope = boundary.declared(scope)
         untracked = git.check_starting_checkout(self.context.repo)
         if not self.context.config.data["verification"]["commands"]:
-            raise HarnessError("请先配置目标项目的 verification.commands")
+            raise HarnessError(f"请先在{PROJECT_FILE}中配置 verification.commands")
         git.reject_submodules(self.context.repo)
         with stops.classify("invalid_input", "input_schema", data={"option": "--plan"}):
             supplied_tasks = self.services.planning.validate_tasks(plan) if plan is not None else []

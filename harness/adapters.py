@@ -29,6 +29,9 @@ class UndecodableOutput(HarnessError):
 _USAGE_MAX_BYTES = 16 * 1024 * 1024
 _USAGE_MAX_COUNT = 2**63 - 1
 _CODEX_ERROR_TAIL_BYTES = 64 * 1024
+# The outer session's skill (operator/<name>/SKILL.md) is linked into the user's
+# skill directories; a role Harness launches must not pick it up and drive Harness itself.
+OPERATOR_SKILL = "harness-operator"
 
 
 def codex_error_summary(path):
@@ -256,6 +259,7 @@ class CLIBackend:
                     "-c", 'approval_policy="never"', "-c", f'model_reasoning_effort={json.dumps(model["effort"])}',
                     "-c", "features.multi_agent=false", "-c", "features.memories=false",
                     "-c", "features.hooks=false", "-c", "features.plugins=false",
+                    "-c", "skills.config=" + toml_value([{"name": OPERATOR_SKILL, "enabled": False}]),
                     "-c", "project_doc_max_bytes=0",
                     "-c", "mcp_servers=" + toml_value(codex),
                     "--output-schema", str(job / "provider-schema.json"),
@@ -280,7 +284,7 @@ class CLIBackend:
             permissions["deny"] = claude_worktree_git_deny_rules(cwd)
         settings = {"autoMemoryEnabled": False, "disableAllHooks": True, "permissions": permissions}
         return ["claude", "--print", "--model", model["model"], "--effort", model["effort"],
-                "--no-session-persistence", "--session-id", job.name,
+                "--no-session-persistence", "--disable-slash-commands", "--session-id", job.name,
                 "--setting-sources", "", "--settings", json.dumps(settings),
                 "--strict-mcp-config", "--mcp-config", str(job / "mcp.json"),
                 "--output-format", "json",

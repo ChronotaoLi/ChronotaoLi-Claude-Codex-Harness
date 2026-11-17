@@ -185,11 +185,13 @@ class ExitReportingBackend(DemoBackend):
 # ---- exit-table rows (spec 14.3): a stop, the exit its projection lists, the next state -----
 # A row test binds itself to its row by calling one of these with the row's (kind, reason);
 # the exit-table guard (G8, test_stop_guards) checks the binding with the AST.
-def run_cli(case, backend, argv):
+def run_cli(case, backend, argv, *, load=False):
     """The real CLI path with a scripted backend; returns (code, stderr text).
 
     Only ``cli.Runtime`` (to pass the backend) and ``cli.Config.load`` (the case's
     configuration) are replaced; the parser, ``operate()`` and the operation record are real.
+    With ``load`` the CLI loads its configuration files itself: the operator file
+    ``--config`` names in ``argv`` and the repository's ``.harness/project.toml``.
     """
     import contextlib
     import io
@@ -198,17 +200,39 @@ def run_cli(case, backend, argv):
     from unittest.mock import patch
     from harness import cli
     runtime = lambda config, repo, **kwargs: Runtime(config, repo, backend=backend, **kwargs)
+    loader = Config if load else SimpleNamespace(load=lambda path, project=None: case.config)
     errors = io.StringIO()
     previous = signal.getsignal(signal.SIGTERM)
     try:
-        with patch.object(cli, "Runtime", runtime), \
-                patch.object(cli, "Config", SimpleNamespace(load=lambda path: case.config)), \
+        with patch.object(cli, "Runtime", runtime), patch.object(cli, "Config", loader), \
                 patch("harness.operations.probe_cli", return_value={"path": None, "version": None}), \
                 contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(errors):
             code = cli.main(["--repo", str(case.repo), *argv])
     finally:
         signal.signal(signal.SIGTERM, previous)
     return code, errors.getvalue()
+
+
+def write_project_config(repo, commands=None, worker_commands=()):
+    """The target repository's project file, which the CLI loads for run, resume and permission-diagnostics."""
+    from harness.shared import toml_value
+    path = Path(repo) / ".harness" / "project.toml"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    commands = [[sys.executable, "-m", "unittest", "-v"]] if commands is None else commands
+    path.write_text(f"[verification]\ncommands = {toml_value(commands)}\n\n"
+                    f"[permissions]\nworker_commands = {toml_value(list(worker_commands))}\n", encoding="utf-8")
+    return path
+
+
+def write_operator_config(path):
+    """The source tree's operator file copied to ``path``, its shared paths made absolute so it works from any folder."""
+    text = (ROOT / "harness.toml").read_text(encoding="utf-8")
+    for key, value in tomllib.loads(text)["shared"].items():
+        text = text.replace(f'{key} = "{value}"', f"{key} = {toml_value(str(ROOT / value))}")
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    return path
 
 
 def scratch(case):

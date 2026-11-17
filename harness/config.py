@@ -1,4 +1,5 @@
 import copy
+import hashlib
 import tomllib
 from collections import Counter
 from dataclasses import dataclass
@@ -24,8 +25,16 @@ RESUME_INCREASES = (
     "claude_max_turns", "max_attempts", "max_agent_dispatches",
 )
 DISPATCH_ROLES = ("commander", "worker", "reviewer")
+ROLE_NAMES = ("commander", "worker", "reviewer", "fable")
 # A wait policy, not a budget: a resume may raise, lower or disable it (0).
 QUOTA_WAIT_KEY = "quota_wait_max_seconds"
+# The top-level sections each file may hold: the operator's file is the same for
+# every project; the project file lives at <Git root>/.harness/project.toml.
+OPERATOR_SECTIONS = ("roles", "runtime", "memory", "shared")
+PROJECT_SECTIONS = ("verification", "permissions", "runtime")
+OPERATOR_LABEL, PROJECT_LABEL = "操作者配置", "项目配置"
+# Operator-facing hints that ask for a verification or permissions change name the file holding them.
+PROJECT_FILE = f"{PROJECT_LABEL}（目标仓库的 .harness/project.toml）"
 
 
 def claude_turn_limit(runtime, role):
@@ -60,6 +69,55 @@ def normalized(data):
     return data
 
 
+def unknown_keys(data):
+    """Full paths of keys no section allows; sections absent from ``data`` are skipped."""
+    unknown = []
+
+    def check_keys(values, allowed, prefix=""):
+        if isinstance(values, dict):
+            unknown.extend(prefix + key for key in values if key not in allowed)
+
+    check_keys(data, {*DEFAULTS, "shared", "roles"})
+    for section, defaults in DEFAULTS.items():
+        check_keys(data.get(section), defaults, section + ".")
+    check_keys(data.get("shared"), ("rules", "skills", "mcp"), "shared.")
+    roles = data.get("roles")
+    check_keys(roles, ROLE_NAMES, "roles.")
+    if isinstance(roles, dict):
+        for name in ROLE_NAMES:
+            check_keys(roles.get(name), ("cli", "model", "effort"), f"roles.{name}.")
+    return unknown
+
+
+def read_layer(path):
+    """One configuration file read once: (bytes, sha256). Whatever is parsed is these very bytes."""
+    raw = path.read_bytes()
+    return raw, hashlib.sha256(raw).hexdigest()
+
+
+def parse_layer(raw, path, label, sections):
+    """One file's bytes as read, checked on their own.
+
+    Only the file's own sections are accepted and each must be a table; those refusals
+    and unknown keys name the file. UTF-8 and TOML errors propagate unchanged and do not name it.
+    """
+    data = tomllib.loads(raw.decode("utf-8"))
+    for section, values in data.items():
+        if section not in sections and section in (*OPERATOR_SECTIONS, *PROJECT_SECTIONS):
+            home = (f"{PROJECT_LABEL}（目标仓库 Git 根目录下的 .harness/project.toml）" if label == OPERATOR_LABEL
+                    else f"{OPERATOR_LABEL}（--config 指定的文件）")
+            raise HarnessError(f"{label} {path} 不能包含 {section}：它应写在{home}中")
+        if section in sections and not isinstance(values, dict):
+            raise HarnessError(f"{section} 必须为配置表（{label} {path}）")
+    unknown = unknown_keys(data)
+    limits = data.get("runtime", {}).get("claude_max_turns_by_role")
+    if isinstance(limits, dict):
+        unknown.extend(f"runtime.claude_max_turns_by_role.{role}" for role in limits if role not in DISPATCH_ROLES)
+    if unknown:
+        raise HarnessError("未知配置键：" + "、".join(sorted(unknown)) + f"（{label} {path}）")
+    return data
+
+
 def validate_commands(commands, field):
     if not isinstance(commands, list):
         raise HarnessError(f"{field} 必须使用 argv 数组列表")
@@ -74,32 +132,43 @@ def validate_commands(commands, field):
 class Config:
     path: Path
     data: dict
+    # What load() read: each file's digest is of the very bytes it parsed. None when not loaded from files.
+    sha256: str | None = None
+    project_path: Path | None = None
+    project_sha256: str | None = None
 
     @classmethod
-    def load(cls, path):
+    def load(cls, path, project_path=None):
+        """Effective configuration: built-in defaults <- operator file <- project file (when given)."""
         path = Path(path).resolve()
-        data = normalized(tomllib.loads(path.read_text(encoding="utf-8")))
+        raw, digest = read_layer(path)
+        data = parse_layer(raw, path, OPERATOR_LABEL, OPERATOR_SECTIONS)
+        project = project_digest = None
+        if project_path is not None:
+            # Its place is fixed and shown as it is: a link there is followed when read, never displayed.
+            project_path = Path(project_path).absolute()
+            raw, project_digest = read_layer(project_path)
+            project = parse_layer(raw, project_path, PROJECT_LABEL, PROJECT_SECTIONS)
+        return cls(path, cls.effective(data, project), digest, project_path, project_digest)
+
+    @classmethod
+    def effective(cls, operator, project):
+        """Built-in defaults <- operator layer <- project layer (None when there is none), checked by validate.
+
+        The operator layer may already be an effective configuration, as doctor's is: defaults only fill
+        what nothing set, so filling them before the project layer gives the same result as after it.
+        """
+        if project is not None:
+            # runtime is replaced key by key, each value whole (tables and arrays are not merged);
+            # verification and permissions come only from the project file.
+            operator = {**operator, **project, "runtime": {**operator.get("runtime", {}), **project.get("runtime", {})}}
+        data = normalized(operator)
         cls.validate(data)
-        return cls(path, data)
+        return data
 
     @staticmethod
     def validate(data):
-        unknown = []
-
-        def check_keys(values, allowed, prefix=""):
-            if isinstance(values, dict):
-                unknown.extend(prefix + key for key in values if key not in allowed)
-
-        check_keys(data, {*DEFAULTS, "shared", "roles"})
-        for section, defaults in DEFAULTS.items():
-            check_keys(data.get(section), defaults, section + ".")
-        check_keys(data.get("shared"), ("rules", "skills", "mcp"), "shared.")
-        roles = data.get("roles")
-        role_names = ("commander", "worker", "reviewer", "fable")
-        check_keys(roles, role_names, "roles.")
-        if isinstance(roles, dict):
-            for name in role_names:
-                check_keys(roles.get(name), ("cli", "model", "effort"), f"roles.{name}.")
+        unknown = unknown_keys(data)
         if unknown:
             raise HarnessError("未知配置键：" + "、".join(sorted(unknown)))
         shared = data.get("shared")
@@ -111,7 +180,7 @@ class Config:
                 raise HarnessError(f"shared.{key} 必须为非空路径字符串")
         if not isinstance(data.get("roles"), dict):
             raise HarnessError("roles 必须为配置表")
-        for name in role_names:
+        for name in ROLE_NAMES:
             role = data.get("roles", {}).get(name, {})
             if (not isinstance(role, dict) or role.get("cli") not in ("codex", "claude")
                     or not isinstance(role.get("model"), str) or not role["model"].strip()

@@ -7,6 +7,7 @@ from copy import deepcopy
 from pathlib import Path
 
 from . import git, stops
+from .config import PROJECT_FILE
 from .context import compact_checks, compact_feedback, compact_reviews, instruction_file_changes
 from .contracts import envelope, judge_review, review_approved, review_schema, WORK
 from .memory import Memory, validate_proposals
@@ -35,7 +36,7 @@ def environment_blocked(result, task_id, dispatch_id, artifact, digest, *, inval
     """The environment-blocked stop: an excerpt in the text, the full artifact in the stop's source."""
     return HarnessError(f"worker 环境受阻：{environment_blocker_excerpt(result)}。"
                         f"完整 worker 结果：{artifact}（SHA256 {digest}）。"
-                        "若必要命令被拒绝，可在 permissions.worker_commands 追加精确 argv 后 resume；"
+                        f"若必要命令被拒绝，可在{PROJECT_FILE}的 permissions.worker_commands 追加精确 argv 后 resume；"
                         "环境事实有变化可使用 --environment-update FILE 记录补充说明与本地检查；"
                         "原尝试和派发预算仍保留。",
                         stop=stops.make("environment", "worker_blocked", data={"invalid_output": invalid_output},

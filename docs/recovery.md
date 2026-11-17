@@ -13,7 +13,7 @@
 - 先看 `status RUN`：它给出状态、停止投影 `stop`（类型、标题、出口命令与诊断摘录）、预算（`budgets`、`budget_explanation`、`remaining_model_calls`）、worker 结局计数 `worker_outcomes`、待答决定 `pending_decisions`、续作 `continuation`、缺失命令 `missing_command_requirements`、范围边界 `scope`（有已判定合格而未落地的提案时含即时重算的 `scope.held`）、最近环境阻断 `last_environment_blocker`、返工提示 `convergence`、审阅轮次 `review_rounds`、额度等待记录 `quota_wait`（等待期间）和运行期间账号额度的观测变化 `quota`（见[额度](operations.md#额度)）。`status RUN --full` 输出完整台账。
 - 每个出口都沿用同一 run 的累计预算、证据和接受条件。读得出的拒绝、停止和阻断不会被丢弃；读不出否决的无效输出不是结果，由新调用重做（见[无效输出与自动重做](#无效输出与自动重做)）。同一快照上重复 `resume` 只会得到同样的停止，或消耗新的调用。
 - 出口可以是继续，也可以是保留现场后 `abandon`。`abandon` 与 `resume` 一样先经过 `load_run`：加载时核验的证据（见[证据损坏](#证据损坏)）被删改时，两者都被拒绝。
-- `resume` 使用与 `run` 相同的 `--config`。恢复时只能提高 `agent_timeout_seconds`、`verify_timeout_seconds`、`context_chars`、`claude_max_turns`（及各角色实际生效的 `claude_max_turns_by_role`）、`max_attempts`、`max_agent_dispatches`，在 `permissions.worker_commands` 追加精确 argv，或任意调整额度等待上限 `quota_wait_max_seconds`（调高、调低、设 0 关闭；事件 `resume_config_changed`）；其他配置、模型和共享资产必须与创建时一致。
+- `resume` 与 `run` 一样读操作者配置与项目配置（项目配置缺失时同样拒绝，见[统一入口](operations.md#统一入口)），用两者合并后的有效配置与台账当前的 `config_snapshot` 比较。恢复时只能提高 `agent_timeout_seconds`、`verify_timeout_seconds`、`context_chars`、`claude_max_turns`（及各角色实际生效的 `claude_max_turns_by_role`）、`max_attempts`、`max_agent_dispatches`（写在哪一份的 `runtime` 里都可以），在项目配置的 `permissions.worker_commands` 追加精确 argv，或任意调整额度等待上限 `quota_wait_max_seconds`（调高、调低、设 0 关闭；事件 `resume_config_changed`）。合法放宽被采纳后更新这份快照，后续恢复以更新后的值为基准：例如 `agent_timeout_seconds` 创建时是 300、一次恢复提高到 1000 之后，再恢复时设为 600 会被拒绝（`config_mismatch/immutable_config`），即使它仍高于创建时的值。其他配置与模型不能改；共享资产按创建 run 时记下的摘要比较，必须一致。比较的是有效配置的内容，不是文件路径或文件摘要：操作者配置换了路径而内容等价、任一份文件只改了注释，恢复照常；台账的 `config_path` 始终是创建时操作者配置的路径，只作显示。
 - 恢复先核对共享资产与计划文件，记下 `--confirm-exited` 的确认，再确认旧进程退出、核对 Git 绑定、索引与 HEAD，之后才登记本次的其他恢复输入；这些检查失败时，答复、范围、配置放宽、环境更新、执行指导与拒绝都不写入，但同一条命令里已经保存的退出确认与审计照常保留。例外：已返回而未登记的指挥提问在 HEAD 门禁之前完成登记（见[指挥提问、修订与范围](#指挥提问修订与范围)），之后的回答与执行仍先过 HEAD 门禁。
 - 外层自动化会话的权限边界见[外层 agent 操作说明](operations.md#外层-agent-操作说明)：新增权限、预算或需求选择要向用户请求。
 
@@ -64,7 +64,7 @@
 | `plan-outside-scope` | `invalid_input/plan_outside_scope`（操作） | 2 | `--plan` 的模式无法证明在 `--scope` 声明的边界内（`data.gaps`、`data.suggested_scope`；此时没有创建 run、台账或工作树） | 修正计划，或调整 `--scope` 后重新 `run` | 无命令出口 |
 | `scope-pattern` | `invalid_input/scope_pattern`（操作） | 2 | `--scope` 的条目不是具体路径、字面子树 `p/…/**` 或 `**`，或以受保护根开头（`.CLAUDE` 这类别名写法同样算；`data.patterns` 列出被拒的条目；整批拒绝，不创建或改写 run） | 改成合法形式后重试；一般 glob 的缺口用停止信息给出的建议条目 | 无命令出口 |
 | `plan-approval-after-capacity` | `budget/context_capacity` | 3 | 带 `--pause-after-plan` 启动后，计划的整体审阅必要上下文超过预算（计划已登记、尚未批准） | 提高 `context_chars`；之后普通 `resume` 重新预检，通过即进入计划待批准（退出 0），未提高时仍是同一停止 | `resume RUN`；`abandon RUN` |
-| `commands-all-ready` | `missing_commands/all_ready_tasks` | 3 | `任务所需命令尚未授权`（全部就绪任务都缺），或 `missing_command_requirements` 非空 | 在 `permissions.worker_commands` 追加精确 argv；`git_query` 形式表内的 Git 查询无需授权；停止期间不扣尝试与派发预算 | `resume RUN` |
+| `commands-all-ready` | `missing_commands/all_ready_tasks` | 3 | `任务所需命令尚未授权`（全部就绪任务都缺），或 `missing_command_requirements` 非空 | 在项目配置的 `permissions.worker_commands` 追加精确 argv；`git_query` 形式表内的 Git 查询无需授权；停止期间不扣尝试与派发预算 | `resume RUN` |
 | `commands-selected` | `missing_commands/selected_task` | 3 | 已选中的任务（待派发指令保留）在派发前缺少命令授权 | 同上；授权后同一指令派发，不重新决定 | `resume RUN` |
 | `continuation-commands` | `continuation/commands_required` | 3 | `等待续作条件：{'kind': 'commands', …}` | 授权缺少的命令，或认为方案需修正时拒绝续作（交给同一任务的新 worker；`request_id` 取 `status RUN` 的 `continuation.request_id`） | `resume RUN`；`resume RUN --reject-request FILE` |
 | `continuation-timeout` | `continuation/timeout_required` | 3 | `等待续作条件：{'kind': 'budget', …}` | 把 `agent_timeout_seconds` 提高到请求下限，或拒绝续作 | `resume RUN`；`resume RUN --reject-request FILE` |
@@ -115,7 +115,7 @@
 | `revision-head` | `workspace_mismatch/head_changed` | 1 | `应用修订前 HEAD 与已校验计划不符` | 恢复原 HEAD 后普通 `resume`（修订照常发布），或放弃 | `resume RUN`；`abandon RUN`；〔`question_registered`〕`resume RUN --operator-decision FILE` |
 | `shared-assets` | `config_mismatch/shared_assets`（操作） | 2 | `共享规则、skills 或 MCP 已改变` | 恢复原版本的共享资产 | `resume RUN` |
 | `wake-shared-assets` | `config_mismatch/shared_assets` | 2 | 同上，额度等待醒来后的前提核对发现的（等待期间改了共享资产）；之后没有调用任何模型 | 恢复原版本的共享资产后普通 `resume`；醒来后的核对与手工 `resume` 是同一组函数，HEAD、Git 绑定、计划文件、索引、加载核验的不符也按各自的行处理 | `resume RUN` |
-| `config-changed` | `config_mismatch/immutable_config`（操作） | 2 | `配置已改变：…` | 恢复不可放宽的配置值 | `resume RUN` |
+| `config-changed` | `config_mismatch/immutable_config`（操作） | 2 | `配置已改变：…` | 把操作者配置或项目配置改回[通用规则](#通用规则)允许的范围：不可放宽的值恢复原样，可放宽的值不低于台账当前 `config_snapshot` 里的值 | `resume RUN` |
 | `binding-missing` | `workspace_mismatch/binding_missing`（操作） | 1 | `缺少已保存的 worktree Git 绑定` | 启动在绑定保存前中断；放弃后重新 `run`，核对后手工 `git worktree remove` 并删除 `harness/<run>` 分支 | `abandon RUN` |
 | `unsupported` | `unsupported_ledger/ledger_version`（操作） | 2 | `台账版本 N 不支持（当前版本 18）` | 当前版本不恢复、不放弃、不准备、不清理、不解释这份台账（见[终态与其他版本的台账](#终态与其他版本的台账)）；运行列表仍显示路径与版本；开始新 run，原始 JSON 用文件工具查看 | 无命令出口 |
 | `busy` | `busy/run_lock`（操作） | 3 | `已有进程持有运行锁`。额度等待期间 `resume`／`abandon` 也会遇到：锁外读到的台账有 `quota_wait` 时，停止值带 `quota_wait_until`、`quota_wait_recorded_at` 与固定说明 `quota_wait_note`（记录不证明持锁的进程仍在等待），并列出 `status RUN` | 等另一个 `run`／`resume`／`abandon` 结束后重试原命令；看 `status RUN` 的 `quota_wait` 判断是否在等额度；要取消等待就中断那个进程（Ctrl-C 或 SIGTERM），再按 `interrupted` 处理。`cleanup-run` 遇到锁被占按逐资源结果返回 1 | 〔`quota_wait_recorded`〕`status RUN` |
@@ -131,7 +131,7 @@
 | `unclassified-harness-error` | `unclassified/untyped_harness_error` | 1 | 未分类的停止 | 不推测恢复动作，保留现场报告 | 无命令出口 |
 | `unclassified-exception` | `unclassified/unexpected_exception` | 1 | 未预期的异常 | 同上 | 无命令出口 |
 | `interrupted` | `interrupted/signal` | 130 | Ctrl-C、SIGTERM、SIGHUP | 确认中断原因；普通 `resume` 报出需要确认退出的确切派发 | `resume RUN`；〔`exits_confirmed`〕`abandon RUN` |
-| `input-arguments` | `invalid_input/cli_arguments`（操作） | 2 | 命令参数无效（例如 run ID 形式无效、run 不存在、目标为空） | 修正参数后重试 | 无命令出口 |
+| `input-arguments` | `invalid_input/cli_arguments`（操作） | 2 | 命令参数无效（例如 run ID 形式无效、run 不存在、目标为空、`--operation-id` 形式不合格或同名操作记录已存在）；或 `run`、`resume`、`permission-diagnostics` 找不到项目配置（`data.option` 为 `--repo`，错误给出期望的路径；拒绝在任何写入之前） | 修正参数后重试；缺项目配置时以 `examples/project.toml` 为起点在给出的路径创建它（见[两份配置](../README.md#两份配置)），再重试原命令 | 无命令出口 |
 | `input-file` | `invalid_input/input_schema`（操作） | 2 | 输入文件不合格（`--operator-decision`、`--environment-update`、`--execution-guidance`、`--reject-request`、`prepare-run --manifest`），含文件不存在、读不出、不是 UTF-8 或不是 JSON | 修正文件后重试。`--operator-decision`、`--execution-guidance`、`--reject-request` 与 `prepare-run --manifest` 的读取与解析在任何写入之前，这些拒绝不改写台账；`--environment-update` 的文件在退出确认之后才读取，同一条命令里先前保存的 `--confirm-exited` 确认与审计会保留，其他恢复输入都不写入（内容合法而之后的状态检查拒绝的，见各选项） | 无命令出口 |
 | `options` | `invalid_input/incompatible_options`（操作） | 2 | 选项不能同用（见[恢复选项与互斥](#恢复选项与互斥)） | 拆成合法的组合后重试 | 无命令出口 |
 | `stale-request` | `invalid_input/stale_request`（操作） | 2 | 输入针对的请求或来源已失效（未知请求、之后已有模型调用、已被新答复取代；`--reject-request` 的 `request_id` 不是已判定合格而未落地的提案或当前续作） | 用 `status RUN` 读当前请求后重答 | `status RUN` |
@@ -145,7 +145,7 @@
 
 ### 命令授权与前置命令
 
-任务的 `required_commands` 与 `self_checks` 是前置条件。派发前与 `verification.commands`、`permissions.worker_commands` 精确比较，参数、空参数、字面 `*` 和换行都原样比较，不接受前缀；`verification.setup_commands` 不授予 worker 能力。能被 `git_query` 解析的形式表内 argv 算作已满足（只表示能力存在，worker 要用该工具执行，不能用 Bash）。缺少授权的任务不启动 worker、不扣尝试，其他就绪任务照常继续；全部就绪任务都缺命令时停止。追加精确 argv 后普通 `resume` 即可重检，无需环境更新。
+任务的 `required_commands` 与 `self_checks` 是前置条件。派发前与 `verification.commands`、`permissions.worker_commands` 精确比较，参数、空参数、字面 `*` 和换行都原样比较，不接受前缀；`verification.setup_commands` 不授予 worker 能力。能被 `git_query` 解析的形式表内 argv 算作已满足（只表示能力存在，worker 要用该工具执行，不能用 Bash）。缺少授权的任务不启动 worker、不扣尝试，其他就绪任务照常继续；全部就绪任务都缺命令时停止。在项目配置追加精确 argv 后普通 `resume` 即可重检，无需环境更新。
 
 ### 续作与操作指导
 
@@ -178,7 +178,7 @@ worker 需要新的精确命令或更长的单次时限时，返回 `blocker_kin
 worker 因环境受阻后，用结构化更新说明已修复的环境事实：
 
 ```bash
-python3 -m harness --config /path/to/harness.toml --repo /path/to/project resume RUN --environment-update /absolute/path/update.json --step
+harness resume RUN --environment-update /absolute/path/update.json --step
 ```
 
 ```json
@@ -201,7 +201,7 @@ python3 -m harness --config /path/to/harness.toml --repo /path/to/project resume
 worker 返回 `blocker_kind=operator`、指挥提问，或已接受任务为下游任务留下 `decision_requests` 时，`status RUN` 的 `pending_decisions` 列出请求。回答：
 
 ```bash
-python3 -m harness --config /path/to/harness.toml --repo /path/to/project resume RUN --operator-decision /absolute/path/decision.json --step
+harness resume RUN --operator-decision /absolute/path/decision.json --step
 ```
 
 ```json
@@ -255,7 +255,7 @@ python3 -m harness --config /path/to/harness.toml --repo /path/to/project resume
 Claude 担任的角色（worker、`--commander fable` 的指挥、配置成 Claude 的审阅者）在执行循环里遇到已判定的 `provider_quota/usage_limit` 时，默认先在同一进程里等到快照给出的重置时刻再继续，不停止、不退出。条件、选窗口的规则与不等时的原因见设计的不变量 22；配置键 `runtime.quota_wait_max_seconds`（默认 21,600 秒，0 关闭），单次最多这么久，余量 60 秒；没有命令行参数。Codex 的失败、进入执行循环之前的失败（首版规划，以及恢复时重放已封存而未交接的 worker 结果所做的验证与任务审阅）、限速与其他失败从不等待。
 
 - **等待期间**：状态保持 `running`，台账另有只供观察的 `quota_wait`（来源调用、窗口、重置时刻、等到何时、记录时刻、上限、失败样本），`status RUN` 的 `quota_wait` 与观察网页的关注项“等待额度恢复”显示它，`watch` 的快照带 `quota_wait`，退出条件不变。进程持有 `run.lock`：另一个 `resume`／`abandon` 得到 `busy/run_lock`（提示里有等待记录的时刻，记录不证明持锁的进程仍在等待）。事件 `quota_wait_started`、`quota_wait_finished`；失败时与醒来时各取一份额度样本（触发 `quota_failure`、`wake`）。
-- **醒来之后**：先删除 `quota_wait`（单独一次保存），再重跑 `resume` 预检里只读的前提核对，与手工 `resume` 调用同一组函数：盘上台账仍是本进程刚提交的那份、加载核验、共享资产摘要、环境产物、计划文件、Git 绑定、路径与输入索引、HEAD、依赖副本、回执链接。任何一项不符就停止，类型与 `resume` 遇到同样情况时相同（例如 `head-changed` 的 `workspace_mismatch/head_changed`、`wake-shared-assets`、`load-integrity`），之后不调用任何模型。不重跑带写入的预检步骤（退出确认、登记已返回的提问、补终端摘要、恢复输入），也不重读配置文件：等待期间改了 `harness.toml`，本进程照旧用启动时加载的配置，改动由下一次 `resume` 按通用规则接受或拒绝。核对通过后回到调度循环开头，重跑全部调度门禁，下一步照常推导：worker 失败之后是一次新的指挥决定，指挥或审阅失败之后是同一种调用的新请求（新进程、新 dispatch，不带 `retry_of`），不是重试同一个调用。
+- **醒来之后**：先删除 `quota_wait`（单独一次保存），再重跑 `resume` 预检里只读的前提核对，与手工 `resume` 调用同一组函数：盘上台账仍是本进程刚提交的那份、加载核验、共享资产摘要、环境产物、计划文件、Git 绑定、路径与输入索引、HEAD、依赖副本、回执链接。任何一项不符就停止，类型与 `resume` 遇到同样情况时相同（例如 `head-changed` 的 `workspace_mismatch/head_changed`、`wake-shared-assets`、`load-integrity`），之后不调用任何模型。不重跑带写入的预检步骤（退出确认、登记已返回的提问、补终端摘要、恢复输入），也不重读任何一份配置文件：等待期间改了操作者配置或项目配置，本进程照旧用启动时加载的有效配置，改动由下一次 `resume` 按通用规则接受或拒绝。核对通过后回到调度循环开头，重跑全部调度门禁，下一步照常推导：worker 失败之后是一次新的指挥决定，指挥或审阅失败之后是同一种调用的新请求（新进程、新 dispatch，不带 `retry_of`），不是重试同一个调用。
 - **取消**：中断这个进程（Ctrl-C 或 SIGTERM），台账记 `interrupted/signal`（退出码 130），`quota_wait` 与中断同次删除；之后普通 `resume` 或 `abandon`。等待中改小或关闭上限只能这样：中断后带新配置 `resume`，新值只影响之后的额度失败。
 - **主进程被强杀**：台账留着 `running` 与 `quota_wait`，读法与被强杀的 `running` 相同——记录不证明进程存活，不会自动继续。普通 `resume` 进入执行时删除它、照常推导下一步，不续等；`abandon` 同样删除它。
 - **有界**：每次等待之前都有一次计入 `max_agent_dispatches` 的失败调用，并且要求 `agent_dispatches` 仍小于上限；所以等待次数受派发预算约束，但累计等待时长不受单次上限约束（默认 200 次 × 6 小时）。

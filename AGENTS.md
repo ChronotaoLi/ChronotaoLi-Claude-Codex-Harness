@@ -2,6 +2,8 @@
 
 Read `README.md` for usage and `docs/design.md` for constraints and reference sources.
 Runtime code is in `harness/`, common agent instructions in `shared/`, and offline behavior tests in `tests/`.
+`operator/harness-operator/SKILL.md` is the skill for the outer session that calls Harness; it stays out of `shared/skills/`, which the roles see.
+Configuration is two files: the operator file (`--config`, default the root `harness.toml`) and the target repository's `.harness/project.toml`, which alone holds verification commands and worker grants. Tests that need those set them explicitly (for example `write_project_config` in `tests/test_harness.py`) rather than relying on the root `harness.toml`.
 
 Keep the core Python 3.11+ and dependency-free. Run `python3 -m unittest discover -s tests -v` after runtime changes; `python3 tests/run_shards.py` (default `--shards 4`) runs the same discovered tests in parallel processes and exits non-zero unless every collected test ran exactly once. The single-process command remains the reference run.
 Tests must exercise lifecycle behavior, acceptance gates, isolation, retrieval or recovery rather than matching prompt wording.

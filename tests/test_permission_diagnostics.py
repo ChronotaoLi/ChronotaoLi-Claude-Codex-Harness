@@ -11,7 +11,7 @@ from harness.diagnostics import permission_denial_projection
 from harness.permission_diagnostics import command_capability_projection, permission_diagnostics
 from harness.util import HarnessError, write_json
 from harness.versions import RUN_SCHEMA_VERSION
-from test_harness import ROOT, RepoCase
+from test_harness import ROOT, RepoCase, write_project_config
 
 
 class PermissionDiagnosticsTests(unittest.TestCase):
@@ -81,6 +81,7 @@ class PermissionDiagnosticsCliTests(RepoCase):
         job.mkdir(parents=True)
         for name, value in files.items():
             (job / name).write_text(value if isinstance(value, str) else json.dumps(value), encoding='utf-8')
+        write_project_config(self.repo)  # permission-diagnostics compares against the project's commands
         run = {'id': self.RUN, 'commander': 'astra', 'config_snapshot': {'roles': {'worker': {'cli': 'claude'}}},
                'dispatches': [{'id': self.DISPATCH, 'role': 'worker'}], **fields}
         write_json(directory / 'state.json', run)

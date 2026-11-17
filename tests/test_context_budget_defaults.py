@@ -14,8 +14,9 @@ ROOT = Path(__file__).resolve().parents[1]
 class RuntimeBudgetDefaultsTests(unittest.TestCase):
     def load_runtime(self, runtime):
         source = (ROOT / "harness.toml").read_text(encoding="utf-8")
-        start = source.index("[runtime]")
-        end = source.index("[permissions]", start)
+        # The table headers, not their mention in the leading comment.
+        start = source.index("\n[runtime]\n") + 1
+        end = source.index("\n[memory]\n", start) + 1
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "harness.toml"
             path.write_text(source[:start] + runtime + source[end:], encoding="utf-8")

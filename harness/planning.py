@@ -16,6 +16,7 @@ from pathlib import Path
 
 from . import git, stops
 from .budgets import work_attempts
+from .config import PROJECT_FILE
 from .context import compact_feedback
 from .contracts import apply_revision, DECIDE, validate_decision, validate_plan
 from .receipts import judged_decide, ProposalCapacityHold, ScopeHold, SuppliedPlanHold
@@ -62,7 +63,7 @@ class Planner(RuntimeService):
             self.context.event("command_requirements_checked", **report)
             if missing:
                 print("[harness] 计划存在未授权的任务命令：" + json.dumps(missing, ensure_ascii=True)
-                      + "；对应 worker 派发前必须在 permissions.worker_commands 追加精确 argv。",
+                      + f"；对应 worker 派发前必须在{PROJECT_FILE}的 permissions.worker_commands 追加精确 argv。",
                       file=sys.stderr, flush=True)
         return missing
 
@@ -73,7 +74,7 @@ class Planner(RuntimeService):
         if unmet:
             source = {"task_id": task_ids[0]} if reason == "selected_task" else {}
             raise HarnessError("任务所需命令尚未授权：" + json.dumps(unmet, ensure_ascii=True)
-                               + "；在 permissions.worker_commands 追加这些精确 argv 后普通 resume；"
+                               + f"；在{PROJECT_FILE}的 permissions.worker_commands 追加这些精确 argv 后普通 resume；"
                                  "计划批准不授予命令权限，本检查不消耗 worker 尝试或模型派发额度",
                                stop=stops.make("missing_commands", reason, source=source,
                                                data={"config_key": "permissions.worker_commands", "missing": unmet}))

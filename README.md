@@ -53,28 +53,66 @@ python3 -m harness smoke --commander fable
 独立权限与工具检查也调用配置中的真实 Claude worker 模型、消耗账号额度并保留原始证据：
 
 ```bash
-python3 -m harness.permission_smoke --config /path/to/harness.toml --repo /path/to/project
-python3 -m harness.tool_smoke --config /path/to/harness.toml --repo /path/to/project
+python3 -m harness.permission_smoke --repo /abs/project
+python3 -m harness.tool_smoke --repo /abs/project
 ```
 
-权限检查在 `.harness/permission-smoke/` 建立专用现场，关闭外部 MCP，不执行项目验证命令；它不证明完整命令白名单或 OS 隔离。参数、证据要求和结果边界见[真实账号联调](docs/operations.md#真实账号联调)；离线验证、已完成的真实账号联调与仍然没有运行的项目见[验证记录](docs/validation.md)。
+权限检查在 `.harness/permission-smoke/` 建立专用现场，关闭外部 MCP，不读项目配置、不执行项目验证命令；它不证明完整命令白名单或 OS 隔离。参数、证据要求和结果边界见[真实账号联调](docs/operations.md#真实账号联调)；离线验证、已完成的真实账号联调与仍然没有运行的项目见[验证记录](docs/validation.md)。
 
 ## 对自己的项目执行任务
 
-1. 为目标项目准备 [harness.toml](harness.toml)，设置真正需要的 `verification.commands`，运行时显式传入 `--config`。每条命令是 argv 数组，不经 shell 解释，例如 `["uv", "run", "pytest"]` 或 `["npm", "test", "--", "--run"]`。依赖需要在 worktree 中可用；生成产物应已忽略或位于工作树外，验证期间出现未忽略的新文件也会触发快照门禁。
-2. 目标项目必须有 Git 提交，且已跟踪文件与暂存区没有未提交修改。主检出的未跟踪文件只产生警告并保留原位；任务工作树从 HEAD 创建，不复制未跟踪或忽略文件。编排器不会替你 stash。当前不支持 submodule，索引存在 gitlink 时在创建 worktree 和派发模型前报错。
-3. 在本 Harness 仓库目录运行：
+### 安装入口
+
+editable 安装之后，在任何目录都能用 `harness` 命令（`pyproject.toml` 的 `[project.scripts]`）。两种方式任选其一：
 
 ```bash
-python3 -m harness --config /absolute/path/harness.toml --repo /absolute/path/to/project run "修复分页边界错误，并补充必要的回归测试"
-python3 -m harness --config /absolute/path/harness.toml --repo /absolute/path/to/project run "实现导出功能" --commander fable
+uv tool install --editable <Harness 源码目录>
+pip install -e <Harness 源码目录>      # 在一个虚拟环境里
 ```
 
-未传入 `--config` 时使用本 Harness 仓库的默认配置，不会按 `--repo` 自动选择目标项目配置。`run` 启动时输出实际配置路径和验证命令。后续 `resume` 应使用同一份配置；共享资源路径相对于配置文件所在目录。
+editable 安装不复制源码：包、默认操作者配置（源码目录的 `harness.toml`）与 `shared/` 在别的目录运行时也从源码目录解析。安装会在源码目录留下 `*.egg-info/`，它已被 Git 忽略。非 editable 安装不附带默认 `harness.toml` 与 `shared/`，执行任务时要用 `--config` 指定操作者配置。
 
-从 Harness 源码目录对任意项目执行时，`--config`、`--repo` 等全局参数必须写在子命令之前，路径使用绝对路径。先运行 `doctor` 核对回显的 `harness.package`、`harness.revision`、`config.sha256` 与 `shared` 路径，确认加载的是预期的包和配置，而不是同名模块或另一份安装。每次 `run`／`resume` 自动在目标项目 `.harness/operations/` 写一份操作记录，可用 `--operation-id ID` 指定 ID，同名记录已存在时拒绝。统一入口、外层 agent 的操作边界、记录与报告模板见[操作与观察](docs/operations.md)。
+在源码目录里 `python3 -m harness …` 与 `harness …` 等价。`--repo` 默认是当前目录，所以在目标项目里直接运行即可；从别的目录调用时写 `--repo /abs/project`。`--config`、`--repo` 是全局参数，必须写在子命令之前。
 
-配置拒绝未知节和键，并指出完整路径。非 editable 安装不附带默认 `harness.toml` 与 `shared/`，执行任务需显式提供配置；`status`、`watch`、`dashboard`、`memory`、`prepare-run` 和 `cleanup-run` 不加载配置。运行事件和诊断写 stderr，`run`、`resume`、`demo` 的 stdout 保持单个 JSON 结果。
+### 两份配置
+
+| | 操作者配置 | 项目配置 |
+| --- | --- | --- |
+| 位置 | `--config PATH`；不传时是源码目录的 [harness.toml](harness.toml) | 固定为目标仓库 Git 根目录下的 `.harness/project.toml` |
+| 允许的节 | `roles`、`runtime`、`memory`、`shared` | `verification`、`permissions`、`runtime` |
+| 适用范围 | 所有项目相同 | 每个项目一份 |
+
+- 第一次使用时先在目标仓库的 Git 根目录建 `.harness/` 目录，再把 [examples/project.toml](examples/project.toml) 复制进去修改：
+
+  ```bash
+  cd /abs/project
+  mkdir -p .harness
+  cp <Harness 源码目录>/examples/project.toml .harness/project.toml
+  ```
+
+  项目配置的位置固定：不向上级目录搜索，没有回退，也没有命令行参数能改它；`--repo` 指向仓库子目录时用的也是 Git 根目录下的这一份（在 `git worktree` 建的链接工作树里，Git 根目录是那个工作树自己的根）。
+- `verification.commands` 是确定性验证命令，`run` 要求至少一条。每条命令是 argv 数组，不经 shell 解释，例如 `["uv", "run", "pytest"]` 或 `["npm", "test", "--", "--run"]`。依赖需要在 worktree 中可用；生成产物应已忽略或位于工作树外，验证期间出现未忽略的新文件也会触发快照门禁。验证命令与 `permissions.worker_commands` 就是授予 worker 的执行能力（见[worker 命令与删除](docs/operations.md#worker-命令与删除)）。
+- 有效配置是“内置默认值 ← 操作者配置 ← 项目配置”，后者覆盖前者。项目配置里的 `runtime` 逐键覆盖操作者配置，每个键的值整体替换（`claude_max_turns_by_role` 这样的表和所有数组都不合并）；`verification`、`permissions` 只来自项目配置，没写的键取内置默认值。合并后的有效配置再按全部规则校验。
+- 节写错了文件会被拒绝，错误指出它应写在哪份文件里（例如操作者配置里出现 `verification`）；未知节和键同样被拒绝，错误给出完整键路径和所在文件。模型 ID 原样使用；`shared` 的相对路径相对操作者配置所在的目录解析。
+- `run`、`resume`、`permission-diagnostics` 读两份配置，项目配置不存在时在任何写入之前拒绝（退出码 2）；其他命令读哪份配置见[统一入口](docs/operations.md#统一入口)。
+- `.harness/` 的 Git 忽略保护由第一次 `run`（或 `sync`、`memory add`）安装（见[数据与排查](#数据与排查)）。在那之前项目配置只是未跟踪文件，不要 `git add` 它：`.harness` 下有被跟踪或暂存的文件时，运行时拒绝初始化私有状态。Harness 仓库自己的 `.harness/project.toml` 也是本地文件，不入库。
+
+### 执行
+
+目标项目必须有 Git 提交，且已跟踪文件与暂存区没有未提交修改。主检出的未跟踪文件只产生警告并保留原位；任务工作树从 HEAD 创建，不复制未跟踪或忽略文件。编排器不会替你 stash。当前不支持 submodule，索引存在 gitlink 时在创建 worktree 和派发模型前报错。
+
+在目标项目目录里运行：
+
+```bash
+cd /abs/project
+harness doctor
+harness run "修复分页边界错误，并补充必要的回归测试" --scope 'src/**' --scope 'tests/**'
+harness run "实现导出功能" --commander fable
+```
+
+先用 `doctor` 核对回显的 `harness.package`、`harness.revision`、`config.sha256`、`shared` 路径与 `project`（项目配置是否存在、能否与操作者配置一起加载），确认加载的是预期的包和配置，而不是同名模块或另一份安装。`run` 启动时在 stderr 回显两份配置的路径与验证命令。`--config` 只在要用另一份操作者配置时才传；`resume` 比较的是有效配置，不是文件路径（见[通用规则](docs/recovery.md#通用规则)）。每次 `run`／`resume` 自动在目标项目 `.harness/operations/` 写一份操作记录，可用 `--operation-id ID` 指定 ID，同名记录已存在时拒绝。各命令读哪份配置、`doctor` 的字段、外层 agent 的操作边界与它可加载的 skill、记录与报告模板见[操作与观察](docs/operations.md)。
+
+运行事件和诊断写 stderr，`run`、`resume`、`demo` 的 stdout 保持单个 JSON 结果。
 
 可用 `--plan /path/to/plan.json` 提供已有计划，格式见 [examples/plan.json](examples/plan.json)。输入在创建 run、分支和 worktree 前校验任务 ID、DAG、非空验收、范围和 skill。任务 ID 不得重复，折叠后（不区分大小写等）相同也算重复：`greet` 与 `GREET` 不能出现在同一份计划里，因为任务的验证证据目录以 ID 命名。范围从仓库根目录匹配：`src/*` 只匹配直接子项，`src/**` 匹配所有层级，`**/*.py` 也匹配根目录文件；只有独立 `**` 路径段跨越 `/`。范围应覆盖必要测试与夹具。全仓库模式允许但会警告；`.git`、`.harness`、`.codex`、`.claude` 仍受保护，按名称判定、不分大小写，`.CLAUDE` 这类别名写法同样拒绝（规则见 [docs/design.md](docs/design.md) 不变量 17）。可用 `--scope PATTERN`（可重复）在启动前声明 run 的范围边界：只接受具体路径、字面子树 `p/…/**` 或 `**`；首版计划与之后每次修订新增的模式都必须能证明在边界内，`--plan` 越界时不创建 run。不声明时首版不受约束，修订只能复用已发布计划的模式。
 
@@ -91,10 +129,10 @@ worker 可用结构化续作请求正常交还控制权，等待精确命令授�
 默认连续执行。需要先检查计划或分步执行时：
 
 ```bash
-python3 -m harness --config /path/to/harness.toml --repo /path/to/project run "实现导出功能" --pause-after-plan --scope 'src/**' --scope 'tests/**'
-python3 -m harness --repo /path/to/project status RUN
-python3 -m harness --config /path/to/harness.toml --repo /path/to/project resume RUN --approve-plan --step
-python3 -m harness --config /path/to/harness.toml --repo /path/to/project resume RUN --step
+harness run "实现导出功能" --pause-after-plan --scope 'src/**' --scope 'tests/**'
+harness status RUN
+harness resume RUN --approve-plan --step
+harness resume RUN --step
 ```
 
 `RUN` 替换为实际 run ID。`--pause-after-plan` 等待显式 `--approve-plan`，普通恢复不会批准；`--approve-plan` 只批准已发布的首版，首版尚未发布时被拒。等待批准时 `status RUN` 的 `scope_summary` 按任务列出模式及其是否在边界内。`--step` 最多接受一个任务后暂停，最后一个任务完成后仍执行整体验收。
@@ -122,7 +160,7 @@ git cat-file commit SHA | sed '1,/^$/d' | git -c trailer.separators=: interpret-
 
 一条 run 按 DAG 串行执行，复用工作树和已接受代码。Git worktree 是任务隔离，不是操作系统安全沙箱；范围检查发生在接受前，忽略文件和外部服务副作用不在 Git 快照覆盖范围内。CLI、验证命令和 MCP 服务以当前用户权限运行。更强隔离需专用 OS 用户或容器。
 
-需要验证交付提交不依赖 worker 留下的忽略文件时：
+需要验证交付提交不依赖 worker 留下的忽略文件时，在项目配置里写：
 
 ```toml
 [verification]
@@ -138,17 +176,17 @@ setup_commands = [["npm", "ci"]]
 ## 状态、恢复与清理
 
 ```bash
-python3 -m harness --repo /path/to/project status
-python3 -m harness --repo /path/to/project status RUN
-python3 -m harness --repo /path/to/project status RUN --full
-python3 -m harness --repo /path/to/project watch RUN
-python3 -m harness --repo /path/to/project dashboard --port 8765
-python3 -m harness --config /path/to/harness.toml --repo /path/to/project resume RUN
-python3 -m harness --config /path/to/harness.toml --repo /path/to/project abandon RUN
-python3 -m harness --repo /path/to/project cleanup-run RUN
-python3 -m harness --repo /path/to/project cleanup-run RUN --remove
-python3 -m harness --repo /path/to/project cleanup-run RUN --remove-ignored
-python3 -m harness --repo /path/to/project cleanup-run RUN --remove --remove-ignored
+harness status
+harness status RUN
+harness status RUN --full
+harness watch RUN
+harness dashboard --port 8765
+harness resume RUN
+harness abandon RUN
+harness cleanup-run RUN
+harness cleanup-run RUN --remove
+harness cleanup-run RUN --remove-ignored
+harness cleanup-run RUN --remove --remove-ignored
 ```
 
 `status RUN` 显示任务、预算、待答决定、续作、范围边界、审阅轮次、停止投影 `stop`（类型、标题、出口命令与诊断摘录）和运行期间账号额度的观测变化 `quota`（字段见[通用规则](docs/recovery.md#通用规则)与[额度](docs/operations.md#额度)），`--full` 查看完整台账。失败的命令在 stderr 输出一行 `[harness-json] {"event":"stop",…}`，与 `status RUN` 的 `stop` 同一投影；它紧跟在 `harness: ` 开头的错误全文之后，前后还有别的行，外层脚本按前缀 `[harness-json] ` 与 `event` 为 `stop` 找这一行，不按行号（见[自动记录的字段](docs/operations.md#自动记录的字段)）。`resume` 使用保存的现场和全新 agent，不恢复供应商会话，也不清零累计预算；恢复时只能放宽的配置与可以任意调整的额度等待上限见[通用规则](docs/recovery.md#通用规则)，其余配置及共享资产必须一致。
@@ -175,7 +213,7 @@ python3 -m harness --repo /path/to/project cleanup-run RUN --remove --remove-ign
 | 情况 | 常用出口 |
 | --- | --- |
 | 等待计划批准（`plan_approval/initial_plan`） | `resume RUN --approve-plan` |
-| 精确命令未授权（`missing_commands/*`） | 追加配置后普通 `resume RUN` |
+| 精确命令未授权（`missing_commands/*`） | 在项目配置追加精确授权后普通 `resume RUN` |
 | 续作请求需要先修正（`continuation/*`） | `resume RUN --reject-request FILE` |
 | 已保存 worker 环境阻断（`environment/worker_blocked`） | 修复条件后 `resume RUN --environment-update FILE` |
 | 供应商额度用尽、限速、过载或认证失败（`provider_quota/*`、`provider_failure/overloaded`、`provider_failure/authentication`） | 额度恢复或修复登录后普通 `resume RUN`；worker 的这次调用不计工作尝试；额度用尽时先看 `data.wait_reason`（为什么没有在进程内等待） |
@@ -208,11 +246,11 @@ python3 -m harness --repo /path/to/project cleanup-run RUN --remove --remove-ign
 
 协议说明放在 RULES 与角色 skill 里，每次派发都注入；包里只放数据、索引和现场事实，没有静态协议说明（包的构成见[设计：架构](docs/design.md#架构)）。
 
-角色 skill 自动注入一次；计划的 `skills` 选择额外技能，不需要时用 `[]`。其他技能先加载目录，再通过 `skill_read` 按需读取。旧计划引用角色 skill 仍合法且不会重复注入；不会自动安装整个 ECC 技能目录。
+角色 skill 自动注入一次；计划的 `skills` 选择额外技能，不需要时用 `[]`。其他技能先加载目录，再通过 `skill_read` 按需读取。旧计划引用角色 skill 仍合法且不会重复注入；不会自动安装整个 ECC 技能目录。外层会话用的 skill 在 `operator/harness-operator/`，不属于这些角色技能（见[外层 skill](docs/operations.md#外层-skill)）。
 
 内置只读 `harness` MCP 向三种角色提供记忆、技能、运行状态，文件工具 `file_sha256`、`json_check`、`file_diff`，以及按固定形式表执行只读 Git 查询的 `git_query`；表外 argv 不执行即报错，没有记忆写入工具。形式表、参数规则与输出字段见[角色工具参考](docs/operations.md#角色工具参考)。
 
-worker 独有的 `harness_commands` MCP 提供 `list_commands`、`run_command({command_id})` 和 `delete_path({path})`。`run_command` 执行配置中的完整 argv，不能附加参数或覆盖 cwd、env，不经 shell 插值；`delete_path` 删除一个 HEAD 中已跟踪、在任务 `allowed_paths` 内的普通文件，不删目录、不移动文件，删除不能被接受门禁撤销。每次调用的 journal、receipt 和输出留在 dispatch 私有 `commands/`。规则与保证见[worker 命令与删除](docs/operations.md#worker-命令与删除)。
+worker 独有的 `harness_commands` MCP 提供 `list_commands`、`run_command({command_id})` 和 `delete_path({path})`。`run_command` 执行配置中的完整 argv，不能附加参数或覆盖 cwd、env，不经 shell 插值；`delete_path` 删除一个 HEAD 中已跟踪、在任务 `allowed_paths` 内的普通文件，不删目录、不移动文件，删除不能被接受门禁撤销。每次调用的 journal、receipt 和输出留在 dispatch 私有 `commands/`。规则与保证见[worker 命令与删除](docs/operations.md#worker-命令与删除)。额外的命令授权写在项目配置里：
 
 ```toml
 [permissions]
@@ -224,25 +262,25 @@ worker_commands = [["python3", "-m", "unittest", "tests.test_export", "-v"]]
 外部 MCP 支持 stdio / HTTP 和按 `roles` 限制；指挥、审阅服务必须声明 `read_only = true`，由配置维护者核实。凭据只填写环境变量名称。示例见 [examples/mcp.json](examples/mcp.json)；OpenWiki 默认关闭，启用前需填真实路径并关闭 agent 写入能力。预检验证配置，不连接服务或证明凭据可用。
 
 ```bash
-python3 -m harness sync --role worker
+harness sync --role worker
 ```
 
-`sync` 生成 `.harness/generated/worker/claude.mcp.json` 和 `codex.mcp.toml`；正式 dispatch 使用各自配置，不覆盖用户 CLI 配置。Codex 使用 `--ignore-user-config`，依赖自定义 provider/base URL 的登录需先扩展适配器。生成的调用关闭个人原生 hooks 与自动记忆、关闭项目指令自动注入；只读角色的厂商差异见[设计：不变量](docs/design.md#不变量)。候选项目指令作为待审阅证据，不能改变目标、验收或权限。
+`sync` 生成 `.harness/generated/worker/claude.mcp.json` 和 `codex.mcp.toml`；正式 dispatch 使用各自配置，不覆盖用户 CLI 配置。Codex 使用 `--ignore-user-config`，依赖自定义 provider/base URL 的登录需先扩展适配器。生成的调用关闭个人原生 hooks 与自动记忆、关闭项目指令自动注入，并在启动参数里关闭外层 skill（见[外层 skill](docs/operations.md#外层-skill)）；只读角色的厂商差异见[设计：不变量](docs/design.md#不变量)。候选项目指令作为待审阅证据，不能改变目标、验收或权限。
 
 ## 记忆与上下文
 
 SQLite 存在目标项目 `.harness/memory.sqlite3`，同一项目各 run 共享库，各自保留独立分支和工作树。记忆分为任务历史、获批知识和操作者事实；L0 标题、L1 摘要、L2 详情按相关性与时间检索，原始 diff、日志和结果按引用读取。任务历史摘要来自独立 reviewer，worker 只可提出待批准知识。
 
 ```bash
-python3 -m harness --repo /path/to/project memory add \
+harness memory add \
   --key architecture.storage --title "数据库约定" \
   --text "项目使用 PostgreSQL，迁移通过 Alembic 管理。" \
   --source "docs/architecture.md"
-python3 -m harness --repo /path/to/project memory search "数据库迁移" --level 1
-python3 -m harness --repo /path/to/project memory search --key architecture.storage
-python3 -m harness --repo /path/to/project memory read mem_实际ID
-python3 -m harness --repo /path/to/project memory history architecture.storage
-python3 -m harness --repo /path/to/project memory export > memory-backup.json
+harness memory search "数据库迁移" --level 1
+harness memory search --key architecture.storage
+harness memory read mem_实际ID
+harness memory history architecture.storage
+harness memory export > memory-backup.json
 ```
 
 `memory add` 默认保存项目事实，`--run RUN` 保存仅用于该 run 的参考说明，查询也需相同 `--run`。key 在项目内全局唯一，版本替换须作用域一致，旧版本仍可 read/export。真正的继续／停止选择应使用 `--operator-decision`。所有记忆均为 `reference_only`，不授予权限或替代操作者决定。
@@ -253,7 +291,7 @@ python3 -m harness --repo /path/to/project memory export > memory-backup.json
 
 查询返回 `source_status`：`unbound` 未绑定、`matching` 声明来源匹配、`changed` 已变化、`unavailable` 不可用、`not_checked` 未完成核验、`invalid` 来源格式无效。原 `possibly_stale` 和原因列表保留；匹配不证明内容正确或来源已合入当前分支。较早 run 工作树核对主检出后来绑定的文件时，出现 changed/unavailable 是正常结果。
 
-自动任务历史与知识默认 TTL 为 180 天，可通过 `[memory]` 的 `task_ttl_days`／`knowledge_ttl_days` 调整，0 表示不过期；操作者事实默认不过期。检索先排列优先参考，再排列来源变化、不可用、非法或原因未知的需复核记录，组内保留相关性、时间、类型和原有过时降权。未绑定／未核验记录不额外降组，放弃或来源无效的任务历史不自动召回；来源 run 的台账不是当前版本（`source_run_status` 为 `unsupported`）时，它的任务历史也不再召回，记录本身不删除，获批知识与操作者事实不受影响。默认六条仍不能保证某条声明必然进入上下文；必要要求应写入任务验收。没有 embedding 或自动语义冲突合并。
+自动任务历史与知识默认 TTL 为 180 天，可通过操作者配置 `[memory]` 的 `task_ttl_days`／`knowledge_ttl_days` 调整，0 表示不过期；操作者事实默认不过期。检索先排列优先参考，再排列来源变化、不可用、非法或原因未知的需复核记录，组内保留相关性、时间、类型和原有过时降权。未绑定／未核验记录不额外降组，放弃或来源无效的任务历史不自动召回；来源 run 的台账不是当前版本（`source_run_status` 为 `unsupported`）时，它的任务历史也不再召回，记录本身不删除，获批知识与操作者事实不受影响。默认六条仍不能保证某条声明必然进入上下文；必要要求应写入任务验收。没有 embedding 或自动语义冲突合并。
 
 上下文采用结构化检查点、有界检索和原始证据引用，在任务边界写 `handoff.json`；每次指挥调用重新构建输入。worker 结果的 `summary` 最多 32,000 字符，blocker、evidence、finding 等其余自由文本字段仍为 4,000；后续输入只带截取的摘录和全文的路径与 SHA256。环境阻断的停止信息只带 blocker 与 summary 合计至多 2,000 字符的摘录，并给出原 worker 结果的路径与 SHA256。默认 `context_chars = 100000` 是编排输入字符上限，不是 token 数；必要约束超限就停止，可选记忆按整条移除。CLI 内部上下文不在该预算内。
 
@@ -263,7 +301,7 @@ dispatch 私有 `context-report.json` 中的 `memory_retrieval` 记录候选、�
 
 大量变更路径与恢复路径使用 SHA256 绑定的完整索引，按需检索，不重复塞进模型输入。相同清单共用索引，原始范围、验收、diff 与快照仍保留；索引缺失或损坏会阻止继续，不能靠截断路径绕过门禁。
 
-默认 `agent_timeout_seconds = 3600`、全局 `claude_max_turns = 50`。可用 `claude_max_turns_by_role` 为单次 Claude 派发设置角色覆盖；仓库示例给 worker 200 轮，未列角色沿用全局值，旧配置不自动增加。它是工具使用循环的资源保护，一轮可有多个工具调用，不是任务累计工具次数，也不表示验收进度。Codex 不使用此参数；供应商的 `num_turns` 仅供观测，不能直接比较判定到限。
+默认 `agent_timeout_seconds = 3600`、全局 `claude_max_turns = 50`。可用 `claude_max_turns_by_role` 为单次 Claude 派发设置角色覆盖；源码目录的 `harness.toml` 给 worker 200 轮，未列角色沿用全局值。它是工具使用循环的资源保护，一轮可有多个工具调用，不是任务累计工具次数，也不表示验收进度。Codex 不使用此参数；供应商的 `num_turns` 仅供观测，不能直接比较判定到限。
 
 ```toml
 [runtime]
@@ -294,13 +332,13 @@ claude_max_turns_by_role = { worker = 200 }
 复杂任务可先 `run "目标" --pause-after-plan`，用 `status RUN --full` 核对保存的计划后再 `resume RUN --approve-plan`：
 
 ```bash
-python3 -m harness --repo /abs/project prepare-run RUN --manifest /abs/inputs.json
-python3 -m harness --config /abs/config.toml --repo /abs/project supervise -- run "目标" --pause-after-plan
-python3 -m harness --repo /abs/project cleanup-run RUN --remove --remove-input-copies
+harness prepare-run RUN --manifest /abs/inputs.json
+harness supervise -- run "目标" --pause-after-plan
+harness cleanup-run RUN --remove --remove-input-copies
 ```
 
 `prepare-run` 仅在暂停/等待批准且无未消费阶段的边界准备清单指定的不可变依赖。它不导入需要修改的源代码。`cleanup-run --remove-input-copies` 仍为预览，必须同时 `--remove` 才删除登记且未修改的副本；源文件和其他忽略文件保留（加 `--remove-ignored` 时其他忽略文件随工作树删除；`--remove-ignored` 不能代替 `--remove-input-copies`）。清单与恢复规则见 [操作说明](docs/operations.md#依赖副本清单)。
 
 `supervise` 只启动一次指定的 Harness `run`/`resume`，保留子进程 stdout，监督回执写入 `.harness/supervision/` 并输出到 stderr，退出码等于子进程退出码；不会重启或自动恢复。父进程退出仍不证明 broker 子进程退出。要在 run 停下时得到提示，用 `watch RUN`（到阻塞、暂停、等待批准或终态时退出）或 `supervise`。
 
-Claude 调用只用 JSON 输出（`--output-format json`），终态只从派发目录的 `process.stdout` 读取；错误、缺失或损坏的终态及非零退出均不能接受。观察不到的读取范围或拒绝原因保持未知。只读 `permission-diagnostics RUN DISPATCH --argv-json '["python3", "-m", "unittest"]'` 对比供应商拒绝证据和当前配置中的精确命令能力，并在 `builtin_coverage` 中单独说明该 argv 是否由内置 `git_query` 覆盖；它不执行命令或扩大权限。`status` 和 dashboard 同时显示预算的已用/上限/剩余与调用、审阅候选、失败、无效输出等独立维度。
+Claude 调用只用 JSON 输出（`--output-format json`），终态只从派发目录的 `process.stdout` 读取；错误、缺失或损坏的终态及非零退出均不能接受。观察不到的读取范围或拒绝原因保持未知。只读 `permission-diagnostics RUN DISPATCH --argv-json '["python3", "-m", "unittest"]'` 对比供应商拒绝证据和当前有效配置（含项目配置）中的精确命令能力，并在 `builtin_coverage` 中单独说明该 argv 是否由内置 `git_query` 覆盖；它不执行命令或扩大权限。`status` 和 dashboard 同时显示预算的已用/上限/剩余与调用、审阅候选、失败、无效输出等独立维度。

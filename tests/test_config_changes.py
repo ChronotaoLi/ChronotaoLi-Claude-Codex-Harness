@@ -14,6 +14,7 @@ from harness.util import HarnessError, read_json, write_json
 
 
 ROOT = Path(__file__).resolve().parents[1]
+PROJECT_SECTIONS = ("verification", "permissions")
 
 
 class ConfigChangesTests(unittest.TestCase):
@@ -24,11 +25,17 @@ class ConfigChangesTests(unittest.TestCase):
         self.data = Config.load(ROOT / "harness.toml").data
         self.data["shared"] = {key: str(ROOT / path) for key, path in self.data["shared"].items()}
 
+    def write(self, data):
+        """The operator file and the project file of one effective configuration."""
+        operator, project = self.root / "harness.toml", self.root / "target" / ".harness" / "project.toml"
+        project.parent.mkdir(parents=True, exist_ok=True)
+        for path, keep in ((operator, lambda key: key not in PROJECT_SECTIONS),
+                           (project, lambda key: key in PROJECT_SECTIONS)):
+            path.write_text("\n".join(f"{key} = {toml_value(value)}" for key, value in data.items() if keep(key)))
+        return operator, project
+
     def load(self, data=None):
-        data = self.data if data is None else data
-        path = self.root / "harness.toml"
-        path.write_text("\n".join(f"{key} = {toml_value(value)}" for key, value in data.items()))
-        return Config.load(path)
+        return Config.load(*self.write(self.data if data is None else data))
 
     def test_new_configuration_gets_defaults_but_incomplete_saved_snapshot_is_rejected(self):
         del self.data["permissions"]
@@ -53,14 +60,16 @@ class ConfigChangesTests(unittest.TestCase):
     }
 
     def test_unknown_keys_including_removed_ones_are_rejected_without_hints(self):
+        messages = set()
         for key, value in self.UNKNOWN.items():
             with self.subTest(key=key):
                 data = copy.deepcopy(self.data)
                 data["runtime"][key] = value
                 with self.assertRaises(HarnessError) as raised:
                     self.load(data)
-                # The generic error alone: no per-key migration hint, never silently ignored.
-                self.assertEqual(str(raised.exception), f"未知配置键：runtime.{key}")
+                self.assertIn(f"runtime.{key}", str(raised.exception))
+                self.assertIn(str((self.root / "harness.toml").resolve()), str(raised.exception))
+                messages.add(str(raised.exception).replace(key, "KEY"))
             with self.subTest(key=key, snapshot=True):
                 # A saved snapshot carrying the key is equally unknown, never silently dropped.
                 config = self.load()
@@ -69,6 +78,8 @@ class ConfigChangesTests(unittest.TestCase):
                 snapshot["runtime"][key] = value
                 with self.assertRaisesRegex(HarnessError, f"未知配置键：runtime.{key}"):
                     config.resume_changes(snapshot)
+        # The generic error alone: no per-key migration hint, never silently ignored.
+        self.assertEqual(len(messages), 1, messages)
 
     def test_cli_startup_reports_an_unknown_key_before_any_run(self):
         import contextlib
@@ -82,14 +93,15 @@ class ConfigChangesTests(unittest.TestCase):
             with self.subTest(key=key):
                 data = copy.deepcopy(self.data)
                 data["runtime"][key] = value
-                path = self.root / "harness.toml"
-                path.write_text("\n".join(f"{name} = {toml_value(item)}" for name, item in data.items()))
+                path, _ = self.write(data)
                 errors = io.StringIO()
                 with contextlib.redirect_stderr(errors), contextlib.redirect_stdout(io.StringIO()):
                     code = main(["--config", str(path), "--repo", str(repo), "resume", "run_missing"])
                 self.assertEqual(code, 1)
                 first, notice = errors.getvalue().splitlines()
-                self.assertEqual(first, f"harness: 未知配置键：runtime.{key}")
+                self.assertTrue(first.startswith("harness: "), first)
+                self.assertIn(f"runtime.{key}", first)
+                self.assertIn(str(path.resolve()), first)
                 stop = json.loads(notice.removeprefix("[harness-json] "))["stop"]
                 self.assertEqual((stop["kind"], stop["exit_code"]), ("unclassified", 1))
                 self.assertFalse((repo / ".harness").exists())
