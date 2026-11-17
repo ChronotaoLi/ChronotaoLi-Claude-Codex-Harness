@@ -51,9 +51,11 @@ from .util import dump, strict_json_loads
 # start, Codex's answer about 3.0-4.6 s, and cold starts went past 5 s; this is about four times the slowest
 # arrival seen.
 QUERY_SECONDS = 20.0
-# From the answer to the CLI ending on its own, before any signal. Measured on 2026-11-17: Claude Code closed
-# its output 1.0-2.0 s after the result line, and codex app-server exited 0.03-2.2 s after its input closed;
-# this is more than twice the slowest. Running out of it is not a failure: the cleanup then ends the CLI.
+# From the answer to the leader ending on its own, before any signal. Measured against the real CLIs on
+# 2026-11-17: Claude Code exited 1.0-2.0 s after the result line; codex app-server itself exited about 2-18 ms
+# after its input closed (its whole group, with the networked git it starts, took 0.03-2.2 s). This is more
+# than twice the slowest leader. Only the leader is waited for: children still running at the cleanup are
+# ended by its group signals. Running out of it is not a failure: the cleanup then ends the CLI.
 SETTLE_SECONDS = 5.0
 CLEANUP_SECONDS = 3.0           # the timed part of cleanup: grace, reaping wait, group observation
 TERM_GRACE_SECONDS = 0.5
@@ -435,7 +437,8 @@ class ProbeProcess:
     ``termination`` says how the query ended (``normal``: the exchange returned, also
     with an early EOF or a malformed line); ``exited_before_signal`` whether the leader
     had already exited on its own when the cleanup sent its first signal (null: not
-    started, or it could not be told); ``exit_code`` is the leader's status as reaped,
+    started, or it could not be told); it describes the leader only, never the children
+    it started. ``exit_code`` is the leader's status as reaped,
     so after ``exited_before_signal=false`` it is the CLI's answer to the cleanup's
     signals, whatever its value.
     """
@@ -630,9 +633,10 @@ class ProbeProcess:
 def _exited_unreaped(pid):
     """Whether the unreaped child ``pid`` has already exited, looked at without reaping it (``WNOWAIT``).
 
-    None when it cannot be told: no ``os.waitid`` on this platform, or the call failed.
+    None when it cannot be told: no ``os.waitid`` (or its flags) on this platform, or the call failed.
     """
-    if not hasattr(os, "waitid"):
+    names = ("waitid", "P_PID", "WEXITED", "WNOHANG", "WNOWAIT")
+    if not all(hasattr(os, name) for name in names):
         return None
     try:
         return os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None

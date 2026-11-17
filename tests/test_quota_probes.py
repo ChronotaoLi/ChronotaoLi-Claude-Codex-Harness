@@ -5,6 +5,7 @@ this test process or to the stubs it started; each test checks that the probe's 
 group, any descendant and the temporary directory are gone.
 """
 import contextlib
+import errno
 import json
 import os
 import signal
@@ -211,17 +212,33 @@ class SnapshotTests(ProbeCase):
         self.assertEqual(quota_wait.relation(window["scope_model"], "claude-opus-5-5", configured), ("unrelated", None))
 
 
+@contextlib.contextmanager
+def without_waitid():
+    """A platform without ``os.waitid`` (older Pythons on macOS): it is removed for the block."""
+    real = getattr(os, "waitid", None)
+    if real is not None:
+        del os.waitid
+    try:
+        yield
+    finally:
+        if real is not None:
+            os.waitid = real
+
+
 class AnswerTimingTests(ProbeCase):
     """The real CLIs' timing (measured 2026-11-17), which answer-at-once stubs never showed.
 
     The answer completes the query; the CLI then has a bounded time to end on its own
-    before any signal, and the process facts say which of the two ended it.
+    before any signal, and the process facts say which of the two ended it. Where the
+    leader's exit can be seen without reaping it, the settle time ends at that exit;
+    where it cannot, at the output's close.
     """
-    OWN_EXIT = (True, 0) if hasattr(os, "waitid") else (None, 0)
+    OWN_EXIT = (True, 0)
 
     def facts(self, record):
         return record["process"]["exited_before_signal"], record["process"]["exit_code"]
 
+    @unittest.skipUnless(hasattr(os, "waitid"), "needs os.waitid to see the leader's exit without reaping it")
     def test_a_cli_that_ends_on_its_own_while_settling_is_recorded_so(self):
         # The default stubs answer and exit at once (Codex once its input is closed): every time, not by luck.
         quota_stubs.install(self)
@@ -252,6 +269,32 @@ class AnswerTimingTests(ProbeCase):
         self.assertTrue(record["zero_call"]["verified"])
         self.assertEqual((record["process"]["termination"], *self.facts(record)), ("normal", *self.OWN_EXIT))
         self.assert_clean(calls, temp, "claude")
+
+    def test_where_the_exit_cannot_be_seen_settling_ends_when_the_output_closes(self):
+        # No os.waitid on the platform, or the call fails: the settle time ends at the output's close.
+        # These stubs close their output 3 s before exiting, so the cleanup's SIGTERM ends them.
+        fallbacks = {"no os.waitid": without_waitid,
+                     "waitid fails": lambda: patch.object(os, "waitid", create=True,
+                                                          side_effect=OSError(errno.EINVAL, "synthetic"))}
+        for name, fallback in fallbacks.items():
+            for provider in ("claude", "codex"):
+                with self.subTest(fallback=name, provider=provider):
+                    calls = quota_stubs.install(self, **{provider: "close_then_exit:3"})
+                    temp = TrackTemp(self)
+                    begun = time.monotonic()
+                    with fallback():
+                        record = quota.snapshot(provider, environment())
+                    self.assertLess(time.monotonic() - begun, 3.0)   # not the 3 s until the exit
+                    self.assertTrue(record["available"], record)
+                    self.assertEqual(record["process"]["termination"], "normal")
+                    self.assertEqual(self.facts(record), (None, -signal.SIGTERM))
+                    self.assert_clean(calls, temp, provider)
+                    # The default stubs, which exit as their output closes: still available, still null.
+                    quota_stubs.install(self)
+                    with fallback():
+                        record = quota.snapshot(provider, environment())
+                    self.assertTrue(record["available"], record)
+                    self.assertIsNone(record["process"]["exited_before_signal"])
 
     def test_running_out_of_settle_time_is_not_a_failure(self):
         # A CLI that never ends on its own is ended by the cleanup once the settle time is up.
@@ -288,14 +331,17 @@ class AnswerTimingTests(ProbeCase):
         self.assertEqual((record["available"], record["reason"], record["detail"]),
                          (False, "shape_mismatch", {"field": "result"}))
 
+    @unittest.skipUnless(hasattr(os, "waitid"), "needs os.waitid to see the leader's exit without reaping it")
     def test_settle_time_is_counted_from_the_answer(self):
-        # The answer comes late in the query time; the CLI still gets the whole settle time after it.
-        calls = quota_stubs.install(self, claude="slow:2+linger:1.5")
+        # The answer comes 3 s into a 6 s query time (3 s to spare for starting); the stub exits 4 s
+        # after it. A 5 s settle time counted from the answer covers that exit with 1 s to spare;
+        # counted from the start (5 s) or ending with the query time (6 s) it would not (7 s).
+        calls = quota_stubs.install(self, claude="slow:3+linger:4")
         temp = TrackTemp(self)
         begun = time.monotonic()
-        with patch.object(quota, "QUERY_SECONDS", 3.0), patch.object(quota, "SETTLE_SECONDS", 2.5):
+        with patch.object(quota, "QUERY_SECONDS", 6.0), patch.object(quota, "SETTLE_SECONDS", 5.0):
             record = quota.snapshot("claude", environment())
-        self.assertGreaterEqual(time.monotonic() - begun, 3.5)
+        self.assertGreaterEqual(time.monotonic() - begun, 7.0)
         self.assertTrue(record["available"], record)
         self.assertEqual(self.facts(record), self.OWN_EXIT)
         self.assert_clean(calls, temp, "claude")

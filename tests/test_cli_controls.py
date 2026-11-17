@@ -1,3 +1,4 @@
+import argparse
 import contextlib
 import io
 import signal
@@ -94,3 +95,32 @@ class HelpTests(unittest.TestCase):
                 names, described = self.listed(*argv)
                 self.assertGreater(len(names), 1)
                 self.assertEqual(described, names)
+
+    def test_every_help_page_describes_its_command_and_every_argument(self):
+        # The parser the CLI builds, taken just before it parses; then every page, nested ones included.
+        class Built(Exception):
+            pass
+        found = []
+
+        def capture(parser, *args, **kwargs):
+            found.append(parser)
+            raise Built()
+        with patch.object(argparse.ArgumentParser, "parse_args", capture), self.assertRaises(Built):
+            main(["status"])
+        pages, missing = [((), found[0])], []
+        while pages:
+            path, parser = pages.pop()
+            for action in parser._actions:
+                if isinstance(action, argparse._SubParsersAction):
+                    entries = {entry.dest: entry.help for entry in action._choices_actions}
+                    for name, child in action.choices.items():
+                        if not entries.get(name):
+                            missing.append((*path, name, "list entry"))
+                        if not child.description:
+                            missing.append((*path, name, "description"))
+                        pages.append(((*path, name), child))
+                elif not isinstance(action, argparse._HelpAction):
+                    if not action.help or action.help == argparse.SUPPRESS:
+                        missing.append((*path, action.dest))
+        self.assertGreater(len(found), 0)
+        self.assertEqual(missing, [])

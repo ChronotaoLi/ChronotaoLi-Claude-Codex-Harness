@@ -18,8 +18,9 @@ it, so cleanup is tested against a child that really ignores the signal.
 
 Timing modes follow the real CLIs (Claude Code 2.1.325 and codex-cli 0.169.0, measured
 2026-11-17): Claude's three lines came 1.7-4.2 s after the start and the CLI closed its
-output only 1-2 s after the result line; Codex answered after about 3-4.6 s and exited up
-to about 2.2 s after its input closed. ``slow:S`` answers after S seconds (both);
+output and exited 1.0-2.0 s after the result line; Codex answered after about 3-4.6 s, and
+app-server itself exited within about 2-18 ms of its input closing (its whole group, with the
+git it starts, within about 2.2 s). ``slow:S`` answers after S seconds (both);
 ``linger:S`` keeps Claude's output open S seconds after the result line, then exits;
 ``linger_forever`` never closes it (the probe's cleanup ends the stub); ``close_then_exit:S``
 closes the output (Codex: once its input closed) S seconds before exiting. Modes combine
