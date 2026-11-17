@@ -17,7 +17,7 @@ import uuid
 from pathlib import Path
 from unittest.mock import patch
 
-from harness import stops
+from harness import git, stops
 from harness.adapters import CLIBackend, DemoBackend
 from harness.budgets import work_attempts
 from harness.diagnostics import budget_explanation
@@ -27,7 +27,7 @@ from harness.runtime import Runtime
 from harness.util import HarnessError, read_json, write_json
 from harness.worker_receipts import WorkerReceipts
 from harness.worker_returns import inspect_return, validate_return_evidence
-from test_harness import ROOT, RepoCase, after_save, crash_after_save, run_cli, walk_exit
+from test_harness import ROOT, RepoCase, after_save, crash_after_save, crash_point, run_cli, walk_exit
 from test_runtime_changes import ScriptedBackend
 from test_worker_return_recovery import stub_provider_clis
 
@@ -409,6 +409,85 @@ class ImmediateJudgmentTests(RepoCase):
             self.engine(backend).resume(engine.run["id"])
         self.assertEqual(len(backend.calls), calls)
         self.assertEqual(saved(engine)["agent_dispatches"], 1)
+
+    def test_a_quota_that_has_not_returned_fails_again_and_the_dispatch_limit_ends_it(self):
+        # Each resume before the quota returns fails once more: every failure is judged and
+        # exempted on its own, every call still counts, and max_agent_dispatches ends the cycle.
+        # The wait is judged each time and declines (no quota sampler here, then the dispatch limit).
+        self.config.data["runtime"]["max_agent_dispatches"] = 3
+        backend = FailingWorker(self.config, self.repo, QUOTA, failures=(1, 2))
+        engine = self.engine(backend)
+        with self.assertRaises(HarnessError) as caught:
+            engine.start("Implement greet", plan())
+        self.assertEqual(stops.of(caught.exception)["data"]["wait_reason"], "no_sampler")
+        first = saved(engine)
+        self.assertEqual((first["attempts"], work_attempts(first), first["agent_dispatches"]),
+                         ({"greet": 1}, {"greet": 0}, 1))
+        second = walk_exit(self, engine.directory, ("provider_quota", "usage_limit"), backend=backend,
+                           expect_status="blocked", expect_code=3)
+        self.assertEqual((second["stop"]["kind"], second["stop"]["reason"]), ("provider_quota", "usage_limit"))
+        self.assertEqual(second["stop"]["data"]["wait_reason"], "dispatch_budget")
+        failed = [d for d in second["dispatches"] if d.get("role") == "worker"]
+        self.assertEqual([d["attempt_exemption"]["code"] for d in failed], ["usage_limit", "usage_limit"])
+        for entry in failed:   # each exemption is bound to its own failed call's original
+            stdout = engine.directory / "dispatches" / entry["id"] / "process.stdout"
+            self.assertEqual(entry["attempt_exemption"]["artifact_digest"],
+                             hashlib.sha256(stdout.read_bytes()).hexdigest())
+        self.assertEqual(second["stop"]["source"]["dispatch_id"], failed[1]["id"])
+        self.assertEqual((second["attempts"], work_attempts(second), second["agent_dispatches"]),
+                         ({"greet": 2}, {"greet": 0}, 3))
+        calls = len(backend.calls)
+        third = walk_exit(self, engine.directory, ("provider_quota", "usage_limit"), backend=backend,
+                          expect_status="blocked", expect_code=3)
+        self.assertEqual((third["stop"]["kind"], third["stop"]["reason"]), ("budget", "agent_dispatches"))
+        self.assertEqual(len(backend.calls), calls)   # the limit stops before any model call
+        self.assertEqual((third["attempts"], work_attempts(third), third["agent_dispatches"]),
+                         ({"greet": 2}, {"greet": 0}, 3))
+
+    def test_an_interrupt_while_the_rejection_reads_git_leaves_the_failure_unjudged(self):
+        # spec-5 13.3 window B: reject() builds the recovery record (a Git read) before it
+        # changes any entry; a death or a Ctrl-C there leaves the call to be judged on resume.
+        engine, _, _ = self.failed()
+        expected = verdict(saved(engine), engine.directory)
+        for death in (True, False):
+            with self.subTest(death=death):
+                backend = FailingWorker(self.config, self.repo, QUOTA)
+                engine = self.engine(backend)
+                dying, die = crash_point(engine)
+                build = engine.services.workflow.worker_recovery
+                seen = []
+
+                def interrupt(*args, **kwargs):
+                    if death:
+                        die()
+                    raise KeyboardInterrupt()
+
+                def recovery_record(task_id, dispatch_id, job):
+                    seen.append(sorted(engine.run["worker_receipts"]))
+                    with patch.object(git, "changed", side_effect=interrupt):
+                        return build(task_id, dispatch_id, job)
+                with dying, patch.object(engine.services.workflow, "worker_recovery", recovery_record), \
+                        self.assertRaises(KeyboardInterrupt):
+                    engine.start("Implement greet", plan())
+                self.assertEqual(seen, [["worker:implement:greet"]])
+                state = saved(engine)
+                entry = worker(state)
+                # Nothing of the verdict reached the ledger: the receipt is kept, the failure unjudged.
+                self.assertIn("worker:implement:greet", state["worker_receipts"])
+                self.assertEqual(entry["status"], "failed")
+                for key in ("worker_return_evidence", "attempt_exemption", "worker_receipt_consumed"):
+                    self.assertNotIn(key, entry)
+                self.assertNotEqual(state.get("worker_recovery", {}).get("greet", {}).get("dispatch_id"), entry["id"])
+                self.assertEqual(state["status"], "running" if death else "interrupted")
+                fresh = self.engine(backend)
+                with patch.object(fresh.services.tasks, "task_attempt", side_effect=HarnessError("stop before work")):
+                    with self.assertRaisesRegex(HarnessError, "stop before work"):
+                        fresh.resume(state["id"])   # judged on resume without a stop of its own
+                self.assertEqual(verdict(saved(engine), engine.directory), expected)
+                result = self.engine(backend).resume(state["id"])
+                self.assertEqual(result["status"], "completed")
+                self.assertEqual(sum("attempt_exemption" in d for d in result["dispatches"]), 1)
+                self.assertEqual((result["attempts"], work_attempts(result)), ({"greet": 2}, {"greet": 1}))
 
     def test_sealed_or_returned_results_are_never_provider_failures(self):
         ok = {"type": "result", "subtype": "success", "is_error": False, "api_error": "usage_limit_reached",
