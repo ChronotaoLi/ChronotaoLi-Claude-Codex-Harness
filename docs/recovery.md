@@ -44,7 +44,7 @@
 
 ## 阻塞状态与操作者出口
 
-“停止信息”是 `status RUN` 的 `stop.detail` 或 stderr 的第一行（节选）。每个停止都有类型 `stop.kind/stop.reason`；外层按类型选择下表的行，`stop.exits` 给出可直接执行的出口命令，`data`、`source` 给出出口所需的身份（请求号、任务、派发、原件路径与摘要）。行标识是稳定的名字，`tests/test_stop_exits.py` 用它把行与走完出口的用例绑在一起；同一类型因情形不同（例如环境阻断的两条路由）分成几行。
+“停止信息”是 `status RUN` 的 `stop.detail` 或 stderr 里 `harness: ` 开头的错误全文（节选）；紧跟其后的 `[harness-json]` 行是同一停止的投影。每个停止都有类型 `stop.kind/stop.reason`；外层按类型选择下表的行，`stop.exits` 给出可直接执行的出口命令，`data`、`source` 给出出口所需的身份（请求号、任务、派发、原件路径与摘要）。行标识是稳定的名字，`tests/test_stop_exits.py` 用它把行与走完出口的用例绑在一起；同一类型因情形不同（例如环境阻断的两条路由）分成几行。
 
 表的读法：类型后标“（操作）”的行是本次调用被拒或失败，停止值只在 stderr 与操作记录里，不写入台账（同一条命令里此前已保存的退出确认与审计照常保留）；其余行写入台账（`status RUN` 可见）。这个标记说的是该行的情形，同一类型在别的情形可能落在另一个边界（例如 `command-exit`、`head-changed`）。“出口命令”一列就是登记表给出的 `stop.exits` 模板：`RUN` 换成 run ID，`{dispatch_id}` 取自 `source.dispatch_id`，`FILE`、`PATTERN` 由操作者填写；带〔`flag`〕的只在 `data.flag` 为真时列出，〔`!flag`〕只在为假时列出。“无命令出口”表示不给可执行的命令，按“操作者该做什么”处理；“非停止”的行不停止 run。
 

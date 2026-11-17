@@ -142,6 +142,11 @@ class LifecycleTests(SamplingCase):
         self.assertEqual([(record["sequence"], record["role"]) for record in records],
                          [(1, "worker"), (2, "reviewer"), (3, None), (4, None)])
         self.assertTrue(all(record["available"] for record in records))
+        # The Codex answer carries an account identifier; no sample file stores it.
+        for name in names:
+            text = (directory / "observations" / "quota" / name).read_text()
+            self.assertNotIn(quota_stubs.ACCOUNT_ID, text)
+            self.assertNotIn("accountId", text)
         self.assertEqual([record["ledger_revision"] for record in records[2:]], [result["store_revision"]] * 2)
         self.assertEqual(len(self.quota_calls.probes()), 4)
         self.assertEqual(self.quota_calls.unexpected(), [])
@@ -172,7 +177,8 @@ class LifecycleTests(SamplingCase):
                                                                          "verification", "reviewer"])
         for claude, codex in (("hang", "hang"), ("big", "rpc_error"), ("not_zero_call", "shape"), ("exit", "orphan"),
                               ("child_ignores_term_leader_exits", "leader_waits_child_ignores")):
-            with self.subTest(claude=claude, codex=codex), patch.object(quota, "QUERY_SECONDS", 1.0):
+            with self.subTest(claude=claude, codex=codex), patch.object(quota, "QUERY_SECONDS", 1.0), \
+                    patch.object(quota, "SETTLE_SECONDS", 0.5):
                 calls = quota_stubs.install(self, claude=claude, codex=codex)
                 engine = self.engine(self.backend())
                 self.assertEqual(self.decisions(engine.start("Implement greet", plan()), engine.directory), base)
@@ -190,6 +196,23 @@ class LifecycleTests(SamplingCase):
         self.assertEqual((last["reason"], last["detail"], last["process"], last["source"]["command"]),
                          ("probe_disabled", {"disabled_by": quota.sample_name(first)}, None, []))
         self.assertTrue(self.sample(engine, "codex-completed.json")["available"])
+
+    def test_a_claude_cli_that_closes_its_output_late_keeps_probing(self):  # the 2026-11-17 timing
+        # The real CLI keeps its output open after the result line. That is a verified answer, not a
+        # timeout, even when the CLI outlasts the settle time (shortened here) and the cleanup ends it:
+        # the process keeps sampling Claude.
+        calls = quota_stubs.install(self, claude="linger_forever")
+        engine = self.engine(self.backend())
+        with patch.object(quota, "SETTLE_SECONDS", 1.0):
+            self.assertEqual(engine.start("Implement greet", plan())["status"], "completed")
+        self.assertEqual((len(calls.probes("claude")), len(calls.probes("codex"))), (2, 2))
+        for ending in ("claude-before_use.json", "claude-completed.json"):
+            sample = self.sample(engine, ending)
+            self.assertEqual((sample["available"], sample["zero_call"]["verified"], sample["process"]["termination"]),
+                             (True, True, "normal"), ending)
+            self.assertIs(sample["process"]["exited_before_signal"], False if hasattr(os, "waitid") else None)
+        self.assertEqual(engine.services.quota.disabled, {})
+        self.assert_probes_gone(calls)
 
     def test_a_verified_call_with_an_unreadable_shape_keeps_probing(self):  # L4b
         calls = quota_stubs.install(self, claude="shape")
@@ -361,14 +384,16 @@ class QuotaFailureTests(SamplingCase):
             if store.run.get("status") == "blocked":
                 marks.setdefault("saved", time.monotonic())
             return value
-        with patch.object(quota.QuotaSampler, "failure_sample", timed_annotate), \
+        # A shortened query time keeps the test fast; the bound is that time plus the cleanup's.
+        with patch.object(quota, "QUERY_SECONDS", 1.0), \
+                patch.object(quota.QuotaSampler, "failure_sample", timed_annotate), \
                 patch.object(RunStore, "commit", timed_commit), self.assertRaises(HarnessError):
             engine.start("Implement greet", plan())
         stop = read_json(engine.directory / "state.json")["stop"]
         self.assertEqual({key: stop["data"].get(key) for key in QUOTA_FIELDS},
                          {"quota_snapshot": "unavailable", "quota_sample": self.names(engine)[-1],
                           "quota_reason": "timeout", "full_windows": None})
-        self.assertLess(marks["saved"] - marks["raised"], 9)
+        self.assertLess(marks["saved"] - marks["raised"], 1.0 + quota.CLEANUP_SECONDS + 1)
 
     def test_an_interrupt_in_the_failure_probe_stops_as_an_interrupt(self):  # L14
         calls, engine = self.quota_failure(claude="sigint_after:1")
@@ -491,7 +516,7 @@ class AdmissionTests(SamplingCase):
 
     def test_an_interrupt_in_end_sample_cleanup_replaces_the_stop_but_not_the_ledger(self):  # A5
         calls, engine = self.budget_stop(claude="sigint_on_term_after:1")
-        with self.assertRaises(KeyboardInterrupt):
+        with patch.object(quota, "SETTLE_SECONDS", 0.5), self.assertRaises(KeyboardInterrupt):
             engine.start("Implement greet", plan())
         self.assertEqual(read_json(engine.directory / "state.json")["status"], "blocked")
         self.assertFalse(any(name.endswith("claude-stop.json") for name in self.names(engine)))
@@ -562,7 +587,11 @@ class ObservationTests(DashboardCase, SamplingCase):
                           ("weekly_all", ["claude", "weekly_all", "null"], 61, "2031-01-06T03:00:00+00:00"),
                           ("weekly_scoped（Model Z）",
                            ["claude", "weekly_scoped", '{"model":{"display_name":"Model Z"},"surface":null}'],
-                           100, "2031-01-06T03:00:00+00:00")])
+                           100, "2031-01-06T03:00:00+00:00"),
+                          (f"weekly_scoped（{quota_stubs.FAMILY_DISPLAY}）",
+                           ["claude", "weekly_scoped",
+                            '{"model":{"display_name":"%s"},"surface":null}' % quota_stubs.FAMILY_DISPLAY],
+                           12, "2031-01-06T03:00:00+00:00")])
         self.assertFalse(claude["extra_usage"]["is_enabled"])
         self.assertEqual({key: codex[key] for key in ("state", "samples", "unavailable", "buckets", "credits",
                                                       "ordinary_usage_allowed")},

@@ -5,10 +5,16 @@ directory, executes no tools and its result is read once in this process. Every
 failure is "unavailable + reason"; nothing here changes scheduling, budgets,
 receipts, acceptance or recovery. A user interrupt always propagates.
 
-A probe owns its process group. On every exit path the whole group is sent SIGTERM
-and, after a bounded grace (cut short by a pending interrupt), SIGKILL while the
-leader is still unreaped, so the group ID cannot have been reused; after reaping the
-group is only observed. Samples are separate, exclusively published files under
+A query is complete once its answer is read: Claude's result line, Codex's answer
+with id 1. The CLI then gets a bounded time to end on its own (Codex's input is closed
+first, its normal way to end), still read under the same cap and checkpoints; running
+out of that time is not a failure. Failures (timeout, output cap, start, interrupt) do
+not wait. A probe owns its process group. On every exit path the whole group is sent
+SIGTERM and, after a bounded grace (cut short by a pending interrupt), SIGKILL while
+the leader is still unreaped, so the group ID cannot have been reused; after reaping
+the group is only observed. The process facts say whether the leader had already
+exited on its own before that first signal. Samples are separate, exclusively
+published files under
 ``runs/<id>/observations/quota/`` whose names are their total order: ledger revision,
 phase, this process's start time, sequence.
 
@@ -40,7 +46,15 @@ from . import stops, util
 from .services import RuntimeService
 from .util import dump, strict_json_loads
 
-QUERY_SECONDS = 5.0             # start to EOF (Claude) or to the id 1 answer (Codex)
+# From the start to Claude's result line or Codex's id 1 answer, both CLIs alike. Measured against the real
+# CLIs on 2026-11-17 (Claude Code 2.1.325, codex-cli 0.169.0): the result line arrived 1.7-4.2 s after the
+# start, Codex's answer about 3.0-4.6 s, and cold starts went past 5 s; this is about four times the slowest
+# arrival seen.
+QUERY_SECONDS = 20.0
+# From the answer to the CLI ending on its own, before any signal. Measured on 2026-11-17: Claude Code closed
+# its output 1.0-2.0 s after the result line, and codex app-server exited 0.03-2.2 s after its input closed;
+# this is more than twice the slowest. Running out of it is not a failure: the cleanup then ends the CLI.
+SETTLE_SECONDS = 5.0
 CLEANUP_SECONDS = 3.0           # the timed part of cleanup: grace, reaping wait, group observation
 TERM_GRACE_SECONDS = 0.5
 OUTPUT_MAX_BYTES = 1024 * 1024
@@ -411,8 +425,19 @@ class ProbeProcess:
 
     Before the SIGKILL of cleanup nothing here may reap the leader: no ``poll``,
     ``wait``, ``communicate``, ``send_signal``, ``terminate``, ``kill``, ``with Popen``
-    or ``os.waitpid``. An unreaped leader holds its PID, so the group ID it names
+    or ``os.waitpid``; ``os.waitid`` only with ``WNOWAIT``, which looks and leaves the
+    leader unreaped. An unreaped leader holds its PID, so the group ID it names
     cannot have been reused while the group is signalled.
+
+    The query deadline (``QUERY_SECONDS`` from the start) ends at the answer; ``settle()``
+    then gives the CLI ``SETTLE_SECONDS`` from that moment to end on its own.
+
+    ``termination`` says how the query ended (``normal``: the exchange returned, also
+    with an early EOF or a malformed line); ``exited_before_signal`` whether the leader
+    had already exited on its own when the cleanup sent its first signal (null: not
+    started, or it could not be told); ``exit_code`` is the leader's status as reaped,
+    so after ``exited_before_signal=false`` it is the CLI's answer to the cleanup's
+    signals, whatever its value.
     """
 
     def __init__(self, argv, env, *, interactive):
@@ -421,8 +446,8 @@ class ProbeProcess:
         self.buffer, self.received, self.eof = b"", 0, False
         self.started_at = time.monotonic()
         self.deadline = self.started_at + QUERY_SECONDS
-        self.facts = {"started": False, "exit_code": None, "exit_confirmed": True, "kill_sent": False,
-                      "temp_removed": True, "termination": "start_failed", "duration_ms": 0}
+        self.facts = {"started": False, "exit_code": None, "exited_before_signal": None, "exit_confirmed": True,
+                      "kill_sent": False, "temp_removed": True, "termination": "start_failed", "duration_ms": 0}
 
     def run(self, exchange):
         # One signal boundary from before the directory exists until the cleanup removed it:
@@ -466,31 +491,77 @@ class ProbeProcess:
         """The next stdout line, or None at EOF; raises at the query deadline or the output cap."""
         while True:
             self.signals.checkpoint()
-            if b"\n" in self.buffer:
-                line, self.buffer = self.buffer.split(b"\n", 1)
-                return line
+            found = self._take()
+            if found is not None:
+                return found
             if self.eof:
-                line, self.buffer = self.buffer, b""
-                return line or None
+                return None
             remaining = self.deadline - time.monotonic()
             if remaining <= 0:
                 raise _QueryTimeout()
-            if self.selector is None:
-                self.selector = selectors.DefaultSelector()
-                self.selector.register(self.process.stdout.fileno(), selectors.EVENT_READ)
-            if not self.selector.select(min(remaining, 0.1)):
-                continue
-            try:
-                chunk = os.read(self.process.stdout.fileno(), 65536)
-            except BlockingIOError:
-                continue
-            if not chunk:
-                self.eof = True
-                continue
-            self.received += len(chunk)
-            if self.received > OUTPUT_MAX_BYTES:
-                raise _OutputLimit()
-            self.buffer += chunk
+            self._receive(min(remaining, 0.1))
+
+    def settle(self, keep):
+        """After the answer: at most ``SETTLE_SECONDS`` for the CLI to end on its own, before any signal.
+
+        Codex's input is closed first, its normal way to end. Output still written is
+        read under the same cap and checkpoints; each line goes to ``keep`` (None: read
+        and dropped). It ends once the leader is seen to have exited, looked at without
+        reaping it, after taking what it left in the pipe; where that cannot be seen,
+        once the output closes. Running out of time is not a failure: the answer stands
+        and the cleanup ends the CLI.
+        """
+        if self.process.stdin is not None:
+            with contextlib.suppress(OSError):
+                self.process.stdin.close()
+        deadline = time.monotonic() + SETTLE_SECONDS
+        while True:
+            self.signals.checkpoint()
+            exited = _exited_unreaped(self.process.pid)
+            if exited:
+                # Everything the leader wrote is in the pipe by now: take it without waiting.
+                while not self.eof and time.monotonic() < deadline and self._receive(0):
+                    self.signals.checkpoint()
+            while (found := self._take()) is not None:
+                if keep is not None:
+                    keep(found)
+            remaining = deadline - time.monotonic()
+            if exited or (exited is None and self.eof) or remaining <= 0:
+                return
+            if self.eof:
+                time.sleep(min(0.01, remaining))   # output closed; the leader is still ending
+            else:
+                self._receive(min(remaining, 0.1))
+
+    def _take(self):
+        """The next complete line in the buffer, the unterminated rest after EOF, or None."""
+        if b"\n" in self.buffer:
+            line, self.buffer = self.buffer.split(b"\n", 1)
+            return line
+        if self.eof and self.buffer:
+            line, self.buffer = self.buffer, b""
+            return line
+        return None
+
+    def _receive(self, timeout):
+        """Wait at most ``timeout`` seconds for output and take one read; False when nothing was ready."""
+        if self.selector is None:
+            self.selector = selectors.DefaultSelector()
+            self.selector.register(self.process.stdout.fileno(), selectors.EVENT_READ)
+        if not self.selector.select(timeout):
+            return False
+        try:
+            chunk = os.read(self.process.stdout.fileno(), 65536)
+        except BlockingIOError:
+            return False
+        if not chunk:
+            self.eof = True
+            return True
+        self.received += len(chunk)
+        if self.received > OUTPUT_MAX_BYTES:
+            raise _OutputLimit()
+        self.buffer += chunk
+        return True
 
     def _cleanup(self, primary):
         """Input closed, group signalled, leader reaped, group observed, descriptors and directory gone.
@@ -527,12 +598,13 @@ class ProbeProcess:
         if self.process.stdin is not None:
             with contextlib.suppress(OSError):
                 self.process.stdin.close()
+        self.facts["exited_before_signal"] = _exited_unreaped(pgid)
         send(signal.SIGTERM)
         grace = min(time.monotonic() + TERM_GRACE_SECONDS, deadline)
         while time.monotonic() < grace and not interrupted():
             time.sleep(0.01)
-        # Unconditional: the data is read, the query is read-only, nothing needs saving;
-        # descendants that ignore SIGTERM end here.
+        # Unconditional: the answer is read (or the probe failed) and the CLI has had its settle
+        # time to end on its own; descendants that ignore SIGTERM end here.
         send(signal.SIGKILL)
         self.facts["kill_sent"] = True
         try:
@@ -555,24 +627,56 @@ class ProbeProcess:
             time.sleep(0.01)
 
 
+def _exited_unreaped(pid):
+    """Whether the unreaped child ``pid`` has already exited, looked at without reaping it (``WNOWAIT``).
+
+    None when it cannot be told: no ``os.waitid`` on this platform, or the call failed.
+    """
+    if not hasattr(os, "waitid"):
+        return None
+    try:
+        return os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None
+    except OSError:
+        return None
+
+
+def _stream_line(line, messages):
+    """Append one stream-json line to ``messages``; True for a result line."""
+    if not line.strip():
+        return False
+    try:
+        value = strict_json_loads(line)
+    except (ValueError, UnicodeError, RecursionError):
+        raise Shape("stdout line") from None  # stream-json is JSON on every line
+    if not isinstance(value, dict):
+        raise Shape("stdout line")
+    messages.append(value)
+    return value.get("type") == "result"
+
+
 def _claude_exchange(probe):
+    """The stream-json lines: the first result line completes the query, then the CLI settles.
+
+    Lines written while it settles are kept and checked like the others (a second result
+    line, a malformed line, the output cap). An EOF before any result line returns what
+    was read, without settling.
+    """
     messages = []
     while (line := probe.line()) is not None:
-        if not line.strip():
-            continue
-        try:
-            value = strict_json_loads(line)
-        except (ValueError, UnicodeError, RecursionError):
-            raise Shape("stdout line") from None  # stream-json is JSON on every line
-        if not isinstance(value, dict):
-            raise Shape("stdout line")
-        messages.append(value)
+        if _stream_line(line, messages):
+            probe.settle(lambda more: _stream_line(more, messages))
+            break
     return messages
 
 
 def _codex_exchange(probe):
-    """Exactly three messages; notifications, server requests and other lines are ignored."""
-    def answer(ident, method):
+    """Exactly three messages; notifications, server requests and other lines are ignored.
+
+    An error answer to ``initialize`` ends the exchange there (nothing more is sent). The
+    answer with id 1, whatever it says, completes the query; the server then settles
+    (input closed, output read and dropped) and ``normalize_codex`` reads the answer.
+    """
+    def answer(ident):
         while True:
             line = probe.line()
             if line is None:
@@ -583,15 +687,17 @@ def _codex_exchange(probe):
                 continue
             if (isinstance(value, dict) and "method" not in value
                     and type(value.get("id")) is int and value["id"] == ident):
-                _reply(value, method)
                 return value
     probe.send({"id": 0, "method": "initialize",
                 "params": {"clientInfo": {"name": "personal-harness", "title": "Personal Harness quota probe",
                                           "version": "0"}}})
-    initialize = answer(0, "initialize")
+    initialize = answer(0)
+    _reply(initialize, "initialize")
     probe.send({"method": "initialized"})
     probe.send({"id": 1, "method": "account/rateLimits/read"})
-    return initialize, answer(1, "account/rateLimits/read")
+    read = answer(1)
+    probe.settle(None)
+    return initialize, read
 
 
 def _blank(provider, command):
@@ -922,6 +1028,7 @@ _DETAIL = {"field": lambda v: _string(v, 200), "exit_code": lambda v: type(v) is
            "disabled_by": lambda v: v is None or (type(v) is str and NAME.fullmatch(v) is not None),
            "error_type": lambda v: _text(v, 64)}
 _PROCESS = {"started": lambda v: type(v) is bool, "exit_code": lambda v: v is None or type(v) is int and -2**31 <= v < 2**31,
+            "exited_before_signal": lambda v: v is None or type(v) is bool,
             "exit_confirmed": lambda v: type(v) is bool, "kill_sent": lambda v: type(v) is bool,
             "temp_removed": lambda v: type(v) is bool, "termination": lambda v: v in TERMINATIONS,
             "duration_ms": lambda v: type(v) is int and 0 <= v <= 10**9}
@@ -1011,7 +1118,7 @@ def validate_sample(value):
 
 # ---------- the observed change during a run (pure; the observation layer reads saved samples only) ----------
 
-RESET_TOLERANCE_CAP_SECONDS = 120     # design values, to be checked against real CLIs
+RESET_TOLERANCE_CAP_SECONDS = 120     # design values; real resets_at jitter (2026-11-17, ~21 min) stayed sub-second
 RESET_TOLERANCE_UNKNOWN_SECONDS = 60
 # Its own context: never the process default (28 digits). Balances have at most 30+30 digits, so a
 # difference has at most 61 and is always exact; a trap gives "unknown", never an approximation.

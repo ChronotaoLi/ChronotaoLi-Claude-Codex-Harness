@@ -1,6 +1,7 @@
 import contextlib
 import io
 import signal
+import unittest
 from unittest.mock import patch
 
 from harness.adapters import DemoBackend
@@ -73,3 +74,23 @@ class CLIControlsTests(RepoCase):
         self.assertEqual(code, 0, error)
         self.assertEqual(resumed[0].run["status"], "completed")
         self.assertEqual(set(resumed[0].run["accepted"]), {"greet", "document"})
+
+
+class HelpTests(unittest.TestCase):
+    def listed(self, *argv):
+        """The subcommand names of one parser and those its --help lists (argparse omits any without help)."""
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output), self.assertRaises(SystemExit) as caught:
+            main([*argv, "--help"])
+        self.assertEqual(caught.exception.code, 0)
+        lines = output.getvalue().splitlines()
+        names = next(line.strip() for line in lines
+                     if line.strip().startswith("{") and line.strip().endswith("}"))[1:-1].split(",")
+        return names, [name for name in names if any(line.startswith("    " + name) for line in lines)]
+
+    def test_every_subcommand_is_described(self):
+        for argv in ((), ("memory",)):
+            with self.subTest(argv=argv):
+                names, described = self.listed(*argv)
+                self.assertGreater(len(names), 1)
+                self.assertEqual(described, names)

@@ -462,7 +462,8 @@ class RunLifecycle(RuntimeService):
                 def incompatible(*options):
                     return stops.make("invalid_input", "incompatible_options", data={"options": list(options)})
                 if self.context.run["status"] == "abandoned":
-                    raise HarnessError("该 run 已放弃；保留分支、工作树与证据，不能继续派发", stop=state("abandoned"))
+                    raise HarnessError("该 run 已放弃，不能继续派发；分支与运行证据保留，工作树保留到 cleanup-run 移除为止",
+                                       stop=state("abandoned"))
                 self.context.commander = self.context.run["commander"]
                 if self.context.run["status"] == "completed":
                     if (confirm_exited or scope or environment_update is not None or operator_decision is not None

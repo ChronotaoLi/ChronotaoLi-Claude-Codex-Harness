@@ -304,6 +304,25 @@ class WaitTests(WaitCase):
         self.assertEqual(views[1][0]["dispatches"][-1]["consumed"], "provider_failure")
         self.assertEqual(engine.services.quota_wait.waits, 1)
 
+    def test_a_claude_cli_that_closes_its_output_late_still_lets_the_wait_decide(self):  # the 2026-11-17 timing
+        # The real CLI keeps its output open after the result line. That is a verified answer, not a
+        # timeout: Claude probing stays on, the failure sample is available and the wait is decided by it.
+        os.environ["QUOTA_STUB_CLAUDE"] = "linger_forever"
+        self.windows(window("session", 100, 3600))
+        with patch.object(quota, "SETTLE_SECONDS", 1.0):   # the CLI outlasts it; the cleanup ends it
+            engine, result = self.start(self.backend("worker"))
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(sum(self.clock.sleeps), 3660)
+        self.assertEqual(self.triggers(engine), ["before_use", "quota_failure", "wake", "completed"])
+        name = next(name for _, trigger, name in self.samples(engine) if trigger == "quota_failure")
+        failure = read_json(engine.directory / "observations" / "quota" / name)
+        self.assertEqual((failure["available"], failure["zero_call"]["verified"], failure["process"]["termination"]),
+                         (True, True, "normal"))
+        self.assertIs(failure["process"]["exited_before_signal"], False if hasattr(os, "waitid") else None)
+        self.assertEqual([(event["window"], event["sample"]) for event in self.events(engine, "quota_wait_started")],
+                         [("session", name)])
+        self.assertEqual(engine.services.quota.disabled, {})
+
     def test_latest_blocking_window_is_the_target(self):  # T8-3
         self.windows(window("session", 100, 3600), window("weekly_all", 100, 10800))
         engine, result = self.start(self.backend("worker"))

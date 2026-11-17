@@ -48,7 +48,7 @@ python3 -m harness smoke
 python3 -m harness smoke --commander fable
 ```
 
-`smoke` 在临时 Git 仓库完成一个小函数，由真实指挥生成计划，再调用执行者、任务审阅者和整体审阅者，并运行真实测试。它不改动本仓库代码。
+`smoke` 在临时 Git 仓库完成一个小函数，由真实指挥生成计划，再调用执行者、任务审阅者和整体审阅者，并运行真实测试。它不改动本仓库代码。在 Claude Code 会话里运行时，会话的环境变量照常传给 CLI 子进程，建议在普通终端里运行。
 
 独立权限与工具检查也调用配置中的真实 Claude worker 模型、消耗账号额度并保留原始证据：
 
@@ -57,7 +57,7 @@ python3 -m harness.permission_smoke --config /path/to/harness.toml --repo /path/
 python3 -m harness.tool_smoke --config /path/to/harness.toml --repo /path/to/project
 ```
 
-权限检查在 `.harness/permission-smoke/` 建立专用现场，关闭外部 MCP，不执行项目验证命令；它不证明完整命令白名单或 OS 隔离。参数、证据要求和结果边界见[真实账号联调](docs/operations.md#真实账号联调)；离线验证与没有运行的真实联调见[验证记录](docs/validation.md)。
+权限检查在 `.harness/permission-smoke/` 建立专用现场，关闭外部 MCP，不执行项目验证命令；它不证明完整命令白名单或 OS 隔离。参数、证据要求和结果边界见[真实账号联调](docs/operations.md#真实账号联调)；离线验证、已完成的真实账号联调与仍然没有运行的项目见[验证记录](docs/validation.md)。
 
 ## 对自己的项目执行任务
 
@@ -151,7 +151,7 @@ python3 -m harness --repo /path/to/project cleanup-run RUN --remove-ignored
 python3 -m harness --repo /path/to/project cleanup-run RUN --remove --remove-ignored
 ```
 
-`status RUN` 显示任务、预算、待答决定、续作、范围边界、审阅轮次、停止投影 `stop`（类型、标题、出口命令与诊断摘录）和运行期间账号额度的观测变化 `quota`（字段见[通用规则](docs/recovery.md#通用规则)与[额度](docs/operations.md#额度)），`--full` 查看完整台账。失败的命令在 stderr 第二行输出 `[harness-json] {"event":"stop",…}`，与 `status RUN` 的 `stop` 同一投影。`resume` 使用保存的现场和全新 agent，不恢复供应商会话，也不清零累计预算；恢复时只能放宽的配置与可以任意调整的额度等待上限见[通用规则](docs/recovery.md#通用规则)，其余配置及共享资产必须一致。
+`status RUN` 显示任务、预算、待答决定、续作、范围边界、审阅轮次、停止投影 `stop`（类型、标题、出口命令与诊断摘录）和运行期间账号额度的观测变化 `quota`（字段见[通用规则](docs/recovery.md#通用规则)与[额度](docs/operations.md#额度)），`--full` 查看完整台账。失败的命令在 stderr 输出一行 `[harness-json] {"event":"stop",…}`，与 `status RUN` 的 `stop` 同一投影；它紧跟在 `harness: ` 开头的错误全文之后，前后还有别的行，外层脚本按前缀 `[harness-json] ` 与 `event` 为 `stop` 找这一行，不按行号（见[自动记录的字段](docs/operations.md#自动记录的字段)）。`resume` 使用保存的现场和全新 agent，不恢复供应商会话，也不清零累计预算；恢复时只能放宽的配置与可以任意调整的额度等待上限见[通用规则](docs/recovery.md#通用规则)，其余配置及共享资产必须一致。
 
 **额度用尽时的进程内等待。** Claude 担任的角色（worker、`--commander fable` 的指挥、配置成 Claude 的审阅者）遇到额度用尽（`provider_quota/usage_limit`）时，默认在同一进程里等到额度快照给出的重置时刻再继续，单次最多 `runtime.quota_wait_max_seconds` 秒（默认 21,600，即 6 小时；0 关闭）。等待期间 run 仍是 `running`、持有运行锁（另一个 `resume`／`abandon` 得到 `busy/run_lock`），`status RUN` 的 `quota_wait` 显示等到何时；按 Ctrl-C 或 SIGTERM 取消（记为中断），之后普通 `resume`。没有等待时停止值的 `data.wait_reason` 写明原因。它不是恢复：进程被杀就不会自动继续。条件、醒来后的核对与取消方法见[额度等待](docs/recovery.md#额度等待)。
 
@@ -287,7 +287,7 @@ claude_max_turns_by_role = { worker = 200 }
 
 [设计取舍与参考来源](docs/design.md)记录 Orca、ECC、OpenWiki 的借鉴及厂商接口依据；实现是独立的小型编排核心，未复制这些项目源码或运行其安装脚本。当前没有接管 Orca、安装全部 ECC 插件或部署 OpenWiki 图数据库。
 
-[验证记录](docs/validation.md)记录当前版本已完成的离线验证，并列出没有运行的真实联调；[设计](docs/design.md)记录架构、不变量、状态转换与限制，[恢复与操作者出口](docs/recovery.md)列出停止后的处理。一条 run 串行执行；并行需要每任务 worktree、依赖集成与冲突处理，没有实现。
+[验证记录](docs/validation.md)记录当前版本已完成的离线验证与真实账号联调，并列出仍然没有运行的项目；[设计](docs/design.md)记录架构、不变量、状态转换与限制，[恢复与操作者出口](docs/recovery.md)列出停止后的处理。一条 run 串行执行；并行需要每任务 worktree、依赖集成与冲突处理，没有实现。
 
 ### 计划审阅、依赖准备与单次监督
 

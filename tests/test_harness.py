@@ -483,11 +483,41 @@ def install_clock(case, clock):
     return clock
 
 
+def unregistered_run_entries(state):
+    """Entries at the top of each run directory under ``state`` that the observer neither addresses nor excludes.
+
+    A regular file must be one of ``harness.observe.TOP_LEVEL_FILES`` or excluded by name,
+    a directory one of ``ROOT_DIRECTORIES``. Below a registered directory the observer's
+    general path rules apply (they are rules, not a list that can drift). Links are never
+    followed and only directories named like a run ID are read.
+    """
+    from harness import observe
+    runs, found = Path(state) / "runs", []
+    if runs.is_symlink() or not runs.is_dir():
+        return found
+    for run in sorted(runs.iterdir()):
+        if run.is_symlink() or not run.is_dir() or not observe.RUN_ID.fullmatch(run.name):
+            continue
+        for entry in sorted(run.iterdir()):
+            if entry.is_symlink():
+                continue
+            if entry.is_dir() and entry.name not in observe.ROOT_DIRECTORIES:
+                found.append(f"{run.name}/{entry.name}/")
+            elif entry.is_file() and entry.name not in observe.TOP_LEVEL_FILES and not observe.excluded_name(entry.name):
+                found.append(f"{run.name}/{entry.name}")
+    return found
+
+
 class RepoCase(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.repo = Path(self.temp.name)
+        # After every other cleanup (cleanups run last-in first-out): whatever the runtime wrote into a
+        # run directory, the observer can address it or excludes it by name.
+        self.addCleanup(lambda: self.assertEqual(
+            unregistered_run_entries(self.repo / ".harness"), [],
+            "run evidence the observer cannot address: register it in harness.observe or exclude it by name"))
         git.git(self.repo, "init", "-b", "main")
         (self.repo / ".gitignore").write_text("__pycache__/\n")
         (self.repo / "test_hello.py").write_text('import unittest\nfrom hello import greet\nclass Tests(unittest.TestCase):\n    def test_greet(self):\n        self.assertEqual(greet("Ada"), "Hello, Ada!")\n')

@@ -36,10 +36,17 @@ RUN_ID = re.compile(r"^run_[A-Za-z0-9]+$")
 COMPONENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,95}$")
 COMMAND_ID = re.compile(r"^[0-9a-f]{32}$")
 MAX_DEPTH = 8
-TOP_LEVEL_FILES = frozenset(("state.json", "events.jsonl", "handoff.json", "worktree-cleanup.json"))
-ROOT_DIRECTORIES = frozenset(("plans", "dispatches", "verification", "recovery", "decisions",
-                              "environment", "checkpoints", "path-indexes", "indexes", "batches", "observations"))
-EXCLUDED_NAMES = frozenset(("mcp.json", "run.lock"))
+# What the runtime writes at the top of a run directory: every entry is addressable here or
+# excluded by name. tests/test_harness.py checks every run directory a repository test leaves
+# behind against these lists, so an entry added to the runtime without one fails there.
+TOP_LEVEL_FILES = frozenset(("state.json", "events.jsonl", "handoff.json", "worktree-cleanup.json",
+                             "workspace-inputs.json", "workspace-inputs-manifest.json"))
+ROOT_DIRECTORIES = frozenset(("plans", "dispatches", "verification", "recovery", "decisions", "environment",
+                              "checkpoints", "path-indexes", "observations", "preflight", "continuations",
+                              "continuation-rejections", "execution-guidance", "proposal-rejections",
+                              "input-indexes", "finding-progress"))
+# The generated MCP configuration and the two empty lock files; *.tmp and memory.sqlite3* by pattern.
+EXCLUDED_NAMES = frozenset(("mcp.json", "run.lock", "store.lock"))
 DEFAULT_TAIL = 64 * 1024
 MAX_TAIL = 1024 * 1024
 STATE_MAX_BYTES = 64 * 1024 * 1024
@@ -855,13 +862,15 @@ class Observer:
             if truncated:
                 break
             if kind == "file":
-                if name in TOP_LEVEL_FILES and not excluded_name(name):
+                if excluded_name(name):
+                    skipped["excluded"] += 1
+                elif name in TOP_LEVEL_FILES:
                     if len(files) >= FILE_INDEX_MAX:
                         truncated = True  # One shared cap for every entry source.
                         break
                     files.append(([name], info))
                 else:
-                    skipped["excluded"] += 1
+                    skipped["unaddressable"] += 1
             elif kind == "dir":
                 if name not in ROOT_DIRECTORIES:
                     skipped["unaddressable"] += 1

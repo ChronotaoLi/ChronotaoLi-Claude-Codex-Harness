@@ -85,7 +85,7 @@ python3 -m harness --repo /abs/project dashboard --port 8765
 
 run 身份的关联：`run` 的首次台账保存随同写入可选字段 `created_by_operation`（不是额外一次保存），保存成功后追加 `run_created` 事件（带 `operation_id`）、在 stderr 输出一行 `[harness-json] {"event":"run_created","run_id":"...","operation_id":"..."}`，并立即把 `run_id` 写进记录，长时间运行或被强制终止时也能关联。`resume` 在自身预检门禁（含计划批准）通过后、进入 `execute()` 前同样追加 `run_resumed` 事件与通知。
 
-`run_resumed` 不表示已经派发模型：缺少命令授权、等待操作者决定等执行阶段门禁仍可使它紧接一条 `run_stopped`（携带停止投影 `stop`）。命令失败时 stderr 第一行仍是 `harness: ` 加错误全文，第二行是 `[harness-json] {"event":"stop","run_id":…,"operation_id":…,"stop":…}`（与 `status RUN` 的 `stop` 同一投影，不含 `detail`）；写这一行失败不改变退出码与操作记录。恢复预检拒绝时不写 `run_resumed`、不输出该通知，但之前保存的退出确认审计、配置放宽、命令授权检查等记录仍保留。已完成 run 的普通 resume 不写运行事件，台账与事件文件保持不变。操作记录缺失、损坏或与台账不一致都不影响 resume、abandon 或清理。
+`run_resumed` 不表示已经派发模型：缺少命令授权、等待操作者决定等执行阶段门禁仍可使它紧接一条 `run_stopped`（携带停止投影 `stop`）。命令失败时，stderr 里 `harness: ` 加错误全文之后紧跟一行 `[harness-json] {"event":"stop","run_id":…,"operation_id":…,"stop":…}`（与 `status RUN` 的 `stop` 同一投影，不含 `detail`）；写这一行失败不改变退出码与操作记录。这两部分之前有 `[harness] config=…`、`[harness] operation_id=…`、运行事件与 `run_created` 通知等行，之后还可能有输出（例如 `supervise` 的监督回执），所以外层脚本应找以 `[harness-json] ` 开头、`event` 为 `stop` 的那一行，不按行号读。恢复预检拒绝时不写 `run_resumed`、不输出该通知，但之前保存的退出确认审计、配置放宽、命令授权检查等记录仍保留。已完成 run 的普通 resume 不写运行事件，台账与事件文件保持不变。操作记录缺失、损坏或与台账不一致都不影响 resume、abandon 或清理。
 
 上述拒绝或已完成返回只要对应台账文件存在，操作记录结束时仍关联参数中的 run ID。加载配置失败时没有记录（记录在 `Config.load` 之后才创建）；创建 run 之前失败（仓库基线不满足、计划非法等）时记录保留但没有 `run_id`；resume 在预检阶段被强制终止时记录也可能没有 `run_id`。
 
@@ -221,7 +221,7 @@ run 列表 → run 详情 → 文件查看。列表按最近事件排序，以�
 
 ### 额度
 
-**样本。** 真实 `CLIBackend` 的 `run`／`resume` 在这些时刻各取一份账号额度快照（不调用模型）：本进程首次用到某供应商之前（`before_use`），额度失败之后、判断是否等待或停止之前（`quota_failure`），额度等待醒来之后（`wake`），以及停止、暂停、完成、等待批准确已保存之后，对本进程用过的供应商各一份（`stop`、`paused`、`completed`、`awaiting_approval`）；不计额度等待时每次至多 5 份，额度等待每等一次另加一份失败样本与一份醒来样本（受派发预算约束）。`demo` 与离线后端不采样。探测：Claude 是 `claude -p /usage --output-format stream-json --verbose --no-session-persistence --setting-sources "" --strict-mcp-config --max-turns 1`，必须读到零调用的结果行（`num_turns`、`total_cost_usd`、`duration_api_ms` 为 0，`local_command` 为 `usage`），读不到就在本进程停用 Claude 探测；Codex 是 `codex app-server` 的三条 JSON-RPC 消息（`initialize`、`initialized`、`account/rateLimits/read`）。两者都在空临时目录、用与模型调用相同的环境运行，5 秒查询时限，收尾时整个进程组 SIGTERM 后 SIGKILL；探测期间按 Ctrl-C，读写中的探测在约 0.1 秒内由检查点转为中断，其余时刻在收尾完成之后传播（收尾计时至多 3 秒），临时目录与进程组照样清理。
+**样本。** 真实 `CLIBackend` 的 `run`／`resume` 在这些时刻各取一份账号额度快照（不调用模型）：本进程首次用到某供应商之前（`before_use`），额度失败之后、判断是否等待或停止之前（`quota_failure`），额度等待醒来之后（`wake`），以及停止、暂停、完成、等待批准确已保存之后，对本进程用过的供应商各一份（`stop`、`paused`、`completed`、`awaiting_approval`）；不计额度等待时每次至多 5 份，额度等待每等一次另加一份失败样本与一份醒来样本（受派发预算约束）。`demo` 与离线后端不采样。探测：Claude 是 `claude -p /usage --output-format stream-json --verbose --no-session-persistence --setting-sources "" --strict-mcp-config --max-turns 1`，必须读到零调用的结果行（`num_turns`、`total_cost_usd`、`duration_api_ms` 为 0，`local_command` 为 `usage`），读不到就在本进程停用 Claude 探测；Codex 是 `codex app-server` 的三条 JSON-RPC 消息（`initialize`、`initialized`、`account/rateLimits/read`）。两者都在空临时目录、用与模型调用相同的环境运行。查询时限 20 秒，从启动算到读到 Claude 的结果行或 Codex 的答复，读到即完成查询（依据 2026-11-17 的联调实测：结果行在启动后约 1.7–4.2 秒到达，Codex 的答复约 3.0–4.6 秒，冷启动超过 5 秒）。之后至多等 5 秒让 CLI 自行结束，再发任何信号：Claude 什么也不做，Codex 先关闭输入（实测 Claude Code 在结果行之后 1–2 秒关闭输出，`codex app-server` 在输入关闭后 0.03–2.2 秒退出）；其间照旧读输出，受同一输出上限与检查点约束，Claude 这时写出的行照旧校验（第二条结果行、不是 JSON 的行、超出上限都与查询中相同），Codex 的只读掉；能不回收地看到领导进程已退出的平台以此为准提前结束，看不到的平台以输出关闭为准；等满不算失败，样本照常可用。超时、输出超限、启动失败与中断不等，直接收尾。收尾时整个进程组 SIGTERM 后 SIGKILL；进程事实的 `exited_before_signal` 记收尾发出第一个信号时领导进程是否已经自己退出（null：未启动或无法观察），为 false 时 `exit_code` 是 CLI 对收尾信号的结果，不表示它自己正常退出。一次探测的计时部分至多约 28 秒（查询 20 秒＋等待自行结束 5 秒＋收尾 3 秒）：不计额度等待时一次 `run`／`resume` 的探测合计最坏约 140 秒（至多 5 次），每次额度等待另加的失败与醒来两份最坏再加约 56 秒；Claude 探测超时一次就在本进程停用，所以 Claude 一侧每个进程至多一次超时。探测期间按 Ctrl-C，读写中的探测在约 0.1 秒内由检查点转为中断，其余时刻在收尾完成之后传播（收尾计时至多 3 秒），临时目录与进程组照样清理。
 
 样本写在 `runs/<id>/observations/quota/`，文件名 `r<修订>-p<相位>-<进程启动时刻>-s<序号>-<供应商>-<触发>.json` 就是它们的顺序，排他发布、从不覆盖，只存归一化字段（窗口的已用百分比与重置时刻、Codex 的 credits 余额原样字符串、`extra_usage`、进程事实），不存 CLI 原始输出或错误文字。探测失败只记“不可用＋原因”：`not_installed`、`timeout`、`output_limit`、`exited`、`provider_error`、`shape_mismatch`、`not_zero_call`、`probe_disabled`、`internal_error`；从不改变调度、预算、回执与接受，用户中断照常传播。
 
@@ -229,20 +229,20 @@ run 列表 → run 详情 → 文件查看。列表按最近事件排序，以�
 
 - 这是账号级观测：包含本 run 以外的使用（含驱动 Harness 的会话），不是本 run 的消耗；样本里没有账号标识，换号认不出来。
 - 每个额度桶分开：Claude 按 `kind` 与 scope（`weekly_all` 与各个 `weekly_scoped（模型显示名）` 各是一个桶，无关模型的周窗口到 100% 也只是它自己那一行）；Codex 按 limit、槽位与样本报告的窗口长度（不把 `primary` 当成固定的 5 小时窗口）。桶与桶不相加，两家不合成总数，输出里没有任何合计。单位是百分点。
-- 每个桶写最近观测（不是“当前”）、观测时间与下次重置时刻，再按重置周期分段，只在同一周期内给首尾差：一段以首个观测的有效重置时刻为锚点；之后的观测时刻达到或越过 min(锚点, 上一份的重置时刻) 就是新周期，重置时刻与锚点相差超过容差也是新周期（与锚点比，连续的小漂移也会累积分段）。容差为 min(120 秒, 窗口长度的 1/60)，窗口长度未知（Claude）时 60 秒；三个取值是设计值，没有经过真实样本复核。
+- 每个桶写最近观测（不是“当前”）、观测时间与下次重置时刻，再按重置周期分段，只在同一周期内给首尾差：一段以首个观测的有效重置时刻为锚点；之后的观测时刻达到或越过 min(锚点, 上一份的重置时刻) 就是新周期，重置时刻与锚点相差超过容差也是新周期（与锚点比，连续的小漂移也会累积分段）。容差为 min(120 秒, 窗口长度的 1/60)，窗口长度未知（Claude）时 60 秒；三个取值是设计值，只在约 21 分钟的真实样本上核对过（同一周期内的抖动 Claude 是亚秒级、Codex 为 0，都在容差之内）。
 - 一份观测报告的重置时刻只有晚于它自己的观测时刻才算有效：已经过期的值不作锚点、不参与同周期判断与差值，该段的变化为未知，标“报告的重置时刻已过期”。
 - 不跨段相减，不假定旧周期用到 100%。有效重置时刻未知、有多个观测的段，变化写“变化未知”；只有一个观测的段写“只有一个观测”；两者都不当作 0。段内下降照算并标“下降（修正或异常）”；因重置时刻偏离锚点而分出的新段标“重置时刻在周期内改变”。
 - 不完整的段写明原因：首个可用观测（之前的样本不可用或没有这个桶，不称“run 开始值”）、较早样本未读取（读取端截掉了更早的样本）、重置之后、重置之前、之后的样本不可用或未报告。不可用的样本不打断分段，只计入每家的不可用原因计数。
 - Codex 的 credits 放在卡片第一行：最近观测的余额（原样十进制字符串），以及运行期间的净变化——连续的、有余额且不是 unlimited 的观测为一段，用独立的 64 位十进制上下文精确相减（对 Inexact、Rounded 等设陷阱，结果是字符串；陷阱触发时为 null，显示“变化未知”；一段只有一个余额观测时也为 null，显示“只有一个余额观测”）；净变化含充值、赠送、过期，不是消费账单，不加货币符号。unlimited 时不计算差值，余额未报告时写“余额未报告”（可用样本都没有报告 credits 时也这样写；`status` 的 JSON 里此时 `credits` 是空对象，不补造条目）；某份样本没有报告 credits 不断开一段。
 - 样本时刻倒退（时钟回拨）时标出，先后仍按台账修订排序；损坏、超大或名实不符的样本计入 `damaged_count` 并跳过；截掉的较早样本计入 `omitted`，第一段的开头标为不完整。`--full` 只打印台账，不带 `quota`。
 
-两个接口都是 experimental，没有对真实账号运行过；这一口径不保证的事（每次调用的消耗、跨重置的缺口、换号、显示的新鲜度、容差取值）见[仍需明确的限制](design.md#额度探测统计与等待)。
+两个接口都是 experimental，2026-11-17 对真实账号运行过（Claude Code 2.1.325、codex-cli 0.169.0，见[验证记录](validation.md)）；自动等待仍然没有在真实的额度失败上运行过。这一口径不保证的事（每次调用的消耗、跨重置的缺口、换号、显示的新鲜度、容差取值）见[仍需明确的限制](design.md#额度探测统计与等待)。
 
 **用量与名义费用。** 调用分类按台账 dispatch ID 计数，重复的 ID 只计一次并列出；事件里的用量不再相加。token 与 CLI 报告的 `reported_cost_usd`（Claude 的名义估算，不是账户账单，也不是订阅额度；Codex 不报告）只在调用记录里逐条显示原字段，不跨 dispatch 或供应商汇总。
 
 ### 文件访问
 
-只能通过固定根读取 run 目录内的普通文件：顶层 `state.json`、`events.jsonl`、`handoff.json`、`worktree-cleanup.json`；目录 `plans/`、`dispatches/<uuid>/`（含 `commands/<32 位十六进制>/`）、`verification/`、`recovery/`、`decisions/`、`environment/`、`checkpoints/`、`path-indexes/`、`indexes/`、`batches/`、`observations/`（额度样本）。`mcp.json`、`run.lock`、`*.tmp` 与 `memory.sqlite3*` 被排除；符号链接与非普通文件一律拒绝，中间目录在检查后被替换为符号链接也无法逃出根目录；路径深度不超过 8。台账中的绝对路径只显示不打开。文件内容永远以 `text/plain`（或 `format=json`）返回，日志不会作为 HTML 执行。
+只能通过固定根读取 run 目录内的普通文件：顶层 `state.json`、`events.jsonl`、`handoff.json`、`worktree-cleanup.json`、`workspace-inputs.json`、`workspace-inputs-manifest.json`；目录 `plans/`、`dispatches/<uuid>/`（含 `commands/<32 位十六进制>/`）、`verification/`、`preflight/`、`recovery/`、`decisions/`、`environment/`、`checkpoints/`、`proposal-rejections/`、`continuations/`、`continuation-rejections/`、`execution-guidance/`、`path-indexes/`、`input-indexes/`、`finding-progress/`、`observations/`（额度样本），即[文件布局](#文件布局)里 run 目录下的全部证据。生成的 MCP 配置 `mcp.json`、两个空锁文件 `run.lock` 与 `store.lock`、`*.tmp` 与 `memory.sqlite3*` 按名排除；顶层其他条目在文件索引里计为“不可寻址”。离线套件在每个仓库用例结束时核对它留下的 run 目录：顶层的每个条目要么在上面的固定根里、要么按名排除，运行时新增顶层文件或目录而忘了登记会让用例失败。符号链接与非普通文件一律拒绝，中间目录在检查后被替换为符号链接也无法逃出根目录；路径深度不超过 8。台账中的绝对路径只显示不打开。文件内容永远以 `text/plain`（或 `format=json`）返回，日志不会作为 HTML 执行。
 
 ### 限制
 
@@ -359,4 +359,4 @@ python3 -m harness.tool_smoke --config /path/to/harness.toml --repo /path/to/pro
 - `permission_smoke` 在 `--repo` 的 `.harness/permission-smoke/` 建立专用现场，检查工作树内读写、精确命令、额外参数、工作树外读写和 `.git` 修改；通过要求实际工具调用、工具结果、对应的 `permission_denials` 和文件内容一致，模型自称“已拒绝”不算证据。专用命令替换项目命令，外部 MCP 关闭。默认超时 180 秒、最多 16 轮、预算参数 1 美元，可用 `--timeout`、`--max-turns`、`--max-budget-usd` 调整。
 - `tool_smoke` 让配置的 Claude worker 调用 broker、文件工具、`git_query`（`ls-tree`、`hash-object` 与一条被拒绝的 argv）和 `delete_path`（范围内删除与范围外拒绝），核对工具结果与文件；默认最多 20 轮。
 
-结果只覆盖这组现场和实际 CLI 版本，不证明完整命令白名单或 OS 隔离。已执行的联调记录在[验证记录](validation.md)。
+结果只覆盖这组现场和实际 CLI 版本，不证明完整命令白名单或 OS 隔离。已执行的联调记录在[验证记录](validation.md)。在 Claude Code 会话里运行这些入口（或 `run`／`resume`）时，会话的环境变量照常传给子进程（见[限制](design.md#额度探测统计与等待)），建议在普通终端里运行。

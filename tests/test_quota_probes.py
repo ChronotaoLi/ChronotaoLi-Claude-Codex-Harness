@@ -5,6 +5,7 @@ this test process or to the stubs it started; each test checks that the probe's 
 group, any descendant and the temporary directory are gone.
 """
 import contextlib
+import json
 import os
 import signal
 import subprocess
@@ -16,7 +17,7 @@ from datetime import datetime, timezone
 from unittest.mock import patch
 
 import quota_stubs
-from harness import quota
+from harness import quota, quota_wait
 from harness.adapters import CLIBackend
 
 
@@ -83,9 +84,11 @@ class SnapshotTests(ProbeCase):
         self.assertTrue(record["available"], record)
         self.assertEqual(record["source"], {"command": list(quota.CLAUDE_ARGV), "cli_version": "9.9.901"})
         self.assertEqual([(w["kind"], w["scope_model"], w["used_percent"]) for w in record["windows"]],
-                         [("session", None, 37), ("weekly_all", None, 61), ("weekly_scoped", "Model Z", 100)])
+                         [("session", None, 37), ("weekly_all", None, 61), ("weekly_scoped", "Model Z", 100),
+                          ("weekly_scoped", quota_stubs.FAMILY_DISPLAY, 12)])
         self.assertEqual([w["resets_at"] for w in record["windows"]],
-                         [epoch(2031, 1, 2, 3), epoch(2031, 1, 6, 3), epoch(2031, 1, 6, 3)])  # "Z" is +00:00
+                         [epoch(2031, 1, 2, 3), epoch(2031, 1, 6, 3), epoch(2031, 1, 6, 3),
+                          epoch(2031, 1, 6, 3)])  # "Z" is +00:00
         self.assertEqual(record["zero_call"], {"verified": True, "num_turns": 0, "total_cost_usd": 0,
                                                "duration_api_ms": 0, "local_command": "usage"})
         self.assertEqual(record["extra_usage"], {"is_enabled": False, "monthly_limit": None, "used_credits": None,
@@ -106,17 +109,24 @@ class SnapshotTests(ProbeCase):
         quota_stubs.install(self)
         record = quota.snapshot("codex", environment())
         self.assertTrue(record["available"], record)
-        # The slot is a position only: its length comes from the data, never assumed.
+        # The slot is a position only: its length comes from the data, never assumed. The real
+        # answer repeats the main snapshot in rateLimitsByLimitId: one bucket, not two, and
+        # nothing set aside as unparsed.
         self.assertEqual(record["windows"], [{"limit_id": "codex", "slot": "primary", "window_minutes": 4320,
                                               "used_percent": 73, "resets_at": 1925000000,
                                               "resets_at_raw": 1925000000}])
         self.assertEqual(record["limits"], [{"limit_id": "codex", "limit_name": None, "rate_limit_reached_type": None,
                                              "spend_control_reached": False,
                                              "credits": {"has_credits": True, "unlimited": False, "balance": "41.25"}}])
+        self.assertEqual(record["unparsed"], [])
         self.assertEqual(record["source"]["cli_version"], "0.900.1")
         self.assertIs(record["ordinary_usage_allowed"], True)
         self.assertEqual(quota.bucket_key("codex", record["windows"][0]), ("codex", "codex", "primary", 4320))
         self.assertIsNone(record["zero_call"])
+        # Fields that are neither read nor stored: no account identifier reaches the record.
+        text = json.dumps(record)
+        for unstored in (quota_stubs.ACCOUNT_ID, "accountId", "rateLimitResetCredits", "synthetic-credit"):
+            self.assertNotIn(unstored, text)
 
     def test_failures_are_unavailable_with_a_reason_and_leave_nothing(self):  # P3
         cases = [("claude", "not_zero_call", "not_zero_call", {"field": "result.num_turns"}),
@@ -125,6 +135,10 @@ class SnapshotTests(ProbeCase):
                  ("claude", "exit", "exited", {"field": "result", "exit_code": 3}),
                  ("claude", "big", "output_limit", None), ("claude", "hang", "timeout", None),
                  ("claude", "provider_error", "provider_error", None),
+                 # Written after the result line, while the CLI settles: still read and checked.
+                 ("claude", "second_result", "shape_mismatch", {"field": "result"}),
+                 ("claude", "badline_after", "shape_mismatch", {"field": "stdout line"}),
+                 ("claude", "big_after", "output_limit", None),
                  ("codex", "rpc_error", "provider_error", {"method": "account/rateLimits/read", "code": -32600}),
                  ("codex", "shape", "shape_mismatch", {"field": "result.rateLimits.primary.usedPercent"}),
                  ("codex", "hang", "timeout", None)]
@@ -142,12 +156,13 @@ class SnapshotTests(ProbeCase):
 
     def test_codex_that_ignores_eof_or_leaves_a_child_is_ended(self):  # P4
         for mode in ("ignore_eof", "orphan"):
-            with self.subTest(mode=mode):
+            with self.subTest(mode=mode), patch.object(quota, "SETTLE_SECONDS", 0.5):
                 calls = quota_stubs.install(self, codex=mode)
                 temp = TrackTemp(self)
                 record = quota.snapshot("codex", environment())
                 self.assertTrue(record["available"], record)
                 self.assertTrue(record["process"]["exit_confirmed"])
+                self.assertIs(record["process"]["exited_before_signal"], False if hasattr(os, "waitid") else None)
                 self.assert_clean(calls, temp, "codex")
 
     def test_a_missing_cli_is_not_installed_and_its_directory_is_removed(self):  # P5
@@ -186,6 +201,126 @@ class SnapshotTests(ProbeCase):
         self.assertTrue(record["available"], record)
         self.assertEqual(([limit["limit_id"] for limit in record["limits"]], record["unparsed"]),
                          (["codex"], ["result.rateLimitsByLimitId"]))
+
+    def test_a_family_display_name_relates_by_family(self):  # the real per-model window's name has no version
+        quota_stubs.install(self)
+        record = quota.snapshot("claude", environment())
+        (window,) = [w for w in record["windows"] if w["scope_model"] == quota_stubs.FAMILY_DISPLAY]
+        configured = {"claude-opus-5-5", "claude-fable-5-2"}   # the Claude models harness.toml configures
+        self.assertEqual(quota_wait.relation(window["scope_model"], "claude-fable-5-2", configured), ("applies", None))
+        self.assertEqual(quota_wait.relation(window["scope_model"], "claude-opus-5-5", configured), ("unrelated", None))
+
+
+class AnswerTimingTests(ProbeCase):
+    """The real CLIs' timing (measured 2026-11-17), which answer-at-once stubs never showed.
+
+    The answer completes the query; the CLI then has a bounded time to end on its own
+    before any signal, and the process facts say which of the two ended it.
+    """
+    OWN_EXIT = (True, 0) if hasattr(os, "waitid") else (None, 0)
+
+    def facts(self, record):
+        return record["process"]["exited_before_signal"], record["process"]["exit_code"]
+
+    def test_a_cli_that_ends_on_its_own_while_settling_is_recorded_so(self):
+        # The default stubs answer and exit at once (Codex once its input is closed): every time, not by luck.
+        quota_stubs.install(self)
+        for _ in range(3):
+            for provider in ("claude", "codex"):
+                with self.subTest(provider=provider):
+                    record = quota.snapshot(provider, environment())
+                    self.assertTrue(record["available"], record)
+                    self.assertEqual(self.facts(record), self.OWN_EXIT)
+        # The output closes a while before the process exits: the probe waits for the exit, not the EOF.
+        quota_stubs.install(self, claude="close_then_exit:0.3", codex="close_then_exit:0.3")
+        for provider in ("claude", "codex"):
+            with self.subTest(provider=provider, mode="close_then_exit"):
+                begun = time.monotonic()
+                record = quota.snapshot(provider, environment())
+                self.assertGreaterEqual(time.monotonic() - begun, 0.3)
+                self.assertTrue(record["available"], record)
+                self.assertEqual(self.facts(record), self.OWN_EXIT)
+        # Claude Code keeps its output open after the result line, then exits: the probe waits for that.
+        calls = quota_stubs.install(self, claude="linger:1")
+        temp = TrackTemp(self)
+        begun = time.monotonic()
+        record = quota.snapshot("claude", environment())
+        elapsed = time.monotonic() - begun
+        self.assertGreaterEqual(elapsed, 1.0)
+        self.assertLess(elapsed, quota.SETTLE_SECONDS)
+        self.assertTrue(record["available"], record)
+        self.assertTrue(record["zero_call"]["verified"])
+        self.assertEqual((record["process"]["termination"], *self.facts(record)), ("normal", *self.OWN_EXIT))
+        self.assert_clean(calls, temp, "claude")
+
+    def test_running_out_of_settle_time_is_not_a_failure(self):
+        # A CLI that never ends on its own is ended by the cleanup once the settle time is up.
+        for provider, mode in (("claude", "linger_forever"), ("codex", "ignore_eof")):
+            with self.subTest(provider=provider), patch.object(quota, "SETTLE_SECONDS", 1.0):
+                calls = quota_stubs.install(self, **{provider: mode})
+                temp = TrackTemp(self)
+                begun = time.monotonic()
+                record = quota.snapshot(provider, environment())
+                elapsed = time.monotonic() - begun
+                self.assertGreaterEqual(elapsed, 1.0)
+                self.assertLess(elapsed, 1.0 + quota.CLEANUP_SECONDS + 2)
+                self.assertTrue(record["available"], record)
+                if provider == "claude":
+                    self.assertTrue(record["zero_call"]["verified"])
+                self.assertEqual(record["process"]["termination"], "normal")
+                self.assertEqual(self.facts(record), (False if hasattr(os, "waitid") else None, -signal.SIGTERM))
+                self.assert_clean(calls, temp, provider)
+
+    @unittest.skipUnless(hasattr(os, "waitid"), "needs os.waitid to see the exit before the output is read")
+    def test_what_an_exited_cli_left_in_the_pipe_is_still_read(self):
+        # The exit is seen before the last line is read (here forced by waiting for it): that line,
+        # a second result line, is still read and checked.
+        quota_stubs.install(self, claude="second_result_late")
+        real = quota._exited_unreaped
+
+        def once_exited(pid):
+            until = time.monotonic() + 10
+            while not real(pid) and time.monotonic() < until:
+                time.sleep(0.01)
+            return real(pid)
+        with patch.object(quota, "_exited_unreaped", once_exited):
+            record = quota.snapshot("claude", environment())
+        self.assertEqual((record["available"], record["reason"], record["detail"]),
+                         (False, "shape_mismatch", {"field": "result"}))
+
+    def test_settle_time_is_counted_from_the_answer(self):
+        # The answer comes late in the query time; the CLI still gets the whole settle time after it.
+        calls = quota_stubs.install(self, claude="slow:2+linger:1.5")
+        temp = TrackTemp(self)
+        begun = time.monotonic()
+        with patch.object(quota, "QUERY_SECONDS", 3.0), patch.object(quota, "SETTLE_SECONDS", 2.5):
+            record = quota.snapshot("claude", environment())
+        self.assertGreaterEqual(time.monotonic() - begun, 3.5)
+        self.assertTrue(record["available"], record)
+        self.assertEqual(self.facts(record), self.OWN_EXIT)
+        self.assert_clean(calls, temp, "claude")
+
+    def test_answers_after_five_seconds_are_read(self):
+        # Cold starts went past 5 s; both probes run at once, so the test waits only once.
+        calls = quota_stubs.install(self, claude="slow:5.5", codex="slow:5.5")
+        temp = TrackTemp(self)
+        records = {}
+
+        def probe(provider):
+            records[provider] = quota.snapshot(provider, environment())
+        begun = time.monotonic()
+        other = threading.Thread(target=probe, args=("codex",))
+        other.start()
+        try:
+            probe("claude")
+        finally:
+            other.join()
+        self.assertGreaterEqual(time.monotonic() - begun, 5.5)
+        for provider in ("claude", "codex"):
+            with self.subTest(provider=provider):
+                self.assertTrue(records[provider]["available"], records[provider])
+                self.assertEqual(records[provider]["process"]["termination"], "normal")
+                self.assert_clean(calls, temp, provider)
 
 
 def claude_lines():
@@ -285,7 +420,8 @@ class CleanupTests(ProbeCase):
         for provider, mode in (("claude", "child_ignores_term_leader_exits"),
                                ("claude", "child_ignores_term_leader_waits"),
                                ("codex", "child_ignores_term"), ("codex", "leader_waits_child_ignores")):
-            with self.subTest(provider=provider, mode=mode):
+            # A leader that stays alive uses up the settle time; a short one keeps the test fast.
+            with self.subTest(provider=provider, mode=mode), patch.object(quota, "SETTLE_SECONDS", 0.5):
                 calls = quota_stubs.install(self, **{provider: mode})
                 temp = TrackTemp(self)
                 record = quota.snapshot(provider, environment())
@@ -297,12 +433,13 @@ class CleanupTests(ProbeCase):
     def test_an_interrupt_in_the_grace_cuts_it_short_and_still_kills_the_group(self):  # C2
         for provider in ("claude", "codex"):
             with self.subTest(provider=provider):
-                calls = quota_stubs.install(self, **{provider: "eof_then_sigint"})
+                # The stub answers, never ends on its own, and answers the cleanup's SIGTERM with the
+                # user's Ctrl-C; a 30 s grace makes that interrupt land inside it. Only SIGKILL ends it.
+                calls = quota_stubs.install(self, **{provider: "sigint_on_term_after:0"})
                 temp = TrackTemp(self)
                 begun = time.monotonic()
-                # A 30 s grace makes the interrupt land inside it; only SIGKILL ends these stubs.
                 with patch.object(quota, "TERM_GRACE_SECONDS", 30), patch.object(quota, "CLEANUP_SECONDS", 30), \
-                        self.assertRaises(KeyboardInterrupt):
+                        patch.object(quota, "SETTLE_SECONDS", 0.5), self.assertRaises(KeyboardInterrupt):
                     quota.snapshot(provider, environment())
                 self.assertLess(time.monotonic() - begun, 15)
                 self.assert_clean(calls, temp, provider)
@@ -369,7 +506,8 @@ class OwnershipWindowTests(ProbeCase):
                 def interrupted_first(*args, **kwargs):
                     os.kill(os.getpid(), signal.SIGINT)
                     return real(*args, **kwargs)
-                with patch(target, interrupted_first), self.assertRaises(KeyboardInterrupt):
+                with patch(target, interrupted_first), patch.object(quota, "SETTLE_SECONDS", 0.5), \
+                        self.assertRaises(KeyboardInterrupt):
                     quota.snapshot("codex", environment())
                 self.assertEqual(len(calls.children("codex")), 1)
                 self.assert_clean(calls, temp, "codex")
@@ -377,11 +515,13 @@ class OwnershipWindowTests(ProbeCase):
 
 class InterruptLatencyTests(ProbeCase):
     def test_an_interrupt_while_waiting_for_output_propagates_within_a_checkpoint(self):
-        # Stubs that read and never answer: only the read loop's checkpoint can act on the signal
-        # before the 5 s query deadline. The bound is loose for slow machines.
-        for provider in ("claude", "codex"):
-            with self.subTest(provider=provider):
-                calls = quota_stubs.install(self, **{provider: "hang"})
+        # Stubs that read and never answer (hang), or answer and never end (the settle time): only
+        # the read loop's checkpoint can act on the signal before the deadline. The bound is loose
+        # for slow machines.
+        for provider, mode in (("claude", "hang"), ("codex", "hang"), ("claude", "linger_forever"),
+                               ("codex", "ignore_eof")):
+            with self.subTest(provider=provider, mode=mode):
+                calls = quota_stubs.install(self, **{provider: mode})
                 temp = TrackTemp(self)
                 sent = []
 
@@ -403,7 +543,7 @@ class InterruptLatencyTests(ProbeCase):
                     sender.join()
                 self.assertEqual(len(sent), 1)
                 self.assertLess(raised - sent[0], 2.0)
-                self.assertLess(raised - sent[0], quota.QUERY_SECONDS)
+                self.assertLess(raised - sent[0], min(quota.QUERY_SECONDS, quota.SETTLE_SECONDS))
                 self.assert_clean(calls, temp, provider)
 
 
@@ -427,7 +567,7 @@ class SignalVerdictTests(ProbeCase):
     def test_while_an_outer_exception_propagates(self):  # C8
         calls = quota_stubs.install(self, claude="sigint_on_term_after:0")
         temp = TrackTemp(self)
-        with self.assertRaises(KeyboardInterrupt):
+        with patch.object(quota, "SETTLE_SECONDS", 0.5), self.assertRaises(KeyboardInterrupt):
             try:
                 raise RuntimeError("a stop being propagated")
             except RuntimeError:
@@ -440,7 +580,7 @@ class SignalVerdictTests(ProbeCase):
             with self.subTest(provider=provider):
                 quota_stubs.install(self)
                 events, original = [], {name: getattr(subprocess.Popen, name) for name in names}
-                real_killpg, real_waitpid = os.killpg, os.waitpid
+                real_killpg, real_waitpid, real_waitid = os.killpg, os.waitpid, getattr(os, "waitid", None)
 
                 def wrap(name):
                     def call(process, *args, **kwargs):
@@ -455,15 +595,24 @@ class SignalVerdictTests(ProbeCase):
                 def waitpid(*args):
                     events.append("waitpid")
                     return real_waitpid(*args)
+
+                def waitid(kind, ident, options):
+                    events.append(("waitid", bool(options & os.WNOWAIT)))   # only a look that leaves it unreaped
+                    return real_waitid(kind, ident, options)
                 with contextlib.ExitStack() as stack:
                     for name in names:
                         stack.enter_context(patch.object(subprocess.Popen, name, wrap(name)))
                     stack.enter_context(patch.object(os, "killpg", killpg))
                     stack.enter_context(patch.object(os, "waitpid", waitpid))
+                    if real_waitid is not None:
+                        stack.enter_context(patch.object(os, "waitid", waitid))
                     record = quota.snapshot(provider, environment())
                 self.assertTrue(record["available"], record)
                 kill = events.index(("killpg", signal.SIGKILL))
-                self.assertEqual(events[:kill], [("killpg", signal.SIGTERM)])
+                # Before the SIGKILL: only looks that leave the leader unreaped (the settle time and the
+                # cleanup's own look), then the one SIGTERM.
+                self.assertEqual(events[kill - 1], ("killpg", signal.SIGTERM))
+                self.assertEqual(set(events[:kill - 1]), {("waitid", True)} if real_waitid is not None else set())
                 self.assertIn("wait", events[kill:])
                 self.assertNotIn(("killpg", signal.SIGTERM), events[kill:])
                 self.assertNotIn(("killpg", signal.SIGKILL), events[kill + 1:])

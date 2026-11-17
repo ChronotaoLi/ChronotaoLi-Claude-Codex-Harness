@@ -595,13 +595,64 @@ class PathPolicyTests(unittest.TestCase):
         for path in ("", "/etc/passwd", "../state.json", "state.json/x", "plans", "worktrees/x", ".hidden",
                      "dispatches/not-a-uuid/prompt.txt", f"dispatches/{dispatch_id.upper()}/prompt.txt",
                      f"dispatches/{dispatch_id}/commands/XYZ/output.stdout",
-                     "verification/" + "/".join(["d"] * 8), "hooks/greet-1/log.stdout"):
+                     "verification/" + "/".join(["d"] * 8), "hooks/greet-1/log.stdout",
+                     "indexes/abc.json", "batches/abc.json"):   # never written at the top of a run
             with self.subTest(path=path), self.assertRaises(observe.InvalidPath):
                 observe.validate_path(path)
-        for path in ("run.lock", f"dispatches/{dispatch_id}/mcp.json", "plans/revision-0.json.abc.tmp",
+        for path in ("run.lock", "store.lock", f"dispatches/{dispatch_id}/mcp.json", "plans/revision-0.json.abc.tmp",
                      "checkpoints/memory.sqlite3-journal"):
             with self.subTest(path=path), self.assertRaises(observe.PathRefused):
                 observe.validate_path(path)
+
+
+# One file in every place the runtime writes evidence at the top of a run directory.
+RUN_EVIDENCE = ("workspace-inputs.json", "workspace-inputs-manifest.json", "continuations/c1.json",
+                "continuation-rejections/r1.json", "execution-guidance/g1.json", "proposal-rejections/p1.json",
+                "input-indexes/i1.json", "finding-progress/indexes/f1.json", "preflight/greet/1/result.json",
+                "checkpoints/batches/b1.json", "checkpoints/indexes/x1.json", "environment/indexes/e1.json")
+
+
+class RunEvidenceIndexTests(StateCase):
+    def test_every_evidence_location_is_listed_and_readable(self):
+        run_id = self.save(ledger("run_evidence"))
+        folder = self.state / "runs" / run_id
+        for path in RUN_EVIDENCE:
+            write_json(folder / path, {"path": path})
+        (folder / "store.lock").write_text("")
+        (folder / "unknown-top.json").write_text("{}")
+        with observe.Observer(self.state) as observer:
+            index = observer.file_index(run_id)
+            listed = {item["path"] for item in index["files"]}
+            self.assertLessEqual(set(RUN_EVIDENCE), listed)
+            for path in RUN_EVIDENCE:
+                with self.subTest(path=path):
+                    self.assertEqual(json.loads(observer.read_file(run_id, path)["text"]), {"path": path})
+        # Named exclusions are counted as such; anything else at the top is unaddressable, never "excluded".
+        self.assertEqual((index["skipped"]["excluded"], index["skipped"]["unaddressable"]), (1, 1))
+
+
+class RunFileGuardTests(unittest.TestCase):
+    """The repository tests' guard: an unregistered entry the runtime writes into a run directory fails the test."""
+
+    def outcome(self, plant):
+        class Planted(RepoCase):
+            def runTest(inner):
+                result = inner.engine().start("Implement greet")
+                plant(inner.repo / ".harness" / "runs" / result["id"])
+        result = unittest.TestResult()
+        Planted().run(result)
+        return [text for _, text in result.failures + result.errors]
+
+    def test_an_unregistered_run_directory_fails_the_test_that_left_it(self):
+        self.assertEqual(self.outcome(lambda folder: None), [])
+
+        def new_directory(folder):
+            (folder / "new-evidence").mkdir()
+            (folder / "new-evidence" / "record.json").write_text("{}")
+        (failure,) = self.outcome(new_directory)
+        self.assertIn("/new-evidence/", failure)
+        (failure,) = self.outcome(lambda folder: (folder / "new-top.json").write_text("{}"))
+        self.assertIn("new-top.json", failure)
 
 
 if __name__ == "__main__":

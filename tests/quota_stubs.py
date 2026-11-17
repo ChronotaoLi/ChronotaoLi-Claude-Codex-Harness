@@ -15,6 +15,18 @@ probe's behaviour; ``…_after:N`` modes apply only once more than N probes of t
 logged. Stubs signal nobody but their own parent (the probing test process). A descendant
 that ignores SIGTERM writes a ready marker after installing SIG_IGN and the stub waits for
 it, so cleanup is tested against a child that really ignores the signal.
+
+Timing modes follow the real CLIs (Claude Code 2.1.325 and codex-cli 0.169.0, measured
+2026-11-17): Claude's three lines came 1.7-4.2 s after the start and the CLI closed its
+output only 1-2 s after the result line; Codex answered after about 3-4.6 s and exited up
+to about 2.2 s after its input closed. ``slow:S`` answers after S seconds (both);
+``linger:S`` keeps Claude's output open S seconds after the result line, then exits;
+``linger_forever`` never closes it (the probe's cleanup ends the stub); ``close_then_exit:S``
+closes the output (Codex: once its input closed) S seconds before exiting. Modes combine
+with ``+`` (``slow:2+linger:1``). By default both answer at once and exit, so the suite
+stays fast. The default Codex answer has the real message order and fields: two
+notifications between the messages, ``rateLimitsByLimitId`` repeating the main snapshot
+under ``codex``, and fields the probe neither reads nor stores (``accountId`` among them).
 """
 import json
 import os
@@ -25,6 +37,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 STUB_PREFIX = "harness-quota-stub-"
+ACCOUNT_ID = "synthetic-account-0001"   # the stub's account identifier, which no sample may contain
+FAMILY_DISPLAY = "Fable"                # a per-model weekly window named by its family alone, as the real CLI does
 
 COMMON = r'''
 import json, os, signal, subprocess, sys, time
@@ -37,6 +51,12 @@ def probes(cli):
         return sum(1 for line in handle if json.loads(line).get("cli") == cli and json.loads(line).get("probe"))
 def after(mode, prefix, cli):
     return mode.startswith(prefix) and probes(cli) > int(mode.split(":")[1])
+def seconds(mode, name):
+    """S of a ``name:S`` part of a mode (parts joined by ``+``), else None."""
+    found = [part for part in mode.split("+") if part.startswith(name + ":")]
+    return float(found[0].split(":", 1)[1]) if found else None
+def has(mode, name):
+    return name in mode.split("+")
 def stubborn_child(cli):
     ready = os.path.join(os.getcwd(), "child-ready")
     child = subprocess.Popen([sys.executable, "-c",
@@ -109,7 +129,9 @@ limits = [
     {"kind": "weekly_all", "group": "weekly", "percent": 61, "resets_at": "2031-01-06T03:00:00.000000+00:00",
      "scope": None, "severity": "sev-2", "is_active": False},
     {"kind": "weekly_scoped", "group": "weekly", "percent": 100, "resets_at": "2031-01-06T03:00:00Z",
-     "scope": {"model": {"display_name": "Model Z"}, "surface": None}, "severity": "sev-2", "is_active": False}]
+     "scope": {"model": {"display_name": "Model Z"}, "surface": None}, "severity": "sev-2", "is_active": False},
+    {"kind": "weekly_scoped", "group": "weekly", "percent": 12, "resets_at": "2031-01-06T03:00:00.000000+00:00",
+     "scope": {"model": {"display_name": FAMILY}, "surface": None}, "severity": "sev-1", "is_active": False}]
 custom = os.environ.get("QUOTA_STUB_WINDOWS")
 if custom:
     # The test's own windows: reset_in counts from QUOTA_STUB_NOW (the test's fake clock), resets_at is absolute.
@@ -143,18 +165,35 @@ if mode == "no_local_command":
     del result["local_command"]
 if mode == "provider_error":
     result.update(is_error=True, subtype="error_during_execution")
+# Handlers first: the probe may signal as soon as it has read the result line.
+on_term = after(mode, "sigint_on_term_after:", "claude")
+if on_term:
+    interrupt_parent_on_term()
+if seconds(mode, "slow") is not None:
+    time.sleep(seconds(mode, "slow"))
 for line in (init, report, result):
     print(json.dumps(line), flush=True)
-if after(mode, "sigint_on_term_after:", "claude"):
-    interrupt_parent_on_term()
-    close_stdout()
-    time.sleep(60)
-if mode in ("child_ignores_term_leader_waits", "eof_then_sigint"):
+# Written while the CLI settles, after the result line.
+if mode == "second_result":
+    print(json.dumps(result), flush=True)
+if mode == "second_result_late":         # once the probe has surely read the first one
+    time.sleep(0.3)
+    print(json.dumps(result), flush=True)
+if mode == "badline_after":
+    print("not json", flush=True)
+if mode == "big_after":
+    sys.stdout.write("x" * (2 * 1024 * 1024))
+    sys.stdout.flush()
+if on_term or mode == "child_ignores_term_leader_waits":
     close_stdout()                      # EOF for the reader while the leader stays alive
-    if mode == "eof_then_sigint":
-        os.kill(os.getppid(), signal.SIGINT)
-        signal.signal(signal.SIGTERM, signal.SIG_IGN)
     time.sleep(60)
+if has(mode, "linger_forever"):
+    time.sleep(60)                      # the output stays open; the probe's cleanup ends this stub
+if seconds(mode, "linger") is not None:
+    time.sleep(seconds(mode, "linger"))  # the output stays open for a while after the result line
+if seconds(mode, "close_then_exit") is not None:
+    close_stdout()                      # the output closes S seconds before the stub exits on its own
+    time.sleep(seconds(mode, "close_then_exit"))
 '''
 
 CODEX = COMMON + r'''
@@ -171,22 +210,30 @@ if not probe:
     sys.exit(97)
 if mode in ("child_ignores_term", "leader_waits_child_ignores"):
     stubborn_child("codex")
-if mode == "eof_then_sigint":
-    signal.signal(signal.SIGTERM, signal.SIG_IGN)   # survives SIGTERM, so the interrupt lands in the grace
+on_term = after(mode, "sigint_on_term_after:", "codex")
+if on_term:
+    interrupt_parent_on_term()
 if mode == "orphan":
     subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)", "harness-quota-stub-child"],
                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 def snapshot(limit_id, percent, balance):
-    return {"limitId": limit_id, "limitName": None,
+    return {"limitId": limit_id, "limitName": None, "normalModelSlug": None,
             "primary": {"usedPercent": percent, "windowDurationMins": 4320, "resetsAt": 1925000000},
             "secondary": None, "credits": {"hasCredits": True, "unlimited": False, "balance": balance},
-            "planType": "synthetic", "rateLimitReachedType": None, "spendControlReached": False}
-answer = {"rateLimits": snapshot("codex", 73, "41.25"), "ordinaryUsageAllowed": True}
+            "individualLimit": None, "spendControlReached": False, "planType": "synthetic",
+            "rateLimitReachedType": None}
+answer = {"ordinaryUsageAllowed": True, "rateLimits": snapshot("codex", 73, "41.25"),
+          # The real CLI repeats the main snapshot here, under its own limitId.
+          "rateLimitsByLimitId": {"codex": snapshot("codex", 73, "41.25")},
+          "rateLimitResetCredits": {"availableCount": 1, "credits": [
+              {"id": "synthetic-credit", "resetType": "synthetic", "status": "synthetic", "grantedAt": 1924000000,
+               "expiresAt": 1926000000, "title": "synthetic", "description": "synthetic"}]},
+          "accountId": ACCOUNT_ID, "rateLimitUpsell": None}
 if mode == "full_window":
     answer["rateLimits"]["primary"]["usedPercent"] = 100
+    answer["rateLimitsByLimitId"]["codex"]["primary"]["usedPercent"] = 100
 if mode == "by_limit_id":
-    answer["rateLimitsByLimitId"] = {"codex": snapshot("codex", 73, "41.25"),
-                                     "codex_other": snapshot("codex_other", 12, None)}
+    answer["rateLimitsByLimitId"]["codex_other"] = snapshot("codex_other", 12, None)
 if mode == "by_limit_id_bad":
     answer["rateLimitsByLimitId"] = {"codex_other": {"limitId": "codex_other", "primary": {"usedPercent": "12"}}}
 for line in sys.stdin:
@@ -199,11 +246,18 @@ for line in sys.stdin:
             os.kill(os.getppid(), signal.SIGINT)
             time.sleep(60)
         print(json.dumps({"id": message["id"], "result": {"userAgent": "codex_cli_rs/0.900.1 (synthetic)",
-                                                         "codexHome": "/nonexistent", "platformOs": "x"}}), flush=True)
-        print(json.dumps({"method": "account/rateLimits/updated", "params": {}}), flush=True)
+                                                         "codexHome": "/nonexistent", "platformFamily": "x",
+                                                         "platformOs": "x"}}), flush=True)
+        print(json.dumps({"method": "remoteControl/status/changed",
+                          "params": {"status": "synthetic", "serverName": "synthetic",
+                                     "installationId": "synthetic-installation", "environmentId": None}}), flush=True)
         if mode == "server_request":
             print(json.dumps({"id": 0, "method": "item/tool/requestUserInput", "params": {}}), flush=True)
     elif message.get("method") == "account/rateLimits/read":
+        if seconds(mode, "slow") is not None:
+            time.sleep(seconds(mode, "slow"))
+        print(json.dumps({"method": "account/updated", "params": {"authMode": "synthetic", "planType": "synthetic"}}),
+              flush=True)
         if mode == "rpc_error":
             print(json.dumps({"id": message["id"], "error": {"code": -32600, "message": "synthetic"}}), flush=True)
         elif mode == "shape":
@@ -213,12 +267,12 @@ for line in sys.stdin:
             print(json.dumps({"id": 1, "method": "item/tool/requestUserInput", "params": {}}), flush=True)
         else:
             print(json.dumps({"id": message["id"], "result": answer}), flush=True)
-# stdin reached EOF: the client closed its input.
-if mode == "eof_then_sigint":
-    os.kill(os.getppid(), signal.SIGINT)
+# stdin reached EOF: the client closed its input. By default the server exits, as the real one does.
+if on_term or mode in ("ignore_eof", "orphan", "leader_waits_child_ignores", "server_request_only"):
     time.sleep(60)
-if mode in ("ignore_eof", "orphan", "leader_waits_child_ignores", "server_request_only"):
-    time.sleep(60)
+if seconds(mode, "close_then_exit") is not None:
+    close_stdout()                      # the output closes S seconds before the stub exits on its own
+    time.sleep(seconds(mode, "close_then_exit"))
 '''
 
 
@@ -254,9 +308,10 @@ class Calls:
 def install(case, claude="ok", codex="ok", state=None):
     folder = Path(tempfile.mkdtemp(prefix=STUB_PREFIX))
     case.addCleanup(shutil.rmtree, folder, True)
+    constants = f"FAMILY = {FAMILY_DISPLAY!r}\nACCOUNT_ID = {ACCOUNT_ID!r}\n"
     for name, body in (("claude", CLAUDE), ("codex", CODEX)):
         path = folder / name
-        path.write_text(f"#!{sys.executable}\n" + body, encoding="utf-8")
+        path.write_text(f"#!{sys.executable}\n" + constants + body, encoding="utf-8")
         path.chmod(0o755)
     log = folder / "calls.jsonl"
     environment = patch.dict(os.environ, {"PATH": str(folder) + os.pathsep + os.environ.get("PATH", ""),
