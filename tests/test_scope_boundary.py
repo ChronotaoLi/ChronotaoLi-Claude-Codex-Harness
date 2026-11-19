@@ -162,7 +162,7 @@ class HeldCase(RepoCase):
         return probe.services.planning.capacity_report(proposed)["required_chars"]
 
     BIG = staticmethod(implement_after_rejection(lambda b, p, r: new_task(b, p, r, description="Prepare. " + "z" * 10000)))
-    COMMAND = ["python3", "-c", "print(123)"]
+    COMMAND = {"cwd": ".", "argv": ["python3", "-c", "print(123)"]}
 
     def capacity_tight(self, scope=("hello.py",), *, held=True):
         """A run whose budget fits the proposal's final review by 12 characters (spec-6 T6-24).
@@ -547,14 +547,14 @@ class AppendFieldsTests(HeldCase):
         tasks = plan()["tasks"]
         tasks[0]["allowed_paths"] = ["hello.py", "a.py"]
         first = {"new_tasks": [], "updates": [update(tasks[0], paths=["b.py", "hello.py", "c.py", "b.py"],
-                                                     commands=[["python3", "-V"], ["python3", "-V"]])]}
+                                                     commands=[{"cwd": ".", "argv": ["python3", "-V"]}, {"cwd": ".", "argv": ["python3", "-V"]}])]}
         revised_tasks = apply_revision(tasks, first, set(), scope=["**"])
         self.assertEqual(revised_tasks[0]["allowed_paths"], ["hello.py", "a.py", "b.py", "c.py"])
-        self.assertEqual(revised_tasks[0]["required_commands"], [["python3", "-V"]])  # created when absent
-        second = {"new_tasks": [], "updates": [update(revised_tasks[0], commands=[["git", "status"], ["python3", "-V"]])]}
+        self.assertEqual(revised_tasks[0]["required_commands"], [{"cwd": ".", "argv": ["python3", "-V"]}])  # created when absent
+        second = {"new_tasks": [], "updates": [update(revised_tasks[0], commands=[{"cwd": ".", "argv": ["git", "status"]}, {"cwd": ".", "argv": ["python3", "-V"]}])]}
         again = apply_revision(revised_tasks, second, set(), scope=["**"])
-        self.assertEqual(again[0]["required_commands"], [["python3", "-V"], ["git", "status"]])
-        for fields in ({"paths": ["hello.py", "z.py"]}, {"commands": [["python3", "-V"]]}):
+        self.assertEqual(again[0]["required_commands"], [{"cwd": ".", "argv": ["python3", "-V"]}, {"cwd": ".", "argv": ["git", "status"]}])
+        for fields in ({"paths": ["hello.py", "z.py"]}, {"commands": [{"cwd": ".", "argv": ["python3", "-V"]}]}):
             with self.subTest(accepted=fields), self.assertRaisesRegex(HarnessError, "未接受"):
                 apply_revision(tasks, {"new_tasks": [], "updates": [update(tasks[0], **fields)]}, {"greet"}, scope=["**"])
         # The compact plan context represents the appended fields losslessly.
@@ -570,7 +570,7 @@ class AppendFieldsTests(HeldCase):
         self.assertEqual(rebuilt, again)
 
     def test_current_task_widening_retains_candidate_and_new_commands_gate_dispatch(self):
-        command = ["python3", "-c", "print('support')"]
+        command = {"cwd": ".", "argv": ["python3", "-c", "print('support')"]}
         backend = blocked_then(widen("support.txt", commands=[command]))
         engine = self.engine(backend)
         with self.assertRaisesRegex(HarnessError, "所需命令尚未授权"):
@@ -860,7 +860,7 @@ class CombinedCommitTests(HeldCase):
     def test_answer_scope_and_relaxation_are_one_commit_and_restore_on_failure(self):
         engine, backend, reply = self.asked(lambda b, p, r: decided(r, "implement", selected_task="greet",
                                                                     instruction="Finish greet"))
-        extra = ["python3", "-c", "print(1)"]
+        extra = {"cwd": ".", "argv": ["python3", "-c", "print(1)"]}
         self.config.data["permissions"]["worker_commands"].append(extra)
         before = (engine.directory / "state.json").read_bytes()
         decisions = engine.directory / "decisions"

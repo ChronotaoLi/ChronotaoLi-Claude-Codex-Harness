@@ -27,7 +27,7 @@ from harness.util import (HarnessError, ProcessTimeout, ensure_dispatches_exited
 from test_harness import ROOT, RepoCase
 from test_runtime_changes import ScriptedBackend
 
-ECHO = [sys.executable, '-c', 'print("checked")']
+ECHO = {'cwd': '.', 'argv': [sys.executable, '-c', 'print("checked")']}
 
 
 def sha(data):
@@ -648,7 +648,7 @@ class DeletePathLifecycleTests(RepoCase):
 
     def test_rm_continuation_request_still_stops_as_before(self):
         self.add_tracked({'legacy/old.txt': 'old\n'})
-        rm = ['rm', '--', 'legacy/old.txt']
+        rm = {'cwd': '.', 'argv': ['rm', '--', 'legacy/old.txt']}
         def request(backend, kwargs, packet, result):
             if kwargs['role'] == 'worker' and sum(c['role'] == 'worker' for c in backend.calls) == 1:
                 result.update(status='blocked', blocker_kind='continuation', blockers=['rm was denied'],

@@ -33,6 +33,8 @@ class Scheduler(RuntimeService):
     def next_step(self, *, step=False, accepted_this_call=0):
         # Every step derives from the plan: its published files are the authority.
         self.services.planning.verify_plan_authority()
+        # A leave whose record file is written is a fact before anything is derived from the whole-run history.
+        self.services.finalization.publish_written_leave()
         result = self._next_step(step=step, accepted_this_call=accepted_this_call)
         if (DECIDE_KEY in self.context.run["commander_receipts"] and result.kind in ADVANCING
                 and not (result.kind == "final_review" and self.context.reverify_requested)):
@@ -132,6 +134,8 @@ class Scheduler(RuntimeService):
                     raise HarnessError("首版计划尚未登记；保留现场", stop=stops.make("runtime_failure", "invariant"))
             self.services.planning.report_command_requirements()
             if not self.context.run["attempts"] or self.context.run.get("environment_updates") or self.context.run.get("operator_decisions"):
+                # The estimate reads the whole-run history, a written leave included.
+                self.services.finalization.publish_written_leave()
                 self.services.packets.preflight_final_context()
             if self.context.run["plan_approval_required"] and not self.context.run["plan_approved"]:
                 plan = self.context.run["plan_history"][0]

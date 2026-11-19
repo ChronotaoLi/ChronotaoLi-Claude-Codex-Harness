@@ -4,6 +4,7 @@ import errno
 import io
 import json
 import os
+import stat
 import subprocess
 import sys
 import tempfile
@@ -13,11 +14,11 @@ from pathlib import Path
 from unittest.mock import patch
 
 from harness import stops
-from harness import cli, observe
+from harness import cli, git, observe
 from harness.cli import status_summary
 from harness.util import read_json, write_json
 from harness.versions import RUN_SCHEMA_VERSION
-from test_harness import RepoCase
+from test_harness import ROOT, RepoCase, cli_notice, scratch
 
 ROLES = {"commander": {"cli": "codex", "model": "gpt-6.2-astra", "effort": "high"},
          "fable": {"cli": "claude", "model": "claude-fable-5-2", "effort": "high"},
@@ -525,6 +526,88 @@ class RootDescriptorTests(StateCase):
         self.assertEqual([item["id"] for item in observe.list_runs(self.state)["runs"]], ["run_new"])
 
 
+class LocationTests(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        # Resolved, so a given absolute path and the directory the reader resolved compare as text.
+        self.base = Path(temp.name).resolve()
+
+    def test_each_layout_names_what_is_opened(self):
+        b, top = self.base, self.base.name
+        for folder in ("repo/.harness/runs", "archive/.harness", "archive/state-copy", "store/h1", "store/.harness",
+                       "linked", "linked2", "deep/inner", "deep/.harness"):
+            (b / folder).mkdir(parents=True)
+        (b / "linked" / ".harness").symlink_to(b / "store" / "h1", target_is_directory=True)
+        (b / "linked2" / ".harness").symlink_to(b / "store" / ".harness", target_is_directory=True)
+        (b / "jump").symlink_to(b / "deep" / "inner", target_is_directory=True)
+        (b / "loop-a").symlink_to(b / "loop-b")
+        (b / "loop-b").symlink_to(b / "loop-a")
+
+        def observed(state, checkout, basis, name):
+            return {"state": str(state), "checkout": None if checkout is None else str(checkout),
+                    "checkout_basis": basis, "name": name}
+
+        dotdot = str(b / "jump") + "/../.harness"
+        layouts = (  # (given, checkout passed by the caller, expected)
+            (b / "repo" / ".harness", b / "repo", observed(b / "repo" / ".harness", b / "repo", "git", f"{top}/repo")),
+            (b / "linked" / ".harness", b / "linked", observed(b / "store" / "h1", b / "linked", "git", f"{top}/linked")),
+            (b / "archive" / ".harness", None, observed(b / "archive" / ".harness", b / "archive", "path", f"{top}/archive")),
+            (b / "archive" / "state-copy", None, observed(b / "archive" / "state-copy", None, None, "archive/state-copy")),
+            (b / "linked" / ".harness", None, observed(b / "store" / "h1", None, None, "store/h1")),
+            (b / "linked2" / ".harness", None, observed(b / "store" / ".harness", b / "store", "path", f"{top}/store")),
+            (dotdot, None, observed(b / "deep" / ".harness", b / "deep", "path", f"{top}/deep")))
+        with patch("harness.git.git", side_effect=AssertionError("an observation entry never runs git")):
+            for given, checkout, expected in layouts:
+                with self.subTest(given=str(given), checkout=checkout), \
+                        observe.Observer(given, required=True, checkout=checkout) as observer:
+                    self.assertTrue(observer.reader.opened)
+                    self.assertEqual(observer.observed, expected)
+                    # The location names what the reader opened, and the reader opens what it always did.
+                    self.assertEqual(observer.observed["state"], str(observer.reader.state))
+                    self.assertEqual(observer.reader.state, Path(given).resolve())
+            self.assertNotEqual(os.path.abspath(dotdot), str(b / "deep" / ".harness"))  # a lexical fold would name another
+            # A symbolic link loop (resolution fails on 3.11, opening fails from 3.13) and a NUL byte: not openable.
+            for given in (str(b / "loop-a"), str(b / "bad") + "\x00x"):
+                with self.subTest(given=given):
+                    with observe.Observer(given) as observer:
+                        self.assertFalse(observer.reader.opened)
+                        self.assertEqual(observer.list_runs()["runs"], [])
+                        with self.assertRaises(observe.NotFound):
+                            observer.run_detail("run_x")
+                        self.assertEqual(observer.observed, observed(given, None, None, f"{top}/{Path(given).name}"))
+                    with self.assertRaises(observe.NotFound):
+                        observe.Observer(given, required=True)
+
+    def test_every_json_view_carries_the_fixed_location(self):
+        checkout = self.base / "repo"
+        state = checkout / ".harness"
+        write_json(state / "runs" / "run_good" / "state.json", ledger("run_good"))
+        (state / "runs" / "run_good" / "events.jsonl").write_text('{"time": 1.0, "event": "run_started"}\n')
+        (state / "runs" / "run_broken").mkdir()
+        (state / "runs" / "run_broken" / "state.json").write_bytes(b"{not json")
+        observer = observe.Observer(state, required=True, checkout=checkout)
+        self.addCleanup(observer.close)
+        fixed = {"state": str(state), "checkout": str(checkout), "checkout_basis": "git", "name": f"{self.base.name}/repo"}
+
+        def views():
+            return {"list": observer.list_runs(), "detail": observer.run_detail("run_good"),
+                    "damaged detail": observer.run_detail("run_broken"), "events": observer.events("run_good"),
+                    "file index": observer.file_index("run_good"), "file": observer.read_file("run_good", "state.json")}
+
+        shown = views()
+        self.assertIsNotNone(shown["damaged detail"]["ledger_error"])
+        for name, view in shown.items():
+            self.assertEqual(view["observed"], fixed, name)
+        # Renamed and rebuilt while served: like the root descriptor, the location stays what was opened.
+        state.rename(state.with_name("harness-moved"))
+        write_json(state / "runs" / "run_good" / "state.json", ledger("run_good", goal="rebuilt"))
+        shown = views()
+        self.assertEqual(shown["detail"]["run"]["goal"], "Implement greet")
+        for name, view in shown.items():
+            self.assertEqual(view["observed"], fixed, name)
+
+
 class StatusListDiagnosticsTests(RepoCase):
     def snapshot(self, root):
         result = {}
@@ -581,6 +664,258 @@ class StatusListDiagnosticsTests(RepoCase):
         self.assertIn(os.strerror(errno.EACCES), errors.getvalue())
         self.assertNotIn("Traceback", errors.getvalue())
         self.assertEqual(self.snapshot(state), before)
+
+
+class StatusBindingTests(RepoCase):
+    def test_status_run_reads_ledger_and_quota_from_the_located_directory(self):
+        base = repo = self.repo.resolve()
+        for name in ("a", "b"):
+            write_json(base / f"state-{name}" / "runs" / "run_same" / "state.json", ledger("run_same", goal=f"goal {name}"))
+        # Only b has a (damaged) quota sample, so the quota block shows which directory it came from.
+        samples = base / "state-b" / "runs" / "run_same" / "observations" / "quota"
+        samples.mkdir(parents=True)
+        (samples / "r0000000001-p0-20261118T000000.000000Z-s0001-claude-run_start.json").write_text("{}")
+        link = self.repo / ".harness"
+        real_init, repointed = observe.StateReader.__init__, []
+
+        def point(target):
+            if link.is_symlink():
+                link.unlink()
+            link.symlink_to(target, target_is_directory=True)
+
+        def init_then_repoint(reader, state, **options):
+            real_init(reader, state, **options)
+            if not repointed:  # Once, after the root is fixed and before anything below it is read.
+                repointed.append(reader.state)
+                point(base / "state-b")
+
+        expected = f"harness: 检出 {repo}；状态目录 {base / 'state-a'}"
+        for extra in ([], ["--full"]):
+            point(base / "state-a")
+            repointed.clear()
+            output, errors = io.StringIO(), io.StringIO()
+            with patch.object(observe.StateReader, "__init__", init_then_repoint), \
+                    contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+                code = cli.main(["--repo", str(self.repo), "status", "run_same", *extra])
+            with self.subTest(extra=extra):
+                self.assertEqual(code, 0, errors.getvalue())
+                self.assertEqual(repointed, [base / "state-a"])
+                self.assertEqual(errors.getvalue().splitlines()[0], expected)
+                shown = json.loads(output.getvalue())
+                self.assertEqual(shown["goal"], "goal a")
+                if not extra:
+                    self.assertEqual(shown["quota"]["damaged_count"], 0)
+        # The repointed link really leads elsewhere: a fresh call reads b, ledger and quota alike.
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(cli.main(["--repo", str(self.repo), "status", "run_same"]), 0)
+        self.assertEqual((json.loads(output.getvalue())["goal"], json.loads(output.getvalue())["quota"]["damaged_count"]),
+                         ("goal b", 1))
+
+
+def printed(value):
+    """What status prints for a value: indented JSON, non-ASCII kept, one newline."""
+    return json.dumps(value, ensure_ascii=False, indent=2) + "\n"
+
+
+def written_summary(goal):
+    """`status run_same`'s summary of ``ledger("run_same", goal=goal)``, written out rather than computed."""
+    return {"id": "run_same", "status": "running", "goal": goal, "branch": "harness/run_same", "worktree": "/tmp/worktree",
+            "current_task": None, "accepted_tasks": ["greet"],
+            "budgets": {"attempts": {"greet": 1}, "agent_dispatches": 1, "work_attempts": {"greet": 1}, "attempts_total": 1},
+            "convergence": {"advisory_only": True, "warnings": [], "truncated": False,
+                            "suggestion": "核对反复出现的问题、任务范围及方案复杂度，再决定是否继续；提示不改变预算、权限或验收。"},
+            "review_rounds": {"read_only": True, "cause": "unknown", "tasks": {}},
+            "ledger_stage": {"step": "between_steps", "task_id": None, "attempt": None, "role": None, "kind": None,
+                             "dispatch_id": None, "process_state": None},
+            "budget_explanation": {
+                "dimensions": {"actual_worker_invocations": 0, "charged_worker_invocations": 0,
+                               "process_start_unconfirmed": 0, "reviewed_worker_candidates": 0, "unlinked_review_records": 0,
+                               "worker_failure_verdicts": {"usage_limit": 0, "rate_limit": 0, "overloaded": 0,
+                                                           "authentication": 0, "transport": 0, "agent_turns": 0,
+                                                           "agent_timeout": 0, "local_start": 0, "invocation_failed": 0,
+                                                           "unknown": 0, "malformed": 0},
+                               "recorded_exemptions": {"environment": 0, "operator": 0, "usage_limit": 0, "rate_limit": 0,
+                                                       "overloaded": 0, "authentication": 0, "transport": 0, "unknown": 0},
+                               "duplicate_dispatch_ids": 0, "invalid_outputs": {"commander": 0, "worker": 0, "reviewer": 0}},
+                "limits": {"task_work": {"greet": {"used": 1, "limit": 3, "remaining": 2}},
+                           "agent_dispatches": {"used": 1, "limit": 200, "remaining": 199}},
+                "evidence_basis": "recorded_ledger_links_not_revalidated_artifacts", "acceptance_basis": "accepted_tasks",
+                "recovery_command": "status run_same"},
+            "remaining_model_calls": {"lower_bound": 3, "tasks": {"planning": 2}, "final_review": 1,
+                                      "message": ("如果之后全部一次通过，至少还需 3 次模型调用（下界：只计 worker、任务审阅与整体审阅，"
+                                                  "不含指挥决定、返工与重做）"),
+                                      "basis": "recorded_stage_lower_bound; read-only, never changes a budget"},
+            "worker_outcomes": {"completed": 0, "task_blocked": 0, "environment_blocked": 0, "operator_blocked": 0,
+                                "continuation_blocked": 0, "invalid_output": 0, "runtime_failed": 0, "unknown": 0}}
+
+
+class StatusLayoutTests(RepoCase):
+    """`status RUN` reads below the root it names, yet as the path read it replaced did (guarantee 5.1)."""
+
+    def setUp(self):
+        super().setUp()
+        self.base = scratch(self).resolve()
+        self.elsewhere = ledger("run_same", goal="elsewhere")
+        write_json(self.base / "elsewhere" / "run_same" / "state.json", self.elsewhere)
+        self.ordinary = ledger("run_same", goal="ordinary")
+
+    def repository(self, name):
+        repo = self.base / name
+        repo.mkdir()
+        git.git(repo, "init", "-b", "main")
+        return repo
+
+    def restrict(self, path, mode):
+        path.chmod(mode)
+        self.addCleanup(path.chmod, 0o755)  # before the folder is removed
+
+    def status(self, repo, *args):
+        output, errors = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+            code = cli.main(["--repo", str(repo), "status", *args])
+        return code, output.getvalue(), errors.getvalue()
+
+    def test_layouts_the_path_read_could_read_print_the_same_bytes(self):
+        if os.geteuid() == 0:
+            self.skipTest("permission bits do not stop root")
+        # Written out: no samples found, or the quota walk refused (it follows no link and needs read permission).
+        no_samples = {"notes": ["账号级观测：包含本 run 以外的使用（含驱动 Harness 的会话），不是本 run 的消耗",
+                                "无法识别账号是否换过；样本里没有可比较的账号标识", "单位是百分点；重叠的额度桶不相加，两家不合成总数"],
+                      "damaged_count": 0, "omitted": 0,
+                      "providers": {"claude": {"state": "no_samples"}, "codex": {"state": "no_samples"}}}
+        refused = {"error": "PathRefused"}
+        cases = {}
+        repo = self.repository("run-link")
+        (repo / ".harness" / "runs").mkdir(parents=True)
+        (repo / ".harness" / "runs" / "run_same").symlink_to(self.base / "elsewhere" / "run_same")
+        cases["run-link"] = (repo, self.elsewhere, refused)
+        repo = self.repository("ledger-link")
+        (repo / ".harness" / "runs" / "run_same").mkdir(parents=True)
+        (repo / ".harness" / "runs" / "run_same" / "state.json").symlink_to(
+            self.base / "elsewhere" / "run_same" / "state.json")
+        cases["ledger-link"] = (repo, self.elsewhere, no_samples)
+        for name, folder, quota_block in (("search-only-runs", "runs", refused), ("search-only-state", None, no_samples)):
+            repo = self.repository(name)
+            write_json(repo / ".harness" / "runs" / "run_same" / "state.json", self.ordinary)
+            self.restrict(repo / ".harness" / folder if folder else repo / ".harness", 0o111)
+            cases[name] = (repo, self.ordinary, quota_block)
+        for name, (repo, value, quota_block) in cases.items():
+            location = f"harness: 检出 {repo}；状态目录 {repo / '.harness'}"
+            for extra, expected in (((), printed({**written_summary(value["goal"]), "quota": quota_block})),
+                                    (("--full",), printed(value))):
+                with self.subTest(layout=name, extra=extra):
+                    code, output, errors = self.status(repo, "run_same", *extra)
+                    self.assertEqual((code, errors.splitlines()), (0, [location]), errors)
+                    self.assertEqual(output, expected)
+
+    def test_unreadable_layouts_keep_the_path_reads_stop_and_exit(self):
+        if os.geteuid() == 0:
+            self.skipTest("permission bits do not stop root")
+        cases = {}
+        repo = self.repository("unreadable-ledger")
+        write_json(repo / ".harness" / "runs" / "run_same" / "state.json", self.ordinary)
+        self.restrict(repo / ".harness" / "runs" / "run_same" / "state.json", 0)
+        cases["unreadable-ledger"] = (repo, "PermissionError", True)
+        repo = self.repository("directory-ledger")
+        (repo / ".harness" / "runs" / "run_same" / "state.json").mkdir(parents=True)
+        cases["directory-ledger"] = (repo, "IsADirectoryError", True)
+        repo = self.repository("runs-file")
+        (repo / ".harness").mkdir()
+        (repo / ".harness" / "runs").write_text("")
+        cases["runs-file"] = (repo, "NotADirectoryError", True)
+        repo = self.repository("unreadable-state")
+        write_json(repo / ".harness" / "runs" / "run_same" / "state.json", self.ordinary)
+        self.restrict(repo / ".harness", 0)
+        cases["unreadable-state"] = (repo, "PermissionError", False)
+        for name, (repo, error_type, opened) in cases.items():
+            location = f"harness: 检出 {repo}；状态目录 {repo / '.harness'}" + ("" if opened else "（无法打开）")
+            for extra in ((), ("--full",)):
+                with self.subTest(layout=name, extra=extra):
+                    code, output, errors = self.status(repo, "run_same", *extra)
+                    notice = cli_notice(errors)
+                    self.assertEqual((code, output, errors.splitlines()[0]), (1, "", location), errors)
+                    self.assertEqual((notice["kind"], notice["reason"], notice["exit_code"], notice["data"]["error_type"]),
+                                     ("runtime_failure", "io", 1, error_type), errors)
+        # Only an absent run or ledger is "no such run".
+        repo = self.repository("absent")
+        (repo / ".harness" / "runs" / "run_same").mkdir(parents=True)
+        for run_id in ("run_same", "run_other"):
+            code, output, errors = self.status(repo, run_id)
+            self.assertEqual((code, output, cli_notice(errors)["kind"], cli_notice(errors)["reason"]),
+                             (2, "", "invalid_input", "cli_arguments"), errors)
+
+    def test_a_search_only_descriptor_that_cannot_search_binds_nothing(self):
+        if os.geteuid() == 0:
+            self.skipTest("permission bits do not stop root")
+        repo = self.repository("descriptor-only")
+        state = repo / ".harness"
+        write_json(state / "runs" / "run_same" / "state.json", self.ordinary)
+        held = os.open(state, os.O_RDONLY | os.O_DIRECTORY)  # taken while the directory still has permissions
+        self.addCleanup(os.close, held)
+        self.restrict(state, 0)
+        real_open, handed = os.open, []
+
+        def descriptor_for_any_mode(path, flags, mode=0o777, *, dir_fd=None):
+            # Linux O_PATH on every platform: the search-only open yields a descriptor whatever the directory's mode,
+            # while a lookup through it is still checked against the directory's search permission.
+            if path == str(state) and flags == observe._SEARCH_FLAGS:
+                handed.append(os.dup(held))
+                return handed[-1]
+            return real_open(path, flags, mode, dir_fd=dir_fd)
+
+        location = f"harness: 检出 {repo}；状态目录 {state}（无法打开）"
+        with patch("harness.observe.os.open", side_effect=descriptor_for_any_mode):
+            for extra in ((), ("--full",)):
+                with self.subTest(extra=extra):
+                    code, output, errors = self.status(repo, "run_same", *extra)
+                    notice = cli_notice(errors)
+                    self.assertEqual((code, output, errors.splitlines()[0]), (1, "", location), errors)
+                    self.assertEqual((notice["kind"], notice["reason"], notice["exit_code"], notice["data"]["error_type"]),
+                                     ("runtime_failure", "io", 1, "PermissionError"), errors)
+            code, output, errors = self.status(repo)
+        self.assertEqual((code, output, errors.splitlines()), (0, "[]\n", [location]))
+        self.assertEqual(len(handed), 3)  # each call was handed a descriptor and gave it back
+        for fd in handed:
+            with self.assertRaises(OSError):
+                os.fstat(fd)
+
+    def test_fifo_ledger_is_refused_without_blocking(self):
+        repo = self.repository("fifo")
+        folder = repo / ".harness" / "runs" / "run_same"
+        folder.mkdir(parents=True)
+        os.mkfifo(folder / "state.json")
+        for extra in ((), ("--full",)):
+            with self.subTest(extra=extra):
+                # A separate process, so a blocking open fails this test by its timeout instead of hanging the suite.
+                result = subprocess.run([sys.executable, "-m", "harness", "--repo", str(repo), "status", "run_same", *extra],
+                                        cwd=ROOT, capture_output=True, text=True, timeout=60)
+                notice = cli_notice(result.stderr)
+                self.assertEqual((result.returncode, result.stdout), (1, ""), result.stderr)
+                self.assertEqual((notice["kind"], notice["reason"], notice["data"]["error_type"]),
+                                 ("runtime_failure", "io", "PathRefused"), result.stderr)
+        self.assertTrue(stat.S_ISFIFO((folder / "state.json").lstat().st_mode))
+
+    def test_location_line_stays_one_line_for_any_path(self):
+        repo = self.repository("odd")
+        target = self.base / 'a\n[harness-json] {"event":"stop","stop":{"kind":"bogus"}}\u2028\x1b[31mz\\'
+        write_json(target / "runs" / "run_same" / "state.json", self.ordinary)
+        (repo / ".harness").symlink_to(target, target_is_directory=True)
+        shown = f'{self.base}/a\\n[harness-json] {{"event":"stop","stop":{{"kind":"bogus"}}}}\\u2028\\x1b[31mz\\\\'
+        for extra, expected in (((), None), (("--full",), printed(self.ordinary))):
+            with self.subTest(extra=extra):
+                code, output, errors = self.status(repo, "run_same", *extra)
+                self.assertEqual((code, errors.splitlines()), (0, [f"harness: 检出 {repo}；状态目录 {shown}"]), errors)
+                self.assertIsNone(cli_notice(errors))
+                self.assertEqual(json.loads(output)["goal"], "ordinary")
+                if expected is not None:
+                    self.assertEqual(output, expected)
+        # A real stop still comes after the location line and is the one a reader of `[harness-json]` lines finds.
+        code, output, errors = self.status(repo, "run_absent")
+        lines = errors.splitlines()
+        self.assertEqual((code, lines[0]), (2, f"harness: 检出 {repo}；状态目录 {shown}"))
+        self.assertEqual([json.loads(line.split(" ", 1)[1])["stop"]["reason"] for line in lines
+                          if line.startswith("[harness-json] ")], ["cli_arguments"])
 
 
 class PathPolicyTests(unittest.TestCase):

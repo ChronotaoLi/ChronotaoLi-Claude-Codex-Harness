@@ -5,18 +5,22 @@
 # .harness/ 的 Git 忽略保护由第一次 run（或 sync、memory add）安装；在那之前不要 git add 这个文件。
 
 [verification]
-# 确定性验证命令，每条是一个 argv 数组；run 要求至少一条。换成目标项目自己的测试命令。
-commands = [["python3", "-m", "unittest", "discover", "-s", "tests", "-v"]]
+# 确定性验证命令；run 要求至少一条。换成目标项目自己的测试命令。
+# 每条命令是 { cwd, argv }，两键都必填：argv 不经 shell；cwd 是执行目录，相对仓库根，"." 是根。
+# 工程在子目录时把那个目录写成 cwd（例如 cwd = "app"），不要写 cd 的 shell 脚本；同一 argv 在两个目录是两条命令。
+commands = [{ cwd = ".", argv = ["python3", "-m", "unittest", "discover", "-s", "tests", "-v"] }]
 # 显式开启后，整体验证在仓库之外的全新 detached worktree 中执行。
 fresh_checkout = false
-# 只供确定性验证器在全新检出里准备依赖（需要 fresh_checkout = true），不授予 worker Bash 权限。
+# 只供确定性验证器在全新检出里准备依赖（需要 fresh_checkout = true），不授予 worker 任何能力。
+# 准备命令的 cwd 必须在 HEAD 中存在，或由排在前面的准备命令创建。
 setup_commands = []
 
 [permissions]
-# 额外授权给 Claude worker 的精确 argv，由命令 MCP 按 ID 执行；* 和换行按字面传入。
-# 例如 [["npm", "run", "build"]]；管道需单独授权完整 shell argv。这不是操作系统沙箱。
-# 形式表内的只读 Git 查询用内置 git_query，范围内已跟踪文件的删除用 delete_path，二者无需在此授权。
-# 验证命令与这里的命令就是授予 worker 的执行能力。
+# 额外授权给 Claude worker 的精确命令 { cwd, argv }，由命令 MCP 按 ID 在 cwd 里执行；* 和换行按字面传入。
+# 配置的命令只授权命令 MCP，不是 Bash 许可。管道需单独授权完整 shell argv。这不是操作系统沙箱。
+# cwd 为 "." 的形式表内只读 Git 查询用内置 git_query，范围内已跟踪文件的删除用 delete_path，二者无需在此授权。
+# 验证命令与这里的命令就是授予 worker 的执行能力。例如子目录里的 Flutter 工程：
+# worker_commands = [{ cwd = "app", argv = ["flutter", "test"] }]
 worker_commands = []
 
 # 按项目覆盖操作者配置里的 runtime 键：只能写已知键，每个键的值整体替换（表和数组不合并）。

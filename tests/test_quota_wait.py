@@ -4,7 +4,8 @@ A Claude role's usage-limit failure is a real local child process run through
 ``CLIBackend`` (the classifier and the immediate judgment are the real ones); the quota
 snapshot is the real probe landing on the ``claude``/``codex`` stubs (``quota_stubs``),
 whose windows each test sets. ``harness.quota_wait.time`` is a fake clock: no test sleeps.
-Every quota number and time is synthetic.
+Every quota number and time is synthetic; the one real envelope is the de-identified
+connection failure ``test_provider_failures.REAL_CONNECTION_REFUSED``.
 """
 import copy
 import json
@@ -20,6 +21,7 @@ from unittest.mock import patch
 import quota_stubs
 from harness import quota, quota_wait, stops
 from harness.adapters import CLIBackend, DemoBackend
+from harness.budgets import work_attempts
 from harness.cli import status_summary
 from harness.config import Config
 from harness.quota_wait import QuotaWait, choose, parse_display, parse_model, relation, valid_record
@@ -31,6 +33,7 @@ from harness.util import HarnessError, lock, read_json, write_json
 from harness.worker_receipts import WorkerReceipts
 from test_harness import (ROOT, FakeClock, RepoCase, cli_notice, commit_recorder, crash_after_save,
                           install_clock, run_cli, scratch, walk_exit, write_operator_config, write_project_config)
+from test_provider_failures import REAL_CONNECTION_REFUSED
 
 T0 = 1925000000.0   # a synthetic start, late 2030
 QUOTA = {"type": "result", "subtype": "success", "is_error": True, "num_turns": 3,
@@ -56,8 +59,9 @@ class QuotaFailingBackend(DemoBackend):
 
     A script item ``role`` makes that role's next call a real local child that prints
     Claude's usage-limit envelope and exits 1; ``(role, "codex")`` prints a Codex-style
-    failure event instead; ``(role, "invalid")`` returns an invalid output. Snapshots
-    use the real probe (``CLIBackend.quota_snapshot``), so the stubs answer them.
+    failure event instead; ``(role, envelope)`` prints that Claude envelope (a dict);
+    ``(role, "invalid")`` returns an invalid output. Snapshots use the real probe
+    (``CLIBackend.quota_snapshot``), so the stubs answer them.
     """
 
     def __init__(self, config, repo, script=()):
@@ -76,7 +80,7 @@ class QuotaFailingBackend(DemoBackend):
         self.script.pop(0)
         if mode == "invalid":
             return {**super().invoke(**kwargs), "action": "not-an-action"}
-        terminal = CODEX_QUOTA_TEXT if mode == "codex" else QUOTA
+        terminal = mode if isinstance(mode, dict) else CODEX_QUOTA_TEXT if mode == "codex" else QUOTA
         program = f"import sys; print({json.dumps(terminal)!r}, flush=True); sys.exit(1)"
         backend = CLIBackend(self.config, self.state)
         backend.command = lambda *args: [sys.executable, "-c", program]
@@ -434,6 +438,63 @@ class WaitTests(WaitCase):
         self.assertIn("09:00", (engine.directory / "dispatches" / saved["stop"]["source"]["dispatch_id"]
                                 / "process.stdout").read_text())
         self.assertNotIn("resets_at", saved["stop"]["data"])
+
+    def test_paired_usage_limit_labels_wait_only_with_a_quota_status(self):
+        # usage_limit_reached beside the body type rate_limit_error is still a usage limit with 429, and is
+        # waited out; the same pair with any other HTTP status is a counted invocation failure that stops.
+        paired = {**QUOTA, "api_error_type": "rate_limit_error"}
+        self.windows(window("session", 100, 600))
+        backend = self.backend(("worker", paired))
+        engine, result = self.start(backend)
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(sum(self.clock.sleeps), 660)
+        self.assertEqual([event["role"] for event in self.events(engine, "quota_wait_started")], ["worker"])
+        self.assertEqual([call[0] for call in backend.calls][:3], ["worker", "commander", "worker"])
+        failed = next(entry for entry in result["dispatches"] if entry["id"] == backend.calls[0][2])
+        self.assertEqual(failed["worker_return_evidence"]["provider"], {"code": "usage_limit", "http_status": 429})
+        self.assertEqual(failed["attempt_exemption"]["code"], "usage_limit")
+        self.assertEqual((result["attempts"], work_attempts(result)), ({"greet": 2}, {"greet": 1}))
+        self.clock.sleeps.clear()
+        backend = self.backend(("worker", {**paired, "api_error_status": 503}))
+        recorder, states = commit_recorder()
+        with recorder:
+            engine, saved = self.start(backend, expect=HarnessError)
+        self.assertEqual((saved["status"], saved["stop"]["kind"], saved["stop"]["reason"], stops.exit_code(self.error)),
+                         ("blocked", "provider_failure", "invocation_failed", 3))
+        self.assertEqual(self.clock.sleeps, [])
+        self.assertEqual([call[0] for call in backend.calls], ["worker"])
+        self.assertFalse(any("quota_wait" in state for state in states))
+        self.assertEqual(self.events(engine, "quota_wait_started"), [])
+        self.assertFalse(set(WAIT_FIELDS) & set(saved["stop"]["data"]))
+        entry = next(entry for entry in saved["dispatches"] if entry["role"] == "worker")
+        self.assertEqual(entry["worker_return_evidence"]["provider"], {"code": "invocation_failed", "http_status": 503})
+        self.assertNotIn("attempt_exemption", entry)
+        self.assertEqual((saved["attempts"], work_attempts(saved), saved["agent_dispatches"]), ({"greet": 1}, {"greet": 1}, 1))
+        self.assertIs(saved["stop"]["data"]["attempt_charged"], True)
+
+    def test_transport_failure_never_waits(self):
+        # The de-identified real connection failure, with a full window that a usage limit would wait for.
+        self.windows(window("session", 100, 600))
+        backend = self.backend(("worker", REAL_CONNECTION_REFUSED))
+        recorder, states = commit_recorder()
+        with recorder:
+            engine, saved = self.start(backend, expect=HarnessError)
+        self.assertEqual((saved["status"], saved["stop"]["kind"], saved["stop"]["reason"], stops.exit_code(self.error)),
+                         ("blocked", "provider_failure", "transport", 3))
+        self.assertEqual(self.clock.sleeps, [])
+        self.assertEqual([call[0] for call in backend.calls], ["worker"])
+        self.assertFalse(any("quota_wait" in state for state in states))
+        self.assertEqual([event for event in self.events(engine) if event["event"].startswith("quota_wait")], [])
+        self.assertFalse(set(WAIT_FIELDS) & set(saved["stop"]["data"]))
+        self.assertNotIn("quota_failure", self.triggers(engine))
+        entry = next(entry for entry in saved["dispatches"] if entry["role"] == "worker")
+        self.assertEqual(entry["attempt_exemption"]["code"], "transport")
+        self.assertEqual((saved["attempts"], work_attempts(saved), saved["agent_dispatches"]), ({"greet": 1}, {"greet": 0}, 1))
+        # The listed plain resume continues the run, still without a wait.
+        after = walk_exit(self, engine.directory, ("provider_failure", "transport"), backend=self.backend(),
+                          expect_status="completed")
+        self.assertEqual(self.clock.sleeps, [])
+        self.assertEqual((after["attempts"], work_attempts(after)), ({"greet": 2}, {"greet": 1}))
 
 
 class InterruptionTests(WaitCase):
@@ -1018,7 +1079,7 @@ class ConfigTests(WaitCase):
         reader.start()
         self.addCleanup(reader.stop)
         marker = folder / "rewritten-command-ran"
-        rewritten = [[sys.executable, "-c", f"import pathlib, sys; pathlib.Path({str(marker)!r}).write_text('ran'); sys.exit(1)"]]
+        rewritten = [{"cwd": ".", "argv": [sys.executable, "-c", f"import pathlib, sys; pathlib.Path({str(marker)!r}).write_text('ran'); sys.exit(1)"]}]
 
         def rewrite(clock, seconds):
             if len(clock.sleeps) == 1:
@@ -1119,17 +1180,21 @@ class ObservationTests(WaitCase):
         presentation.DashboardPresentationTests.run_browser(self, data, r'''
   navigate("#/runs/run_wait");
   await respond("/api/runs/run_wait", D.detail);
-  const attention = one(attrIs("data-attention", "true"));
-  const shown = visibleText(attention);
-  assert.ok(shown.includes("等待额度恢复：session"), "the wait is an attention item: " + shown);
-  assert.ok(shown.includes(D.detail.summary.quota_wait.until), "it says until when");
-  assert.ok(shown.includes("不证明 Harness 进程仍在等待"), "a record, not a liveness proof");
-  assert.ok(shown.includes("Ctrl-C"), "how to cancel it");
+  // The process waits on its own: the record is part of the run header, not an item for the operator.
+  assert.equal(all(attrIs("data-attention", "true")).length, 0, "the wait is not an attention item");
+  one(attrIs("data-pending-count", "0"));
+  const wait = one(attrIs("data-quota-wait", "true"));
+  let holder = wait;
+  while (holder && holder.parentNode !== byId.main) { holder = holder.parentNode; }
+  assert.equal(holder, byId.main.childNodes[0], "the wait is in the run header");
+  const shown = visibleText(wait);
+  const recorded = D.detail.summary.quota_wait;
+  for (const value of [recorded.window, recorded.until]) { assert.ok(shown.includes(value), value + " in " + shown); }
   assert.ok(byId.main.textContent.includes("开始等待额度"), "the started event has its label");
   assert.ok(byId.main.textContent.includes("恢复时调整配置"), "the renamed event has its label");
   navigate("#/runs/run_calm");
   await respond("/api/runs/run_calm", D.calm);
-  assert.ok(!byId.main.textContent.includes("等待额度恢复"), "no record, no item");
+  assert.equal(all(attrIs("data-quota-wait", "true")).length, 0, "no record, no wait");
 ''')
 
     def test_busy_while_waiting_points_to_the_record(self):  # T8-35
@@ -1237,7 +1302,8 @@ class ContractTests(WaitCase):
     def test_quota_wait_literal_guard(self):  # T8-26 (GQ)
         import ast
         allowed = {("quota_wait.py", "validate_ledger"), ("quota_wait.py", "clear"), ("quota_wait.py", "project"),
-                   ("quota_wait.py", "_wait"), ("cli.py", "status_summary"), ("watch_cli.py", "watch_run")}
+                   ("quota_wait.py", "_wait"), ("cli.py", "status_summary"), ("watch_cli.py", "watch_run"),
+                   ("diagnostics.py", "ledger_stage")}
         found = set()
         for path in sorted((ROOT / "harness").glob("*.py")):
             tree = ast.parse(path.read_text(encoding="utf-8"))
@@ -1590,7 +1656,7 @@ class RealEvidenceTests(WaitCase):
 
     def test_damaged_input_index_on_waking(self):
         # A long granted command is projected into an input index of the worker's packet.
-        self.config.data["permissions"]["worker_commands"] = [["echo", "synthetic " + "y" * 4200]]
+        self.config.data["permissions"]["worker_commands"] = [{"cwd": ".", "argv": ["echo", "synthetic " + "y" * 4200]}]
         self.windows(window("session", 100, 600))
         backend = self.backend("worker")
         engine = self.engine(backend)

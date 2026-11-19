@@ -5,6 +5,7 @@ from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
+from .commands import command_key, validate_commands
 from .util import HarnessError
 
 
@@ -98,8 +99,9 @@ def read_layer(path):
 def parse_layer(raw, path, label, sections):
     """One file's bytes as read, checked on their own.
 
-    Only the file's own sections are accepted and each must be a table; those refusals
-    and unknown keys name the file. UTF-8 and TOML errors propagate unchanged and do not name it.
+    Only the file's own sections are accepted and each must be a table; those refusals,
+    unknown keys and command lists of the wrong shape name the file. UTF-8 and TOML
+    errors propagate unchanged and do not name it.
     """
     data = tomllib.loads(raw.decode("utf-8"))
     for section, values in data.items():
@@ -115,17 +117,13 @@ def parse_layer(raw, path, label, sections):
         unknown.extend(f"runtime.claude_max_turns_by_role.{role}" for role in limits if role not in DISPATCH_ROLES)
     if unknown:
         raise HarnessError("未知配置键：" + "、".join(sorted(unknown)) + f"（{label} {path}）")
+    for section, key in (("verification", "commands"), ("verification", "setup_commands"), ("permissions", "worker_commands")):
+        if key in data.get(section, {}):
+            try:
+                validate_commands(data[section][key], f"{section}.{key}")
+            except HarnessError as error:
+                raise HarnessError(f"{error}（{label} {path}）") from error
     return data
-
-
-def validate_commands(commands, field):
-    if not isinstance(commands, list):
-        raise HarnessError(f"{field} 必须使用 argv 数组列表")
-    for command in commands:
-        if (not isinstance(command, list) or not command
-                or not all(isinstance(s, str) and "\0" not in s for s in command)
-                or not command[0].strip()):
-            raise HarnessError(f"{field} 必须使用非空 argv 数组")
 
 
 @dataclass
@@ -250,20 +248,20 @@ class Config:
                 changes[key] = {"old": old, "new": new}
         old_commands = previous["permissions"].pop("worker_commands")
         new_commands = current["permissions"].pop("worker_commands")
-        remaining = Counter(tuple(command) for command in old_commands)
+        remaining = Counter(command_key(command) for command in old_commands)
         added = []
         for command in new_commands:
-            exact = tuple(command)
+            exact = command_key(command)
             if remaining[exact]:
                 remaining[exact] -= 1
             else:
                 added.append(command)
         if any(remaining.values()):
-            raise HarnessError("配置已改变：恢复时 permissions.worker_commands 只允许增加精确 argv，不能删除或修改已有命令")
+            raise HarnessError("配置已改变：恢复时 permissions.worker_commands 只允许增加精确命令（目录与 argv），不能删除或修改已有命令")
         if added:
             changes["worker_commands"] = {"old": old_commands, "new": new_commands, "added": added}
         if previous != current:
-            raise HarnessError("配置已改变：恢复只允许增大超时、上下文、轮数、尝试与派发预算、追加精确 worker 命令"
+            raise HarnessError("配置已改变：恢复只允许增大超时、上下文、轮数、尝试与派发预算、加入精确 worker 命令（目录与 argv）"
                                "或调整额度等待上限；其他配置必须保持一致")
         return changes
 

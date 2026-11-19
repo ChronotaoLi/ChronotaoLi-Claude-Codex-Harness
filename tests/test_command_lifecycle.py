@@ -84,7 +84,7 @@ class CommandLifecycleTests(unittest.TestCase):
     def test_synchronous_start_failure_does_not_require_operator_confirmation(self):
         from harness.command_server import Broker, create_manifest, command_id
         job = self.root / 'dispatches' / 'missing-binary'
-        argv = [str(self.root / 'no-such-binary')]
+        argv = {'cwd': '.', 'argv': [str(self.root / 'no-such-binary')]}
         config = {'verification': {'commands': [argv]}, 'permissions': {'worker_commands': []},
                   'runtime': {'verify_timeout_seconds': 1}}
         metadata = create_manifest(config, self.root, job)

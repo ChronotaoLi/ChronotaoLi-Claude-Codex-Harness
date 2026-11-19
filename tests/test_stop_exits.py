@@ -112,6 +112,8 @@ ROW_COVERAGE = {
                                "test_provider_failures.ImmediateJudgmentTests.test_overloaded_row"),
     "provider-authentication": Row(("provider_failure", "authentication"), RUN,
                                    "test_provider_failures.ImmediateJudgmentTests.test_authentication_row"),
+    "provider-transport": Row(("provider_failure", "transport"), RUN,
+                              "test_provider_failures.ImmediateJudgmentTests.test_transport_row"),
     "provider-failed": Row(("provider_failure", "invocation_failed"), RUN,
                            "test_worker_return_recovery.WorkerReturnRecoveryTests.test_explicit_provider_error_allows_counted_retry"),
     "provider-unknown": Row(("provider_failure", "unknown"), RUN,
@@ -180,7 +182,6 @@ ROW_COVERAGE = {
                            "test_worktree_binding.EngineWorktreeBindingTests."
                            "test_redirect_before_acceptance_cannot_commit_to_main"),
     "process-incomplete": Row(("evidence", "process_incomplete"), RUN, "test_stop_exits.ProcessRowTests.test_process_incomplete"),
-    "review-findings": Row(("budget", "review_findings"), RUN, "test_stop_exits.ProcessRowTests.test_review_findings"),
     "runtime-io": Row(("runtime_failure", "io"), RUN,
                       "test_engine_repairs.EngineRepairsTests.test_worktree_creation_failure_persists_blocked_checkpoint"),
     "runtime-database": Row(("runtime_failure", "database"), OPERATION,
@@ -244,7 +245,7 @@ class PlanRowTests(RepoCase):
         self.assertEqual(backend.calls, [])
 
     def test_commands_selected(self):
-        command = [sys.executable, "-c", "print('prerequisite tool')"]
+        command = {"cwd": ".", "argv": [sys.executable, "-c", "print('prerequisite tool')"]}
 
         def change(backend, kwargs, packet, result):
             if kwargs["role"] == "worker" and sum(c["role"] == "worker" for c in backend.calls) == 1:
@@ -758,26 +759,6 @@ class ProcessRowTests(RepoCase):
                     walk_exit(self, engine.directory, ("evidence", "process_incomplete"), backend=backend,
                               expect_status="abandoned")
 
-    def test_review_findings(self):
-        from test_runtime_changes import finding
-        self.config.data["runtime"]["max_attempts"] = 10
-
-        def thirty_open_findings(backend, kwargs, packet, result):
-            if kwargs["kind"] == "review":
-                rounds = sum(c["kind"] == "review" for c in backend.calls)
-                result.update(verdict="request_changes",
-                              findings=[{**finding(), "id": f"r{rounds}-{i}"} for i in range(30)])
-                for row in result.get("finding_dispositions", {}).values():
-                    row.update(status="open", evidence=[])
-        backend = ScriptedBackend(thirty_open_findings)
-        engine = self.engine(backend)
-        with self.assertRaises(HarnessError):
-            engine.start("Implement greet", plan())
-        state = saved(engine.directory)
-        self.assertEqual((state["stop"]["kind"], state["stop"]["reason"]), ("budget", "review_findings"))
-        self.assertEqual((state["stop"]["data"]["open_findings"], state["stop"]["data"]["limit"]), (90, 60))
-        walk_exit(self, engine.directory, ("budget", "review_findings"), backend=backend, expect_status="abandoned")
-
 
 class OperationRowTests(RepoCase):
     blocked_at_limit = EvidenceRowTests.blocked_at_limit
@@ -818,19 +799,19 @@ class OperationRowTests(RepoCase):
         backend, engine = self.blocked_at_limit()
         path = engine.directory / "state.json"
         run = read_json(path)
-        run["schema_version"] = 17
+        run["schema_version"] = 18
         write_json(path, run)
         before = path.read_bytes()
         notice = refused_by_cli(self, backend, ["resume", engine.run["id"]], ("unsupported_ledger", "ledger_version"), 2)
         no_command_exit(self, notice, ("unsupported_ledger", "ledger_version"))
-        self.assertEqual((notice["data"]["schema_version"], notice["data"]["supported"]), (17, 18))
+        self.assertEqual((notice["data"]["schema_version"], notice["data"]["supported"]), (18, 19))
         for argv in (["abandon", engine.run["id"]], ["status", engine.run["id"]]):
             self.assertEqual(run_cli(self, backend, argv)[0], 2, argv)
         self.assertEqual(run_cli(self, backend, ["cleanup-run", engine.run["id"]])[0], 1)
         code, errors = run_cli(self, backend, ["status"])  # the list still shows its path and version
         self.assertEqual(code, 0)
         self.assertIn(f"runs/{engine.run['id']}", errors)
-        self.assertIn("17", errors)
+        self.assertIn("18", errors)
         self.assertEqual(path.read_bytes(), before)
 
     def test_runtime_database(self):

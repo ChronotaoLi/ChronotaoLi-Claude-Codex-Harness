@@ -95,8 +95,8 @@ class TerminalCaptureRecoveryTests(RepoCase):
     def test_short_worker_and_verification_descendants_finish_normally(self):
         spawn = ("import subprocess,sys; subprocess.Popen([sys.executable,'-c',"
                  "'import time;time.sleep(.1)'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)")
-        self.config.data["verification"]["commands"] = [[sys.executable, "-c",
-            "from hello import greet; assert greet('Ada') == 'Hello, Ada!'; " + spawn]]
+        self.config.data["verification"]["commands"] = [{"cwd": ".", "argv": [sys.executable, "-c",
+            "from hello import greet; assert greet('Ada') == 'Hello, Ada!'; " + spawn]}]
         backend = self.backend("implement", duration=.1)
         engine = self.engine(backend)
         try:

@@ -7,7 +7,7 @@ from copy import deepcopy
 from pathlib import PurePosixPath
 
 from . import git
-from .config import validate_commands
+from .commands import CWD_MAX_CHARS, command_key, validate_commands
 from .util import HarnessError, fold_name
 
 
@@ -38,8 +38,10 @@ TASK = obj(id=TASK_ID, title=NONBLANK, description=NONBLANK, depends_on=DEPENDEN
            allowed_paths=OBLIGATIONS, acceptance=OBLIGATIONS,
            skills={"type": "array", "items": SKILL_NAME})
 # Optional for existing plans. These are prerequisites, never command grants.
-REQUIRED_COMMANDS = {"type": "array", "items": {"type": "array", "items": TEXT, "minItems": 1},
-                     "maxItems": 32, "uniqueItems": True}
+# The directory rules beyond the schema (protected roots, "..", blank segments) are checked by validate_commands.
+CWD = {"type": "string", "minLength": 1, "maxLength": CWD_MAX_CHARS}
+COMMAND = obj(cwd=CWD, argv={"type": "array", "items": TEXT, "minItems": 1})
+REQUIRED_COMMANDS = {"type": "array", "items": COMMAND, "maxItems": 32, "uniqueItems": True}
 TASK["properties"]["required_commands"] = REQUIRED_COMMANDS
 TASK["properties"]["self_checks"] = REQUIRED_COMMANDS
 EVIDENCE_KIND = {"type": "string", "enum": ["static", "simulation", "host_integration", "device"]}
@@ -414,7 +416,7 @@ def validate_required_commands(task):
         validate_structure(commands, REQUIRED_COMMANDS, "task." + field)
         validate_commands(commands, "task." + field)
         _validate_format(commands, REQUIRED_COMMANDS, "task." + field)
-        result.extend(argv for argv in commands if argv not in result)
+        result.extend(command for command in commands if command not in result)
     return result
 
 
@@ -440,7 +442,7 @@ def validate_plan(plan):
         # Changing prerequisites is a plan correction, not a text format repair.
         if len(commands) > REQUIRED_COMMANDS["maxItems"]:
             raise HarnessError(f"任务 {task['id']} 的 required_commands 最多 {REQUIRED_COMMANDS['maxItems']} 条")
-        if len({tuple(argv) for argv in commands}) != len(commands):
+        if len({command_key(command) for command in commands}) != len(commands):
             raise HarnessError(f"任务 {task['id']} 的 required_commands 不得重复")
         validate_required_commands(task)
         requirement_ids = set()

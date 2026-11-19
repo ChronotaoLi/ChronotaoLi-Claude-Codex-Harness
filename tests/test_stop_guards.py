@@ -50,7 +50,8 @@ class RegistryGuard(unittest.TestCase):
         expected = {"evidence": 1, "workspace_mismatch": 1, "scope_violation": 1, "runtime_failure": 1,
                     "unclassified": 1, "interrupted": 130, "plan_approval": 0, "invalid_input": 2,
                     "config_mismatch": 2, "unsupported_ledger": 2}
-        # 54 from step 4, four provider types from step 5, six scope boundary types from step 6
+        # 53 from step 4, four provider types from step 5, six scope boundary types from step 6,
+        # one transport failure type
         self.assertEqual(len(stops.REGISTRY), 64)
         for (kind, reason), entry in stops.REGISTRY.items():
             with self.subTest(row=(kind, reason)):
@@ -840,7 +841,7 @@ class PreflightRefusals(RepoCase):
             ("stale answer", None, None, ["--operator-decision", files["stale"]], ("invalid_input", "stale_request"), 2, False),
             ("unreadable environment update", None, None, ["--environment-update", files["broken"]],
              ("invalid_input", "input_schema"), 2, False),
-            ("unsupported ledger version", set_version(17), None, [], ("unsupported_ledger", "ledger_version"), 2, False),
+            ("unsupported ledger version", set_version(18), None, [], ("unsupported_ledger", "ledger_version"), 2, False),
         ]
         for name, setup, undo, argv, row, code, audited in cases:
             with self.subTest(refusal=name):

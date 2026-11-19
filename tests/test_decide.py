@@ -117,7 +117,7 @@ def reject_first(*tids):
 class DecideCase(RepoCase):
     def setUp(self):
         super().setUp()
-        self.config.data["verification"]["commands"] = [[sys.executable, "-c", "pass"]]
+        self.config.data["verification"]["commands"] = [{"cwd": ".", "argv": [sys.executable, "-c", "pass"]}]
 
     def state(self, engine):
         return read_json(engine.directory / "state.json")

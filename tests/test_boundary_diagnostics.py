@@ -31,7 +31,7 @@ class BoundaryDiagnosticsTests(unittest.TestCase):
         git.git(self.repo, "add", ".")
         self.commit("fixture")
         self.config = Config.load(ROOT / "harness.toml")
-        self.config.data["verification"]["commands"] = [[sys.executable, "-c", "pass"]]
+        self.config.data["verification"]["commands"] = [{"cwd": ".", "argv": [sys.executable, "-c", "pass"]}]
 
     def commit(self, message):
         git.git(self.repo, "-c", "user.name=Test", "-c", "user.email=test@localhost",

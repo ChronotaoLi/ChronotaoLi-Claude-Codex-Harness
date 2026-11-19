@@ -45,8 +45,8 @@ class ResumeConfigurationTests(unittest.TestCase):
                 Config.validate(invalid)
 
     def test_command_grants_preserve_exact_argv_and_auditable_additions(self):
-        first = ["python3", "-c", "print('literal $(value)')"]
-        second = ["rm", "--", "generated file.txt"]
+        first = {"cwd": ".", "argv": ["python3", "-c", "print('literal $(value)')"]}
+        second = {"cwd": ".", "argv": ["rm", "--", "generated file.txt"]}
         self.config.data["permissions"]["worker_commands"] = [first]
         saved = copy.deepcopy(self.config.data)
         self.config.data["permissions"]["worker_commands"] = [second, first]
@@ -59,17 +59,17 @@ class ResumeConfigurationTests(unittest.TestCase):
         self.assertEqual(self.config.resume_changes(current), {})
 
     def test_command_removals_and_argument_changes_remain_rejected(self):
-        original = ["rm", "--", "generated.txt"]
+        original = {"cwd": ".", "argv": ["rm", "--", "generated.txt"]}
         self.config.data["permissions"]["worker_commands"] = [original]
         saved = copy.deepcopy(self.config.data)
-        for commands in ([], [["rm", "--", "different.txt"]], [["rm", "generated.txt"]]):
+        for commands in ([], [{"cwd": ".", "argv": ["rm", "--", "different.txt"]}], [{"cwd": ".", "argv": ["rm", "generated.txt"]}]):
             self.config.data["permissions"]["worker_commands"] = commands
             with self.subTest(commands=commands), self.assertRaises(HarnessError):
                 self.config.resume_changes(saved)
 
     def test_resume_allows_appending_literal_star_and_newline_commands(self):
         saved = copy.deepcopy(self.config.data)
-        commands = [["echo", "*"], ["echo", "line\nbreak"]]
+        commands = [{"cwd": ".", "argv": ["echo", "*"]}, {"cwd": ".", "argv": ["echo", "line\nbreak"]}]
         self.config.data["permissions"]["worker_commands"] = commands
         changes = self.config.resume_changes(saved)
         self.assertEqual(changes["worker_commands"]["added"], commands)
@@ -127,7 +127,7 @@ class ResumeConfigurationIntegrationTests(RepoCase):
 
     def test_additional_command_is_saved_and_audited_on_resume(self):
         engine = self.paused_run()
-        command = ["rm", "--", "generated file.txt"]
+        command = {"cwd": ".", "argv": ["rm", "--", "generated file.txt"]}
         self.config.data["permissions"]["worker_commands"] = [command]
         result = self.engine().resume(engine.run["id"], approve_plan=True)
         self.assertEqual(result["status"], "completed")
@@ -176,7 +176,7 @@ class ResumeConfigurationFilesTests(RepoCase):
         # The ledger keeps its fields: the operator file's path and the effective configuration.
         self.assertEqual(created["config_path"], str(self.operator.resolve()))
         self.assertEqual(created["config_snapshot"]["verification"]["commands"], self.config.data["verification"]["commands"])
-        command = [sys.executable, "--version"]
+        command = {"cwd": ".", "argv": [sys.executable, "--version"]}
         self.operator.write_bytes(self.operator.read_bytes().replace(b"max_attempts = 5", b"max_attempts = 6"))
         write_project_config(self.repo, self.config.data["verification"]["commands"], [command])
         with self.project.open("a", encoding="utf-8") as output:
@@ -195,7 +195,7 @@ class ResumeConfigurationFilesTests(RepoCase):
     def test_other_differences_are_refused_and_leave_the_ledger_unchanged(self):
         operator, project = self.operator.read_bytes(), self.project.read_bytes()
         changes = {
-            "verification commands": lambda: write_project_config(self.repo, [[sys.executable, "-c", "pass"]]),
+            "verification commands": lambda: write_project_config(self.repo, [{"cwd": ".", "argv": [sys.executable, "-c", "pass"]}]),
             "fresh checkout": lambda: self.project.write_bytes(
                 project.replace(b"[verification]\n", b"[verification]\nfresh_checkout = true\n")),
             "budget lowered by the project file": lambda: self.project.write_bytes(
@@ -265,7 +265,7 @@ class CLIBoundaryTests(RepoCase):
                 self.assertEqual(code, 2)
                 self.assertEqual(output, "")
                 # A non-object is not a current-version ledger: the shared refusal, no field read.
-                self.assertIn("台账版本缺失或无效，不支持（当前版本 18）", errors)
+                self.assertIn("台账版本缺失或无效，不支持（当前版本 19）", errors)
                 self.assertNotIn("Traceback", errors)
                 self.assertEqual(read_json(path), value)
 
@@ -277,7 +277,7 @@ class CLIBoundaryTests(RepoCase):
             with self.subTest(value=value):
                 self.assertEqual(code, 2)
                 self.assertEqual(output, "")
-                self.assertIn("不支持（当前版本 18）", errors)
+                self.assertIn("不支持（当前版本 19）", errors)
                 self.assertNotIn("Traceback", errors)
                 self.assertEqual(read_json(path), value)
 

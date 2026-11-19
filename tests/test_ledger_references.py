@@ -36,7 +36,7 @@ def ledger_fixture(case, observe=None):
     git.git(case.repo, 'add', '.')
     git.git(case.repo, '-c', 'user.name=Test', '-c', 'user.email=test@localhost',
             '-c', 'commit.gpgsign=false', 'commit', '-m', 'vendor fixture')
-    command = [sys.executable, '-c', "print('focused continuation check')"]
+    command = {'cwd': '.', 'argv': [sys.executable, '-c', "print('focused continuation check')"]}
 
     def script(backend, kwargs, packet, result):
         if kwargs['role'] == 'worker' and sum(call['role'] == 'worker' for call in backend.calls) == 1:
@@ -55,7 +55,7 @@ def ledger_fixture(case, observe=None):
 
 def waiting(case, expect=HarnessError):
     """A run blocked on a pending command continuation, before any grant."""
-    command = [sys.executable, '-c', "print('pending continuation check')"]
+    command = {'cwd': '.', 'argv': [sys.executable, '-c', "print('pending continuation check')"]}
 
     def script(backend, kwargs, packet, result):
         if kwargs['role'] == 'worker' and sum(call['role'] == 'worker' for call in backend.calls) == 1:

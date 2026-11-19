@@ -13,7 +13,8 @@ from pathlib import Path
 
 from . import git
 from .adapters import CLIBackend
-from .command_server import DELETE_COMMAND_ID, command_id, ensure_command_processes_exited
+from .command_server import DELETE_COMMAND_ID, ensure_command_processes_exited
+from .commands import command_id
 from .config import Config
 from .permission_smoke import _git
 from .util import HarnessError, dump, read_json, run_process, write_json
@@ -32,14 +33,19 @@ def prepare_fixture(directory):
     (repo / 'known.txt').write_text(known, encoding='utf-8')
     deletable = 'tracked file removed by delete_path\n'
     (repo / 'deletable.txt').write_text(deletable, encoding='utf-8')
+    # Git keeps no empty directory: a tracked file makes sub/ exist in the worktree.
+    (repo / 'sub').mkdir()
+    (repo / 'sub' / 'marker.txt').write_text('subdirectory command fixture\n', encoding='utf-8')
     _git(repo, 'init', '-q', '-b', 'main')
     _git(repo, 'add', '.')
     _git(repo, '-c', 'user.name=Harness Tool Smoke', '-c', 'user.email=smoke@localhost',
          '-c', 'commit.gpgsign=false', 'commit', '-qm', 'Tool fixture')
     _git(repo, 'worktree', 'add', '--detach', str(worktree))
     values = ['with spaces', "single'quote", 'double"quote', '*', ';', 'literal\nnewline', '$(printf unintended)']
-    commands = [[sys.executable, 'argv_fixture.py', *values],
-                ['/bin/sh', '-c', "printf '%s\\n' 'pipeline fixture' | /usr/bin/tr a-z A-Z"]]
+    commands = [{'cwd': '.', 'argv': [sys.executable, 'argv_fixture.py', *values]},
+                {'cwd': '.', 'argv': ['/bin/sh', '-c', "printf '%s\\n' 'pipeline fixture' | /usr/bin/tr a-z A-Z"]},
+                {'cwd': 'sub', 'argv': [sys.executable, '-c', 'import os; print(os.path.basename(os.getcwd()))']},
+                {'cwd': 'absent', 'argv': [sys.executable, '-c', 'pass']}]
     valid, invalid = '{"ok": [1, true]}\n', '{"duplicate":1,"duplicate":2}\n'
     (worktree / 'untracked-valid.json').write_text(valid, encoding='utf-8')
     (worktree / 'untracked-invalid.json').write_text(invalid, encoding='utf-8')
@@ -54,6 +60,11 @@ def prepare_fixture(directory):
          {'exit_code': 0, 'stdout': 'fixture stdout\n', 'stderr': 'fixture stderr\n'})
     case('explicit_pipeline', 'mcp__harness_commands__run_command', {'command_id': command_id(commands[1])},
          {'exit_code': 0, 'stdout': 'PIPELINE FIXTURE\n', 'stderr': ''})
+    case('subdirectory_command', 'mcp__harness_commands__run_command', {'command_id': command_id(commands[2])},
+         {'exit_code': 0, 'stdout': 'sub\n'})
+    # A directory the worktree lacks is a receipt of a command that never started, not a tool error.
+    case('missing_directory', 'mcp__harness_commands__run_command', {'command_id': command_id(commands[3])},
+         {'exit_code': None, 'termination_reason': 'start_failed', 'evidence_complete': True})
     case('unknown_id', 'mcp__harness_commands__run_command', {'command_id': 'unauthorized-command'}, error=True)
     case('extra_argv', 'mcp__harness_commands__run_command',
          {'command_id': command_id(commands[0]), 'argv': '--ungranted'}, error=True)
@@ -149,6 +160,7 @@ def inspect_evidence(path, fixture, job=None):
     if final is None:
         raise HarnessError('Tool smoke lacks final provider result')
     checks, covered = [], set()
+    granted = {command_id(c): c for c in fixture.get('commands', [])}
     denials = final.get('permission_denials', [])
     if not isinstance(denials, list):
         raise HarnessError('Tool smoke permission_denials must be an array')
@@ -171,11 +183,18 @@ def inspect_evidence(path, fixture, job=None):
                 try:
                     value = _value(result)
                     passed = passed and value is not None
-                    passed = passed and all(isinstance(value, dict) and value.get(k) == v for k, v in case['expected'].items())
+                    # Present, not merely equal to get()'s default: an expected null must be recorded.
+                    passed = passed and all(isinstance(value, dict) and k in value and value[k] == v
+                                            for k, v in case['expected'].items())
                     if case['name'] == 'list':
-                        passed = passed and value == [{'command_id': command_id(c), 'argv': c} for c in fixture['commands']]
+                        passed = passed and value == [{'command_id': command_id(c), 'command': c} for c in fixture['commands']]
                     if case['tool'].endswith('__run_command') and isinstance(value, dict):
                         passed = passed and value.get('exit_confirmed') is True
+                        command = granted.get(case['input'].get('command_id'))
+                        passed = passed and command is not None and value.get('command') == command
+                        if case['name'] == 'missing_directory':
+                            # The reason, naming the directory, is in the command's own stderr capture.
+                            passed = passed and command['cwd'] in str(value.get('stderr'))
                         for stream in ('stdout', 'stderr'):
                             artifact = Path(value.get(stream + '_path', ''))
                             passed = passed and artifact.is_file() and (job is None or artifact.is_relative_to(Path(job) / 'commands'))
@@ -199,8 +218,12 @@ def inspect_evidence(path, fixture, job=None):
     if job is not None:
         records = ensure_command_processes_exited(job)
         ran = sorted(r['command_id'] for r in records if r['command_id'] != DELETE_COMMAND_ID)
-        checks.append(dict(name='exactly_two_command_processes',
-                           passed=ran == sorted(command_id(c) for c in fixture['commands'])))
+        unstarted = {c['input']['command_id'] for c in fixture['cases'] if c['name'] == 'missing_directory'}
+        # A command that never started still closes its journal as exited, so later calls are admitted.
+        checks.append(dict(name='one_record_per_command',
+                           passed=ran == sorted(command_id(c) for c in fixture['commands'])
+                           and all(r['process_state'] == 'exited' and r['exit_confirmed'] is True
+                                   for r in records if r['command_id'] in unstarted)))
         deletes = sum(c['tool'].endswith('__delete_path') for c in fixture['cases'])
         checks.append(dict(name='one_record_per_delete_call',
                            passed=sum(r['command_id'] == DELETE_COMMAND_ID for r in records) == deletes))

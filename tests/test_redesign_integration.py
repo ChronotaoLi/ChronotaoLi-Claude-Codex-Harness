@@ -13,7 +13,7 @@ class RedesignIntegrationTests(RepoCase):
         return read_json(ROOT / "examples/plan.json")
 
     def waiting_backend(self, *, kind="commands", minimum=0):
-        command = [sys.executable, "-c", "print('focused fixture')"]
+        command = {"cwd": ".", "argv": [sys.executable, "-c", "print('focused fixture')"]}
 
         def wait(backend, kwargs, packet, result):
             workers = [c for c in backend.calls if c["role"] == "worker"]

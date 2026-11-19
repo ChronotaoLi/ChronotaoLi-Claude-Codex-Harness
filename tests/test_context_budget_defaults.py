@@ -54,7 +54,7 @@ class ContextBudgetAccountingTests(unittest.TestCase):
     def test_compact_verification_keeps_failed_gate_and_retrievable_lifecycle(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            check = {"argv": ["check"], "exit_code": 0, "status": "failed",
+            check = {"command": {"cwd": ".", "argv": ["check"]}, "exit_code": 0, "status": "failed",
                      "termination_reason": "normal", "exit_confirmed": False,
                      "evidence_complete": False, "log": str(root / "check-0"),
                      "process_outcome": {"pid": 42, "cleanup_errors": [{"step": "wait"}],

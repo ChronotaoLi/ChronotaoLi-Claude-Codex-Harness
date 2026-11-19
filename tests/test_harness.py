@@ -218,7 +218,7 @@ def write_project_config(repo, commands=None, worker_commands=()):
     from harness.shared import toml_value
     path = Path(repo) / ".harness" / "project.toml"
     path.parent.mkdir(parents=True, exist_ok=True)
-    commands = [[sys.executable, "-m", "unittest", "-v"]] if commands is None else commands
+    commands = [{"cwd": ".", "argv": [sys.executable, "-m", "unittest", "-v"]}] if commands is None else commands
     path.write_text(f"[verification]\ncommands = {toml_value(commands)}\n\n"
                     f"[permissions]\nworker_commands = {toml_value(list(worker_commands))}\n", encoding="utf-8")
     return path
@@ -548,7 +548,7 @@ class RepoCase(unittest.TestCase):
         git.git(self.repo, "add", ".")
         git.git(self.repo, "-c", "user.name=Test", "-c", "user.email=test@localhost", "-c", "commit.gpgsign=false", "commit", "-m", "fixture")
         self.config = Config.load(ROOT / "harness.toml")
-        self.config.data["verification"]["commands"] = [[sys.executable, "-m", "unittest", "-v"]]
+        self.config.data["verification"]["commands"] = [{"cwd": ".", "argv": [sys.executable, "-m", "unittest", "-v"]}]
         install_stop_guards(self)
         # Every PATH lookup of claude or codex in a repository test lands on a recording stub;
         # quota probes are expected, any other call to either CLI fails the test.
@@ -781,7 +781,7 @@ class RuntimeTests(RepoCase):
             self.engine().resume(engine.run["id"])
 
     def test_verification_must_not_rewrite_review_candidate(self):
-        self.config.data["verification"]["commands"] = [[sys.executable, "-c", "from pathlib import Path; Path('hello.py').write_text('bad')"]]
+        self.config.data["verification"]["commands"] = [{"cwd": ".", "argv": [sys.executable, "-c", "from pathlib import Path; Path('hello.py').write_text('bad')"]}]
         engine = self.engine()
         with self.assertRaisesRegex(HarnessError, "验证命令修改"):
             engine.start("Implement greet")

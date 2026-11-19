@@ -31,8 +31,8 @@ TOOLS.extend([
     {"name": "git_query", "description": "Run one fixed-form read-only Git query on the run worktree without a shell, pager, writes or network. Forms: "
      + "; ".join(git_queries.FORMS) + ". " + git_queries.RULES + " Any other argv is rejected without execution. "
      "An argv in these forms needs no operator grant when a plan's required_commands or self_checks, or a continuation "
-     "request, lists it: run it with this tool, not Bash or the command broker. Pipelines, redirections and other "
-     "options are not covered.",
+     "request, lists it with cwd \".\": run it with this tool, not Bash or the command broker. The same argv with "
+     "another cwd is not covered. Pipelines, redirections and other options are not covered.",
      "inputSchema": {"type": "object", "properties": {"argv": {"type": "array", "items": {"type": "string"},
                      "minItems": 2, "maxItems": git_queries.MAX_ARGV}}, "required": ["argv"], "additionalProperties": False}},
 ])

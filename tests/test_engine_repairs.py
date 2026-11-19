@@ -168,7 +168,7 @@ class EngineRepairsTests(RepoCase):
                   "ok = greet('Ada') == 'Hello, Ada!'; "
                   "print('O' * 8000 if not ok else 'pass'); "
                   "print('E' * 8000 if not ok else '', file=sys.stderr); sys.exit(0 if ok else 1)")
-        self.config.data["verification"]["commands"] = [[sys.executable, "-c", script] for _ in range(3)]
+        self.config.data["verification"]["commands"] = [{"cwd": ".", "argv": [sys.executable, "-c", script]} for _ in range(3)]
         def fail_first(backend, kwargs, packet, result):
             if kwargs["role"] == "worker" and sum(c["role"] == "worker" for c in backend.calls) == 1:
                 (kwargs["cwd"] / "hello.py").write_text('def greet(name):\n    return "wrong"\n')
@@ -257,8 +257,8 @@ class EngineRepairsTests(RepoCase):
 
     def test_real_verification_timeout_records_feedback_then_repairs(self):
         self.config.data["runtime"]["verify_timeout_seconds"] = 1
-        self.config.data["verification"]["commands"] = [[sys.executable, "-c",
-            "from hello import greet; print('starting check', flush=True); assert greet('Ada') == 'Hello, Ada!'"]]
+        self.config.data["verification"]["commands"] = [{"cwd": ".", "argv": [sys.executable, "-c",
+            "from hello import greet; print('starting check', flush=True); assert greet('Ada') == 'Hello, Ada!'"]}]
         def slow_first(backend, kwargs, packet, result):
             if kwargs["role"] == "worker" and sum(c["role"] == "worker" for c in backend.calls) == 1:
                 (kwargs["cwd"] / "hello.py").write_text(
@@ -280,8 +280,8 @@ class EngineRepairsTests(RepoCase):
         self.assertFalse(any(dispatch["status"] == "running" for dispatch in result["dispatches"]))
 
     def test_verifier_generated_untracked_file_blocks_with_file_diagnostics(self):
-        self.config.data["verification"]["commands"] = [[sys.executable, "-c",
-            "from pathlib import Path; Path('.coverage').write_bytes(b'generated coverage')"]]
+        self.config.data["verification"]["commands"] = [{"cwd": ".", "argv": [sys.executable, "-c",
+            "from pathlib import Path; Path('.coverage').write_bytes(b'generated coverage')"]}]
         backend = RecordingBackend()
         engine = self.engine(backend)
         with self.assertRaises(HarnessError):

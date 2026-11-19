@@ -293,7 +293,7 @@ class KeyedLifecycleTests(RepoCase):
         self.assertEqual(result["status"], "completed")
 
     def test_continuation_with_claims_records_its_bound_source(self):
-        command = ["python3", "-c", "print('focused check')"]
+        command = {"cwd": ".", "argv": ["python3", "-c", "print('focused check')"]}
         def continuation(kwargs, result):
             result.update(status="blocked", blocker_kind="continuation", blockers=["Need a focused check"],
                           continuation_request={"kind": "commands", "commands": [command],

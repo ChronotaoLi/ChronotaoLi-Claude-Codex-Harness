@@ -10,7 +10,7 @@ from fnmatch import fnmatchcase
 from pathlib import Path
 
 from . import stops
-from .util import HarnessError, fold_name, write_json
+from .util import DIRECTORY_FLAGS, HarnessError, fold_name, write_json
 
 
 PROTECTED_ROOTS = frozenset((".git", ".harness", ".codex", ".claude"))
@@ -113,22 +113,71 @@ def capture_worktree_binding(worktree: Path, expected_branch: str | None):
     return binding
 
 
-@stops.classifies("workspace_mismatch", "binding_changed")
-def check_worktree_binding(worktree: Path, binding):
-    """Refuse redirected metadata before any run-worktree Git command."""
+def _binding_file_at(held, root_fd, path):
+    """Read the root's .git through an open root descriptor; ``path`` only names it in errors.
+
+    The .git descriptor is opened into ``held`` and closed here once read; after a
+    failure the caller's cleanup of ``held`` closes it.
+    """
+    try:
+        # Nonblocking: a FIFO without a writer must not hang the open before fstat refuses it.
+        descriptor = held.open(".git", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=root_fd)
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise HarnessError(f"worktree Git 绑定文件必须为普通文件：{path}")
+        # Not deferred: an interrupt ends a slow read as it would a read by path.
+        with os.fdopen(descriptor, "rb", closefd=False) as stream:
+            content = stream.read()
+        held.close(descriptor)
+        return content
+    except OSError as error:
+        stops.keep_local_io(error)
+        raise HarnessError(f"worktree Git 绑定文件无法读取：{path}：{error}") from error
+
+
+def _check_binding_record(binding):
     fields = ("worktree", "git_dir", "common_dir", "gitfile_sha256", "backlink_sha256", "commondir_sha256")
     if (not isinstance(binding, dict) or any(not isinstance(binding.get(key), str) for key in fields)
             or "branch" not in binding
             or binding["branch"] is not None and not isinstance(binding["branch"], str)
             or binding.get("branch") is None and not isinstance(binding.get("detached_head"), str)):
         raise HarnessError("worktree Git 绑定缺失或无效；保留现场，不能重新推断绑定")
+
+
+@stops.classifies("workspace_mismatch", "binding_changed")
+def check_worktree_binding(worktree: Path, binding):
+    """Refuse redirected metadata before any run-worktree Git command."""
+    _check_binding_record(binding)
+    _check_binding(worktree, binding, lambda checked: _binding_file(checked / ".git"))
+
+
+@stops.classifies("workspace_mismatch", "binding_changed")
+def open_bound_root(held, worktree: Path, binding) -> int:
+    """Open the bound root once into ``held`` and check the binding on it.
+
+    The root's .git, the only fact the check takes from the root itself, is read
+    through this descriptor, so a command started from it runs below the very
+    directory the check accepted. The descriptor stays ``held``'s whatever the
+    outcome; the caller's cleanup of ``held`` closes it.
+    """
+    _check_binding_record(binding)
+    try:
+        root = held.open(binding["worktree"], DIRECTORY_FLAGS)
+    except (OSError, ValueError) as error:
+        stops.keep_local_io(error)
+        raise HarnessError(f"worktree 根目录无法打开：{binding['worktree']}：{error}") from error
+    _check_binding(worktree, binding, lambda checked: _binding_file_at(held, root, checked / ".git"))
+    return root
+
+
+def _check_binding(worktree, binding, read_gitfile):
+    # read_gitfile gets the path resolved and compared here, never a second resolution of the caller's path.
     worktree = worktree.resolve()
     git_dir, common_dir = Path(binding["git_dir"]), Path(binding["common_dir"])
     if (str(worktree) != binding["worktree"] or git_dir.resolve() != git_dir
             or common_dir.resolve() != common_dir or git_dir == common_dir
             or not git_dir.is_dir() or not common_dir.is_dir()):
         raise HarnessError("worktree Git 绑定目录已改变；保留现场")
-    gitfile = _binding_file(worktree / ".git")
+    gitfile = read_gitfile(worktree)
     if (hashlib.sha256(gitfile).hexdigest() != binding["gitfile_sha256"]
             or not gitfile.startswith(b"gitdir: ")
             or _binding_path(worktree, gitfile[len(b"gitdir: "):]) != git_dir):

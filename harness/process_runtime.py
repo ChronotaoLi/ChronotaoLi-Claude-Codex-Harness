@@ -19,11 +19,13 @@ class DeferredSignals(list):
 
 
 @contextlib.contextmanager
-def defer_cleanup_signals(*, primary=None):
+def defer_cleanup_signals(*, primary=None, inherit=True):
     """Defer cancellation through cleanup, including the handler handoff.
 
     Each scope retains the first signal it receives. An existing exception always
-    wins; otherwise a deferred request must prevent a normal return.
+    wins; otherwise a deferred request must prevent a normal return. With
+    inherit=False only an exception raised inside the scope wins: one its caller
+    is already handling does not hide the request of a scope that completed.
     """
     import sys
     captured = DeferredSignals()
@@ -41,10 +43,14 @@ def defer_cleanup_signals(*, primary=None):
     finally:
         if main:
             signal.pthread_sigmask(signal.SIG_SETMASK, mask)
+    failed = False
     try:
         yield captured
+    except BaseException:
+        failed = True
+        raise
     finally:
-        pending = sys.exc_info()[1]
+        pending = sys.exc_info()[1] is not None if inherit else failed
         mask = signal.pthread_sigmask(signal.SIG_BLOCK, signals) if main else None
         try:
             for sig, handler in old.items():
@@ -60,9 +66,9 @@ def defer_cleanup_signals(*, primary=None):
                 try:
                     signal.pthread_sigmask(signal.SIG_SETMASK, mask)
                 except KeyboardInterrupt:
-                    if primary is None and pending is None:
+                    if primary is None and not pending:
                         raise
-        if captured and not getattr(captured, "handled", False) and primary is None and pending is None:
+        if captured and not getattr(captured, "handled", False) and primary is None and not pending:
             raise KeyboardInterrupt(f"Process cleanup signal {captured[0]}")
 
 

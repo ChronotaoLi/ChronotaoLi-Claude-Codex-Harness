@@ -52,8 +52,8 @@ from harness.util import read_json
 root, repo, mode, witness = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3], Path(sys.argv[4])
 config = Config.load(root / "harness.toml")
 command = [sys.executable, "-c", "import time; time.sleep(60)", "startup-gap"]
-config.data["verification"]["commands"] = ([command] if mode == "verification" else
-    [[sys.executable, "-m", "unittest", "-v"]])
+config.data["verification"]["commands"] = ([{"cwd": ".", "argv": command}] if mode == "verification" else
+    [{"cwd": ".", "argv": [sys.executable, "-m", "unittest", "-v"]}])
 backend = CLIBackend(config, repo / ".harness") if mode == "worker" else DemoBackend()
 if mode == "worker":
     backend.command = lambda *args: command
@@ -116,7 +116,7 @@ engine.start("Implement greet", read_json(root / "examples/plan.json"))
                     backend.command = lambda *args: command
                     engine = self.engine(backend)
                 else:
-                    self.config.data["verification"]["commands"] = [command]
+                    self.config.data["verification"]["commands"] = [{"cwd": ".", "argv": command}]
                     engine = self.engine()
                 try:
                     with patch("harness.util.subprocess.Popen", side_effect=interrupted_start), \

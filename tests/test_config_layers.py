@@ -33,7 +33,7 @@ class LayerMergeTests(unittest.TestCase):
         self.operator_path = self.root / "operator" / "harness.toml"
         self.project_path = self.root / "repo" / ".harness" / "project.toml"
         self.operator = tomllib.loads((ROOT / "harness.toml").read_text(encoding="utf-8"))
-        self.project = {"verification": {"commands": [["make", "check"]]}}
+        self.project = {"verification": {"commands": [{"cwd": ".", "argv": ["make", "check"]}]}}
 
     def load(self, operator=None, project=None, *, with_project=True):
         write_toml(self.operator_path, self.operator if operator is None else operator)
@@ -57,9 +57,9 @@ class LayerMergeTests(unittest.TestCase):
                          (7, {"worker": 200, "reviewer": 30}))
 
     def test_verification_and_permissions_come_only_from_the_project_file(self):
-        self.project = {"verification": {"commands": [["make", "check"], ["echo", "*", "a\nb"]],
-                                         "fresh_checkout": True, "setup_commands": [["make", "deps"]]},
-                        "permissions": {"worker_commands": [["npm", "run", "build"]]}}
+        self.project = {"verification": {"commands": [{"cwd": ".", "argv": ["make", "check"]}, {"cwd": ".", "argv": ["echo", "*", "a\nb"]}],
+                                         "fresh_checkout": True, "setup_commands": [{"cwd": ".", "argv": ["make", "deps"]}]},
+                        "permissions": {"worker_commands": [{"cwd": ".", "argv": ["npm", "run", "build"]}]}}
         config = self.load()
         self.assertEqual(config.data["verification"], self.project["verification"])
         self.assertEqual(config.data["permissions"], self.project["permissions"])
@@ -68,16 +68,16 @@ class LayerMergeTests(unittest.TestCase):
             self.assertEqual(config.data["verification"], DEFAULTS["verification"])
             self.assertEqual(config.data["permissions"], DEFAULTS["permissions"])
         # Arrays replace the defaults; nothing is appended.
-        self.project = {"verification": {"commands": [["make", "check"]]}}
-        self.assertEqual(self.load().data["verification"]["commands"], [["make", "check"]])
+        self.project = {"verification": {"commands": [{"cwd": ".", "argv": ["make", "check"]}]}}
+        self.assertEqual(self.load().data["verification"]["commands"], [{"cwd": ".", "argv": ["make", "check"]}])
 
     def test_effective_configuration_is_validated_with_the_existing_rules(self):
         invalid = [
             ({}, {"runtime": {"max_attempts": 0}}),
             ({}, {"runtime": {"claude_max_turns_by_role": {"worker": True}}}),
             ({}, {"verification": {"commands": "npm test"}}),
-            ({}, {"verification": {"commands": [["true"]], "setup_commands": [["make", "deps"]]}}),
-            ({}, {"permissions": {"worker_commands": [["npm", 7]]}}),
+            ({}, {"verification": {"commands": [{"cwd": ".", "argv": ["true"]}], "setup_commands": [{"cwd": ".", "argv": ["make", "deps"]}]}}),
+            ({}, {"permissions": {"worker_commands": [{"cwd": ".", "argv": ["npm", 7]}]}}),
             ({"worker": "codex"}, {}),
         ]
         for operator_change, project in invalid:
@@ -90,7 +90,7 @@ class LayerMergeTests(unittest.TestCase):
         self.assertEqual(config.resume_changes(copy.deepcopy(config.data)), {})
 
     def test_a_section_in_the_wrong_file_is_rejected_naming_where_it_belongs(self):
-        for section, value in (("verification", {"commands": [["true"]]}), ("permissions", {"worker_commands": []})):
+        for section, value in (("verification", {"commands": [{"cwd": ".", "argv": ["true"]}]}), ("permissions", {"worker_commands": []})):
             for with_project in (True, False):
                 with self.subTest(section=section, with_project=with_project):
                     with self.assertRaises(HarnessError) as raised:
@@ -110,10 +110,10 @@ class LayerMergeTests(unittest.TestCase):
 
     def test_unknown_sections_and_keys_report_their_full_path_and_their_file(self):
         project_cases = [
-            ("verificaton", {"verificaton": {"commands": [["true"]]}}),
+            ("verificaton", {"verificaton": {"commands": [{"cwd": ".", "argv": ["true"]}]}}),
             ("runtime.max_attempt", {"runtime": {"max_attempt": 3}}),
             ("runtime.claude_max_turns_by_role.fable", {"runtime": {"claude_max_turns_by_role": {"fable": 3}}}),
-            ("verification.command", {"verification": {"command": [["true"]]}}),
+            ("verification.command", {"verification": {"command": [{"cwd": ".", "argv": ["true"]}]}}),
             ("permissions.worker_command", {"permissions": {"worker_command": []}}),
         ]
         for field, extra in project_cases:
@@ -141,6 +141,52 @@ class LayerMergeTests(unittest.TestCase):
         with self.assertRaises(HarnessError) as raised:
             self.load(project={**self.project, "runtime": 5})
         self.assertIn(str(self.project_path), str(raised.exception))
+
+    def load_text(self, text):
+        """The project file written as TOML text, beside the checked-in operator file."""
+        write_toml(self.operator_path, self.operator)
+        self.project_path.parent.mkdir(parents=True, exist_ok=True)
+        self.project_path.write_text(text, encoding="utf-8")
+        return Config.load(self.operator_path, self.project_path)
+
+    def test_tables_and_inline_tables_load_the_same_commands(self):
+        tables = ('[[verification.commands]]\ncwd = "."\nargv = ["make", "check"]\n\n'
+                  '[[permissions.worker_commands]]\ncwd = "spikes/sp-2-export/app"\nargv = ["flutter", "test"]\n\n'
+                  '[[permissions.worker_commands]]\ncwd = "my app/src"\nargv = ["npm", "run", "build"]\n')
+        inline = ('[verification]\ncommands = [{ cwd = ".", argv = ["make", "check"] }]\n\n[permissions]\n'
+                  'worker_commands = [{ cwd = "spikes/sp-2-export/app", argv = ["flutter", "test"] },\n'
+                  '                   { cwd = "my app/src", argv = ["npm", "run", "build"] }]\n')
+        for name, text in (("tables", tables), ("inline", inline)):
+            with self.subTest(name):
+                config = self.load_text(text)
+                self.assertEqual(config.data["verification"]["commands"], [{"cwd": ".", "argv": ["make", "check"]}])
+                self.assertEqual(config.data["permissions"]["worker_commands"],
+                                 [{"cwd": "spikes/sp-2-export/app", "argv": ["flutter", "test"]},
+                                  {"cwd": "my app/src", "argv": ["npm", "run", "build"]}])
+
+    def test_a_command_without_cwd_with_env_or_with_a_bad_cwd_names_its_field_and_file(self):
+        good = '{ cwd = ".", argv = ["make", "check"] }'
+        cases = {"no cwd": ('{ argv = ["make", "x"] }', ""),
+                 "env": ('{ cwd = ".", argv = ["make", "x"], env = { A = "1" } }', ""),
+                 "parent segment": ('{ cwd = "app/../x", argv = ["make", "x"] }', ".cwd"),
+                 "protected": ('{ cwd = "app/.Git", argv = ["make", "x"] }', ".cwd"),
+                 "blank": ('{ cwd = "  ", argv = ["make", "x"] }', ".cwd"),
+                 "blank segment": ('{ cwd = "a/ /b", argv = ["make", "x"] }', ".cwd"),
+                 "empty argv": ('{ cwd = "app", argv = [] }', ".argv")}
+        layouts = {"verification.commands": "[verification]\ncommands = [{good}, {bad}]\n",
+                   "verification.setup_commands": ("[verification]\ncommands = [{good}]\nfresh_checkout = true\n"
+                                                   "setup_commands = [{good}, {bad}]\n"),
+                   "permissions.worker_commands": "[verification]\ncommands = [{good}]\n\n[permissions]\nworker_commands = [{good}, {bad}]\n"}
+        for key, layout in layouts.items():
+            for name, (bad, suffix) in cases.items():
+                with self.subTest(key=key, case=name), self.assertRaises(HarnessError) as raised:
+                    self.load_text(layout.format(good=good, bad=bad))
+                message = str(raised.exception)
+                self.assertIn(f"{key}[1]{suffix}", message)
+                self.assertNotIn(f"{key}[0]", message)
+                for part in (".cwd", ".argv"):
+                    self.assertEqual(f"{key}[1]{part}" in message, suffix == part)
+                self.assertIn(str(self.project_path), message)
 
     def test_exact_model_ids_survive_and_shared_paths_resolve_beside_the_operator_file(self):
         self.operator["roles"]["worker"]["model"] = "exact-custom-worker-model-v42[1m]"
@@ -173,23 +219,23 @@ class LayerMergeTests(unittest.TestCase):
         tuned = {**self.operator, "runtime": {"max_attempts": 7, "context_chars": 50000,
                                               "claude_max_turns_by_role": {"worker": 200, "reviewer": 30}}}
         bare = {key: value for key, value in self.operator.items() if key != "runtime"}
-        commands = {"verification": {"commands": [["make", "check"]]}}
+        commands = {"verification": {"commands": [{"cwd": ".", "argv": ["make", "check"]}]}}
         cases = [  # name, operator file, project file (a table or raw bytes), loads
             ("runtime key by key, role table whole", tuned,
              {**commands, "runtime": {"max_attempts": 9, "claude_max_turns_by_role": {"commander": 40}}}, True),
             ("operator runtime kept where the project sets none", tuned, commands, True),
             ("project runtime over an operator file without one", bare, {**commands, "runtime": {"max_attempts": 2}}, True),
             ("verification and permissions only from the project", self.operator,
-             {"verification": {"commands": [["make", "check"]], "fresh_checkout": True, "setup_commands": [["make", "deps"]]},
-              "permissions": {"worker_commands": [["npm", "run", "build"]]}}, True),
+             {"verification": {"commands": [{"cwd": ".", "argv": ["make", "check"]}], "fresh_checkout": True, "setup_commands": [{"cwd": ".", "argv": ["make", "deps"]}]},
+              "permissions": {"worker_commands": [{"cwd": ".", "argv": ["npm", "run", "build"]}]}}, True),
             ("no verification or permissions", tuned, {"runtime": {"quota_wait_max_seconds": 0}}, True),
             ("empty project file", self.operator, {}, True),
             ("invalid effective value", tuned, {**commands, "runtime": {"max_attempts": 0}}, False),
             ("invalid role table", tuned, {"runtime": {"claude_max_turns_by_role": {"worker": True}}}, False),
             ("setup commands without a fresh checkout", self.operator,
-             {"verification": {"commands": [["true"]], "setup_commands": [["make", "deps"]]}}, False),
+             {"verification": {"commands": [{"cwd": ".", "argv": ["true"]}], "setup_commands": [{"cwd": ".", "argv": ["make", "deps"]}]}}, False),
             ("operator section", self.operator, {**commands, "roles": copy.deepcopy(self.operator["roles"])}, False),
-            ("unknown key", self.operator, {"verification": {"command": [["true"]]}}, False),
+            ("unknown key", self.operator, {"verification": {"command": [{"cwd": ".", "argv": ["true"]}]}}, False),
             ("not TOML", self.operator, b"[verification\n", False),
             ("not UTF-8", self.operator, b"\xff\xfe", False),
         ]
@@ -234,12 +280,12 @@ class ProjectFileLocationTests(RepoCase):
 
     def setUp(self):
         super().setUp()
-        self.commands = [["python3", "-c", "print('root project')"]]
+        self.commands = [{"cwd": ".", "argv": ["python3", "-c", "print('root project')"]}]
         self.project = write_project_config(self.repo, self.commands)
         self.deep = self.repo / "pkg" / "deep"
         self.deep.mkdir(parents=True)
         # A project file below the Git root is never the one loaded.
-        write_project_config(self.repo / "pkg", [["python3", "-c", "print('decoy')"]])
+        write_project_config(self.repo / "pkg", [{"cwd": ".", "argv": ["python3", "-c", "print('decoy')"]}])
         self.outside = scratch(self)
 
     def invoke(self, argv, cwd):
@@ -275,7 +321,7 @@ class ProjectFileLocationTests(RepoCase):
         inner.mkdir(parents=True)
         git.git(inner, "init", "-b", "main")
         (inner / "sub").mkdir()
-        write_project_config(inner / "sub", [["python3", "-c", "print('decoy')"]])
+        write_project_config(inner / "sub", [{"cwd": ".", "argv": ["python3", "-c", "print('decoy')"]}])
         expected = (git.repository(inner) / ".harness" / "project.toml").resolve()
         for cwd, prefix in ((self.outside, ["--repo", str(inner)]), (inner / "sub", [])):
             with self.subTest(cwd=cwd):
@@ -295,7 +341,7 @@ class ProjectFileLocationTests(RepoCase):
         self.assertEqual(loaded, [])
         self.assertIn(str(expected), errors)
         self.assertNotIn(str(self.project.resolve()), errors)
-        commands = [["python3", "-c", "print('linked worktree')"]]
+        commands = [{"cwd": ".", "argv": ["python3", "-c", "print('linked worktree')"]}]
         write_project_config(tree, commands)
         for cwd, prefix in ((self.outside, ["--repo", str(tree)]), (tree, [])):
             with self.subTest(cwd=cwd):
@@ -306,7 +352,7 @@ class ProjectFileLocationTests(RepoCase):
                 self.assertEqual(loaded[0].data["verification"]["commands"], commands)
 
     def test_a_project_file_that_links_to_a_regular_file_loads(self):
-        commands = [["python3", "-c", "print('linked file')"]]
+        commands = [{"cwd": ".", "argv": ["python3", "-c", "print('linked file')"]}]
         target = write_project_config(self.outside / "kept", commands)
         self.project.unlink()
         self.project.symlink_to(target)
@@ -362,8 +408,8 @@ class CommandConfigurationTests(RepoCase):
 
     def setUp(self):
         super().setUp()
-        self.commands = [["python3", "-c", "print('project')"]]
-        self.project = write_project_config(self.repo, self.commands, [["make", "deploy"]])
+        self.commands = [{"cwd": ".", "argv": ["python3", "-c", "print('project')"]}]
+        self.project = write_project_config(self.repo, self.commands, [{"cwd": ".", "argv": ["make", "deploy"]}])
 
     def loads(self, argv):
         loaded, real = [], Config.load
@@ -389,7 +435,7 @@ class CommandConfigurationTests(RepoCase):
                 config = self.loads(argv)
                 self.assertEqual(config.project_path, self.project.resolve())
                 self.assertEqual(config.data["verification"]["commands"], self.commands)
-                self.assertEqual(config.data["permissions"]["worker_commands"], [["make", "deploy"]])
+                self.assertEqual(config.data["permissions"]["worker_commands"], [{"cwd": ".", "argv": ["make", "deploy"]}])
         for argv in (["abandon", "run_test"], ["doctor"], ["demo"], ["smoke"], ["sync"]):
             with self.subTest(command=argv[0]):
                 config = self.loads(argv)

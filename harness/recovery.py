@@ -23,27 +23,31 @@ def snapshot_digest(snapshot):
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
+def acceptance_review_records(run, feedback=None, *, attempt=None, candidate_digest=None):
+    """The review records a known acceptance invalidation voids that are not yet marked; the ledger is unchanged."""
+    feedback = run.get("feedback") if feedback is None else feedback
+    if not isinstance(feedback, dict) or not isinstance(feedback.get("acceptance"), dict):
+        return []
+    artifact = feedback["acceptance"].get("review_artifact")
+    if not artifact:
+        return []
+    return [record for record in run.get("review_history", {}).get(feedback.get("task_id"), [])
+            if record.get("artifact") == artifact
+            and (attempt is None or record.get("attempt") == attempt)
+            and (candidate_digest is None or record.get("snapshot_digest") == candidate_digest)
+            and record.get("status") != "invalidated"]
+
+
 def invalidate_acceptance_review(run, feedback=None, *, attempt=None, candidate_digest=None):
     """Persist a known acceptance invalidation without changing its evidence.
 
     Feedback binds the exact review artifact. Call before replacing it, so a
     later plan cannot make the invalidated approval look current again.
     """
-    feedback = run.get("feedback") if feedback is None else feedback
-    if not isinstance(feedback, dict) or not isinstance(feedback.get("acceptance"), dict):
-        return False
-    artifact = feedback["acceptance"].get("review_artifact")
-    if not artifact:
-        return False
-    changed = False
-    for record in run.get("review_history", {}).get(feedback.get("task_id"), []):
-        if (record.get("artifact") == artifact
-                and (attempt is None or record.get("attempt") == attempt)
-                and (candidate_digest is None or record.get("snapshot_digest") == candidate_digest)
-                and record.get("status") != "invalidated"):
-            record["status"] = "invalidated"
-            changed = True
-    return changed
+    records = acceptance_review_records(run, feedback, attempt=attempt, candidate_digest=candidate_digest)
+    for record in records:
+        record["status"] = "invalidated"
+    return bool(records)
 
 
 def worker_recovery_context(run, directory, task_id, *, feedback=None):

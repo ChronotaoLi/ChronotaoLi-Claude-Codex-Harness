@@ -1,5 +1,6 @@
 import hashlib
 import json
+import shlex
 import tempfile
 import unittest
 from pathlib import Path
@@ -19,9 +20,9 @@ class CommandAdapterTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name).resolve()
         self.config = Config.load(ROOT / 'harness.toml')
-        self.literal = ['python3', '-c', 'print("literal")', '*', 'line\nbreak', "single'quote", '$(literal)']
+        self.literal = {'cwd': '.', 'argv': ['python3', '-c', 'print("literal")', '*', 'line\nbreak', "single'quote", '$(literal)']}
         self.config.data['permissions']['worker_commands'] = [self.literal]
-        self.config.data['verification']['commands'] = [['python3', 'verify.py']]
+        self.config.data['verification']['commands'] = [{'cwd': '.', 'argv': ['python3', 'verify.py']}]
 
     def command(self, role):
         job = self.root / role
@@ -35,10 +36,10 @@ class CommandAdapterTests(unittest.TestCase):
         manifest_path = job / 'commands.json'
         manifest = json.loads(manifest_path.read_text())
         self.assertEqual(manifest['dispatch_id'], job.name)
-        self.assertEqual(manifest['cwd'], str(self.root))
+        self.assertEqual(manifest['worktree'], str(self.root))
         self.assertEqual(manifest['role'], 'worker')
         commands = manifest['commands']
-        self.assertEqual(commands, [{'command_id': command_id(c), 'argv': c} for c in
+        self.assertEqual(commands, [{'command_id': command_id(c), 'command': c} for c in
                          self.config.data['verification']['commands'] + [self.literal]])
         server = mcp['mcpServers']['harness_commands']
         args = server['args']
@@ -49,6 +50,9 @@ class CommandAdapterTests(unittest.TestCase):
         self.assertIn('mcp__harness_commands', allow)
         self.assertFalse(any(rule.startswith('Bash(python3 -c') for rule in allow))
         self.assertNotIn('Bash(python3 *)', allow)
+        # The broker grants above add no Bash rule, not even for the plain verification argv.
+        self.assertEqual([rule for rule in allow if rule.startswith('Bash(')],
+                         ['Bash(' + shlex.join(c) + ' *)' for c in Config.readonly_commands()])
         self.assertEqual(argv[argv.index('--model') + 1], 'exact-configured-id')
         self.assertEqual(argv[argv.index('--effort') + 1], 'high')
         self.assertIn('--no-session-persistence', argv)

@@ -296,7 +296,7 @@ class WorkerReceiptTests(RepoCase):
                         if kwargs['role'] == 'worker':
                             result.update(status='blocked', blocker_kind=kind, blockers=['Need prerequisite'])
                             if kind == 'continuation':
-                                result['continuation_request'] = {'kind': 'commands', 'commands': [['python3', 'focused.py']],
+                                result['continuation_request'] = {'kind': 'commands', 'commands': [{'cwd': '.', 'argv': ['python3', 'focused.py']}],
                                     'minimum_timeout_seconds': 0, 'reason': 'focused check needed'}
                             from harness.util import write_json
                             write_json(kwargs['job'] / 'response.json', result)

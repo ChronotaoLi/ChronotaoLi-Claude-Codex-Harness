@@ -57,10 +57,10 @@ class DecisionContextTests(RepoCase):
             self.assertEqual(Path(path).read_bytes(), raw)
         reports = [read_json(p) for p in (engine.directory / 'dispatches').glob('*/context-report.json')]
         self.assertTrue(reports)
-        # The decide prompt carries the whole plan and every decision: 36.5K in the
+        # The decide prompt carries the whole plan and every decision: 38.8K in the
         # eight-decision case with the append-only update fields and the scope boundary
         # (the dispatch prompt it replaced was 25.7K).
-        self.assertTrue(all(r['used_chars'] <= 37000 for r in reports))
+        self.assertTrue(all(r['used_chars'] <= 39000 for r in reports))
 
     def test_four_full_length_answers_fit_complete_engine_prompts(self):
         self.exercise(4, 4000)

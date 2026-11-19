@@ -17,6 +17,7 @@ INDEX_HTML = """<!DOCTYPE html>
 <header class="appbar">
   <div class="appbar-inner">
     <h1 class="brand"><a href="#/"><span class="brand-mark" aria-hidden="true"></span>Harness 观察台</a></h1>
+    <p id="binding" class="binding small"></p>
     <div class="controls">
       <span id="connection" class="conn" role="status" aria-live="polite"></span>
       <span id="sampled" class="muted small"></span>
@@ -66,6 +67,10 @@ main.page { padding-top: 20px; padding-bottom: 32px; }
 .brand { margin: 0; font-size: 16px; font-weight: 650; letter-spacing: .01em; }
 .brand a { color: inherit; text-decoration: none; display: inline-flex; align-items: center; gap: 8px; }
 .brand-mark { width: 14px; height: 14px; border-radius: 4px; background: var(--accent); display: inline-block; }
+.binding { margin: 0; flex: 1 1 260px; min-width: 0; color: var(--muted); overflow-wrap: anywhere; line-height: 1.5;
+  max-height: 4.5em; overflow-y: auto; }
+.binding:empty { display: none; }
+.breakable { overflow-wrap: anywhere; }
 .controls { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; }
 .conn { font-size: 12px; color: var(--muted); display: inline-flex; align-items: center; gap: 6px; }
 .conn::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--line); display: inline-block; }
@@ -92,6 +97,9 @@ h2, h3 { line-height: 1.35; }
 .hero { padding: 20px 22px; }
 .hero-top { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 8px; }
 .hero h2 { font-size: 20px; margin: 0 0 6px; font-weight: 650; overflow-wrap: anywhere; }
+.hero > .alert { margin: 0 0 10px; }
+.stage { display: inline-block; min-width: 0; max-width: 100%; padding: 0 7px; border: 1px dashed var(--line);
+  border-radius: 6px; font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
 .meta-line { display: flex; flex-wrap: wrap; gap: 4px 16px; font-size: 12px; color: var(--muted); }
 .badge { display: inline-flex; align-items: center; gap: 4px; padding: 1px 9px; border-radius: 999px; font-size: 12px;
   font-weight: 600; line-height: 1.7; white-space: nowrap; }
@@ -122,8 +130,10 @@ progress.tone-bad::-webkit-progress-value { background: var(--bad); } progress.t
 .alert { border-left: 4px solid var(--line); background: var(--surface-2); border-radius: 8px; padding: 10px 12px; min-width: 0; }
 .alert.tone-bad { border-left-color: var(--bad); background: var(--bad-bg); color: var(--fg); }
 .alert.tone-warn { border-left-color: var(--warn); background: var(--warn-bg); color: var(--fg); }
-.alert h3 { font-size: 14px; margin: 0 0 4px; }
+.alert.tone-info { border-left-color: var(--info); background: var(--info-bg); color: var(--fg); }
+.alert h3 { font-size: 14px; margin: 0 0 4px; overflow-wrap: anywhere; }
 .alert.tone-bad h3 { color: var(--bad); } .alert.tone-warn h3 { color: var(--warn); }
+.alert.tone-info h3 { color: var(--info); }
 .alert p { margin: 4px 0; overflow-wrap: anywhere; }
 .hint { font-size: 12px; color: var(--muted); }
 .hint code { font-family: var(--mono); background: var(--surface); padding: 0 4px; border-radius: 4px; }
@@ -217,6 +227,7 @@ APP_JS = r""""use strict";
   var main = document.getElementById("main");
   var sampledLabel = document.getElementById("sampled");
   var connectionLabel = document.getElementById("connection");
+  var bindingLabel = document.getElementById("binding");
   var stream = null;
   var streamRun = null;
   var refreshTimer = null;
@@ -253,12 +264,13 @@ APP_JS = r""""use strict";
   };
   var EVENT = {
     dispatch_prepared: "准备派发", dispatch_started: "开始调用", dispatch_finished: "派发结束", task_accepted: "任务已接受",
-    review_rejected: "审阅要求修改", verification_failed: "验证失败",
+    review_rejected: "审阅要求修改", review_batch_approved: "审阅分批通过", verification_failed: "验证失败",
     run_completed: "运行完成", run_paused: "运行暂停", run_stopped: "运行停止", run_abandoned: "运行已放弃",
     quota_sampled: "额度样本", quota_wait_started: "开始等待额度", quota_wait_finished: "额度等待结束",
     plan_awaiting_approval: "计划等待批准", plan_approved: "计划已批准", plan_revised: "计划已修订",
     revision_edits_archived: "修订前已归档未接受修改", commander_candidate_changed: "指挥调用期间候选已变化",
     final_verification_failed: "整体验证失败", final_review_rejected: "整体审阅拒绝",
+    final_review_batch_approved: "整体审阅分批通过", final_attempt_left: "整体尝试因候选变化离开",
     final_reverification_requested: "请求重新整体验证", environment_update_recorded: "登记环境更新",
     verification_checkout_reclaimed: "已回收验证检出", verification_checkout_reclaim_failed: "验证检出回收失败",
     environment_checked: "环境检查", command_requirements_checked: "命令授权检查",
@@ -278,6 +290,34 @@ APP_JS = r""""use strict";
       connectionLabel.textContent = text;
       connectionLabel.className = "conn" + (tone ? " tone-" + tone : "");
     }
+  }
+
+  // The server can be restarted on another state directory behind the same port: each response names its own,
+  // so the header and the tab title follow the response whose content is shown.
+  function located(observed) {
+    return !!observed && typeof observed === "object" && typeof observed.state === "string";
+  }
+  function showBinding(observed) {
+    if (!located(observed)) { return; }
+    var basis = typeof observed.checkout === "string" && (observed.checkout_basis === "git" ||
+      observed.checkout_basis === "path") ? observed.checkout_basis : null;
+    var checkout = basis ? observed.checkout : null;
+    var name = typeof observed.name === "string" && observed.name ? observed.name : observed.state;
+    document.title = name + " · Harness 观察台";
+    if (!bindingLabel) { return; }
+    var text = (basis === "git" ? "检出 " + checkout : basis === "path" ? "检出（按路径推定）" + checkout
+      : "检出 未知") + " · 状态目录 " + observed.state;
+    bindingLabel.textContent = text;
+    // The header shows at most three lines; the full text stays reachable by scrolling it or hovering.
+    attr(bindingLabel, "title", text);
+    attr(bindingLabel, "data-checkout", checkout === null ? "" : checkout);
+    attr(bindingLabel, "data-checkout-basis", basis === null ? "" : basis);
+    attr(bindingLabel, "data-state", observed.state);
+  }
+  // A file index depends only on the directory it was read from, so only the state paths are compared.
+  function sameState(a, b) {
+    return !!(a && b && a.observed && b.observed && typeof a.observed.state === "string" &&
+      a.observed.state === b.observed.state);
   }
 
   function closeStream() {
@@ -435,7 +475,7 @@ APP_JS = r""""use strict";
     return ul;
   }
   function badge(value, map, cls) {
-    var entry = map[value];
+    var entry = own(map, value);
     var node = el("span", (cls || "badge") + " tone-" + (entry ? entry[1] : "neutral"), entry ? entry[0] : show(value));
     if (typeof value === "string") { node.title = "原始值：" + value; }
     return node;
@@ -499,6 +539,7 @@ APP_JS = r""""use strict";
           var message = body && body.error ? body.error : text.slice(0, 200);
           var failure = new Error("HTTP " + response.status + "：" + message);
           failure.status = response.status;
+          failure.observed = body && body.observed;
           throw failure;
         }
         return body;
@@ -646,8 +687,16 @@ APP_JS = r""""use strict";
     }
     promise.catch(function (error) {
       if (sequence !== renderSequence) { return; }
-      replaceMain([errorCard("读取失败：" + error.message, error.status === 409
-        ? "当前版本不解释该 run 的台账；原始文件可用文件工具查看。" : "可稍后点击刷新重试。")], "error:" + key);
+      showBinding(error.observed);
+      // This page reads one state directory; a run missing here may live in another checkout. A 404 that names no
+      // directory leaves an earlier header in place, so its hint says only that nothing was found.
+      var missing = error.status === 404 && (current.view === "detail" || current.view === "file");
+      var hint = notice(!missing ? (error.status === 409 ? "当前版本不解释该 run 的台账；原始文件可用文件工具查看。" : "可稍后点击刷新重试。")
+        : !located(error.observed) ? (current.view === "detail" ? "未找到这个 run。" : "未找到该 run 或文件。")
+        : current.view === "detail" ? "本页只读取页首所示的状态目录，这个 run 不在其中，可能属于另一个检出。"
+        : "该 run 或文件不在本页页首所示的状态目录里。", "hint");
+      if (missing) { attr(hint, "data-not-found", "true"); }
+      replaceMain([errorCard("读取失败：" + error.message, hint)], "error:" + key);
     });
   }
 
@@ -655,7 +704,7 @@ APP_JS = r""""use strict";
     var node = el("section", "card");
     attr(node, "role", "alert");
     node.appendChild(el("p", "error-text", message));
-    if (hint) { node.appendChild(notice(hint, "hint")); }
+    if (hint) { node.appendChild(hint instanceof Node ? hint : notice(hint, "hint")); }
     node.appendChild(link("返回运行列表", "#/"));
     return node;
   }
@@ -674,6 +723,7 @@ APP_JS = r""""use strict";
   function renderList(data, key) {
     keyed = {};
     sampledLabel.textContent = "采样时间 " + fmtTime(data.sampled_at);
+    showBinding(data.observed);
     var nodes = [];
     var runs = data.runs.slice().sort(function (a, b) {
       var x = typeof a.last_event_time === "number" ? a.last_event_time : -Infinity;
@@ -758,12 +808,12 @@ APP_JS = r""""use strict";
   }
 
   function dispatchSummary(row, accepted) {
-    var parts = [(ROLE[row.role] || show(row.role)) + (row.kind ? " · " + row.kind : "")];
-    var status = DISPATCH_STATUS[row.status] ? DISPATCH_STATUS[row.status][0] : show(row.status);
-    parts.push("调用状态 " + status);
-    if (row.process_state) { parts.push("进程记录 " + (PROCESS_STATE[row.process_state] || row.process_state)); }
+    var parts = [(own(ROLE, row.role) || show(row.role)) + (row.kind ? " · " + row.kind : "")];
+    var status = own(DISPATCH_STATUS, row.status);
+    parts.push("调用状态 " + (status ? status[0] : show(row.status)));
+    if (row.process_state) { parts.push("进程记录 " + (own(PROCESS_STATE, row.process_state) || row.process_state)); }
     if (row.role === "worker" && row.worker_outcome) {
-      parts.push((OUTCOME[row.worker_outcome] || row.worker_outcome) + (accepted ? "" : "（尚未接受）"));
+      parts.push((own(OUTCOME, row.worker_outcome) || row.worker_outcome) + (accepted ? "" : "（尚未接受）"));
     }
     return parts.join(" · ");
   }
@@ -774,7 +824,24 @@ APP_JS = r""""use strict";
     return node;
   }
 
-  function attentionItems(data, run, summary, current) {
+  // A call failure's facts (display only): labels, HTTP status, process exit, work attempt; null when it has none.
+  var HTTP_STATE = { missing: "缺失", "null": "null", invalid: "无效" };
+  function callFacts(data) {
+    var parts = [], hidden = Array.isArray(data.unrecognized_labels) ? data.unrecognized_labels : [];
+    ["api_error", "api_error_type", "terminal_reason"].forEach(function (name) {
+      if (hidden.indexOf(name) >= 0) { parts.push(name + "：未识别"); }
+      else if (typeof data[name] === "string") { parts.push(name + "：" + data[name]); }
+    });
+    var http = own(HTTP_STATE, data.http_status_state);
+    if (http) { parts.push("HTTP 状态：" + http); }
+    else if (typeof data.http_status === "number") { parts.push("HTTP 状态：" + data.http_status); }
+    if (typeof data.exit_confirmed === "boolean") { parts.push("进程退出：" + (data.exit_confirmed ? "已确认" : "未确认")); }
+    if (typeof data.attempt_charged === "boolean") { parts.push("工作尝试：" + (data.attempt_charged ? "已计" : "未计")); }
+    return parts.length ? el("div", "item-sub", parts.join(" · ")) : null;
+  }
+
+  // Only what needs the operator now; a recorded quota wait, rework hints and call errors are shown where they belong.
+  function attentionItems(data, run, summary) {
     var items = [];
     function add(tone, title, body) { items.push({ tone: tone, title: title, body: body }); }
     if (data.ledger_error) { add("bad", "台账无法读取", [notice(data.ledger_error, "error-text")]); }
@@ -784,7 +851,7 @@ APP_JS = r""""use strict";
     var stop = summary.stop;
     if (stop && stop.kind !== "plan_approval") {
       add(stop.exit_code === 130 ? "warn" : "bad", "停止：" + stop.title + "（" + stop.kind + "/" + stop.reason + "）",
-        [stop.detail ? notice(stop.detail, "error-text") : null].concat((stop.exits || []).map(function (command) {
+        [stop.detail ? notice(stop.detail, "error-text") : null, callFacts(stop.data || {})].concat((stop.exits || []).map(function (command) {
           var node = el("p", "hint", "出口：");
           node.appendChild(el("code", null, command));
           return node;
@@ -796,15 +863,6 @@ APP_JS = r""""use strict";
       add("warn", "运行已中断", [notice("不会自动继续，需要显式恢复。")]);
     }
     if (run.status === "paused") { add("warn", "运行已暂停", [notice("不会自动继续，需要显式恢复。")]); }
-    var wait = summary.quota_wait;
-    if (wait) {
-      // A record, not a liveness proof: a killed process leaves it behind until the next resume.
-      add("warn", "等待额度恢复：" + show(wait.window), [
-        line("item-sub", "等到 " + show(wait.until) + " · 重置时刻 " + show(wait.resets_at) + " · 来源调用 ",
-          mono(wait.source_dispatch_id)),
-        notice("记录于 " + show(wait.recorded_at) + "；台账不证明 Harness 进程仍在等待（被强杀时遗留，下一次进入执行时清除）。", "hint"),
-        notice("要取消等待：中断该进程（Ctrl-C 或 SIGTERM），之后普通 resume。", "hint")]);
-    }
     if (run.status === "awaiting_approval") {
       var bounds = summary.scope;
       add("warn", "计划等待批准", [notice("普通恢复不会批准计划。"),
@@ -841,23 +899,150 @@ APP_JS = r""""use strict";
         cont.state === "revision_pending" ? null : notice("满足请求（追加精确授权或调整超时）后普通 resume 继续；需要先修正时可拒绝该请求。", "hint"),
         cont.state === "revision_pending" ? null : resumeHint(data.id, "--reject-request FILE")]);
     }
-    if (summary.convergence && summary.convergence.warnings && summary.convergence.warnings.length) {
-      add("warn", "返工提示（仅供判断）", [list(summary.convergence.warnings.map(function (item) {
-        var scope = item.kind === "whole_run_rework" ? "整体验收" : "任务 " + show(item.task_id);
-        var text = scope + (item.work_attempts !== undefined ? "：工作尝试 " + item.work_attempts + " 次" : "：") +
-          "，审阅拒绝 " + show(item.review_rejections) + " 次";
-        if (item.recurring_findings && item.recurring_findings.length) {
-          text += "，连续出现的阻断 " + item.recurring_findings.join("、");
-        }
-        return text;
-      })), notice(summary.convergence.suggestion, "hint")]);
-    }
-    if (current && current.error && !current.accepted) {
-      add("bad", "当前任务最近一次调用出错", [line("item-sub", dispatchSummary(current, false) + " · ", mono(current.id)),
-        notice(current.error, "error-text")]);
-    }
     items.sort(function (a, b) { return (a.tone === "bad" ? 0 : 1) - (b.tone === "bad" ? 0 : 1); });
     return items;
+  }
+
+  function present(value) { return value === null || value === undefined ? "" : value; }
+  // A table's own entry for a ledger value, so that "constructor" or "__proto__" is shown as written.
+  function own(table, key) { return Object.prototype.hasOwnProperty.call(table, key) ? table[key] : undefined; }
+  function idMono(value) {
+    var node = mono(shortId(value));
+    if (typeof value === "string") { node.title = value; }
+    return node;
+  }
+
+  // The step the ledger last recorded, in wording of its own: DISPATCH_STATUS and PROCESS_STATE say "running",
+  // which next to the run ID reads as a live process; the page never probes one.
+  var STAGE_PROCESS = { prepared: "已登记，未启动", starting: "启动未确认", running: "已记录启动", exited: "已记录退出" };
+  var STAGE_STEP = {
+    task_verification: "记录的阶段：任务验证", task_review: "记录的阶段：任务审阅",
+    task_acceptance: "记录的阶段：任务接受与接受后的收尾", final_verification: "记录的阶段：整体验证",
+    final_review: "记录的阶段：整体审阅", between_steps: "台账未记录更具体的阶段"
+  };
+  function stageMarker(stage, wait) {
+    var node = el("span", "stage");
+    attr(node, "data-stage", present(stage.step));
+    attr(node, "data-stage-task", present(stage.task_id));
+    attr(node, "data-stage-attempt", present(stage.attempt));
+    attr(node, "data-stage-process", present(stage.process_state));
+    node.title = "台账最后记录的阶段；页面不探测进程，不说明进程此刻是否仍在执行";
+    if (stage.step === "dispatch") {
+      put(node, "最后记录的派发：" + (own(ROLE, stage.role) || show(stage.role)) + (stage.kind ? " · " + stage.kind : "") +
+        " · 进程记录 " + (stage.process_state ? own(STAGE_PROCESS, stage.process_state) || stage.process_state : UNAVAILABLE) + " · ");
+      node.appendChild(idMono(stage.dispatch_id));
+    } else if (stage.step === "quota_wait") {
+      wait = wait || {};
+      put(node, "等待记录：额度 " + show(wait.window) + "，等到 " + show(wait.until));
+      if (stage.dispatch_id) { put(node, " · "); node.appendChild(idMono(stage.dispatch_id)); }
+    } else {
+      put(node, own(STAGE_STEP, stage.step) || show(stage.step));
+    }
+    if (stage.task_id) { put(node, " · 任务 " + stage.task_id); }
+    if (typeof stage.attempt === "number") { put(node, " · 第 " + stage.attempt + " 次尝试"); }
+    return node;
+  }
+
+  // A record, not a liveness proof: a killed process leaves it behind until the next resume.
+  function quotaWaitNote(wait) {
+    var box = el("div", "alert tone-info");
+    attr(box, "data-quota-wait", "true");
+    box.appendChild(el("h3", null, "额度等待记录：" + show(wait.window)));
+    box.appendChild(line("item-sub", "等到 " + show(wait.until) + " · 重置时刻 " + show(wait.resets_at) + " · 来源调用 ",
+      mono(wait.source_dispatch_id)));
+    box.appendChild(notice("记录于 " + show(wait.recorded_at) + "；台账不证明 Harness 进程仍在等待（被强杀时遗留，下一次进入执行时清除）。", "hint"));
+    box.appendChild(notice("要取消等待：中断该进程（Ctrl-C 或 SIGTERM），之后普通 resume。", "hint"));
+    return box;
+  }
+
+  // Rework hints observe finished reviews and attempt counts: history to judge by, not an item to act on now.
+  function conclusionText(review) {
+    if (review.outcome === "rejected") {
+      return "否决" + (review.verdict === "approve" ? "（审阅写的是 approve，因阻断问题或处置缺口被否决）" : "");
+    }
+    if (review.outcome === "approved") { return "批准，待接受"; }
+    if (review.outcome === "invalidated") { return "审阅记录已失效（候选变化）"; }
+    return show(review.outcome);
+  }
+  function taskRework(item) {
+    var latest = item.latest_review && typeof item.latest_review === "object" ? item.latest_review : null;
+    var compared = Array.isArray(item.compared_reviews) ? item.compared_reviews.filter(function (ref) {
+      return ref && typeof ref === "object"; }) : [];
+    var labels = Array.isArray(item.repeated_labels) ? item.repeated_labels : [];
+    var since = item.attempts_since_latest_review;
+    var box = el("div", "alert tone-info");
+    attr(box, "data-rework-item", "task:" + present(item.task_id));
+    attr(box, "data-latest-attempt", present(item.latest_attempt));
+    attr(box, "data-since-review", present(since));
+    attr(box, "data-latest-outcome", latest ? present(latest.outcome) : "");
+    attr(box, "data-compared-rounds", compared.map(function (ref) { return present(ref.round); }).join(","));
+    box.appendChild(el("h3", null, "任务 " + show(item.task_id)));
+    box.appendChild(el("p", null, "工作尝试 " + show(item.work_attempts) + " 次 · 有结论的尝试中实际否决 " +
+      show(item.review_rejections) + " 次"));
+    if (compared.length) {
+      var basis = el("p", null, "依据：");
+      attr(basis, "data-basis", "label");
+      compared.forEach(function (ref, index) {
+        put(basis, (index ? "；" : "") + "第 " + show(ref.round) + " 轮（第 " + show(ref.attempt) + " 次尝试，审阅 ");
+        basis.appendChild(idMono(ref.review_dispatch_id));
+        put(basis, "）");
+      });
+      put(basis, "都新报告了阻断标签 ");
+      labels.forEach(function (label, index) {
+        if (index) { put(basis, "、"); }
+        basis.appendChild(mono(label));
+      });
+      if (item.repeated_labels_truncated) { put(basis, " 等（只列前 " + labels.length + " 个）"); }
+      box.appendChild(basis);
+      box.appendChild(notice("最近两次有结论的尝试都被否决，且都新报告了这些标签。标签是审阅者写的文字，相同标签不代表同一个问题；" +
+        "以原键 open 指出的旧问题不算重复报告。可对照“运行信息”标签页的审阅轮次。", "hint"));
+    } else {
+      box.appendChild(el("p", null, "依据：只因工作尝试次数达到阈值触发，没有可比较的重复报告标签。"));
+    }
+    var when;
+    if (!latest) { when = "尚无有结论的审阅"; }
+    else if (typeof since !== "number") { when = "尝试编号不可用"; }
+    else if (since > 0) {
+      when = "最近一次有结论的是第 " + show(latest.attempt) + " 次尝试（第 " + show(latest.round) + " 轮，" + conclusionText(latest) +
+        "）；之后尝试编号已到第 " + show(item.latest_attempt) + " 次（多 " + since + " 个，被豁免的调用也占编号），尚无审阅结论";
+    } else {
+      when = "最新一次尝试（第 " + show(item.latest_attempt) + " 次）的结论：" + conclusionText(latest) +
+        "（第 " + show(latest.round) + " 轮）";
+    }
+    box.appendChild(el("p", null, when));
+    return box;
+  }
+  function finalRework(item) {
+    var rejection = item.latest_rejection && typeof item.latest_rejection === "object" ? item.latest_rejection : {};
+    var last = item.latest_final_attempt && typeof item.latest_final_attempt === "object" ? item.latest_final_attempt : {};
+    var box = el("div", "alert tone-info");
+    attr(box, "data-rework-item", "final");
+    attr(box, "data-latest-rejection-attempt", present(rejection.attempt));
+    attr(box, "data-latest-final-attempt", present(last.attempt));
+    box.appendChild(el("h3", null, "整体验收"));
+    box.appendChild(el("p", null, "整体审阅拒绝 " + show(item.review_rejections) + " 次"));
+    var rejected = el("p", null, "最近一次拒绝：第 " + show(rejection.attempt) + " 次整体尝试，审阅 ");
+    rejected.appendChild(idMono(rejection.review_dispatch_id));
+    box.appendChild(rejected);
+    var recorded = el("p", null, "最近一次整体尝试：第 " + show(last.attempt) + " 次，台账记录 status ");
+    recorded.appendChild(mono(last.status));
+    put(recorded, " · phase ");
+    recorded.appendChild(mono(last.phase));
+    box.appendChild(recorded);
+    return box;
+  }
+  function reworkSection(convergence) {
+    var warnings = convergence && Array.isArray(convergence.warnings) ? convergence.warnings.filter(function (item) {
+      return item && typeof item === "object"; }) : [];
+    if (!warnings.length) { return null; }
+    var section = card("返工提示（已结束审阅与尝试计数的历史观察，不需要立即处理）");
+    attr(section, "data-rework", "true");
+    section.appendChild(notice("取自已结束的审阅与尝试计数，只供判断是否继续；台账最后记录的阶段见首屏的阶段标记。", "hint"));
+    var alerts = el("div", "alerts");
+    warnings.forEach(function (item) { alerts.appendChild(item.kind === "whole_run_rework" ? finalRework(item) : taskRework(item)); });
+    section.appendChild(alerts);
+    if (convergence.suggestion) { section.appendChild(notice(convergence.suggestion, "hint")); }
+    return section;
   }
 
   function metric(label, value, note, extra) {
@@ -875,7 +1060,7 @@ APP_JS = r""""use strict";
   function eventLabel(record) {
     if (record.event === "dispatch_finished" && record.invoked === true) { return "调用结束"; }
     if (record.event === "dispatch_finished" && record.invoked === false) { return "派发结束（未调用）"; }
-    return EVENT[record.event] || show(record.event);
+    return own(EVENT, record.event) || show(record.event);
   }
 
   function renderDetail(current, data, sequence, key) {
@@ -883,6 +1068,7 @@ APP_JS = r""""use strict";
     var state = ui;
     keyed = {};
     sampledLabel.textContent = "采样时间 " + fmtTime(data.sampled_at);
+    showBinding(data.observed);
     var nodes = [];
     var run = data.run || {};
     var summary = data.summary || {};
@@ -902,8 +1088,10 @@ APP_JS = r""""use strict";
     var crumbs = el("p", "crumbs");
     crumbs.appendChild(link("← 全部运行", "#/"));
     hero.appendChild(crumbs);
+    var stage = summary.ledger_stage && typeof summary.ledger_stage === "object" ? summary.ledger_stage : null;
     hero.appendChild(line("hero-top", data.run ? badge(run.status, RUN_STATUS) : chip("台账不可用", "bad"),
-      mono(data.id)));
+      mono(data.id), stage ? stageMarker(stage, summary.quota_wait) : null));
+    if (summary.quota_wait) { hero.appendChild(quotaWaitNote(summary.quota_wait)); }
     var goal = typeof run.goal === "string" && run.goal.trim() ? run.goal : null;
     var goalCut = goal ? clip(goal, GOAL_EXCERPT) : null;
     hero.appendChild(el("h2", null, goalCut ? goalCut.text : "运行 " + data.id));
@@ -917,7 +1105,7 @@ APP_JS = r""""use strict";
     nodes.push(hero);
 
     // Attention first: errors, decisions and active blockers are never behind a closed control.
-    var items = attentionItems(data, run, summary, currentDispatch);
+    var items = attentionItems(data, run, summary);
     if (items.length) {
       var attention = card("需要处理（" + items.length + "）", "attention" +
         (items.some(function (item) { return item.tone === "bad"; }) ? " has-bad" : ""));
@@ -933,6 +1121,8 @@ APP_JS = r""""use strict";
       attention.appendChild(alerts);
       nodes.push(attention);
     }
+    var rework = reworkSection(summary.convergence);
+    if (rework) { nodes.push(rework); }
 
     // Overview metrics.
     var metrics = el("div", "metrics");
@@ -953,9 +1143,9 @@ APP_JS = r""""use strict";
       last ? eventLabel(last) + (last.task_id ? " · " + last.task_id : "") : "events.jsonl 中没有可读事件");
     lastNode.title = fmtTime(data.timing && data.timing.last_event_time);
     metrics.appendChild(lastNode);
-    metrics.appendChild(metric("待处理", items.length ? el("span", items.some(function (item) {
+    metrics.appendChild(attr(metric("待处理", items.length ? el("span", items.some(function (item) {
       return item.tone === "bad"; }) ? "tone-bad" : "tone-warn", items.length + " 项") : el("span", "tone-ok", "无"),
-      items.length ? "见上方“需要处理”" : null));
+      items.length ? "见上方“需要处理”" : null), "data-pending-count", items.length));
     nodes.push(metrics);
 
     var explain = disclosure("explain", "如何理解这些状态", "small");
@@ -987,6 +1177,12 @@ APP_JS = r""""use strict";
           task.depends_on && task.depends_on.length ? " · 依赖 " + task.depends_on.join("、") : null));
         if (stateName === "current" && currentDispatch) {
           li.appendChild(el("div", "item-sub", "最近调用：" + dispatchSummary(currentDispatch, false)));
+          // The call's own record, beside the call: a stop that follows from it carries the diagnosis and exits.
+          if (currentDispatch.error) {
+            var failure = line("error-line", "错误：" + (typeof currentDispatch.error === "string" ?
+              currentDispatch.error.trim().split("\n")[0] : show(currentDispatch.error)) + " · ", mono(currentDispatch.id));
+            li.appendChild(attr(failure, "data-call-error", "true"));
+          }
         }
         ul.appendChild(li);
       });
@@ -1017,8 +1213,10 @@ APP_JS = r""""use strict";
     split.appendChild(activity);
     nodes.push(split);
 
-    // Secondary detail grouped into tabs.
-    var filesCount = el("span", "count", state.files ? state.files.files.length : "…");
+    // Secondary detail grouped into tabs. A cached index read from another state directory (the same run ID
+    // behind a restarted server) is never shown, not even until the fresh one arrives.
+    if (!sameState(state.files, data)) { state.files = null; }
+    var filesCount = el("span", "count", "…");
     var filesPanel = el("div");
     var errored = dispatches.filter(function (row) { return row.error; }).length;
     var tabNode = tabs(state, [
@@ -1040,12 +1238,22 @@ APP_JS = r""""use strict";
         if (name.indexOf("file:") === 0 || name === "files:filter") { delete keyed[name]; }
       });
       while (filesPanel.firstChild) { filesPanel.removeChild(filesPanel.firstChild); }
+      // The count and the panel always show one and the same outcome: only an attached index has a count.
+      var attached = !error && index && sameState(index, data);
+      filesCount.textContent = attached ? String(index.files.length) : "…";
       if (error) {
         filesPanel.appendChild(notice("文件索引读取失败：" + error, "error-text"));
         return;
       }
+      if (index && !attached) {
+        var mismatch = notice("文件索引与本页详情不是从同一个状态目录读取的，未显示：详情来自 " +
+          show(data.observed && data.observed.state) + "，索引来自 " + show(index.observed && index.observed.state) +
+          "。请刷新。", "hint tone-warn breakable");
+        attr(mismatch, "data-files-mismatch", "true");
+        filesPanel.appendChild(mismatch);
+        return;
+      }
       if (!index) { filesPanel.appendChild(notice("载入中…")); return; }
-      filesCount.textContent = String(index.files.length);
       filesPanel.appendChild(filesView(data.id, index, state));
       restoreScroll(filesPanel);
     }
@@ -1053,7 +1261,7 @@ APP_JS = r""""use strict";
     replaceMain(nodes, key);
     getJSON("/api/runs/" + encodeURIComponent(data.id) + "/files").then(function (index) {
       if (sequence !== renderSequence || state !== ui) { return; }
-      state.files = index;
+      if (sameState(index, data)) { state.files = index; }
       var focused = captureFocus(filesPanel);
       fillFiles(index);
       refocus(focused);
@@ -1136,7 +1344,8 @@ APP_JS = r""""use strict";
 
   function dispatchPanel(data, dispatches, tasks) {
     var panel = el("div");
-    var accepted = {};
+    // Task IDs are ledger values: without a prototype, "constructor" or "__proto__" is an ID like any other.
+    var accepted = Object.create(null);
     tasks.forEach(function (task) { if (task.accepted) { accepted[task.id] = true; } });
     if (data.invalid_dispatches) { panel.appendChild(notice("跳过 " + data.invalid_dispatches + " 个没有字符串 ID 的 dispatch 项", "tone-warn")); }
     if (!dispatches.length) {
@@ -1149,7 +1358,7 @@ APP_JS = r""""use strict";
       var box = disclosure("dispatch:" + row.id, null, "dispatch");
       var summary = box.firstChild;
       var head = el("span", "dispatch-line");
-      head.appendChild(el("span", "item-title", (ROLE[row.role] || show(row.role)) + (row.kind ? " · " + row.kind : "")));
+      head.appendChild(el("span", "item-title", (own(ROLE, row.role) || show(row.role)) + (row.kind ? " · " + row.kind : "")));
       if (row.task_id) { head.appendChild(chip(row.task_id)); }
       head.appendChild(badge(row.status, DISPATCH_STATUS));
       if (row.invocation_class === "unknown" || row.startup_unconfirmed) {
@@ -1159,7 +1368,7 @@ APP_JS = r""""use strict";
         head.appendChild(klass);
       }
       if (row.role === "worker" && row.worker_outcome) {
-        head.appendChild(chip((OUTCOME[row.worker_outcome] || row.worker_outcome) +
+        head.appendChild(chip((own(OUTCOME, row.worker_outcome) || row.worker_outcome) +
           (row.task_id && accepted[row.task_id] ? "" : "（尚未接受）")));
       }
       head.appendChild(el("span", "small muted", fmtTime(row.invoked_at)));
@@ -1172,7 +1381,8 @@ APP_JS = r""""use strict";
         if (index) { files.appendChild(document.createTextNode(" ")); }
         files.appendChild(link(name, fileHash(data.id, "dispatches/" + row.id + "/" + name)));
       });
-      var klassText = (INVOCATION[row.invocation_class] ? INVOCATION[row.invocation_class][0] : show(row.invocation_class)) +
+      var invocation = own(INVOCATION, row.invocation_class);
+      var klassText = (invocation ? invocation[0] : show(row.invocation_class)) +
         " (" + show(row.invocation_class) + ")" + (row.invocation_reason ? "：" + row.invocation_reason : "");
       body.appendChild(kv([
         ["dispatch", mono(row.id)], ["角色 / 类型", show(row.role) + " / " + show(row.kind)], ["任务", row.task_id],
@@ -1215,7 +1425,8 @@ APP_JS = r""""use strict";
       (events.unparsed_tail ? "；最后一行未完成或无法解析（运行中属正常）" : "") +
       (events.invalid_lines ? "；无法解析 " + events.invalid_lines + " 行" : ""), "hint"));
     panel.appendChild(table(["时间", "事件", "任务", "dispatch", "其他字段"], records.slice().reverse().map(function (record) {
-      var extra = {};
+      // Field names come from the record: on a plain object a field named "__proto__" would drop out of the text.
+      var extra = Object.create(null);
       Object.keys(record).forEach(function (key) {
         if (["time", "event", "run_id", "task_id", "dispatch_id"].indexOf(key) < 0) { extra[key] = record[key]; }
       });
@@ -1273,11 +1484,11 @@ APP_JS = r""""use strict";
         points > 0 ? "（增加 " + points + " 个百分点）" : points < 0 ? "（减少 " + (-points) + " 个百分点）" : "（无变化）";
     }
     var missing = [];
-    if (segment.incomplete_start) { missing.push(QUOTA_START[segment.incomplete_start] || segment.incomplete_start); }
-    if (segment.incomplete_end) { missing.push(QUOTA_END[segment.incomplete_end] || segment.incomplete_end); }
+    if (segment.incomplete_start) { missing.push(own(QUOTA_START, segment.incomplete_start) || segment.incomplete_start); }
+    if (segment.incomplete_end) { missing.push(own(QUOTA_END, segment.incomplete_end) || segment.incomplete_end); }
     if (missing.length) { text += "（不完整：" + missing.join("／") + "）"; }
     if (segment.flags && segment.flags.length) {
-      text += "［" + segment.flags.map(function (flag) { return QUOTA_FLAGS[flag] || flag; }).join("、") + "］";
+      text += "［" + segment.flags.map(function (flag) { return own(QUOTA_FLAGS, flag) || flag; }).join("、") + "］";
     }
     return text;
   }
@@ -1512,7 +1723,7 @@ APP_JS = r""""use strict";
     if (summary.worker_outcomes) {
       panel.appendChild(el("h3", null, "worker 结果计数（观测值，不等于接受）"));
       panel.appendChild(kv(Object.keys(summary.worker_outcomes).map(function (key) {
-        return [(OUTCOME[key] || key) + "（" + key + "）", summary.worker_outcomes[key]];
+        return [(own(OUTCOME, key) || key) + "（" + key + "）", summary.worker_outcomes[key]];
       })));
     }
     var blocker = summary.last_environment_blocker;
@@ -1585,6 +1796,7 @@ APP_JS = r""""use strict";
   function renderFile(current, data, key) {
     keyed = {};
     sampledLabel.textContent = "采样时间 " + fmtTime(data.sampled_at);
+    showBinding(data.observed);
     var nodes = [];
     var head = el("section", "card");
     var crumbs = el("p", "crumbs");

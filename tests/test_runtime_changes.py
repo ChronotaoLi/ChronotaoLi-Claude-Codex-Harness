@@ -72,7 +72,7 @@ def revised(result, packet, reason, new_tasks=(), updates=(), selected=None, ins
 def update(task, description=None, deps=(), paths=(), commands=()):
     """One revision update row: every field present (the contract requires them), unused ones empty."""
     return {"id": task["id"], "description": description or task["description"], "add_depends_on": list(deps),
-            "add_allowed_paths": list(paths), "add_required_commands": [list(argv) for argv in commands]}
+            "add_allowed_paths": list(paths), "add_required_commands": [copy.deepcopy(command) for command in commands]}
 
 
 def current_tasks(packet):

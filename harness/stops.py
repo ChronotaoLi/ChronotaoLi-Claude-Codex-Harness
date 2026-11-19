@@ -28,6 +28,15 @@ LIST_BYTES = 8 * 1024
 STOP_LIMIT = 32 * 1024
 _ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,119}")
 _SHA = re.compile(r"[0-9a-f]{64}")
+# The shape of the enum constants the Claude CLI writes itself (api_error, terminal_reason, subtype):
+# shown as written, new values included. Defined here, not in provider_failures: util imports stops.
+LABEL = re.compile(r"[a-z][a-z0-9_]{0,63}")
+# Claude Code 2.1.327's own table of standard response-body error types (eQr); the CLI files any other
+# api_error_type as "other". That field is copied from the upstream body, so only these are shown.
+BODY_TYPES = ("invalid_request_error", "authentication_error", "billing_error", "permission_error",
+              "not_found_error", "request_too_large", "rate_limit_error", "timeout_error", "api_error",
+              "overloaded_error")
+LABEL_FIELDS = ("api_error", "api_error_type", "terminal_reason")
 
 
 def _id(v): return type(v) is str and _ID.fullmatch(v) is not None
@@ -42,6 +51,10 @@ def _enum(*names):
     def check(v): return type(v) is str and v in names
     check.values = names
     return check
+def _label(v): return type(v) is str and LABEL.fullmatch(v) is not None
+def _label_names(v):
+    return (type(v) is list and len(v) > 0 and all(type(x) is str and x in LABEL_FIELDS for x in v)
+            and len(set(v)) == len(v))
 def _size(v): return len(json.dumps(v, ensure_ascii=True))
 
 
@@ -61,11 +74,14 @@ def _listed(entry, name):
 
 
 def _strings_shape(v): return type(v) is list and all(type(x) is str and len(x) <= 4096 for x in v)
-def _argv_list_shape(v): return type(v) is list and all(type(a) is list and all(type(x) is str for x in a) for a in v)
+def _command_shape(v):
+    return (type(v) is dict and set(v) == {"cwd", "argv"} and type(v["cwd"]) is str
+            and type(v["argv"]) is list and all(type(x) is str for x in v["argv"]))
+def _command_list_shape(v): return type(v) is list and all(_command_shape(c) for c in v)
 def _map_shape(v): return (type(v) is dict and all(_id(k) and type(x) is list
                                                     and all(type(p) is str and len(p) <= 4096 for p in x)
                                                     for k, x in v.items()))
-def _argv_map_shape(v): return type(v) is dict and all(_id(k) and _argv_list_shape(x) for k, x in v.items())
+def _command_map_shape(v): return type(v) is dict and all(_id(k) and _command_list_shape(x) for k, x in v.items())
 def _superseded(v): return type(v) is dict and set(v) == {"kind", "reason"} and all(_id(x) for x in v.values())
 def _quota_window(v):
     return (type(v) is dict and set(v) == {"bucket", "used_percent", "resets_at"}
@@ -73,8 +89,8 @@ def _quota_window(v):
             and (type(v["used_percent"]) is int or (type(v["used_percent"]) is float and math.isfinite(v["used_percent"])))
             and v["used_percent"] >= 0 and (v["resets_at"] is None or _text(v["resets_at"]) and len(v["resets_at"]) <= 40))
 _strings = _bounded(_strings_shape)
-_argv_list = _bounded(_argv_list_shape)
-_argv_map = _bounded(_argv_map_shape)
+_command_list = _bounded(_command_list_shape)
+_command_map = _bounded(_command_map_shape)
 _strings_map = _bounded(_map_shape)
 _quota_windows = _bounded(lambda v: type(v) is list and all(_quota_window(x) for x in v), 4096, items=16)
 
@@ -92,6 +108,12 @@ def _row(kind, reason, exit_code, title, exits=(), source=(), **data):
 
 
 ROLE = _enum("commander", "worker", "reviewer")
+# Facts of a classified call failure (spec-3 rule 8), display only: nothing classifies from them and no
+# exit reads them. Labels, the HTTP status state and the exit confirmation come from the two originals
+# when they read again unchanged; attempt_charged (workers only) comes from the ledger.
+_CALL_FACTS = {"api_error": _label, "api_error_type": _enum(*BODY_TYPES), "terminal_reason": _label,
+               "unrecognized_labels": _label_names, "http_status_state": _enum("missing", "null", "valid", "invalid"),
+               "exit_confirmed": _bool, "attempt_charged": _bool}
 _row("plan_approval", "initial_plan", 0, "计划等待明确批准", ("status {run} --full", "resume {run} --approve-plan"),
      ("artifact", "artifact_digest"), revision=_int, task_count=_int)
 _row("operator_decision", "answer_required", 3, "等待操作者决定",
@@ -106,23 +128,23 @@ _SCOPE_EXITS = (("resume {run} {suggested_scope:scope_args}", "suggested_scope")
                 "resume {run} --reject-request FILE", "status {run}")
 _PROPOSAL_SOURCE = ("request_id", "dispatch_id", "artifact", "artifact_digest")
 _row("scope_extension", "revision", 3, "指挥修订有模式无法证明在范围边界内（已持有）", _SCOPE_EXITS, _PROPOSAL_SOURCE,
-     suggested_scope=_strings, gaps=_strings_map, missing_commands=_argv_map, scope=_strings, widened=_strings,
+     suggested_scope=_strings, gaps=_strings_map, missing_commands=_command_map, scope=_strings, widened=_strings,
      selected_task=_id, config_key=_key)
 _row("scope_extension", "initial_plan", 3, "首版计划有模式无法证明在范围边界内（已持有）", _SCOPE_EXITS, _PROPOSAL_SOURCE,
-     suggested_scope=_strings, gaps=_strings_map, missing_commands=_argv_map, scope=_strings, widened=_strings,
+     suggested_scope=_strings, gaps=_strings_map, missing_commands=_command_map, scope=_strings, widened=_strings,
      config_key=_key)
 _row("scope_extension", "supplied_plan", 3, "供给的首版计划越出启动后声明的范围边界",
      (("resume {run} {suggested_scope:scope_args}", "suggested_scope"), "abandon {run}"), (),
      suggested_scope=_strings, gaps=_strings_map, scope=_strings, widened=_strings)
-for _r, _t, _extra in (("commands_required", "续作需要授权精确命令", {"missing_commands": _argv_list}),
+for _r, _t, _extra in (("commands_required", "续作需要授权精确命令", {"missing_commands": _command_list}),
                        ("timeout_required", "续作需要更长的单次时限",
                         {"config_key": _key, "minimum_timeout_seconds": _int, "agent_timeout_seconds": _int})):
     _row("continuation", _r, 3, _t, ("resume {run}", "resume {run} --reject-request FILE"),
          ("continuation_id", "task_id", "dispatch_id"), **_extra)
 _row("missing_commands", "selected_task", 3, "选中任务所需命令尚未授权", ("resume {run}",), ("task_id",),
-     config_key=_key, missing=_argv_map)
+     config_key=_key, missing=_command_map)
 _row("missing_commands", "all_ready_tasks", 3, "全部就绪任务所需命令尚未授权", ("resume {run}",), (),
-     config_key=_key, missing=_argv_map)
+     config_key=_key, missing=_command_map)
 _row("environment", "worker_blocked", 3, "worker 报告环境受阻", ("resume {run}", "resume {run} --environment-update FILE"),
      ("task_id", "dispatch_id", "artifact", "artifact_digest"), invalid_output=_bool)
 _row("environment", "checks_failed", 3, "环境前置检查未通过", ("resume {run}",), ("task_id", "artifact"))
@@ -135,12 +157,12 @@ _row("budget", "context_capacity", 3, "必要上下文超过预算", ("resume {r
 _row("budget", "proposal_capacity", 3, "已判定合格的提案在当前条件下超过整体审阅容量（提案保留）",
      ("resume {run}", "resume {run} --reject-request FILE"), _PROPOSAL_SOURCE,
      config_key=_key, required_chars=_int, budget_chars=_int)
-_row("budget", "review_findings", 3, "待核验阻断问题超过单次审阅容量", ("abandon {run}",), ("task_id",),
-     open_findings=_int, limit=_int)
 _row("budget", "agent_timeout", 3, "调用超过单次时限", ("resume {run}",),
-     ("dispatch_id", "task_id", "artifact", "artifact_digest"), role=ROLE, config_key=_key, limit_seconds=_int)
+     ("dispatch_id", "task_id", "artifact", "artifact_digest"), role=ROLE, config_key=_key, limit_seconds=_int,
+     **_CALL_FACTS)
 _row("budget", "agent_turns", 3, "Claude 轮数用尽", ("resume {run}",),
-     ("dispatch_id", "task_id", "artifact", "artifact_digest"), role=ROLE, config_key=_key, http_status=_int)
+     ("dispatch_id", "task_id", "artifact", "artifact_digest"), role=ROLE, config_key=_key, http_status=_int,
+     **_CALL_FACTS)
 _row("verification", "final_timeout", 3, "整体验证超时", ("resume {run}",), ("artifact",), config_key=_key, attempt=_int)
 _row("verification", "setup_failed", 3, "全新检出的依赖准备失败", ("resume {run}",), ("artifact",), attempt=_int)
 _row("verification", "checks_modified_files", 3, "验证修改了受检文件", ("resume {run}",), ("task_id", "artifact"),
@@ -154,7 +176,8 @@ _row("process_unconfirmed", "dispatch_exit", 3, "旧派发的退出无法确认"
      returned_unsealed=_bool)
 _row("process_unconfirmed", "command_exit", 3, "命令子进程的退出无法确认", _UNCONFIRMED_EXITS, ("dispatch_id",),
      command_id=_id, returned_unsealed=_bool)
-# Classified call failures (spec-5): the failure original's path and digest in source.
+# Classified call failures (spec-5): the failure original's path and digest in source; their
+# _CALL_FACTS only describe the failure (spec-3 rule 8), the type alone decides the exits.
 _FAILURE_SOURCE = ("dispatch_id", "task_id", "artifact", "artifact_digest")
 # A quota failure's account snapshot (spec-7 3.6), all optional: whether a sample was taken and
 # published, its file name, why it is unavailable, and the snapshot's windows at 100 % or more as
@@ -173,14 +196,15 @@ _WAIT_DATA = {"wait_reason": _enum(*WAIT_REASONS), "waits": _int, "window": _tex
               "wait_seconds": _int, "wait_limit_seconds": _int, "uncertain_windows": _strings}
 for _k, _r, _t in (("provider_quota", "usage_limit", "供应商额度用尽"), ("provider_quota", "rate_limit", "供应商限速"),
                    ("provider_failure", "overloaded", "供应商过载"),
+                   ("provider_failure", "transport", "与供应商的连接失败"),
                    ("provider_failure", "invocation_failed", "模型调用失败（CLI 报告错误）"),
                    ("provider_failure", "local_start", "模型 CLI 未能启动"),
                    ("provider_failure", "unknown", "模型调用失败（原因未识别）")):
     _row(_k, _r, 3, _t, ("resume {run}",), _FAILURE_SOURCE,
-         role=ROLE, provider=_enum("claude", "codex"), http_status=_int,
+         role=ROLE, provider=_enum("claude", "codex"), http_status=_int, **_CALL_FACTS,
          **(_QUOTA_DATA if _k == "provider_quota" else {}), **(_WAIT_DATA if _r == "usage_limit" else {}))
 _row("provider_failure", "authentication", 3, "账号认证或权限失败", ("doctor", "resume {run}"), _FAILURE_SOURCE,
-     role=ROLE, provider=_enum("claude", "codex"), http_status=_int)
+     role=ROLE, provider=_enum("claude", "codex"), http_status=_int, **_CALL_FACTS)
 _row("invalid_output", "redo_exhausted", 3, "输出连续两次无效", ("resume {run}", "abandon {run}"),
      ("dispatch_id", "task_id", "artifact", "artifact_digest"), role=ROLE)
 _row("workspace_mismatch", "head_changed", 1, "工作树 HEAD 与检查点不同",

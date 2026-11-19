@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import contextlib
+import errno
 import fcntl
 import json
 import math
 import os
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -18,6 +20,7 @@ from . import stops
 
 
 PROCESS_HEARTBEAT_SECONDS = 60
+DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 
 
 class HarnessError(Exception):
@@ -40,6 +43,10 @@ class EvidenceError(HarnessError):
 
 class ProcessStartError(HarnessError):
     """Popen rejected startup synchronously; no child process was created."""
+
+
+class CommandDirectoryError(ProcessStartError):
+    """A command's directory could not be opened or entered below its root; nothing started."""
 
 
 class ProcessTimeout(HarnessError):
@@ -317,11 +324,130 @@ def readonly_lock(path):
         os.close(descriptor)
 
 
+# Failures that describe the directory itself; other errors (descriptors, devices) stay local I/O.
+_DIRECTORY_ERRNOS = frozenset((errno.ENOENT, errno.ENOTDIR, errno.ELOOP, errno.EACCES, errno.EPERM, errno.ENAMETOOLONG))
+
+
+def _directory_failure(name, parent, error):
+    if isinstance(error, ValueError):
+        return "无法编码为路径"
+    try:
+        mode = os.stat(name, dir_fd=parent, follow_symlinks=False).st_mode
+    except FileNotFoundError:
+        return "不存在"
+    except PermissionError:
+        return "无权限"
+    except OSError:
+        return str(error)
+    if stat.S_ISLNK(mode):
+        return "是符号链接"
+    if not stat.S_ISDIR(mode):
+        return "不是目录"
+    return "无权限" if isinstance(error, PermissionError) else str(error)
+
+
+class Descriptors:
+    """Descriptors a caller owns from the step that opens each one until its cleanup closes them.
+
+    Get one from with_descriptors, which closes it. Opening and registering are one step,
+    so no descriptor is ever held by a return value alone. Only that step and closing
+    defer signals; whatever runs between them (reads, later levels of a walk, Git) stays
+    interruptible. Each descriptor leaves the holder before it is closed, so closing
+    again never reaches a number reused since; nothing closes them on collection.
+    """
+
+    def __init__(self):
+        self._held = []
+
+    def open(self, path, flags, *, dir_fd=None) -> int:
+        return self._take(os.open, path, flags, dir_fd=dir_fd)
+
+    def dup(self, descriptor) -> int:
+        return self._take(os.dup, descriptor)
+
+    def _take(self, opener, *args, **kwargs):
+        from .process_runtime import defer_cleanup_signals
+        # Not inherit: a caller handling another exception must still see a request deferred here.
+        with defer_cleanup_signals(inherit=False):
+            descriptor = opener(*args, **kwargs)
+            self._held.append(descriptor)
+        return descriptor
+
+    def close(self, descriptor):
+        """Close one held descriptor now; it is dropped first, so a failed close is never retried."""
+        from .process_runtime import defer_cleanup_signals
+        with defer_cleanup_signals(inherit=False):
+            self._held.remove(descriptor)
+            os.close(descriptor)
+
+    def close_all(self):
+        """Close what is still held, each once; a failed close never replaces the error in flight."""
+        from .process_runtime import defer_cleanup_signals
+        if not self._held:
+            return
+        with defer_cleanup_signals(inherit=False):
+            while self._held:
+                with contextlib.suppress(OSError):
+                    os.close(self._held.pop())
+
+
+def with_descriptors(use):
+    """Return ``use(held)`` for a new holder, closing it in two nested cleanups.
+
+    A signal can land at any bytecode, a cleanup's entry before it defers signals
+    included; the outer cleanup then closes what the inner one did not. Only two
+    signals, one on each cleanup's entry, can leave descriptors open.
+    """
+    held = Descriptors()
+    try:
+        try:
+            return use(held)
+        finally:
+            held.close_all()
+    finally:
+        held.close_all()
+
+
+def open_command_directory(held: Descriptors, root_fd: int, relative: str) -> int:
+    """Open a worktree-relative directory level by level below an open root, following no link.
+
+    Each level is registered in ``held`` as it opens and the level above it is closed; the
+    returned descriptor stays ``held``'s ("." gives a dup of the root). root_fd is never closed.
+    """
+    # Entry validation already refused these; a stale or hand-made value must still not escape.
+    if relative != "." and (not isinstance(relative, str) or relative.startswith("/")
+                            or any(segment in ("", ".", "..") for segment in relative.split("/"))):
+        raise CommandDirectoryError(f"命令目录 {relative!r} 无效：不能是绝对路径，不能有空段、. 或 .. 段")
+    if relative == ".":
+        return held.dup(root_fd)
+    segments = relative.split("/")
+    current = root_fd
+    for index, segment in enumerate(segments):
+        try:
+            following = held.open(segment, DIRECTORY_FLAGS, dir_fd=current)
+        except (OSError, ValueError) as error:
+            if isinstance(error, OSError) and error.errno not in _DIRECTORY_ERRNOS:
+                raise
+            shown = "/".join(segments[:index + 1])
+            raise CommandDirectoryError(
+                f"命令目录 {relative!r} 无法打开：{shown!r} {_directory_failure(segment, current, error)}") from error
+        if current != root_fd:
+            held.close(current)
+        current = following
+    return current
+
+
 def run_process(argv: list[str], cwd: Path, log: Path, *, stdin: str = "",
                 timeout: int | float = 900, env=None, on_start=None, on_outcome=None,
-                execution_deadline=None, cleanup_deadline=None) -> int:
-    """No shell interpolation; terminate the owned process group on all exits."""
+                execution_deadline=None, cleanup_deadline=None, relative_cwd=None, root_fd=None) -> int:
+    """No shell interpolation; terminate the owned process group on all exits.
+
+    With relative_cwd the child starts in that directory, opened from root_fd (the
+    caller's verified root, which stays open and the caller's); cwd is then unused.
+    """
     from .process_runtime import ProcessSupervisor, defer_cleanup_signals
+    if (relative_cwd is None) != (root_fd is None):
+        raise ValueError("relative_cwd and root_fd go together")
     execution_deadline = min(time.monotonic() + timeout, execution_deadline if execution_deadline is not None else float("inf"))
     log.parent.mkdir(parents=True, exist_ok=True)
     supervision = ProcessSupervisor(log, on_outcome=on_outcome, cleanup_deadline=cleanup_deadline)
@@ -336,18 +462,48 @@ def run_process(argv: list[str], cwd: Path, log: Path, *, stdin: str = "",
             source.seek(0)
             if time.monotonic() >= execution_deadline:
                 raise ProcessTimeout(timeout, log)
-            # Retain cancellation until the supervisor owns the new process.
-            # Popen can have created its child before returning to this frame.
-            with defer_cleanup_signals():
-                supervision.begin_launch()
-                try:
-                    p = subprocess.Popen(argv, cwd=cwd, stdin=source, stdout=out,
-                                         stderr=err, text=True, env=env, start_new_session=True)
-                except (OSError, ValueError) as e:
-                    message = f"无法启动进程 {argv[0] if argv else '<empty argv>'}：{e}；日志：{log}"
-                    err.write(message + "\n")
-                    raise ProcessStartError(message) from e
-                supervision.started(p)
+
+            def start(held):
+                directory = None
+                if relative_cwd is not None:
+                    try:
+                        directory = open_command_directory(held, root_fd, relative_cwd)
+                    except CommandDirectoryError as e:
+                        err.write(f"{e}\n")
+                        raise
+                    # Opening may have blocked; nothing starts after the deadline.
+                    if time.monotonic() >= execution_deadline:
+                        raise ProcessTimeout(timeout, log)
+                # The child enters the opened directory itself, so no path is resolved
+                # again; preexec_fn assumes this process is single-threaded.
+                launch = {"cwd": cwd} if directory is None else {
+                    "cwd": None, "preexec_fn": lambda fd=directory: os.fchdir(fd)}
+                # Retain cancellation until the supervisor owns the new process.
+                # Popen can have created its child before returning to this frame.
+                with defer_cleanup_signals():
+                    supervision.begin_launch()
+                    try:
+                        p = subprocess.Popen(argv, stdin=source, stdout=out, stderr=err, text=True,
+                                             env=env, start_new_session=True, **launch)
+                    except subprocess.SubprocessError as e:
+                        if directory is None:
+                            raise
+                        # preexec_fn failed before exec; the child reports no errno.
+                        message = f"无法进入命令目录 {relative_cwd!r}（fchdir 失败，例如没有搜索权限）：{e}；日志：{log}"
+                        err.write(message + "\n")
+                        raise CommandDirectoryError(message) from e
+                    except (OSError, ValueError) as e:
+                        message = f"无法启动进程 {argv[0] if argv else '<empty argv>'}：{e}；日志：{log}"
+                        err.write(message + "\n")
+                        raise ProcessStartError(message) from e
+                    # Ownership first: a failing close below must not leave the child unsupervised.
+                    supervision.started(p)
+                    if directory is not None:
+                        held.close(directory)
+                return p
+
+            # A start that failed or was interrupted leaves its directory to the holder's cleanup.
+            p = with_descriptors(start)
             started = time.monotonic()
             if on_start:
                 on_start(p.pid)
@@ -368,8 +524,13 @@ def tail(path: Path, size=4000) -> str:
     if not path.exists():
         return ""
     with path.open("rb") as f:
-        f.seek(0, 2)
-        length = f.tell()
-        f.seek(max(0, length - size))
-        value = f.read().decode("utf-8", errors="replace")
+        return tail_text(f, size)
+
+
+def tail_text(f, size=4000) -> str:
+    f.seek(0, 2)
+    length = f.tell()
+    f.seek(max(0, length - size))
+    # At most size bytes: the file can grow after the seek.
+    value = f.read(size).decode("utf-8", errors="replace")
     return ("[earlier output omitted; see log]\n" if length > size else "") + value

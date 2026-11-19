@@ -31,7 +31,8 @@ class ConfigChangesTests(unittest.TestCase):
         project.parent.mkdir(parents=True, exist_ok=True)
         for path, keep in ((operator, lambda key: key not in PROJECT_SECTIONS),
                            (project, lambda key: key in PROJECT_SECTIONS)):
-            path.write_text("\n".join(f"{key} = {toml_value(value)}" for key, value in data.items() if keep(key)))
+            path.write_text("\n".join(f"{key} = {toml_value(value)}" for key, value in data.items() if keep(key)),
+                            encoding="utf-8")
         return operator, project
 
     def load(self, data=None):
@@ -140,15 +141,19 @@ class ConfigChangesTests(unittest.TestCase):
                 self.load()
 
     def test_worker_permissions_require_exact_command_arrays(self):
-        for commands in ("npm test", ["npm test"], [[]], [[""]], [["npm", 7]], [["echo", "bad\0arg"]]):
+        for argv in ([], [""], ["npm", 7], ["echo", "bad\0arg"]):
+            self.data["permissions"]["worker_commands"] = [{"cwd": ".", "argv": argv}]
+            with self.subTest(argv=argv), self.assertRaises(HarnessError):
+                self.load()
+        for commands in ("npm test", ["npm test"], [["npm", "test"]]):
             self.data["permissions"]["worker_commands"] = commands
             with self.subTest(commands=commands), self.assertRaises(HarnessError):
                 self.load()
-        self.data["permissions"]["worker_commands"] = [["npm", "run", "build"]]
-        self.assertEqual(self.load().data["permissions"]["worker_commands"], [["npm", "run", "build"]])
+        self.data["permissions"]["worker_commands"] = [{"cwd": ".", "argv": ["npm", "run", "build"]}]
+        self.assertEqual(self.load().data["permissions"]["worker_commands"], [{"cwd": ".", "argv": ["npm", "run", "build"]}])
 
     def test_worker_commands_preserve_literal_star_and_line_breaks(self):
-        commands = [["echo", "*", "a\nb", "a\rb"]]
+        commands = [{"cwd": ".", "argv": ["echo", "*", "a\nb", "a\rb"]}]
         self.data["permissions"]["worker_commands"] = commands
         self.assertEqual(self.load().data["permissions"]["worker_commands"], commands)
 
@@ -177,7 +182,7 @@ class ConfigChangesTests(unittest.TestCase):
         mutations = [
             ("roles", "reviewer", "model", "configured-other-model"),
             ("roles", "reviewer", "effort", "low"),
-            ("verification", "commands", [["true"]]),
+            ("verification", "commands", [{"cwd": ".", "argv": ["true"]}]),
             ("shared", "rules", "different-rules.md"),
             ("memory", "task_ttl_days", 365),
         ]
@@ -191,6 +196,56 @@ class ConfigChangesTests(unittest.TestCase):
             with self.subTest(keys=keys), self.assertRaisesRegex(HarnessError, "配置已改变"):
                 config.resume_changes(snapshot)
 
+    def resumed(self, section, key, saved, current):
+        """resume_changes of a snapshot holding ``saved`` at section.key against ``current``; the snapshot is left unchanged."""
+        self.data[section][key] = copy.deepcopy(saved)
+        config = self.load()
+        snapshot = copy.deepcopy(config.data)
+        config.data[section][key] = copy.deepcopy(current)
+        try:
+            return config.resume_changes(snapshot)
+        finally:
+            self.assertEqual(snapshot[section][key], saved)
+
+    def test_resume_compares_worker_grants_as_a_multiset_of_exact_directory_and_argv_pairs(self):
+        a, b, c = ({"cwd": cwd, "argv": ["flutter", "test"]} for cwd in ("a/app", "b/app", "c/app"))
+        # One name precomposed and decomposed: two directory strings, so two grants.
+        cafe, cafe_nfd = ({"cwd": cwd, "argv": ["flutter", "test"]} for cwd in ("caf\u00e9", "cafe\u0301"))
+        lint = {"cwd": ".", "argv": ["make", "lint"]}
+        grants = lambda saved, current: self.resumed("permissions", "worker_commands", saved, current)
+        # The same argv in another directory, anywhere in the list, is a relaxation; added in the current order.
+        self.assertEqual(grants([a, lint], [b, a, lint]), {"worker_commands": {"old": [a, lint], "new": [b, a, lint], "added": [b]}})
+        self.assertEqual(grants([cafe, lint], [cafe, cafe_nfd, lint]),
+                         {"worker_commands": {"old": [cafe, lint], "new": [cafe, cafe_nfd, lint], "added": [cafe_nfd]}})
+        self.assertEqual(grants([a, lint], [c, a, b, lint])["worker_commands"]["added"], [c, b])
+        self.assertEqual(grants([a, lint, a], [a, a, lint, a])["worker_commands"]["added"], [a])
+        # Reordering is no change, a pair saved twice included.
+        self.assertEqual(grants([a, lint], [lint, a]), {})
+        self.assertEqual(grants([a, lint, a], [lint, a, a]), {})
+        refused = {"directory changed": ([a, lint], [{**a, "cwd": "A/app"}, lint]),
+                   "directory case changed back": ([{**a, "cwd": "A/app"}, lint], [a, lint]),
+                   "decomposed": ([cafe, lint], [cafe_nfd, lint]),
+                   "precomposed": ([cafe_nfd, lint], [cafe, lint]),
+                   "moved to the root": ([a, lint], [{**a, "cwd": "."}, lint]),
+                   "argv changed": ([a, lint], [{**a, "argv": ["flutter", "test", "-v"]}, lint]),
+                   "removed": ([a, lint], [lint, b]),
+                   "a pair saved twice kept once": ([a, lint, a], [a, lint, b])}
+        for name, (saved, current) in refused.items():
+            with self.subTest(name), self.assertRaisesRegex(HarnessError, "配置已改变"):
+                grants(saved, current)
+
+    def test_resume_requires_verification_and_setup_commands_unchanged_in_order_and_directory(self):
+        test, app = {"cwd": ".", "argv": ["make", "test"]}, {"cwd": "app", "argv": ["flutter", "test"]}
+        self.data["verification"]["fresh_checkout"] = True
+        for key in ("commands", "setup_commands"):
+            self.assertEqual(self.resumed("verification", key, [test, app], [test, app]), {})
+            # Reordered, moved to another directory (case, level), another argv in the same directory, removed, added.
+            for current in ([app, test], [test, {**app, "cwd": "App"}], [test, {**app, "cwd": "."}],
+                            [test, {**app, "argv": ["flutter", "test", "-v"]}], [{**test, "argv": ["make", "check"]}, app],
+                            [test], [test, app, app]):
+                with self.subTest(key=key, current=current), self.assertRaisesRegex(HarnessError, "配置已改变"):
+                    self.resumed("verification", key, [test, app], current)
+
     def command(self, config, role, model=None):
         job = self.root / "dispatch"
         job.mkdir(exist_ok=True)
@@ -200,7 +255,7 @@ class ConfigChangesTests(unittest.TestCase):
         return argv, settings["permissions"]["allow"]
 
     def test_claude_readonly_roles_get_constrained_inspection_without_worker_commands(self):
-        self.data["permissions"]["worker_commands"] = [["npm", "run", "build"]]
+        self.data["permissions"]["worker_commands"] = [{"cwd": ".", "argv": ["npm", "run", "build"]}]
         config = self.load()
         for role in ("commander", "reviewer"):
             argv, allow = self.command(config, role)
@@ -218,24 +273,39 @@ class ConfigChangesTests(unittest.TestCase):
                 self.assertNotIn("Bash(git *)", allow)
                 self.assertEqual(argv[argv.index("--permission-mode") + 1], "dontAsk")
 
-    def test_worker_extra_commands_are_exact_and_keep_quoted_arguments(self):
-        extra = ["python3", "-c", "print('comma, paren() and $(literal)')"]
-        self.data["permissions"]["worker_commands"] = [extra]
-        config = self.load()
-        argv, allow = self.command(config, "worker", config.role("worker"))
-        self.assertIn("Bash(" + shlex.join(extra) + ")", allow)
-        self.assertNotIn("Bash(python3 *)", allow)
-        self.assertIn("Edit(/" + self.root.resolve().as_posix() + "/**)", allow)
-        self.assertNotIn("Edit", allow)
-        self.assertNotIn("Write", allow)
-        self.assertEqual(argv[argv.index("--disallowedTools") + 1], "Agent,Task")
+    def test_worker_configured_commands_add_no_bash_rules(self):
+        readonly = ["Bash(" + shlex.join(cmd) + " *)" for cmd in Config.readonly_commands()]
+        # A plain root command, a literal *, quoted punctuation, an argv inside a read-only prefix
+        # and a subdirectory command.
+        verification = [{"cwd": ".", "argv": ["python3", "-m", "unittest", "-v"]},
+                        {"cwd": ".", "argv": ["python3", "-c", "print(2 * 3)"]}]
+        worker = [{"cwd": ".", "argv": ["python3", "-c", "print('comma, paren() and $(literal)')"]},
+                  {"cwd": ".", "argv": ["ls", "--", "."]}, {"cwd": "app", "argv": ["flutter", "test"]},
+                  {"cwd": "app", "argv": ["ls", "--", "lib"]}]
+        for name, commands in (("none", ([], [])), ("configured", (verification, worker))):
+            self.data["verification"]["commands"], self.data["permissions"]["worker_commands"] = commands
+            config = self.load()
+            job = self.root / ("dispatch-" + name)
+            job.mkdir()
+            argv = CLIBackend(config, self.root / ".harness").command("worker", config.role("worker"), self.root, job, {}, None)
+            allow = json.loads(argv[argv.index("--settings") + 1])["permissions"]["allow"]
+            with self.subTest(commands=name):
+                self.assertEqual([rule for rule in allow if rule.startswith("Bash(")], readonly)
+                self.assertIn("Bash", argv[argv.index("--tools") + 1].split(","))
+                # The same commands stay broker grants.
+                self.assertIn("mcp__harness_commands", allow)
+                self.assertEqual([c["command"] for c in read_json(job / "commands.json")["commands"]], commands[0] + commands[1])
+                self.assertIn("Edit(/" + self.root.resolve().as_posix() + "/**)", allow)
+                self.assertNotIn("Edit", allow)
+                self.assertNotIn("Write", allow)
+                self.assertEqual(argv[argv.index("--disallowedTools") + 1], "Agent,Task")
 
     def test_verification_literal_star_never_becomes_wildcard_permission(self):
-        self.data["verification"]["commands"] = [["python3", "-c", "print(2 * 3)"]]
+        self.data["verification"]["commands"] = [{"cwd": ".", "argv": ["python3", "-c", "print(2 * 3)"]}]
         config = self.load()
         _, allow = self.command(config, "worker", config.role("worker"))
         self.assertFalse(any(rule.startswith("Bash(python3") for rule in allow))
-        self.assertEqual(config.data["verification"]["commands"], [["python3", "-c", "print(2 * 3)"]])
+        self.assertEqual(config.data["verification"]["commands"], [{"cwd": ".", "argv": ["python3", "-c", "print(2 * 3)"]}])
 
     def test_adapter_keeps_exact_model_and_fresh_process_options(self):
         config = self.load()

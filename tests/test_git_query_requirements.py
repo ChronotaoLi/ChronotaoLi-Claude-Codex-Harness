@@ -6,14 +6,14 @@ from types import SimpleNamespace
 
 from harness import git
 from harness.continuation import continuation_gate
-from harness.permission_diagnostics import command_capability_projection, permission_diagnostics
+from harness.permission_diagnostics import command_capability_projection
 from harness.requirements import missing_commands
 from harness.util import HarnessError, read_json, write_json
 from test_harness import ROOT, RepoCase
 from test_runtime_changes import ScriptedBackend
 
-COVERED = ["git", "ls-files", "-z", "--", "x"]
-UNLISTED = ["git", "ls-files", "--output=y", "--", "x"]
+COVERED = {"cwd": ".", "argv": ["git", "ls-files", "-z", "--", "x"]}
+UNLISTED = {"cwd": ".", "argv": ["git", "ls-files", "--output=y", "--", "x"]}
 
 
 def events(engine):
@@ -45,12 +45,13 @@ class GitQueryCoverageLifecycleTests(RepoCase):
 
     def test_self_check_in_table_form_needs_no_grant(self):
         engine = self.engine(ScriptedBackend())
-        result = engine.start("Implement greet", self.plan(self_checks=[["git", "rev-parse", "--verify", "HEAD"]]))
+        result = engine.start("Implement greet", self.plan(self_checks=[{"cwd": ".", "argv": ["git", "rev-parse", "--verify", "HEAD"]}]))
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["command_requirements"]["missing"], {})
 
     def test_out_of_table_prerequisite_still_blocks_only_itself(self):
-        for field, unlisted in (("required_commands", UNLISTED), ("self_checks", ["sh", "-c", "git ls-files | head"])):
+        for field, unlisted in (("required_commands", UNLISTED),
+                                ("self_checks", {"cwd": ".", "argv": ["sh", "-c", "git ls-files | head"]})):
             with self.subTest(field=field):
                 backend = ScriptedBackend()
                 engine = self.engine(backend)
@@ -72,8 +73,8 @@ class GitQueryCoverageLifecycleTests(RepoCase):
         return ScriptedBackend(wait)
 
     def test_continuation_with_only_table_queries_dispatches_again_without_stopping(self):
-        query = ["git", "ls-tree", "-r", git.head(self.repo), "--", "a"]
-        self.assertEqual(len(query[3]), 40)
+        query = {"cwd": ".", "argv": ["git", "ls-tree", "-r", git.head(self.repo), "--", "a"]}
+        self.assertEqual(len(query["argv"][3]), 40)
         backend = self.continuation_backend([query])
         engine = self.engine(backend)
         result = engine.start("Implement greet", self.plan())
@@ -87,8 +88,8 @@ class GitQueryCoverageLifecycleTests(RepoCase):
         self.assertEqual(self.config.data["permissions"]["worker_commands"], [])
 
     def test_continuation_with_one_unlisted_command_stops_only_for_it(self):
-        query = ["git", "ls-tree", "-r", git.head(self.repo), "--", "a"]
-        unlisted = ["git", "ls-files", "--others", "--", "a"]
+        query = {"cwd": ".", "argv": ["git", "ls-tree", "-r", git.head(self.repo), "--", "a"]}
+        unlisted = {"cwd": ".", "argv": ["git", "ls-files", "--others", "--", "a"]}
         backend = self.continuation_backend([query, unlisted])
         engine = self.engine(backend)
         with self.assertRaises(HarnessError):
@@ -119,7 +120,7 @@ class GitQueryCoverageLifecycleTests(RepoCase):
         return engine, backend, path
 
     def test_environment_command_check_counts_builtin_capability_without_execution(self):
-        check = {"kind": "worker_command", "argv": COVERED}
+        check = {"kind": "worker_command", "command": COVERED}
         engine, backend, path = self.environment_blocked([check])
         result = self.engine(backend).resume(engine.run["id"], environment_update=path)
         self.assertEqual(result["status"], "completed")
@@ -130,8 +131,8 @@ class GitQueryCoverageLifecycleTests(RepoCase):
         self.assertEqual(self.config.data["permissions"]["worker_commands"], [])
 
     def test_environment_command_check_with_unlisted_argv_still_fails(self):
-        engine, backend, path = self.environment_blocked([{"kind": "worker_command", "argv": COVERED},
-                                                          {"kind": "worker_command", "argv": UNLISTED}])
+        engine, backend, path = self.environment_blocked([{"kind": "worker_command", "command": COVERED},
+                                                          {"kind": "worker_command", "command": UNLISTED}])
         calls = len(backend.calls)
         with self.assertRaises(HarnessError):
             self.engine(backend).resume(engine.run["id"], environment_update=path)
@@ -146,19 +147,19 @@ class GitQueryCoverageLifecycleTests(RepoCase):
 class GitQueryPermissionDiagnosticsTests(RepoCase):
     def test_builtin_coverage_is_reported_apart_from_configured_exact_argv(self):
         config = SimpleNamespace(data={"verification": {"commands": []},
-                                       "permissions": {"worker_commands": [["git", "rev-parse", "HEAD"]]}})
+                                       "permissions": {"worker_commands": [{"cwd": ".", "argv": ["git", "rev-parse", "HEAD"]}]}})
         covered = command_capability_projection(config, COVERED)
-        self.assertFalse(covered["local_exact_argv_match"])
+        self.assertFalse(covered["local_exact_command_match"])
         self.assertEqual(covered["configured_sources"], [])
         self.assertTrue(covered["builtin_coverage"]["covered"])
         self.assertEqual(covered["builtin_coverage"]["form"], "ls-files")
         self.assertFalse(covered["provider_allowance_verified"])
-        both = command_capability_projection(config, ["git", "rev-parse", "HEAD"])
-        self.assertTrue(both["local_exact_argv_match"])
+        both = command_capability_projection(config, {"cwd": ".", "argv": ["git", "rev-parse", "HEAD"]})
+        self.assertTrue(both["local_exact_command_match"])
         self.assertEqual(both["configured_sources"], ["permissions.worker_commands"])
         self.assertTrue(both["builtin_coverage"]["covered"])
-        for argv in (UNLISTED, ["sh", "-c", "git ls-files | head"]):
-            report = permission_diagnostics(config, None, argv=argv)["local_command_capability"]
-            self.assertFalse(report["local_exact_argv_match"])
+        for command in (UNLISTED, {"cwd": ".", "argv": ["sh", "-c", "git ls-files | head"]}):
+            report = command_capability_projection(config, command)
+            self.assertFalse(report["local_exact_command_match"])
             self.assertFalse(report["builtin_coverage"]["covered"])
             self.assertTrue(report["builtin_coverage"]["reason"])

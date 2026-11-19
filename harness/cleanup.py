@@ -1,6 +1,6 @@
 """The one explicit cleanup entry: retained verification checkouts and the run worktree.
 
-One shared gate (run lock, current ledger version, ledger ownership, command
+One shared gate (current ledger version, run lock, ledger ownership, command
 directories, indexes, worker receipt links, exit evidence) precedes two
 concrete resources. Fresh verification checkouts are removable in any run
 status; the branch worktree only for completed or abandoned runs. Each
@@ -42,6 +42,19 @@ def _regular_bytes(path):
     if not stat.S_ISREG(path.lstat().st_mode):
         raise HarnessError(f"清理证据或 Git 绑定必须为普通文件：{path}")
     return path.read_bytes()
+
+
+def refuse_other_version(state):
+    """Refuse a readable ledger of another version before the run lock is created or taken.
+
+    A missing or unreadable ledger is left to the entry's read under the lock,
+    which reports it as before and checks the version again.
+    """
+    try:
+        run = json.loads(_regular_bytes(state))
+    except (OSError, ValueError, RecursionError, HarnessError):
+        return
+    require_current_ledger(run)
 
 
 def _registered(repo):
@@ -98,6 +111,7 @@ def cleanup_run(repo: Path, ident: str, *, remove=False, confirm_exited=(), remo
         raise HarnessError(f"运行不存在：{ident}")
     for name in ("state.json", "run.lock", "worktree-cleanup.json"):
         _canonical(directory / name)
+    refuse_other_version(directory / "state.json")
     if remove or confirm_exited:
         from .private_state import ensure_private_state
         ensure_private_state(repo)

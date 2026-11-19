@@ -164,13 +164,13 @@ class IncrementalRevisionTests(unittest.TestCase):
 
 class ContextCompactionTests(unittest.TestCase):
     def test_noisy_verification_preserves_outcomes_and_fits_a_small_packet(self):
-        checks = [{"argv": ["python3", "check.py", str(i)], "exit_code": 1,
+        checks = [{"command": {"cwd": ".", "argv": ["python3", "check.py", str(i)]}, "exit_code": 1,
                    "log": f"verification/{i}", "stdout": "o" * 8000,
                    "stderr": "e" * 8000, "timed_out": i == 2} for i in range(3)]
         original = copy.deepcopy(checks)
         compacted = compact_checks(checks)
         for old, new in zip(checks, compacted):
-            for key in ("argv", "exit_code", "log", "timed_out"):
+            for key in ("command", "exit_code", "log", "timed_out"):
                 self.assertEqual(new[key], old[key])
             self.assertLessEqual(len(new["stdout"]) + len(new["stderr"]), 500)
             self.assertTrue(new["stdout"] and new["stderr"])
@@ -201,7 +201,7 @@ class ContextCompactionTests(unittest.TestCase):
         result = review([finding()])
         history = [{"review": result, "artifact": "review.json"}]
         feedback = {"task_id": "implement", "review": result, "artifact": "review.json",
-                    "trigger": {"verification": [{"argv": ["check"], "exit_code": 1,
+                    "trigger": {"verification": [{"command": {"cwd": ".", "argv": ["check"]}, "exit_code": 1,
                                  "stdout": "x" * 8000, "stderr": "", "log": "check"}]}}
         original = copy.deepcopy(feedback)
         compacted = compact_feedback(feedback, compact_reviews(history))

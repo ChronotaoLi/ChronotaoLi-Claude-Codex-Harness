@@ -1,4 +1,4 @@
-"""Exact-argv worker commands over a deliberately closed MCP interface.
+"""Exact worker commands, each an argv run in its cwd, over a deliberately closed MCP interface.
 
 Each run_command is a new execution, including repeated explicit requests. Receipts
 are evidence, never a retry cache. This is capability routing, not OS isolation.
@@ -23,8 +23,9 @@ from pathlib import Path
 
 from .process_runtime import defer_cleanup_signals
 from . import git, stops
-from .util import (HarnessError, ProcessStartError, ProcessTimeout, fold_name, group_alive, lock, read_json,
-                   run_process, tail, write_json)
+from .commands import command_id, valid_command, validate_command
+from .util import (DIRECTORY_FLAGS, HarnessError, ProcessStartError, ProcessTimeout, fold_name, group_alive,
+                   lock, read_json, run_process, tail, with_descriptors, write_json)
 from .versions import read_current_ledger
 
 
@@ -44,10 +45,6 @@ def _file_digest(path):
     return digest.hexdigest()
 
 
-def command_id(argv):
-    return hashlib.sha256(json.dumps(argv, ensure_ascii=True, separators=(",", ":")).encode()).hexdigest()
-
-
 def _safe(path):
     path = Path(path).absolute()
     if any(p.is_symlink() for p in (path, *path.parents)):
@@ -55,18 +52,11 @@ def _safe(path):
     return path
 
 
-def _argv(value):
-    return (isinstance(value, list) and bool(value) and all(isinstance(x, str) and "\0" not in x for x in value)
-            and bool(value[0].strip()))
-
-
 def _valid_delete_scope(scope):
-    if (not isinstance(scope, dict) or set(scope) != {"task_id", "allowed_paths", "root_identity"}
+    if (not isinstance(scope, dict) or set(scope) != {"task_id", "allowed_paths"}
             or not isinstance(scope["task_id"], str) or not scope["task_id"]
             or not isinstance(scope["allowed_paths"], list) or not scope["allowed_paths"]
-            or not all(isinstance(pattern, str) for pattern in scope["allowed_paths"])
-            or not isinstance(scope["root_identity"], list) or len(scope["root_identity"]) != 2
-            or not all(type(value) is int and value >= 0 for value in scope["root_identity"])):
+            or not all(isinstance(pattern, str) for pattern in scope["allowed_paths"])):
         return False
     try:
         for pattern in scope["allowed_paths"]:
@@ -85,7 +75,7 @@ def _ledger_delete_scope(state, dispatch_id):
     return {"task_id": tasks[0]["id"], "allowed_paths": tasks[0].get("allowed_paths")} if len(tasks) == 1 else None
 
 
-def create_manifest(config, cwd, job, run_path=None, *, parent_deadline=None, delete_scope=None):
+def create_manifest(config, worktree, job, run_path=None, *, parent_deadline=None, delete_scope=None):
     """Write the per-dispatch closed command manifest.
 
     A run-bound manifest takes delete_path's task scope from the ledger's live
@@ -93,17 +83,17 @@ def create_manifest(config, cwd, job, run_path=None, *, parent_deadline=None, de
     ``delete_scope`` of {task_id, allowed_paths} enables the tool.
     """
     data = config.data if hasattr(config, "data") else config
-    cwd, job = _safe(Path(cwd).resolve()), _safe(job)
+    worktree, job = _safe(Path(worktree).resolve()), _safe(job)
     # The ledger's version is checked before anything is created or written.
     run_path = _safe(run_path).resolve() if run_path is not None else None
     state = read_current_ledger(run_path) if run_path else {}
     job.mkdir(parents=True, exist_ok=True)
     _safe(job / "commands").mkdir(exist_ok=True)
     commands = {}
-    for argv in data["verification"]["commands"] + data["permissions"]["worker_commands"]:
-        if not _argv(argv):
-            raise HarnessError("Invalid exact command argv")
-        commands.setdefault(command_id(argv), {"command_id": command_id(argv), "argv": argv})
+    for command in data["verification"]["commands"] + data["permissions"]["worker_commands"]:
+        if not valid_command(command):
+            raise HarnessError("Invalid exact command: expected {cwd, argv}")
+        commands.setdefault(command_id(command), {"command_id": command_id(command), "command": command})
     timeout = data["runtime"]["verify_timeout_seconds"]
     if type(timeout) not in (int, float) or not math.isfinite(timeout) or not 0 < timeout:
         raise HarnessError("Command timeout must be finite and positive")
@@ -116,13 +106,13 @@ def create_manifest(config, cwd, job, run_path=None, *, parent_deadline=None, de
     if delete_scope is not None:
         if not isinstance(delete_scope, dict):
             raise HarnessError("Invalid delete_path task scope")
-        # Bind the worktree root by inode so a later path swap cannot redirect it.
-        root = os.stat(cwd, follow_symlinks=False)
-        delete_scope = {"task_id": delete_scope.get("task_id"), "allowed_paths": delete_scope.get("allowed_paths"),
-                        "root_identity": [root.st_dev, root.st_ino]}
+        delete_scope = {"task_id": delete_scope.get("task_id"), "allowed_paths": delete_scope.get("allowed_paths")}
         if not _valid_delete_scope(delete_scope):
             raise HarnessError("Invalid delete_path task scope")
-    manifest = {"version": 2, "role": "worker", "dispatch_id": job.name, "cwd": str(cwd),
+    # Bind the worktree root by inode so a later path swap cannot redirect either tool.
+    root = os.stat(worktree, follow_symlinks=False)
+    manifest = {"version": 3, "role": "worker", "dispatch_id": job.name, "worktree": str(worktree),
+                "root_identity": [root.st_dev, root.st_ino],
                 "job": str(job.resolve()), "run_path": str(run_path) if run_path else None,
                 "binding": state.get("worktree_binding"), "expected_head": state.get("expected_head"),
                 "timeout": timeout, "parent_deadline": parent_deadline, "cleanup_margin": 2.0,
@@ -188,8 +178,10 @@ class Broker:
         if hashlib.sha256(raw).hexdigest() != self.digest:
             raise HarnessError("Command manifest digest mismatch")
         m = json.loads(raw)
-        fields = {"version", "role", "dispatch_id", "cwd", "job", "run_path", "binding", "expected_head", "timeout", "parent_deadline", "cleanup_margin", "commands", "delete_scope"}
-        if (not isinstance(m, dict) or set(m) != fields or m["version"] != 2 or m["role"] != "worker"
+        fields = {"version", "role", "dispatch_id", "worktree", "root_identity", "job", "run_path", "binding", "expected_head", "timeout", "parent_deadline", "cleanup_margin", "commands", "delete_scope"}
+        if (not isinstance(m, dict) or set(m) != fields or m["version"] != 3 or m["role"] != "worker"
+                or not isinstance(m["root_identity"], list) or len(m["root_identity"]) != 2
+                or not all(type(value) is int and value >= 0 for value in m["root_identity"])
                 or m["delete_scope"] is not None and not _valid_delete_scope(m["delete_scope"])
                 or str(self.path) != str(_safe(Path(m["job"]) / "commands.json"))
                 or Path(m["job"]).name != m["dispatch_id"]
@@ -199,12 +191,14 @@ class Broker:
                        for k in ("parent_deadline", "cleanup_margin"))):
             raise HarnessError("Invalid closed command manifest")
         ids = set()
-        for c in m["commands"]:
-            if (not isinstance(c, dict) or set(c) != {"command_id", "argv"} or not _argv(c["argv"])
-                    or c["command_id"] != command_id(c["argv"]) or c["command_id"] in ids):
+        for index, c in enumerate(m["commands"]):
+            if not isinstance(c, dict) or set(c) != {"command_id", "command"}:
+                raise HarnessError(f"Invalid command manifest entry: commands[{index}]")
+            validate_command(c["command"], f"commands[{index}].command")
+            if c["command_id"] != command_id(c["command"]) or c["command_id"] in ids:
                 raise HarnessError("Invalid or duplicate command ID")
             ids.add(c["command_id"])
-        _safe(m["cwd"])
+        _safe(m["worktree"])
         _safe(Path(m["job"]) / "commands")
         if self.manifest is not None and m != self.manifest:
             raise HarnessError("Command manifest changed")
@@ -223,11 +217,11 @@ class Broker:
                 or entries[0].get("role") != "worker" or entries[0].get("kind") not in ("implement", "format_repair")
                 or entries[0].get("command_directory") != str(Path(m["job"]) / "commands")
                 or entries[0].get("status") != "running" or entries[0].get("invoked") is not True
-                or state.get("worktree") != m["cwd"] or state.get("worktree_binding") != m["binding"]
+                or state.get("worktree") != m["worktree"] or state.get("worktree_binding") != m["binding"]
                 or state.get("expected_head") != m["expected_head"]):
             raise HarnessError("Command source dispatch is no longer live")
-        git.check_worktree_binding(Path(m["cwd"]), m["binding"])
-        if git.head(Path(m["cwd"]), binding=m["binding"]) != m["expected_head"]:
+        git.check_worktree_binding(Path(m["worktree"]), m["binding"])
+        if git.head(Path(m["worktree"]), binding=m["binding"]) != m["expected_head"]:
             raise HarnessError("Command source HEAD changed")
 
     def list_commands(self):
@@ -240,6 +234,7 @@ class Broker:
     def _prior_evidence(self, m):
         """Every earlier command or deletion must have exited with complete evidence."""
         ensure_command_processes_exited(m["job"])
+        commands = {c["command_id"]: c["command"] for c in m["commands"]}
         for prior in command_processes(m["job"]):
             if prior["process_state"] == "prepared":
                 continue  # No start intent was ever committed.
@@ -260,6 +255,8 @@ class Broker:
                         if receipt["intent_path"] != str(expected) or _file_digest(_safe(expected)) != receipt["intent_sha256"]:
                             raise ValueError("deletion intent digest")
                     continue
+                if receipt["command"] != commands[prior["command_id"]]:
+                    raise ValueError("receipt command")
                 for stream in ("stdout", "stderr"):
                     expected = receipt_path.with_name("output." + stream)
                     if receipt[stream + "_path"] != str(expected) or _file_digest(_safe(expected)) != receipt[stream + "_sha256"]:
@@ -267,9 +264,10 @@ class Broker:
             except (OSError, ValueError, KeyError, TypeError) as error:
                 raise HarnessError("Command evidence incomplete: " + prior["id"]) from error
 
-    def _admit(self, arguments):
+    def _admit(self, arguments, held):
         # Reload authority, inspect every prior child, and durably register intent
         # under one dispatch lock. The active parent delegates this resource.
+        # The root is opened into the caller's holder, which closes it however the call ends.
         m = self._load()
         if not isinstance(arguments, dict) or set(arguments) != {"command_id"} or not isinstance(arguments["command_id"], str):
             raise HarnessError("run_command accepts only command_id")
@@ -281,8 +279,27 @@ class Broker:
         timeout = min(m["timeout"], remaining - m["cleanup_margin"])
         if timeout <= 0:
             raise HarnessError(f"Command budget exhausted: remaining={remaining:.3f}s cleanup_margin={m['cleanup_margin']:.3f}s; not started")
+        root = self._open_root(m, held)
         folder, entry = self._publish_journal(m, command["command_id"], process_state="starting", exit_confirmed=False)
-        return m, command, timeout, folder, entry
+        return m, command, timeout, folder, entry, root
+
+    @staticmethod
+    def _open_root(m, held):
+        """The root a command starts from: bound (checked through this descriptor) and the manifest's inode.
+
+        A failure here is a tool error before any journal: nothing started and no evidence is owed.
+        """
+        if m["binding"] is not None:
+            root = git.open_bound_root(held, Path(m["worktree"]), m["binding"])
+        else:
+            # Only manifests without a run (probes and tests) are unbound.
+            try:
+                root = held.open(m["worktree"], DIRECTORY_FLAGS)
+            except OSError as error:
+                raise HarnessError(f"worktree root is not the bound directory: {error}") from error
+        if _identity(os.fstat(root)) != m["root_identity"]:
+            raise HarnessError("worktree root is not the bound directory: its identity changed since this dispatch started")
+        return root
 
     def _publish_journal(self, m, identifier, *, process_state, exit_confirmed):
         """Make one call's folder visible in commands/ only with its whole journal.
@@ -308,10 +325,14 @@ class Broker:
         return folder, entry
 
     def run_command(self, arguments):
+        # The holder exists before admission opens the root into it; a failed close loses no evidence.
+        return with_descriptors(lambda held: self._run_command(arguments, held))
+
+    def _run_command(self, arguments, held):
         with lock(_safe(Path(self.manifest["job"]) / "command-admission.lock")):
-            m, command, timeout, folder, entry = self._admit(arguments)
+            m, command, timeout, folder, entry, root = self._admit(arguments, held)
         journal = folder / "process.json"
-        result = {"call_id": entry["id"], "command_id": command["command_id"], "exit_code": None,
+        result = {"call_id": entry["id"], "command_id": command["command_id"], "command": command["command"], "exit_code": None,
                   "error": None, "evidence_complete": False, "effective_timeout": timeout}
         def started(pgid):
             entry.update(pgid=pgid, process_state="running")
@@ -333,7 +354,8 @@ class Broker:
         try:
             for signum in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
                 old[signum] = signal.signal(signum, interrupted)
-            result["exit_code"] = run_process(command["argv"], Path(m["cwd"]), folder / "output",
+            result["exit_code"] = run_process(command["command"]["argv"], Path(m["worktree"]), folder / "output",
+                                               relative_cwd=command["command"]["cwd"], root_fd=root,
                                                timeout=timeout, on_start=started, on_outcome=outcome,
                                                execution_deadline=m["parent_deadline"] - m["cleanup_margin"],
                                                cleanup_deadline=m["parent_deadline"])
@@ -418,11 +440,11 @@ class Broker:
         _delete_syntax(path)
         if not any(git.path_matches(path, pattern) for pattern in scope["allowed_paths"]):
             raise _DeleteRefused(f"{path[:160]!r} is outside the task scope {scope['allowed_paths']}")
-        cwd = Path(m["cwd"])
+        worktree = Path(m["worktree"])
         # A run-bound broker already proved HEAD equals the ledger's expected head.
-        head = m["expected_head"] if m["run_path"] is not None else git.head(cwd)
+        head = m["expected_head"] if m["run_path"] is not None else git.head(worktree)
         target = os.fsencode(path)
-        for record in git.git_bytes(cwd, "ls-tree", "-r", "-z", "--full-tree", head, binding=m["binding"]).split(b"\0"):
+        for record in git.git_bytes(worktree, "ls-tree", "-r", "-z", "--full-tree", head, binding=m["binding"]).split(b"\0"):
             metadata, _, name = record.partition(b"\t")
             if name == target:
                 mode, kind, _ = metadata.split()
@@ -478,7 +500,7 @@ class Broker:
                                   intent_sha256=_file_digest(folder / "delete-intent.json"))
                 try:
                     result["head"], result["head_mode"] = self._delete_eligibility(m, scope, path)
-                    _remove_tracked_file(Path(m["cwd"]), scope["root_identity"], path, facts, intent)
+                    _remove_tracked_file(Path(m["worktree"]), m["root_identity"], path, facts, intent)
                     result["concurrent_change"] = facts.get("concurrent_change")
                     result["outcome"] = "concurrent_change" if result["concurrent_change"] else "deleted"
                     if result["concurrent_change"]:
@@ -683,15 +705,24 @@ DELETE_TOOL = {
         "isolation from concurrently running processes; one that renames directories in the worktree between "
         "the final check and the unlink can make the removed file live elsewhere, including outside the "
         "worktree, and the after-the-fact concurrent_change report is best effort and can miss it. Every "
-        "admitted call is recorded with path, prior SHA256 and bytes, outcome and time. The deletion is "
+        "admitted call is recorded with path, prior SHA256 and bytes, outcome and time, and like run_command "
+        "it is refused after any recorded receipt with evidence_complete false. The deletion is "
         "immediate; review and acceptance decide the candidate but cannot undo it."),
     "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"],
                     "additionalProperties": False}}
 
 
-TOOLS = [{"name": "list_commands", "description": "List exact authorized command IDs and argv.",
+TOOLS = [{"name": "list_commands", "description": (
+              "List exact authorized commands: each command_id with its cwd (relative to the worktree root, "
+              "\".\" is the root) and argv."),
           "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False}},
-         {"name": "run_command", "description": "Execute one exact authorized argv. Each explicit call executes anew.",
+         {"name": "run_command", "description": (
+              "Execute one exact authorized command: its argv in its cwd, without a shell; each admitted call "
+              "attempts it anew. A receipt with termination_reason start_failed means the command did not start, "
+              "for example because its cwd below the worktree root is missing, not a directory, a symlink, too long "
+              "or not permitted; its error gives the reason, which the stderr tail can cut off. Admission checks "
+              "the recorded receipt of every earlier call in this dispatch: one with evidence_complete false refuses "
+              "every later run_command whatever its termination_reason, and start_failed alone refuses none."),
           "inputSchema": {"type": "object", "properties": {"command_id": {"type": "string"}}, "required": ["command_id"], "additionalProperties": False}}]
 
 

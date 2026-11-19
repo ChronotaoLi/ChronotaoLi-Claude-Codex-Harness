@@ -180,6 +180,44 @@ class BrokenProjectFileTests(GateCase):
         self.assertEqual((self.engines, self.backend.calls, self.quota_calls.all()), ([], calls, probes))
 
 
+class CommandShapeFileTests(GateCase):
+    """A command list of the wrong shape is refused as an unknown key is: before any write, naming its field and its file."""
+    COMMANDS = b'commands = [{cwd = ".", argv = ["make", "test"]}]\n'
+
+    def assert_refused_naming_the_file(self, content, field):
+        for argv in (["run", "Implement greet", "--plan", str(PLAN)], ["resume", "run_missing"],
+                     ["permission-diagnostics", "run_missing", "dispatch-1"]):
+            with self.subTest(command=argv[0]):
+                replace(self.project, b"[runtime]\nnot_a_budget = 1\n")
+                code, output, errors = self.invoke(*argv)
+                reference = (code, output, cli_notice(errors))
+                replace(self.project, content)
+                before = self.footprint()
+                code, output, errors = self.invoke(*argv)
+                self.assertEqual((code, output, cli_notice(errors)), reference)
+                self.assertIn(field, errors)
+                self.assertIn(str(self.project), errors)
+                self.assertEqual(self.footprint(), before)
+        self.assertEqual((self.engines, self.backend.calls), ([], []))
+
+    def test_an_argv_array_in_verification_commands_names_the_project_file(self):
+        self.assert_refused_naming_the_file(b'[verification]\ncommands = [["make", "test"]]\n', "verification.commands[0]")
+
+    def test_an_argv_array_in_setup_commands_names_the_project_file(self):
+        self.assert_refused_naming_the_file(
+            b"[verification]\n" + self.COMMANDS + b'fresh_checkout = true\nsetup_commands = [["make", "deps"]]\n',
+            "verification.setup_commands[0]")
+
+    def test_an_argv_array_in_worker_commands_names_the_project_file(self):
+        self.assert_refused_naming_the_file(
+            b"[verification]\n" + self.COMMANDS + b'\n[permissions]\nworker_commands = [["npm", "run", "build"]]\n',
+            "permissions.worker_commands[0]")
+
+    def test_a_command_object_with_an_invalid_cwd_names_the_project_file(self):
+        self.assert_refused_naming_the_file(
+            b'[verification]\ncommands = [{cwd = "../outside", argv = ["make", "test"]}]\n', "verification.commands[0].cwd")
+
+
 class EmptyVerificationTests(GateCase):
     # run's refusal of an empty verification.commands is untyped, and spec 2.4 keeps it unchanged.
     allow_unclassified = True
@@ -260,7 +298,7 @@ class EntryPointTests(RepoCase):
         super().setUp()
         folder = scratch(self)
         self.marker = folder / "project-file-command-ran"
-        command = [sys.executable, "-c", f"import pathlib; pathlib.Path({str(self.marker)!r}).write_text('ran')"]
+        command = {"cwd": ".", "argv": [sys.executable, "-c", f"import pathlib; pathlib.Path({str(self.marker)!r}).write_text('ran')"]}
         self.project = write_project_config(self.repo, [command], [command])
         self.read = []
         real = config_module.read_layer
@@ -295,7 +333,7 @@ class EntryPointTests(RepoCase):
                 self.assertTrue(Path(result["repo"]).is_relative_to(folder))
                 saved = read_json(Path(result["repo"]) / ".harness" / "runs" / result["run"] / "state.json")
                 self.assertEqual(saved["config_snapshot"]["verification"]["commands"],
-                                 [[sys.executable, "-m", "unittest", "-v"]])
+                                 [{"cwd": ".", "argv": [sys.executable, "-m", "unittest", "-v"]}])
                 self.assertEqual(saved["config_snapshot"]["permissions"]["worker_commands"], [])
         self.assertEqual(self.read, [OPERATOR.resolve()] * 2)
         self.assertFalse(self.marker.exists())

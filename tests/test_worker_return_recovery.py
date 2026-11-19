@@ -302,7 +302,7 @@ from harness.runtime import Runtime
 from harness.util import HarnessError, read_json
 root, repo, boundary = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
 config = Config.load(root / 'harness.toml')
-config.data['verification']['commands'] = [[sys.executable, '-m', 'unittest', '-v']]
+config.data['verification']['commands'] = [{'cwd': '.', 'argv': [sys.executable, '-m', 'unittest', '-v']}]
 if boundary == 'before_publication':
     # The child's complete terminal is in process.stdout; nothing derived from it is published.
     def killed(self, job, provider):

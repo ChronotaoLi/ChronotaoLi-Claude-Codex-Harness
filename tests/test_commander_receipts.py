@@ -277,7 +277,7 @@ class CommanderReceiptTests(RepoCase):
 
         def failed_final(*args, **kwargs):
             if kwargs.get("whole_run"):
-                return [{"argv": ["integration-check"], "exit_code": 1, "stdout": "",
+                return [{"command": {"cwd": ".", "argv": ["integration-check"]}, "exit_code": 1, "stdout": "",
                          "stderr": "Integration failed", "log": "integration.log", "timed_out": False}]
             return verify(*args, **kwargs)
 

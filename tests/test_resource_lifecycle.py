@@ -336,8 +336,8 @@ class ReclamationTests(RepoCase):
         external = tempfile.TemporaryDirectory()
         self.addCleanup(external.cleanup)
         marker = Path(external.name) / "ready"
-        self.config.data["verification"]["setup_commands"] = [[sys.executable, "-c",
-            f"from pathlib import Path; assert Path({str(marker)!r}).exists()"]]
+        self.config.data["verification"]["setup_commands"] = [{"cwd": ".", "argv": [sys.executable, "-c",
+            f"from pathlib import Path; assert Path({str(marker)!r}).exists()"]}]
         backend = ScriptedBackend()
         engine = self.engine(backend)
         with self.assertRaisesRegex(HarnessError, "依赖准备失败"):
@@ -359,10 +359,10 @@ class ReclamationTests(RepoCase):
         external = tempfile.TemporaryDirectory()
         self.addCleanup(external.cleanup)
         marker = Path(external.name) / "ready"
-        self.config.data["verification"]["setup_commands"] = [[sys.executable, "-c",
+        self.config.data["verification"]["setup_commands"] = [{"cwd": ".", "argv": [sys.executable, "-c",
             "from pathlib import Path; Path('__pycache__').mkdir(exist_ok=True); "
             "Path('__pycache__/setup.log').write_text('x'); "
-            f"assert Path({str(marker)!r}).exists()"]]
+            f"assert Path({str(marker)!r}).exists()"]}]
         backend = ScriptedBackend()
         engine = self.engine(backend)
         with self.assertRaisesRegex(HarnessError, "依赖准备失败"):

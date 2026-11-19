@@ -7,11 +7,14 @@ from copy import deepcopy
 from pathlib import Path
 
 from .versions import RUN_SCHEMA_VERSION, read_current_ledger
+from .commands import validate_commands
 from .config import PROJECT_FILE, normalized
+from .contracts import validate_required_commands
 from . import git, quota_wait, scope as boundary, stops
 from .operations import warn
 from .input_projection import validate_dispatch_indexes as validate_input_dispatch_indexes
 from .path_evidence import validate_dispatch_indexes
+from .review_progress import entries
 from .services import RuntimeService
 from .continuation import (packet as continuation_packet, prepare_continuation_rejection,
                            publish_continuation_rejection, read_execution_guidance, read_request_rejection,
@@ -164,6 +167,7 @@ class RunLifecycle(RuntimeService):
             raise HarnessError("运行输入绑定字段缺失或无效；保留现场")
         validate_command_directories(self.context.run["dispatches"], self.context.directory)
         self.validate_recovery_links()
+        self.validate_command_shapes()
         self.services.worker_receipts.validate_links()
         self.services.budgets.validate_attempt_accounting()
         self.services.environment.validate_environment_links()
@@ -281,6 +285,24 @@ class RunLifecycle(RuntimeService):
         self.verify_head_and_inputs()
 
     @stops.reads_evidence
+    def validate_command_shapes(self):
+        """The saved commands that decide grants and dispatch obey the command shape (rule 21.1).
+
+        ``tasks`` and ``original_tasks`` include a supplied plan not yet registered as the current plan.
+        """
+        snapshot = self.context.run["config_snapshot"]
+        for section, key in (("verification", "commands"), ("verification", "setup_commands"),
+                             ("permissions", "worker_commands")):
+            validate_commands(snapshot[section][key], f"config_snapshot.{section}.{key}")
+        for field in ("tasks", "original_tasks"):
+            for index, task in enumerate(self.context.run[field]):
+                if not isinstance(task, dict):
+                    raise HarnessError(f"运行台账 {field}[{index}] 不是对象；保留原文件并核对证据")
+                try:
+                    validate_required_commands(task)
+                except HarnessError as error:
+                    raise HarnessError(f"运行台账 {field}[{index}] 的命令无效：{error}；保留原文件并核对证据") from error
+
     def validate_recovery_links(self):
         """Reject inconsistent recovery links before any resumed side effects.
 
@@ -332,6 +354,14 @@ class RunLifecycle(RuntimeService):
                 fail(field + ".id 缺失、类型无效或重复（不区分大小写等折叠后比较）")
             task_ids.add(ident)
             folded_ids.add(fold_name(ident))
+
+        # Review histories are read from disk only here and afterwards changed only by the
+        # runtime, so every later reader sees objects that hold a review unless their state says not.
+        for tid, records in self.context.run["review_history"].items():
+            if not isinstance(records, list):
+                fail(f"review_history.{tid} 必须是列表")
+            entries(records)
+        entries(self.context.run["final_history"], whole_run=True)
 
         def task_reference(ident, field):
             if not isinstance(ident, str) or ident not in task_ids:
@@ -400,7 +430,8 @@ class RunLifecycle(RuntimeService):
             if (previous is None or previous.get("id") != entry["retry_of"]
                     or f"{previous.get('role')}:{previous.get('kind')}:{previous.get('task_id')}" != key
                     or previous.get("status") != "invalid" or "retry_of" in previous
-                    or entry.get("role") not in ("commander", "reviewer")):
+                    or entry.get("role") not in ("commander", "reviewer")
+                    or entry.get("role") == "reviewer" and previous.get("snapshot_digest") != entry.get("snapshot_digest")):
                 fail("dispatches.retry_of 必须指向它之前最后一次模型调用，且那是同一调用、未重做过的无效输出")
             if entry.get("invoked") is True:
                 if entry["retry_of"] in retried:

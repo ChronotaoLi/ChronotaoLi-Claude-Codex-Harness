@@ -121,7 +121,7 @@ class MemoryCLIReadTests(unittest.TestCase):
                    "repo": str(self.repo.resolve())}
         for value in ([], {**current, "repo": "/another/repo"}, {**current, "status": "unknown"},
                       # Another ledger version is not interpreted, however valid its fields look.
-                      {**current, "schema_version": 17}, {key: current[key] for key in ("id", "status", "repo")}):
+                      {**current, "schema_version": 18}, {key: current[key] for key in ("id", "status", "repo")}):
             ledger.write_text(json.dumps(value))
             with self.subTest(value=value):
                 code, output, errors = self.invoke("add", "--key", "decision", "--title", "Upgrade",

@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 from . import stops
+from .commands import command_id
 from .context import prompt_json
 from .util import HarnessError, dump, write_json
 
@@ -91,8 +92,28 @@ def project_history(packet, directory):
     return result
 
 
+def project_review_keys(packet, directory, records):
+    """Publish past reviews' mappings and dispositions as one digest-bound index.
+
+    Call only with records a history traversal has checked; prior_reviews keeps
+    them inline for its latest entry alone, and no runtime decision reads this.
+    """
+    if not records:
+        return packet
+    ref = _index(directory, records)
+    indexes = {**packet.get('input_evidence_indexes', {}), ref['artifact_digest']: ref}
+    # How to read the index is shared protocol (RULES), not packet data.
+    return {**packet, 'input_evidence_indexes': indexes,
+            'prior_review_keys_index': {'input_index': ref['artifact_digest'], 'count': len(records)}}
+
+
+def _command(value):
+    return (isinstance(value, dict) and set(value) == {'cwd', 'argv'} and isinstance(value['cwd'], str)
+            and isinstance(value['argv'], list) and all(isinstance(x, str) for x in value['argv']))
+
+
 def project_commands(packet, directory):
-    """Deduplicate argv only in input views; grants and broker config stay exact."""
+    """Deduplicate whole commands ({cwd, argv}) only in input views; grants and broker config stay exact."""
     result = deepcopy(packet)
     indexes = result.get('input_evidence_indexes', {})
     if not isinstance(indexes, dict) or any(not isinstance(ref, dict) or key != ref.get('artifact_digest') for key, ref in indexes.items()):
@@ -100,28 +121,22 @@ def project_commands(packet, directory):
     validate_indexes(directory, list(indexes.values()))
     occurrences = {}
     def visit(value):
-        if isinstance(value, dict):
-            for key, child in list(value.items()):
-                if key == 'argv' and isinstance(child, list) and all(isinstance(x, str) for x in child):
-                    occurrences.setdefault(prompt_json(child), []).append((value, key, child))
-                elif key in ('readonly_commands', 'worker_commands', 'verification_commands', 'commands', 'required_commands', 'self_checks', 'missing_commands') and isinstance(child, list):
-                    for i, argv in enumerate(child):
-                        if isinstance(argv, list) and all(isinstance(x, str) for x in argv):
-                            occurrences.setdefault(prompt_json(argv), []).append((child, i, argv))
-                else:
-                    visit(child)
-        elif isinstance(value, list):
-            for child in value:
+        children = value.items() if isinstance(value, dict) else enumerate(value) if isinstance(value, list) else ()
+        for key, child in list(children):
+            if _command(child):
+                # Keyed by command ID, so key order never splits one command into two entries.
+                occurrences.setdefault(command_id(child), []).append((value, key, child))
+            else:
                 visit(child)
     visit(result)
     records = []
-    for encoded, rows in occurrences.items():
-        identity = hashlib.sha256(encoded.encode('utf-8')).hexdigest()
+    for identity, rows in occurrences.items():
+        encoded = prompt_json(rows[0][2])
         replacement = {'exact_command_ref': identity}
         # Count both the catalog entry and every replacement before deciding.
         if len(encoded) <= INLINE_CHARS and len(encoded) * len(rows) <= len(prompt_json(replacement)) * len(rows) + len(encoded) + len(identity) + 60:
             continue
-        records.append({'id': identity, 'argv': rows[0][2]})
+        records.append({'id': identity, 'command': rows[0][2]})
         for parent, key, _ in rows:
             parent[key] = replacement.copy()
     if not records:

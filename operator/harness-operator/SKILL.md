@@ -22,10 +22,10 @@ You are the outer session: the owner opened you in a target project and wants Ha
 
 1. Run `harness doctor` (it calls no model). Check that `harness.package` and `harness.revision` are the Harness you expect and that `checks.<cli>.logged_in` is true. Its exit code reflects only CLI login.
 2. Read its `project` field: `{path, exists, sha256, error}` (null when `--repo` is not in a Git repository).
-3. If `project.exists` is false: draft the complete file, starting from `examples/project.toml` in the Harness source directory, and show the owner the full content and the absolute path (`project.path`). The verification commands and worker command grants in it are the execution capability given to workers, so write it only after the owner confirms. If the owner already gave you the exact content, write it without asking again. Create the `.harness/` directory at the Git root first when it does not exist. Commands are argv arrays and run without a shell.
+3. If `project.exists` is false: draft the complete file, starting from `examples/project.toml` in the Harness source directory, and show the owner the full content and the absolute path (`project.path`). The verification commands and worker command grants in it are the execution capability given to workers, so write it only after the owner confirms. If the owner already gave you the exact content, write it without asking again. Create the `.harness/` directory at the Git root first when it does not exist. Each command is a table `{cwd, argv}`: `cwd` is the directory, relative to the repository root, it runs in (`"."` for the root; no absolute path, `..` or symbolic link), and `argv` runs without a shell. When the project builds in a subdirectory (where its `pubspec.yaml`, `package.json` or `pyproject.toml` is), write that directory as `cwd` instead of a `cd` shell script. The same argv in two directories is two grants. A grant does not make a read-only Bash prefix unavailable; it adds no Bash permission.
 4. If `project.error` is set, show it to the owner and fix the file with their agreement before any `run`.
 5. Never `git add` or commit `.harness/`. Harness adds its ignore rule on the first `run`; until then the directory is only untracked.
-6. Check the target repository: it has commits, tracked files and the index have no uncommitted changes, the verification commands and their dependencies are available in a worktree created from HEAD (untracked and ignored files are not copied), and generated files are ignored.
+6. Check the target repository: it has commits, tracked files and the index have no uncommitted changes, the verification commands and their dependencies are available in a worktree created from HEAD (untracked and ignored files are not copied), every verification command's cwd exists in HEAD, and every setup command's cwd exists in HEAD or is created by an earlier setup command (a wrong directory there cannot be fixed by resume; it needs a new run), and generated files are ignored.
 
 ## Starting a run
 
@@ -40,6 +40,7 @@ You are the outer session: the owner opened you in a target project and wants Ha
 - `&` and `nohup` do not keep a run alive; do not rely on them.
 - If your tool has no reliable background tasks, or its sandbox does not allow network access, writes under `.git`, or starting `claude`/`codex` child processes, do not run `run` or a continuing `resume` yourself. Give the owner the complete command to run in an ordinary terminal. You still observe, prepare input files (operator decisions, environment updates, request rejections) and propose the next command.
 - `status` and `watch` are read-only and load no configuration. A `running` ledger does not prove that a process is alive.
+- `dashboard` reads one state directory for its whole life and names it, with its checkout, on stderr before the URL; the page header and tab title show the same. Every form of `status` names them on the first line of its stderr and leaves stdout unchanged, so keep that stderr when you need to know which checkout a result came from. Start `dashboard` with `--repo` set to the checkout that holds the run, and when you give the owner its URL, say which checkout it shows. If another dashboard may already hold the default port, use `--port 0`; a port in use is an error, not a redirect.
 
 ## Reading the outcome
 
@@ -56,6 +57,12 @@ When the call you just ran fails, read its own stop first: the stderr line that 
 ## Quota and provider stops
 
 - `provider_quota/*`, `provider_failure/overloaded` and `provider_failure/authentication` exit 3: wait for the quota; for `provider_failure/authentication` (a login or permission failure), check the login with `harness doctor`, which only checks and repairs nothing, and have the owner fix the authentication or permission. Then plain `resume RUN` as `stop.exits` says.
+- `provider_failure/transport` exits 3: the Claude CLI reported `api_error=connection_failed` (in the CLI's own definition: it could not reach the API host, or the connection was cut). For a worker, `stop.data.attempt_charged` is false: the call did not count as a work attempt, though it counted as a dispatch. You may run the plain `resume RUN` that `stop.exits` lists without asking the owner, at most 3 times in a row for the same run:
+  - Act only on the stop returned by a call you ran yourself in this session (its `[harness-json]` line with `"event":"stop"`, or its operation record), never on the stop `status RUN` shows.
+  - Give each such `resume` a new, unique `--operation-id` and start it under "Long runs and limited sandboxes". Under the terminal handoff, give the owner the command as usual; that resume is the owner's, not one of yours.
+  - Count the transport stops of that run you resumed this way; the first one you resume counts as 1. Only another stop of the same run returned by a call you ran, or a decision by the owner, resets the count. `busy/run_lock` does not reset it and is never a reason to resume again: another process may still hold the run while the ledger shows the old transport stop; handle it as the `busy/run_lock` item below says.
+  - The count exists only in this session; a new session starts at zero.
+  - At the fourth transport stop in a row, do not resume: report to the owner that the network or proxy needs checking.
 - Claude roles' usage limits are waited out inside the Harness process by default (`runtime.quota_wait_max_seconds`). Do not sleep and loop `resume` yourself. On `provider_quota/usage_limit`, read `stop.data.wait_reason` first.
 - `busy/run_lock` from `resume` or `abandon` may mean another process is waiting for quota: check `quota_wait` in `status RUN`, which is a record, not proof that the process is alive. To cancel the wait, interrupt that process.
 - Never judge quota by matching error text.
@@ -65,17 +72,18 @@ When the call you just ran fails, read its own stop first: the stderr line that 
 - Start `run` with the agreed `--scope` and an `--operation-id`.
 - Observe with `status`, `status RUN`, `status RUN --full`, `watch RUN` and `dashboard`, and read the target's `.harness/` ledger, events, dispatch artifacts and operation records.
 - Use the exits `docs/recovery.md` lists for the current state, within what the owner has already authorized: `resume RUN --approve-plan`, a plain `resume RUN` after exact command grants were added, `--environment-update FILE`, `--operator-decision FILE` carrying the owner's answer.
+- A plain `resume RUN` after `provider_failure/transport`, within the limit and rules in "Quota and provider stops".
 
 ## Ask the owner first
 
-- New authority: command grants (exact argv in `permissions.worker_commands` of the project file), scope extension, higher budgets, timeouts, turns or context limits.
+- New authority: command grants (exact `{cwd, argv}` commands in `permissions.worker_commands` of the project file), scope extension, higher budgets, timeouts, turns or context limits.
 - Requirement choices: answers to `pending_decisions`, accepting a risk, abandoning a run (`abandon RUN` keeps the branch, worktree and evidence).
 - A held proposal (`scope_extension/*`): both `resume RUN --scope ...` and `resume RUN --reject-request FILE` need the owner. Suggested entries can be wider than the gap (`data.widened`); the full gap is `scope.held` in `status RUN`.
 - Creating or changing `.harness/project.toml`, and the scope before a run starts.
 
 ## Never
 
-- Loop `resume` until it passes. The same snapshot gives the same stop; repeats only spend dispatches.
+- Loop `resume` until it passes. The same snapshot gives the same stop; repeats only spend dispatches. The only exception is the bounded resume after `provider_failure/transport` in "Quota and provider stops".
 - Raise budgets, timeouts, turns or context limits on your own to clear a stop.
 - Change models, providers or effort.
 - Edit `state.json`, `events.jsonl`, dispatch artifacts or the memory store.

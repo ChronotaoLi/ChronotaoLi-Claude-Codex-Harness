@@ -6,7 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from harness.util import HarnessError, read_json, write_json
-from harness.review_progress import claim_gaps, delivered_worker_findings, required_findings
+from harness.review_progress import claim_gaps, delivered_worker_findings, repair_findings, required_findings
 from test_engine_repairs import RecordingBackend
 from test_harness import RepoCase, ROOT, after_save
 from test_runtime_changes import finding, finding_key
@@ -153,6 +153,119 @@ class WorkerRepairObligationsTests(RepoCase):
         self.assertEqual(errors[0]["code"], "finding_not_independently_resolved")
         row = next(item for item in record["required_findings"] if item["key"] == errors[0]["key"])
         self.assertEqual((row["label"], row["finding_index"]), ("edge-case", 0))
+
+    @staticmethod
+    def new_candidate(backend, kwargs):
+        path = kwargs["cwd"] / "hello.py"
+        path.write_text(path.read_text() + f"# candidate {sum(c['role'] == 'worker' for c in backend.calls)}\n")
+
+    def test_more_than_sixty_open_findings_give_the_worker_the_oldest_sixty(self):
+        self.config.data["runtime"]["max_attempts"] = 4
+
+        def change(backend, kwargs, packet, result):
+            if kwargs["role"] == "worker":
+                self.new_candidate(backend, kwargs)
+            elif kwargs["kind"] == "review":
+                number = sum(call["kind"] == "review" for call in backend.calls)
+                result.update(verdict="request_changes",
+                              findings=[{**finding(), "id": f"r{number}-{index}"} for index in range(30)])
+                for row in result.get("finding_dispositions", {}).values():
+                    row.update(status="open", evidence=["hello.py still has the defect"])
+
+        backend = RecordingBackend(change)
+        engine = self.engine(backend)
+        with self.assertRaises(HarnessError):
+            engine.start("Implement greet", self.plan())
+        workers = [call for call in backend.calls if call["role"] == "worker"]
+        self.assertEqual([len(call["packet"].get("required_findings", [])) for call in workers], [0, 30, 60, 60])
+        self.assertEqual(labels(workers[-1]["packet"]["required_findings"]),
+                         [f"r{number}-{index}" for number in (1, 2) for index in range(30)])
+        state = read_json(engine.directory / "state.json")
+        entry = [row for row in state["dispatches"] if row["role"] == "worker"][-1]
+        delivered = delivered_worker_findings(engine.context, "greet", entry["id"])
+        self.assertEqual([row["key"] for row in delivered], [f"f{n}" for n in range(1, 61)])
+        # Nothing stops at the count: the fourth candidate's review gets a batch of 60 of
+        # its 90, rejects, and the run stops only when the task's attempts run out.
+        reviews = [call for call in backend.calls if call["kind"] == "review"]
+        self.assertEqual([len(call["packet"].get("required_findings", [])) for call in reviews], [0, 30, 60, 60])
+        self.assertEqual((state["stop"]["kind"], state["stop"]["reason"]), ("budget", "task_attempts"))
+
+    def test_ninety_open_findings_back_on_a_reviewed_candidate_rekey_the_shared_claims(self):
+        # Candidates A, A, B, A: the second review resolves r1 on A; the third, on B,
+        # reopens r1 and r2 and reports r3, so 90 findings are open when A returns.
+        candidates = {}
+
+        def change(backend, kwargs, packet, result):
+            number = sum(call["role"] == "worker" for call in backend.calls)
+            if kwargs["role"] == "worker":
+                path = kwargs["cwd"] / "hello.py"
+                candidates.setdefault("A", path.read_bytes())
+                path.write_bytes(candidates["A"] + (b"# B\n" if number == 3 else b""))
+                for key, claim in result.get("repair_claims", {}).items():
+                    claim["summary"] = f"worker's {key}"
+            elif kwargs["kind"] == "review" and number < 4:
+                result.update(verdict="request_changes",
+                              findings=[{**finding(), "id": f"r{number}-{index}"} for index in range(30)])
+                if number == 3:
+                    for row in result["finding_dispositions"].values():
+                        row.update(status="open", evidence=["hello.py still has the defect"])
+
+        backend = RecordingBackend(change)
+        engine = self.engine(backend)
+        result = engine.start("Implement greet", self.plan())
+        self.assertEqual(result["status"], "completed")
+        self.assertIn("greet", result["accepted"])
+        workers = [call["packet"] for call in backend.calls if call["role"] == "worker"]
+        reviews = [call["packet"] for call in backend.calls if call["kind"] == "review"]
+        self.assertEqual([len(packet.get("required_findings", [])) for packet in workers], [0, 30, 30, 60])
+        self.assertEqual([len(packet.get("required_findings", [])) for packet in reviews], [0, 30, 60, 60])
+
+        def rounds(*numbers):
+            return [f"r{number}-{index}" for number in numbers for index in range(30)]
+
+        # The worker gets the oldest sixty open; back on A, the review lacks only r2 and r3.
+        worker = [row for row in result["dispatches"] if row["role"] == "worker"][-1]
+        self.assertEqual(labels(delivered_worker_findings(engine.context, "greet", worker["id"])), rounds(1, 2))
+        self.assertEqual(labels(reviews[-1]["required_findings"]), rounds(2, 3))
+        # The shared r2 rows carry the worker's f31..f60 claims onto the review's f1..f30;
+        # r3 reaches the review with no claim, and the review still disposes of all sixty.
+        self.assertEqual({key: claim["summary"] for key, claim in reviews[-1]["repair_claims"].items()},
+                         {f"f{n}": f"worker's f{n + 30}" for n in range(1, 31)})
+        self.assertTrue(read_json(engine.directory / "preflight/greet/4/result.json")["passed"])
+        approval = result["review_history"]["greet"][-1]
+        self.assertEqual(set(approval["review"]["finding_dispositions"]), {f"f{n}" for n in range(1, 61)})
+        self.assertEqual(required_findings(result, "greet", approval["snapshot_digest"]), [])
+        # r1, reopened on B, stays on the repair list: its resolution holds only on A.
+        self.assertEqual(labels(repair_findings(result, "greet")), rounds(1))
+
+    def test_not_checked_keeps_repair_status_and_open_reopens(self):
+        def change(backend, kwargs, packet, result):
+            if kwargs["role"] == "worker":
+                self.new_candidate(backend, kwargs)
+            elif kwargs["kind"] == "review":
+                number = sum(call["kind"] == "review" for call in backend.calls)
+                if number == 1:
+                    result.update(verdict="request_changes", findings=[{**finding(), "id": name} for name in "AB"])
+                elif number == 2:
+                    # Resolves A and B, and reports C.
+                    result.update(verdict="request_changes", findings=[{**finding(), "id": "C"}])
+                elif number == 3:
+                    # A rejection that leaves A unchecked; B is still wrong, so it stays open on its key.
+                    result.update(verdict="request_changes")
+                    result["finding_dispositions"][finding_key(packet, "A")] = {"status": "not_checked", "evidence": []}
+                    result["finding_dispositions"][finding_key(packet, "B")] = {
+                        "status": "open", "evidence": ["hello.py still has defect B"]}
+
+        backend = RecordingBackend(change)
+        result = self.engine(backend).start("Implement greet", self.plan())
+        self.assertEqual(result["status"], "completed")
+        workers = [call for call in backend.calls if call["role"] == "worker"]
+        self.assertEqual([labels(call["packet"].get("required_findings", [])) for call in workers],
+                         [[], ["A", "B"], ["C"], ["B"]])
+        # Each new candidate is still checked against every earlier finding.
+        reviews = [call for call in backend.calls if call["kind"] == "review"]
+        self.assertEqual([labels(call["packet"].get("required_findings", [])) for call in reviews],
+                         [[], ["A", "B"], ["A", "B", "C"], ["A", "B", "C"]])
 
     def test_external_citations_never_become_candidate_repair_paths(self):
         delivered = [{"key": "f1", "review_dispatch_id": "review", "finding_index": 0}]

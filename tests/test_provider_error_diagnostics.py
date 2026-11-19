@@ -62,13 +62,40 @@ class ProviderErrorSummaryTests(unittest.TestCase):
                 self.assertIn("api_error_status=invalid", claude_error_summary(payload))
         payload = usage_limit_envelope()
         payload["api_error_status"] = None
-        self.assertIn("api_error_status=not_provided", claude_error_summary(payload))
+        self.assertIn("api_error_status=null", claude_error_summary(payload))
         del payload["api_error_status"]
-        self.assertIn("api_error_status=not_provided", claude_error_summary(payload))
+        self.assertIn("api_error_status=missing", claude_error_summary(payload))
         for item in (400, 429, 500, 599):
             payload = usage_limit_envelope()
             payload["api_error_status"] = item
             self.assertIn(f"api_error_status={item}", claude_error_summary(payload))
+
+    def test_labels_show_by_where_they_come_from(self):
+        """The CLI's own constants show by shape, new ones included; the body type only from the CLI's table."""
+        payload = usage_limit_envelope()
+        payload.update(api_error="connection_failed", api_error_status=None)
+        summary = claude_error_summary(payload)
+        self.assertIn('api_error="connection_failed"', summary)
+        self.assertIn("api_error_status=null", summary)
+        self.assertNotIn("api_error_type", summary)                  # absent: not shown at all
+        payload.update(api_error="brand_new_kind", subtype="error_brand_new", terminal_reason="brand_new_reason",
+                       api_error_type="rate_limit_error")
+        summary = claude_error_summary(payload)
+        for shown in ('api_error="brand_new_kind"', 'subtype="error_brand_new"', 'terminal_reason="brand_new_reason"',
+                      'api_error_type="rate_limit_error"'):
+            self.assertIn(shown, summary)
+        payload["api_error_type"] = "private_project_olive"   # identifier-shaped, but not one of the CLI's types
+        summary = claude_error_summary(payload)
+        self.assertIn("api_error_type=unrecognized", summary)
+        self.assertNotIn("private_project_olive", summary)
+        for item in (None, ["x"], "Private_Project", "x" * 65):
+            payload.update(api_error=item, api_error_type=item)
+            with self.subTest(item=item):
+                summary = claude_error_summary(payload)
+                self.assertIn("; api_error=unrecognized;", summary)        # bare: never a quoted value
+                self.assertIn("api_error_type=unrecognized", summary)
+                self.assertNotIn("Private_Project", summary)
+                self.assertNotIn("x" * 65, summary)
 
     def test_turn_limit_errors_remain_bounded_and_escape_control_characters(self):
         message = "Reached maximum turns\n\r\x00\x1b\x85\u202e" + "\U0001f600" * 1000

@@ -53,6 +53,59 @@ class RegistryTests(unittest.TestCase):
         self.assertEqual(projected["data"], {"revision": 0, "task_count": 2})
         self.assertNotIn("detail", stops.project(value, "run_ab12", omit_detail=True))
 
+    def test_transport_failure_row_projects_like_the_other_provider_failures(self):
+        source = {"dispatch_id": "w1", "task_id": "greet", "artifact": "/runs/r/dispatches/w1/process.stdout",
+                  "artifact_digest": "b" * 64}
+        value = stops.make("provider_failure", "transport", data={"role": "worker", "provider": "claude"},
+                           source=source)
+        stops.validate(value)
+        projected = stops.project(value, "run_ab12")
+        self.assertEqual((projected["exits"], projected["exit_code"]), (["resume run_ab12"], 3))
+        self.assertEqual((projected["data"], projected["source"]), ({"role": "worker", "provider": "claude"}, source))
+        failed = stops.REGISTRY[("provider_failure", "invocation_failed")]
+        row = stops.REGISTRY[("provider_failure", "transport")]
+        self.assertEqual((set(row["data"]), row["source"], row["exits"]), (set(failed["data"]), failed["source"], failed["exits"]))
+        bad = stops.make("provider_failure", "transport", data={"role": "worker", "provider": "gemini", "http_status": "x"})
+        self.assertEqual(sorted(bad["data"]["dropped_fields"]), ["http_status", "provider"])
+
+    def test_call_failure_facts_are_registered_on_the_ten_failure_rows_and_checked(self):
+        facts = {"api_error", "api_error_type", "terminal_reason", "unrecognized_labels", "http_status_state",
+                 "exit_confirmed", "attempt_charged"}
+        rows = {key for key, entry in stops.REGISTRY.items() if facts <= set(entry["data"])}
+        self.assertEqual(rows, {("provider_quota", "usage_limit"), ("provider_quota", "rate_limit"),
+                                ("provider_failure", "overloaded"), ("provider_failure", "invocation_failed"),
+                                ("provider_failure", "local_start"), ("provider_failure", "unknown"),
+                                ("provider_failure", "authentication"), ("provider_failure", "transport"),
+                                ("budget", "agent_timeout"), ("budget", "agent_turns")})
+        self.assertFalse(any(set(entry["data"]) & facts for key, entry in stops.REGISTRY.items() if key not in rows))
+        source = {"dispatch_id": "w1", "task_id": "greet"}
+        shown = {"role": "worker", "provider": "claude", "api_error": "brand_new_kind", "api_error_type": "billing_error",
+                 "terminal_reason": "api_error", "unrecognized_labels": ["api_error_type", "terminal_reason"],
+                 "http_status_state": "null", "exit_confirmed": True, "attempt_charged": False}
+        value = stops.make("provider_failure", "transport", data=dict(shown), source=source)
+        stops.validate(value)
+        projected = stops.project(value, "run_ab12")
+        self.assertEqual((projected["data"], projected["exits"]), (shown, ["resume run_ab12"]))
+        self.assertEqual(stops.make("budget", "agent_turns", data={"role": "worker", "exit_confirmed": False})["data"],
+                         {"role": "worker", "exit_confirmed": False})
+        # A label off the identifier shape, a body type outside the CLI's table, an unknown, repeated or empty
+        # list of names, an unknown HTTP state or a non-boolean fact is dropped and named, never kept.
+        for name, item in (("api_error", "UNRECOGNIZED_SECRET\n"), ("api_error", "x" * 65), ("api_error", "9lives"),
+                           ("api_error", ["x"]), ("terminal_reason", None), ("terminal_reason", "api-error"),
+                           ("api_error_type", "private_project_olive"), ("api_error_type", "rate_limit_error\n"),
+                           ("unrecognized_labels", []), ("unrecognized_labels", ["subtype"]),
+                           ("unrecognized_labels", ["api_error", "api_error"]), ("unrecognized_labels", "api_error"),
+                           ("unrecognized_labels", [["api_error"]]), ("http_status_state", "not_provided"),
+                           ("exit_confirmed", 1), ("attempt_charged", "false")):
+            with self.subTest(field=name, value=item):
+                made = stops.make("provider_failure", "invocation_failed", data={"role": "worker", name: item},
+                                  source=source)
+                stops.validate(made)
+                self.assertEqual((made["kind"], made["data"]["dropped_fields"]), ("provider_failure", [name]))
+                self.assertNotIn(name, made["data"])
+                with self.assertRaises(HarnessError):
+                    stops.validate({**made, "data": {"role": "worker", name: item}})
+
     def test_strings_map_drops_bad_values_keeps_heads_and_fits_the_whole_value(self):
         key = ("scope_extension", "revision")
         bad = stops.make(*key, data={"gaps": {"not an id!": ["x"]}, "suggested_scope": ["x"]})
@@ -69,7 +122,7 @@ class RegistryTests(unittest.TestCase):
         # Five full lists exceed the whole value's limit: the later-listed ones shrink first.
         full = ["p/" + "y" * 200 + f"/{i}" for i in range(200)]
         value = stops.make(*key, data={"suggested_scope": full, "gaps": big, "scope": full, "widened": full,
-                                       "missing_commands": {"t0": [["cmd", "z" * 100]] * 20}})
+                                       "missing_commands": {"t0": [{"cwd": ".", "argv": ["cmd", "z" * 100]}] * 20}})
         error = HarnessError("\u4e2d" * 5000)
         error.stop = value
         final = stops.of(error)
@@ -175,12 +228,17 @@ class FitProperty(unittest.TestCase):
             return {"kind": self.ident(rng), "reason": self.ident(rng)}
         if hasattr(check, "values"):
             return rng.choice(check.values)
+        if check is stops._label:
+            return rng.choice("abz") + "".join(rng.choice("az09_") for _ in range(rng.randint(0, 63)))
+        if check is stops._label_names:
+            return rng.sample(stops.LABEL_FIELDS, rng.randint(1, len(stops.LABEL_FIELDS)))
         if check is stops._strings:
             return [self.text(rng, 1, 600) for _ in range(many)]
-        if check is stops._argv_list:
-            return [[self.text(rng, 1, 60) for _ in range(rng.randint(1, 6))] for _ in range(many)]
-        if check is stops._argv_map:
-            return {self.ident(rng): self.value(rng, stops._argv_list) for _ in range(rng.randint(1, 6))}
+        if check is stops._command_list:
+            return [{"cwd": self.text(rng, 1, 60), "argv": [self.text(rng, 1, 60) for _ in range(rng.randint(1, 6))]}
+                    for _ in range(many)]
+        if check is stops._command_map:
+            return {self.ident(rng): self.value(rng, stops._command_list) for _ in range(rng.randint(1, 6))}
         if check is stops._strings_map:
             return {self.ident(rng): [self.text(rng, 1, 600) for _ in range(many)] for _ in range(rng.randint(1, 6))}
         if check is stops._quota_windows:
@@ -248,14 +306,15 @@ class FitProperty(unittest.TestCase):
         texts = [f"item/{i}/" + "x" * 300 for i in range(start, start + 40)]
         if check is stops._strings:
             return texts
-        if check is stops._argv_list:
-            return [["cmd", text] for text in texts]
+        if check is stops._command_list:
+            return [{"cwd": "app", "argv": ["cmd", text]} for text in texts]
         if check is stops._quota_windows:
             return [{"bucket": text[:160], "used_percent": 100, "resets_at": None} for text in texts]
         if check is stops._strings_map:
             return {f"t{start + k}": texts[10 * k:10 * k + 10] for k in range(4)}
-        if check is stops._argv_map:
-            return {f"t{start + k}": [["cmd", text] for text in texts[10 * k:10 * k + 10]] for k in range(4)}
+        if check is stops._command_map:
+            return {f"t{start + k}": [{"cwd": "app", "argv": ["cmd", text]} for text in texts[10 * k:10 * k + 10]]
+                    for k in range(4)}
         raise AssertionError(f"no items for {check}")
 
     @staticmethod

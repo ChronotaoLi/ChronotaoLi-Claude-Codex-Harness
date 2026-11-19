@@ -112,7 +112,7 @@ class MemoryScopeTests(unittest.TestCase):
                                   provenance={'commit': 'a' * 40, 'run_id': 'run_old', 'task_id': 'task',
                                               'source_hashes': {}})
         self.assertEqual({item['id'] for item in self.memory.search('upgrade', run_id='run_new')}, {task, knowledge})
-        for name, value in (('version 17', {**current, 'schema_version': 17}), ('no version', {
+        for name, value in (('version 18', {**current, 'schema_version': 18}), ('no version', {
                 key: item for key, item in current.items() if key != 'schema_version'}), ('array', []), ('null', None)):
             with self.subTest(ledger=name):
                 path.write_text(json.dumps(value))

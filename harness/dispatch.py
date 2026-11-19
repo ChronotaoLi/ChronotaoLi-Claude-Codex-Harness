@@ -47,8 +47,31 @@ def process_stop(failure, dispatch_id, task_id=None):
     return None
 
 
-def failure_stop(code, http_status, *, role, provider, dispatch_id, task_id, timeout, artifacts):
-    """The stop of a classified call failure (spec-5 8.3); ``artifacts`` maps file name to digest or None."""
+def _original_facts(code, provider, artifacts):
+    """The facts read again from the two originals (spec-3 rule 8), or none at all.
+
+    Only when both read and each matches the digest the failure was typed by; a None digest
+    (absent or unreadable then) never matches. A timeout or start failure shows no labels.
+    """
+    from .provider_failures import read_for_boundary, stop_facts
+    raw = {}
+    for name in ("process.outcome.json", "process.stdout"):
+        state, data = read_for_boundary(artifacts["job"] / name)
+        if state != "read" or artifacts.get(name) is None or hashlib.sha256(data).hexdigest() != artifacts[name]:
+            return {}
+        raw[name] = data
+    facts = stop_facts(raw["process.outcome.json"], raw["process.stdout"], provider)
+    if code in ("agent_timeout", "local_start"):
+        facts = {key: value for key, value in facts.items() if key == "exit_confirmed"}
+    return facts
+
+
+def failure_stop(code, http_status, *, role, provider, dispatch_id, task_id, timeout, artifacts, attempt_charged=None):
+    """The stop of a classified call failure (spec-5 8.3); ``artifacts`` maps file name to digest or None.
+
+    The facts from the originals are display only: whether they read again never changes the type.
+    ``http_status`` and a worker's ``attempt_charged`` come from the judgment and the ledger.
+    """
     from .provider_failures import STOPS
     kind, reason = STOPS[code]
     decisive = ("process.outcome.json" if code in ("agent_timeout", "local_start") or not artifacts.get("process.stdout")
@@ -64,6 +87,9 @@ def failure_stop(code, http_status, *, role, provider, dispatch_id, task_id, tim
         data = {"role": role, "provider": provider}
     if http_status is not None and code not in ("agent_timeout", "local_start"):
         data["http_status"] = http_status
+    data.update(_original_facts(code, provider, artifacts))
+    if attempt_charged is not None:
+        data["attempt_charged"] = attempt_charged
     return stops.make(kind, reason, data=data, source=source)
 
 
@@ -75,7 +101,6 @@ def invocation_stop(failure, *, job, role, provider, dispatch_id, task_id, timeo
     Claude's envelope fields and never Codex's messages. A worker's failure is typed
     by its judgment instead (``Dispatcher.judge_worker_failure``).
     """
-    import hashlib
     from .provider_failures import classify, read_for_boundary
     from .util import ProcessStartError, ProcessTimeout
     value = process_stop(failure, dispatch_id, task_id)
@@ -88,10 +113,10 @@ def invocation_stop(failure, *, job, role, provider, dispatch_id, task_id, timeo
         code = "agent_timeout"
     else:
         code = None
-    raw = {name: read_for_boundary(Path(job) / name) for name in ("process.outcome.json", "process.stdout")}
-    found = classify(raw["process.outcome.json"], raw["process.stdout"] or b"", provider)
-    artifacts = {"job": Path(job), **{name: hashlib.sha256(data).hexdigest() if data is not None else None
-                                      for name, data in raw.items()}}
+    read = {name: read_for_boundary(Path(job) / name) for name in ("process.outcome.json", "process.stdout")}
+    found = classify(read["process.outcome.json"][1], read["process.stdout"][1] or b"", provider)
+    artifacts = {"job": Path(job), **{name: hashlib.sha256(data).hexdigest() if state == "read" else None
+                                      for name, (state, data) in read.items()}}
     return failure_stop(code or found["code"], None if code else found["http_status"], role=role, provider=provider,
                         dispatch_id=dispatch_id, task_id=task_id, timeout=timeout, artifacts=artifacts)
 
@@ -107,24 +132,43 @@ def last_model_call(dispatches, before=None):
                  if entry.get("role") in MODEL_ROLES and entry.get("invoked") is True), None)
 
 
+def last_invalid(dispatches, key):
+    """The run's last model call when it is an invalid output of the call ``key``, else None."""
+    last = last_model_call(dispatches)
+    return last if last is not None and dispatch_key(last) == key and last.get("status") == "invalid" else None
+
+
+def redo_judgment(dispatches, key, digest):
+    """The redo judgment of the call ``key`` on the candidate ``digest``: (previous_invalid, retry_of).
+
+    Only the run's last model call counts: when it is an invalid output of
+    this same call without retry_of, this call is its one automatic redo.
+    When that invalid output was itself a redo, this is a new request (a
+    resume after the stop), still shown the previous invalid output. A held
+    proposal is ``completed``, never a redo basis. A review's invalid output
+    is one only on the candidate it reviewed (spec-1 rule 15); ``digest`` is
+    read for nothing else. Takes no snapshot, so the derivation before the
+    packet is built and the recheck on the bound snapshot are one rule.
+    """
+    last = last_invalid(dispatches, key)
+    if last is None or last["role"] == "reviewer" and last.get("snapshot_digest") != digest:
+        # A review of another candidate is another call: neither a redo nor its hint.
+        return None, None
+    source = last["invalid_output"]
+    previous = {"dispatch_id": last["id"], "artifact": source["artifact"],
+                "artifact_digest": source["artifact_digest"],
+                "error": str(last.get("error", ""))[:ERROR_EXCERPT_CHARS]}
+    return previous, (None if last.get("retry_of") else last["id"])
+
+
 class Dispatcher(RuntimeService):
     def redo_basis(self, key):
-        """Derive the previous invalid output and redo eligibility from the ledger.
-
-        Only the run's last model call counts: when it is an invalid output of
-        this same call without retry_of, this call is its one automatic redo.
-        When that invalid output was itself a redo, this is a new request (a
-        resume after the stop), still shown the previous invalid output. A held
-        proposal is ``completed``, never a redo basis.
-        """
-        last = last_model_call(self.context.run["dispatches"])
-        if last is None or dispatch_key(last) != key or last.get("status") != "invalid":
-            return None, None
-        source = last["invalid_output"]
-        previous = {"dispatch_id": last["id"], "artifact": source["artifact"],
-                    "artifact_digest": source["artifact_digest"],
-                    "error": str(last.get("error", ""))[:ERROR_EXCERPT_CHARS]}
-        return previous, (None if last.get("retry_of") else last["id"])
+        """The redo judgment of ``key`` on the current candidate, before its packet is built."""
+        dispatches = self.context.run["dispatches"]
+        last = last_invalid(dispatches, key)
+        # Only a review's judgment depends on the candidate; the snapshot is read for nothing else.
+        digest = snapshot_digest(self.context.snapshot()) if last is not None and last["role"] == "reviewer" else None
+        return redo_judgment(dispatches, key, digest)
 
     def dispatch(self, role, kind, task_id, schema, packet, task=None):
         validate_dispatch_indexes(self.context.directory, self.context.run["dispatches"])
@@ -160,7 +204,8 @@ class Dispatcher(RuntimeService):
                 if role == "worker":
                     return self.judge_worker_failure(key, error)
                 self.context.ensure_exited()
-                invalid = self.services.receipts.record_invalid(key, error, artifact=error.artifact)
+                invalid = self.services.receipts.record_invalid(key, error, source={
+                    "artifact": str(error.artifact), "artifact_digest": error.artifact_digest})
                 if invalid.entry.get("retry_of"):
                     raise self.stop_invalid(role, invalid) from error
             except InvalidOutput as invalid:
@@ -204,13 +249,33 @@ class Dispatcher(RuntimeService):
         error.stop = failure_stop(evidence["provider"]["code"], evidence["provider"]["http_status"], role="worker",
                                   provider="claude", dispatch_id=dispatch_id, task_id=entry["task_id"],
                                   timeout=self.context.config.data["runtime"]["agent_timeout_seconds"],
-                                  artifacts={"job": job, **evidence["sources"]})
+                                  artifacts={"job": job, **evidence["sources"]},
+                                  attempt_charged="attempt_exemption" not in entry)
         raise error
 
     @staticmethod
     def stop_invalid(role, invalid):
         return HarnessError(f"{role} 输出连续两次无效：{invalid}；原件 {invalid.entry['invalid_output']['artifact']}；"
                             "普通 resume 重新请求，或 abandon", stop=stops.make("invalid_output", "redo_exhausted", data={"role": role}, source={"dispatch_id": invalid.entry["id"], "task_id": invalid.entry["task_id"], "artifact": invalid.entry["invalid_output"]["artifact"], "artifact_digest": invalid.entry["invalid_output"]["artifact_digest"]}))
+
+    def require_review_candidate(self, kind, entry, previous_invalid):
+        """A review is bound to the candidate its batch mapping, and its redo judgment, belong to (spec-1 rule 15).
+
+        Checked once the entry's snapshot is bound and before any budget, receipt or call: a
+        review bound to another candidate could be attributed to no attempt, and a redo judged
+        on another candidate (either way: a redo that is none, or a redo taken for a new
+        request) is a different call. A local preparation failure, charged nothing.
+        """
+        run = self.context.run
+        batch = run["final_history"][-1] if kind == "final_review" else run["pending_task"]
+        source = {"dispatch_id": entry["id"], "task_id": entry["task_id"]}
+        if entry["snapshot_digest"] != batch["snapshot_digest"]:
+            raise HarnessError("审阅派发前候选已变化，与本批必需问题对照所属的快照不同；未调用模型",
+                               stop=stops.make("workspace_mismatch", "candidate_changed", source=source))
+        bound, _ = redo_judgment(run["dispatches"], dispatch_key(entry), entry["snapshot_digest"])
+        if (bound and bound["dispatch_id"]) != (previous_invalid and previous_invalid["dispatch_id"]):
+            raise HarnessError("审阅派发前候选已变化，按绑定的快照推导的重做判定与组包时不同；未调用模型",
+                               stop=stops.make("workspace_mismatch", "candidate_changed", source=source))
 
     def dispatch_once(self, role, kind, task_id, schema, packet, task=None, *, retry_of=None, previous_invalid=None):
         self.context.ensure_exited()
@@ -329,6 +394,8 @@ class Dispatcher(RuntimeService):
                 read_bound_bytes(previous_invalid, "无效输出")
             before = self.context.snapshot()
             entry["snapshot_digest"] = snapshot_digest(before)
+            if role == "reviewer":
+                self.require_review_candidate(kind, entry, previous_invalid)
             rejection = validate_continuation_rejection(self.context, before,
                                                        worker_task=task_id if role == "worker" else None)
             if rejection and role != "worker":

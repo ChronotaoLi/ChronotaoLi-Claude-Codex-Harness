@@ -4,6 +4,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from .provider_failures import read_original
+
 
 def _identifier(value):
     return value if isinstance(value, str) and 0 < len(value) <= 160 and all(
@@ -33,13 +35,12 @@ def invocation_diagnostics(job, provider):
     value = {'permission_denials': {'status': 'unknown'}}
     if provider == 'claude':
         try:
-            with (job / 'process.stdout').open('rb') as stream:
-                raw = stream.read(16 * 1024 * 1024 + 1)
-            if len(raw) <= 16 * 1024 * 1024:
+            state, raw = read_original(job / 'process.stdout', lambda stream: stream.read(16 * 1024 * 1024 + 1))
+            if state == 'read' and len(raw) <= 16 * 1024 * 1024:
                 envelope = json.loads(raw)
                 if isinstance(envelope, dict) and envelope.get('type') == 'result':
                     value['permission_denials'] = permission_denial_projection(envelope)
-        except (OSError, ValueError, RuntimeError):
+        except (ValueError, RuntimeError):
             pass
     return value
 
@@ -95,6 +96,57 @@ def remaining_model_calls(run):
             'message': (f'如果之后全部一次通过，至少还需 {bound} 次模型调用（下界：只计 worker、任务审阅与整体审阅，'
                         '不含指挥决定、返工与重做）'),
             'basis': 'recorded_stage_lower_bound; read-only, never changes a budget'}
+
+
+def ledger_stage(run):
+    """The step a planning or running ledger last recorded; a record only, never a sign the process is alive.
+
+    Later sources override earlier keys: the task or whole-run stage, then the
+    last running dispatch entry, then a recorded quota wait.
+    """
+    if not isinstance(run, dict) or run.get('status') not in ('planning', 'running'):
+        return None
+    def text(value):
+        return value if isinstance(value, str) else None
+    def number(value):
+        return value if type(value) is int else None
+    stage = dict.fromkeys(('step', 'task_id', 'attempt', 'role', 'kind', 'dispatch_id', 'process_state'))
+    stage['step'] = 'between_steps'
+    phases = {'verifying': 'verification', 'reviewing': 'review'}
+    pending, accepting, post = (run.get(field) for field in ('pending_task', 'pending_acceptance', 'pending_post_accept'))
+    history = run.get('final_history')
+    history = [item for item in history if isinstance(item, dict)] if isinstance(history, list) else []
+    final = history[-1] if history else {}
+    if isinstance(pending, dict) and text(pending.get('stage')) in phases:
+        stage.update(step='task_' + phases[pending['stage']], task_id=text(pending.get('task_id')),
+                     attempt=number(pending.get('attempt')))
+    elif isinstance(accepting, dict):
+        stage.update(step='task_acceptance', task_id=text(accepting.get('task_id')), attempt=number(accepting.get('attempt')))
+    elif isinstance(post, dict):
+        payload = post.get('payload')
+        stage.update(step='task_acceptance', task_id=text(payload.get('task_id')) if isinstance(payload, dict) else None)
+    elif final.get('status') == 'running' and text(final.get('phase')) in phases:
+        stage.update(step='final_' + phases[final['phase']], task_id='final', attempt=number(final.get('attempt')))
+    entries = run.get('dispatches')
+    running = [entry for entry in entries if isinstance(entry, dict) and entry.get('status') == 'running'] \
+        if isinstance(entries, list) else []
+    if running:
+        entry = running[-1]
+        task_id = text(entry.get('task_id'))
+        if entry.get('role') == 'worker':
+            receipt = entry.get('worker_receipt')
+            attempt = number(receipt.get('attempt')) if isinstance(receipt, dict) else None
+        else:
+            # Another role's entry carries no attempt; it shares the stage's only when it is that task's call.
+            attempt = stage['attempt'] if task_id is not None and task_id == stage['task_id'] else None
+        stage.update(step='dispatch', task_id=task_id, attempt=attempt, role=text(entry.get('role')),
+                     kind=text(entry.get('kind')), dispatch_id=text(entry.get('id')),
+                     process_state=text(entry.get('process_state')))
+    waiting = run.get('quota_wait')
+    if isinstance(waiting, dict):
+        stage.update(step='quota_wait', role=text(waiting.get('role')), dispatch_id=text(waiting.get('dispatch_id')),
+                     kind=None, process_state=None)
+    return stage
 
 
 def budget_explanation(run, work):

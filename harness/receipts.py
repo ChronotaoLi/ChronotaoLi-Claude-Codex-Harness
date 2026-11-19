@@ -82,6 +82,13 @@ class ResultReceipts(RuntimeService):
                 and type(outcome.get("exit_code")) is int
                 and (outcome.get("termination_reason") == "normal" or outcome["exit_code"] == 0))
 
+    def has_terminal_capture(self, receipt):
+        """Whether the receipt's result was, or must be, recovered from the provider terminal."""
+        entry = next(d for d in self.context.run["dispatches"] if d["id"] == receipt["dispatch_id"])
+        marker = self.context.directory / "dispatches" / entry["id"] / "terminal-capture.json"
+        return bool(marker.exists() or receipt.get("terminal_capture_digest")
+                    or self.terminal_capture_required(entry.get("process_outcome")))
+
     def validate_pending_terminal_captures(self):
         for field in ("review_receipts", "commander_receipts"):
             for receipt in self.context.run[field].values():
@@ -91,7 +98,7 @@ class ResultReceipts(RuntimeService):
                 if (marker.exists() or receipt.get("terminal_capture_digest")
                         or outcome):
                     self.validate_terminal_capture(receipt)
-                    if ((marker.exists() or receipt.get("terminal_capture_digest") or self.terminal_capture_required(outcome))
+                    if (self.has_terminal_capture(receipt)
                             and snapshot_digest(self.context.snapshot()) != receipt["snapshot_digest"]):
                         raise HarnessError("终端结果的代码快照已变化；保留证据，禁止重新抽取结论", stop=stops.make("workspace_mismatch", "candidate_changed"))
 
@@ -184,16 +191,17 @@ class ResultReceipts(RuntimeService):
         receipts.pop(key)
         self.context.save()
 
-    def record_invalid(self, key, error, *, artifact=None):
-        """Record an output without a readable veto and consume its receipt in one save."""
+    def record_invalid(self, key, error, *, source=None):
+        """Record an output without a readable veto and consume its receipt in one save.
+
+        ``source``: an undecodable provider file with the digest of the bytes the judgment read
+        (``UndecodableOutput``), never read again here; otherwise the receipt's returned result.
+        """
         field = "commander_receipts" if key.startswith("commander:") else "review_receipts"
         receipt = self.context.run[field][key]
         entry = next(d for d in self.context.run["dispatches"] if d["id"] == receipt["dispatch_id"])
-        if artifact is None:
+        if source is None:
             source = {"artifact": receipt["artifact"], "artifact_digest": receipt["artifact_digest"]}
-        else:
-            # An undecodable provider file: bind the bytes the judgment read.
-            source = {"artifact": str(artifact), "artifact_digest": hashlib.sha256(Path(artifact).read_bytes()).hexdigest()}
         entry.update(status="invalid", error=str(error), invalid_output=source)
         self.context.run[field].pop(key)
         self.context.save()

@@ -5,20 +5,70 @@ import sys
 from copy import deepcopy
 
 from . import git, git_query, stops
-from .command_server import command_id
+from .commands import command_id
 from .context import (
     capacity_report, compact_checks, compact_plan, compact_reviews, field_size_report, instruction_file_changes,
 )
 from .contracts import envelope, output_constraints, review_output_constraints, review_schema, with_keys
 from .path_evidence import project_paths
-from .input_projection import project_history, project_commands
+from .input_projection import project_history, project_commands, project_review_keys
 from .services import RuntimeService
 from .shared import read_skill, skills_catalog
 from .util import HarnessError
 from .verification_plan import build_verification_plan, finding_progress_packet, project_finding_sources, verification_role_view, recent_costs
 from .continuation import packet as continuation_packet
-from .review_progress import required_findings, validate_review_source
+from .review_progress import entries, repair_findings, required_findings, verify_history
 from .recovery import snapshot_digest
+
+
+def _reviewed(record):
+    """Whether a whole-run record view holds review content: a review is registered with it, never after a failed verification."""
+    return isinstance(record, dict) and not {"review", "review_in_prior_reviews", "review_source",
+                                             "required_findings"}.isdisjoint(record)
+
+
+def _feedback_histories(feedback):
+    """The histories a saved feedback holds review content of, each named by its own kind and source fields.
+
+    A whole-run record counts once reviewed; a task's rejecting review or voided approval
+    belongs to the task it records; a revision's saved decide trigger is read the same
+    way, its task recovery belonging to its current task, however deeply revisions nest.
+    No path or other text inside it names a history.
+    """
+    found = set()
+    while isinstance(feedback, dict):
+        tid = feedback.get("task_id")
+        if isinstance(tid, str) and not {"review", "review_in_prior_reviews", "acceptance"}.isdisjoint(feedback):
+            found.add((tid, False))
+        if _reviewed(feedback.get("final_review")):
+            found.add(("final", True))
+        trigger = feedback.get("trigger")
+        if not isinstance(trigger, dict):
+            break
+        if _reviewed(trigger.get("final_review")):
+            found.add(("final", True))
+        recovery, current = trigger.get("recovery"), trigger.get("current_task")
+        latest = recovery.get("latest") if isinstance(recovery, dict) else None
+        if isinstance(current, str) and isinstance(latest, dict) and isinstance(latest.get("review"), dict):
+            found.add((current, False))
+        feedback = trigger.get("feedback")
+    return found
+
+
+def carried_histories(run, packet):
+    """The review histories a task-level packet holds content of: (task ID, False) for a task's, ("final", True) for the whole run's.
+
+    Its own history's positions (prior_reviews, recovery, required_findings) are built
+    from its task. The positions that can hold another history's are its feedback, saved
+    by an earlier call, and each dependency's summary, which the dependency's approving
+    review wrote; each is read from its own source fields. A value elsewhere that
+    happens to equal a review's dispatch or original path names nothing.
+    """
+    found = _feedback_histories(packet.get("feedback"))
+    for tid in packet.get("dependencies") or {}:
+        if run["accepted"].get(tid, {}).get("summary_source") == "reviewer":
+            found.add((tid, False))
+    return found
 
 
 class PacketBuilder(RuntimeService):
@@ -47,7 +97,7 @@ class PacketBuilder(RuntimeService):
             # Capacity preflight; a final review passes its saved mapping instead.
             required = required_findings(
                 self.context.run, "final", snapshot_digest(self.context.snapshot()),
-                whole_run=True, records=history) if any(item.get("review") for item in history) else []
+                whole_run=True, records=history) if entries(history, whole_run=True) else []
         return {
             "goal": self.context.run["goal"], **compact_plan(original_tasks, tasks),
             "accepted": self.accepted_context(), "base_commit": self.context.run["base_commit"],
@@ -105,7 +155,7 @@ class PacketBuilder(RuntimeService):
         if original_tasks is None:
             original_tasks = self.context.run["original_tasks"] or tasks
         dispatch_id = "00000000-0000-0000-0000-000000000000"
-        checks = [{"argv": command, "exit_code": 0, "stdout": "", "stderr": "",
+        checks = [{"command": command, "exit_code": 0, "stdout": "", "stderr": "",
                    "log": "", "timed_out": False}
                   for command in self.context.config.data["verification"]["commands"]]
         # The ignored listing is read when the review is built; the lower bound holds an empty one.
@@ -192,10 +242,10 @@ class PacketBuilder(RuntimeService):
             packet = {**packet, "tool_constraints": constraints}
         task = next((item for item in self.context.run.get("tasks", []) if item["id"] == task_id), None)
         if role == "worker" and self.context.run.get("review_history", {}).get(task_id):
-            packet = {**packet, "required_findings": required_findings(
-                self.context.run, task_id, snapshot_digest(self.context.snapshot()))}
-        # Synthetic commander/final IDs describe a run-level view, not a task.
-        scope = task_id if task is not None else None
+            packet = {**packet, "required_findings": repair_findings(self.context.run, task_id)}
+        # The call, never a task's name, makes a run-level view: the commander's decide and the
+        # whole-run review see every history, any other call its own task's.
+        scope = None if role == "commander" or kind == "final_review" else task_id
         continuation = continuation_packet(self.context, scope)
         if continuation.get("execution_guidance"):
             digest = snapshot_digest(self.context.snapshot())
@@ -213,21 +263,32 @@ class PacketBuilder(RuntimeService):
                     "superseded_by_worker_dispatches": [item["id"] for item in successors],
                     "active": digest == row["snapshot_digest"] and not successors}
         continuation = project_history(continuation, self.context.directory)
-        # Validate every historical body used by progress, including run-wide views.
-        for tid, records in self.context.run.get("review_history", {}).items():
-            if scope is None or tid == scope:
-                for record in records:
-                    # A record without a review is a structurally invalid original
-                    # kept when its candidate changed; it carries nothing to check.
-                    if record.get("review"):
-                        validate_review_source(self.context.run, tid, record)
-        if scope is None:
-            for record in self.context.run.get("final_history", []):
-                if record.get("review"):
-                    validate_review_source(self.context.run, "final", record, kind="final_review")
+        # The packet projects its call's histories. It traverses those and every other history it
+        # carries content of (a correction's feedback holds the whole-run review that asked for it,
+        # a worker's dependencies their approving reviews), each before any review projection:
+        # every source authenticated, every saved mapping and approval checked.
+        histories = [tid for tid in self.context.run.get("review_history", {}) if scope is None or tid == scope]
+        carried = set() if scope is None else carried_histories(self.context.run, packet)
+        keyed = {tid: verify_history(self.context.run, tid) for tid in self.context.run.get("review_history", {})
+                 if tid in histories or (tid, False) in carried}
+        whole = (verify_history(self.context.run, "final", whole_run=True)
+                 if scope is None or ("final", True) in carried else None)
         packet = {**packet, **{key: value for key, value in continuation.items() if value}}
+        # Stale authority is refused before this packet publishes either review index (the
+        # continuation projection above may already have written its own).
         self.context.store.check_current()
-        progress = finding_progress_packet(self.context.run, task_id, self.context.directory)
+        if "prior_reviews" in packet:
+            # The full ledger decides, not the count of prior_reviews: a review packet's
+            # prior_reviews may predate its candidate's earlier batches, and a whole-run one
+            # omits its current attempt. Publish when any disposition entry of this packet's
+            # history is not the one prior_reviews still carries inline.
+            records = whole if scope is None else keyed.get(scope, [])
+            inline = {item["review_source"].get("dispatch_id") for item in packet["prior_reviews"]
+                      if "required_findings" in item and isinstance(item.get("review_source"), dict)}
+            if any(row["review_dispatch_id"] not in inline for row in records):
+                packet = project_review_keys(packet, self.context.directory, records)
+        progress = finding_progress_packet(self.context.run, histories, self.context.directory,
+                                           whole_run=scope is None)
         if progress is not None:
             packet = {**packet, "finding_progress": progress}
         packet = {**packet, "verification_plan": verification_role_view(

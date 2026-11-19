@@ -19,7 +19,7 @@ class VerificationCleanupTests(RepoCase):
     def setUp(self):
         super().setUp()
         self.config.data["verification"].update(fresh_checkout=True,
-            commands=[[sys.executable, "-c", "from pathlib import Path; assert Path('hello.py').is_file()"]])
+            commands=[{"cwd": ".", "argv": [sys.executable, "-c", "from pathlib import Path; assert Path('hello.py').is_file()"]}])
         self.engine_instance = self.engine()
         # A verified checkout the runtime did not reclaim: the state a reclamation
         # failure before its intent leaves behind (no cleanup.json).

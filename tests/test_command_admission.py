@@ -1,4 +1,5 @@
 import multiprocessing
+import os
 import sys
 import tempfile
 import time
@@ -7,7 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from harness.command_server import Broker, command_id, create_manifest
-from harness.util import HarnessError, write_json
+from harness.util import HarnessError, with_descriptors, write_json
 
 
 def invoke(path, digest, identifier, queue):
@@ -23,8 +24,8 @@ class CommandAdmissionTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name).resolve()
         self.job = self.root / 'worker'
-        self.argv = [sys.executable, '-c', 'import time;time.sleep(.3);print("done")']
-        config = {'verification': {'commands': [self.argv]}, 'permissions': {'worker_commands': []},
+        self.command = {'cwd': '.', 'argv': [sys.executable, '-c', 'import time;time.sleep(.3);print("done")']}
+        config = {'verification': {'commands': [self.command]}, 'permissions': {'worker_commands': []},
                   'runtime': {'verify_timeout_seconds': 2, 'agent_timeout_seconds': 10}}
         self.meta = create_manifest(config, self.root, self.job)
         self.broker = Broker(self.meta['artifact'], self.meta['artifact_digest'])
@@ -33,7 +34,7 @@ class CommandAdmissionTests(unittest.TestCase):
         folder = self.job / 'commands' / (letter * 32)
         folder.mkdir()
         write_json(folder / 'process.json', {'id': 'worker:command:' + folder.name,
-                   'command_id': command_id(self.argv), 'pgid': None,
+                   'command_id': command_id(self.command), 'pgid': None,
                    'process_state': state, 'exit_confirmed': confirmed})
         return folder
 
@@ -41,23 +42,23 @@ class CommandAdmissionTests(unittest.TestCase):
         self.journal('a')
         self.journal('b', 'prepared')
         with self.assertRaises(HarnessError):
-            self.broker.run_command({'command_id': command_id(self.argv)})
+            self.broker.run_command({'command_id': command_id(self.command)})
         self.assertEqual(len(list((self.job / 'commands').iterdir())), 2)
 
     def test_missing_receipt_blocks_even_confirmed_exit(self):
         self.journal('a', 'exited', True)
         with self.assertRaisesRegex(HarnessError, 'evidence incomplete'):
-            self.broker.run_command({'command_id': command_id(self.argv)})
+            self.broker.run_command({'command_id': command_id(self.command)})
 
     def test_prepared_crash_did_not_start(self):
         self.journal('a', 'prepared')
-        result = self.broker.run_command({'command_id': command_id(self.argv)})
+        result = self.broker.run_command({'command_id': command_id(self.command)})
         self.assertEqual(result['exit_code'], 0)
 
     def test_short_lived_descendant_drain_allows_following_commands(self):
-        argv = [sys.executable, '-c', 'import subprocess,sys; '
+        argv = {'cwd': '.', 'argv': [sys.executable, '-c', 'import subprocess,sys; '
                 'subprocess.Popen([sys.executable,"-c","import time;time.sleep(.1)"],'
-                'stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL);print("done")']
+                'stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL);print("done")']}
         config = {'verification': {'commands': [argv]}, 'permissions': {'worker_commands': []},
                   'runtime': {'verify_timeout_seconds': 2, 'agent_timeout_seconds': 10}}
         meta = create_manifest(config, self.root, self.root / 'short-child-worker')
@@ -71,17 +72,17 @@ class CommandAdmissionTests(unittest.TestCase):
     def test_parent_budget_rejects_without_intent(self):
         with patch('harness.command_server.time.monotonic', return_value=self.broker.manifest['parent_deadline']):
             with self.assertRaisesRegex(HarnessError, 'budget exhausted'):
-                self.broker.run_command({'command_id': command_id(self.argv)})
+                self.broker.run_command({'command_id': command_id(self.command)})
         self.assertEqual(list((self.job / 'commands').iterdir()), [])
 
     def test_intent_write_failure_never_starts_or_publishes(self):
         with patch('harness.command_server.write_json', side_effect=OSError('disk full')), patch('harness.command_server.run_process') as runner:
             with self.assertRaises(OSError):
-                self.broker.run_command({'command_id': command_id(self.argv)})
+                self.broker.run_command({'command_id': command_id(self.command)})
             runner.assert_not_called()
         # No journal-less folder was published, so the next call is admitted.
         self.assertEqual(list((self.job / 'commands').iterdir()), [])
-        self.assertEqual(self.broker.run_command({'command_id': command_id(self.argv)})['exit_code'], 0)
+        self.assertEqual(self.broker.run_command({'command_id': command_id(self.command)})['exit_code'], 0)
 
     def test_receipt_write_failure_blocks_next_call(self):
         original = write_json
@@ -90,22 +91,26 @@ class CommandAdmissionTests(unittest.TestCase):
                 raise OSError('receipt disk full')
             return original(path, value)
         with patch('harness.command_server.write_json', side_effect=fail_receipt):
-            result = self.broker.run_command({'command_id': command_id(self.argv)})
+            result = self.broker.run_command({'command_id': command_id(self.command)})
         self.assertEqual(result['exit_code'], 0)
         self.assertFalse(result['evidence_complete'])
         with self.assertRaisesRegex(HarnessError, 'evidence incomplete'):
-            self.broker.run_command({'command_id': command_id(self.argv)})
+            self.broker.run_command({'command_id': command_id(self.command)})
 
     def test_output_tampering_blocks_next_call(self):
-        result = self.broker.run_command({'command_id': command_id(self.argv)})
+        result = self.broker.run_command({'command_id': command_id(self.command)})
         Path(result['stdout_path']).write_text('changed')
         with self.assertRaisesRegex(HarnessError, 'evidence incomplete'):
-            self.broker.run_command({'command_id': command_id(self.argv)})
+            self.broker.run_command({'command_id': command_id(self.command)})
 
     def test_frozen_parent_bounds_effective_command_timeout(self):
         deadline = self.broker.manifest['parent_deadline']
         with patch('harness.command_server.time.monotonic', return_value=deadline - 2.1):
-            _, _, timeout, _, _ = self.broker._admit({'command_id': command_id(self.argv)})
+            _, _, timeout, _, _, root = with_descriptors(
+                lambda held: self.broker._admit({'command_id': command_id(self.command)}, held))
+        # The admitted root is opened into the caller's holder, whose cleanup closes it.
+        with self.assertRaises(OSError):
+            os.fstat(root)
         self.assertAlmostEqual(timeout, .1)
 
     def test_cleanup_uncertainty_preserves_wait_code_and_blocks(self):
@@ -122,18 +127,18 @@ class CommandAdmissionTests(unittest.TestCase):
             error.outcome = facts
             raise error
         with patch('harness.command_server.run_process', side_effect=runner):
-            result = self.broker.run_command({'command_id': command_id(self.argv)})
+            result = self.broker.run_command({'command_id': command_id(self.command)})
         self.assertEqual(result['exit_code'], 0)
         self.assertEqual(result['termination_reason'], 'normal')
         self.assertFalse(result['exit_confirmed'])
         with patch('harness.command_server.group_alive', return_value=False):
             with self.assertRaises(HarnessError):
-                self.broker.run_command({'command_id': command_id(self.argv)})
+                self.broker.run_command({'command_id': command_id(self.command)})
 
     def test_two_process_callers_cannot_overlap(self):
         context = multiprocessing.get_context('spawn')
         queue = context.Queue()
-        args = (self.meta['artifact'], self.meta['artifact_digest'], command_id(self.argv), queue)
+        args = (self.meta['artifact'], self.meta['artifact_digest'], command_id(self.command), queue)
         first = context.Process(target=invoke, args=args)
         first.start()
         until = time.monotonic() + 3
@@ -149,7 +154,7 @@ class CommandAdmissionTests(unittest.TestCase):
 
     def test_slow_admission_intent_exhausts_parent_budget_without_start(self):
         witness = self.root / 'started'
-        argv = [sys.executable, '-c', f'open({str(witness)!r},"w").write("started")']
+        argv = {'cwd': '.', 'argv': [sys.executable, '-c', f'open({str(witness)!r},"w").write("started")']}
         config = {'verification': {'commands': [argv]}, 'permissions': {'worker_commands': []},
                   'runtime': {'verify_timeout_seconds': 2, 'agent_timeout_seconds': 10}}
         meta = create_manifest(config, self.root, self.root / 'slow', parent_deadline=time.monotonic() + 2.1)
@@ -184,7 +189,7 @@ class CommandAdmissionTests(unittest.TestCase):
                 os.kill(os.getpid(), signal.SIGINT)
             return result
         with patch('harness.process_runtime.signal.signal', side_effect=handoff):
-            result = self.broker.run_command({'command_id': command_id(self.argv)})
+            result = self.broker.run_command({'command_id': command_id(self.command)})
         self.assertTrue(injected)
         self.assertTrue(result['response_cancelled'])
         self.assertTrue(result['error'])
@@ -199,7 +204,7 @@ class CommandAdmissionTests(unittest.TestCase):
     def test_receipt_real_interrupt_records_cancellation_and_completed_wait(self):
         import os
         import signal
-        argv = self.argv
+        argv = self.command
         original = write_json
         def interrupt(path, value):
             if Path(path).name == 'receipt.json':
@@ -228,7 +233,7 @@ class CommandAdmissionTests(unittest.TestCase):
             write_json(path, value)
         with patch('harness.command_server.run_process', side_effect=timeout_runner), \
                 patch('harness.command_server.write_json', side_effect=fail):
-            result = self.broker.run_command({'command_id': command_id(self.argv)})
+            result = self.broker.run_command({'command_id': command_id(self.command)})
         self.assertTrue(result['timed_out'])
         self.assertIn('injected persistence interrupt', result['persistence_error'])
         self.assertNotIn('injected persistence interrupt', result['error'])

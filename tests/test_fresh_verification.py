@@ -55,9 +55,9 @@ class FreshVerificationTests(RepoCase):
                 if entry["role"] == "verification" and entry["task_id"] == "final"]
 
     def need_ignored_helper(self):
-        self.config.data["verification"]["commands"] = [[sys.executable, "-c",
+        self.config.data["verification"]["commands"] = [{"cwd": ".", "argv": [sys.executable, "-c",
             "from pathlib import Path; from hello import greet; "
-            "assert greet('Ada') == 'Hello, Ada!'; assert Path('ignored-helper').read_text() == 'ready'"]]
+            "assert greet('Ada') == 'Hello, Ada!'; assert Path('ignored-helper').read_text() == 'ready'"]}]
 
     @staticmethod
     def helper_worker(backend, kwargs, packet, result):
@@ -91,8 +91,8 @@ class FreshVerificationTests(RepoCase):
 
     def test_explicit_setup_builds_ignored_dependency_and_fresh_review_gets_evidence(self):
         self.need_ignored_helper()
-        self.config.data["verification"]["setup_commands"] = [[sys.executable, "-c",
-            "from pathlib import Path; Path('ignored-helper').write_text('ready')"]]
+        self.config.data["verification"]["setup_commands"] = [{"cwd": ".", "argv": [sys.executable, "-c",
+            "from pathlib import Path; Path('ignored-helper').write_text('ready')"]}]
         backend = ScriptedBackend(self.helper_worker)
         engine = self.engine(backend)
         result = engine.start("Implement greet", self.plan())
@@ -109,14 +109,14 @@ class FreshVerificationTests(RepoCase):
         self.assertEqual(review["verification"][0]["worktree"], environment["worktree"])
         reviewed_environment = read_json(Path(review["verification"][0]["checkout_artifact"]))
         setup_evidence = read_json(Path(reviewed_environment["setup_artifact"]))
-        self.assertEqual(setup_evidence[0]["argv"], self.config.data["verification"]["setup_commands"][0])
+        self.assertEqual(setup_evidence[0]["command"], self.config.data["verification"]["setup_commands"][0])
         self.assertEqual(setup_evidence[0]["exit_code"], 0)
         self.assertEqual(setup_evidence[0]["phase"], "setup")
         self.assertEqual(len(self.final_checks(result)), 2)
 
     def test_setup_cannot_modify_tracked_checkout_files(self):
-        self.config.data["verification"]["setup_commands"] = [[sys.executable, "-c",
-            "from pathlib import Path; Path('hello.py').write_text('tampered')"]]
+        self.config.data["verification"]["setup_commands"] = [{"cwd": ".", "argv": [sys.executable, "-c",
+            "from pathlib import Path; Path('hello.py').write_text('tampered')"]}]
         backend = ScriptedBackend()
         engine = self.engine(backend)
         with self.assertRaisesRegex(HarnessError, "依赖准备.*修改.*受检文件"):
@@ -132,8 +132,8 @@ class FreshVerificationTests(RepoCase):
         external = tempfile.TemporaryDirectory()
         self.addCleanup(external.cleanup)
         marker = Path(external.name) / "environment-ready"
-        self.config.data["verification"]["setup_commands"] = [[sys.executable, "-c",
-            f"from pathlib import Path; assert Path({str(marker)!r}).exists(), 'environment unavailable'"]]
+        self.config.data["verification"]["setup_commands"] = [{"cwd": ".", "argv": [sys.executable, "-c",
+            f"from pathlib import Path; assert Path({str(marker)!r}).exists(), 'environment unavailable'"]}]
         self.config.data["runtime"]["max_attempts"] = 1
         backend = ScriptedBackend()
         engine = self.engine(backend)
@@ -186,8 +186,8 @@ class FreshVerificationTests(RepoCase):
         ready = Path(external.name) / "ready"
         sentinel = Path(external.name) / "second-step"
         self.config.data["verification"]["setup_commands"] = [
-            [sys.executable, "-c", f"from pathlib import Path; assert Path({str(ready)!r}).exists()"],
-            [sys.executable, "-c", f"from pathlib import Path; Path({str(sentinel)!r}).write_text(str(Path.cwd()))"],
+            {"cwd": ".", "argv": [sys.executable, "-c", f"from pathlib import Path; assert Path({str(ready)!r}).exists()"]},
+            {"cwd": ".", "argv": [sys.executable, "-c", f"from pathlib import Path; Path({str(sentinel)!r}).write_text(str(Path.cwd()))"]},
         ]
         backend = ScriptedBackend()
         engine = self.engine(backend)
@@ -213,8 +213,8 @@ class FreshVerificationTests(RepoCase):
     def test_fresh_git_pointer_tampering_blocks_without_changing_main_branch(self):
         main_head = git.head(self.repo)
         main_git = str(self.repo / ".git")
-        self.config.data["verification"]["setup_commands"] = [[sys.executable, "-c",
-            f"from pathlib import Path; Path('.git').write_text('gitdir: ' + {main_git!r} + '\\n')"]]
+        self.config.data["verification"]["setup_commands"] = [{"cwd": ".", "argv": [sys.executable, "-c",
+            f"from pathlib import Path; Path('.git').write_text('gitdir: ' + {main_git!r} + '\\n')"]}]
         backend = ScriptedBackend()
         engine = self.engine(backend)
         with self.assertRaises(HarnessError):
@@ -226,11 +226,11 @@ class FreshVerificationTests(RepoCase):
 
     def test_setup_cannot_change_source_run_candidate(self):
         run_root = str(self.repo.resolve() / ".harness" / "worktrees")
-        self.config.data["verification"]["setup_commands"] = [[sys.executable, "-c",
+        self.config.data["verification"]["setup_commands"] = [{"cwd": ".", "argv": [sys.executable, "-c",
             "from pathlib import Path; import subprocess; "
             "trees = subprocess.check_output(['git', 'worktree', 'list', '--porcelain'], text=True); "
             f"source = next(Path(line[9:]) for line in trees.splitlines() if line.startswith('worktree ') and line[9:].startswith({run_root!r})); "
-            "file = source / 'hello.py'; file.write_text(file.read_text() + '# source modified by setup\\n')"]]
+            "file = source / 'hello.py'; file.write_text(file.read_text() + '# source modified by setup\\n')"]}]
         backend = ScriptedBackend()
         engine = self.engine(backend)
         with self.assertRaisesRegex(HarnessError, "原工作树发生变化"):
@@ -244,7 +244,7 @@ class FreshVerificationTests(RepoCase):
         engine.start("Implement greet", self.plan(), pause_after_plan=True)
         saved = deepcopy(self.config.data["verification"])
         alternatives = [{**saved, "fresh_checkout": False},
-                        {**saved, "setup_commands": [[sys.executable, "-c", "pass"]]}]
+                        {**saved, "setup_commands": [{"cwd": ".", "argv": [sys.executable, "-c", "pass"]}]}]
         for verification in alternatives:
             self.config.data["verification"] = verification
             with self.subTest(verification=verification), self.assertRaisesRegex(HarnessError, "配置已改变"):
@@ -277,9 +277,10 @@ class FreshVerificationConfigTests(unittest.TestCase):
         invalid = [
             {"fresh_checkout": "true"}, {"fresh_checkout": 1},
             {"fresh_checkout": True, "setup_commands": "npm install"},
-            {"fresh_checkout": True, "setup_commands": [[]]},
-            {"fresh_checkout": True, "setup_commands": [["python3", None]]},
-            {"fresh_checkout": False, "setup_commands": [["python3", "-c", "pass"]]},
+            {"fresh_checkout": True, "setup_commands": [{"cwd": ".", "argv": []}]},
+            {"fresh_checkout": True, "setup_commands": [{"cwd": ".", "argv": ["python3", None]}]},
+            {"fresh_checkout": True, "setup_commands": [["python3", "-c", "pass"]]},
+            {"fresh_checkout": False, "setup_commands": [{"cwd": ".", "argv": ["python3", "-c", "pass"]}]},
         ]
         for updates in invalid:
             candidate = deepcopy(config.data)

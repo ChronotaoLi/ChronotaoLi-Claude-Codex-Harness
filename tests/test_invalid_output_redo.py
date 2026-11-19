@@ -651,7 +651,7 @@ class UndecodableOutputTests(RepoCase):
                     self.calls.append({"role": "reviewer", "kind": "review", "packet": {}})
                     path = kwargs["job"] / "response.json"
                     path.write_text('{"verdict": "approve", "verdict": "request_changes"}')
-                    raise UndecodableOutput(path, "duplicate key")
+                    raise UndecodableOutput(path, path.read_bytes(), "duplicate key")
                 return super().invoke(**kwargs)
 
         run = self.engine(Raising()).start("Implement greet", plan())

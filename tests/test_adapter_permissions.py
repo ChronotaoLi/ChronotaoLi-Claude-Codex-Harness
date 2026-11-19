@@ -75,6 +75,8 @@ class AdapterPermissionTests(unittest.TestCase):
 
     def test_newline_paths_cannot_inject_permission_patterns(self):
         for name in ("work\n**", "work\r**"):
+            # A real worktree: the worker's command manifest records the root's identity first.
+            (self.root / name).mkdir()
             with self.subTest(name=name), self.assertRaisesRegex(HarnessError, "路径不能包含换行符"):
                 self.command(self.root / name)
 

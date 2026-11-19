@@ -89,8 +89,9 @@ class FinalPacketBuilderTests(RepoCase):
         replacement["goal"] = "Replacement goal"
         replacement["tasks"][0]["description"] = "Refined implementation requirement"
         replacement["final_history"] = [
-            {"status": "verification_failed", "artifact": "old-final.json", "verification_failures": []},
-            {"status": "running", "artifact": "active-final.json"},
+            {"status": "verification_failed", "artifact": "old-final.json", "verification_failures": [],
+             "approved_batches": []},
+            {"status": "running", "artifact": "active-final.json", "approved_batches": []},
         ]
         engine.run.update(replacement)
         engine.context.save()

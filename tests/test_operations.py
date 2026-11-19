@@ -256,7 +256,7 @@ class OperationRecordTests(OperationCase):
 
     def test_resume_stopped_before_dispatch_keeps_events_and_budgets(self):
         plan = read_json(ROOT / "examples" / "plan.json")
-        plan["tasks"][0]["required_commands"] = [["required-tool", "run", "--exact"]]
+        plan["tasks"][0]["required_commands"] = [{"cwd": ".", "argv": ["required-tool", "run", "--exact"]}]
         plan_path = self.repo / "input-plan.json"
         write_json(plan_path, plan)
         backend = Mock(spec=DemoBackend)
@@ -292,7 +292,7 @@ class OperationRecordTests(OperationCase):
         backend.invoke.assert_not_called()
 
     def test_approval_rejection_keeps_prior_grant_audit_without_resume_notice(self):
-        command = ["required-tool", "run", "--exact"]
+        command = {"cwd": ".", "argv": ["required-tool", "run", "--exact"]}
         plan = read_json(ROOT / "examples" / "plan.json")
         plan["tasks"][0]["required_commands"] = [command]
         plan_path = self.repo / "input-plan.json"
@@ -736,7 +736,7 @@ class DoctorEchoTests(OperationCase):
         cases = [  # name, how the fixed place is filled, exists, digested, error mentions
             ("missing", lambda: None, False, False, None),
             ("dangling link", lambda: place.symlink_to(outside / "nowhere.toml"), False, False, None),
-            ("valid", lambda: write_project_config(self.repo, [["make", "check"]]), True, True, None),
+            ("valid", lambda: write_project_config(self.repo, [{"cwd": ".", "argv": ["make", "check"]}]), True, True, None),
             ("link to a valid file", lambda: place.symlink_to(write_project_config(outside / "kept")), True, True, None),
             ("directory", place.mkdir, True, False, ""),
             ("unreadable", lambda: write_project_config(self.repo).chmod(0), True, False, ""),

@@ -15,12 +15,12 @@ from .planning import attempt_limit_error
 from .input_projection import validate_dispatch_indexes as validate_input_dispatch_indexes
 from .path_evidence import validate_dispatch_indexes
 from .progress import CheckpointDeclarationError
-from .recovery import read_evidence_json, invalidate_acceptance_review, snapshot_digest, worker_recovery_context
+from .recovery import read_evidence_json, acceptance_review_records, snapshot_digest, worker_recovery_context
 from .services import RuntimeService
 from .continuation import record_continuation
 from .review_progress import (
-    bind_review_source, validate_review_source, claim_gaps, claims_for_review, disposition_gaps,
-    required_findings, delivered_worker_findings,
+    batch_after, bind_review_source, validate_review_source, claim_gaps, claims_for_review, disposition_gaps,
+    required_findings, delivered_worker_findings, require_saved_batch,
 )
 from .verification_plan import candidate_preflight
 from .verification import checks_passed
@@ -36,7 +36,7 @@ def environment_blocked(result, task_id, dispatch_id, artifact, digest, *, inval
     """The environment-blocked stop: an excerpt in the text, the full artifact in the stop's source."""
     return HarnessError(f"worker 环境受阻：{environment_blocker_excerpt(result)}。"
                         f"完整 worker 结果：{artifact}（SHA256 {digest}）。"
-                        f"若必要命令被拒绝，可在{PROJECT_FILE}的 permissions.worker_commands 追加精确 argv 后 resume；"
+                        f"若必要命令被拒绝，可在{PROJECT_FILE}的 permissions.worker_commands 追加精确命令（目录与 argv）后 resume；"
                         "环境事实有变化可使用 --environment-update FILE 记录补充说明与本地检查；"
                         "原尝试和派发预算仍保留。",
                         stop=stops.make("environment", "worker_blocked", data={"invalid_output": invalid_output},
@@ -276,16 +276,32 @@ class TaskLifecycle(RuntimeService):
             raise HarnessError(f"{error}。工作树：{self.context.worktree}；请先核对并清理越界修改，再 resume。"
                                "现场与证据已保留，本次预检不会派发 worker。", stop=error.stop) from error
 
-    def preserve_invalidated_reviews(self, pending, key):
-        """Keep evidence when a changed candidate invalidates its pending gate."""
+    def invalidated_reviews(self, pending, key):
+        """The records that keep the evidence when a changed candidate invalidates its pending gate.
+
+        Every read and check happens here; the caller appends them in the
+        transition that ends the gate.
+        """
         runtime = self.context
         history = self.context.run["review_history"].setdefault(pending["task_id"], [])
+        kept = []
         for source in [self.context.run["review_receipts"].get(key)]:
             if not source:
                 continue
             artifact = Path(source["artifact"])
             if not artifact.exists() and "artifact_digest" not in source:
                 continue  # A provider invocation that never returned a result.
+            dispatch_id = source.get("dispatch_id", artifact.parent.name)
+            if any(isinstance(item, dict) and item.get("dispatch_id") == dispatch_id for item in history):
+                continue
+            # A returned review exists only in the reviewing stage, whose saved
+            # mapping produced its schema; never validate it against a default.
+            if "required_findings" not in pending:
+                raise HarnessError("审阅阶段缺少必需问题对照；保留证据")
+            # Checked before the original is read or its digest bound, so a
+            # changed mapping leaves the receipt exactly as it was.
+            require_saved_batch(self.context.run, pending["task_id"], pending["snapshot_digest"],
+                                pending["required_findings"])
             try:
                 raw = artifact.read_bytes()
             except OSError as error:
@@ -297,9 +313,6 @@ class TaskLifecycle(RuntimeService):
                 self.context.save()
             if digest != source["artifact_digest"]:
                 raise EvidenceError("审阅原始结果已改变；禁止通过候选变化丢弃证据", stop=stops.make("evidence", "runtime_integrity", source={"artifact": str(artifact)}))
-            dispatch_id = source.get("dispatch_id", artifact.parent.name)
-            if any(item.get("dispatch_id") == dispatch_id for item in history):
-                continue
             try:
                 result = json.loads(raw)
             except (ValueError, UnicodeError):
@@ -312,10 +325,6 @@ class TaskLifecycle(RuntimeService):
                       "reason": "候选已变化；原结果仅作待复核证据，不构成当前候选的批准"}
             record["review_source"] = {"dispatch_id": dispatch_id, "artifact": str(artifact),
                 "artifact_digest": digest, "snapshot_digest": source["snapshot_digest"]}
-            # A returned review exists only in the reviewing stage, whose saved
-            # mapping produced its schema; never validate it against a default.
-            if "required_findings" not in pending:
-                raise HarnessError("审阅阶段缺少必需问题对照；保留证据")
             record["required_findings"] = deepcopy(pending["required_findings"])
             schema = review_schema(pending["required_findings"])
             if not isinstance(result, dict):
@@ -330,7 +339,8 @@ class TaskLifecycle(RuntimeService):
                     record["review"] = {k: v for k, v in result.items() if k not in ("task_id", "dispatch_id")}
                     if judgment.error is not None:
                         record["validation_error"] = str(judgment.error)
-            history.append(record)
+            kept.append(record)
+        return kept
 
     def continue_task(self):
         runtime = self.context
@@ -344,13 +354,17 @@ class TaskLifecycle(RuntimeService):
         key = f"reviewer:review:{tid}"
         snapshot = self.context.snapshot()
         if snapshot_digest(snapshot) != pending["snapshot_digest"]:
-            self.preserve_invalidated_reviews(pending, key)
-            self.context.run.pop("pending_task")
-            self.context.run["review_receipts"].pop(key, None)
-            self.context.run["feedback"] = {"task_id": tid, "recovery": {
+            # The kept original, the gate's end and the receipt's consumption are one step: a kept
+            # original beside its receipt would make a resumed gate replay a registered dispatch.
+            kept = self.invalidated_reviews(pending, key)
+            feedback = {"task_id": tid, "recovery": {
                 "error": "任务候选已变化；旧验证及审阅失效，重新执行任务",
                 "verification": pending.get("verification")}}
-            self.context.save()
+            with self.context.transition():
+                self.context.run["review_history"][tid].extend(kept)
+                self.context.run.pop("pending_task")
+                self.context.run["review_receipts"].pop(key, None)
+                self.context.run["feedback"] = feedback
             self.context.event("pending_task_invalidated", task_id=tid)
             return False
         if pending["stage"] == "verifying":
@@ -369,10 +383,10 @@ class TaskLifecycle(RuntimeService):
             preflight_path = self.context.directory / "preflight" / tid / str(attempt) / "result.json"
             write_json(preflight_path, preflight)
             if not preflight["passed"]:
-                self.context.run["feedback"] = {"task_id": tid, "preflight": preflight,
-                                           "artifact": str(preflight_path)}
-                self.context.run.pop("pending_task")
-                self.context.save()
+                feedback = {"task_id": tid, "preflight": preflight, "artifact": str(preflight_path)}
+                with self.context.transition():
+                    self.context.run["feedback"] = feedback
+                    self.context.run.pop("pending_task")
                 self.context.event("candidate_preflight_failed", task_id=tid, artifact=str(preflight_path))
                 return False
             pending["required_findings"] = required
@@ -384,9 +398,10 @@ class TaskLifecycle(RuntimeService):
             self.context.save()
             checks = self.services.verification.verify(tid, attempt, artifact_dir=folder, before=snapshot)
             if not checks_passed(checks):
-                self.context.run["feedback"] = {"task_id": tid, "verification": compact_checks(checks)}
-                self.context.run.pop("pending_task")
-                self.context.save()
+                feedback = {"task_id": tid, "verification": compact_checks(checks)}
+                with self.context.transition():
+                    self.context.run["feedback"] = feedback
+                    self.context.run.pop("pending_task")
                 self.context.event("verification_failed", task_id=tid)
                 return False
             paths = self.check_task_scope(task)
@@ -413,6 +428,9 @@ class TaskLifecycle(RuntimeService):
         if "required_findings" not in pending:
             raise HarnessError("审阅阶段缺少必需问题对照；保留证据")
         required = pending["required_findings"]
+        # The saved mapping is rechecked against the history before its review is dispatched or replayed.
+        require_saved_batch(self.context.run, tid, reviewed_digest, required,
+                            receipt=self.context.run["review_receipts"].get(key))
         delivered = delivered_worker_findings(self.context, tid, Path(pending["worker_artifact"]).parent.name)
         message = self.review_worker_message(pending)
         review, diagnostics = self.services.receipts.dispatch_review("review", tid,
@@ -428,7 +446,11 @@ class TaskLifecycle(RuntimeService):
                   "decision_requests": deepcopy(pending["worker_result"].get("decision_requests", [])),
                   "commit_message": message,
                   "tool_constraints": self.services.packets.tool_constraints()}, task=task, required=required)
-        review_artifact = evidence.parent / "review.json"
+        # One record per review batch of this verified candidate, each in its own file;
+        # the history is unchanged until registration, so a replay names the same file.
+        batch = 1 + sum(item.get("diff_artifact") == pending["diff_artifact"]
+                        for item in self.context.run["review_history"].get(tid, []))
+        review_artifact = evidence.parent / ("review.json" if batch == 1 else f"review-{batch}.json")
         record = {"attempt": attempt, "review": review, "diff_artifact": str(evidence),
                   "verification": str(evidence.parent / "results.json"), "artifact": str(review_artifact),
                   "snapshot_digest": reviewed_digest, "snapshot_artifact": str(snapshot_artifact),
@@ -444,8 +466,15 @@ class TaskLifecycle(RuntimeService):
                                        "artifact": pending["worker_artifact"],
                                        "artifact_digest": pending["worker_artifact_digest"]}
         write_json(review_artifact, record)
-        approved_keys = [] if diagnostics else self.approved_memory_keys(tid, review, proposals)
-        if not diagnostics and review_approved(review):
+        approved = not diagnostics and review_approved(review)
+        # Computed after the record file and before any ledger change: an approving batch completes
+        # the approval only if no historical blocking finding still lacks a resolution on this candidate.
+        remaining = (batch_after(self.context.run, tid, reviewed_digest, required,
+                                 records=[*self.context.run["review_history"].get(tid, []), record])
+                     if approved else [])
+        # Only the batch that completes an approval reads its memory approvals.
+        approved_keys = [] if diagnostics or remaining else self.approved_memory_keys(tid, review, proposals)
+        if approved and not remaining:
             try:
                 self.context.memory.check_proposals(proposals, approved_keys)
             except EvidenceError:
@@ -453,7 +482,12 @@ class TaskLifecycle(RuntimeService):
             except HarnessError as error:
                 approved_keys = []
                 self.context.event("memory_proposals_discarded", task_id=tid, reason=str(error))
-        if not self._finish_review(pending, record, paths, approved_keys, diagnostics):
+        outcome = self._finish_review(pending, record, paths, approved_keys, diagnostics, remaining)
+        if outcome == "next_batch":
+            self.context.event("review_batch_approved", task_id=tid, dispatch_id=record["dispatch_id"],
+                               next_batch=len(remaining))
+            return False
+        if outcome == "rejected":
             self.context.event("review_rejected", task_id=tid)
             return False
         return self.accept_pending()
@@ -523,15 +557,25 @@ class TaskLifecycle(RuntimeService):
                 or any(destination in run for destination in destinations)):
             raise HarnessError("任务阶段转换冲突；保留原阶段和证据", stop=stops.make("runtime_failure", "invariant"))
 
-    def _finish_review(self, pending, record, paths, approved_keys, diagnostics):
-        """Save review history and its successor phase together, before acceptance."""
+    def _finish_review(self, pending, record, paths, approved_keys, diagnostics, remaining):
+        """Save review history and its successor phase together, before acceptance.
+
+        An approving batch that leaves findings without a resolution on this
+        candidate keeps the reviewing stage with the next batch's mapping,
+        saved with its record and the receipt's removal. Every value is
+        computed first; the ledger changes in one transition.
+        """
         runtime = self.context
         self._require_handoff("pending_task", pending, "pending_acceptance", "pending_post_accept")
         if pending["stage"] != "reviewing":
             raise HarnessError("任务必须完成验证后才能登记审阅结果", stop=stops.make("runtime_failure", "invariant"))
         tid, review = pending["task_id"], record["review"]
         approved = not diagnostics and review_approved(review)
-        if approved:
+        key = f"reviewer:review:{tid}"
+        if approved and remaining:
+            outcome, mapping = "next_batch", deepcopy(remaining)
+        elif approved:
+            outcome = "approved"
             successor = {"task_id": tid, "attempt": pending["attempt"], "files": paths,
                 "review": review, "review_artifact": record["artifact"],
                 "review_source": deepcopy(record["review_source"]),
@@ -545,14 +589,17 @@ class TaskLifecycle(RuntimeService):
                                    "dispatch_id": Path(pending["worker_artifact"]).parent.name},
                     decision_requests=deepcopy(pending["worker_result"].get("decision_requests", [])))
         else:
+            outcome = "rejected"
             successor = {"task_id": tid, "review": review, "artifact": record["artifact"], **diagnostics}
-        key = f"reviewer:review:{tid}"
-        self.context.run["review_history"].setdefault(tid, []).append(record)
-        self.context.run["review_receipts"].pop(key, None)
-        self.context.run.pop("pending_task")
-        self.context.run["pending_acceptance" if approved else "feedback"] = successor
-        self.context.save()
-        return approved
+        with self.context.transition():
+            self.context.run["review_history"].setdefault(tid, []).append(record)
+            self.context.run["review_receipts"].pop(key, None)
+            if outcome == "next_batch":
+                pending["required_findings"] = mapping
+            else:
+                self.context.run.pop("pending_task")
+                self.context.run["pending_acceptance" if approved else "feedback"] = successor
+        return outcome
 
     def _record_accepted(self, pending, accepted, completion):
         """Publish the commit and its remaining work at the same durable barrier."""
@@ -560,14 +607,15 @@ class TaskLifecycle(RuntimeService):
         self._require_handoff("pending_acceptance", pending, "pending_task", "pending_post_accept")
         tid = pending["task_id"]
         successor = {"payload": {"task_id": tid, **accepted}, "completion": completion}
-        self.context.run["expected_head"] = accepted["commit"]
-        self.context.run["accepted"][tid] = accepted
-        self.context.run["feedback"] = None
-        self.context.run["current_task"] = None
-        self.context.run.get("worker_recovery", {}).pop(tid, None)
-        self.context.run.pop("pending_acceptance")
-        self.context.run["pending_post_accept"] = successor
-        self.context.save()
+        # The commit already exists: a stop saves it wholly recorded with its successor, or not recorded at all.
+        with self.context.transition():
+            self.context.run["expected_head"] = accepted["commit"]
+            self.context.run["accepted"][tid] = accepted
+            self.context.run["feedback"] = None
+            self.context.run["current_task"] = None
+            self.context.run.get("worker_recovery", {}).pop(tid, None)
+            self.context.run.pop("pending_acceptance")
+            self.context.run["pending_post_accept"] = successor
 
     def task_memory_record(self, task, pending, commit, paths):
         """The accepted task's memory record fields; the preflight uses a same-length placeholder commit."""
@@ -605,11 +653,13 @@ class TaskLifecycle(RuntimeService):
             feedback = {"task_id": tid, "acceptance": {
                 "error": "待接受文件已变化，旧审阅失效；需要重新验证和独立审阅",
                 "review_artifact": pending["review_artifact"]}}
-            invalidate_acceptance_review(self.context.run, feedback, attempt=attempt,
-                                         candidate_digest=pending["snapshot_digest"])
-            self.context.run.pop("pending_acceptance")
-            self.context.run["feedback"] = feedback
-            self.context.save()
+            voided = acceptance_review_records(self.context.run, feedback, attempt=attempt,
+                                               candidate_digest=pending["snapshot_digest"])
+            with self.context.transition():
+                for record in voided:
+                    record["status"] = "invalidated"
+                self.context.run.pop("pending_acceptance")
+                self.context.run["feedback"] = feedback
             self.context.event("pending_acceptance_invalidated", task_id=tid)
             return False
         validate_dispatch_indexes(self.context.directory, self.context.run["dispatches"])
@@ -617,6 +667,10 @@ class TaskLifecycle(RuntimeService):
         paths = git.check_scope(self.context.worktree, task["allowed_paths"], binding=self.context.run["worktree_binding"],
                                 task_id=tid)
         validate_review_source(self.context.run, tid, pending, candidate_digest=pending["snapshot_digest"])
+        # The coverage gate, on the whole history: every historical blocking
+        # finding has a usable resolution on this very snapshot.
+        if required_findings(self.context.run, tid, pending["snapshot_digest"]):
+            raise HarnessError("批准没有覆盖该任务全部历史阻断问题的独立解决处置；未提交", stop=stops.make("runtime_failure", "invariant"))
         commit = git.accept(self.context.worktree, paths, self.context.run["id"], tid, message,
                             binding=self.context.run["worktree_binding"])
         accepted = {"commit": commit, "summary": pending["review"]["summary"], "summary_source": "reviewer",

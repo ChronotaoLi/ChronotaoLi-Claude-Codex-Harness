@@ -3,15 +3,17 @@ import copy
 import contextlib
 import io
 import json
-import tempfile
+import shlex
 import subprocess
+import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 from harness.config import Config
 from harness.permission_smoke import inspect_evidence, permission_smoke, prepare_fixture
-from harness.util import HarnessError
+from harness.util import HarnessError, read_json
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -115,6 +117,49 @@ class PermissionSmokeTests(unittest.TestCase):
             {"type": "tool_use", "id": "extra", "name": "Bash", "input": {"command": "echo extra"}}]}})
         self.assertFalse(self.inspect(events)["passed"])
 
+    def outcome(self, events, name, *, allowed, content):
+        """Rewrite one case's provider outcome as an allowed or a denied call."""
+        index = next(i for i, case in enumerate(self.fixture["cases"]) if case["name"] == name)
+        identity = f"tool-{index}"
+        events[index * 2 + 1]["message"]["content"][0].update(is_error=not allowed, content=content)
+        denials = [d for d in events[-1]["permission_denials"] if d["tool_use_id"] != identity]
+        if not allowed:
+            case = self.fixture["cases"][index]
+            denials.append({"tool_use_id": identity, "tool_name": case["tool"], "tool_input": case["input"]})
+        events[-1]["permission_denials"] = denials
+        return events
+
+    def check(self, result, name):
+        return next(check["passed"] for check in result["checks"] if check["name"] == name)
+
+    def test_configured_command_passes_only_when_bash_denies_it(self):
+        self.apply_controls()
+        result = self.inspect(self.events())
+        self.assertTrue(result["passed"], result)
+        self.assertTrue(self.check(result, "configured_command_via_bash"))
+        allowed = self.outcome(self.events(), "configured_command_via_bash", allowed=True,
+                               content="permission command control succeeded")
+        result = self.inspect(allowed)
+        self.assertFalse(result["passed"])
+        self.assertFalse(self.check(result, "configured_command_via_bash"))
+        # The command's own side effect fails the probe even when the stream reports a denial.
+        sentinel = Path(self.fixture["worktree"]) / "command-control.txt"
+        sentinel.write_text("command allowed\n", encoding="utf-8")
+        result = self.inspect(self.events())
+        self.assertFalse(result["passed"])
+        self.assertTrue(self.check(result, "configured_command_via_bash"))
+        self.assertFalse(self.check(result, "file:" + str(sentinel)))
+
+    def test_readonly_prefix_overlap_passes_only_when_allowed_with_its_listing(self):
+        self.apply_controls()
+        self.assertTrue(self.check(self.inspect(self.events()), "readonly_prefix_overlap"))
+        for allowed, content in ((False, "permission denied"), (True, "control.txt\nwrite-control.txt\n")):
+            with self.subTest(allowed=allowed):
+                result = self.inspect(self.outcome(self.events(), "readonly_prefix_overlap",
+                                                   allowed=allowed, content=content))
+                self.assertFalse(result["passed"])
+                self.assertFalse(self.check(result, "readonly_prefix_overlap"))
+
     def test_missing_or_malformed_stream_is_diagnostic(self):
         with self.assertRaises(HarnessError):
             inspect_evidence(self.stream, self.fixture)
@@ -127,12 +172,20 @@ class PermissionSmokeTests(unittest.TestCase):
     def test_probe_keeps_model_id_and_bounds_calls_without_project_commands(self):
         config = Config.load(ROOT / "harness.toml")
         config.data["roles"]["worker"]["model"] = "exact-configured-model-id"
-        config.data["permissions"]["worker_commands"] = [["project-side-effect"]]
+        config.data["permissions"]["worker_commands"] = [{"cwd": ".", "argv": ["project-side-effect"]}]
         original = copy.deepcopy(config.data)
         seen = []
 
         def process(argv, cwd, log, **kwargs):
             seen.append(argv)
+            # The probe's commands reach the broker, while Bash keeps only the read-only prefixes.
+            allow = json.loads(argv[argv.index("--settings") + 1])["permissions"]["allow"]
+            self.assertEqual([rule for rule in allow if rule.startswith("Bash(")],
+                             ["Bash(" + shlex.join(c) + " *)" for c in Config.readonly_commands()])
+            manifest = read_json(log.parent / "commands.json")
+            self.assertEqual([c["command"] for c in manifest["commands"]],
+                             [{"cwd": ".", "argv": [sys.executable, "permission_control.py"]},
+                              {"cwd": "sub", "argv": ["ls", "--", "."]}])
             self.assertEqual(argv[argv.index("--model") + 1], "exact-configured-model-id")
             self.assertNotIn("--resume", argv)
             self.assertNotIn("--fallback-model", argv)

@@ -177,8 +177,8 @@ class EnvironmentUpdateTests(RepoCase):
 
     def test_large_saved_update_uses_compact_command_references(self):
         engine, backend, path, value = self.blocked()
-        argv = [sys.executable, '-c', '#' + ' ' * 3900]
-        value['checks'] = [{'kind': 'worker_command', 'argv': argv}] * 12
+        argv = {'cwd': '.', 'argv': [sys.executable, '-c', '#' + ' ' * 3900]}
+        value['checks'] = [{'kind': 'worker_command', 'command': argv}] * 12
         write_json(path, value)
         self.config.data['permissions']['worker_commands'].append(argv)
         result = self.engine(backend).resume(engine.run['id'], environment_update=path)
@@ -280,9 +280,9 @@ class EnvironmentUpdateTests(RepoCase):
     def test_exact_command_check_is_a_declaration_without_execution(self):
         engine, backend, path, value = self.blocked()
         sentinel = self.repo / 'command-executed'
-        argv = [sys.executable, '-c', f'from pathlib import Path; Path({str(sentinel)!r}).touch()']
+        argv = {'cwd': '.', 'argv': [sys.executable, '-c', f'from pathlib import Path; Path({str(sentinel)!r}).touch()']}
         self.config.data['permissions']['worker_commands'].append(argv)
-        value['checks'] = [{'kind': 'worker_command', 'argv': argv},
+        value['checks'] = [{'kind': 'worker_command', 'command': argv},
                            {'kind': 'executable', 'name': sys.executable},
                            {'kind': 'path', 'path': str(self.repo), 'path_type': 'directory'}]
         write_json(path, value)
@@ -361,7 +361,7 @@ class EnvironmentUpdateTests(RepoCase):
 
     def test_unauthorized_command_is_a_saved_failing_gate(self):
         engine, backend, path, value = self.blocked()
-        value['checks'] = [{'kind': 'worker_command', 'argv': ['unapproved-tool', '--write']}]
+        value['checks'] = [{'kind': 'worker_command', 'command': {'cwd': '.', 'argv': ['unapproved-tool', '--write']}}]
         write_json(path, value)
         with self.assertRaises(HarnessError):
             self.engine(backend).resume(engine.run['id'], environment_update=path)

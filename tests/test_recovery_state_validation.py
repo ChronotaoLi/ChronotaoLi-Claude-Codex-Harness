@@ -157,3 +157,29 @@ class RecoveryStateValidationTests(RepoCase):
                 state = copy.deepcopy(self.saved)
                 state.setdefault(field, {})[self.key] = []
                 self.assert_stops_before_resume(state)
+
+    def test_a_review_redo_link_needs_the_candidate_of_the_invalid_output(self):
+        """Spec-1 rule 15: a review's retry_of also requires both entries to have reviewed the same snapshot."""
+        self.blocked_review()
+        path = self.engine_before.directory / "state.json"
+        for other_candidate in (False, True):
+            with self.subTest(other_candidate=other_candidate):
+                state = copy.deepcopy(self.saved)
+                review = next(d for d in state["dispatches"] if d["id"] == self.receipt["dispatch_id"])
+                # The review is the redo of an invalid output of the same call just before it.
+                invalid = {**copy.deepcopy(review), "id": "invalid-review", "status": "invalid", "invalid_output": {
+                    "artifact": str(self.engine_before.directory / "dispatches" / "invalid-review" / "returned-result.json"),
+                    "artifact_digest": "0" * 64}}
+                if other_candidate:
+                    invalid["snapshot_digest"] = "f" * 64
+                state["dispatches"].insert(state["dispatches"].index(review), invalid)
+                review["retry_of"] = invalid["id"]
+                if not other_candidate:
+                    write_json(path, state)
+                    self.engine(self.backend).services.lifecycle.load_run(state["id"])
+                    continue
+                self.assert_stops_before_resume(state)
+                with self.assertRaisesRegex(HarnessError, "dispatches.retry_of") as caught:
+                    self.engine(self.backend).services.lifecycle.load_run(state["id"])
+                self.assertEqual((caught.exception.stop["kind"], caught.exception.stop["reason"]),
+                                 ("evidence", "load_integrity"))

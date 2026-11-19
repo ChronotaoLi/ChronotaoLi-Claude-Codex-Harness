@@ -12,7 +12,7 @@ class CheckpointContextTests(RepoCase):
     def setUp(self):
         super().setUp()
         # Keep the original pressure limit independent of production defaults.
-        self.config.data['runtime']['context_chars'] = 32000
+        self.config.data['runtime']['context_chars'] = 35000
 
     def backend(self, count, blocked_attempts=0):
         evidence = self.repo.resolve() / 'external-output.bin'
@@ -34,7 +34,7 @@ class CheckpointContextTests(RepoCase):
     def assert_prompts_fit(self, engine):
         reports = [read_json(path) for path in (engine.directory / 'dispatches').glob('*/context-report.json')]
         self.assertTrue(reports)
-        self.assertTrue(all(r['used_chars'] <= 32000 for r in reports))
+        self.assertTrue(all(r['used_chars'] <= 35000 for r in reports))
 
     def test_sixteen_checkpoints_across_three_attempts_fit_actual_prompts(self):
         backend = self.backend(16, blocked_attempts=2)

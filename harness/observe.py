@@ -3,7 +3,9 @@
 Every byte this module reads comes through one descriptor walk below the resolved
 `.harness` directory: each intermediate directory opens with O_DIRECTORY|O_NOFOLLOW
 from its parent descriptor, the final component opens with O_NOFOLLOW|O_NONBLOCK and
-must fstat as a regular file. Nothing here constructs a Runtime, loads a run for
+must fstat as a regular file. The one exception is `status RUN`'s ledger
+(`StateReader.read_following`): below the same root, it follows links as the path read
+it replaced did. Nothing here constructs a Runtime, loads a run for
 recovery, takes run.lock, writes files, runs git or probes processes.
 
 Ledger interpretation stays in `harness.cli.status_summary`; this module only adds
@@ -25,7 +27,7 @@ import stat
 import time
 import uuid
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePath
 
 from . import quota
 from .util import strict_json_loads
@@ -65,6 +67,9 @@ PROVIDERS = ("claude", "codex", "unknown")
 
 _DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 _FILE_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+# A directory with search permission only (macOS O_SEARCH, Linux O_PATH): enough to open names below it.
+_SEARCH_FLAGS = (getattr(os, "O_SEARCH", 0) or getattr(os, "O_PATH", 0)) | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+_FOLLOWED_FLAGS = _FILE_FLAGS & ~os.O_NOFOLLOW
 _CHUNK = 1024 * 1024
 
 
@@ -183,6 +188,42 @@ def _scan(fd):
     return entries
 
 
+def location(given, resolved, *, checkout=None):
+    """Which state directory an observation entry opened, and whose checkout it is. No git, no file access.
+
+    ``resolved`` is the directory StateReader opened (None when the path could not be resolved).
+    A checkout is known only when the caller passes it (the CLI's ``git.repository(--repo)``);
+    otherwise a resolved directory named `.harness` only suggests its parent, and anything else is unknown.
+    """
+    state = str(resolved) if resolved is not None else str(given)
+    if checkout is not None:
+        checkout, basis = str(checkout), "git"
+    elif resolved is not None and resolved.name == ".harness":
+        checkout, basis = str(resolved.parent), "path"
+    else:
+        checkout, basis = None, None
+    text = checkout if checkout is not None else state
+    named = PurePath(text)
+    parts = named.parts[1:] if named.anchor else named.parts
+    return {"state": state, "checkout": checkout, "checkout_basis": basis, "name": "/".join(parts[-2:]) or text}
+
+
+def _one_line(path):
+    """A path shown on one stderr line: newlines, other controls and the backslash escaped as repr() writes them."""
+    return "".join(char if char.isprintable() and char != "\\" else repr(char)[1:-1] for char in path)
+
+
+def location_text(observed, *, opened=True):
+    """The one stderr wording of an entry's location, always one line; an inferred checkout says so."""
+    if observed["checkout_basis"] == "git":
+        checkout = f"检出 {_one_line(observed['checkout'])}"
+    elif observed["checkout_basis"] == "path":
+        checkout = f"检出（按状态目录路径推定，未核实）{_one_line(observed['checkout'])}"
+    else:
+        checkout = "检出 未知"
+    return f"{checkout}；状态目录 {_one_line(observed['state'])}" + ("" if opened else "（无法打开）")
+
+
 class StateReader:
     """Descriptor-anchored reads below one resolved `.harness` directory."""
 
@@ -192,19 +233,81 @@ class StateReader:
         With required=False a missing `.harness` yields empty listings and NotFound
         reads (the `status` list stays usable); required=True raises NotFound so a
         long-lived service refuses to start against a directory it could not fix.
+        A path that cannot be resolved (a symbolic link loop on 3.11, a NUL byte)
+        is one that cannot be opened: ``state`` is None.
+
+        The root is also what ``read_following`` reads below. A root that may not be
+        read is bound with search permission alone, all a path read needs: ``opened``
+        is true and ``read_following`` works, while listings and walks find no root
+        there, as before. Bound means a lookup below the descriptor works, not just that
+        one was returned. When nothing is bound, ``_failure`` keeps why.
         """
-        self.state = Path(state).resolve()
+        self._root = self._bound = self._failure = None
         try:
-            self._root = os.open(str(self.state), _DIR_FLAGS)
+            self.state = Path(state).resolve()
+        except (OSError, RuntimeError, ValueError) as error:
+            self.state, self._failure = None, error
+            if required:
+                raise NotFound(f"观察目录不可用：{state}") from error
+            return
+        try:
+            self._root = self._bound = os.open(str(self.state), _DIR_FLAGS)
         except OSError as error:
             if required:
                 raise NotFound(f"观察目录不可用：{self.state}") from error
-            self._root = None
+            self._failure = error
+            if isinstance(error, PermissionError):
+                try:
+                    bound = os.open(str(self.state), _SEARCH_FLAGS)
+                except OSError:
+                    return
+                try:
+                    # O_PATH needs no permission on the directory itself: bound only if a lookup below it works.
+                    # "." always exists, so a refusal here is missing search permission, never a missing name.
+                    os.stat(".", dir_fd=bound)
+                except OSError:
+                    os.close(bound)
+                else:
+                    self._bound = bound
+
+    @property
+    def opened(self):
+        return self._bound is not None
 
     def close(self):
-        if self._root is not None:
-            os.close(self._root)
-            self._root = None
+        for fd in {self._root, self._bound} - {None}:
+            os.close(fd)
+        self._root = self._bound = None
+
+    def read_following(self, components):
+        """The whole regular file below the bound root, read as a path read is: links followed, search permission enough.
+
+        Only `status RUN` reads this way, for its ledger. Failures are the OSErrors a path read
+        raises (FileNotFoundError when the root or the file is absent, IsADirectoryError for a
+        directory); any other non-regular file is PathRefused, opened without blocking and never read.
+        """
+        if self._bound is None:
+            if isinstance(self._failure, RuntimeError):  # 3.11 resolves a link loop with this; a path read gets ELOOP
+                raise OSError(errno.ELOOP, os.strerror(errno.ELOOP)) from self._failure
+            raise self._failure
+        name = os.path.join(str(self.state), *components)
+        try:
+            fd = os.open("/".join(components), _FOLLOWED_FLAGS, dir_fd=self._bound)
+        except OSError as error:
+            error.filename = name  # the file it names, not the relative path
+            raise
+        try:
+            mode = os.fstat(fd).st_mode
+            if stat.S_ISDIR(mode):
+                raise IsADirectoryError(errno.EISDIR, os.strerror(errno.EISDIR), name)
+            if not stat.S_ISREG(mode):
+                raise PathRefused("拒绝非普通文件")
+            chunks = []
+            while chunk := os.read(fd, _CHUNK):
+                chunks.append(chunk)
+            return b"".join(chunks)
+        finally:
+            os.close(fd)
 
     def _root_fd(self):
         if self._root is None:
@@ -545,8 +648,10 @@ def _operation_summary(name, record):
 class Observer:
     """Pure read projections over one `.harness` directory."""
 
-    def __init__(self, state, reader=None, *, required=False):
+    def __init__(self, state, reader=None, *, required=False, checkout=None):
         self.reader = reader or StateReader(state, required=required)
+        # Fixed with the root descriptor: every view names the directory it reads, never recomputed.
+        self.observed = location(state, self.reader.state, checkout=checkout)
 
     def close(self):
         self.reader.close()
@@ -578,7 +683,7 @@ class Observer:
     def list_runs(self):
         sampled = time.time()
         result = {"sampled_at": sampled, "sampled_at_utc": utc(sampled), "runs": [], "skipped": [], "incomplete": [],
-                  "unsupported": []}
+                  "unsupported": [], "observed": self.observed}
         try:
             entries = self.reader.scandir(["runs"])
         except NotFound:
@@ -639,7 +744,8 @@ class Observer:
                   "notes": {"invoked": "invoked=true 在进程启动前写入；它不证明 CLI 已启动或供应商已收到请求",
                             "process": "首版不探测进程；台账记为 running 与进程是否仍在工作是两回事",
                             "events": ("事件只是观察，计数以台账为准：dispatch_prepared 在预算检查前写入，"
-                                       "dispatch_started 在台账保存 invoked=true 之后写入")}}
+                                       "dispatch_started 在台账保存 invoked=true 之后写入")},
+                  "observed": self.observed}
         try:
             detail["events"] = self._events(run_id, DEFAULT_TAIL)
         except ObserveError as error:
@@ -816,7 +922,8 @@ class Observer:
         validate_run_id(run_id)
         sampled = time.time()
         os.close(self.reader.open_directory(["runs", run_id]))  # Missing run: 404 even without events.jsonl
-        return {"id": run_id, "sampled_at": sampled, "sampled_at_utc": utc(sampled), **self._events(run_id, tail)}
+        return {"id": run_id, "sampled_at": sampled, "sampled_at_utc": utc(sampled), **self._events(run_id, tail),
+                "observed": self.observed}
 
     # ----- operations -----
 
@@ -894,7 +1001,7 @@ class Observer:
         return {"id": run_id, "sampled_at": sampled, "sampled_at_utc": utc(sampled), "truncated": truncated,
                 "limit": FILE_INDEX_MAX, "skipped": skipped,
                 "files": [{"path": "/".join(path), "size": info.st_size, "mtime": info.st_mtime}
-                          for path, info in files]}
+                          for path, info in files], "observed": self.observed}
 
     def read_file(self, run_id, path, tail=None):
         validate_run_id(run_id)
@@ -905,7 +1012,7 @@ class Observer:
         return {"id": run_id, "source": "/".join(components), "size": read["size"], "tail_bytes": tail,
                 "truncated": read["truncated"], "changed_while_reading": read["changed_while_reading"],
                 "sampled_at": sampled, "sampled_at_utc": utc(sampled),
-                "text": read["data"].decode("utf-8", errors="replace")}
+                "text": read["data"].decode("utf-8", errors="replace"), "observed": self.observed}
 
 
 def list_runs(state):
@@ -916,15 +1023,3 @@ def list_runs(state):
 def run_detail(state, run_id):
     with Observer(state) as observer:
         return observer.run_detail(run_id)
-
-
-def quota_status(state, run_id):
-    """The ``status RUN`` quota block, the same as the run detail's: saved samples only, never a CLI.
-
-    Any failure to read is ``{"error": <type>}`` and leaves the rest of status alone.
-    """
-    try:
-        with Observer(state) as observer:
-            return observer.quota_block(run_id)
-    except Exception as error:
-        return {"error": type(error).__name__}

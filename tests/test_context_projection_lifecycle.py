@@ -59,7 +59,7 @@ class ContextProjectionLifecycleTests(RepoCase):
         self.assertEqual(sum(result['attempts'].values()), 2)
 
     def test_saved_command_index_tamper_blocks_recovery_before_any_model_call(self):
-        self.config.data['permissions']['worker_commands'] = [['python3', '-c', '#' + 'x' * 9000]]
+        self.config.data['permissions']['worker_commands'] = [{'cwd': '.', 'argv': ['python3', '-c', '#' + 'x' * 9000]}]
         plan = read_json(ROOT / 'examples/plan.json')
         second = deepcopy(plan['tasks'][0])
         second.update(id='second', title='Second greeting', depends_on=['greet'])
@@ -73,7 +73,7 @@ class ContextProjectionLifecycleTests(RepoCase):
         path = Path(ref['artifact'])
         original = path.read_bytes()
         catalog = read_json(path)
-        self.assertEqual(catalog['records'][0]['argv'], self.config.data['permissions']['worker_commands'][0])
+        self.assertEqual(catalog['records'][0]['command'], self.config.data['permissions']['worker_commands'][0])
         path.write_text('{}')
         count = len(backend.calls)
         with self.assertRaisesRegex(HarnessError, 'input index'):

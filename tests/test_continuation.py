@@ -24,11 +24,11 @@ class ContinuationTests(unittest.TestCase):
             run={'id': 'run', 'tasks': [{'id': 'task'}], 'accepted': {}, 'dispatches': [],
                  'current_task': 'task', 'status': 'blocked', 'attempts': {'task': 1}, 'rounds': 3},
             config={'runtime': {'agent_timeout_seconds': 30}, 'permissions': {'worker_commands': []},
-                    'verification': {'commands': [['python3', '-m', 'unittest']]}},
+                    'verification': {'commands': [{'cwd': '.', 'argv': ['python3', '-m', 'unittest']}]}},
             snapshot=lambda: deepcopy(self.candidate), save=lambda: self.saved.append(True))
         self.result = dict(task_id='task', dispatch_id='worker1', status='blocked', blocker_kind='continuation',
             summary='remaining edits', evidence=[], blockers=['need exact test'], proposed_memories=[],
-            continuation_request={'kind': 'commands', 'commands': [['python3', 'focused.py']],
+            continuation_request={'kind': 'commands', 'commands': [{'cwd': '.', 'argv': ['python3', 'focused.py']}],
                                   'minimum_timeout_seconds': 0, 'reason': 'focused regression'})
 
     def record(self, dispatch='worker1'):
@@ -43,12 +43,12 @@ class ContinuationTests(unittest.TestCase):
     def test_exact_grant_gate_preserves_candidate_and_cumulative_budgets(self):
         self.record()
         before = deepcopy(self.context.run)
-        self.assertEqual(continuation_gate(self.context)['missing_commands'], [['python3', 'focused.py']])
-        self.context.config['permissions']['worker_commands'] = [['python3']]
+        self.assertEqual(continuation_gate(self.context)['missing_commands'], [{'cwd': '.', 'argv': ['python3', 'focused.py']}])
+        self.context.config['permissions']['worker_commands'] = [{'cwd': '.', 'argv': ['python3']}]
         self.assertIsNotNone(continuation_gate(self.context))
         with self.assertRaises(HarnessError):
             resolve_continuation(self.context)
-        self.context.config['permissions']['worker_commands'].append(['python3', 'focused.py'])
+        self.context.config['permissions']['worker_commands'].append({'cwd': '.', 'argv': ['python3', 'focused.py']})
         resolve_continuation(self.context)
         self.assertIsNone(self.context.run['pending_continuation'])
         for key in ('attempts', 'rounds', 'continuation_history', 'accepted'):
@@ -92,7 +92,7 @@ class ContinuationTests(unittest.TestCase):
 
     def test_repeated_requests_preserve_immutable_history(self):
         first = self.record()
-        self.context.config['permissions']['worker_commands'] = [['python3', 'focused.py']]
+        self.context.config['permissions']['worker_commands'] = [{'cwd': '.', 'argv': ['python3', 'focused.py']}]
         resolve_continuation(self.context)
         self.context.run['attempts']['task'] += 1
         second = self.record('worker2')

@@ -71,7 +71,7 @@ class EnvironmentProjectionTests(unittest.TestCase):
                 self.assertEqual(hashlib.sha256(Path(row['artifact']).read_bytes()).hexdigest(), row['artifact_digest'])
 
     def test_long_commands_compact_and_failed_checks_retained(self):
-        checks = [dict(kind='worker_command', argv=['tool', 'x' * 4000])] * 12
+        checks = [dict(kind='worker_command', command={'cwd': '.', 'argv': ['tool', 'x' * 4000]})] * 12
         self.add('a', 'Ready except check failure', checks, passed=False)
         result = self.env.environment_packet({}, task_id='a')
         self.assertLess(len(json.dumps(result)), 7000)

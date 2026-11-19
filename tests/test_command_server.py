@@ -29,9 +29,10 @@ class CommandServerTests(unittest.TestCase):
     def test_exact_argv_and_private_receipts(self):
         argv = [sys.executable, '-c', 'import json,sys;print(json.dumps(sys.argv[1:]));sys.stderr.write("err");sys.exit(7)',
                 '*', 'one\ntwo', '$(touch nope)', '; touch nope']
-        broker = self.broker([argv])
+        command = {'cwd': '.', 'argv': argv}
+        broker = self.broker([command])
         self.assertEqual(len(broker.list_commands()), 1)
-        result = broker.run_command({'command_id': command_id(argv)})
+        result = broker.run_command({'command_id': command_id(command)})
         self.assertEqual(json.loads(result['stdout']), argv[3:])
         self.assertEqual(result['exit_code'], 7)
         self.assertEqual(result['stderr'], 'err')
@@ -42,15 +43,16 @@ class CommandServerTests(unittest.TestCase):
 
     def test_unauthorized_and_extra_fields_do_not_execute(self):
         argv = [sys.executable, '-c', 'raise Exception("should not run")']
-        broker = self.broker([argv])
-        for args in ({'command_id': 'no'}, {'command_id': command_id(argv), 'argv': argv}, {}):
+        command = {'cwd': '.', 'argv': argv}
+        broker = self.broker([command])
+        for args in ({'command_id': 'no'}, {'command_id': command_id(command), 'argv': argv}, {}):
             with self.assertRaises(HarnessError):
                 broker.run_command(args)
         self.assertEqual(command_processes(self.job), [])
         self.assertTrue(handle({'method': 'tools/call', 'params': {'name': 'list_commands', 'arguments': {'cwd': '.'}}}, broker)['isError'])
 
     def test_manifest_tamper_and_duplicate_ids(self):
-        broker = self.broker([[sys.executable, '-V']])
+        broker = self.broker([{'cwd': '.', 'argv': [sys.executable, '-V']}])
         manifest = broker.manifest.copy()
         manifest['commands'] *= 2
         write_json(broker.path, manifest)
@@ -60,9 +62,21 @@ class CommandServerTests(unittest.TestCase):
         with self.assertRaises(HarnessError):
             Broker(broker.path, digest)
 
+    def test_an_invalid_manifest_command_is_refused_naming_its_field(self):
+        broker = self.broker([{'cwd': '.', 'argv': [sys.executable, '-V']}, {'cwd': 'app', 'argv': [sys.executable, '-V']}])
+        for key, value, field in (('cwd', '../outside', 'commands[1].command.cwd'), ('argv', [], 'commands[1].command.argv')):
+            with self.subTest(field=field):
+                manifest = json.loads(json.dumps(broker.manifest))
+                manifest['commands'][1]['command'][key] = value
+                write_json(broker.path, manifest)
+                with self.assertRaises(HarnessError) as raised:
+                    Broker(broker.path, hashlib.sha256(broker.path.read_bytes()).hexdigest())
+                self.assertIn(field, str(raised.exception))
+        self.assertEqual(command_processes(self.job), [])
+
     def test_start_failure_and_timeout_have_receipts(self):
-        argv = [str(self.root / 'missing')]
-        sleep = [sys.executable, '-c', 'import time;time.sleep(5)']
+        argv = {'cwd': '.', 'argv': [str(self.root / 'missing')]}
+        sleep = {'cwd': '.', 'argv': [sys.executable, '-c', 'import time;time.sleep(5)']}
         broker = self.broker([argv, sleep], timeout=.1)
         missing = broker.run_command({'command_id': command_id(argv)})
         self.assertIsNotNone(missing['error'])
@@ -94,7 +108,7 @@ class CommandServerTests(unittest.TestCase):
             command_processes(self.job)
 
     def test_fresh_stdio_protocol(self):
-        broker = self.broker([[sys.executable, '-V']])
+        broker = self.broker([{'cwd': '.', 'argv': [sys.executable, '-V']}])
         entry = Path(__file__).resolve().parents[1] / 'harness' / 'command_entry.py'
         requests = [{'jsonrpc': '2.0', 'id': 1, 'method': 'initialize'},
                     {'jsonrpc': '2.0', 'id': 2, 'method': 'tools/call', 'params': {'name': 'list_commands', 'arguments': {}}}]
@@ -124,7 +138,7 @@ class CommandServerTests(unittest.TestCase):
                 broker.list_commands()
 
     def test_large_output_hashing_does_not_load_full_log(self):
-        argv = [sys.executable, '-c', 'import sys;sys.stdout.write("x" * 2000000)']
+        argv = {'cwd': '.', 'argv': [sys.executable, '-c', 'import sys;sys.stdout.write("x" * 2000000)']}
         broker = self.broker([argv])
         original_read = Path.read_bytes
         def bounded_read(path):
@@ -138,7 +152,7 @@ class CommandServerTests(unittest.TestCase):
         self.assertEqual(result['stdout_sha256'], hashlib.sha256(b'x' * 2000000).hexdigest())
 
     def test_standard_progress_metadata_and_version_negotiation(self):
-        argv = [sys.executable, '-c', 'print("metadata call executed")']
+        argv = {'cwd': '.', 'argv': [sys.executable, '-c', 'print("metadata call executed")']}
         broker = self.broker([argv])
         request = {'method': 'tools/call', 'params': {'name': 'run_command',
                    'arguments': {'command_id': command_id(argv)},

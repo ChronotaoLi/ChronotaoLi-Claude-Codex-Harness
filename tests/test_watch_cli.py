@@ -53,6 +53,41 @@ class WatchCliTests(unittest.TestCase):
                                             "exit_code": 1})
         self.assertNotIn("error", rows[-1])
 
+    def test_a_registered_review_conclusion_is_one_more_line(self):
+        def rejected(attempt):
+            return {"attempt": attempt, "snapshot_digest": f"s{attempt}", "review_source": {"dispatch_id": f"d{attempt}"},
+                    "review": {"verdict": "request_changes", "findings": [{"id": "gate", "severity": "blocking"}]}}
+
+        five = {**self.run, "attempts": {"t": 6}, "review_history": {"t": [rejected(n) for n in range(1, 6)]}}
+        six = {**five, "review_history": {"t": [rejected(n) for n in range(1, 7)]}}
+        ledgers = [six, {**six, "goal": "not projected"},
+                   {**six, "status": "blocked", "stop": stops.make("unclassified", "untyped_harness_error",
+                                                                   data={"error_type": "HarnessError", "detail": "x"})}]
+        write_json(self.path, five)
+        path = self.path
+        class Watcher:
+            backend = "fixture"
+            def __init__(self, *args): pass
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+            def wait(self, seconds):
+                write_json(path, ledgers.pop(0))
+                return True
+        output = io.StringIO()
+        with patch("harness.watch_cli.RunWatcher", Watcher):
+            self.assertEqual(watch_run(self.state, "run_test", stdout=output), 0)
+        rows = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertEqual([row["status"] for row in rows], ["running", "running", "blocked"])
+        first, second = rows[0], rows[1]
+        self.assertEqual({key: value for key, value in first.items() if key != "convergence"},
+                         {key: value for key, value in second.items() if key != "convergence"})
+        before, after = first["convergence"]["warnings"][0], second["convergence"]["warnings"][0]
+        self.assertEqual((before["latest_review"]["attempt"], before["attempts_since_latest_review"],
+                          [item["round"] for item in before["compared_reviews"]]), (5, 1, [4, 5]))
+        self.assertEqual((after["latest_review"]["attempt"], after["attempts_since_latest_review"],
+                          [item["round"] for item in after["compared_reviews"]]), (6, 0, [5, 6]))
+        self.assertEqual(rows[2]["convergence"], second["convergence"])
+
     def test_explicit_state_command_needs_no_git_repository_or_config(self):
         write_json(self.path, {**self.run, "status": "completed"})
         output = io.StringIO()

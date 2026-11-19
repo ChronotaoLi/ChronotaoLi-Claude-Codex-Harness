@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import tempfile
 import time
+from copy import deepcopy
 from datetime import datetime, timezone
 import uuid
 from pathlib import Path
@@ -11,7 +12,7 @@ from . import git, stops
 from .context import compact_checks
 from .recovery import snapshot_digest
 from .services import RuntimeService
-from .util import HarnessError, ProcessTimeout, run_process, tail, write_json
+from .util import CommandDirectoryError, HarnessError, ProcessTimeout, run_process, tail, with_descriptors, write_json
 
 
 def checks_failed(result):
@@ -38,120 +39,142 @@ class Verification(RuntimeService):
         write_json(folder / "results.json", results)
         for i, command in enumerate(commands):
             self.context.ensure_exited()
-            git.check_worktree_binding(cwd, binding)
-            log = folder / f"check-{i}"
-            entry = {"id": str(uuid.uuid4()), "role": "verification", "task_id": task_id,
-                     "status": "running", "pgid": None, "process_state": "starting"}
-            entry["worktree"] = str(cwd)
-            if phase:
-                entry["phase"] = phase
-            self.context.run["dispatches"].append(entry)
-            self.context.save()
-
-            def on_start(pgid):
-                entry["pgid"] = pgid
-                entry["process_state"] = "running"
+            # The binding is checked on the very root the command starts from (rule 12).
+            def run_check(held):
+                root_fd = git.open_bound_root(held, cwd, binding)
+                log = folder / f"check-{i}"
+                entry = {"id": str(uuid.uuid4()), "role": "verification", "task_id": task_id,
+                         "status": "running", "pgid": None, "process_state": "starting"}
+                entry["worktree"] = str(cwd)
+                if phase:
+                    entry["phase"] = phase
+                self.context.run["dispatches"].append(entry)
                 self.context.save()
 
-            started = time.monotonic()
-            entry["started_at"] = datetime.now(timezone.utc).isoformat()
-            outcome = None
-            error = None
-            code = None
-
-            def on_outcome(value):
-                nonlocal outcome
-                outcome = value
-
-            try:
-                code = run_process(command, cwd, log,
-                    timeout=self.context.config.data["runtime"]["verify_timeout_seconds"],
-                    on_start=on_start, on_outcome=on_outcome)
-            except BaseException as caught:
-                error = caught
-                outcome = getattr(caught, "outcome", outcome)
-            finally:
-                facts = outcome.to_dict() if outcome is not None else {
-                    "exit_code": code, "exit_confirmed": False, "evidence_complete": False,
-                    "termination_reason": "cancelled" if isinstance(error, KeyboardInterrupt) else "error",
-                    "cleanup_errors": [], "cleanup_actions": [], "errors": []}
-                code = facts["exit_code"]
-                reason = facts["termination_reason"]
-                status = ("passed" if code == 0 and reason == "normal"
-                          and facts["exit_confirmed"] and facts["evidence_complete"] and error is None
-                          else "timed_out" if reason == "timeout"
-                          else "interrupted" if reason in {"cancelled", "interrupted"}
-                          else "failed" if facts["exit_confirmed"] else "unknown")
-                entry.update(status="completed" if status == "passed" else status,
-                    argv=list(command), exit_code=code, termination_reason=reason,
-                    process_outcome=facts, exit_confirmed=facts["exit_confirmed"],
-                    evidence_complete=facts["evidence_complete"],
-                    duration_seconds=time.monotonic() - started,
-                    finished_at=datetime.now(timezone.utc).isoformat(),
-                    timing_scope="formal_verification_command_including_cleanup")
-                if entry["exit_confirmed"]:
-                    entry["process_state"] = "exited"
-                result = {"argv": list(command), "exit_code": code, "status": status,
-                    "termination_reason": reason, "exit_confirmed": facts["exit_confirmed"],
-                    "evidence_complete": facts["evidence_complete"], "process_outcome": facts,
-                    "stdout": "", "stderr": "", "log": str(log), "timed_out": reason == "timeout",
-                    "duration_seconds": entry["duration_seconds"], "started_at": entry["started_at"],
-                    "finished_at": entry["finished_at"],
-                    "timing_source": {"dispatch_id": entry["id"], "scope": entry["timing_scope"]}}
-                if phase:
-                    result["phase"] = phase
-                results.append(result)
-                # Persist the receipt independently of the run ledger. A failed
-                # save must still leave the owned process and partial results inspectable.
-                persistence_error = None
-                try:
-                    result.update(stdout=tail(log.with_suffix(".stdout")), stderr=tail(log.with_suffix(".stderr")))
-                except BaseException as caught:
-                    result["evidence_complete"] = False
-                    result["status"] = "failed"
-                    persistence_error = caught
-                try:
-                    write_json(folder / "results.json", results)
-                except BaseException as caught:
-                    persistence_error = persistence_error or caught
-                try:
+                def on_start(pgid):
+                    entry["pgid"] = pgid
+                    entry["process_state"] = "running"
                     self.context.save()
+
+                started = time.monotonic()
+                entry["started_at"] = datetime.now(timezone.utc).isoformat()
+                outcome = None
+                error = None
+                code = None
+
+                def on_outcome(value):
+                    nonlocal outcome
+                    outcome = value
+
+                def report(failure):
+                    # Every error that leaves this command, the exit gate's included, is its feedback (rule 11).
+                    self.context.run["feedback"] = {"task_id": task_id,
+                        "verification_error": {"command": deepcopy(command), "error": str(failure), "log": str(log)}}
+
+                try:
+                    code = run_process(command["argv"], cwd, log, relative_cwd=command["cwd"], root_fd=root_fd,
+                        timeout=self.context.config.data["runtime"]["verify_timeout_seconds"],
+                        on_start=on_start, on_outcome=on_outcome)
                 except BaseException as caught:
-                    persistence_error = persistence_error or caught
-                if persistence_error is not None:
-                    result.update(status="failed", evidence_complete=False,
-                                  persistence_error=str(persistence_error))
-                    entry.update(status="failed", evidence_complete=False,
-                                 persistence_error=str(persistence_error))
-                    # Either destination can fail independently. Retry once with
-                    # the incomplete-evidence fact, without masking the cause.
-                    for persist in (lambda: write_json(folder / "results.json", results), self.context.save):
-                        try:
-                            persist()
-                        except BaseException:
-                            pass
-                if error is None:
+                    error = caught
+                    outcome = getattr(caught, "outcome", outcome)
+                finally:
+                    facts = outcome.to_dict() if outcome is not None else {
+                        "exit_code": code, "exit_confirmed": False, "evidence_complete": False,
+                        "termination_reason": "cancelled" if isinstance(error, KeyboardInterrupt) else "error",
+                        "cleanup_errors": [], "cleanup_actions": [], "errors": []}
+                    code = facts["exit_code"]
+                    reason = facts["termination_reason"]
+                    status = ("passed" if code == 0 and reason == "normal"
+                              and facts["exit_confirmed"] and facts["evidence_complete"] and error is None
+                              else "timed_out" if reason == "timeout"
+                              else "interrupted" if reason in {"cancelled", "interrupted"}
+                              else "failed" if facts["exit_confirmed"] else "unknown")
+                    entry.update(status="completed" if status == "passed" else status,
+                        command=deepcopy(command), exit_code=code, termination_reason=reason,
+                        process_outcome=facts, exit_confirmed=facts["exit_confirmed"],
+                        evidence_complete=facts["evidence_complete"],
+                        duration_seconds=time.monotonic() - started,
+                        finished_at=datetime.now(timezone.utc).isoformat(),
+                        timing_scope="formal_verification_command_including_cleanup")
+                    if entry["exit_confirmed"]:
+                        entry["process_state"] = "exited"
+                    result = {"command": deepcopy(command), "exit_code": code, "status": status,
+                        "termination_reason": reason, "exit_confirmed": facts["exit_confirmed"],
+                        "evidence_complete": facts["evidence_complete"], "process_outcome": facts,
+                        "stdout": "", "stderr": "", "log": str(log), "timed_out": reason == "timeout",
+                        "duration_seconds": entry["duration_seconds"], "started_at": entry["started_at"],
+                        "finished_at": entry["finished_at"],
+                        "timing_source": {"dispatch_id": entry["id"], "scope": entry["timing_scope"]}}
+                    if phase:
+                        result["phase"] = phase
+                    results.append(result)
+                    # Persist the receipt independently of the run ledger. A failed
+                    # save must still leave the owned process and partial results inspectable.
+                    persistence_error = None
+                    try:
+                        result.update(stdout=tail(log.with_suffix(".stdout")), stderr=tail(log.with_suffix(".stderr")))
+                    except BaseException as caught:
+                        result["evidence_complete"] = False
+                        result["status"] = "failed"
+                        persistence_error = caught
+                    try:
+                        write_json(folder / "results.json", results)
+                    except BaseException as caught:
+                        persistence_error = persistence_error or caught
+                    try:
+                        self.context.save()
+                    except BaseException as caught:
+                        persistence_error = persistence_error or caught
+                    if persistence_error is not None:
+                        result.update(status="failed", evidence_complete=False,
+                                      persistence_error=str(persistence_error))
+                        entry.update(status="failed", evidence_complete=False,
+                                     persistence_error=str(persistence_error))
+                        # Either destination can fail independently. Retry once with
+                        # the incomplete-evidence fact, without masking the cause.
+                        for persist in (lambda: write_json(folder / "results.json", results), self.context.save):
+                            try:
+                                persist()
+                            except BaseException:
+                                pass
+                    if error is None:
+                        error = persistence_error
+                # The command boundary (spec 4.3 cells 1-2): process facts come first. A timeout or a
+                # command that never started for its directory is a verification result only when its
+                # cleanup and persistence were clean. Otherwise the process facts decide the stop and a
+                # failed write is the error raised, with the process error as its cause.
+                from .dispatch import process_stop
+                stop = process_stop(error, entry["id"]) if error is not None else None
+                replaced = isinstance(error, (ProcessTimeout, CommandDirectoryError)) and persistence_error is not None
+                if replaced:
+                    persistence_error.__cause__ = error
                     error = persistence_error
-            # The command boundary (spec 4.3 cells 1-2): process facts come first. A timeout is a
-            # verification result only when its cleanup and persistence were clean.
-            from .dispatch import process_stop
-            stop = process_stop(error, entry["id"]) if error is not None else None
-            faulty = stop is not None and stop["kind"] == "evidence"
-            if error is not None and (not isinstance(error, ProcessTimeout) or faulty):
-                self.context.run["feedback"] = {"task_id": task_id,
-                    "verification_error": {"argv": command, "error": str(error), "log": str(log)}}
-                if stop is not None and not (isinstance(error, HarnessError) and error.stop is not None):
-                    if isinstance(error, HarnessError):
-                        error.stop = stop
-                    else:
-                        typed = HarnessError(str(error) or type(error).__name__, stop=stop)
-                        typed.outcome = error.outcome
-                        raise typed from error
-                raise error
-            self.context.ensure_exited()
-            if not result["exit_confirmed"]:
-                raise HarnessError("Verification process exit is unknown; inspect " + str(log), stop=stops.make("process_unconfirmed", "dispatch_exit", data={"returned_unsealed": False}, source={"dispatch_id": entry["id"]}))
-            if phase == "setup" and checks_failed(result):
+                recordable = (isinstance(error, (ProcessTimeout, CommandDirectoryError))
+                              and (stop is None or stop["kind"] != "evidence"))
+                if error is not None and not recordable:
+                    # The feedback names the very error that leaves, so it is decided first.
+                    # A replaced write error carries the process facts' stop even when it has its own.
+                    if stop is not None and (replaced or not (isinstance(error, HarnessError) and error.stop is not None)):
+                        if isinstance(error, HarnessError) and error.stop is None:
+                            error.stop = stop
+                        else:
+                            typed = HarnessError(str(error) or type(error).__name__, stop=stop)
+                            typed.outcome = outcome
+                            report(typed)
+                            raise typed from error
+                    report(error)
+                    raise error
+                try:
+                    self.context.ensure_exited()
+                    if not result["exit_confirmed"]:
+                        raise HarnessError("Verification process exit is unknown; inspect " + str(log), stop=stops.make("process_unconfirmed", "dispatch_exit", data={"returned_unsealed": False}, source={"dispatch_id": entry["id"]}))
+                except BaseException as gate:
+                    report(gate)
+                    raise
+                return phase == "setup" and checks_failed(result)
+
+            if with_descriptors(run_check):
                 break
         return results
 

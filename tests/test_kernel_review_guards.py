@@ -7,8 +7,8 @@ import unittest
 
 from harness.run_store import RunStore
 from harness.run_context import RunContext
-from harness.review_progress import bind_review_source, required_findings
-from harness.util import HarnessError
+from harness.review_progress import bind_review_source, repair_findings, required_findings
+from harness.util import EvidenceError, HarnessError
 
 
 class KernelReviewGuards(unittest.TestCase):
@@ -50,6 +50,16 @@ class KernelReviewGuards(unittest.TestCase):
             with self.assertRaises(HarnessError):
                 required_findings(run, 't', 'candidate')
             record['review']['findings'] = body['findings']
+            # An emptied copy is still a review to authenticate, not a record without one.
+            saved = record['review']
+            for emptied in ({}, None):
+                record['review'] = emptied
+                for calculate in (lambda: required_findings(run, 't', 'candidate'), lambda: repair_findings(run, 't')):
+                    with self.assertRaises(EvidenceError) as caught:
+                        calculate()
+                    self.assertEqual(caught.exception.stop['reason'], 'runtime_integrity')
+            record['review'] = saved
+            self.assertEqual(len(repair_findings(run, 't')), 1)
             path.unlink()
             with self.assertRaises(HarnessError):
                 required_findings(run, 't', 'candidate')

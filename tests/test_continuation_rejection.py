@@ -30,11 +30,11 @@ class RejectionEvidenceTests(unittest.TestCase):
                          'current_task': 'task', 'attempts': {'task': 1},
                          'agent_dispatches': 1, 'rounds': 3}),
             config={'runtime': {'agent_timeout_seconds': 30}, 'permissions': {'worker_commands': []},
-                    'verification': {'commands': [['python3', '-m', 'unittest']]}},
+                    'verification': {'commands': [{'cwd': '.', 'argv': ['python3', '-m', 'unittest']}]}},
             snapshot=lambda: deepcopy(self.candidate), save=lambda: self.saved.append(deepcopy(self.context.run)))
         self.result = dict(task_id='task', dispatch_id='worker1', status='blocked', blocker_kind='continuation',
             summary='remaining edits', evidence=[], blockers=['need exact test'], proposed_memories=[],
-            continuation_request={'kind': 'commands', 'commands': [['python3', 'focused.py']],
+            continuation_request={'kind': 'commands', 'commands': [{'cwd': '.', 'argv': ['python3', 'focused.py']}],
                                   'minimum_timeout_seconds': 0, 'reason': 'focused regression'})
         source_path = self.context.directory / 'dispatches/worker1/returned-result.json'
         write_json(source_path, self.result)
@@ -183,8 +183,8 @@ class RejectionEvidenceTests(unittest.TestCase):
 
 class RejectionLifecycleTests(RepoCase):
     def waiting(self, *, second_request=False, kind='commands', required_command=None):
-        command = [sys.executable, '-c', "print('old continuation')"]
-        new_command = [sys.executable, '-c', "print('new exact continuation')"]
+        command = {'cwd': '.', 'argv': [sys.executable, '-c', "print('old continuation')"]}
+        new_command = {'cwd': '.', 'argv': [sys.executable, '-c', "print('new exact continuation')"]}
         def change(backend, kwargs, packet, result):
             if kwargs['role'] != 'worker':
                 return
@@ -336,7 +336,7 @@ class RejectionLifecycleTests(RepoCase):
             self.assertEqual(len(backend.calls), 1)
 
     def test_rejection_does_not_allow_permission_removal_on_resume(self):
-        extra = [sys.executable, '-c', "print('retained grant')"]
+        extra = {'cwd': '.', 'argv': [sys.executable, '-c', "print('retained grant')"]}
         self.config.data['permissions']['worker_commands'].append(extra)
         engine, backend, path, _, _ = self.waiting()
         self.config.data['permissions']['worker_commands'].remove(extra)
@@ -363,7 +363,7 @@ class RejectionLifecycleTests(RepoCase):
         self.assertEqual([d['task_id'] for d in result['dispatches'] if d['role'] == 'verification'], ['greet', 'final'])
 
     def test_correction_still_checks_task_command_prerequisites_before_dispatch(self):
-        required = [sys.executable, '-c', "print('task prerequisite')"]
+        required = {'cwd': '.', 'argv': [sys.executable, '-c', "print('task prerequisite')"]}
         self.config.data['permissions']['worker_commands'].append(required)
         engine, backend, path, _, _ = self.waiting(required_command=required)
         resumed = self.engine(backend)

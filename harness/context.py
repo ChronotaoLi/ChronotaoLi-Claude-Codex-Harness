@@ -217,8 +217,12 @@ def compact_review(review, artifact, budget=REVIEW_CONTEXT_CHARS, *, digest=None
     Finding identities and classifications are mandatory, even if they alone
     exceed the requested share. compose() then fails closed instead of hiding
     findings. This representation is input context, never an acceptance result.
+    ``artifact`` is the enclosing record's own, which holds the complete review,
+    so the excerpt does not name it again. An excerpt reaches here again inside
+    persisted decide triggers: it keeps the digest it was bound to, and only the
+    fields it still has are trimmed.
     """
-    digest = digest or review_digest(review)
+    digest = digest or review.get("review_content_sha256") or review_digest(review)
     review = review_view(review)
     if not artifact or len(dump(review)) <= budget:
         return review
@@ -226,19 +230,17 @@ def compact_review(review, artifact, budget=REVIEW_CONTEXT_CHARS, *, digest=None
     def excerpt(size):
         result = {key: deepcopy(value) for key, value in review.items()
                   if key not in ("summary", "findings")}
-        result.update(
-            details_truncated=True, full_review_artifact=artifact,
-            review_content_sha256=digest,
-        )
-        if size:
-            result["summary"] = review.get("summary", "")[:min(600, size)]
+        result.update(details_truncated=True, review_content_sha256=digest)
+        if size and "summary" in review:
+            result["summary"] = review["summary"][:min(600, size)]
         result["findings"] = []
         for finding in review.get("findings", []):
             item = {key: finding[key] for key in ("id", "severity", "category")}
             if size:
-                item.update(location=finding["location"][:size // 5],
-                            message=finding["message"][:size * 2 // 5],
-                            evidence=[value[:size // 5] for value in finding["evidence"][:2]])
+                item.update({key: finding[key][:share] for key, share in
+                             (("location", size // 5), ("message", size * 2 // 5)) if key in finding})
+                if "evidence" in finding:
+                    item["evidence"] = [value[:size // 5] for value in finding["evidence"][:2]]
             result["findings"].append(item)
         return result
 
@@ -262,6 +264,10 @@ def compact_reviews(history):
     Finding disappearance never proves resolution. Only identical findings are
     deduplicated; changed severity, message or evidence keeps a distinct entry.
     Prose shares a bounded budget, with complete text in the cited artifacts.
+    Only the latest record keeps its mapping copy and dispositions; earlier ones
+    are in the packet's prior_review_keys_index. A value is cited once: an
+    earlier batch of the same verified candidate names the next record with
+    same_candidate_as instead of repeating its candidate references.
     """
     history = [item for index, item in enumerate(history) if item not in history[index + 1:]]
     result = []
@@ -270,6 +276,22 @@ def compact_reviews(history):
     for index in range(len(history) - 1, -1, -1):
         item = deepcopy(history[index])
         item.pop("snapshot", None)
+        # A whole-run attempt's approved batches carry nothing to rework; the ledger keeps them.
+        item.pop("approved_batches", None)
+        source = item.get("review_source")
+        for field in ("dispatch_id", "snapshot_digest"):
+            if isinstance(source, dict) and field in item and item[field] == source.get(field):
+                item.pop(field)
+        if index != len(history) - 1:
+            item.pop("required_findings", None)
+            older, newer = history[index], history[index + 1]
+            ident = (newer["review_source"].get("dispatch_id")
+                     if isinstance(newer.get("review_source"), dict) else None)
+            if isinstance(ident, str) and older.get("diff_artifact") and older["diff_artifact"] == newer.get("diff_artifact"):
+                for field in ("diff_artifact", "verification", "worker_source"):
+                    if field in older and older[field] == newer.get(field):
+                        item.pop(field)
+                item["same_candidate_as"] = ident
         if item.get("artifact"):
             # The cited record retains execution bookkeeping. Review context
             # needs the decision, candidate, findings and evidence references,
@@ -296,6 +318,7 @@ def compact_reviews(history):
                 # without exceeding the budget. Preserve the original identity
                 # even when compact_review needs no further prose reduction.
                 review["review_content_sha256"] = digest
+                review.pop("finding_dispositions", None)
                 review["findings"] = unique
                 if item.get("artifact"):
                     review.pop("summary", None)

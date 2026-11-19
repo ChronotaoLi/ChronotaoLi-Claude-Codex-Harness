@@ -18,11 +18,13 @@ flowchart TD
     V -->|通过| R[全新审阅实例]
     V -->|失败| C
     R -->|返工| C
-    R -->|通过| A[核对快照并提交隔离分支]
+    R -->|本批通过，还有历史问题待核验：同一候选的下一批| R
+    R -->|通过且没有待核验的历史问题| A[核对快照并提交隔离分支]
     A --> M[记忆与交接检查点]
     M --> C
     A --> F[全部任务完成：重新验证并整体审阅原始目标]
-    F -->|通过| D[交付分支，由操作者集成]
+    F -->|本批通过，还有历史问题待核验：同一快照的下一批（沿用本次验证）| F
+    F -->|通过且没有待核验的历史问题| D[交付分支，由操作者集成]
     F -->|缺漏| C
 ```
 
@@ -91,7 +93,7 @@ editable 安装不复制源码：包、默认操作者配置（源码目录的 `
   ```
 
   项目配置的位置固定：不向上级目录搜索，没有回退，也没有命令行参数能改它；`--repo` 指向仓库子目录时用的也是 Git 根目录下的这一份（在 `git worktree` 建的链接工作树里，Git 根目录是那个工作树自己的根）。
-- `verification.commands` 是确定性验证命令，`run` 要求至少一条。每条命令是 argv 数组，不经 shell 解释，例如 `["uv", "run", "pytest"]` 或 `["npm", "test", "--", "--run"]`。依赖需要在 worktree 中可用；生成产物应已忽略或位于工作树外，验证期间出现未忽略的新文件也会触发快照门禁。验证命令与 `permissions.worker_commands` 就是授予 worker 的执行能力（见[worker 命令与删除](docs/operations.md#worker-命令与删除)）。
+- `verification.commands` 是确定性验证命令，`run` 要求至少一条。每条命令是只含 `cwd` 与 `argv` 两个键的表，两键都必填，例如 `{ cwd = ".", argv = ["uv", "run", "pytest"] }` 或 `{ cwd = "web", argv = ["npm", "test", "--", "--run"] }`。`argv` 不经 shell 解释。`cwd` 是命令执行的目录，相对工作树根，`"."` 表示根；工程在子目录时（它的 `pubspec.yaml`、`package.json` 或 `pyproject.toml` 所在的目录）把那个目录写成 `cwd`，不要写 `cd` 的 shell 脚本。同一 argv 在两个目录是两条命令。`cwd` 不能是绝对路径，不能以 `/` 结尾，不能有空段、`.` 或 `..` 段，每段要含非空白字符，不含反斜杠与 NUL，不含代理码点（JSON 输入可以用单独的 `\ud800` 这类转义写出它，TOML 本身不接受这种转义），最多 4,096 个字符；首段不能是 `.git`、`.harness`、`.codex`、`.claude`，任一段不能是 `.git`（按折叠后的名称判定，`.GIT` 这类写法同样拒绝）。不合格时加载配置即报错，错误写明字段路径（例如 `permissions.worker_commands[2].cwd`）与所在文件。命令形状的错误在逐个文件解析时报出：两份配置里还有预算、`fresh_checkout` 类型、准备命令需要 `fresh_checkout` 这类合并之后才检查的错误时，先报出的是命令形状的错误。目录是否存在在加载时不检查。执行时从工作树根逐级以 no-follow 打开目录（下面的结果都以单一故障为前提，见[设计：隔离与进程](docs/design.md#隔离与进程)）：某一段不存在、不是目录、是符号链接、没有权限或名称过长，或者子进程进入目录的 `fchdir` 失败（例如没有搜索权限）时，这条命令不启动，不是缺少授权：正式验证里它记为一条失败的检查（`termination_reason` 为 `start_failed`）。逐级打开时遇到其他本地 I/O 错误（例如 `EIO`）时它不是检查结果，正式验证以 `runtime_failure/io` 停止；验证自己的写入或监督器出故障时的结果见[设计：不变量](docs/design.md#不变量)第 23 条。依赖需要在 worktree 中可用；生成产物应已忽略或位于工作树外，验证期间出现未忽略的新文件也会触发快照门禁。验证命令与 `permissions.worker_commands` 就是授予 worker 的执行能力（见[worker 命令与删除](docs/operations.md#worker-命令与删除)）。
 - 有效配置是“内置默认值 ← 操作者配置 ← 项目配置”，后者覆盖前者。项目配置里的 `runtime` 逐键覆盖操作者配置，每个键的值整体替换（`claude_max_turns_by_role` 这样的表和所有数组都不合并）；`verification`、`permissions` 只来自项目配置，没写的键取内置默认值。合并后的有效配置再按全部规则校验。
 - 节写错了文件会被拒绝，错误指出它应写在哪份文件里（例如操作者配置里出现 `verification`）；未知节和键同样被拒绝，错误给出完整键路径和所在文件。模型 ID 原样使用；`shared` 的相对路径相对操作者配置所在的目录解析。
 - `run`、`resume`、`permission-diagnostics` 读两份配置，项目配置不存在时在任何写入之前拒绝（退出码 2）；其他命令读哪份配置见[统一入口](docs/operations.md#统一入口)。
@@ -116,11 +118,11 @@ harness run "实现导出功能" --commander fable
 
 可用 `--plan /path/to/plan.json` 提供已有计划，格式见 [examples/plan.json](examples/plan.json)。输入在创建 run、分支和 worktree 前校验任务 ID、DAG、非空验收、范围和 skill。任务 ID 不得重复，折叠后（不区分大小写等）相同也算重复：`greet` 与 `GREET` 不能出现在同一份计划里，因为任务的验证证据目录以 ID 命名。范围从仓库根目录匹配：`src/*` 只匹配直接子项，`src/**` 匹配所有层级，`**/*.py` 也匹配根目录文件；只有独立 `**` 路径段跨越 `/`。范围应覆盖必要测试与夹具。全仓库模式允许但会警告；`.git`、`.harness`、`.codex`、`.claude` 仍受保护，按名称判定、不分大小写，`.CLAUDE` 这类别名写法同样拒绝（规则见 [docs/design.md](docs/design.md) 不变量 17）。可用 `--scope PATTERN`（可重复）在启动前声明 run 的范围边界：只接受具体路径、字面子树 `p/…/**` 或 `**`；首版计划与之后每次修订新增的模式都必须能证明在边界内，`--plan` 越界时不创建 run。不声明时首版不受约束，修订只能复用已发布计划的模式。
 
-任务的 `required_commands` 最多声明 32 条不同的完整 argv，表示执行前置条件，不授予权限。派发前与 `verification.commands`、`permissions.worker_commands` 精确比较；不接受前缀，`verification.setup_commands` 不授予 worker 能力。能被内置 [`git_query`](docs/operations.md#git_query) 解析的只读 Git 查询（例如 `["git", "ls-files", "-z", "--", "src"]`）算作已满足，无需授权；`self_checks` 按同样规则比较。缺少授权时不启动 worker 或消耗其尝试，其他满足条件的就绪任务仍可继续；已有任务选择保持绑定。`status RUN` 显示 `missing_command_requirements`，追加精确授权后普通 `resume` 即可重检，无需环境更新。计划批准不增加权限，检查不证明命令存在、执行成功或验收通过。
+任务的 `required_commands` 最多声明 32 条不同的完整命令 `{"cwd": …, "argv": […]}`，表示执行前置条件，不授予权限。派发前按（目录，argv）与 `verification.commands`、`permissions.worker_commands` 精确比较，原样字符串相等才算，不做大小写或 Unicode 折叠；不接受前缀，同一 argv 在另一个目录的授权不算，`verification.setup_commands` 不授予 worker 能力。`cwd` 为 `.`、argv 能被内置 [`git_query`](docs/operations.md#git_query) 解析的只读 Git 查询（例如 `{"cwd": ".", "argv": ["git", "ls-files", "-z", "--", "src"]}`）算作已满足，无需授权；`git_query` 只在工作树根执行，同一 argv 带其他目录需要显式授权。`self_checks` 按同样规则比较。缺少授权时不启动 worker 或消耗其尝试，其他满足条件的就绪任务仍可继续；已有任务选择保持绑定。`status RUN` 显示 `missing_command_requirements`（每条命令带目录），加入精确授权后普通 `resume` 即可重检，无需环境更新。计划批准不增加权限，检查不证明命令存在、执行成功或验收通过。
 
 模型计划无效（含 `required_commands` 重复或超过 32 条、计划大到整体审阅的必要上下文超出 `context_chars`）时自动重做一次，仍无效则停止，普通 `resume` 重新请求。指挥与审阅读不出否决的无效输出都这样处理；worker 的无效输出计一次工作尝试后继续。规则与边界见[无效输出与自动重做](docs/recovery.md#无效输出与自动重做)及[阻塞出口](docs/recovery.md#阻塞状态与操作者出口)。
 
-任务可另声明 `self_checks`（最多 32 条精确 argv）与 `evidence_requirements`（`id`、从 0 起的 `acceptance_index`、`kind`、仓库相对 `path`）。证据类型为 `static`、`simulation`、`host_integration` 或 `device`。角色收到 `verification_plan`，区分 worker 聚焦自检、全部正式任务门禁与最终门禁；自检不授权，也不替代正式验证。worker 无需默认重复全套门禁，仅在有明确诊断理由时重复。运行时按 `evidence_requirements` 直接检查候选中的文件并记录摘要，worker 不再声明证据；内容正确性仍由独立审阅核验。返工时，修复声明和审阅处置都使用运行时按本次必需问题生成的键 `f1…fN`，模型不回填来源与问题 ID；声明不证明修复，候选路径与普通 evidence 中的外部日志引用保持分开。
+任务可另声明 `self_checks`（最多 32 条精确命令 `{cwd, argv}`）与 `evidence_requirements`（`id`、从 0 起的 `acceptance_index`、`kind`、仓库相对 `path`）。证据类型为 `static`、`simulation`、`host_integration` 或 `device`。角色收到 `verification_plan`，区分 worker 聚焦自检、全部正式任务门禁与最终门禁；自检不授权，也不替代正式验证。worker 无需默认重复全套门禁，仅在有明确诊断理由时重复。运行时按 `evidence_requirements` 直接检查候选中的文件并记录摘要，worker 不再声明证据；内容正确性仍由独立审阅核验。返工时，修复声明和审阅处置都使用运行时按本次必需问题生成的键 `f1…fN`，模型不回填来源与问题 ID；worker 收到的是仍待修的历史阻断问题（对它最近一次生效的是报告或任何审阅的 open，而不是可用审阅的 resolved；not_checked 不算），按来源顺序至多 60 条，审阅在同一候选上分批（每批至多 60 条）核验这个候选上还没有可用 resolved 的全部历史阻断问题，问题数量没有单独的上限（每次调用的必要上下文仍受 `context_chars` 约束；“可用”与选批规则见[设计：不变量](docs/design.md#不变量)第 12 条）；声明不证明修复，候选路径与普通 evidence 中的外部日志引用保持分开。
 
 worker 可用结构化续作请求正常交还控制权，等待精确命令授权或单次派发超时调整；满足条件后以全新派发继续原候选，累计调用和任务预算保留。`resume RUN --execution-guidance FILE` 可在安全待处理任务边界登记绑定来源与候选的操作约束；指导不授予命令权限。格式与适用边界见[续作与操作指导](docs/recovery.md#续作与操作指导)。
 
@@ -152,7 +154,7 @@ git cat-file commit SHA | sed '1,/^$/d' | git -c trailer.separators=: interpret-
 
 ## 验收与隔离
 
-任务接受必须同时满足：合法 worker 结果声明完成（含合规的 `commit_message`）、Git 绑定与 HEAD 未变、修改在允许范围内、所有验证成功、独立审阅批准且无 blocking findings、接受前文件快照仍一致。建议可以保留，`request_changes` 或任何阻断问题都不通过。审阅者读取实际 diff、验证日志和历轮问题的证据，不接收 worker 的私有推理；worker 自报完成不等于接受。
+任务接受必须同时满足：合法 worker 结果声明完成（含合规的 `commit_message`）、Git 绑定与 HEAD 未变、修改在允许范围内、所有验证成功、独立审阅批准且无 blocking findings、该任务历史上的每个阻断问题在待接受的快照上都有可用审阅给出的 resolved（可能分几批审阅）、接受前文件快照仍一致。建议可以保留，`request_changes` 或任何阻断问题都不通过。审阅者读取实际 diff、验证日志和历轮问题的证据，不接收 worker 的私有推理；worker 自报完成不等于接受。
 
 全部任务接受并提交后重新运行验证，由新的审阅实例对照原始目标、原始任务约束和整条分支 diff 验收。整体拒绝须经正常修复任务门禁，不能靠反复恢复重抽审阅结论。记忆在任务接受后写入，知识提案还须逐项获批。
 
@@ -164,12 +166,12 @@ git cat-file commit SHA | sed '1,/^$/d' | git -c trailer.separators=: interpret-
 
 ```toml
 [verification]
-commands = [["npm", "test", "--", "--run"]]
+commands = [{ cwd = ".", argv = ["npm", "test", "--", "--run"] }]
 fresh_checkout = true
-setup_commands = [["npm", "ci"]]
+setup_commands = [{ cwd = ".", argv = ["npm", "ci"] }]
 ```
 
-默认 `fresh_checkout = false`、`setup_commands = []`。开启后，仅整体验证改用目标仓库外的全新 detached worktree，顺序执行准备与验证；准备不得改变已跟踪文件或留下未忽略文件，也不授予 worker 权限。任务级验证仍在原工作树，依赖仍须可用。同一 run 不可改变这两项设置。
+默认 `fresh_checkout = false`、`setup_commands = []`。开启后，仅整体验证改用目标仓库外的全新 detached worktree，顺序执行准备与验证；准备不得改变已跟踪文件或留下未忽略文件，也不授予 worker 权限。任务级验证仍在原工作树，依赖仍须可用。同一 run 不可改变这两项设置。准备与验证命令的 `cwd` 相对新检出的根，新检出只含 HEAD 的已提交内容：准备命令的目录必须在 HEAD 中存在或由前面的准备命令创建，否则依赖准备失败（`verification/setup_failed`），每次 `resume` 都在同一 HEAD 上同样失败；`verification.*` 恢复时不能改，只能 `abandon` 后用改正的配置开新 run。
 
 验证通过的检出由运行时在整体审阅派发前尝试回收；准备失败、验证失败或中断的检出保留供检查，用 `cleanup-run` 清理（见[整体验证与重验](docs/recovery.md#整体验证与重验)）。该模式仍使用当前环境、Git 配置及声明的准备命令，不承诺容器级可复现性。审阅包里的忽略清单只列路径（目录折叠、有界），不校验内容，不能替代全新检出。
 
@@ -200,23 +202,24 @@ harness cleanup-run RUN --remove --remove-ignored
 | `max_attempts` | 每个任务的 worker 工作尝试；已完整校验的 environment／operator 阻断不计入 |
 | `max_agent_dispatches` | 整个 run 的模型调用次数，包括指挥、worker、任务审阅、整体审阅和无效输出的重做 |
 
-没有全 run 的 worker 尝试上限，计划任务数、修订次数和整体尝试次数也没有单独的上限：修订新增的任务各有自己的 `max_attempts`（默认 5），全局由 `max_agent_dispatches` 封顶；计划大小由整体审阅的必要上下文约束。模型调用数远多于任务数，例如一次 7 个任务的 run 用了 52 次模型调用。因派发上限停止时，停止信息和 `status RUN` 的 `remaining_model_calls` 给出“如果之后全部一次通过，至少还需 N 次模型调用”；N 是下界，不含指挥决定、返工和重做。`status RUN` 的 `budgets` 另给出 `work_attempts`（扣除豁免后的任务尝试：环境或操作者阻断，以及额度、限速、过载、认证四类供应商失败）和 `attempts_total`（各任务 worker 调用之和）。
+没有全 run 的 worker 尝试上限，计划任务数、修订次数和整体尝试次数也没有单独的上限：修订新增的任务各有自己的 `max_attempts`（默认 5），全局由 `max_agent_dispatches` 封顶；计划大小由整体审阅的必要上下文约束。模型调用数远多于任务数，例如一次 7 个任务的 run 用了 52 次模型调用。因派发上限停止时，停止信息和 `status RUN` 的 `remaining_model_calls` 给出“如果之后全部一次通过，至少还需 N 次模型调用”；N 是下界，不逐批计入同一候选或整体快照的后续审阅，也不含指挥决定、返工和重做。`status RUN` 的 `budgets` 另给出 `work_attempts`（扣除豁免后的任务尝试：环境或操作者阻断，以及额度、限速、过载、认证、传输失败五类供应商失败）和 `attempts_total`（各任务 worker 调用之和）。`budget_explanation.dimensions` 里已判定的 worker 调用失败（`worker_failure_verdicts`）按分类计数，已记录的豁免（`recorded_exemptions`）按种类计数，两者都有 `transport` 一项。
 
 `watch RUN` 用 macOS kqueue 或 Linux inotify 等待文件变化，只在观察结果改变时输出简短 JSONL；等待超时不重读台账。默认到阻塞、暂停、等待批准或终态后退出，`--follow` 可继续等待后续恢复。`watch RUN --state /path/to/.harness` 可以直接观察保留下来的运行证据，不要求该目录仍是 Git 工作树。不支持原生通知的平台会明确报错。观察值来自台账，不证明模型进程仍在工作。
 
-状态和网页提供只读的返工提示 `convergence` 与审阅轮次 `review_rounds`，用于判断范围和方案复杂度，不增加预算、不启动恢复、不改变验收（规则见[观察网页用法与限制](docs/operations.md#观察网页用法与限制)）。
+状态和网页提供只读的返工提示 `convergence` 与审阅轮次 `review_rounds`，用于判断范围和方案复杂度，不增加预算、不启动恢复、不改变验收（规则见[观察网页用法与限制](docs/operations.md#观察网页用法与限制)）。返工提示按工作尝试给出结论，写明最近一个结论（有的话）属于第几次尝试、此后尝试编号是否增加（被豁免的调用也占编号）；因重复报告的标签触发时还写明比较的是哪两轮审阅。
 
-`dashboard` 在 127.0.0.1 启动只读观察网页，stdout 只打印访问地址，Ctrl-C 停止；与 `status` 一样不加载配置，不启动、恢复或修改 run，刷新不启动任何 CLI。台账记为 running 不等于进程仍在工作。页面、“预算与额度”标签、事件订阅与文件访问边界见[观察网页用法与限制](docs/operations.md#观察网页用法与限制)。
+`dashboard` 在 127.0.0.1 启动只读观察网页，stdout 只打印访问地址，Ctrl-C 停止；启动成功时在 stderr 写出它读取的检出与状态目录，页眉也显示它们，浏览器标题以检出（未知时是状态目录）路径的最后两段开头；与 `status` 一样不加载配置，不启动、恢复或修改 run，刷新不启动任何 CLI。`status` 的三种形式（带 run ID 时它的格式须有效）也把检出与状态目录写在 stderr 第一行。台账记为 running 不等于进程仍在工作。页面、“预算与额度”标签、事件订阅与文件访问边界见[观察网页用法与限制](docs/operations.md#观察网页用法与限制)。
 
-同一快照上的已保存阶段可复用：验证中断只重跑验证，审阅调用故障只新派发 reviewer，已封存的 worker 结果不重新派发。已返回的结果不重抽，读得出的拒绝、提问和阻断不会因恢复消失；worker 调用失败时当场判定，额度、限速、过载、认证失败不计工作尝试（仍计入 `max_agent_dispatches`），输出完整但解不出对象结果是一次无效交付（计一次尝试后继续）。判定与保存顺序见[设计：不变量](docs/design.md#不变量)，进程未确认退出、HEAD／Git 绑定异常或证据损坏时的出口见下表与[阻塞状态与操作者出口](docs/recovery.md#阻塞状态与操作者出口)。
+同一快照上的已保存阶段可复用：验证中断只重跑验证，审阅调用故障只新派发 reviewer，已封存的 worker 结果不重新派发。已返回的结果不重抽，读得出的拒绝、提问和阻断不会因恢复消失；worker 调用失败时当场判定，额度、限速、过载、认证、传输失败不计工作尝试（仍计入 `max_agent_dispatches`），输出完整但解不出对象结果是一次无效交付（计一次尝试后继续）。判定与保存顺序见[设计：不变量](docs/design.md#不变量)，进程未确认退出、HEAD／Git 绑定异常或证据损坏时的出口见下表与[阻塞状态与操作者出口](docs/recovery.md#阻塞状态与操作者出口)。
 
 | 情况 | 常用出口 |
 | --- | --- |
 | 等待计划批准（`plan_approval/initial_plan`） | `resume RUN --approve-plan` |
-| 精确命令未授权（`missing_commands/*`） | 在项目配置追加精确授权后普通 `resume RUN` |
+| 精确命令未授权（`missing_commands/*`） | 在项目配置加入停止数据里的精确命令（目录与 argv）后普通 `resume RUN` |
 | 续作请求需要先修正（`continuation/*`） | `resume RUN --reject-request FILE` |
 | 已保存 worker 环境阻断（`environment/worker_blocked`） | 修复条件后 `resume RUN --environment-update FILE` |
 | 供应商额度用尽、限速、过载或认证失败（`provider_quota/*`、`provider_failure/overloaded`、`provider_failure/authentication`） | 额度恢复或修复登录后普通 `resume RUN`；worker 的这次调用不计工作尝试；额度用尽时先看 `data.wait_reason`（为什么没有在进程内等待） |
+| 与供应商的连接失败（`provider_failure/transport`） | 网络或代理恢复后普通 `resume RUN`；worker 的这次调用不计工作尝试 |
 | 等待用户决定 | 从 status 取 request ID，`resume RUN --operator-decision FILE`；可重复参数一次回答多项 |
 | 指挥提问 | 从 status 取 request ID，`resume RUN --operator-decision FILE` 回答；回答进入下一次指挥决定 |
 | 指挥提案越出范围边界，已持有（`scope_extension/revision`、`scope_extension/initial_plan`） | 核对 `gaps` 与建议后执行停止信息给出的 `resume RUN --scope=…`，或 `resume RUN --reject-request FILE`；都不重抽提案 |
@@ -230,9 +233,9 @@ harness cleanup-run RUN --remove --remove-ignored
 
 `cleanup-run RUN` 是唯一的显式清理入口（验证通过的检出另由运行时在整体审阅前尝试回收）：默认预览，逐项列出保留的全新验证检出和分支工作树能否清理、被什么挡住，`--remove` 才逐项删除。分支工作树只在 `completed` 或 `abandoned` 时清理，其他状态报告 `retained`；工作树里被 Git 忽略的文件只在本次命令带 `--remove-ignored` 时随工作树删除（不带时报 `blocked`，`--remove-ignored` 单独使用是预览忽略清单）；验证检出里的忽略文件随检出删除。某项受阻不影响其余各项，只有出现 `blocked` 时退出码为 1。派发或命令子进程退出未确认时整条命令拒绝，核实后可加 `--confirm-exited DISPATCH_ID`。命令不改 run 状态，不删除分支、台账或运行证据；中断后重跑同一命令续做。各状态的含义、门禁与记录文件见[放弃与清理](docs/recovery.md#放弃与清理)。
 
-台账版本为 18。台账只存摘要与引用，完整内容在 run 目录的不可变文件里；这些文件被删除、修改或换成符号链接时 `resume` 停止并保留现场（见[证据损坏](docs/recovery.md#证据损坏)）。已完成 run 的普通恢复返回保存结果。
+台账版本为 19。台账只存摘要与引用，完整内容在 run 目录的不可变文件里；这些文件被删除、修改或换成符号链接时 `resume` 停止并保留现场（见[证据损坏](docs/recovery.md#证据损坏)）。已完成 run 的普通恢复返回保存结果。
 
-只支持当前台账版本：其他版本的台账在各入口一律被拒绝（`台账版本 N 不支持（当前版本 18）`），运行列表只列出它的路径、版本和“不支持”。见[终态与其他版本的台账](docs/recovery.md#终态与其他版本的台账)。
+只支持当前台账版本：其他版本的台账在各入口一律被拒绝（`台账版本 N 不支持（当前版本 19）`），运行列表只列出它的路径、版本和“不支持”。见[终态与其他版本的台账](docs/recovery.md#终态与其他版本的台账)。
 
 ## 共用 skills / MCP
 
@@ -250,14 +253,19 @@ harness cleanup-run RUN --remove --remove-ignored
 
 内置只读 `harness` MCP 向三种角色提供记忆、技能、运行状态，文件工具 `file_sha256`、`json_check`、`file_diff`，以及按固定形式表执行只读 Git 查询的 `git_query`；表外 argv 不执行即报错，没有记忆写入工具。形式表、参数规则与输出字段见[角色工具参考](docs/operations.md#角色工具参考)。
 
-worker 独有的 `harness_commands` MCP 提供 `list_commands`、`run_command({command_id})` 和 `delete_path({path})`。`run_command` 执行配置中的完整 argv，不能附加参数或覆盖 cwd、env，不经 shell 插值；`delete_path` 删除一个 HEAD 中已跟踪、在任务 `allowed_paths` 内的普通文件，不删目录、不移动文件，删除不能被接受门禁撤销。每次调用的 journal、receipt 和输出留在 dispatch 私有 `commands/`。规则与保证见[worker 命令与删除](docs/operations.md#worker-命令与删除)。额外的命令授权写在项目配置里：
+worker 独有的 `harness_commands` MCP 提供 `list_commands`、`run_command({command_id})` 和 `delete_path({path})`。`list_commands` 给出每条命令的 ID、目录与 argv；`run_command` 在命令的 `cwd` 里执行配置中的完整 argv，不能附加参数或改目录、env，不经 shell 插值；命令目录某一段不存在、不是目录、是符号链接、没有权限或名称过长，或者子进程进入目录的 `fchdir` 失败时，命令不启动，回执记 `termination_reason: "start_failed"`，逐级打开目录时遇到其他本地 I/O 错误（例如 `EIO`）时回执记 `termination_reason: "error"`、`evidence_complete: false`；`delete_path` 删除一个 HEAD 中已跟踪、在任务 `allowed_paths` 内的普通文件，不删目录、不移动文件，删除不能被接受门禁撤销。每次调用的 journal、receipt 和输出留在 dispatch 私有 `commands/`。规则与保证见[worker 命令与删除](docs/operations.md#worker-命令与删除)。额外的命令授权写在项目配置里：
 
 ```toml
 [permissions]
-worker_commands = [["python3", "-m", "unittest", "tests.test_export", "-v"]]
+worker_commands = [
+  { cwd = ".", argv = ["python3", "-m", "unittest", "tests.test_export", "-v"] },
+  { cwd = "app", argv = ["flutter", "test"] },
+]
 ```
 
-字面 `*` 或换行由 broker 原样传递，但含这些字符的 argv 不生成 Bash 许可；其余已配置命令和只读前缀仍作为 Claude worker 的 CLI 层 Bash 许可存在，这些调用不留 broker 记录，应优先用 broker。管道或重定向须显式授权完整 `["/bin/sh", "-c", "固定脚本"]`；删除范围内的已跟踪文件用 `delete_path`，移动文件或删除目录、未跟踪文件须配置含具体路径的精确 argv（如 `rm`、`mv`）。不会自动组合命令、授权 `gh`／`ssh`／`curl` 前缀或跳过权限检查，不得用后台执行绕过 broker。必要命令被拒绝时 worker 应报告环境 blocker。当前 Codex 适配器只提供只读模式，配置 Codex worker 会提前报错。
+同一份授权也可以写成 `[[permissions.worker_commands]]` 表数组（每个表一行 `cwd = …`、一行 `argv = […]`），两种写法解析成同一份数据。
+
+字面 `*` 或换行由 broker 原样传递。配置条目只授权 broker，不生成 Bash 规则：Harness 给 Claude worker 生成的 CLI 层 Bash 放行规则只有只读前缀（参数只能接在 `--` 之后）。Claude CLI 据此实际放行或拒绝哪些 Bash 调用，这一版没有用真实账号核对；预期是 argv 落在只读前缀里的命令仍可经 Bash 执行（那是只读前缀独立的能力，在 Bash 会话当时的目录里执行，不留 broker 记录），其余配置命令经 Bash 被拒绝。管道或重定向须显式授权完整 `{ cwd = …, argv = ["/bin/sh", "-c", "固定脚本"] }`，子目录写进 `cwd`，不要在脚本里 `cd`；删除范围内的已跟踪文件用 `delete_path`，移动文件或删除目录、未跟踪文件须配置含具体路径的精确命令（如 `rm`、`mv`）。不会自动组合命令、授权 `gh`／`ssh`／`curl` 前缀或跳过权限检查，不得用后台执行绕过 broker。必要命令被拒绝时 worker 应报告环境 blocker。当前 Codex 适配器只提供只读模式，配置 Codex worker 会提前报错。
 
 外部 MCP 支持 stdio / HTTP 和按 `roles` 限制；指挥、审阅服务必须声明 `read_only = true`，由配置维护者核实。凭据只填写环境变量名称。示例见 [examples/mcp.json](examples/mcp.json)；OpenWiki 默认关闭，启用前需填真实路径并关闭 agent 写入能力。预检验证配置，不连接服务或证明凭据可用。
 
@@ -341,4 +349,4 @@ harness cleanup-run RUN --remove --remove-input-copies
 
 `supervise` 只启动一次指定的 Harness `run`/`resume`，保留子进程 stdout，监督回执写入 `.harness/supervision/` 并输出到 stderr，退出码等于子进程退出码；不会重启或自动恢复。父进程退出仍不证明 broker 子进程退出。要在 run 停下时得到提示，用 `watch RUN`（到阻塞、暂停、等待批准或终态时退出）或 `supervise`。
 
-Claude 调用只用 JSON 输出（`--output-format json`），终态只从派发目录的 `process.stdout` 读取；错误、缺失或损坏的终态及非零退出均不能接受。观察不到的读取范围或拒绝原因保持未知。只读 `permission-diagnostics RUN DISPATCH --argv-json '["python3", "-m", "unittest"]'` 对比供应商拒绝证据和当前有效配置（含项目配置）中的精确命令能力，并在 `builtin_coverage` 中单独说明该 argv 是否由内置 `git_query` 覆盖；它不执行命令或扩大权限。`status` 和 dashboard 同时显示预算的已用/上限/剩余与调用、审阅候选、失败、无效输出等独立维度。
+Claude 调用只用 JSON 输出（`--output-format json`），终态只从派发目录的 `process.stdout` 读取；错误、缺失或损坏的终态及非零退出均不能接受。观察不到的读取范围或拒绝原因保持未知。只读 `permission-diagnostics RUN DISPATCH --command-json '{"cwd": ".", "argv": ["python3", "-m", "unittest"]}'` 对比供应商拒绝证据和当前有效配置（含项目配置）中的精确命令能力（`local_exact_command_match` 要求目录与 argv 都相同），并在 `builtin_coverage` 中单独说明该命令是否由内置 `git_query` 覆盖（`cwd` 不是 `.` 时总是不覆盖）；`--command-json` 一出现就比较，`null`、空串与数组都被拒绝；它不执行命令或扩大权限。`status` 和 dashboard 同时显示预算的已用/上限/剩余与调用、审阅候选、失败、无效输出等独立维度。

@@ -14,7 +14,8 @@ def work_attempts(run):
     """Project saved accounting without changing the monotonic invocation totals.
 
     Work counting spares only evidence-bound exemptions: environment/operator
-    waits and provider quota, rate-limit, overload and authentication failures.
+    waits and provider quota, rate-limit, overload, authentication and transport
+    failures.
     """
     attempts = dict(run.get("attempts", {}))
     for entry in run.get("dispatches", []):

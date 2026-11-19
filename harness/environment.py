@@ -16,7 +16,7 @@ import time
 
 from .contracts import validate_work_core
 from .worker_receipts import delivered_work_contract
-from .git_query import covers as git_query_covers
+from .commands import available_through, validate_command
 from .recovery import RECOVERY_BUSY_KEYS, read_bound_result, snapshot_digest
 from .util import EvidenceError, HarnessError, dump, write_json
 
@@ -50,17 +50,13 @@ def validate_update(value):
             _text(check["name"], "checks.name", 4096)
             if "/" in check["name"] and not Path(check["name"]).is_absolute():
                 raise HarnessError("环境可执行程序检查只接受程序名或绝对路径")
-        elif kind == "worker_command" and set(check) == {"kind", "argv"}:
-            argv = check["argv"]
-            if not isinstance(argv, list) or not argv or len(argv) > 128:
-                raise HarnessError("环境命令检查需要非空 argv，最多 128 项")
-            for arg in argv:
-                if (not isinstance(arg, str) or len(arg) > 4096
-                        or "\0" in arg):
-                    raise HarnessError("环境命令检查只接受精确 argv，不能包含 NUL")
-            _text(argv[0], "checks.argv[0]", 4096)
+        elif kind == "worker_command" and set(check) == {"kind", "command"}:
+            validate_command(check["command"], "checks.command")
+            argv = check["command"]["argv"]
+            if len(argv) > 128 or any(len(arg) > 4096 for arg in argv):
+                raise HarnessError("环境命令检查的 argv 最多 128 项，每项最多 4096 个字符")
         else:
-            raise HarnessError("环境检查只支持 path、executable、worker_command 的规定字段")
+            raise HarnessError("环境检查只支持 path、executable、worker_command（command 为 {cwd, argv}）的规定字段")
     return {**deepcopy(value), "checks": deepcopy(checks)}
 
 
@@ -334,12 +330,12 @@ class EnvironmentRecovery(RuntimeService):
                 elif check["kind"] == "executable":
                     passed = shutil.which(check["name"]) is not None
                 else:
-                    allowed = self.context.config.data["permissions"]["worker_commands"] + self.context.config.data["verification"]["commands"]
-                    passed = check["argv"] in allowed
-                    if not passed and git_query_covers(check["argv"]):
+                    source = available_through(check["command"], self.context.config.data)
+                    if source == "builtin_git_query":
                         # Built-in read-only capability exists; nothing was executed.
-                        results.append({"check": check, "passed": True, "coverage": "builtin_git_query"})
+                        results.append({"check": check, "passed": True, "coverage": source})
                         continue
+                    passed = source is not None
                 results.append({"check": check, "passed": passed})
             except OSError as error:
                 results.append({"check": check, "passed": False, "error": str(error)})

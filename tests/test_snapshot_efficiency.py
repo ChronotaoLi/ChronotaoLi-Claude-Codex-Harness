@@ -22,8 +22,8 @@ class SnapshotEfficiencyTests(RepoCase):
     def test_reused_verification_snapshot_still_detects_changes(self):
         # The last command changes the candidate after the checks have passed.
         self.config.data["verification"]["commands"] = [
-            [sys.executable, "-m", "unittest", "-v"],
-            [sys.executable, "-c", "open('hello.py', 'a').write('# Changed after checks\\n')"]]
+            {"cwd": ".", "argv": [sys.executable, "-m", "unittest", "-v"]},
+            {"cwd": ".", "argv": [sys.executable, "-c", "open('hello.py', 'a').write('# Changed after checks\\n')"]}]
         engine = self.engine()
         with self.assertRaisesRegex(HarnessError, "验证命令修改"):
             engine.start("Implement greet", read_json(ROOT / "examples" / "plan.json"))

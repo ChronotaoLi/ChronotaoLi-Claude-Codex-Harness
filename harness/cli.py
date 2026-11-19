@@ -23,7 +23,7 @@ from .operations import RUN_ID, OperationRecord, config_identity, digest_assets,
 from .runtime import Runtime
 from .shared import mcp_configs, toml_value
 from .util import HarnessError, dump, read_json, write_json
-from .versions import read_current_ledger, require_current_ledger, unsupported_ledger
+from .versions import missing_ledger, parse_current_ledger, require_current_ledger, unsupported_ledger
 
 
 def project_report(config, location):
@@ -87,7 +87,7 @@ def demo(config, live=False, commander="astra"):
     git.git(root, "add", ".")
     git.git(root, "-c", "user.name=Harness Demo", "-c", "user.email=demo@localhost", "-c", "commit.gpgsign=false", "commit", "-m", "Demo fixture")
     config = copy.deepcopy(config)
-    config.data["verification"]["commands"] = [[sys.executable, "-m", "unittest", "-v"]]
+    config.data["verification"]["commands"] = [{"cwd": ".", "argv": [sys.executable, "-m", "unittest", "-v"]}]
     config.data["runtime"]["agent_timeout_seconds"] = 180 if live else 1200
     config.data["runtime"]["max_attempts"] = 1 if live else 3
     print(f"[harness] {'LIVE SMOKE' if live else 'OFFLINE DEMO'} repo={root}", file=sys.stderr, flush=True)
@@ -146,7 +146,8 @@ def status_summary(run):
     result["budgets"]["attempts_total"] = attempts_total(run)
     result["convergence"] = convergence_summary(run, result["budgets"]["work_attempts"])
     result["review_rounds"] = review_rounds(run)
-    from .diagnostics import budget_explanation, remaining_model_calls
+    from .diagnostics import budget_explanation, ledger_stage, remaining_model_calls
+    result["ledger_stage"] = ledger_stage(run)
     result["budget_explanation"] = budget_explanation(run, result["budgets"]["work_attempts"])
     remaining = remaining_model_calls(run)
     if remaining is not None:
@@ -256,24 +257,40 @@ def status_summary(run):
     return result
 
 
-def show_status(args, state):
-    if args.run_id:
-        if not args.run_id.startswith("run_") or not args.run_id[4:].isalnum():
-            raise HarnessError("无效 run ID", stop=stops.make("invalid_input", "cli_arguments", data={"option": "run_id"}))
-        ledger = read_current_ledger(state / "runs" / args.run_id / "state.json")
-        if args.full:
-            print(dump(ledger))
+def show_status(args, repo):
+    if args.run_id and (not args.run_id.startswith("run_") or not args.run_id[4:].isalnum()):
+        raise HarnessError("无效 run ID", stop=stops.make("invalid_input", "cli_arguments", data={"option": "run_id"}))
+    state = repo / ".harness"
+    # One binding per call: the location line names the directory every read below goes through,
+    # so a `.harness` repointed meanwhile cannot put another directory's ledger under it.
+    with observe.Observer(state, checkout=repo) as observer:
+        print("harness: " + observe.location_text(observer.observed, opened=observer.reader.opened),
+              file=sys.stderr, flush=True)
+        if args.run_id:
+            path = state / "runs" / args.run_id / "state.json"
+            try:
+                # Below the bound root, but as the path read it replaces: links followed, uncapped, OSErrors as raised.
+                raw = observer.reader.read_following(["runs", args.run_id, "state.json"])
+            except FileNotFoundError as error:
+                raise missing_ledger(path) from error
+            except observe.PathRefused as error:
+                # A FIFO or device, never read: local I/O, as a directory in its place is.
+                raise HarnessError(f"无法读取运行台账 {path}：{error}", stop=stops.make(
+                    "runtime_failure", "io", data={"error_type": type(error).__name__})) from error
+            ledger = parse_current_ledger(raw)
+            if args.full:
+                print(dump(ledger))
+                return
+            summary = status_summary(ledger)
+            # Read after the ledger's version gate; saved samples only, never a CLI.
+            summary["quota"] = observer.quota_block(args.run_id)
+            print(dump(summary))
             return
-        summary = status_summary(ledger)
-        # Read after the ledger's version gate; saved samples only, never a CLI.
-        summary["quota"] = observe.quota_status(state, args.run_id)
-        print(dump(summary))
-        return
-    # The read-only observation layer owns the list; stdout fields are unchanged.
-    try:
-        listing = observe.list_runs(state)
-    except observe.ObserveError as error:
-        raise HarnessError(f"无法读取运行目录 {state / 'runs'}：{error}") from error
+        # The read-only observation layer owns the list; stdout fields are unchanged.
+        try:
+            listing = observer.list_runs()
+        except observe.ObserveError as error:
+            raise HarnessError(f"无法读取运行目录 {state / 'runs'}：{error}") from error
     for item in listing["unsupported"]:
         print(f"harness: 运行目录 {state / item['path']}：{item['reason']}", file=sys.stderr)
     for item in listing["skipped"]:
@@ -552,7 +569,8 @@ def _main(argv=None):
     permission = _command(sub, "permission-diagnostics", "只读比较供应商拒绝证据与本地精确命令能力")
     permission.add_argument("run_id", help=run_id)
     permission.add_argument("dispatch_id", help="要比较的那次调用的 dispatch ID")
-    permission.add_argument("--argv-json", help="要比较的完整 argv JSON 数组；不会执行")
+    permission.add_argument("--command-json",
+                            help='要比较的完整命令 JSON 对象 {"cwd": …, "argv": […]}；出现即比较，不会执行')
     sync = _command(sub, "sync", "生成共用 MCP 的两种客户端配置，不覆盖个人配置")
     sync.add_argument("--role", choices=["commander", "worker", "reviewer"], default="worker",
                       help="按哪个角色生成配置；默认 worker")
@@ -603,11 +621,11 @@ def _main(argv=None):
             repo = git.repository(args.repo)
             state = repo / ".harness"
             if args.command == "status":
-                show_status(args, state)
+                show_status(args, repo)
             elif args.command == "dashboard":
                 # Serves until SIGINT/SIGTERM (main() maps them to KeyboardInterrupt,
                 # which serve() absorbs) and then returns 0; stdout is only the URL.
-                return dashboard.serve(state, args.port)
+                return dashboard.serve(state, args.port, checkout=repo)
             elif args.command == "cleanup-run":
                 result = cleanup_run(repo, args.run_id, remove=args.remove,
                                      remove_input_copies=args.remove_input_copies,
@@ -634,7 +652,7 @@ def _main(argv=None):
         if args.command == "doctor":
             return doctor(config, args.repo)
         if args.command == "permission-diagnostics":
-            from .permission_diagnostics import permission_diagnostics
+            from .permission_diagnostics import command_capability_projection, permission_diagnostics
             if not RUN_ID.fullmatch(args.run_id) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,119}", args.dispatch_id):
                 raise HarnessError("无效 run/dispatch ID", stop=stops.make("invalid_input", "cli_arguments", data={"option": "run_id"}))
             state = repo / ".harness"
@@ -661,8 +679,11 @@ def _main(argv=None):
                                 terminal = json.loads(source["data"])
                         except (observe.NotFound, ValueError, RecursionError):
                             pass
-                    report = permission_diagnostics(config, terminal,
-                        argv=json.loads(args.argv_json) if args.argv_json else None)
+                    report = permission_diagnostics(config, terminal)
+                    # Presence decides: an explicit null, empty string or array is refused, never "not given".
+                    if args.command_json is not None:
+                        report["local_command_capability"] = command_capability_projection(
+                            config, json.loads(args.command_json))
                     report.update(run_id=args.run_id, dispatch_id=args.dispatch_id,
                                   local_config_basis="current_configuration_not_historical_provider_policy")
                     print(dump(report))

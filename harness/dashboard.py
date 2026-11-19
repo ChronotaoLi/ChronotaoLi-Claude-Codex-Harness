@@ -129,7 +129,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             status, body, content_type, extra = result
         except observe.ObserveError as error:
             status = next((code for kind, code in _STATUS_CODES.items() if isinstance(error, kind)), 400)
-            body, content_type, extra = _json_bytes({"error": str(error), "status": status}), JSON, ()
+            body = _json_bytes({"error": str(error), "status": status, "observed": self.server.observer.observed})
+            content_type, extra = JSON, ()
         except Exception as error:  # Never leak a traceback to the client.
             self.log_error("internal error: %s: %s", type(error).__name__, error)
             status, body, content_type, extra = 500, b"500 internal error\n", TEXT, ()
@@ -274,9 +275,9 @@ class DashboardServer(ThreadingHTTPServer):
 
     def __init__(self, state, port=DEFAULT_PORT, *, max_connections=MAX_CONNECTIONS,
                  socket_timeout=SOCKET_TIMEOUT, log=None, max_streams=MAX_STREAMS,
-                 stream_heartbeat=STREAM_HEARTBEAT, stream_wait=STREAM_WAIT):
+                 stream_heartbeat=STREAM_HEARTBEAT, stream_wait=STREAM_WAIT, checkout=None):
         # The `.harness` descriptor is fixed here, before the socket exists.
-        self.observer = observe.Observer(state, required=True)
+        self.observer = observe.Observer(state, required=True, checkout=checkout)
         self.max_connections = max_connections
         self.socket_timeout = socket_timeout
         self.log = log if log is not None else sys.stderr
@@ -388,13 +389,14 @@ def add_arguments(parser):
                         help=f"只绑定 127.0.0.1 的端口；默认 {DEFAULT_PORT}，0 由系统分配")
 
 
-def serve(state, port=DEFAULT_PORT, *, stdout=None, stderr=None):
-    """Print the URL on stdout, serve until SIGINT/SIGTERM, return 0."""
+def serve(state, port=DEFAULT_PORT, *, stdout=None, stderr=None, checkout=None):
+    """Name the bound directory on stderr, print the URL on stdout, serve until SIGINT/SIGTERM, return 0."""
     stdout = sys.stdout if stdout is None else stdout
     stderr = sys.stderr if stderr is None else stderr
-    server = create_server(state, port, log=stderr)
+    server = create_server(state, port, log=stderr, checkout=checkout)
     previous = {}
     try:
+        print("harness dashboard: " + observe.location_text(server.observer.observed), file=stderr, flush=True)
         print(server.url, file=stdout, flush=True)
         if threading.current_thread() is threading.main_thread():
             def interrupted(signum, frame):

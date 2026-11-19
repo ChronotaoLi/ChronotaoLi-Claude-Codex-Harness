@@ -10,7 +10,7 @@ from pathlib import Path
 
 from . import git, stops
 from .worker_receipts import read_worker_source
-from .git_query import covers as git_query_covers
+from .commands import available_through
 from .recovery import RECOVERY_BUSY_KEYS, read_bound_result, snapshot_digest
 from .util import EvidenceError, HarnessError, dump, write_json
 
@@ -161,9 +161,7 @@ def continuation_gate(context, current_snapshot=None):
         raise HarnessError('pending continuation superseded by a model invocation', stop=stops.make("runtime_failure", "invariant"))
     config, request = _config(context), row['request']
     if request['kind'] == 'commands':
-        allowed = config['verification']['commands'] + config['permissions']['worker_commands']
-        # Built-in harness.git_query forms need no grant; everything else stays exact.
-        missing = [argv for argv in request['commands'] if argv not in allowed and not git_query_covers(argv)]
+        missing = [c for c in request['commands'] if available_through(c, config) is None]
         if missing:
             return {'kind': 'commands', 'task_id': row['task_id'], 'missing_commands': deepcopy(missing)}
     elif request['kind'] == 'budget':

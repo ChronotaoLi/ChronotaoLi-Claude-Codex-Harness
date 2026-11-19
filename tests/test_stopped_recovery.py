@@ -189,7 +189,7 @@ class StoppedRecoveryTests(RepoCase):
                   f"p=Path({str(marker)!r}); n=int(p.read_text())+1 if p.exists() else 1; "
                   "p.write_text(str(n)); "
                   "Path('report.tmp').write_text('generated') if n > 1 else None")
-        self.config.data["verification"]["commands"] = [[sys.executable, "-c", script]]
+        self.config.data["verification"]["commands"] = [{"cwd": ".", "argv": [sys.executable, "-c", script]}]
         backend = ScriptedBackend()
         engine = self.engine(backend)
         with self.assertRaisesRegex(HarnessError, "info/exclude"):

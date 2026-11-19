@@ -4,9 +4,11 @@ Every entry that reads a run ledger checks it here before any other field is
 read: a value that is not an object, or an object of another version, is refused
 with the same sentence.
 """
-from .util import HarnessError, read_json
+import json
 
-RUN_SCHEMA_VERSION = 18
+from .util import HarnessError
+
+RUN_SCHEMA_VERSION = 19
 
 
 def unsupported_ledger(run):
@@ -30,13 +32,23 @@ def require_current_ledger(run):
         raise HarnessError(message, stop=stops.make("unsupported_ledger", "ledger_version", data=data))
 
 
-def read_current_ledger(path):
-    """Read a run ledger file; refuse any other version before a field is interpreted."""
+def missing_ledger(path):
+    """The refusal for a run whose ledger file is not there."""
     from . import stops
-    try:
-        run = read_json(path)
-    except FileNotFoundError as error:
-        raise HarnessError(f"run 不存在：{path}",
-                           stop=stops.make("invalid_input", "cli_arguments", data={"option": "run_id"})) from error
+    return HarnessError(f"run 不存在：{path}", stop=stops.make("invalid_input", "cli_arguments", data={"option": "run_id"}))
+
+
+def parse_current_ledger(raw):
+    """A run ledger from its bytes; refuse any other version before a field is interpreted."""
+    run = json.loads(raw.decode("utf-8"))
     require_current_ledger(run)
     return run
+
+
+def read_current_ledger(path):
+    """Read a run ledger file; refuse any other version before a field is interpreted."""
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError as error:
+        raise missing_ledger(path) from error
+    return parse_current_ledger(raw)

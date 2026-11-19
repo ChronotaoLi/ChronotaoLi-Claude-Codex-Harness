@@ -6,13 +6,21 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock
 
-from harness.review_progress import required_findings, claim_gaps, disposition_gaps
+from harness.review_progress import repair_findings, required_findings, claim_gaps, disposition_gaps
 from harness.run_store import RunStore
 from harness.task_lifecycle import TaskLifecycle
-from harness.util import HarnessError, read_json
+from harness.util import EvidenceError, HarnessError, read_json
 from test_engine_repairs import RecordingBackend
 from test_harness import RepoCase, ROOT
 from test_runtime_changes import finding, revised, trigger_kind
+
+
+def labels(rows):
+    return [row['label'] for row in rows]
+
+
+def reported(*names):
+    return dict(verdict='request_changes', findings=[{**finding(), 'id': name} for name in names])
 
 
 class FindingIdentityTests(unittest.TestCase):
@@ -91,6 +99,105 @@ class FindingIdentityTests(unittest.TestCase):
                 second['required_findings'] = copy_rows[:1]
                 with self.assertRaisesRegex(HarnessError, '对照不符'):
                     required_findings(run, 't', 'X2')
+
+    def disposed(self, record, run, ident, snapshot, statuses, **extra):
+        """Record a review of snapshot that disposes the rows its dispatch received."""
+        rows = required_findings(run, 't', snapshot)
+        return record(ident, dict(verdict='request_changes', findings=[],
+                                  finding_dispositions=self.dispositions(**statuses)),
+                      snapshot, required_findings=rows, **extra)
+
+    def test_repair_list_follows_usable_resolutions_and_any_reopening(self):
+        with TemporaryDirectory() as tmp:
+            run, record = self.history(tmp)
+            record('R1', reported('A', 'B'), 'X1')
+            self.assertEqual(labels(repair_findings(run, 't')), ['A', 'B'])
+            for ident, snapshot, statuses, repair in (
+                    # not_checked neither takes B off the list nor, next, puts A back on it.
+                    ('R2', 'X2', dict(f1='resolved', f2='not_checked'), ['B']),
+                    ('R3', 'X3', dict(f1='not_checked', f2='resolved'), []),
+                    ('R4', 'X4', dict(f1='open', f2='not_checked'), ['A'])):
+                self.disposed(record, run, ident, snapshot, statuses)
+                self.assertEqual(labels(repair_findings(run, 't')), repair)
+            self.assertEqual([(r['key'], r['finding_index']) for r in repair_findings(run, 't')], [('f1', 0)])
+            # Leaving the repair list never closes a finding beyond the candidate that was reviewed.
+            self.assertEqual(labels(required_findings(run, 't', 'X2')), ['B'])
+            self.assertEqual(labels(required_findings(run, 't', 'X3')), ['A'])
+            self.assertEqual(labels(required_findings(run, 't', 'X5')), ['A', 'B'])
+
+    def test_unusable_reviews_keep_their_open_vetoes_but_never_resolve(self):
+        for status in ('invalid_rejected', 'invalidated'):
+            extra = dict(status=status, **({'validation_error': 'invalid evidence'}
+                                           if status == 'invalid_rejected' else {}))
+            with self.subTest(status=status), TemporaryDirectory() as tmp:
+                run, record = self.history(tmp)
+                record('R1', reported('A', 'B'), 'X1')
+                self.disposed(record, run, 'R2', 'X2', dict(f1='resolved', f2='resolved'))
+                self.assertEqual(repair_findings(run, 't'), [])
+                self.disposed(record, run, 'R3', 'X3', dict(f1='open', f2='resolved'), **extra)
+                self.assertEqual(labels(repair_findings(run, 't')), ['A'])
+                self.disposed(record, run, 'R4', 'X4', dict(f1='resolved', f2='not_checked'), **extra)
+                self.assertEqual(labels(repair_findings(run, 't')), ['A'])
+                # Neither unusable review closed anything on the candidate it reviewed.
+                self.assertEqual(labels(required_findings(run, 't', 'X3')), ['A', 'B'])
+                self.assertEqual(labels(required_findings(run, 't', 'X4')), ['A', 'B'])
+                self.assertEqual(required_findings(run, 't', 'X2'), [])
+
+    def test_every_saved_copy_is_checked_whatever_its_candidate_or_usability(self):
+        tampers = (('order', lambda rows: list(reversed(rows))), ('count', lambda rows: rows[:1]),
+                   ('label', lambda rows: [{**rows[0], 'label': 'invented'}, *rows[1:]]))
+        with TemporaryDirectory() as tmp:
+            run, record = self.history(tmp)
+            record('R1', reported('A', 'B'), 'X1')
+            saved = [self.disposed(record, run, ident, snapshot, dict(f1='open', f2='open'), **extra)
+                     for ident, snapshot, extra in (
+                         ('R2', 'X2', {}),
+                         ('R3', 'X3', dict(status='invalid_rejected', validation_error='invalid evidence')),
+                         ('R4', 'X4', dict(status='invalidated')))]
+            self.assertEqual(labels(required_findings(run, 't', 'X5')), ['A', 'B'])
+            for entry in saved:
+                original = entry['required_findings']
+                for name, tamper in tampers:
+                    with self.subTest(record=entry['review_source']['dispatch_id'], tamper=name):
+                        entry['required_findings'] = tamper(original)
+                        # Neither list may be derived from a history with a copy that differs.
+                        with self.assertRaisesRegex(HarnessError, '对照不符'):
+                            required_findings(run, 't', 'X5')
+                        with self.assertRaisesRegex(HarnessError, '对照不符'):
+                            repair_findings(run, 't')
+                entry['required_findings'] = original
+            self.assertEqual(labels(repair_findings(run, 't')), ['A', 'B'])
+
+    def test_an_empty_or_non_mapping_disposition_field_is_still_checked_against_its_copy(self):
+        # An authenticated original registered as invalidated whose dispatch received
+        # A as f1: disposing of nothing, or of a list, cannot pass for its saved copy.
+        for name, dispositions, keep_copy in (('empty mapping', {}, False), ('empty list', [], False),
+                                              ('list of the keys', ['f1'], True)):
+            with self.subTest(name), TemporaryDirectory() as tmp:
+                run, record = self.history(tmp)
+                record('R1', reported('A'), 'X1')
+                rows = required_findings(run, 't', 'X2')
+                self.assertEqual(labels(rows), ['A'])
+                record('R2', dict(verdict='request_changes', findings=[], finding_dispositions=dispositions),
+                       'X2', required_findings=rows if keep_copy else [], status='invalidated')
+                for calculate in (lambda: required_findings(run, 't', 'X3'), lambda: repair_findings(run, 't')):
+                    with self.assertRaisesRegex(EvidenceError, '对照不符') as caught:
+                        calculate()
+                    self.assertEqual((caught.exception.stop['kind'], caught.exception.stop['reason']),
+                                     ('evidence', 'runtime_integrity'))
+
+    def test_resolution_on_one_candidate_survives_an_unusable_reopening_on_another(self):
+        with TemporaryDirectory() as tmp:
+            run, record = self.history(tmp)
+            record('R1', reported('X', 'Y'), 'S0')
+            self.disposed(record, run, 'R2', 'A', dict(f1='resolved', f2='open'))
+            self.disposed(record, run, 'R3', 'B', dict(f1='open', f2='resolved'),
+                          status='invalid_rejected', validation_error='invalid evidence')
+            # Back on A's bytes: A's usable resolution of X still holds there, while
+            # B's kept veto puts X back on the repair list and B resolves nothing.
+            self.assertEqual(labels(required_findings(run, 't', 'A')), ['Y'])
+            self.assertEqual(labels(required_findings(run, 't', 'B')), ['X', 'Y'])
+            self.assertEqual(labels(repair_findings(run, 't')), ['X', 'Y'])
 
     def test_stale_post_accept_cannot_write_either_memory_stage(self):
         for task_memory_saved in (False, True):
@@ -204,3 +311,21 @@ class FinalFindingLifecycleTests(RepoCase):
         Path(original['review_source']['artifact']).write_bytes(raw + b' ')
         with self.assertRaises(HarnessError):
             engine.services.finalization.final_review()
+
+    def test_packets_authenticate_an_emptied_review_instead_of_skipping_it(self):
+        engine = self.engine(self.backend())
+        result = engine.start('Implement greet', read_json(ROOT / 'examples/plan.json'))
+        self.assertEqual(result['status'], 'completed')
+        engine.services.packets.final_context_capacity()
+        run = engine.context.run
+        for name, record in (('task', run['review_history']['greet'][-1]), ('final', run['final_history'][-1])):
+            with self.subTest(name):
+                saved = record['review']
+                record['review'] = {}
+                # The run-wide view validates every history it projects from; an emptied
+                # copy no longer hides its original's findings or resolutions.
+                with self.assertRaises(EvidenceError) as caught:
+                    engine.services.packets.final_context_capacity()
+                self.assertEqual(caught.exception.stop['reason'], 'runtime_integrity')
+                record['review'] = saved
+        engine.services.packets.final_context_capacity()

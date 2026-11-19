@@ -14,7 +14,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from .versions import require_current_ledger
 from . import git, stops
-from .cleanup import _canonical, _regular_bytes
+from .cleanup import _canonical, _regular_bytes, refuse_other_version
 from .path_evidence import validate_dispatch_indexes
 from .input_projection import validate_dispatch_indexes as validate_input_dispatch_indexes
 from .worker_receipts import validate_worker_receipt_links
@@ -204,6 +204,7 @@ def prepare_run(repo, ident, manifest):
     directory = repo / '.harness' / 'runs' / ident
     _canonical(directory)
     _canonical(directory / 'run.lock')
+    refuse_other_version(directory / 'state.json')
     from .private_state import ensure_private_state
     ensure_private_state(repo)
     with lock(directory / 'run.lock', stop=stops.make('busy', 'run_lock')):

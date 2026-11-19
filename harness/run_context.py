@@ -1,5 +1,6 @@
 """Resources and persistence barriers shared by named runtime services."""
 from __future__ import annotations
+import contextlib
 import sys
 from copy import deepcopy
 from pathlib import Path
@@ -7,6 +8,7 @@ from . import git
 from .adapters import CLIBackend
 from .budgets import work_attempts
 from .memory import Memory
+from .process_runtime import defer_cleanup_signals
 from .run_store import RunStore
 from .util import HarnessError, append_event, confirm_dispatches_exited, ensure_dispatches_exited, group_alive, validate_command_directories, write_json
 
@@ -62,6 +64,19 @@ class RunContext:
         self.store.commit()
         if self.on_save is not None:
             self.on_save(self.run)
+
+    @contextlib.contextmanager
+    def transition(self):
+        """Change the ledger in one step, then save it.
+
+        A stop saves the in-memory ledger as it stands, so the body only assigns
+        values computed before it; a signal arriving inside is raised after the
+        body's last assignment. Stop handling sees the whole old ledger or the
+        whole new one, never a half step.
+        """
+        with defer_cleanup_signals(inherit=False):
+            yield
+        self.save()
 
     def event(self, event, **fields):
         append_event(self.directory / "events.jsonl", self.run["id"], event, **fields)

@@ -64,10 +64,13 @@ def prepare_fixture(directory):
                                     "old_string": original, "new_string": changed}, True),
         case("inside_write", "Write", {"file_path": str(worktree / "write-control.txt"),
                                       "content": "write allowed\n"}, True),
-        case("exact_command", "Bash", {"command": command}, True,
-             contains="permission command control succeeded"),
+        # A configured command is a broker grant, never a Bash permission.
+        case("configured_command_via_bash", "Bash", {"command": command}, False),
         case("extended_command", "Bash", {"command": command + " --ungranted"}, False),
         case("unlisted_command", "Bash", {"command": shlex.join(["touch", str(directory / "bash-outside.txt")])}, False),
+        # Configured too, but the read-only prefix allows it on its own.
+        case("readonly_prefix_overlap", "Bash", {"command": shlex.join(["ls", "--", "."])}, True,
+             contains="permission_control.py"),
         case("outside_edit", "Edit", {"file_path": str(outside), "old_string": outside_text,
                                      "new_string": "outside edit unexpectedly allowed\n"}, False),
         case("outside_write", "Write", {"file_path": str(directory / "write-outside.txt"),
@@ -78,7 +81,7 @@ def prepare_fixture(directory):
     expected_files = {
         str(worktree / "control.txt"): changed,
         str(worktree / "write-control.txt"): "write allowed\n",
-        str(worktree / "command-control.txt"): "command allowed\n",
+        str(worktree / "command-control.txt"): None,
         str(outside): outside_text,
         str(git_file): git_text,
         str(directory / "bash-outside.txt"): None,
@@ -173,10 +176,12 @@ def permission_smoke(config, repo, *, timeout=180, max_turns=16, max_budget_usd=
     job = directory / str(uuid.uuid4())
     job.mkdir()
     probe_config = copy.deepcopy(config)
-    # Exercise the adapter with a disposable exact command grant. Project
-    # commands and external MCP services must not execute as side effects.
+    # Exercise the adapter with disposable command grants that must not become
+    # Bash grants, one inside a read-only prefix. Project commands and external
+    # MCP services must not execute as side effects.
     probe_config.data["verification"]["commands"] = []
-    probe_config.data["permissions"]["worker_commands"] = [[sys.executable, "permission_control.py"]]
+    probe_config.data["permissions"]["worker_commands"] = [{"cwd": ".", "argv": [sys.executable, "permission_control.py"]},
+                                                           {"cwd": "sub", "argv": ["ls", "--", "."]}]
     probe_config.data["runtime"]["claude_max_turns"] = max_turns
     probe_config.data["runtime"]["claude_max_turns_by_role"] = {"worker": max_turns}
     write_json(directory / "external-mcp.json", {"servers": {}})
@@ -200,7 +205,8 @@ def permission_smoke(config, repo, *, timeout=180, max_turns=16, max_budget_usd=
     (job / "prompt.txt").write_text(prompt, encoding="utf-8")
     report = {"models_called": True, "simulation": False, "model": model["model"],
               "dispatch_id": job.name, "evidence": str(directory),
-              "permission_profile": "adapter defaults with disposable exact Bash grant; external MCP disabled",
+              "permission_profile": "adapter defaults with configured commands that must not become Bash grants, "
+                                    "one of them inside a read-only prefix; external MCP disabled",
               "outside_read_policy": "allowed by the adapter's Read grant",
               "limitations": "one CLI version and fixture; not OS isolation or an exhaustive Bash allowlist"}
     print(f"[harness] LIVE PERMISSION SMOKE model={model['model']} max_budget_usd={max_budget_usd} "

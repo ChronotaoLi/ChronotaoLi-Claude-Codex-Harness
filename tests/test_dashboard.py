@@ -53,7 +53,7 @@ class Node {
   focus() { globalThis.document.activeElement = this; }
 }
 const byId = {};
-["main", "sampled", "refresh", "auto"].forEach(function (id) { byId[id] = new Node("div"); byId[id].id = id; });
+["main", "sampled", "refresh", "auto", "binding"].forEach(function (id) { byId[id] = new Node("div"); byId[id].id = id; });
 const windowListeners = {};
 globalThis.Node = Node;
 globalThis.document = {
@@ -78,7 +78,8 @@ function anchors(node, out) {
   return out;
 }
 function snapshot(hash) {
-  return { hash: hash, requested: requested.slice(), text: byId.main.textContent, anchors: anchors(byId.main, []) };
+  return { hash: hash, requested: requested.slice(), text: byId.main.textContent, anchors: anchors(byId.main, []),
+           title: document.title, binding_state: byId.binding.getAttribute("data-state") };
 }
 (async function () {
   const phases = [];
@@ -130,8 +131,8 @@ def tree_snapshot(root):
 
 
 class DashboardCase(RepoCase):
-    def start_server(self, **options):
-        server = dashboard.create_server(self.repo / ".harness", 0, log=io.StringIO(), **options)
+    def start_server(self, state=None, **options):
+        server = dashboard.create_server(self.repo / ".harness" if state is None else state, 0, log=io.StringIO(), **options)
         thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
         thread.start()
         self.addCleanup(server.server_close)
@@ -245,6 +246,31 @@ class RouteTests(DashboardCase):
             self.assertIsNone(detail["summary"])
             self.assertTrue(detail["summary_error"].startswith(prefix), detail["summary_error"])
             self.assertEqual(detail["run"]["goal"], "g")
+
+    def test_two_checkouts_serve_their_own_location(self):
+        base = self.repo.resolve()
+        servers = {}
+        for name in ("a", "b"):
+            checkout = base / name
+            write_json(checkout / ".harness" / "runs" / f"run_{name}" / "state.json",
+                       {"schema_version": RUN_SCHEMA_VERSION, "id": f"run_{name}", "status": "running", "goal": name,
+                        "branch": name})
+            servers[name] = self.start_server(checkout / ".harness", checkout=checkout)
+        self.assertNotEqual(servers["a"].server_port, servers["b"].server_port)
+        for name, server in servers.items():
+            status, _, body = self.request(server, "/api/runs")
+            listing = json.loads(body)
+            self.assertEqual((status, [item["id"] for item in listing["runs"]]), (200, [f"run_{name}"]))
+            self.assertEqual({key: listing["observed"][key] for key in ("state", "checkout", "checkout_basis")},
+                             {"state": str(base / name / ".harness"), "checkout": str(base / name), "checkout_basis": "git"})
+        # The old port's run asked of the other checkout's service: 404, and the body names where it looked.
+        status, _, body = self.request(servers["b"], "/api/runs/run_a")
+        refusal = json.loads(body)
+        self.assertEqual((status, refusal["status"]), (404, 404))
+        self.assertEqual((refusal["observed"]["state"], refusal["observed"]["checkout"]),
+                         (str(base / "b" / ".harness"), str(base / "b")))
+        with self.assertRaises(OSError):  # a port in use is an error, never a redirect
+            dashboard.create_server(base / "b" / ".harness", servers["a"].server_port, log=io.StringIO(), checkout=base / "b")
 
 
 class FileRouteTests(DashboardCase):
@@ -476,6 +502,52 @@ class ServeEntryTests(RepoCase):
         self.assertEqual(process.returncode, 0, stderr)
         self.assertEqual(stdout, "")
         self.assertNotIn("Traceback", stderr)
+        # Before the URL, stderr names the directory the service is bound to (no checkout given: inferred).
+        state = (self.repo / ".harness").resolve()
+        self.assertEqual(stderr.splitlines()[0], f"harness dashboard: 检出（按状态目录路径推定，未核实）{state.parent}；状态目录 {state}")
+
+    def test_location_line_escapes_line_breaks_while_json_keeps_the_path(self):
+        state = self.repo.resolve() / "odd\nharness: forged\u2028\x1b[0m\\"
+        write_json(state / "runs" / "run_odd" / "state.json",
+                   {"schema_version": RUN_SCHEMA_VERSION, "id": "run_odd", "status": "running", "goal": "g", "branch": "b"})
+        code = ("import sys\nfrom harness.dashboard import serve\n"
+                "sys.exit(serve(sys.argv[1], 0))\n")
+        process = subprocess.Popen([sys.executable, "-c", code, str(state)], cwd=ROOT,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            url = process.stdout.readline().strip()
+            port = int(url.rsplit(":", 1)[1].rstrip("/"))
+            connection = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+            connection.request("GET", "/api/runs")
+            observed = json.loads(connection.getresponse().read())["observed"]
+            connection.close()
+            process.send_signal(signal.SIGTERM)
+            stdout, stderr = process.communicate(timeout=15)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.communicate()
+        self.assertEqual((process.returncode, stdout), (0, ""), stderr)
+        self.assertEqual(observed["state"], str(state))  # the JSON keeps the path as it is
+        shown = f"{self.repo.resolve()}/odd\\nharness: forged\\u2028\\x1b[0m\\\\"
+        self.assertEqual(stderr.splitlines()[:1], [f"harness dashboard: 检出 未知；状态目录 {shown}"])
+        self.assertNotIn("\nharness: forged", stderr)
+
+    def test_unopenable_state_refuses_without_location_or_traceback(self):
+        base = self.repo.resolve()
+        (base / "loop-a").symlink_to(base / "loop-b")
+        (base / "loop-b").symlink_to(base / "loop-a")
+        for given in (str(base / "absent" / ".harness"), str(base / "loop-a"), str(base / "bad") + "\x00x"):
+            output, errors = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+                code = dashboard.main(["--state", given, "--port", "0"])
+            with self.subTest(given=given):
+                self.assertEqual((code, output.getvalue()), (1, ""))
+                lines = errors.getvalue().splitlines()
+                self.assertEqual(len(lines), 1, lines)  # the refusal alone: no location line before it
+                self.assertTrue(lines[0].startswith("harness: "), lines)
+                self.assertNotIn("Traceback", errors.getvalue())
+        self.assertFalse((base / "absent").exists())
 
     def test_add_arguments_and_port_validation(self):
         import argparse
@@ -494,6 +566,11 @@ class CLIWiringTests(RepoCase):
         with contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
             code = cli.main(["--repo", str(self.repo), *args])
         return code, output.getvalue(), errors.getvalue()
+
+    def location_line(self, prefix, opened=True):
+        """The stderr line naming this repository's Git root as the known checkout and its `.harness`."""
+        repo = self.repo.resolve()
+        return f"{prefix}检出 {repo}；状态目录 {repo / '.harness'}" + ("" if opened else "（无法打开）")
 
     def test_dashboard_subcommand_prints_only_url_and_exits_zero_on_sigterm(self):
         run_id = self.engine().start("Implement greet")["id"]
@@ -519,6 +596,7 @@ class CLIWiringTests(RepoCase):
         self.assertEqual(stdout, "")  # Nothing after the URL line already consumed above.
         self.assertNotIn("Traceback", stderr)
         self.assertNotIn("已中断", stderr)
+        self.assertEqual(stderr.splitlines()[0], self.location_line("harness dashboard: "))
         code, output, errors = self.invoke(["dashboard", "--port", "70000"])
         self.assertEqual((code, output), (1, ""))
         self.assertIn("端口", errors)
@@ -535,6 +613,7 @@ class CLIWiringTests(RepoCase):
         (runs / "run_missing").mkdir()
         code, output, errors = self.invoke(["status"])
         self.assertEqual(code, 0, errors)
+        self.assertEqual(errors.splitlines()[0], self.location_line("harness: "))  # before the diagnostics
         values = json.loads(output)
         self.assertEqual(values, [{key: ledger[key] for key in ("id", "status", "goal", "branch")},
                                   {"id": "run_partial", "status": "unknown", "goal": "partial", "branch": None}])
@@ -549,6 +628,7 @@ class CLIWiringTests(RepoCase):
         self.assertNotIn("run_partial", output.replace("run_partial", "", 1))  # listed once
         code, output, errors = self.invoke(["status", ledger["id"]])
         self.assertEqual(code, 0, errors)
+        self.assertEqual(errors.splitlines(), [self.location_line("harness: ")])
         shown = json.loads(output)
         # status RUN adds the latest quota observation from saved samples; this run has none.
         quota = shown.pop("quota")
@@ -557,9 +637,11 @@ class CLIWiringTests(RepoCase):
         self.assertEqual((quota["damaged_count"], quota["omitted"]), (0, 0))
         code, output, errors = self.invoke(["status", ledger["id"], "--full"])
         self.assertEqual(code, 0, errors)
+        self.assertEqual(errors.splitlines(), [self.location_line("harness: ")])
         self.assertEqual(json.loads(output), ledger)
         code, output, errors = self.invoke(["status", "run_broken"])
         self.assertEqual((code, output), (1, ""))
+        self.assertEqual(errors.splitlines()[0], self.location_line("harness: "))  # the stop lines follow it
         self.assertNotIn("Traceback", errors)
 
     def test_dashboard_entry_spawns_nothing_after_service_starts(self):
@@ -610,12 +692,20 @@ class CLIWiringTests(RepoCase):
     def test_dashboard_refuses_missing_state_directory_while_status_lists_empty(self):
         self.assertFalse((self.repo / ".harness").exists())
         code, output, errors = self.invoke(["status"])
-        self.assertEqual((code, output.strip(), errors), (0, "[]", ""))
+        self.assertEqual((code, output.strip(), errors.splitlines()), (0, "[]", [self.location_line("harness: ", False)]))
         code, output, errors = self.invoke(["dashboard", "--port", "0"])
         self.assertEqual((code, output), (1, ""))
         self.assertIn("观察目录不可用", errors)
         self.assertNotIn("Traceback", errors)
         self.assertFalse((self.repo / ".harness").exists())
+        # A `.harness` linked to itself cannot be resolved (3.11) or opened (3.13 on): the same as a missing one.
+        os.symlink(".harness", self.repo / ".harness")
+        code, output, errors = self.invoke(["status"])
+        self.assertEqual((code, output.strip(), errors.splitlines()), (0, "[]", [self.location_line("harness: ", False)]))
+        code, output, errors = self.invoke(["dashboard", "--port", "0"])
+        self.assertEqual((code, output), (1, ""))
+        self.assertNotIn("Traceback", errors)
+        self.assertTrue((self.repo / ".harness").is_symlink())
 
 
 class PageScriptTests(RepoCase):
@@ -680,6 +770,14 @@ class PageScriptTests(RepoCase):
         absent = phases["#/runs/run_absent"]
         self.assertEqual(absent["requested"], ["/api/runs/run_absent"])
         self.assertIn("读取失败：HTTP 404", absent["text"])
+
+        # Each view names the state directory of the projection it shows; the fake 404 names none, so the
+        # header keeps what the previous view showed.
+        observed = listing["observed"]
+        self.assertEqual(observed["state"], str(state.resolve()))
+        for phase in report["phases"]:
+            self.assertTrue(str(phase.get("title")).startswith(observed["name"] + " "), (phase["hash"], phase.get("title")))
+            self.assertEqual(phase.get("binding_state"), observed["state"], phase["hash"])
 
 
 if __name__ == "__main__":

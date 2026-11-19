@@ -12,17 +12,21 @@ from pathlib import Path
 
 from . import stops
 from .command_server import create_manifest
-from .provider_failures import claude_http_status
+from .provider_failures import LIMIT, claude_http_status, display_label, read_original
 from .shared import mcp_configs, toml_value
-from .util import EvidenceError, HarnessError, dump, read_json, run_process, strict_json_loads, tail, write_json
+from .util import EvidenceError, HarnessError, dump, read_json, run_process, strict_json_loads, tail_text, write_json
 from .worker_returns import decode_terminal
 
 
 class UndecodableOutput(HarnessError):
-    """A complete provider terminal whose result is not a strictly decodable JSON object."""
+    """A complete provider terminal whose result is not a strictly decodable JSON object.
 
-    def __init__(self, artifact, message):
+    ``artifact_digest`` binds the bytes judged: recording the invalid output never reads the original again.
+    """
+
+    def __init__(self, artifact, raw, message):
         self.artifact = Path(artifact)
+        self.artifact_digest = hashlib.sha256(raw).hexdigest()
         super().__init__(message)
 
 
@@ -34,46 +38,63 @@ _CODEX_ERROR_TAIL_BYTES = 64 * 1024
 OPERATOR_SKILL = "harness-operator"
 
 
+def _original_bytes(path, message, *, local_io=True):
+    """One of a call's originals (``read_original``); any miss is HarnessError(message).
+
+    With ``local_io``, a returned result (exit 0): read whole, as it always was (the CLI's envelope
+    has no size bound: Claude's ``permission_denials`` accumulate), and local I/O leaves as itself.
+    Without it, a failed call's terminal: at most ``LIMIT`` bytes, over is a miss as the classifier
+    and the worker judgment treat the same file, and no read can replace the failure being reported.
+    """
+    state, raw = read_original(path, lambda stream: stream.read(-1 if local_io else LIMIT + 1))
+    if state == "read" and (local_io or len(raw) <= LIMIT):
+        return raw
+    error = raw if state != "read" else None
+    if local_io:
+        stops.keep_local_io(error)
+    raise HarnessError(message) from error
+
+
 def codex_error_summary(path):
     """Read only error envelopes from a bounded JSONL tail, not agent/tool text."""
-    try:
-        with path.open("rb") as stream:
-            size = stream.seek(0, os.SEEK_END)
-            start = max(0, size - _CODEX_ERROR_TAIL_BYTES)
-            stream.seek(start)
-            raw = stream.read(_CODEX_ERROR_TAIL_BYTES)
-        # A tail can start inside a UTF-8 character or a large JSON record.
-        # Never parse the partial first record, even if its suffix looks valid.
-        if start:
-            raw = raw.partition(b"\n")[2]
-        details = []
-        for line in reversed(raw.split(b"\n")):
-            try:
-                event = json.loads(line)
-            except (ValueError, UnicodeError, RecursionError):
-                continue
-            if not isinstance(event, dict):
-                continue
-            if event.get("type") == "error":
-                message = event.get("message")
-            elif event.get("type") == "turn.failed" and isinstance(event.get("error"), dict):
-                message = event["error"].get("message")
-            else:
-                continue
-            if not isinstance(message, str) or not message.strip():
-                continue
-            # ASCII JSON escaping makes terminal controls, newlines and bidi
-            # characters inert. Truncate before escaping to bound expansion.
-            excerpt = json.dumps(message[:240], ensure_ascii=True)
-            if len(message) > 240:
-                excerpt += " [truncated]"
-            if excerpt not in details:
-                details.append(excerpt)
-            if len(details) == 3:
-                break
-        return "Codex reported an error: " + "; ".join(reversed(details)) if details else ""
-    except OSError:
+    def read(stream):
+        start = max(0, stream.seek(0, os.SEEK_END) - _CODEX_ERROR_TAIL_BYTES)
+        stream.seek(start)
+        return start, stream.read(_CODEX_ERROR_TAIL_BYTES)
+    state, value = read_original(path, read)
+    if state != "read":
         return ""
+    start, raw = value
+    # A tail can start inside a UTF-8 character or a large JSON record.
+    # Never parse the partial first record, even if its suffix looks valid.
+    if start:
+        raw = raw.partition(b"\n")[2]
+    details = []
+    for line in reversed(raw.split(b"\n")):
+        try:
+            event = json.loads(line)
+        except (ValueError, UnicodeError, RecursionError):
+            continue
+        if not isinstance(event, dict):
+            continue
+        if event.get("type") == "error":
+            message = event.get("message")
+        elif event.get("type") == "turn.failed" and isinstance(event.get("error"), dict):
+            message = event["error"].get("message")
+        else:
+            continue
+        if not isinstance(message, str) or not message.strip():
+            continue
+        # ASCII JSON escaping makes terminal controls, newlines and bidi
+        # characters inert. Truncate before escaping to bound expansion.
+        excerpt = json.dumps(message[:240], ensure_ascii=True)
+        if len(message) > 240:
+            excerpt += " [truncated]"
+        if excerpt not in details:
+            details.append(excerpt)
+        if len(details) == 3:
+            break
+    return "Codex reported an error: " + "; ".join(reversed(details)) if details else ""
 
 
 def _usage_counts(value, fields):
@@ -91,9 +112,8 @@ def provider_usage(job, provider):
     never summed. None of these observations affect execution budgets.
     """
     try:
-        with (job / "process.stdout").open("rb") as stream:
-            raw = stream.read(_USAGE_MAX_BYTES + 1)
-        if len(raw) > _USAGE_MAX_BYTES:
+        state, raw = read_original(job / "process.stdout", lambda stream: stream.read(_USAGE_MAX_BYTES + 1))
+        if state != "read" or len(raw) > _USAGE_MAX_BYTES:
             return None
         if provider == "claude":
             result = json.loads(raw)
@@ -128,7 +148,7 @@ def provider_usage(job, provider):
         if tokens:
             metrics["tokens"] = tokens
         return {"provider": provider, **metrics} if metrics else None
-    except (OSError, ValueError, UnicodeError, RecursionError):
+    except (ValueError, UnicodeError, RecursionError):
         return None
 
 
@@ -141,25 +161,15 @@ def claude_error_summary(value):
     if "is_error" in value:
         flag = value["is_error"]
         details.append("is_error=" + (str(flag).lower() if type(flag) is bool else "invalid"))
-    subtype = value.get("subtype")
-    if "subtype" in value:
-        known = ("success", "error_max_turns", "error_during_execution", "error_max_budget_usd",
-                 "error_max_structured_output_retries")
-        label = subtype if isinstance(subtype, str) and subtype in known else "unrecognized"
-        details.append("subtype=" + json.dumps(label))
-    # These fields are CLI envelope diagnostics, not instructions or evidence
-    # from the model's result. Unknown values stay private in process.stdout.
-    for field, known in (("terminal_reason", ("api_error",)),
-                         ("api_error", ("usage_limit_reached", "rate_limit_error", "overloaded_error",
-                                        "authentication_error", "permission_error", "invalid_request_error",
-                                        "not_found_error", "request_too_large", "api_error"))):
+    # These fields are CLI envelope diagnostics, not instructions or evidence from the
+    # model's result, shown by where they come from (display_label); a value that cannot
+    # show is the bare word unrecognized and stays private in process.stdout.
+    for field in ("subtype", "terminal_reason", "api_error", "api_error_type"):
         if field in value:
-            item = value[field]
-            label = item if isinstance(item, str) and item in known else "unrecognized"
-            details.append(field + "=" + json.dumps(label))
+            label = display_label(field, value[field])
+            details.append(field + "=" + (json.dumps(label) if label is not None else "unrecognized"))
     status = claude_http_status(value)
-    details.append("api_error_status=" + (str(status["value"]) if status["state"] == "valid"
-                   else "not_provided" if status["state"] in ("missing", "null") else "invalid"))
+    details.append("api_error_status=" + (str(status["value"]) if status["state"] == "valid" else status["state"]))
     errors = value.get("errors")
     if isinstance(errors, list):
         details.extend(json.dumps(message[:240], ensure_ascii=True)
@@ -173,10 +183,9 @@ def cli_error_summary(job, provider):
     if provider != "claude":
         return ""
     try:
-        with (job / "process.stdout").open("rb") as stream:
-            raw = stream.read(_USAGE_MAX_BYTES + 1)
-        return claude_error_summary(json.loads(raw)) if len(raw) <= _USAGE_MAX_BYTES else ""
-    except (OSError, ValueError, UnicodeError, RecursionError):
+        state, raw = read_original(job / "process.stdout", lambda stream: stream.read(_USAGE_MAX_BYTES + 1))
+        return claude_error_summary(json.loads(raw)) if state == "read" and len(raw) <= _USAGE_MAX_BYTES else ""
+    except (ValueError, UnicodeError, RecursionError):
         return ""
 
 
@@ -264,21 +273,16 @@ class CLIBackend:
                     "-c", "mcp_servers=" + toml_value(codex),
                     "--output-schema", str(job / "provider-schema.json"),
                     "--output-last-message", str(job / "response.json"), "-"]
+        # Bash gets only the read-only prefixes, whatever the configuration lists:
+        # configured commands are broker grants and never become Bash rules.
         allow = ["Read", "Glob", "Grep"]
         allow += ["Bash(" + shlex.join(cmd) + " *)" for cmd in self.config.readonly_commands()]
         tools = "Read,Glob,Grep,Bash"
         if role == "worker":
             allow.append(claude_worktree_edit_rule(cwd))
             tools = "Read,Edit,Write,Glob,Grep,Bash"
-            commands = self.config.data["verification"]["commands"] + self.config.data["permissions"]["worker_commands"]
-            # A literal * in an argv becomes a permission wildcard even when
-            # shell-quoted. The broker can execute these literal argv safely;
-            # they must never become broad Bash grants.
-            allow += ["Bash(" + shlex.join(cmd) + ")" for cmd in commands
-                      if not any("*" in arg or "\n" in arg or "\r" in arg for arg in cmd)]
         # Only configured MCP servers are exposed. Their permissions are a trusted operator choice.
         allow += ["mcp__" + name for name in claude["mcpServers"]]
-        # JSON preserves commas and parentheses inside exact command arguments.
         permissions = {"allow": allow}
         if role == "worker":
             permissions["deny"] = claude_worktree_git_deny_rules(cwd)
@@ -335,76 +339,84 @@ class CLIBackend:
                     error.add_note(f"Terminal evidence preservation failed: {type(capture_error).__name__}: {capture_error}")
             raise
         if code:
+            note = None
             if role in ("commander", "reviewer") and observed_outcome is not None:
-                self.preserve_terminal(job, model["cli"], observed_outcome.to_dict(), terminal_only=True)
+                try:
+                    self.preserve_terminal(job, model["cli"], observed_outcome.to_dict(), terminal_only=True)
+                except HarnessError as capture_error:
+                    # As on the exception path: evidence that cannot be read never replaces the CLI failure.
+                    note = f"Terminal evidence preservation failed: {type(capture_error).__name__}: {capture_error}"
             diagnostic = cli_error_summary(job, model["cli"])
             detail = f"；{diagnostic}" if diagnostic else ""
-            raise HarnessError(f"{role} CLI exit={code}{detail}；{job}\n{tail(job / 'process.stderr')}")
+            state, stderr = read_original(job / "process.stderr", tail_text)
+            failure = HarnessError(f"{role} CLI exit={code}{detail}；{job}\n{stderr if state == 'read' else ''}")
+            if note:
+                failure.add_note(note)
+            raise failure
         return self.completed_result(job, model["cli"])
 
     def preserve_terminal(self, job, provider, outcome, *, terminal_only=False):
-        """Save designated terminal evidence separately from process success."""
+        """Save designated terminal evidence separately from process success.
+
+        Called only after a failed process end: the terminal is read once, and a read that
+        misses is a HarnessError, never local I/O (``_original_bytes`` without ``local_io``).
+        No path check precedes a read: ``read_original`` refuses a link or anything but a
+        regular file itself, and a separate stat could raise on Python 3.11 to 3.13.
+        """
         source = job / ("response.json" if provider == "codex" else "process.stdout")
         known_completion = (outcome.get("exit_code") is not None
                             and (outcome.get("termination_reason") == "normal" or outcome["exit_code"] == 0))
-        value = None
+        value = terminal = None
         if terminal_only or not known_completion:
             # A timeout before any terminal remains retryable. A whole provider
             # terminal followed by timeout/cancellation is retained, never used
             # as success. Partial JSON and ordinary event output are insufficient.
             try:
-                if source.is_symlink() or not source.is_file():
-                    return False
-                terminal = self.read_result(source, provider)
-                if provider == "claude" and terminal.get("type") != "result":
-                    return False
-                value = self.completed_result(job, provider)
+                terminal = _original_bytes(source, "Terminal evidence must be a regular file", local_io=False)
+                value = self.completed_result(job, provider, terminal)
             except HarnessError:
                 return False
-        for path in (source, job / "process.outcome.json"):
-            if path.is_symlink() or not path.is_file():
-                raise HarnessError("Terminal evidence must be a regular file")
+        if terminal is None:
+            terminal = _original_bytes(source, "Terminal evidence must be a regular file", local_io=False)
+        record = _original_bytes(job / "process.outcome.json", "Terminal evidence must be a regular file", local_io=False)
         capture = {"version": 1, "provider": provider, "source": source.name,
-                   "source_digest": hashlib.sha256(source.read_bytes()).hexdigest(),
-                   "outcome_digest": hashlib.sha256((job / "process.outcome.json").read_bytes()).hexdigest()}
+                   "source_digest": hashlib.sha256(terminal).hexdigest(),
+                   "outcome_digest": hashlib.sha256(record).hexdigest()}
         # Publish intent before parsing or result publication. Incomplete intent
         # is a permanent evidence blocker, never permission to redraw a decision.
         write_json(job / "terminal-capture.json", capture)
         if value is not None or outcome.get("exit_code") == 0:
-            value = value if value is not None else self.completed_result(job, provider)
+            value = value if value is not None else self.completed_result(job, provider, terminal)
             capture["result_digest"] = hashlib.sha256((dump(value) + "\n").encode("utf-8")).hexdigest()
             write_json(job / "terminal-capture.json", capture)
             write_json(job / "returned-result.json", value)
         return True
 
-    def completed_result(self, job, provider):
+    def completed_result(self, job, provider, raw=None):
         """Parse only the provider's designated, complete terminal artifact.
 
         A complete, non-error terminal whose result does not strictly decode to a
         JSON object raises UndecodableOutput: an invalid delivery, not a provider
         failure. Claude's output is decoded by the same function the worker
         no-result classifier uses, so both reach the same verdict on the same bytes.
+        ``raw``: the terminal's bytes, when a failed call's capture already read them.
         """
         if provider == "codex":
             path = job / "response.json"
-            if not path.exists():
-                raise HarnessError(f"Codex 未输出结构化结果：{job}")
+            if raw is None:
+                if not path.exists():
+                    raise HarnessError(f"Codex 未输出结构化结果：{job}")
+                raw = _original_bytes(path, f"Codex 结构化结果无法读取；日志：{path}")
             try:
-                value = strict_json_loads(path.read_bytes())
-            except OSError as e:
-                stops.keep_local_io(e)
-                raise HarnessError(f"Codex 结构化结果无法读取；日志：{path}") from e
+                value = strict_json_loads(raw)
             except (ValueError, UnicodeError, RecursionError) as e:
-                raise UndecodableOutput(path, f"Codex 结构化结果不能严格解码（{type(e).__name__}）；日志：{path}") from e
+                raise UndecodableOutput(path, raw, f"Codex 结构化结果不能严格解码（{type(e).__name__}）；日志：{path}") from e
             if not isinstance(value, dict):
-                raise UndecodableOutput(path, f"Codex 结构化结果必须为 JSON 对象；日志：{path}")
+                raise UndecodableOutput(path, raw, f"Codex 结构化结果必须为 JSON 对象；日志：{path}")
             return value
         path = job / "process.stdout"
-        try:
-            raw = path.read_bytes()
-        except OSError as e:
-            stops.keep_local_io(e)
-            raise HarnessError(f"Claude 未返回有效 JSON；日志：{path}") from e
+        if raw is None:
+            raw = _original_bytes(path, f"Claude 未返回有效 JSON；日志：{path}")
         kind, envelope, value, detail = decode_terminal(raw)
         if isinstance(envelope, dict):
             write_json(job / "provider-result.json", envelope)
@@ -413,21 +425,10 @@ class CLIBackend:
         if kind == "error":
             raise HarnessError(f"Claude 未成功完成：{claude_error_summary(envelope) or 'unclassified CLI error'}；日志：{job}")
         if kind == "undecodable":
-            raise UndecodableOutput(path, f"Claude 输出不能解码为 JSON 对象结果（{detail}）；日志：{job}")
+            raise UndecodableOutput(path, raw, f"Claude 输出不能解码为 JSON 对象结果（{detail}）；日志：{job}")
         # Written only once the value is known to be an object: its presence
         # means an object result was returned (worker_returns.inspect_return).
         write_json(job / "response.json", value)
-        return value
-
-    @staticmethod
-    def read_result(path, provider):
-        try:
-            value = strict_json_loads(path.read_bytes())
-        except (OSError, ValueError, UnicodeError, RecursionError) as e:
-            stops.keep_local_io(e)
-            raise HarnessError(f"{provider} 未返回有效 JSON；日志：{path}") from e
-        if not isinstance(value, dict):
-            raise HarnessError(f"{provider} 结果必须为 JSON 对象；日志：{path}")
         return value
 
 

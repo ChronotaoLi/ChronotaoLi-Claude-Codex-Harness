@@ -14,7 +14,7 @@ from pathlib import Path, PurePosixPath
 from . import git, stops
 from .context import prompt_json
 from .recovery import snapshot_digest
-from .review_progress import dispositions_usable
+from .review_progress import dispositions_usable, entries
 from .util import HarnessError, dump, write_json
 
 
@@ -27,12 +27,12 @@ def recent_costs(context, *, limit=64):
     samples = []
     for entry in reversed(context.run.get("dispatches", [])):
         duration = entry.get("duration_seconds")
-        if (entry.get("role") != "verification" or not entry.get("argv")
+        if (entry.get("role") != "verification" or not entry.get("command")
                 or not isinstance(duration, (int, float)) or isinstance(duration, bool)
                 or not math.isfinite(duration) or duration < 0
                 or not entry.get("exit_confirmed") or not entry.get("evidence_complete")):
             continue
-        samples.append({"argv": list(entry["argv"]), "seconds": duration,
+        samples.append({"command": deepcopy(entry["command"]), "seconds": duration,
                         "source": "measured_formal_command",
                         "provenance": {"dispatch_id": entry["id"],
                             "finished_at": entry.get("finished_at"),
@@ -42,10 +42,11 @@ def recent_costs(context, *, limit=64):
     return samples
 
 
-def _cost_estimate(argv, samples):
+def _cost_estimate(command, samples):
+    # Only the same command, directory included, estimates a check's time.
     for sample in samples or ():
         seconds = sample.get("seconds")
-        if (sample.get("argv") == list(argv) and sample.get("source") == "measured_formal_command"
+        if (sample.get("command") == command and sample.get("source") == "measured_formal_command"
                 and sample.get("provenance", {}).get("dispatch_id")
                 and isinstance(seconds, (int, float)) and not isinstance(seconds, bool)
                 and math.isfinite(seconds) and seconds >= 0):
@@ -68,13 +69,13 @@ def build_verification_plan(config, task=None, *, cost_samples=None):
         previous = ("final_setup:" + str(len(verification.get("setup_commands", [])) - 1)
                     if responsibility == "final_gate" and verification.get("fresh_checkout")
                     and verification.get("setup_commands") else None)
-        for index, argv in enumerate(commands):
+        for index, command in enumerate(commands):
             identity = f"{responsibility}:{index}"
-            checks.append({"id": identity, "responsibility": responsibility, "argv": list(argv),
+            checks.append({"id": identity, "responsibility": responsibility, "command": deepcopy(command),
                            "after": [previous] if previous else [],
                            "obligation_refs": [{"task_id": o["task_id"], "acceptance_index": o["acceptance_index"]}
                                                for o in obligations] if responsibility == "task_gate" else [],
-                           "cost_estimate": _cost_estimate(argv, cost_samples),
+                           "cost_estimate": _cost_estimate(command, cost_samples),
                            "applicability": "current candidate and environment only",
                            "mapping": "configured gate; semantic coverage requires independent review"})
             previous = identity
@@ -184,17 +185,24 @@ def candidate_preflight(task, worker_result, *, worktree, candidate_snapshot, cu
             "semantic_coverage": "requires independent review"}
 
 
-def finding_progress(run, task_id, *, limit=60):
+def finding_progress(run, task_ids, *, whole_run=False, limit=60):
     """History projection only; a worker claim or an absent finding never closes it.
 
     Explicit reviewer dispositions remain scoped to their recorded candidate.
     Missing source identity stays unknown rather than inventing a global ID.
+    It indexes each finding's latest status, entry by entry as review_progress
+    walks them, over exactly the histories its caller verified: the named tasks'
+    and, for a run-level view, the whole-run entries, approved batches included,
+    after every task's. No task name widens it.
     """
-    task_ids = [task_id] if task_id in run.get("review_history", {}) else (
-        list(run.get("review_history", {})) if task_id in {"run", "final", "commander"} else [task_id])
+    task_ids = list(task_ids)
+    scopes = [(tid, run.get("review_history", {}).get(tid, []), False) for tid in task_ids]
+    if whole_run and run.get("final_history"):
+        scopes.append(("final", run["final_history"], True))
+        task_ids.append("final")
     rows = {}
-    for tid in task_ids:
-        for record in run.get("review_history", {}).get(tid, []):
+    for tid, records, whole in scopes:
+        for record, _ in entries(records, whole):
             review = record.get("review") or {}
             source = record.get("review_source") or {}
             dispatch = source.get("dispatch_id") or record.get("dispatch_id") or review.get("dispatch_id")
@@ -208,12 +216,14 @@ def finding_progress(run, task_id, *, limit=60):
                     "artifact": artifact, "source_artifact_digest": source.get("artifact_digest"),
                     "snapshot_digest": candidate,
                     "status": "open" if dispatch else "unknown", "disposition_source": None}
-            if not dispositions_usable(record):
-                continue
+            usable = dispositions_usable(record)
             mapping = {item.get("key"): (item.get("review_dispatch_id"), item.get("finding_index"))
                        for item in record.get("required_findings") or [] if isinstance(item, dict)}
             for name, disposition in (review.get("finding_dispositions") or {}).items():
-                if name not in mapping:
+                # The repair status rule of review_progress: not_checked records no judgment,
+                # open from any review is a kept veto, only a usable review resolves.
+                if (name not in mapping or disposition.get("status") == "not_checked"
+                        or (disposition.get("status") == "resolved" and not usable)):
                     continue
                 row = rows.get((tid, *mapping[name], None))
                 if row is not None:
@@ -229,13 +239,14 @@ def finding_progress(run, task_id, *, limit=60):
             "history_task_ids": task_ids}
 
 
-def finding_progress_packet(run, task_id, directory):
+def finding_progress_packet(run, task_ids, directory, *, whole_run=False):
     """Retrieve the complete progress matrix through immutable private evidence.
 
-    Callers authenticate original review sources before projecting this index.
-    This summary is input context, never authority to close a finding.
+    Callers authenticate original review sources before projecting this index,
+    and name the histories they authenticated. This summary is input context,
+    never authority to close a finding.
     """
-    progress = finding_progress(run, task_id, limit=None)
+    progress = finding_progress(run, task_ids, whole_run=whole_run, limit=None)
     if not progress["findings"]:
         return None
     value = {"version": 1, "progress": progress}

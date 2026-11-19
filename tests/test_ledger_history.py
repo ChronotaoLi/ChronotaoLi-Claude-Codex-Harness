@@ -28,7 +28,7 @@ from harness.command_server import Broker, create_manifest
 from harness.mcp_server import handle
 from harness.memory import Memory
 from harness.recovery import snapshot_digest
-from harness.util import HarnessError, ProcessTimeout, read_json, write_json
+from harness.util import HarnessError, ProcessTimeout, lock, read_json, write_json
 from harness.versions import RUN_SCHEMA_VERSION
 from harness.watch_cli import watch_run
 from harness.workspace_inputs import prepare_run
@@ -77,8 +77,8 @@ class CurrentLedgerTests(RepoCase):
         # Keep the verified checkout as a reclamation failure before its intent would.
         self.enterContext(patch("harness.finalization.FinalAcceptance.reclaim_verified_checkout"))
         self.config.data['verification'].update(fresh_checkout=True,
-            commands=[[sys.executable, '-c', "from pathlib import Path; assert Path('hello.py').is_file()"]])
-        command = [sys.executable, '-c', "print('focused continuation check')"]
+            commands=[{'cwd': '.', 'argv': [sys.executable, '-c', "from pathlib import Path; assert Path('hello.py').is_file()"]}])
+        command = {'cwd': '.', 'argv': [sys.executable, '-c', "print('focused continuation check')"]}
 
         def script(backend, kwargs, packet, result):
             if kwargs['role'] == 'worker' and sum(call['role'] == 'worker' for call in backend.calls) == 2:
@@ -238,7 +238,7 @@ class CurrentLedgerTests(RepoCase):
         self.assertEqual(self.path.read_bytes(), self.before)
 
     def test_new_ledger_has_no_removed_fields_and_status_sums_attempts(self):
-        self.assertEqual(self.run['schema_version'], 18)
+        self.assertEqual(self.run['schema_version'], 19)
         self.assertFalse(REMOVED_KEYS & set(self.run))
         self.assertFalse({'max_total_attempts', 'claude_output_mode'} & set(self.run['config_snapshot']['runtime']))
         self.assertFalse(any('capture' in entry['worker_receipt'] for entry in self.workers(self.run)))
@@ -285,7 +285,7 @@ def ledger_bytes(current, version, **fields):
 
 class UnsupportedLedgerTests(DashboardCase):
     # Object ledgers of other versions (including a string and a boolean), then non-objects.
-    VERSIONS = (17, 19, 1, '18', True, MISSING, ARRAY, NULL)
+    VERSIONS = (18, 20, 1, '19', True, MISSING, ARRAY, NULL)
 
     def setUp(self):
         super().setUp()
@@ -377,10 +377,10 @@ class UnsupportedLedgerTests(DashboardCase):
     def test_damaged_identity_of_another_version_gets_the_same_refusal_and_creates_nothing(self):
         for identity in ([], 'run_unexpected', {'id': 'nested'}):
             with self.subTest(identity=identity):
-                self.save(17, id=identity)
+                self.save(18, id=identity)
                 before = self.tree()
                 for call in self.entries():
-                    with self.assertRaisesRegex(HarnessError, re.escape(refusal(17))):
+                    with self.assertRaisesRegex(HarnessError, re.escape(refusal(18))):
                         call()
                 self.assertFalse((self.runs / 'run_unexpected').exists())
                 self.assertEqual(self.tree(), before)
@@ -396,18 +396,74 @@ class UnsupportedLedgerTests(DashboardCase):
         self.assertEqual(self.tree(), before)
         self.assertEqual(self.backend.calls, [])
 
+    def lock_entries(self):
+        """Every entry that creates or takes run.lock on an existing run, called directly and from the CLI."""
+        calls = (lambda: self.engine(self.backend).resume(self.ident),
+                 lambda: self.engine(self.backend).abandon(self.ident),
+                 lambda: prepare_run(self.repo, self.ident, self.manifest),
+                 lambda: cleanup_run(self.repo, self.ident),
+                 lambda: cleanup_run(self.repo, self.ident, remove=True),
+                 lambda: cleanup_run(self.repo, self.ident, confirm_exited=('dispatch-1',)))
+        argvs = (('resume', self.ident), ('abandon', self.ident),
+                 ('prepare-run', self.ident, '--manifest', str(self.manifest)),
+                 ('cleanup-run', self.ident), ('cleanup-run', self.ident, '--remove'),
+                 ('cleanup-run', self.ident, '--confirm-exited', 'dispatch-1'))
+        return calls, argvs
+
+    def assert_version_refusals(self, version):
+        calls, argvs = self.lock_entries()
+        for index, call in enumerate(calls):
+            with self.assertRaisesRegex(HarnessError, re.escape(refusal(version))) as caught:
+                call()
+            self.assertEqual((caught.exception.stop['kind'], caught.exception.stop['reason']),
+                             ('unsupported_ledger', 'ledger_version'), index)
+        for argv in argvs:
+            code, output, errors = self.cli(*argv)
+            self.assertEqual((code, output), (1 if argv[0] == 'cleanup-run' else 2, ''), argv)
+            self.assertIn(refusal(version), errors)
+
+    def test_lock_taking_entries_refuse_another_version_without_creating_the_lock(self):
+        # A run interrupted after its first save has a ledger and no lock file.
+        lock_path = self.runtime.directory / 'run.lock'
+        for version in self.VERSIONS:
+            with self.subTest(version=version):
+                self.save(version)
+                lock_path.unlink(missing_ok=True)
+                before = self.tree()
+                self.assert_version_refusals(version)
+                self.assertFalse(lock_path.exists())
+                self.assertEqual(self.tree(), before)
+        self.assertEqual(self.backend.calls, [])
+
+    def test_a_held_lock_reports_another_version_not_the_lock(self):
+        lock_path = self.runtime.directory / 'run.lock'
+        with lock(lock_path):
+            for version in self.VERSIONS:
+                with self.subTest(version=version):
+                    self.save(version)
+                    before = self.tree()
+                    self.assert_version_refusals(version)
+                    self.assertEqual(self.tree(), before)
+            # The lock is really held: the current ledger still meets it at every entry.
+            self.path.write_bytes(self.current)
+            calls, _ = self.lock_entries()
+            for call in calls:
+                with self.assertRaisesRegex(HarnessError, '已有进程持有运行锁|运行正被写入，暂不能预览'):
+                    call()
+        self.assertEqual(self.backend.calls, [])
+
     def test_run_list_names_other_versions_by_path_and_version_only(self):
         current = self.engine(self.backend).start('Implement greet', read_json(ROOT / 'examples/plan.json'),
                                                   pause_after_plan=True)
         # Fields an old ledger might hold in any shape are never read.
-        self.save(17, status={'not': 'a status'}, goal=['unreadable'], tasks='damaged', dispatches='damaged',
+        self.save(18, status={'not': 'a status'}, goal=['unreadable'], tasks='damaged', dispatches='damaged',
                   accepted='damaged', attempts=None)
         write_json(self.runs / 'run_noversion' / 'state.json', {'id': 'run_noversion', 'status': 'running'})
         write_json(self.runs / 'run_array' / 'state.json', [])
         write_json(self.runs / 'run_null' / 'state.json', None)
         (self.runs / 'run_damaged').mkdir()
         (self.runs / 'run_damaged' / 'state.json').write_text('{not json', encoding='utf-8')
-        expected = sorted([{'path': f'runs/{self.ident}', 'schema_version': 17, 'reason': refusal(17)}]
+        expected = sorted([{'path': f'runs/{self.ident}', 'schema_version': 18, 'reason': refusal(18)}]
                           + [{'path': f'runs/{name}', 'schema_version': None, 'reason': refusal(None)}
                              for name in ('run_noversion', 'run_array', 'run_null')],
                           key=lambda item: item['path'])
@@ -428,7 +484,7 @@ class UnsupportedLedgerTests(DashboardCase):
         status, _, body = self.request(server, '/api/runs')
         self.assertEqual(status, 200)
         self.assertEqual(sorted(json.loads(body)['unsupported'], key=lambda item: item['path']), expected)
-        for run_id, version in ((self.ident, 17), ('run_array', None), ('run_null', None)):
+        for run_id, version in ((self.ident, 18), ('run_array', None), ('run_null', None)):
             status, _, body = self.request(server, f'/api/runs/{run_id}')
             self.assertEqual((status, json.loads(body)['error']), (409, refusal(version)), run_id)
         status, _, body = self.request(server, f"/api/runs/{current['id']}")
@@ -455,7 +511,7 @@ class UnsupportedLedgerBrokerTests(RepoCase):
                 return
             path, job, target = engine.directory / 'state.json', kwargs['job'], kwargs['cwd'] / 'obsolete.txt'
             current = path.read_bytes()
-            old = ledger_bytes(current, 17)
+            old = ledger_bytes(current, 18)
             try:
                 # 1. No manifest, command directory or record is created for another version.
                 fresh = job.parent / (job.name + '-fresh')
@@ -487,7 +543,7 @@ class UnsupportedLedgerBrokerTests(RepoCase):
         run = engine.start('Implement greet', plan)
         self.assertEqual(run['status'], 'completed')
         for key in ('manifest', 'source_delete', 'source_command', 'scope_delete'):
-            self.assertEqual(seen[key], refusal(17), key)
+            self.assertEqual(seen[key], refusal(18), key)
         self.assertFalse(seen['manifest_created'])
         self.assertTrue(seen['file_kept'])
         self.assertEqual(seen['records'], [])  # No call was published, so none was recorded.
@@ -519,7 +575,7 @@ class UnsupportedLedgerMcpTests(unittest.TestCase):
                  'file_diff': {'left': 'file.txt', 'right': 'file.txt'},
                  'git_query': {'argv': ['git', 'ls-files', '--', 'file.txt']},
                  'memory_search': {'query': 'fact'}, 'memory_read': {'id': self.memory.export()[0]['id']}}
-        for version in (17, MISSING, ARRAY):
+        for version in (18, MISSING, ARRAY):
             write_json(self.run, json.loads(ledger_bytes(json.dumps(
                 {'schema_version': RUN_SCHEMA_VERSION, 'id': 'run_old', 'goal': {'interpreted': True},
                  'worktree': str(self.root), 'worktree_binding': {}}).encode(), version)))
@@ -528,7 +584,7 @@ class UnsupportedLedgerMcpTests(unittest.TestCase):
                     request = {'method': 'tools/call', 'params': {'name': name, 'arguments': arguments}}
                     result = handle(request, self.memory, None, self.run)
                     self.assertEqual((result['isError'], result['content'][0]['text']), (True, refusal(
-                        17 if version == 17 else None)))
+                        18 if version == 18 else None)))
         # The same tools answer for the current version.
         write_json(self.run, {'schema_version': RUN_SCHEMA_VERSION, 'id': 'run_old', 'goal': 'g',
                               'worktree': str(self.root)})
@@ -536,14 +592,14 @@ class UnsupportedLedgerMcpTests(unittest.TestCase):
         self.assertFalse(handle(request, self.memory, None, self.run)['isError'])
 
     def test_server_does_not_start_on_another_version(self):
-        write_json(self.run, {'schema_version': 17, 'id': 'run_old', 'worktree': str(self.root)})
+        write_json(self.run, {'schema_version': 18, 'id': 'run_old', 'worktree': str(self.root)})
         request = json.dumps({'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call',
                               'params': {'name': 'run_status', 'arguments': {}}}) + '\n'
         result = subprocess.run([sys.executable, str(ROOT / 'harness' / 'mcp_entry.py'), '--state', str(self.state),
                                  '--skills', str(ROOT / 'shared' / 'skills'), '--run', str(self.run)],
                                 input=request, capture_output=True, text=True, timeout=60)
         self.assertEqual((result.returncode, result.stdout), (1, ''))
-        self.assertIn(refusal(17), result.stderr)
+        self.assertIn(refusal(18), result.stderr)
 
 if __name__ == '__main__':
     unittest.main()

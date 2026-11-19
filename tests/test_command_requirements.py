@@ -15,7 +15,7 @@ from test_runtime_changes import ScriptedBackend, revised, trigger_kind
 
 
 class CommandRequirementsTests(RepoCase):
-    command = ['required-tool', 'run', '--exact']
+    command = {'cwd': '.', 'argv': ['required-tool', 'run', '--exact']}
 
     def plan(self, commands=None):
         plan = read_json(ROOT / 'examples' / 'plan.json')
@@ -28,8 +28,9 @@ class CommandRequirementsTests(RepoCase):
 
     def test_invalid_supplied_commands_fail_before_run_or_model(self):
         backend = ScriptedBackend()
-        invalid = [None, 'tool', ['tool'], [[]], [['']], [['  ']], [[True]], [['tool', None]], [['tool', 'a\0b']]]
-        invalid.extend([[self.command, self.command], [['tool', str(i)] for i in range(33)]])
+        invalid = [None, 'tool', ['tool'], [['tool']]] + [[{'cwd': '.', 'argv': argv}] for argv in (
+            [], [''], ['  '], [True], ['tool', None], ['tool', 'a\0b'])]
+        invalid.extend([[self.command, self.command], [{'cwd': '.', 'argv': ['tool', str(i)]} for i in range(33)]])
         for commands in invalid:
             plan = self.plan()
             plan['tasks'][0]['required_commands'] = commands
@@ -39,12 +40,13 @@ class CommandRequirementsTests(RepoCase):
         self.assertFalse((self.repo / '.harness' / 'runs').exists())
 
     def test_exact_arguments_and_only_explicit_execution_grants_satisfy(self):
-        exact = ['tool', '*', 'line\nbreak', '', ' spaced ']
+        exact = {'cwd': '.', 'argv': ['tool', '*', 'line\nbreak', '', ' spaced ']}
         task = self.plan([exact])['tasks'][0]
         validate_plan({'tasks': [task]})
         config = copy.deepcopy(self.config.data)
         config['verification']['setup_commands'] = [exact]
-        config['permissions']['worker_commands'] = [['tool'], ['tool', '*', 'line\nbreak', '', 'spaced']]
+        config['permissions']['worker_commands'] = [{'cwd': '.', 'argv': ['tool']},
+                                                    {'cwd': '.', 'argv': ['tool', '*', 'line\nbreak', '', 'spaced']}]
         self.assertEqual(missing_commands([task], {}, config), {'greet': [exact]})
         config['permissions']['worker_commands'].append(exact)
         self.assertEqual(missing_commands([task], {}, config), {})
@@ -118,7 +120,7 @@ class CommandRequirementsTests(RepoCase):
 
     def command_repair_cases(self):
         yield 'duplicate', [self.command, self.command], [self.command]
-        commands = [['required-tool', 'run', str(i)] for i in range(33)]
+        commands = [{'cwd': '.', 'argv': ['required-tool', 'run', str(i)]} for i in range(33)]
         yield 'too_many', commands, commands[:32]
 
     def assert_command_redo(self, result, backend):
@@ -247,8 +249,10 @@ class CommandRequirementsTests(RepoCase):
 
     def test_requirements_immutable_for_existing_tasks(self):
         # Existing requirements only grow: removing, replacing or reordering is refused, appending is allowed.
-        old = self.plan([self.command, ['second']])['tasks']
-        for changed in ([], [['different']], [['second'], self.command], [self.command], [['additional'], self.command, ['second']]):
+        second, additional = {'cwd': '.', 'argv': ['second']}, {'cwd': '.', 'argv': ['additional']}
+        old = self.plan([self.command, second])['tasks']
+        for changed in ([], [{'cwd': '.', 'argv': ['different']}], [second, self.command], [self.command],
+                        [additional, self.command, second]):
             proposed = copy.deepcopy(old)
             proposed[0]['description'] += ' Refined.'
             proposed[0]['required_commands'] = changed
@@ -257,7 +261,7 @@ class CommandRequirementsTests(RepoCase):
         proposed = copy.deepcopy(old)
         proposed[0]['description'] += ' Refined.'
         self.assertEqual(validate_revision(old, proposed, []), proposed)
-        proposed[0]['required_commands'] = [self.command, ['second'], ['additional']]
+        proposed[0]['required_commands'] = [self.command, second, additional]
         self.assertEqual(validate_revision(old, proposed, []), proposed)
 
     def test_legacy_plan_stays_unchanged_and_new_task_can_declare(self):
