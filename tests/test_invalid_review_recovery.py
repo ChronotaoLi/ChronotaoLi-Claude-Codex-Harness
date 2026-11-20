@@ -1,13 +1,16 @@
 import copy
+import errno
 import json
 import hashlib
 from pathlib import Path
 from unittest.mock import patch
 
 from harness import git
+from harness.task_lifecycle import TaskLifecycle
 from harness.util import HarnessError, read_json, write_json
+import test_review_batches as batches  # by module: its TestCases imported by name would be collected again here
 from test_engine_repairs import RecordingBackend
-from test_harness import RepoCase, ROOT, crash_after_save, review_bound
+from test_harness import RepoCase, ROOT, crash_after_save, review_bound, walk_exit
 from test_runtime_changes import finding, invalid_rejection, revised, trigger_kind
 
 
@@ -204,6 +207,101 @@ class InvalidReviewRecoveryTests(RepoCase):
             self.engine(backend).resume(engine.run["id"])
         self.assertEqual(backend.calls, calls)
         self.assertEqual(git.head(engine.worktree), engine.run["expected_head"])
+
+    def returned_second_review(self):
+        """The run dies after a second task review returned and was bound by its digest, a blocking finding open."""
+        backend = batches.scripted([1])
+        engine = self.engine(backend)
+        finish = TaskLifecycle._finish_review
+
+        def interrupt(service, *args):
+            if len(batches.calls(backend, kind="review")) == 2:
+                raise KeyboardInterrupt()
+            return finish(service, *args)
+        with patch.object(TaskLifecycle, "_finish_review", autospec=True, side_effect=interrupt), \
+                self.assertRaises(KeyboardInterrupt):
+            engine.start("Implement greet", self.plan())
+        before = read_json(engine.directory / "state.json")
+        receipt = before["review_receipts"]["reviewer:review:greet"]
+        self.assertIn("artifact_digest", receipt)
+        self.assertTrue(before["pending_task"]["required_findings"])
+        with (engine.worktree / "hello.py").open("a", encoding="utf-8") as stream:
+            stream.write("# Candidate changed after the review returned\n")
+        return backend, engine, before, Path(receipt["artifact"])
+
+    def stopped_on_changed_candidate(self, damage):
+        """The returned original is damaged by ``damage(path)`` and the candidate changed; ``resume`` stops.
+        Returns the backend, the engine, the ledger before the resume, the original's path, the error, and the
+        ledger after."""
+        backend, engine, before, original = self.returned_second_review()
+        damage(original)
+        calls = copy.deepcopy(backend.calls)
+        with self.assertRaises(BaseException) as raised:
+            self.engine(backend).resume(engine.run["id"])
+        self.assertEqual(backend.calls, calls)
+        after = read_json(engine.directory / "state.json")
+        for key in ("review_receipts", "review_history", "pending_task", "feedback", "attempts"):
+            self.assertEqual(after.get(key), before.get(key), key)
+        return backend, engine, before, original, raised.exception, after
+
+    def test_a_missing_or_replaced_original_stops_as_evidence_naming_its_dispatch(self):
+        for layout in ("deleted", "a directory"):
+            with self.subTest(layout=layout):
+                if layout != "deleted":
+                    self.setUp()
+                backend, engine, before, original, _, after = self.stopped_on_changed_candidate(
+                    lambda path: (path.unlink(), path.mkdir() if layout == "a directory" else None))
+                dispatch_id = before["review_receipts"]["reviewer:review:greet"]["dispatch_id"]
+                self.assertEqual((after["stop"]["kind"], after["stop"]["reason"], after["stop"]["source"]),
+                                 ("evidence", "runtime_integrity", {"artifact": str(original), "dispatch_id": dispatch_id}))
+                walk_exit(self, engine.directory, ("evidence", "runtime_integrity"), backend=backend, choose=1,
+                          expect_status="abandoned")
+
+    def test_changed_original_bytes_name_the_dispatch_and_resume_after_restoring(self):
+        kept = {}
+        backend, engine, before, original, _, after = self.stopped_on_changed_candidate(
+            lambda path: (kept.update(raw=path.read_bytes()), path.write_text("{}\n")))
+        dispatch_id = before["review_receipts"]["reviewer:review:greet"]["dispatch_id"]
+        self.assertEqual((after["stop"]["kind"], after["stop"]["reason"], after["stop"]["source"]),
+                         ("evidence", "runtime_integrity", {"artifact": str(original), "dispatch_id": dispatch_id}))
+        original.write_bytes(kept["raw"])
+        result = walk_exit(self, engine.directory, ("evidence", "runtime_integrity"), backend=backend,
+                           expect_status="completed")
+        self.assertIn(("invalidated", dispatch_id),
+                      [(record.get("status"), record.get("dispatch_id")) for record in result["review_history"]["greet"]])
+
+    def test_an_unreadable_original_is_local_io_and_keeps_the_receipt(self):
+        read, failing = Path.read_bytes, {}
+
+        def reading(path):
+            if path == failing.get("path"):
+                raise OSError(errno.EIO, "Input/output error", str(path))
+            return read(path)
+        self.enterContext(patch.object(Path, "read_bytes", reading))
+        backend, engine, before, original, error, after = self.stopped_on_changed_candidate(
+            lambda path: failing.update(path=path))
+        self.assertEqual((type(error), error.errno), (OSError, errno.EIO))
+        self.assertEqual((after["stop"]["kind"], after["stop"]["reason"], after["stop"]["data"]["error_type"]),
+                         ("runtime_failure", "io", "OSError"))
+        failing.clear()  # the device recovers: the kept receipt's original is preserved, not redrawn
+        result = self.engine(backend).resume(engine.run["id"])
+        self.assertEqual(result["status"], "completed")
+        receipt = before["review_receipts"]["reviewer:review:greet"]
+        self.assertIn(("invalidated", receipt["dispatch_id"], receipt["artifact_digest"]),
+                      [(record.get("status"), record.get("dispatch_id"), record.get("artifact_digest"))
+                       for record in result["review_history"]["greet"]])
+
+    def test_a_reviewing_gate_without_its_mapping_is_an_invariant_stop(self):
+        backend, engine, before, original = self.returned_second_review()
+        del before["pending_task"]["required_findings"]
+        write_json(engine.directory / "state.json", before)
+        calls = copy.deepcopy(backend.calls)
+        with self.assertRaisesRegex(HarnessError, "审阅阶段缺少必需问题对照"):
+            self.engine(backend).resume(engine.run["id"])
+        self.assertEqual(backend.calls, calls)
+        after = read_json(engine.directory / "state.json")
+        self.assertEqual((after["stop"]["kind"], after["stop"]["reason"]), ("runtime_failure", "invariant"))
+        self.assertEqual((after["review_receipts"], after["pending_task"]), (before["review_receipts"], before["pending_task"]))
 
     def test_version_five_ledger_requires_original_runtime(self):
         backend = RecordingBackend()

@@ -16,7 +16,6 @@ from .adapters import CLIBackend
 from .command_server import DELETE_COMMAND_ID, ensure_command_processes_exited
 from .commands import command_id
 from .config import Config
-from .permission_smoke import _git
 from .util import HarnessError, dump, read_json, run_process, write_json
 from .versions import RUN_SCHEMA_VERSION
 
@@ -36,11 +35,10 @@ def prepare_fixture(directory):
     # Git keeps no empty directory: a tracked file makes sub/ exist in the worktree.
     (repo / 'sub').mkdir()
     (repo / 'sub' / 'marker.txt').write_text('subdirectory command fixture\n', encoding='utf-8')
-    _git(repo, 'init', '-q', '-b', 'main')
-    _git(repo, 'add', '.')
-    _git(repo, '-c', 'user.name=Harness Tool Smoke', '-c', 'user.email=smoke@localhost',
-         '-c', 'commit.gpgsign=false', 'commit', '-qm', 'Tool fixture')
-    _git(repo, 'worktree', 'add', '--detach', str(worktree))
+    git.git(repo, 'init', '-q', '-b', 'main', effect=git.CHECKOUT, isolated_config=True)
+    git.git(repo, 'add', '.', effect=git.INDEX, isolated_config=True)
+    git.git(repo, 'commit', '-qm', 'Tool fixture', effect=git.INDEX_REFS, isolated_config=True)
+    git.git(repo, 'worktree', 'add', '--detach', str(worktree), effect=git.CHECKOUT, isolated_config=True)
     values = ['with spaces', "single'quote", 'double"quote', '*', ';', 'literal\nnewline', '$(printf unintended)']
     commands = [{'cwd': '.', 'argv': [sys.executable, 'argv_fixture.py', *values]},
                 {'cwd': '.', 'argv': ['/bin/sh', '-c', "printf '%s\\n' 'pipeline fixture' | /usr/bin/tr a-z A-Z"]},
@@ -216,7 +214,7 @@ def inspect_evidence(path, fixture, job=None):
     for name in fixture.get('absent_files', []):
         checks.append(dict(name='absent:' + name, passed=not os.path.lexists(name)))
     if job is not None:
-        records = ensure_command_processes_exited(job)
+        records = ensure_command_processes_exited(job, state=Path(job).parent)
         ran = sorted(r['command_id'] for r in records if r['command_id'] != DELETE_COMMAND_ID)
         unstarted = {c['input']['command_id'] for c in fixture['cases'] if c['name'] == 'missing_directory'}
         # A command that never started still closes its journal as exited, so later calls are admitted.
@@ -298,7 +296,7 @@ def tool_smoke(config, repo, *, timeout=180, max_turns=20, max_budget_usd=1.0):
         raise
     finally:
         try:
-            report['command_processes'] = ensure_command_processes_exited(job)
+            report['command_processes'] = ensure_command_processes_exited(job, state=directory)
         except HarnessError as error:
             report.update(passed=False, command_process_error=str(error))
         write_json(directory / 'report.json', report)

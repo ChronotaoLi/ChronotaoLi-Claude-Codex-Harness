@@ -1,12 +1,21 @@
 import contextlib
 import multiprocessing
+import os
 import sqlite3
+import stat
 import tempfile
 import traceback
 import unittest
 from pathlib import Path
 
+import errno
+from unittest.mock import patch
+
+from harness import state_files, stops
 from harness.memory import Memory
+from harness.util import HarnessError
+from test_provider_failures import FifoWatchdog
+from test_state_files import FakeOs, failing
 
 
 def initialize_and_remember(path, index, ready, results):
@@ -66,6 +75,51 @@ class MemoryInitializationTests(unittest.TestCase):
             self.assertEqual(db.execute("PRAGMA journal_mode").fetchone()[0], "wal")
             self.assertEqual(db.execute("PRAGMA integrity_check").fetchone()[0], "ok")
         return memory
+
+    def test_the_initialization_lock_lies_beside_the_name_and_is_never_followed(self):
+        other = Path(self.temp.name) / "elsewhere"
+        other.mkdir()
+        self.path.symlink_to(other / "database.sqlite3")
+        Memory(self.path)
+        lock = self.path.with_name("memory.sqlite3.init.lock")
+        self.assertTrue(stat.S_ISREG(os.lstat(lock).st_mode))
+        self.assertEqual(sorted(os.listdir(other)), ["database.sqlite3"])
+        target = Path(self.temp.name) / "target"
+        for layout in ("fifo", "dangling", "directory"):
+            with self.subTest(layout=layout):
+                lock.unlink()
+                {"fifo": os.mkfifo, "dangling": lambda path: path.symlink_to(target), "directory": os.mkdir}[layout](lock)
+                watchdog = FifoWatchdog(lock, bound=5) if layout == "fifo" else None
+                try:
+                    with self.assertRaises(HarnessError) as caught:
+                        Memory(self.path)
+                finally:
+                    self.assertFalse(watchdog and watchdog.stop())
+                    lock.rmdir() if layout == "directory" else lock.unlink()
+                    lock.touch()
+                value = stops.of(caught.exception)
+                self.assertEqual((value["kind"], value["reason"]), ("runtime_failure", "io"))
+                self.assertFalse(os.path.lexists(target))
+
+    def test_a_lock_file_reported_missing_while_created_is_opened_again(self):
+        # macOS reports ENOENT to an openat(O_CREAT) that races another process creating the same name.
+        name = "memory.sqlite3.init.lock"
+        lost = []
+
+        def losing_once(real, *args, **kwargs):
+            if args[0] == name and not lost:
+                lost.append(True)
+                raise OSError(errno.ENOENT, os.strerror(errno.ENOENT))
+            return real(*args, **kwargs)
+        with patch.object(state_files, "os", FakeOs(open=losing_once)):
+            Memory(self.path).remember(key="k", abstract="a", overview="o", detail="d", source="test")
+        self.assertEqual(lost, [True])
+        # A directory that keeps answering ENOENT is no race: initialization stops as local I/O.
+        with patch.object(state_files, "os", FakeOs(open=failing(errno.ENOENT, name))), \
+                self.assertRaises(HarnessError) as caught:
+            Memory(self.path)
+        value = stops.of(caught.exception)
+        self.assertEqual((value["kind"], value["reason"]), ("runtime_failure", "io"))
 
     def test_processes_initialize_a_new_database_and_preserve_all_writes(self):
         memory = self.initialize_concurrently()

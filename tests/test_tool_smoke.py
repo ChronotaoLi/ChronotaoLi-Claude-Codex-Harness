@@ -6,6 +6,7 @@ import subprocess
 import unittest
 from pathlib import Path
 
+import git_isolation  # the plain git init below runs isolated even when this module runs on its own
 from harness.command_server import Broker, create_manifest, handle
 from harness.tool_smoke import inspect_evidence, prepare_fixture
 from harness.util import HarnessError, read_json, write_json

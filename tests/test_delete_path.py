@@ -122,7 +122,7 @@ class DeletePathBrokerTests(BrokerFixture):
         self.assertEqual(sorted(status), [' D legacy/old.txt', ' D legacy/tool.sh'])
         # Siblings and parent directories are left alone.
         self.assertTrue((self.repo / 'legacy' / 'nested' / 'deep.txt').is_file())
-        records = ensure_command_processes_exited(self.job)
+        records = ensure_command_processes_exited(self.job, state=self.run_dir)
         self.assertEqual([(r['command_id'], r['pgid'], r['process_state'], r['exit_confirmed']) for r in records],
                          [(DELETE_COMMAND_ID, None, 'exited', True)] * 2)
         self.assert_outside_intact()
@@ -159,7 +159,7 @@ class DeletePathBrokerTests(BrokerFixture):
                 self.assertEqual(receipt_of(self.job, result), result)
                 self.assertEqual(os.lstat(self.repo / kept).st_ino, before[kept].st_ino)
         self.assertTrue((self.repo / 'legacy' / 'link').is_symlink())
-        self.assertEqual(len(command_processes(self.job)), len(cases))
+        self.assertEqual(len(command_processes(self.job, state=self.run_dir)), len(cases))
         self.assertEqual(git.git(self.repo, 'status', '--porcelain', '--untracked-files=no'), '')
 
     def test_protected_root_aliases_are_refused_even_when_tracked_and_in_scope(self):
@@ -192,7 +192,7 @@ class DeletePathBrokerTests(BrokerFixture):
         failed, payload = call(unscoped, 'delete_path', {'path': 'legacy/old.txt'})
         self.assertTrue(failed)
         self.assertEqual(payload['started'], False)
-        self.assertEqual(command_processes(self.job), [])
+        self.assertEqual(command_processes(self.job, state=self.run_dir), [])
         scoped = self.broker()
         listed = handle({'method': 'tools/list'}, scoped)['tools']
         self.assertEqual([tool['name'] for tool in listed], ['list_commands', 'run_command', 'delete_path'])
@@ -210,7 +210,7 @@ class DeletePathBrokerTests(BrokerFixture):
                 failed, payload = call(broker, 'delete_path', arguments)
                 self.assertTrue(failed)
                 self.assertIn('accepts only path', payload['error'])
-        self.assertEqual(len(command_processes(self.job)), 1)
+        self.assertEqual(len(command_processes(self.job, state=self.run_dir)), 1)
         failed, payload = call(broker, 'delete_path', {'path': 'legacy/old.txt'})
         self.assertFalse(failed)
         self.assertEqual(payload['outcome'], 'deleted')
@@ -240,7 +240,7 @@ class DeletePathBrokerTests(BrokerFixture):
                    'command_id': command_id(ECHO), 'pgid': None, 'process_state': 'starting', 'exit_confirmed': False})
         with self.assertRaisesRegex(HarnessError, 'Cannot confirm command process exited'):
             broker.delete_path({'path': 'legacy/old.txt'})
-        self.assertEqual(len(command_processes(self.job)), 1)
+        self.assertEqual(len(command_processes(self.job, state=self.run_dir)), 1)
         self.assertTrue((self.repo / 'legacy' / 'old.txt').is_file())
 
     def test_admission_lock_held_elsewhere_refuses_without_a_record(self):
@@ -250,7 +250,7 @@ class DeletePathBrokerTests(BrokerFixture):
             fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
             with self.assertRaises(HarnessError):
                 broker.delete_path({'path': 'legacy/old.txt'})
-        self.assertEqual(command_processes(self.job), [])
+        self.assertEqual(command_processes(self.job, state=self.run_dir), [])
         self.assertTrue((self.repo / 'legacy' / 'old.txt').is_file())
 
 
@@ -471,11 +471,11 @@ class DeletePathInterruptionTests(BrokerFixture):
                     # Recovery sees an exited child, never an unknown exit.
                     parent = self.parent_entry()
                     validate_command_directories([parent], self.run_dir)
-                    self.assertEqual(ensure_dispatches_exited([parent]), [])
+                    self.assertEqual(ensure_dispatches_exited([parent], state=self.run_dir), [])
                     # Later calls are admitted and nothing repeats the deletion.
                     self.assertEqual(broker.run_command({'command_id': command_id(ECHO)})['exit_code'], 0)
                     self.assertEqual((self.repo / 'legacy' / 'old.txt').exists(), when == 'before')
-                    self.assertEqual(sum(r['command_id'] == DELETE_COMMAND_ID for r in command_processes(self.job)), 1)
+                    self.assertEqual(sum(r['command_id'] == DELETE_COMMAND_ID for r in command_processes(self.job, state=self.run_dir)), 1)
 
     def test_lost_receipt_blocks_only_its_own_dispatch(self):
         broker = self.broker()
@@ -492,7 +492,7 @@ class DeletePathInterruptionTests(BrokerFixture):
         folder = Path(result['intent_path']).parent
         self.assertEqual(sorted(p.name for p in folder.iterdir()), ['delete-intent.json', 'process.json'])
         # Exit is already confirmed: resume and cleanup need no operator assertion.
-        self.assertEqual(ensure_dispatches_exited([self.parent_entry()]), [])
+        self.assertEqual(ensure_dispatches_exited([self.parent_entry()], state=self.run_dir), [])
         # The same dispatch refuses further calls instead of guessing; nothing is repeated.
         for attempt in (lambda: broker.delete_path({'path': 'legacy/tool.sh'}),
                         lambda: broker.run_command({'command_id': command_id(ECHO)})):
@@ -508,7 +508,7 @@ class DeletePathInterruptionTests(BrokerFixture):
             return original(name, dir_fd)
         with self.interpose('_unlinkat', signal_then_unlink), self.assertRaises(KeyboardInterrupt):
             broker.delete_path({'path': 'legacy/old.txt'})
-        folder = next(r for r in command_processes(self.job))['journal']
+        folder = next(r for r in command_processes(self.job, state=self.run_dir))['journal']
         receipt = read_json(Path(folder).with_name('receipt.json'))
         self.assertEqual((receipt['outcome'], receipt['deleted'], receipt['evidence_complete']), ('deleted', True, True))
         self.assertFalse((self.repo / 'legacy' / 'old.txt').exists())
@@ -584,7 +584,7 @@ class DeletePathLifecycleTests(RepoCase):
         rows = []
         for dispatch in run['dispatches']:
             if dispatch.get('command_directory'):
-                for record in command_processes(dispatch['command_directory']):
+                for record in command_processes(dispatch['command_directory'], state=self.repo / '.harness'):
                     if record['command_id'] == DELETE_COMMAND_ID:
                         rows.append((dispatch['id'], read_json(Path(record['journal']).with_name('receipt.json'))))
         return rows
@@ -639,7 +639,7 @@ class DeletePathLifecycleTests(RepoCase):
                     broker.delete_path({'path': 'legacy/old.txt'})
             finally:
                 state_path.write_bytes(raw)
-            outcomes.append(command_processes(kwargs['job']))
+            outcomes.append(command_processes(kwargs['job'], state=self.repo / '.harness'))
         engine = self.engine(ScriptedBackend(tamper))
         result = engine.start('Implement greet', self.plan('legacy/**'))
         self.assertEqual(result['status'], 'completed')

@@ -18,18 +18,10 @@ import sys
 import uuid
 from pathlib import Path
 
+from . import git
 from .adapters import CLIBackend
 from .config import Config
 from .util import HarnessError, dump, run_process, write_json
-
-
-def _git(cwd, *args):
-    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
-    env.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
-    result = subprocess.run(["git", "-C", str(cwd), "-c", "core.hooksPath=" + os.devnull, *args],
-                            capture_output=True, text=True, timeout=60, env=env)
-    if result.returncode:
-        raise HarnessError(f"权限 smoke Git 准备失败：{result.stderr.strip()}")
 
 
 def prepare_fixture(directory):
@@ -41,11 +33,10 @@ def prepare_fixture(directory):
     (repo / "permission_control.py").write_text(
         'from pathlib import Path\nPath("command-control.txt").write_text("command allowed\\n")\n'
         'print("permission command control succeeded")\n', encoding="utf-8")
-    _git(repo, "init", "-q", "-b", "main")
-    _git(repo, "add", ".")
-    _git(repo, "-c", "user.name=Harness Permission Smoke", "-c", "user.email=smoke@localhost",
-         "-c", "commit.gpgsign=false", "commit", "-qm", "Permission fixture")
-    _git(repo, "worktree", "add", "--detach", str(worktree))
+    git.git(repo, "init", "-q", "-b", "main", effect=git.CHECKOUT, isolated_config=True)
+    git.git(repo, "add", ".", effect=git.INDEX, isolated_config=True)
+    git.git(repo, "commit", "-qm", "Permission fixture", effect=git.INDEX_REFS, isolated_config=True)
+    git.git(repo, "worktree", "add", "--detach", str(worktree), effect=git.CHECKOUT, isolated_config=True)
     outside = directory / "outside.txt"
     outside_text = "outside read control " + uuid.uuid4().hex + "\n"
     outside.write_text(outside_text, encoding="utf-8")

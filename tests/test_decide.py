@@ -126,7 +126,7 @@ class DecideCase(RepoCase):
         rows = [r for r in run["decision_requests"]
                 if not any(o["request_id"] == r["id"] for o in run["operator_decisions"])]
         request = request or rows[-1]
-        path = self.repo.parent / f"answer-{request['id'][-12:]}-{len(run['operator_decisions'])}.json"
+        path = self.outside / f"answer-{request['id'][-12:]}-{len(run['operator_decisions'])}.json"
         path.write_text(json.dumps({"schema_version": 1, "request_id": request["id"], "task_id": request["task_id"],
                                     "decision": decision, "summary": summary}))
         return str(path)
@@ -572,7 +572,7 @@ class BudgetConfigTests(DecideCase):
         self.assertEqual(Config.load(Path(__file__).resolve().parents[1] / "harness.toml").data["runtime"]["max_attempts"], 5)
         for key in ("max_replans", "max_final_attempts", "max_tasks"):
             with self.subTest(key=key):
-                path = self.repo.parent / f"{key}.toml"
+                path = self.outside / f"{key}.toml"
                 path.write_text(text.replace("[runtime]\n", f"[runtime]\n{key} = 3\n", 1))
                 with self.assertRaises(HarnessError) as raised:
                     Config.load(path)

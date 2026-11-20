@@ -6,9 +6,9 @@ import sys
 from copy import deepcopy
 from pathlib import Path
 
-from .versions import RUN_SCHEMA_VERSION, read_current_ledger
+from .versions import RUN_SCHEMA_VERSION, missing_ledger, parse_current_ledger
 from .commands import validate_commands
-from .config import PROJECT_FILE, normalized
+from .config import normalized, require_run_commands
 from .contracts import validate_required_commands
 from . import git, quota_wait, scope as boundary, stops
 from .operations import warn
@@ -20,7 +20,8 @@ from .continuation import (packet as continuation_packet, prepare_continuation_r
                            publish_continuation_rejection, read_execution_guidance, read_request_rejection,
                            record_execution_guidance)
 from .shared import asset_digest, validate_mcp
-from .util import HarnessError, fold_name, lock, uid, validate_command_directories
+from .state_files import StateFiles
+from .util import HarnessError, fold_name, uid, validate_command_directories
 
 
 class RunLifecycle(RuntimeService):
@@ -30,8 +31,7 @@ class RunLifecycle(RuntimeService):
             raise HarnessError("目标不能为空", stop=stops.make("invalid_input", "cli_arguments", data={"option": "goal"}))
         scope = boundary.declared(scope)
         untracked = git.check_starting_checkout(self.context.repo)
-        if not self.context.config.data["verification"]["commands"]:
-            raise HarnessError(f"请先在{PROJECT_FILE}中配置 verification.commands")
+        require_run_commands(self.context.config)
         git.reject_submodules(self.context.repo)
         with stops.classify("invalid_input", "input_schema", data={"option": "--plan"}):
             supplied_tasks = self.services.planning.validate_tasks(plan) if plan is not None else []
@@ -67,12 +67,14 @@ class RunLifecycle(RuntimeService):
                     "agent_dispatches": 0,
                     "plan_approval_required": pause_after_plan, "plan_approved": not pause_after_plan,
                     "created_by_operation": getattr(operation, "id", None) if operation is not None else None}
-        self.context.directory.mkdir(parents=True, exist_ok=True)
+        # The first save makes the run directory.
         self.context.save()
         self.announce("run_created")
-        with lock(self.context.directory / "run.lock", stop=stops.make("busy", "run_lock")):
+
+        def start_locked():
             try:
-                git.git(self.context.repo, "worktree", "add", "-b", self.context.run["branch"], str(worktree), "HEAD")
+                git.git(self.context.repo, "worktree", "add", "-b", self.context.run["branch"], str(worktree), "HEAD",
+                        effect=git.CHECKOUT)
                 self.context.run["worktree_binding"] = git.capture_worktree_binding(worktree, self.context.run["branch"])
                 self.context.save()
             except BaseException as error:
@@ -81,6 +83,7 @@ class RunLifecycle(RuntimeService):
             self.context.memory.repo = self.context.worktree
             self.context.memory.binding = self.context.run["worktree_binding"]
             return self.services.scheduler.execute(plan, step=step)
+        return self.context.run_lock(stops.make("busy", "run_lock"), start_locked)
 
     def announce(self, event):
         """Observation after a successful save: event, machine-readable stderr line, operation link.
@@ -113,8 +116,12 @@ class RunLifecycle(RuntimeService):
         try:
             # Version and identity are checked on a local value: binding the store
             # reads id and store_revision and locks the directory that id names.
+            outcome = StateFiles(self.context.state).read(("runs", ident, "state.json"), limit=None)
+            if outcome.state == "absent":
+                raise missing_ledger(path)
+            raw = outcome.evidence({"artifact": str(path)})
             with stops.evidence_reads(source={"artifact": str(path)}):
-                run = read_current_ledger(path)
+                run = parse_current_ledger(raw)
                 if run.get("id") != ident:
                     raise HarnessError("运行台账字段缺失或类型无效；保留原文件并核对证据")
             self.context.run = run
@@ -362,6 +369,8 @@ class RunLifecycle(RuntimeService):
                 fail(f"review_history.{tid} 必须是列表")
             entries(records)
         entries(self.context.run["final_history"], whole_run=True)
+        from .finalization import validate_final_records
+        validate_final_records(self.context.run["final_history"])
 
         def task_reference(ident, field):
             if not isinstance(ident, str) or ident not in task_ids:
@@ -457,8 +466,8 @@ class RunLifecycle(RuntimeService):
     def abandon(self, ident, *, confirm_exited=()):
         """Mark an unfinished run abandoned; the worktree is removed only by cleanup-run."""
         self.load_run(ident)
-        # A busy lock points to a wait the ledger read outside the lock records.
-        with lock(self.context.directory / "run.lock", stop=quota_wait.busy_stop(self.context.run)):
+
+        def abandon_locked():
             # Reload under the lock so a concurrent completion cannot be lost.
             self.load_run(ident)
             try:
@@ -479,14 +488,16 @@ class RunLifecycle(RuntimeService):
                 # The operation boundary: a refusal after a successful load is settled once.
                 self.settle_stop(error, ident=ident)
                 raise
+        # A busy lock points to a wait the ledger read outside the lock records.
+        return self.context.run_lock(quota_wait.busy_stop(self.context.run), abandon_locked)
 
     def resume(self, ident, *, step=False, approve_plan=False, reverify=False, confirm_exited=(),
                scope=(), environment_update=None, operator_decision=None,
                execution_guidance=None, reject_request=None):
         runtime = self.context
         self.load_run(ident)
-        # A busy lock points to a wait the ledger read outside the lock records.
-        with lock(self.context.directory / "run.lock", stop=quota_wait.busy_stop(self.context.run)):
+
+        def resume_locked():
             self.load_run(ident)
             try:
                 def state(status):
@@ -520,7 +531,7 @@ class RunLifecycle(RuntimeService):
                 if environment_update is not None and (reverify or scope):
                     raise HarnessError("--environment-update 不能与 --reverify 或 --scope 合用",
                                        stop=incompatible("--environment-update", "--reverify", "--scope"))
-                scope = boundary.declared(scope)
+                declared = boundary.declared(scope)
                 if approve_plan and not self.context.run["plan_history"]:
                     # Only a published first plan can be approved; nothing is written.
                     raise HarnessError("首版计划尚未发布，--approve-plan 无可批准的计划；先普通 resume 或扩大范围，发布后再批准",
@@ -577,7 +588,7 @@ class RunLifecycle(RuntimeService):
                     else:
                         prepared = prepare_continuation_rejection(runtime, rejection)
                         publish_rejection = lambda: publish_continuation_rejection(runtime, prepared)
-                added = [pattern for pattern in scope if pattern not in self.context.run["scope"]]
+                added = [pattern for pattern in declared if pattern not in self.context.run["scope"]]
                 # After every input is prepared: a rejected input never follows this possible digest save.
                 self.services.receipts.validate_pending_terminal_captures()
                 # One commit: the answers, the widened boundary and the adopted relaxation (spec-6 3.1).
@@ -623,3 +634,5 @@ class RunLifecycle(RuntimeService):
                 # The operation boundary: a refusal after a successful load is settled once.
                 self.settle_stop(error, ident=ident)
                 raise
+        # A busy lock points to a wait the ledger read outside the lock records.
+        return self.context.run_lock(quota_wait.busy_stop(self.context.run), resume_locked)

@@ -155,6 +155,14 @@ class ProcessSupervisor:
             self.outcome.cleanup_errors.append(failure("observe_group", error))
             return None
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, kind, error, trace):
+        # The exception is handed over, not read from sys.exc_info(): that also sees one the
+        # caller is handling, and an except clause binding it leaves lines an interrupt can replace it on.
+        self.finish(error)
+
     def finish(self, primary=None):
         try:
             self._finish_deferred(primary)
@@ -183,7 +191,8 @@ class ProcessSupervisor:
 
     def _finish_deferred(self, primary=None):
         from .util import HarnessError
-        with defer_cleanup_signals(primary=primary) as deferred:
+        # Not inherit: an exception the caller of run_process is handling must not hide this cleanup's request.
+        with defer_cleanup_signals(primary=primary, inherit=False) as deferred:
             try:
                 self._finish(primary)
             except HarnessError:

@@ -4,6 +4,8 @@ The HTML carries no inline script or style; the JS renders every value through
 textContent/createElement and never assigns markup. No external resources.
 """
 
+from .contracts import WORK
+
 INDEX_HTML = """<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -103,8 +105,8 @@ h2, h3 { line-height: 1.35; }
 .meta-line { display: flex; flex-wrap: wrap; gap: 4px 16px; font-size: 12px; color: var(--muted); }
 .badge { display: inline-flex; align-items: center; gap: 4px; padding: 1px 9px; border-radius: 999px; font-size: 12px;
   font-weight: 600; line-height: 1.7; white-space: nowrap; }
-.chip { display: inline-block; padding: 0 7px; border-radius: 6px; font-size: 12px; background: var(--surface-2);
-  color: var(--muted); white-space: nowrap; }
+.chip { display: inline-block; max-width: 100%; padding: 0 7px; border-radius: 6px; font-size: 12px;
+  background: var(--surface-2); color: var(--muted); overflow-wrap: anywhere; }
 .tone-ok { color: var(--ok); } .badge.tone-ok, .chip.tone-ok { background: var(--ok-bg); }
 .tone-warn { color: var(--warn); } .badge.tone-warn, .chip.tone-warn { background: var(--warn-bg); }
 .tone-bad { color: var(--bad); } .badge.tone-bad, .chip.tone-bad { background: var(--bad-bg); }
@@ -221,6 +223,8 @@ APP_JS = r""""use strict";
   var UNAVAILABLE = "不可用";
   var DEFAULT_TAIL = 65536;
   var MAX_TAIL = 1048576;
+  // The worker request contract's bound on a budget request's seconds, filled in from contracts.WORK below.
+  var MAX_REQUEST_SECONDS = __MAX_REQUEST_SECONDS__;
   var GOAL_EXCERPT = 180;
   var TEXT_EXCERPT = 140;
   var RECENT_EVENTS = 8;
@@ -840,6 +844,22 @@ APP_JS = r""""use strict";
     return parts.length ? el("div", "item-sub", parts.join(" · ")) : null;
   }
 
+  // Names the setting that satisfies a continuation request. The gate refuses a kind it does not know, so an
+  // unrecognized request only lists both keys to check, and a budget whose seconds the worker request contract
+  // refuses (a whole number from 1 to MAX_REQUEST_SECONDS) names no target.
+  function continuationHint(request) {
+    var kind = request ? request.kind : null;
+    if (kind === "commands") { return "在目标仓库的 .harness/project.toml 的 permissions.worker_commands 追加请求的精确命令（目录与 argv）后普通 resume 继续；需要先修正时可拒绝该请求。"; }
+    if (kind === "budget") {
+      var seconds = request.minimum_timeout_seconds;
+      if (Number.isInteger(seconds) && seconds > 0 && seconds <= MAX_REQUEST_SECONDS) {
+        return "把 runtime.agent_timeout_seconds 提高到至少 " + seconds + " 秒后普通 resume 继续（目标仓库的 .harness/project.toml 写了这个键时以它为准）；需要先修正时可拒绝该请求。";
+      }
+      return "请求所需的时限不可用（minimum_timeout_seconds 不是有效秒数），无法给出 runtime.agent_timeout_seconds 的目标值；可对照上面的请求原文核对这个键（目标仓库的 .harness/project.toml 写了这个键时以它为准）。";
+    }
+    return "续作请求的类型或内容无法识别；可核对目标仓库的 .harness/project.toml 中的 permissions.worker_commands 与 runtime.agent_timeout_seconds。";
+  }
+
   // Only what needs the operator now; a recorded quota wait, rework hints and call errors are shown where they belong.
   function attentionItems(data, run, summary) {
     var items = [];
@@ -889,14 +909,14 @@ APP_JS = r""""use strict";
     if (summary.missing_command_requirements) {
       add("warn", "缺失命令授权", [list(Object.keys(summary.missing_command_requirements).map(function (task) {
         return line(null, task + "：", mono(summary.missing_command_requirements[task]));
-      })), notice("追加精确授权后普通 resume 即可重检。", "hint")]);
+      })), notice("在目标仓库的 .harness/project.toml 的 permissions.worker_commands 追加这些精确命令（目录与 argv）后，普通 resume 即可重检。", "hint")]);
     }
     if (summary.continuation) {
       var cont = summary.continuation;
       add("warn", cont.state === "revision_pending" ? "续作请求已拒绝，等待修订" : "worker 请求续作授权", [
         line("item-sub", "任务 " + show(cont.task_id) + " · 状态 " + show(cont.state)),
         cont.request ? longText("continuation:request", JSON.stringify(cont.request), TEXT_EXCERPT) : null,
-        cont.state === "revision_pending" ? null : notice("满足请求（追加精确授权或调整超时）后普通 resume 继续；需要先修正时可拒绝该请求。", "hint"),
+        cont.state === "revision_pending" ? null : notice(continuationHint(cont.request), "hint"),
         cont.state === "revision_pending" ? null : resumeHint(data.id, "--reject-request FILE")]);
     }
     items.sort(function (a, b) { return (a.tone === "bad" ? 0 : 1) - (b.tone === "bad" ? 0 : 1); });
@@ -1004,7 +1024,7 @@ APP_JS = r""""use strict";
     else if (typeof since !== "number") { when = "尝试编号不可用"; }
     else if (since > 0) {
       when = "最近一次有结论的是第 " + show(latest.attempt) + " 次尝试（第 " + show(latest.round) + " 轮，" + conclusionText(latest) +
-        "）；之后尝试编号已到第 " + show(item.latest_attempt) + " 次（多 " + since + " 个，被豁免的调用也占编号），尚无审阅结论";
+        "）；之后尝试编号已到第 " + show(item.latest_attempt) + " 次（编号增加 " + since + "，被豁免的调用也占编号），尚无审阅结论";
     } else {
       when = "最新一次尝试（第 " + show(item.latest_attempt) + " 次）的结论：" + conclusionText(latest) +
         "（第 " + show(latest.round) + " 轮）";
@@ -1804,7 +1824,7 @@ APP_JS = r""""use strict";
     crumbs.appendChild(document.createTextNode(" / "));
     crumbs.appendChild(link("返回运行 " + current.runId, runHash(current.runId)));
     head.appendChild(crumbs);
-    var title = el("h2", null, "文件 " + data.source);
+    var title = el("h2", "breakable", "文件 " + data.source);
     head.appendChild(title);
     head.appendChild(line("meta-line", "大小 " + fmtBytes(data.size), "　读取尾部 " + fmtBytes(data.tail_bytes),
       "　采样时间 " + fmtTime(data.sampled_at)));
@@ -1855,3 +1875,6 @@ APP_JS = r""""use strict";
   render();
 })();
 """
+# The page judges a budget request's seconds by the contract's own bound, so the two cannot drift apart.
+APP_JS = APP_JS.replace("__MAX_REQUEST_SECONDS__", str(
+    WORK["properties"]["continuation_request"]["properties"]["minimum_timeout_seconds"]["maximum"]))

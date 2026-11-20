@@ -51,8 +51,8 @@ class RegistryGuard(unittest.TestCase):
                     "unclassified": 1, "interrupted": 130, "plan_approval": 0, "invalid_input": 2,
                     "config_mismatch": 2, "unsupported_ledger": 2}
         # 53 from step 4, four provider types from step 5, six scope boundary types from step 6,
-        # one transport failure type
-        self.assertEqual(len(stops.REGISTRY), 64)
+        # one transport failure type, one configuration file type
+        self.assertEqual(len(stops.REGISTRY), 65)
         for (kind, reason), entry in stops.REGISTRY.items():
             with self.subTest(row=(kind, reason)):
                 self.assertEqual(entry["exit_code"], expected.get(kind, 3))
@@ -67,9 +67,9 @@ class RegistryGuard(unittest.TestCase):
 
 # ---- G6: no runtime code reads the ledger's stop ------------------------------------------
 WRITERS = {("workflow.py", "stop"), ("scheduler.py", "execute"), ("cli.py", "status_summary")}
-DELETERS = {("scheduler.py", "execute"), ("run_lifecycle.py", "abandon")}
-OUTPUT_KEYS = {("cli.py", "stop_notice"), ("operations.py", "create"), ("watch_cli.py", "watch_run")}
-READERS = {("observe.py", "_operation_summary"), ("watch_cli.py", "watch_run")}  # projections and records only
+DELETERS = {("scheduler.py", "execute"), ("run_lifecycle.py", "abandon_locked")}  # abandon's body under run.lock
+OUTPUT_KEYS = {("cli.py", "stop_notice"), ("operations.py", "create"), ("watch_cli.py", "watching")}
+READERS = {("observe.py", "_operation_summary"), ("watch_cli.py", "watching")}  # projections and records only
 
 
 def stop_literals(name, text):

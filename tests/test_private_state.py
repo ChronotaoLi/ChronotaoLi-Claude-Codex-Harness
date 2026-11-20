@@ -1,11 +1,17 @@
+import errno
+import os
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from harness import git
-from harness.private_state import ensure_private_state
+from harness import git, state_files, stops
+from harness.private_state import CONTROL_LIMIT, ensure_private_state
+from harness.state_files import StateReadError
 from harness.util import HarnessError
+from test_provider_failures import FifoWatchdog
+from test_state_files import FakeOs, failing
 
 
 class PrivateStateTests(unittest.TestCase):
@@ -78,6 +84,37 @@ class PrivateStateTests(unittest.TestCase):
         (root / '.gitignore').symlink_to(outside / 'rules')
         with self.assertRaises(HarnessError):
             ensure_private_state(self.repo)
+
+    def test_the_control_file_is_read_once_without_waiting_following_or_reading_past_its_limit(self):
+        root = self.repo / '.harness'
+        root.mkdir()
+        control = root / '.gitignore'
+        exclude = self.repo / '.git/info/exclude'
+        before = exclude.read_bytes()
+        os.mkfifo(control)
+        watchdog = FifoWatchdog(control, bound=5)
+        try:
+            with self.assertRaisesRegex(HarnessError, '私有状态控制路径类型无效'):
+                ensure_private_state(self.repo)
+        finally:
+            self.assertFalse(watchdog.stop())
+        control.unlink()
+        # Past the limit is a conflict even when the rules beyond it are only comments; the bytes stay.
+        large = b'*\n' + b'#' * CONTROL_LIMIT + b'\n'
+        control.write_bytes(large)
+        with self.assertRaisesRegex(HarnessError, '私有忽略控制文件冲突'):
+            ensure_private_state(self.repo)
+        self.assertEqual(control.read_bytes(), large)
+        control.write_bytes(b'*\n' + b'#' * (CONTROL_LIMIT - 3) + b'\n')
+        ensure_private_state(self.repo)
+        # A read that fails is local I/O, never a missing control file that would be written anew.
+        control.write_bytes(b'*\n')
+        exclude.write_bytes(before)
+        with patch.object(state_files, 'os', FakeOs(open=failing(errno.EIO, '.gitignore'))), \
+                self.assertRaises(StateReadError) as caught:
+            ensure_private_state(self.repo)
+        self.assertEqual(stops.of(caught.exception)['kind'], 'runtime_failure')
+        self.assertEqual((control.read_bytes(), exclude.read_bytes()), (b'*\n', before))
 
     def test_linked_checkout_and_external_state(self):
         linked = Path(self.temp.name).resolve() / 'linked'

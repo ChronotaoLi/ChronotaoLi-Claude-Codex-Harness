@@ -6,14 +6,16 @@ import shutil
 import signal
 import subprocess
 import sys
+import traceback
 from pathlib import Path
 from unittest.mock import patch
 
+from git_isolation import clean_environment, fixture_git as _git
 from harness import git, verification
 from harness.config import Config
-from harness.permission_smoke import _git
 from harness.util import HarnessError, read_json
-from test_harness import ROOT, RepoCase, scratch, walk_exit, write_project_config
+from test_command_cwd_broker import capture_tail
+from test_harness import ROOT, RepoCase, walk_exit, write_project_config
 from test_runtime_changes import ScriptedBackend
 
 
@@ -36,10 +38,10 @@ def facts(row):
 
 
 def head(path):
-    # The commit a checkout actually holds, read by Git isolated from the environment's GIT_* settings.
-    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    # The commit a checkout actually holds, read by Git without a test's GIT_* settings but with the
+    # isolated configuration selectors, so no system configuration comes back.
     return subprocess.run(["git", "-C", path, "rev-parse", "HEAD"], capture_output=True, text=True,
-                          check=True, timeout=60, env=env).stdout.strip()
+                          check=True, timeout=60, env=clean_environment()).stdout.strip()
 
 
 def stop_of(error):
@@ -55,7 +57,6 @@ class CommandDirectoryVerificationTests(RepoCase):
         # Git isolated from the user's configuration and hooks.
         _git(self.repo, "add", ".")
         _git(self.repo, "-c", "user.name=Test", "-c", "user.email=test@localhost", "commit", "-q", "-m", "app")
-        self.outside = scratch(self)
         self.marker = self.outside / "ran"
         self.engines = []
         self.addCleanup(self.remove_checkouts)
@@ -147,6 +148,35 @@ class CommandDirectoryVerificationTests(RepoCase):
         self.assertEqual((told["command"], facts(told)), (missing, NOT_STARTED))
         self.assertIn("'build' 不存在", told["stderr"])
 
+    def test_a_check_whose_stderr_tail_is_cut_inside_a_character_is_a_failed_check_and_the_task_is_reworked(self):
+        # 4,201 bytes of stderr, the 4,000-byte tail starting on the last byte of a three-byte character; fails until build/ exists.
+        written = b"x" + "汉".encode() * 1400
+        command = {"cwd": ".", "argv": [sys.executable, "-c", "import os, sys; "
+                                        "sys.stderr.buffer.write(b'x' + '\\u6c49'.encode() * 1400); "
+                                        "sys.exit(0 if os.path.isdir('build') else 1)"]}
+        self.configure([command])
+
+        def second_attempt_builds(backend, kwargs, packet, result):
+            if kwargs["role"] == "worker" and sum(call["role"] == "worker" for call in backend.calls) == 2:
+                (kwargs["cwd"] / "build").mkdir()
+        backend = ScriptedBackend(second_attempt_builds)
+        engine, result = self.start(backend)
+        self.assertEqual(result["status"], "completed")
+        ledger = read_json(engine.directory / "state.json")
+        self.assertNotIn("stop", ledger)
+        self.assertEqual(self.events(engine).count("verification_failed"), 1)
+        self.assertEqual(sum(call["role"] == "worker" for call in backend.calls), 2)
+        # Valid JSON in strict UTF-8, carrying the cut tail as a failed check with complete evidence.
+        path = engine.directory / "verification" / "tasks" / "greet" / "1" / "results.json"
+        (row,) = json.loads(path.read_bytes().decode("utf-8"))
+        self.assertEqual((row["status"], row["exit_code"], row["evidence_complete"]), ("failed", 1, True))
+        self.assertNotIn("persistence_error", row)
+        self.assertEqual(Path(row["log"]).with_suffix(".stderr").read_bytes(), written)
+        self.assertEqual(row["stderr"], capture_tail(written))
+        self.assertTrue(row["stderr"].startswith("[earlier output omitted; see log]\n�汉"))
+        entry = self.checks(ledger, command=command)[0]
+        self.assertEqual((entry["status"], entry["evidence_complete"]), ("failed", True))
+
     # ---- rule 13: the fresh checkout's root -----------------------------------------------------------
 
     def test_setup_runs_in_its_directory_of_the_fresh_checkout_or_one_an_earlier_setup_created(self):
@@ -204,11 +234,12 @@ class CommandDirectoryVerificationTests(RepoCase):
 
     @contextlib.contextmanager
     def at_open(self, replace, when=lambda binding: True):
-        """For the first open_bound_root call ``when`` selects, ``replace(path)`` holds during that call only."""
-        real, calls = git.open_bound_root, []
+        """For the first open_bound_root call of a check ``when`` selects, ``replace(path)`` holds during that call only."""
+        real, calls, check = git.open_bound_root, [], verification.Verification.run_verification_commands.__code__
 
         def wrapped(held, worktree, binding):
-            if calls or not when(binding):
+            if (calls or not when(binding)
+                    or not any(frame.f_code is check for frame, _ in traceback.walk_stack(None))):
                 return real(held, worktree, binding)
             calls.append(binding["worktree"])
             with replace(Path(binding["worktree"])):

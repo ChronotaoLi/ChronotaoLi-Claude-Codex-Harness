@@ -29,7 +29,7 @@ def notices(stderr):
 
 class RegistryTests(unittest.TestCase):
     def test_registry_shape_and_projection(self):
-        self.assertEqual(len(stops.REGISTRY), 64)
+        self.assertEqual(len(stops.REGISTRY), 65)
         self.assertLessEqual({("plan_approval", "initial_plan"), ("interrupted", "signal"),
                               ("unclassified", "untyped_harness_error"), ("unclassified", "unexpected_exception")},
                              set(stops.REGISTRY))
@@ -410,7 +410,7 @@ class LedgerStopTests(OperationCase):
 
     def test_every_commit_keeps_stop_with_its_status(self):
         recorder, states = commit_recorder()
-        path = self.repo.parent / "plan.json"
+        path = self.outside / "plan.json"
         write_json(path, plan())
         self.config.data["runtime"]["max_agent_dispatches"] = 1
         with recorder:
@@ -472,7 +472,7 @@ class LedgerStopTests(OperationCase):
         self.assertNotIn("stop", next(state for state in states if state["status"] == "running"))
 
     def test_untyped_error_is_unclassified_and_exits_1(self):
-        path = self.repo.parent / "plan.json"
+        path = self.outside / "plan.json"
         write_json(path, plan())
 
         def boom(*args, **kwargs):
@@ -497,7 +497,7 @@ class LedgerStopTests(OperationCase):
         no_command_exit(self, notice["stop"], ("unclassified", "untyped_harness_error"))
 
     def test_interrupt_records_signal_stop_and_130(self):
-        path = self.repo.parent / "plan.json"
+        path = self.outside / "plan.json"
         write_json(path, plan())
 
         def interrupt(*args, **kwargs):
@@ -518,7 +518,7 @@ class LedgerStopTests(OperationCase):
 
     def test_file_input_record_keeps_stop_without_text(self):
         engine = self.blocked()
-        update = self.repo.parent / "update.json"
+        update = self.outside / "update.json"
         write_json(update, {"schema_version": 1, "secret": "VALUE-THAT-MUST-NOT-LEAK"})
         code, _, err = self.invoke(["resume", engine.run["id"], "--environment-update", str(update)])
         self.assertEqual(code, 2)
@@ -531,7 +531,7 @@ class LedgerStopTests(OperationCase):
         self.assertNotIn("VALUE-THAT-MUST-NOT-LEAK", json.dumps(record))
 
     def test_propagated_exceptions_still_record_their_projection(self):
-        path = self.repo.parent / "plan.json"
+        path = self.outside / "plan.json"
         write_json(path, plan())
         cases = (("before run creation", RuntimeError("internal fault"), "harness.runtime.Runtime.start"),
                  ("before run creation", sqlite3.ProgrammingError("db misuse"), "harness.runtime.Runtime.start"),
@@ -652,7 +652,7 @@ class WorkerRecoveryProjectionTests(RepoCase):
         worker = next(entry for entry in engine.run["dispatches"] if entry["role"] == "worker")
         self.assertEqual((worker["status"], worker["error"]), ("invalid_blocked", engine.run["feedback"]["output_error"]))
         self.assertNotEqual(worker["error"], stop_text)
-        update = self.repo.parent / "environment-update.json"
+        update = self.outside / "environment-update.json"
         write_json(update, {"schema_version": 1, "task_id": "greet", "blocker_dispatch_id": worker["id"],
                             "summary": "Restored"})
         result = self.engine(backend).resume(engine.run["id"], environment_update=update)

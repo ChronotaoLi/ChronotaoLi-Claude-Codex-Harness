@@ -39,7 +39,7 @@ class CommandServerTests(unittest.TestCase):
         self.assertFalse((self.root / 'nope').exists())
         self.assertEqual(hashlib.sha256(Path(result['stdout_path']).read_bytes()).hexdigest(), result['stdout_sha256'])
         self.assertTrue((Path(result['stdout_path']).parent / 'receipt.json').exists())
-        self.assertTrue(command_processes(self.job)[0]['exit_confirmed'])
+        self.assertTrue(command_processes(self.job, state=self.root)[0]['exit_confirmed'])
 
     def test_unauthorized_and_extra_fields_do_not_execute(self):
         argv = [sys.executable, '-c', 'raise Exception("should not run")']
@@ -48,7 +48,7 @@ class CommandServerTests(unittest.TestCase):
         for args in ({'command_id': 'no'}, {'command_id': command_id(command), 'argv': argv}, {}):
             with self.assertRaises(HarnessError):
                 broker.run_command(args)
-        self.assertEqual(command_processes(self.job), [])
+        self.assertEqual(command_processes(self.job, state=self.root), [])
         self.assertTrue(handle({'method': 'tools/call', 'params': {'name': 'list_commands', 'arguments': {'cwd': '.'}}}, broker)['isError'])
 
     def test_manifest_tamper_and_duplicate_ids(self):
@@ -72,7 +72,7 @@ class CommandServerTests(unittest.TestCase):
                 with self.assertRaises(HarnessError) as raised:
                     Broker(broker.path, hashlib.sha256(broker.path.read_bytes()).hexdigest())
                 self.assertIn(field, str(raised.exception))
-        self.assertEqual(command_processes(self.job), [])
+        self.assertEqual(command_processes(self.job, state=self.root), [])
 
     def test_start_failure_and_timeout_have_receipts(self):
         argv = {'cwd': '.', 'argv': [str(self.root / 'missing')]}
@@ -84,7 +84,7 @@ class CommandServerTests(unittest.TestCase):
         timed = broker.run_command({'command_id': command_id(sleep)})
         self.assertTrue(timed['timed_out'])
         self.assertTrue(timed['exit_confirmed'])
-        ensure_command_processes_exited(self.job)
+        ensure_command_processes_exited(self.job, state=self.root)
 
     def test_starting_journal_requires_exact_operator_assertion(self):
         broker = self.broker([])
@@ -92,20 +92,21 @@ class CommandServerTests(unittest.TestCase):
         folder.mkdir()
         write_json(folder / 'process.json', {'id': self.job.name + ':command:' + folder.name,
                    'command_id': 'fixture', 'pgid': None, 'process_state': 'starting', 'exit_confirmed': False})
-        record = command_processes(self.job)[0]
+        record = command_processes(self.job, state=self.root)[0]
         with self.assertRaises(HarnessError):
-            ensure_command_processes_exited(self.job)
+            ensure_command_processes_exited(self.job, state=self.root)
         parent = {'command_exit_confirmations': {record['id']: {'journal_digest': record['journal_digest']}}}
-        ensure_command_processes_exited(self.job, parent)
-        write_json(folder / 'process.json', {k: v for k, v in record.items() if k not in ('journal', 'journal_digest')} | {'pgid': 123})
+        ensure_command_processes_exited(self.job, parent, state=self.root)
+        write_json(folder / 'process.json', {k: v for k, v in record.items() if k not in ('journal', 'journal_digest', 'journal_state')} | {'pgid': 123})
+        self.assertEqual(command_processes(self.job, state=self.root)[0]['journal_state'], 'valid')
         with self.assertRaises(HarnessError):
-            ensure_command_processes_exited(self.job, parent, observe=lambda _: True)
+            ensure_command_processes_exited(self.job, parent, state=self.root, observe=lambda _: True)
 
     def test_symlink_journal_refused(self):
         self.broker([])
         (self.job / 'commands' / ('b' * 32)).symlink_to(self.root, target_is_directory=True)
         with self.assertRaises(HarnessError):
-            command_processes(self.job)
+            command_processes(self.job, state=self.root)
 
     def test_fresh_stdio_protocol(self):
         broker = self.broker([{'cwd': '.', 'argv': [sys.executable, '-V']}])

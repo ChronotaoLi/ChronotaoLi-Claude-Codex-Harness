@@ -151,7 +151,7 @@ class RuntimeChangesTests(RepoCase):
         (engine.worktree / "hello.py").write_text('def greet(name):\n    return f"Hello, {name}!"\n# unreviewed\n')
         run = read_json(engine.directory / "state.json")
         request = run["decision_requests"][-1]
-        answer = self.repo.parent / "continue.json"
+        answer = self.outside / "continue.json"
         answer.write_text(json.dumps({"schema_version": 1, "request_id": request["id"], "task_id": "final",
                                       "decision": "continue", "summary": "Proceed with the edited tree."}))
         with self.assertRaisesRegex(HarnessError, "干净的已接受提交"):

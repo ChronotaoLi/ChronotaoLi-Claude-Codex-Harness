@@ -5,48 +5,77 @@ process, as SIGKILL would: no in-memory state can repair a split save.
 """
 import hashlib
 import json
+import os
 from pathlib import Path
 from unittest.mock import patch
 
-from harness import git
+from harness import git, state_files
 from harness.planning import Planner
 from harness.recovery import snapshot_digest
 from harness.util import HarnessError, read_json
 from test_harness import crash_after_save, crash_point, decide_bound
 from test_decide import (KEY, DecideCase, Script, ask, block_first, blocked_by_task, describe, implement,
                          revise, task)
+from test_state_files import FakeOs
 
 
 class Killed:
-    """Write the first state save that ``boundary(old, new)`` marks, then kill the process."""
+    """Write the first state save that ``boundary(old, new)`` marks, then kill the process.
+
+    A file is published by ``Path.replace``, the ledger by a rename in its locked directory (``harness.state_files``).
+    """
 
     def __init__(self, boundary=None, target=None):
         self.boundary, self.target = boundary, target
         self.killed = False
         self.original = Path.replace
 
-    def replace(self, source, destination):
+    def decide(self, name, old, new):
+        """Whether the write publishing ``name`` is the kill point; ``old()`` is None when it is new."""
         if self.killed:
             raise OSError("the killed process cannot write")
-        destination = Path(destination)
-        hit = False
-        if self.target is not None and destination.name == self.target:
-            hit = True
-        elif self.boundary is not None and destination.name == "state.json" and destination.exists():
-            hit = self.boundary(json.loads(destination.read_text()), json.loads(Path(source).read_text()))
-        result = self.original(source, destination)
+        if self.target is not None and name == self.target:
+            return True
+        if self.boundary is not None and name == "state.json":
+            before = old()
+            return before is not None and self.boundary(json.loads(before), json.loads(new()))
+        return False
+
+    def finish(self, hit, result):
         if hit:
             self.killed = True
             raise KeyboardInterrupt()
         return result
 
+    def replace(self, source, destination):
+        destination = Path(destination)
+        hit = self.decide(destination.name, lambda: destination.read_bytes() if destination.exists() else None,
+                          Path(source).read_bytes)
+        return self.finish(hit, self.original(source, destination))
+
+    def renamed(self, real, source, destination, *, src_dir_fd, dst_dir_fd):
+        def read(name, directory):
+            with open(name, "rb", opener=lambda path, flags: os.open(path, flags, dir_fd=directory)) as stream:
+                return stream.read()
+
+        def old():
+            try:
+                return read(destination, dst_dir_fd)
+            except FileNotFoundError:
+                return None
+        hit = self.decide(destination, old, lambda: read(source, src_dir_fd))
+        return self.finish(hit, real(source, destination, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd))
+
     def __enter__(self):
-        self.patch = patch.object(Path, "replace", new=lambda source, destination: self.replace(source, destination))
-        self.patch.__enter__()
+        self.patches = [patch.object(Path, "replace", new=lambda source, destination: self.replace(source, destination)),
+                        patch.object(state_files, "os", FakeOs(replace=self.renamed))]
+        for item in self.patches:
+            item.__enter__()
         return self
 
     def __exit__(self, *exc):
-        self.patch.__exit__(*exc)
+        for item in reversed(self.patches):
+            item.__exit__(*exc)
         return False
 
 
@@ -361,7 +390,7 @@ class AskCandidateChangeTests(DecideCase):
         self.assertEqual(len(script.calls), calls)
         # The answer does not open execution: the HEAD gate still holds.
         request = saved["decision_requests"][0]
-        answer = self.repo.parent / "continue.json"
+        answer = self.outside / "continue.json"
         answer.write_text(json.dumps({"schema_version": 1, "request_id": request["id"], "task_id": "a",
                                       "decision": "continue", "summary": "Continue"}))
         with self.assertRaises(HarnessError) as stopped:

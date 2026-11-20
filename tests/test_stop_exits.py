@@ -26,7 +26,7 @@ from harness.runtime import Runtime
 from harness.util import HarnessError, read_json, write_json
 from test_decide import DecideCase, Script, ask, block_first, blocked_by_task, implement, task
 from test_harness import (ROOT, RepoCase, cli_notice, continues_without_stop, no_command_exit, refused_by_cli, scratch,
-                          run_cli, walk_exit, walk_notice_exit)
+                          run_cli, walk_exit, walk_notice_exit, write_operator_config, write_project_config)
 from test_runtime_changes import ScriptedBackend, revised, trigger_kind
 
 
@@ -200,6 +200,7 @@ ROW_COVERAGE = {
                    "test_stop_exits.RefusalRowTests.test_incompatible_options"),
     "stale-request": Row(("invalid_input", "stale_request"), OPERATION, "test_stop_exits.InputRowTests.test_stale_request"),
     "run-state": Row(("invalid_input", "run_state"), OPERATION, "test_stop_exits.RefusalRowTests.test_run_state"),
+    "config-file": Row(("invalid_input", "config_file"), OPERATION, "test_stop_exits.InputRowTests.test_config_file"),
 }
 
 
@@ -327,7 +328,8 @@ class ExitRowTests(RepoCase):
                 write_json(update, {"schema_version": 1, "task_id": "greet", "blocker_dispatch_id": worker["id"],
                                     "summary": "Docker restarted"})
                 after = walk_exit(self, engine.directory, ("environment", "worker_blocked"), backend=backend,
-                                  choose=exit_number, fill={"FILE": update}, expect_status="completed")
+                                  choose=exit_number, fill={"FILE": update} if exit_number else None,
+                                  expect_status="completed")
                 workers = [d for d in after["dispatches"] if d["role"] == "worker"]
                 # Same task, a fresh worker; the exempted blocker spent no work attempt.
                 self.assertEqual((len(workers), work_attempts(after)), (2, {"greet": 1}))
@@ -879,6 +881,27 @@ class InputRowTests(RepoCase):
                             "decision": "continue", "summary": "Use the documented greeting."})
         walk_exit(self, engine.directory, ("operator_decision", "answer_required"), backend=backend,
                   fill={"FILE": answer}, expect_status="completed")
+
+    def test_config_file(self):
+        from harness import git
+        backend = ScriptedBackend()
+        project = git.repository(self.repo) / ".harness" / "project.toml"
+        valid = write_project_config(self.repo, self.config.data["verification"]["commands"]).read_bytes()
+        project.write_bytes(b'[verification]\ncommands = [["make", "test"]]\n')  # an argv array, not a command object
+        argv = ["--config", str(write_operator_config(scratch(self) / "harness.toml")),
+                "run", "Implement greet", "--plan", str(ROOT / "examples" / "plan.json")]
+        # The CLI reads both files itself: the case's configuration would never read the broken one.
+        notice = refused_by_cli(self, backend, argv, ("invalid_input", "config_file"), 2, load=True)
+        no_command_exit(self, notice, ("invalid_input", "config_file"))
+        self.assertEqual((notice["data"], notice["source"]), ({"file": "project"}, {"artifact": str(project)}))
+        # Refused before any write: no operation record, no run, no private state beyond the file itself.
+        self.assertEqual([path.name for path in (self.repo / ".harness").iterdir()], ["project.toml"])
+        self.assertEqual(backend.calls, [])
+        project.write_bytes(valid)  # the file is corrected; the same command goes on
+        code, errors = run_cli(self, backend, argv, load=True)
+        self.assertEqual(code, 0, errors)
+        (ledger,) = (self.repo / ".harness" / "runs").glob("*/state.json")
+        self.assertEqual(read_json(ledger)["status"], "completed")
 
     def test_stale_request(self):
         backend, engine, request, answer = self.operator_question()

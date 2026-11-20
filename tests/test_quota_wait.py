@@ -1303,7 +1303,7 @@ class ContractTests(WaitCase):
         import ast
         allowed = {("quota_wait.py", "validate_ledger"), ("quota_wait.py", "clear"), ("quota_wait.py", "project"),
                    ("quota_wait.py", "_wait"), ("cli.py", "status_summary"), ("watch_cli.py", "watch_run"),
-                   ("diagnostics.py", "ledger_stage")}
+                   ("watch_cli.py", "watching"), ("diagnostics.py", "ledger_stage")}
         found = set()
         for path in sorted((ROOT / "harness").glob("*.py")):
             tree = ast.parse(path.read_text(encoding="utf-8"))

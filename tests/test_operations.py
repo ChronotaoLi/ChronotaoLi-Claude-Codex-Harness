@@ -25,6 +25,7 @@ from harness.shared import asset_digest
 from harness.util import HarnessError, read_json, write_json
 from harness.versions import RUN_SCHEMA_VERSION
 from test_harness import ROOT, RepoCase, scratch, write_operator_config, write_project_config
+from test_project_config_gate import deep_dotted, deep_header
 
 
 def fake_probe(name):
@@ -799,6 +800,29 @@ class DoctorEchoTests(OperationCase):
                 self.assertIsInstance(project["error"], str)
                 self.assertTrue(project["error"])
                 self.assertNotIn("\n", project["error"])
+
+    def test_doctor_reports_a_project_file_nested_too_deep_to_copy(self):
+        operator = write_operator_config(scratch(self) / "harness.toml")
+        place = git.repository(self.repo) / ".harness" / "project.toml"
+        place.parent.mkdir()
+        for name, content in (("700 dotted parts", deep_dotted()), ("999-part header and key", deep_header())):
+            place.write_bytes(content)
+            for logged_in in (True, False):
+                with self.subTest(case=name, logged_in=logged_in):
+                    code, report, errors = self.doctor(["--config", str(operator)], logged_in=logged_in, load=Config.load)
+                    self.assertEqual(code, 0 if logged_in else 1, errors)
+                    project = report["project"]
+                    self.assertEqual((project["exists"], project["sha256"]),
+                                     (True, hashlib.sha256(content).hexdigest()))
+                    self.assertIsInstance(project["error"], str)
+                    self.assertTrue(project["error"])
+                    self.assertNotIn("\n", project["error"])
+
+    def test_doctor_does_not_hide_a_programming_error_while_checking_the_project_file(self):
+        # Only the file's refusals are reported in project.error; a recursion anywhere else is a defect.
+        write_project_config(self.repo)
+        with patch.object(Config, "effective", side_effect=RecursionError("defect")), self.assertRaises(RecursionError):
+            self.doctor()
 
     def test_doctor_outside_a_git_repository_reports_no_project_file(self):
         outside = scratch(self)

@@ -144,7 +144,8 @@ class ConvergenceTests(unittest.TestCase):
         first = rejection("X", attempt=1, dispatch="d1")
         variants = {
             "blocking finding": rejection("X", attempt=2, dispatch="d2", verdict="approve"),
-            "disposition errors": approval(2, "d2", disposition_errors=["f1 has no disposition"]),
+            "disposition errors": approval(2, "d2", disposition_errors=[{"code": "finding_not_independently_resolved", "key": "f1",
+                                                                         "review_dispatch_id": "d1", "finding_index": 0}]),
             "invalid rejected": approval(2, "d2", status="invalid_rejected", validation_error="f1 is open"),
             "validation error": approval(2, "d2", validation_error="schema mismatch"),
         }

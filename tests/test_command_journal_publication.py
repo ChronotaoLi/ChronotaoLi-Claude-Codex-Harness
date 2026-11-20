@@ -53,12 +53,12 @@ EXITS = ('resume', 'resume_confirm_exited', 'abandon')
 class BrokerPublicationWindowTests(BrokerFixture):
     def assert_no_partial_record(self):
         self.assertEqual(list((self.job / 'commands').iterdir()), [])
-        self.assertEqual(command_processes(self.job), [])
+        self.assertEqual(command_processes(self.job, state=self.run_dir), [])
         parent = self.parent_entry()
         validate_command_directories([parent], self.run_dir)
-        self.assertEqual(ensure_dispatches_exited([parent]), [])
+        self.assertEqual(ensure_dispatches_exited([parent], state=self.run_dir), [])
         audits = []
-        confirm_dispatches_exited([parent], [parent['id']], audit=lambda *a, **k: audits.append(a), save=lambda: None)
+        confirm_dispatches_exited([parent], [parent['id']], state=self.run_dir, audit=lambda *a, **k: audits.append(a), save=lambda: None)
         self.assertEqual(audits, [])
 
     def test_delete_window_failure_deletes_nothing_and_publishes_nothing(self):
@@ -75,7 +75,7 @@ class BrokerPublicationWindowTests(BrokerFixture):
                 result = broker.delete_path({'path': 'legacy/old.txt'})
                 self.assertEqual((result['outcome'], result['deleted'], result['evidence_complete']),
                                  ('deleted', True, True))
-                self.assertEqual([r['command_id'] for r in ensure_command_processes_exited(self.job)],
+                self.assertEqual([r['command_id'] for r in ensure_command_processes_exited(self.job, state=self.run_dir)],
                                  [DELETE_COMMAND_ID])
                 self.assert_outside_intact()
                 git.git(self.repo, 'checkout', '--', 'legacy/old.txt')
@@ -101,10 +101,10 @@ class BrokerPublicationWindowTests(BrokerFixture):
         staged = sorted((self.job / STAGING_DIRECTORY).iterdir())
         # One folder lost its journal write; the other holds a whole, unpublished journal.
         self.assertEqual(sorted(any(folder.iterdir()) for folder in staged), [False, True])
-        self.assertEqual(command_processes(self.job), [])
+        self.assertEqual(command_processes(self.job, state=self.run_dir), [])
         self.assertEqual(broker.run_command({'command_id': command_id(ECHO)})['exit_code'], 0)
         self.assertEqual(broker.delete_path({'path': 'legacy/old.txt'})['outcome'], 'deleted')
-        self.assertEqual(sorted(r['command_id'] for r in ensure_command_processes_exited(self.job)),
+        self.assertEqual(sorted(r['command_id'] for r in ensure_command_processes_exited(self.job, state=self.run_dir)),
                          sorted([command_id(ECHO), DELETE_COMMAND_ID]))
         self.assertEqual(len(list((self.job / STAGING_DIRECTORY).iterdir())), 2)
 
@@ -160,7 +160,7 @@ class LifecyclePublicationWindowTests(RepoCase):
     def assert_terminal_views_ignore_staging(self, run, first):
         job = Path(first['command_directory']).parent
         self.assertTrue((job / STAGING_DIRECTORY).is_dir())
-        self.assertEqual(command_processes(job), [])
+        self.assertEqual(command_processes(job, state=self.repo / '.harness'), [])
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(cli.main(['--repo', str(self.repo), 'status', run['id']]), 0)
         # The simulated verification leaves only these known test caches.

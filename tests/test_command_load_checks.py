@@ -68,7 +68,9 @@ def corrective(rejections, worker_hook=None):
             result.update(verdict="request_changes", findings=[finding()])
         if trigger_kind(kwargs, packet) == "final" and finals <= 2:
             task = copy.deepcopy(current_tasks(packet)[0])
-            task.update(id=f"fix{finals}", depends_on=["greet"])
+            # The fixture's commands, not the packet's: a long interpreter path reaches the packet as an exact_command_ref.
+            task.update(id=f"fix{finals}", depends_on=["greet"], required_commands=[copy.deepcopy(UNIT)],
+                        self_checks=[copy.deepcopy(UNIT)])
             revised(result, packet, "Address the final finding", new_tasks=[task])
         if kwargs["role"] == "worker" and kwargs["task"]["id"] != "greet":
             with (kwargs["cwd"] / "hello.py").open("a") as file:

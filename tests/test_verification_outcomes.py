@@ -1,5 +1,4 @@
 import contextlib
-import fcntl
 import json
 import os
 import subprocess
@@ -11,13 +10,14 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from harness import stops
+from harness import state_files, stops
 from harness.process_runtime import ProcessOutcome
 from harness.run_store import RunStore
 from harness.util import CommandDirectoryError, HarnessError, ProcessStartError, ProcessTimeout, read_json, tail, write_json
 from harness.verification import Verification, checks_passed
 from harness.workflow import Workflow
 from test_harness import ROOT, RepoCase
+from test_state_files import FakeFcntl, FakeOs
 
 
 # Rule 10's facts for a command whose directory could not be opened, and the reasons its record tells apart.
@@ -450,11 +450,16 @@ class StopSaveChainTests(unittest.TestCase):
             ledger = Path(directory) / "runs" / run["id"] / "state.json"
             written = ledger.read_bytes() + b"\n"
             ledger.write_bytes(written)   # another writer: the stop's save is refused
-            interrupt, flock = KeyboardInterrupt("at store unlock"), fcntl.flock
+            interrupt, locked = KeyboardInterrupt("at store unlock"), []
 
-            def unlock(fd, operation):
-                flock(fd, operation)
-                if operation == fcntl.LOCK_UN:
+            def lock(real, fd, operation):
+                real(fd, operation)
+                locked.append(fd)
+
+            def unlock(real, fd):  # store.lock is released when its descriptor closes
+                real(fd)
+                if fd in locked:
+                    locked.clear()
                     raise interrupt
             workflow = Workflow(SimpleNamespace(run=run, save=store.commit),
                                 SimpleNamespace(lifecycle=SimpleNamespace(settle_stop=lambda error: run["stop"])))
@@ -463,7 +468,8 @@ class StopSaveChainTests(unittest.TestCase):
                 try:
                     raise original
                 except HarnessError as error:
-                    with patch("harness.util.fcntl.flock", side_effect=unlock):
+                    with patch.object(state_files, "fcntl", FakeFcntl(lock)), \
+                            patch.object(state_files, "os", FakeOs(close=unlock)):
                         workflow.stop(error)
             self.assertIs(caught.exception, interrupt)
             self.assertEqual(ledger.read_bytes(), written)

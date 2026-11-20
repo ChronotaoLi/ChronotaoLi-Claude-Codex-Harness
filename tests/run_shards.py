@@ -5,7 +5,8 @@
 Test IDs are collected with standard discovery, exactly as by
 ``python3 -m unittest discover -s tests``; a test ID collected more than once
 fails the run before any shard starts.  Modules are split into groups by
-test count, and each group runs as ``python3 -m unittest -v <modules>`` in its
+test count, and each group runs as ``python3 -m unittest -v <modules>`` (led by
+``stop_tripwire`` when ``tests/stop_tripwire.py`` exists) in its
 own process with the repository root as cwd and ``tests/`` on PYTHONPATH, so
 test modules keep importing each other by top-level name (``test_x``, never
 ``tests.test_x``).  Afterwards every log's per-test result lines are parsed and
@@ -32,6 +33,8 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import git_isolation  # collection and every shard inherit the isolated environment
+
 ROOT = Path(__file__).resolve().parent.parent
 START_DIR = "tests"
 DEFAULT_PATTERN = "test*.py"
@@ -39,6 +42,12 @@ FAILED_IMPORT = "unittest.loader._FailedTest."
 FIXTURES = frozenset({"setUpModule", "tearDownModule", "setUpClass", "tearDownClass"})
 STOP_GRACE = 10.0
 LIST_LIMIT = 50
+TRIPWIRE = "stop_tripwire"   # tests/stop_tripwire.py: no test of its own; it watches the tests of its process
+# The stderr line the tripwire of the collection or of a shard writes at exit when its report file could not be
+# written (test results stand): this prefix, ": ", then one JSON object in printable ASCII, so no path or error text
+# in it can end the line.
+REPORT_INCOMPLETE = "stop tripwire: report incomplete"
+INCOMPLETE_TITLE = "stop tripwire report incomplete (test results unaffected)"
 
 # Runs in a child process (cwd = root) so test imports never touch this process.
 _COLLECT = r'''
@@ -68,7 +77,9 @@ with open(sys.argv[3], "w", encoding="utf-8") as handle:
 
 
 class CollectionError(Exception):
-    pass
+    def __init__(self, message, report_incomplete=()):
+        super().__init__(message)
+        self.report_incomplete = list(report_incomplete)  # the collecting process's REPORT_INCOMPLETE lines
 
 
 @dataclass
@@ -76,6 +87,7 @@ class Collection:
     modules: dict  # module name -> test IDs in discovery order
     failed_modules: list
     errors: list
+    report_incomplete: list = field(default_factory=list)  # the collecting process's REPORT_INCOMPLETE lines
 
     @property
     def ids(self):
@@ -101,15 +113,18 @@ def collect(root, pattern, out_dir, python=sys.executable):
     proc = subprocess.run([python, "-c", _COLLECT, START_DIR, pattern, str(target)],
                           cwd=root, env=child_env(root), stdin=subprocess.DEVNULL,
                           capture_output=True, text=True, errors="replace")
+    # Discovery imports the test modules, so a stop published while loading them reaches the tripwire there too; read
+    # before the exit status, so a collecting process that failed still says what its report misses.
+    incomplete = [dict(entry, source="collection") for entry in report_incomplete(proc.stderr)]
     if proc.returncode != 0 or not target.is_file():
         detail = (proc.stderr or proc.stdout).strip()[-4000:]
-        raise CollectionError(f"test discovery exited {proc.returncode}\n{detail}")
+        raise CollectionError(f"test discovery exited {proc.returncode}\n{detail}", incomplete)
     data = json.loads(target.read_text(encoding="utf-8"))
     modules = {}
     for name, ids in data["modules"]:
         modules.setdefault(name, []).extend(ids)
     failed = sorted({test_id[len(FAILED_IMPORT):] for test_id in data["failed"]})
-    return Collection(modules, failed, data["errors"])
+    return Collection(modules, failed, data["errors"], incomplete)
 
 
 def split(counts, shards):
@@ -172,6 +187,23 @@ class ParsedLog:
     ran: int | None
     verdict: str | None
     failures: list  # (ERROR|FAIL, description, first error line)
+    report_incomplete: list = field(default_factory=list)  # REPORT_INCOMPLETE lines, decoded
+
+
+_INCOMPLETE = re.compile(rf"^{re.escape(REPORT_INCOMPLETE)}: (.*)$", re.M)
+
+
+def report_incomplete(text):
+    """The REPORT_INCOMPLETE lines of a process's stderr, each decoded from its JSON (``{"unreadable": line}`` when
+    that fails, e.g. a line cut short)."""
+    entries = []
+    for match in _INCOMPLETE.finditer(text):
+        try:
+            entry = json.loads(match[1])
+        except ValueError:
+            entry = None
+        entries.append(entry if isinstance(entry, dict) else {"unreadable": match[1]})
+    return entries
 
 
 def _test_id(name, target):
@@ -241,7 +273,7 @@ def parse_log(text):
     if end:
         for kind, description, body in _BLOCK.findall(text[end.start():]):
             failures.append((kind, description, _error_line(body)))
-    return ParsedLog(executions, fixtures, ran, verdict, failures)
+    return ParsedLog(executions, fixtures, ran, verdict, failures, report_incomplete(text))
 
 
 # --- running -----------------------------------------------------------------
@@ -308,17 +340,20 @@ def _stop(procs, grace=STOP_GRACE):
     _wait_groups(procs, groups, 5)
 
 
-def make_shards(groups, collection, out_dir, python=sys.executable):
+def make_shards(groups, collection, out_dir, root, python=sys.executable):
+    """One unittest command per group; ``root``'s stop tripwire, when it has one, is the first module of each."""
     out_dir = Path(out_dir)
+    # Imported first, the tripwire is installed before any test module imports a function it wraps by name.
+    first = [TRIPWIRE] if (Path(root) / START_DIR / f"{TRIPWIRE}.py").is_file() else []
     return [Shard(index, list(modules), sum(len(collection.modules.get(name, ())) for name in modules),
                   out_dir / f"shard-{index}.log", out_dir / f"shard-{index}.stdout.log",
-                  [python, "-m", "unittest", "-v", *modules])
+                  [python, "-m", "unittest", "-v", *first, *modules])
             for index, modules in enumerate(groups, 1)]
 
 
 def run_groups(groups, collection, out_dir, root=ROOT, python=sys.executable, echo=print):
     """Run each module group in its own unittest process and verify the results against ``collection``."""
-    shards = make_shards(groups, collection, out_dir, python)
+    shards = make_shards(groups, collection, out_dir, root, python)
     env = child_env(root)
     procs = []  # shards whose process group may still have members
     started = time.monotonic()
@@ -355,6 +390,7 @@ def verify(collection, shards, wall):
     executed = collections.Counter()
     outcomes = collections.Counter()
     import_failures, fixture_errors, problems, failures, rows = [], [], [], [], []
+    incomplete = list(collection.report_incomplete)
     for shard in shards:
         parsed = shard.parsed
         seen = collections.Counter()
@@ -390,6 +426,7 @@ def verify(collection, shards, wall):
             is_test = match and not (match[1] in FIXTURES and not match[2].endswith("." + match[1]))
             test = _test_id(match[1], match[2]) + match[3] if is_test else description
             failures.append({"shard": shard.index, "kind": kind, "test": test, "line": line})
+        incomplete.extend(dict(entry, source=f"shard {shard.index}") for entry in parsed.report_incomplete)
         executed += seen
         rows.append({"index": shard.index, "modules": shard.modules, "tests": shard.tests,
                      "executed": sum(seen.values()), "ran": parsed.ran, "verdict": parsed.verdict,
@@ -407,7 +444,9 @@ def verify(collection, shards, wall):
             "executed": sum(executed.values()), "outcomes": {kind: outcomes[kind] for kind in (*_OUTCOMES, "unknown")},
             "wall_seconds": round(wall, 3), "shards": rows, "missing": missing, "duplicated": duplicated,
             "unexpected": unexpected, "import_failures": import_failures, "fixture_errors": fixture_errors,
-            "log_problems": problems, "failures": failures}
+            "log_problems": problems, "failures": failures,
+            # Not a test outcome, so not part of "ok": the stop tripwire's report file misses findings.
+            "report_incomplete": incomplete}
 
 
 # --- reporting ---------------------------------------------------------------
@@ -420,6 +459,14 @@ def _listing(echo, title, items):
         echo(f"  {item}")
     if len(items) > LIST_LIMIT:
         echo(f"  ... {len(items) - LIST_LIMIT} more in result.json")
+
+
+def _incomplete_text(entry):
+    # Decoded values are shown with repr: a path or an error text keeps to one line here too.
+    if "unreadable" in entry:
+        return f"{entry['source']}: unreadable line {entry['unreadable']!r}"
+    return (f"{entry['source']}: {entry.get('lines')!r} line(s) of {entry.get('writes')!r} write(s) missing from "
+            f"{entry.get('report')!r} (first error: {entry.get('first_error')!r})")
 
 
 def report(result, echo):
@@ -447,6 +494,7 @@ def report(result, echo):
                                         for item in result["duplicated"]])
     _listing(echo, "unexpected tests", result["unexpected"])
     _listing(echo, "log problems", result["log_problems"])
+    _listing(echo, INCOMPLETE_TITLE, [_incomplete_text(entry) for entry in result["report_incomplete"]])
     echo("OK" if result["ok"] else "FAILED")
 
 
@@ -494,7 +542,9 @@ def _main(args, root, out, echo):
         collection = collect(root, args.pattern, out)
     except CollectionError as error:
         echo(f"collection failed: {error}")
-        _write_json(out / "result.json", {"ok": False, "collection_error": str(error)})
+        _listing(echo, INCOMPLETE_TITLE, [_incomplete_text(entry) for entry in error.report_incomplete])
+        _write_json(out / "result.json", {"ok": False, "collection_error": str(error),
+                                          "report_incomplete": error.report_incomplete})
         return 1
     ids = collection.ids
     echo(f"collected {len(ids)} tests from {len(collection.modules)} modules in {time.monotonic() - began:.1f}s "
@@ -509,14 +559,16 @@ def _main(args, root, out, echo):
                  [f"{item['test']}: collected {item['collected']} times" for item in duplicates])
         if not ids:
             echo("no tests collected")
+        _listing(echo, INCOMPLETE_TITLE, [_incomplete_text(entry) for entry in collection.report_incomplete])
         _write_json(out / "result.json", {"ok": False, "collected": len(ids),
                                           "import_failures": collection.failed_modules,
                                           "import_errors": collection.errors,
-                                          "duplicate_ids": duplicates})
+                                          "duplicate_ids": duplicates,
+                                          "report_incomplete": collection.report_incomplete})
         echo("FAILED")
         return 1
     groups = split({name: len(tests) for name, tests in collection.modules.items() if tests}, args.shards)
-    shards = make_shards(groups, collection, out)
+    shards = make_shards(groups, collection, out, root)
     _write_json(out / "manifest.json", {
         "root": str(root), "python": sys.executable, "pattern": args.pattern,
         "pythonpath": child_env(root)["PYTHONPATH"], "collected": len(ids),

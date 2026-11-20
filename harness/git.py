@@ -1,16 +1,19 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
 import shutil
 import stat
 import subprocess
+import time
 from fnmatch import fnmatchcase
 from pathlib import Path
+from typing import NamedTuple
 
 from . import stops
-from .util import DIRECTORY_FLAGS, HarnessError, fold_name, write_json
+from .util import DIRECTORY_FLAGS, HarnessError, fold_name, with_descriptors, write_json
 
 
 PROTECTED_ROOTS = frozenset((".git", ".harness", ".codex", ".claude"))
@@ -22,44 +25,246 @@ def protected_name(segment: str) -> bool:
     return fold_name(segment) in _PROTECTED_FOLDED
 
 
-def _git_environment(binding=None):
-    # Ambient Git overrides must not redirect the pinned index, refs, or
-    # object database. Keep ordinary process environment such as PATH.
-    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+class Effect(NamedTuple):
+    """The most one Git call may do; a call site declares one of the constants below."""
+    name: str
+    real_index: bool  # changes the entries of a real index (a worktree's, a fixture repository's)
+    refs: bool        # creates, moves or deletes a ref, HEAD, ORIG_HEAD, a reflog or a worktree registration
+    worktree: bool    # writes files in a worktree
+    filters: bool     # may run clean, smudge or process filters
+
+    @property
+    def interruptible(self) -> bool:
+        return not (self.real_index or self.refs or self.worktree)
+
+
+READ = Effect("READ", False, False, False, False)
+COMPARE = Effect("COMPARE", False, False, False, True)
+PRIVATE = Effect("PRIVATE", False, False, False, True)
+INDEX = Effect("INDEX", True, False, False, True)
+REFS = Effect("REFS", False, True, False, False)
+INDEX_REFS = Effect("INDEX_REFS", True, True, False, True)
+CHECKOUT = Effect("CHECKOUT", True, True, True, True)
+
+# githooks(5) of Git 2.56. Git without per-event switches ignores these keys; the hook name read covers it.
+HOOK_EVENTS = ("applypatch-msg", "pre-applypatch", "post-applypatch", "pre-commit", "pre-merge-commit",
+               "prepare-commit-msg", "commit-msg", "post-commit", "pre-rebase", "post-checkout", "post-merge",
+               "pre-push", "pre-receive", "update", "proc-receive", "post-receive", "post-update",
+               "reference-transaction", "push-to-checkout", "pre-auto-gc", "post-rewrite", "sendemail-validate",
+               "fsmonitor-watchman", "p4-changelist", "p4-prepare-changelist", "p4-post-changelist",
+               "p4-pre-submit", "post-index-change")
+# Only these choose which configuration files Git reads; every other GIT_* could redirect the
+# repository, index, objects or refs, or set single configuration keys.
+_KEPT_ENVIRONMENT = ("GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_CONFIG_NOSYSTEM")
+# An empty GIT_ALLOW_PROTOCOL also overrides a repository's protocol.<name>.allow=always; Trace2 needs "0".
+_FIXED_ENVIRONMENT = {"GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0", "GIT_NO_LAZY_FETCH": "1",
+                      "GIT_ALLOW_PROTOCOL": "", "GIT_NO_REPLACE_OBJECTS": "1",
+                      "GIT_TRACE2": "0", "GIT_TRACE2_EVENT": "0", "GIT_TRACE2_PERF": "0"}
+
+
+def _fixed_options():
+    name, email = COMMIT_IDENTITY
+    return ["--no-pager", "-c", "core.fsmonitor=", "-c", "core.hooksPath=/dev/null",
+            *(item for event in HOOK_EVENTS for item in ("-c", f"hook.{event}.enabled=false")),
+            "-c", "protocol.allow=never", "-c", "maintenance.auto=false", "-c", "gc.auto=0",
+            "-c", "color.ui=false", "-c", "color.diff=false", "-c", "log.showSignature=false",
+            *(item for role in ("user", "author", "committer")
+              for item in ("-c", f"{role}.name={name}", "-c", f"{role}.email={email}")),
+            "-c", "commit.gpgsign=false", "-c", "i18n.commitEncoding=UTF-8", "-c", "core.splitIndex=false"]
+
+
+def invocation(repo, args, *, effect, deadline, binding=None, index_file=None, literal_pathspecs=False,
+               isolated_config=False, _config=None):
+    """The argv and environment of one Harness Git call; ``args`` are passed through unchanged.
+
+    ``_config`` is None or _RANGE_DIFF_CONFIG itself, whose settings follow the fixed ones as ``-c``:
+    harness.git's own, which only _range_diff passes (R1); a caller sets no other key.
+    A declared call that is not READ first reads the configured hook names in the
+    very context of the call (same prefix and environment) and disables each one,
+    within ``deadline`` (a time.monotonic() value), which the call itself then shares.
+    Besides naming the call in errors, only the first word of ``args`` is looked at:
+    ``init`` makes ``repo/.git`` rather than finding a repository, so its name read
+    chooses its own configuration context, pinned to that directory (_configured_hooks).
+    """
+    _check_config(_config)
+    _check_index_file(repo, binding, effect, index_file)
+    prefix = ["git", "-C", str(repo)]
+    if binding is not None:
+        prefix += ["--git-dir=" + binding["git_dir"], "--work-tree=" + binding["worktree"]]
+    prefix += _fixed_options()
+    if _config is _RANGE_DIFF_CONFIG:  # the module's tuple, never the caller's object
+        prefix += [item for setting in _RANGE_DIFF_CONFIG for item in ("-c", setting)]
+    if literal_pathspecs:
+        prefix.append("--literal-pathspecs")
+    env = {key: value for key, value in os.environ.items()
+           if not key.startswith("GIT_") or key in _KEPT_ENVIRONMENT}
+    env.update(_FIXED_ENVIRONMENT)
+    if isolated_config:
+        env.pop("GIT_CONFIG_SYSTEM", None)
+        env.update(GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_NOSYSTEM="1")
     if binding is not None:
         env["GIT_COMMON_DIR"] = binding["common_dir"]
-    return env
+    if index_file is not None:
+        env["GIT_INDEX_FILE"] = str(index_file)
+    if effect is not None and effect is not READ:
+        # Configured hooks (Git 2.54+) ignore core.hooksPath, and Git 2.54 has no per-event switch.
+        names = _configured_hooks(repo, prefix, env, args, deadline)
+        for number, name in enumerate(names):
+            env[f"GIT_CONFIG_KEY_{number}"] = f"hook.{name}.enabled"
+            env[f"GIT_CONFIG_VALUE_{number}"] = "false"
+        if names:
+            env["GIT_CONFIG_COUNT"] = str(len(names))
+    return prefix + list(args), env
 
 
-def _git_command(repo, args, binding=None):
-    argv = ["git", "-C", str(repo)]
-    if binding is not None:
-        argv += ["--git-dir=" + binding["git_dir"], "--work-tree=" + binding["worktree"]]
-    return argv + list(args)
+def _check_config(settings):
+    """Refuse, before any process starts, anything but None and harness.git's fixed set for the whole-run comparison.
+
+    By identity: an object equal to either may still iterate to other settings.
+    """
+    if settings is not None and settings is not _RANGE_DIFF_CONFIG:
+        raise HarnessError(f"Git 调用只能附加 harness.git 为整体比较固定的设置：{settings!r}",
+                           stop=stops.make("runtime_failure", "invariant"))
 
 
-def _run_git(repo, args, binding=None):
+def _check_index_file(repo, binding, effect, index_file):
+    """Refuse, before any process starts, an ``index_file`` that is not this call's private index."""
+    if index_file is not None and (effect not in (READ, PRIVATE) or not _private_index(repo, binding, index_file)):
+        raise HarnessError(f"Git 临时索引必须是工作树与 Git 目录之外、不是真实索引的绝对路径，且只用于只读或私有调用：{index_file}",
+                           stop=stops.make("runtime_failure", "invariant"))
+
+
+def _private_index(repo, binding, index_file):
+    """Whether ``index_file`` can be this call's private index.
+
+    It is absolute, is no real index (the one in its Git directory, or the main
+    checkout's in its common directory), and lies neither in the call's worktree nor
+    in its Git or common directory: the binding's, or unbound, those ``repo/.git`` names.
+    Compared by file identity, not spelling: on a case-insensitive file system, or
+    through a firmlink, another spelling names the same directory. Anything that
+    cannot be checked is refused.
+    """
+    index = Path(index_file)
+    if not index.is_absolute():
+        return False  # it would resolve against -C, inside the worktree
     try:
-        return subprocess.run(_git_command(repo, args, binding), env=_git_environment(binding),
-                              capture_output=True, timeout=60)
+        if binding is not None:
+            worktree, git_dir, common_dir = binding["worktree"], binding["git_dir"], binding["common_dir"]
+        else:
+            worktree, (git_dir, common_dir) = repo, _git_directories(Path(repo))
+        reals = {Path(git_dir) / "index", Path(common_dir) / "index"}
+        closed = {(info.st_dev, info.st_ino) for info in map(os.stat, (worktree, git_dir, common_dir))}
+        index = index.resolve()
+        for path in (index, *index.parents):
+            try:
+                info = os.stat(path)
+            except (FileNotFoundError, NotADirectoryError):
+                continue
+            if (info.st_dev, info.st_ino) in closed:
+                return False
+        for real in reals:
+            try:
+                if os.path.samefile(index, real):
+                    return False
+            except (FileNotFoundError, NotADirectoryError):
+                pass
+        return True
+    # RuntimeError: a symbolic link loop on Python 3.11; ValueError: a NUL byte in a path; HarnessError: no
+    # readable gitfile; KeyError, TypeError: a malformed binding (git_process checks before the binding check).
+    except (OSError, RuntimeError, ValueError, HarnessError, KeyError, TypeError):
+        return False
+
+
+def _git_directories(repo):
+    """The Git and common directory that ``git -C repo`` without a binding uses, read as Git reads them.
+
+    ``repo/.git`` is the Git directory or, in a linked checkout, a gitfile naming it;
+    a ``commondir`` file there names the common directory. Without ``repo/.git`` Git
+    would search further up, so this raises and the call is refused. A limit: a
+    ``repo/.git`` directory Git does not accept (an empty one) is still taken here,
+    while Git searches further up and may use a parent repository's index.
+    """
+    dot = repo / ".git"
+    if dot.is_dir():
+        git_dir = dot.resolve()
+    else:
+        content = _binding_file(dot)
+        if not content.startswith(b"gitdir: "):
+            raise ValueError(f"not a gitfile: {dot}")
+        git_dir = _binding_path(repo, content[len(b"gitdir: "):].rstrip(b"\r\n"))  # Git trims CR and LF
+    commondir = git_dir / "commondir"
+    if not os.path.lexists(commondir):
+        return git_dir, git_dir
+    return git_dir, _binding_path(git_dir, _binding_file(commondir).rstrip(b"\r\n"))
+
+
+def _configured_hooks(repo, prefix, env, args, deadline):
+    """The names of the configured hooks visible to the call that ``prefix`` and ``env`` start."""
+    if args and args[0] == "init":
+        # init makes repo/.git instead of finding a repository further up, so the read is pinned to that directory:
+        # Git reads its configuration if it is a repository already, else only the user and system files (none with
+        # isolated_config), and never searches upwards. Right after -C, so a binding's --git-dir would still win.
+        prefix = [*prefix[:3], "--git-dir=.git", *prefix[3:]]
+    read = _launch(prefix + ["config", "-z", "--name-only", "--get-regexp", r"^hook\..*\.command$"], env,
+                   effect=READ, input=None, deadline=deadline)
+    if read.returncode == 1:
+        return []
+    if read.returncode:
+        raise HarnessError(f"git {' '.join(args[:3])} failed: hook 名字读取失败："
+                           f"{read.stderr.decode('utf-8', errors='replace').strip()}")
+    names = []
+    for key in os.fsdecode(read.stdout).split("\0"):
+        if key.startswith("hook.") and key.endswith(".command"):
+            name = key[len("hook."):-len(".command")]
+            if name not in names:
+                names.append(name)
+    return names
+
+
+def _launch(argv, env, *, effect, input, deadline):
+    """The only place Harness starts a Git process; it gets what is left of the call's deadline."""
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise subprocess.TimeoutExpired(argv, 0)
+    return subprocess.run(argv, env=env, capture_output=True, timeout=remaining, input=input,
+                          stdin=subprocess.DEVNULL if input is None else None)
+
+
+def _run_git(repo, args, binding=None, *, effect=None, input=None, index_file=None, literal_pathspecs=False,
+             timeout=60):
+    """One call without binding checks: the binding check itself runs through here, so it cannot recurse."""
+    deadline = time.monotonic() + timeout
+    try:
+        argv, env = invocation(repo, args, effect=effect, deadline=deadline, binding=binding,
+                               index_file=index_file, literal_pathspecs=literal_pathspecs)
+        return _launch(argv, env, effect=effect, input=input, deadline=deadline)
     except (OSError, subprocess.TimeoutExpired) as error:
         raise HarnessError(f"git {' '.join(args[:3])} failed: {error}") from error
 
 
-def git_process(repo: Path, *args: str, binding=None, timeout=60):
+def git_process(repo: Path, *args: str, effect=None, binding=None, timeout=60, input=None, index_file=None,
+                literal_pathspecs=False, isolated_config=False, _config=None):
     """Run a pinned command, preserving exit status for provenance checks."""
+    # Before the binding check, which starts a process.
+    _check_config(_config)
+    _check_index_file(repo, binding, effect, index_file)
     if binding is not None:
         check_worktree_binding(repo, binding)
-    p = subprocess.run(_git_command(repo, args, binding), env=_git_environment(binding),
-                       capture_output=True, timeout=timeout)
+    # Measured after the check: the binding checks are calls of their own, with their own budget.
+    deadline = time.monotonic() + timeout
+    argv, env = invocation(repo, args, effect=effect, deadline=deadline, binding=binding, index_file=index_file,
+                           literal_pathspecs=literal_pathspecs, isolated_config=isolated_config, _config=_config)
+    p = _launch(argv, env, effect=effect, input=input, deadline=deadline)
     if binding is not None:
         check_worktree_binding(repo, binding)
     return p
 
 
-def git_bytes(repo: Path, *args: str, binding=None) -> bytes:
+def git_bytes(repo: Path, *args: str, effect=None, binding=None, input=None, index_file=None,
+              literal_pathspecs=False, isolated_config=False, _config=None) -> bytes:
     try:
-        p = git_process(repo, *args, binding=binding)
+        p = git_process(repo, *args, effect=effect, binding=binding, input=input, index_file=index_file,
+                        literal_pathspecs=literal_pathspecs, isolated_config=isolated_config, _config=_config)
     except (OSError, subprocess.TimeoutExpired) as error:
         raise HarnessError(f"git {' '.join(args[:3])} failed: {error}") from error
     if p.returncode:
@@ -67,9 +272,11 @@ def git_bytes(repo: Path, *args: str, binding=None) -> bytes:
     return p.stdout
 
 
-def git(repo: Path, *args: str, binding=None) -> str:
+def git(repo: Path, *args: str, effect=None, binding=None, input=None, index_file=None, literal_pathspecs=False,
+        isolated_config=False) -> str:
     """Keep filesystem bytes reversible."""
-    return os.fsdecode(git_bytes(repo, *args, binding=binding))
+    return os.fsdecode(git_bytes(repo, *args, effect=effect, binding=binding, input=input, index_file=index_file,
+                                 literal_pathspecs=literal_pathspecs, isolated_config=isolated_config))
 
 
 def _binding_file(path):
@@ -96,8 +303,8 @@ def capture_worktree_binding(worktree: Path, expected_branch: str | None):
     """
     worktree = worktree.resolve()
     gitfile = _binding_file(worktree / ".git")
-    git_dir = Path(git(worktree, "rev-parse", "--absolute-git-dir").removesuffix("\n")).resolve()
-    common_dir = Path(git(worktree, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    git_dir = Path(git(worktree, "rev-parse", "--absolute-git-dir", effect=READ).removesuffix("\n")).resolve()
+    common_dir = Path(git(worktree, "rev-parse", "--path-format=absolute", "--git-common-dir", effect=READ)
                       .removesuffix("\n")).resolve()
     if git_dir == common_dir:
         raise HarnessError("只能绑定独立的链接 worktree，不能使用主仓库 Git 目录")
@@ -108,7 +315,7 @@ def capture_worktree_binding(worktree: Path, expected_branch: str | None):
                "backlink_sha256": hashlib.sha256(_binding_file(git_dir / "gitdir")).hexdigest(),
                "commondir_sha256": hashlib.sha256(_binding_file(git_dir / "commondir")).hexdigest()}
     if branch is None:
-        binding["detached_head"] = git(worktree, "rev-parse", "HEAD").strip()
+        binding["detached_head"] = git(worktree, "rev-parse", "HEAD", effect=READ).strip()
     check_worktree_binding(worktree, binding)
     return binding
 
@@ -192,7 +399,7 @@ def _check_binding(worktree, binding, read_gitfile):
     _binding_file(git_dir / "HEAD")
     # symbolic-ref follows nested refs as Git commit does. Reading only HEAD
     # would miss a run branch changed into a symbolic ref pointing to main.
-    result = _run_git(worktree, ("symbolic-ref", "-q", "HEAD"), binding)
+    result = _run_git(worktree, ("symbolic-ref", "-q", "HEAD"), binding, effect=READ)
     if binding["branch"] is not None:
         if result.returncode or os.fsdecode(result.stdout).strip() != binding["branch"]:
             raise HarnessError("worktree Git 分支绑定已改变；保留现场")
@@ -201,11 +408,11 @@ def _check_binding(worktree, binding, read_gitfile):
 
 
 def repository(path: Path):
-    return Path(git(path, "rev-parse", "--show-toplevel").removesuffix("\n")).resolve()
+    return Path(git(path, "rev-parse", "--show-toplevel", effect=READ).removesuffix("\n")).resolve()
 
 
 def head(repo: Path, *, binding=None):
-    return git(repo, "rev-parse", "HEAD", binding=binding).strip()
+    return git(repo, "rev-parse", "HEAD", effect=READ, binding=binding).strip()
 
 
 def ignore_state(repo: Path):
@@ -215,15 +422,16 @@ def ignore_state(repo: Path):
 
 
 def clean(repo: Path, *, binding=None):
-    return not git(repo, "status", "--porcelain", binding=binding).strip()
+    # Explicit, so status.showUntrackedFiles=no cannot hide an untracked file.
+    return not git(repo, "status", "--porcelain", "--untracked-files=normal", effect=COMPARE, binding=binding).strip()
 
 
 def check_starting_checkout(repo: Path):
     """Require committed tracked files; untracked main-checkout files stay local."""
-    if git(repo, "status", "--porcelain", "--untracked-files=no").strip():
+    if git(repo, "status", "--porcelain", "--untracked-files=no", effect=COMPARE).strip():
         raise HarnessError("目标仓库有已跟踪或暂存的未提交变更；请先保存提交，再创建隔离 worktree", stop=stops.make("invalid_input", "cli_arguments", data={"option": "--repo"}))
     return [os.fsdecode(name) for name in
-            git_bytes(repo, "ls-files", "--others", "--exclude-standard", "--directory", "-z").split(b"\0")
+            git_bytes(repo, "ls-files", "--others", "--exclude-standard", "--directory", "-z", effect=READ).split(b"\0")
             if name]
 
 
@@ -237,7 +445,7 @@ def describe_paths(names):
 
 def reject_submodules(repo: Path, *, binding=None):
     """Reject indexed gitlinks, including uninitialized or missing submodules."""
-    _reject_indexed_submodules(git_bytes(repo, "ls-files", "--stage", "-z", binding=binding))
+    _reject_indexed_submodules(git_bytes(repo, "ls-files", "--stage", "-z", effect=READ, binding=binding))
 
 
 def _reject_indexed_submodules(index):
@@ -271,18 +479,18 @@ def assert_removable_worktree(repo: Path, *, binding=None):
     transformed checkouts (for example autocrlf) when their bytes differ from
     the saved blobs.
     """
-    for entry in git_bytes(repo, "ls-files", "-v", "-z", binding=binding).split(b"\0"):
+    for entry in git_bytes(repo, "ls-files", "-v", "-z", effect=READ, binding=binding).split(b"\0"):
         if entry[:1].islower() or entry.startswith(b"S "):
             raise HarnessError("worktree 索引含 assume-unchanged/skip-worktree 标记；"
                                f"请先核对并清除，不能移除：{os.fsdecode(entry[2:])}")
     untracked = [os.fsdecode(name) for name in
-                 git_bytes(repo, "ls-files", "--others", "--exclude-standard", "-z", binding=binding).split(b"\0")
-                 if name]
+                 git_bytes(repo, "ls-files", "--others", "--exclude-standard", "-z", effect=READ, binding=binding)
+                 .split(b"\0") if name]
     if untracked:
         raise HarnessError("worktree 有未被忽略的未跟踪文件；请先归档或清理，不能移除："
                            + describe_paths(untracked))
     tree = {}
-    for entry in git_bytes(repo, "ls-tree", "-r", "-z", "HEAD", binding=binding).split(b"\0"):
+    for entry in git_bytes(repo, "ls-tree", "-r", "-z", "HEAD", effect=READ, binding=binding).split(b"\0"):
         if not entry:
             continue
         metadata, name = entry.split(b"\t", 1)
@@ -291,7 +499,7 @@ def assert_removable_worktree(repo: Path, *, binding=None):
             raise HarnessError(f"worktree 含 submodule 或不支持的文件类型，不能移除：{os.fsdecode(name)}")
         tree[name] = (mode, object_id)
     index = {}
-    for entry in git_bytes(repo, "ls-files", "--stage", "-z", binding=binding).split(b"\0"):
+    for entry in git_bytes(repo, "ls-files", "--stage", "-z", effect=READ, binding=binding).split(b"\0"):
         if not entry:
             continue
         metadata, name = entry.split(b"\t", 1)
@@ -301,7 +509,7 @@ def assert_removable_worktree(repo: Path, *, binding=None):
         index[name] = (mode, object_id)
     if index != tree:
         raise HarnessError("worktree 索引与 HEAD 不同；请先保存或归档，不能移除")
-    object_format = git(repo, "rev-parse", "--show-object-format", binding=binding).strip()
+    object_format = git(repo, "rev-parse", "--show-object-format", effect=READ, binding=binding).strip()
     if object_format not in ("sha1", "sha256"):
         raise HarnessError(f"不支持的 Git 对象格式，不能移除：{object_format}")
     for name, (mode, object_id) in tree.items():
@@ -342,7 +550,7 @@ def ignored_paths(repo: Path, *, binding=None):
     """
     return sorted(os.fsdecode(name) for name in git_bytes(
         repo, "ls-files", "--others", "--ignored", "--exclude-standard", "--directory",
-        "--no-empty-directory", "-z", binding=binding).split(b"\0") if name)
+        "--no-empty-directory", "-z", effect=READ, binding=binding).split(b"\0") if name)
 
 
 def bounded_paths(names):
@@ -361,28 +569,129 @@ def bounded_paths(names):
             "entry_count": len(names), "omitted_count": len(names) - len(entries)}
 
 
+# Search permission is enough to open names below a directory: O_SEARCH (macOS), else O_PATH (Linux), else read.
+_SEARCH = getattr(os, "O_SEARCH", 0) or getattr(os, "O_PATH", 0) or os.O_RDONLY
+# Open failures that may only say what the entry is; its actual type, read without following it, decides.
+_TYPE_ERRNOS = frozenset(getattr(errno, name) for name in (
+    "ELOOP", "EMLINK", "ENOTDIR", "EISDIR", "ENXIO", "ENODEV", "EOPNOTSUPP", "ENOTSUP") if hasattr(errno, name))
+
+
+def _type_changed(name):
+    return HarnessError(f"快照读取期间路径类型已改变；保留现场：{describe_paths([name])}",
+                        stop=stops.make("workspace_mismatch", "candidate_changed"))
+
+
+def _parents(held, root, names):
+    """Yield ``(name, parent, leaf)`` for sorted worktree-relative ``names``.
+
+    ``parent`` is the descriptor of the directory holding ``leaf``, opened level by
+    level from ``root`` into ``held`` without following links, or None when an
+    ancestor is missing or no directory (a link, a file): Git then lists the name as
+    deleted. Sorted names sharing a prefix are adjacent, so each directory opens once
+    and at most depth + 1 stay open. Permission and I/O failures propagate.
+    """
+    stack, gone = [((), root)], None
+    for name in names:
+        *above, leaf = name.split("/")
+        above = tuple(above)
+        if gone is not None and above[:len(gone)] == gone:
+            yield name, None, leaf
+            continue
+        gone = None
+        while len(stack) > 1 and above[:len(stack[-1][0])] != stack[-1][0]:
+            held.close(stack.pop()[1])
+        for depth in range(len(stack[-1][0]), len(above)):
+            segment, parent = above[depth], stack[-1][1]
+            try:
+                stack.append((above[:depth + 1], held.open(
+                    segment, _SEARCH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent)))
+            except OSError as error:
+                if error.errno != errno.ENOENT:
+                    if error.errno not in _TYPE_ERRNOS:
+                        raise
+                    try:
+                        found = os.stat(segment, dir_fd=parent, follow_symlinks=False).st_mode
+                    except FileNotFoundError:
+                        found = None
+                    if found is not None and stat.S_ISDIR(found):
+                        raise _type_changed(name) from error
+                gone = above[:depth + 1]
+                break
+        yield name, None if gone is not None else stack[-1][1], leaf
+
+
+def _entry(held, parent, leaf, name):
+    """The snapshot mode and bytes of ``leaf`` in the open directory ``parent``: a link's text, a regular file's bytes."""
+    try:
+        found = os.stat(leaf, dir_fd=parent, follow_symlinks=False)
+        if stat.S_ISLNK(found.st_mode):
+            try:
+                return "link", os.fsencode(os.readlink(leaf, dir_fd=parent))
+            except OSError as error:
+                if error.errno == errno.EINVAL:  # no longer a link
+                    raise _type_changed(name) from error
+                raise
+        if not stat.S_ISREG(found.st_mode):
+            # A tracked file replaced by a directory is a deletion of that file; Git enumerates the new
+            # descendants separately. Gitlinks are rejected from index modes, including newly staged ones.
+            return "deleted", b""
+        try:
+            # Nonblocking: a FIFO swapped in since the stat must not hang the open before fstat refuses it.
+            descriptor = held.open(leaf, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=parent)
+        except OSError as error:
+            if error.errno in _TYPE_ERRNOS:
+                raise _type_changed(name) from error
+            raise
+    except FileNotFoundError:
+        return "deleted", b""
+    opened = os.fstat(descriptor).st_mode
+    if not stat.S_ISREG(opened):
+        raise _type_changed(name)
+    with os.fdopen(descriptor, "rb", closefd=False) as stream:
+        data = stream.read()
+    held.close(descriptor)
+    return str(opened & 0o777), data
+
+
+@stops.classifies("workspace_mismatch", "binding_changed")
+def _open_snapshot_root(held, worktree: Path, binding) -> int:
+    """open_bound_root for the snapshot walk, which only opens names below the root: search permission is enough.
+
+    It checks in check_worktree_binding's order, opening the root (not following a link) where that check
+    reads .git and reading .git through it. The descriptor stays ``held``'s whatever the outcome.
+    """
+    _check_binding_record(binding)
+    root = None
+
+    def read_gitfile(checked):
+        nonlocal root
+        try:
+            root = held.open(binding["worktree"], _SEARCH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        except (OSError, ValueError) as error:
+            stops.keep_local_io(error)
+            raise HarnessError(f"worktree 根目录无法打开：{binding['worktree']}：{error}") from error
+        return _binding_file_at(held, root, checked / ".git")
+
+    _check_binding(worktree, binding, read_gitfile)
+    return root
+
+
 def snapshot(repo: Path, *, binding=None):
-    index = git_bytes(repo, "ls-files", "--stage", "-z", binding=binding)
+    index = git_bytes(repo, "ls-files", "--stage", "-z", effect=READ, binding=binding)
     _reject_indexed_submodules(index)
     result = {"head": head(repo, binding=binding), "index": hashlib.sha256(index).hexdigest(),
               "files": {}}
-    names = git(repo, "ls-files", "-z", "--cached", "--others", "--exclude-standard", binding=binding).split("\0")
-    for name in sorted(set(names) - {""}):
-        path = repo / name
-        if path.is_symlink():
-            data = os.fsencode(os.readlink(path))
-            mode = "link"
-        elif path.is_file():
-            data = path.read_bytes()
-            mode = str(path.stat().st_mode & 0o777)
-        elif path.is_dir():
-            # A tracked file replaced by a directory is a deletion of that
-            # file; Git enumerates the new descendants separately. Gitlinks
-            # are rejected from index modes above, including newly staged ones.
-            data, mode = b"", "deleted"
-        else:
-            data, mode = b"", "deleted"
-        result["files"][name] = mode + ":" + hashlib.sha256(data).hexdigest()
+    names = git(repo, "ls-files", "-z", "--cached", "--others", "--exclude-standard", effect=READ,
+                binding=binding).split("\0")
+
+    def read(held):
+        # Bound, the binding is checked on the very descriptor the walk starts from; unbound, the root opens by path.
+        root = (_open_snapshot_root(held, repo, binding) if binding is not None
+                else held.open(repo, _SEARCH | os.O_DIRECTORY | os.O_CLOEXEC))
+        for name, parent, leaf in _parents(held, root, sorted(set(names) - {""})):
+            mode, data = ("deleted", b"") if parent is None else _entry(held, parent, leaf, name)
+            result["files"][name] = mode + ":" + hashlib.sha256(data).hexdigest()
+    with_descriptors(read)
     return result
 
 
@@ -400,9 +709,11 @@ def snapshot_changes(before, after):
 
 
 def changed(repo: Path, *, binding=None):
-    tracked = git(repo, "diff", "--name-only", "--no-renames", "-z", "HEAD", binding=binding).split("\0")
-    staged = git(repo, "diff", "--cached", "--name-only", "--no-renames", "-z", "HEAD", binding=binding).split("\0")
-    untracked = git(repo, "ls-files", "--others", "--exclude-standard", "-z", binding=binding).split("\0")
+    tracked = git(repo, "diff", "--no-ext-diff", "--no-textconv", "--name-only", "--no-renames", "-z", "HEAD",
+                  effect=COMPARE, binding=binding).split("\0")
+    staged = git(repo, "diff", "--cached", "--no-ext-diff", "--no-textconv", "--name-only", "--no-renames", "-z",
+                 "HEAD", effect=COMPARE, binding=binding).split("\0")
+    untracked = git(repo, "ls-files", "--others", "--exclude-standard", "-z", effect=READ, binding=binding).split("\0")
     return sorted((set(tracked) | set(staged) | set(untracked)) - {""})
 
 
@@ -466,14 +777,15 @@ def check_scope(repo: Path, allowed: list[str], *, binding=None, task_id=None):
 
 def diff_bytes(repo: Path, *, binding=None):
     """Lossless Git evidence, including untracked files and non-UTF-8 content."""
-    value = git_bytes(repo, "diff", "--binary", "--no-ext-diff", "--no-textconv", "--no-renames", "HEAD", binding=binding)
-    for name in git(repo, "ls-files", "--others", "--exclude-standard", "-z", binding=binding).split("\0"):
+    value = git_bytes(repo, "diff", "--binary", "--no-ext-diff", "--no-textconv", "--no-renames", "HEAD",
+                      effect=COMPARE, binding=binding)
+    for name in git(repo, "ls-files", "--others", "--exclude-standard", "-z", effect=READ, binding=binding).split("\0"):
         if not name:
             continue
         if binding is not None:
             check_worktree_binding(repo, binding)
         p = _run_git(repo, ("diff", "--no-index", "--binary", "--no-ext-diff", "--no-textconv",
-                            "--", "/dev/null", name), binding)
+                            "--", "/dev/null", name), binding, effect=COMPARE)
         if binding is not None:
             check_worktree_binding(repo, binding)
         if p.returncode not in (0, 1):
@@ -482,9 +794,48 @@ def diff_bytes(repo: Path, *, binding=None):
     return value
 
 
+# Git's defaults for what diff-tree still reads from configuration that would reshape the whole-run comparison:
+# blank context lines, hunk boundaries, abbreviated and quoted names, the binary patch's deflate level, and the
+# binary guess for a path without a diff attribute; only _range_diff passes them (R1). Still applied, as they were
+# to porcelain diff, since no option restores Git's own choice: attributes (.gitattributes, core.attributesFile),
+# so the diff attribute's binary or text and a built-in driver's hunk header rule, and the binary, funcname and
+# xfuncname of the driver it names; diff.default.(x)funcname too. A pattern's matches follow the locale.
+_RANGE_DIFF_CONFIG = ("diff.suppressBlankEmpty=false", "diff.indentHeuristic=true", "core.abbrev=auto",
+                      "core.quotePath=true", "core.looseCompression=1", "diff.default.binary=auto")
+# Where _range_diff's private index is named, never made: the null device's folder always exists, lies in no worktree
+# or Git directory, and only root writes there, so an unguessable name in it is absent when Git opens it.
+_ABSENT_INDEX_FOLDER = os.path.dirname(os.devnull)
+
+
+def _range_diff(repo, base, *output, binding):
+    """diff-tree from ``base`` to HEAD: the bytes of porcelain diff under default configuration.
+
+    An absent private index, a new unguessable name for each call, keeps Git from
+    reusing a work tree file whose stat data matches a real index entry, so the result
+    comes from the two commits' objects only, as porcelain diff between two commits
+    does; it also spares a real index Git cannot read. Git must not create it either.
+    --ignore-submodules=none overrides submodule.<name>.ignore and .gitmodules;
+    --diff-algorithm=myers a diff.<driver>.algorithm, for any driver an attribute names.
+    A driver's command and textconv are off; its wordRegex shapes only word diffs.
+    """
+    index = Path(_ABSENT_INDEX_FOLDER) / f"harness-index-{os.urandom(16).hex()}"
+    value = git_bytes(repo, "diff-tree", "-r", "--no-ext-diff", "--no-textconv", "--no-renames",
+                      "--ignore-submodules=none", "--diff-algorithm=myers", *output, base, "HEAD", "--",
+                      effect=READ, binding=binding, index_file=index, _config=_RANGE_DIFF_CONFIG)
+    if os.path.lexists(index):
+        raise HarnessError(f"整体比较的私有索引应当不存在，Git 调用之后却存在：{index}",
+                           stop=stops.make("runtime_failure", "invariant"))
+    return value
+
+
 def range_diff_bytes(repo: Path, base: str, *, binding=None):
     """The whole committed result, independent of task boundaries."""
-    return git_bytes(repo, "diff", "--binary", "--no-ext-diff", "--no-textconv", "--no-renames", base, "HEAD", "--", binding=binding)
+    return _range_diff(repo, base, "-p", "--binary", binding=binding)
+
+
+def range_paths(repo: Path, base: str, *, binding=None) -> str:
+    """The paths of the whole committed result, NUL-terminated as Git lists them."""
+    return os.fsdecode(_range_diff(repo, base, "--name-only", "-z", binding=binding))
 
 
 def archive_and_reset(repo: Path, expected_head: str, archive: Path, owned_root: Path, *, binding=None):
@@ -506,9 +857,10 @@ def archive_and_reset(repo: Path, expected_head: str, archive: Path, owned_root:
     before = snapshot(repo, binding=binding)
     archive.mkdir(parents=True, exist_ok=False)
     (archive / "change.diff").write_bytes(diff_bytes(repo, binding=binding))
-    (archive / "staged.diff").write_bytes(git_bytes(repo, "diff", "--cached", "--binary", "--no-ext-diff", "--no-textconv", "HEAD", binding=binding))
+    (archive / "staged.diff").write_bytes(git_bytes(repo, "diff", "--cached", "--binary", "--no-ext-diff", "--no-textconv",
+                                                 "HEAD", effect=COMPARE, binding=binding))
     write_json(archive / "snapshot.json", before)
-    untracked = git(repo, "ls-files", "--others", "--exclude-standard", "-z", binding=binding).split("\0")
+    untracked = git(repo, "ls-files", "--others", "--exclude-standard", "-z", effect=READ, binding=binding).split("\0")
     for name in paths:
         source, target = repo / name, archive / "files" / name
         if source.is_symlink():
@@ -521,7 +873,7 @@ def archive_and_reset(repo: Path, expected_head: str, archive: Path, owned_root:
             shutil.copy2(source, target)
     if snapshot(repo, binding=binding) != before:
         raise HarnessError("归档期间文件发生变化；保留现场，不重置")
-    git(repo, "reset", "--hard", expected_head, binding=binding)
+    git(repo, "reset", "--hard", expected_head, effect=CHECKOUT, binding=binding)
     # Remove only the recorded, untracked files, never ignored files or arbitrary directories.
     for name in filter(None, untracked):
         path = repo / name
@@ -533,8 +885,8 @@ def archive_and_reset(repo: Path, expected_head: str, archive: Path, owned_root:
     return str(archive)
 
 
-# accept pins this identity, the commit encoding and the cleanup mode on the command
-# line, so repository configuration cannot change the commit's author or bytes.
+# Every Harness Git call pins this identity and the commit encoding on the command line (_fixed_options), and
+# accept also pins the cleanup mode, so repository configuration cannot change the commit's author or bytes.
 COMMIT_IDENTITY = ("Personal Harness", "harness@localhost")
 
 
@@ -547,20 +899,17 @@ def commit_message_text(message, run_id, task_id):
 def accept(repo: Path, paths: list[str], run_id: str, task_id: str, message, *, binding=None):
     # The worker does not own the acceptance index. Rebuild it from the reviewed
     # worktree so hidden staged content can never enter the runtime's commit.
-    git(repo, "reset", "--mixed", "HEAD", binding=binding)
-    tracked = set(git(repo, "ls-files", "-z", binding=binding).split("\0"))
+    git(repo, "reset", "--mixed", "HEAD", effect=INDEX_REFS, binding=binding)
+    tracked = set(git(repo, "ls-files", "-z", effect=READ, binding=binding).split("\0"))
     # A worker may stage a new file and then delete it. Reset already removes
     # that index-only addition; git add cannot match it afterward. Keep real
     # tracked deletions and dangling symlinks in the reviewed acceptance set.
     stage = [name for name in paths
              if name in tracked or (repo / name).exists() or (repo / name).is_symlink()]
     if stage:
-        git(repo, "--literal-pathspecs", "add", "--", *stage, binding=binding)
-    if git(repo, "diff", "--cached", "--name-only", "HEAD", binding=binding).strip():
-        name, email = COMMIT_IDENTITY
-        identity = [option for role in ("user", "author", "committer")
-                    for option in ("-c", f"{role}.name={name}", "-c", f"{role}.email={email}")]
-        git(repo, *identity, "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false",
-            "-c", "i18n.commitEncoding=UTF-8", "commit", "--cleanup=verbatim",
-            "-m", commit_message_text(message, run_id, task_id), binding=binding)
+        git(repo, "add", "--", *stage, effect=INDEX, binding=binding, literal_pathspecs=True)
+    if git(repo, "diff", "--cached", "--no-ext-diff", "--no-textconv", "--name-only", "HEAD", effect=COMPARE,
+           binding=binding).strip():
+        git(repo, "commit", "--cleanup=verbatim", "-m", commit_message_text(message, run_id, task_id),
+            effect=INDEX_REFS, binding=binding)
     return head(repo, binding=binding)

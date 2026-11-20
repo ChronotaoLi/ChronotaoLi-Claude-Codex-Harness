@@ -1,9 +1,16 @@
 """Read-only observation data layer: ledger projection, invocation classes, events, operations."""
 import contextlib
+import dis
 import errno
+import functools
+import gc
+import inspect
 import io
+import itertools
 import json
 import os
+import signal
+import socket
 import stat
 import subprocess
 import sys
@@ -14,11 +21,11 @@ from pathlib import Path
 from unittest.mock import patch
 
 from harness import stops
-from harness import cli, git, observe
+from harness import cli, dashboard, git, observe, process_runtime, watch_cli
 from harness.cli import status_summary
 from harness.util import read_json, write_json
 from harness.versions import RUN_SCHEMA_VERSION
-from test_harness import ROOT, RepoCase, cli_notice, scratch
+from test_harness import ROOT, RepoCase, cli_notice, scratch, write_project_config
 
 ROLES = {"commander": {"cli": "codex", "model": "gpt-6.2-astra", "effort": "high"},
          "fable": {"cli": "claude", "model": "claude-fable-5-2", "effort": "high"},
@@ -988,6 +995,391 @@ class RunFileGuardTests(unittest.TestCase):
         self.assertIn("/new-evidence/", failure)
         (failure,) = self.outcome(lambda folder: (folder / "new-top.json").write_text("{}"))
         self.assertIn("new-top.json", failure)
+
+
+# ----- K11: one signal anywhere in an entry's construction, hand-off or cleanup leaves no descriptor open -----
+
+SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+
+
+def open_descriptors():
+    return len(os.listdir("/dev/fd"))
+
+
+def functions(module, *names):
+    return {(module.__file__, name) for name in names}
+
+
+# From each open to its owner, and the cleanups that close it. Each of their line, call and return events counts: a
+# call event is a function's entry, where a pending handler runs before any of its code (so before any try of its
+# own); a return event is where a built value is not stored yet.
+CHAIN = (functions(observe, "StateReader.__init__", "StateReader.close", "Observer.__init__", "Observer.close",
+                   "observing", "observing.<locals>.opened", "observing.<locals>.close", "holding", "_closing")
+         | functions(dashboard, "DashboardServer.__init__", "DashboardServer.__init__.<locals>.build",
+                     "DashboardServer._discard", "DashboardServer.server_close", "create_server", "serve",
+                     "serve.<locals>.serving", "serve.<locals>.restore", "serve.<locals>.close"))
+# A deferral's entry and exit (call events only): before it holds the handlers, a signal leaves its with statement.
+DEFERRAL = (functions(contextlib, "_GeneratorContextManager.__enter__", "_GeneratorContextManager.__exit__")
+            | functions(process_runtime, "defer_cleanup_signals"))
+CONSTRUCTORS = {"StateReader.__init__", "Observer.__init__", "observing.<locals>.opened"}
+CLEANUPS = {"holding", "_closing", "Observer.close", "StateReader.close"}
+
+
+def lines_between(function, first, last):
+    """``function``'s line numbers from the first line holding ``first`` through the next one holding ``last``."""
+    source, start = inspect.getsourcelines(function)
+    begin = next(index for index, line in enumerate(source) if first in line)
+    end = next(index for index, line in enumerate(source) if index >= begin and last in line)
+    return set(range(start + begin, start + end + 1))
+
+
+@functools.lru_cache(maxsize=None)
+def bare_lines(code):
+    """Lines of ``code`` that are a NOP alone (a bare ``try:``). A signal handler runs only where the interpreter
+    checks for one, never at a NOP; an interrupt a tracer raises there is outside every exception-table range."""
+    kinds = {}
+    for instruction in dis.get_instructions(code):
+        if instruction.positions is not None and instruction.positions.lineno is not None:
+            kinds.setdefault(instruction.positions.lineno, set()).add(instruction.opname)
+    return {line for line, names in kinds.items() if names == {"NOP"}}
+
+
+@contextlib.contextmanager
+def one_signal(index, lines, signum, stop, once=frozenset()):
+    """Send ``signum`` to this process once, at the ``index``-th counted trace event; yield where it was sent.
+
+    Counted until ``stop`` is non-empty: every line, call and return event of CHAIN, the call events of a cleanup
+    deferral's entry and exit, and the line events of the functions ``lines`` maps ((file, qualified name) -> None
+    for every line, or the line numbers counted). A line in ``once`` ((key, line) pairs) counts at its first event in
+    a frame only; a bare ``try:`` never counts. ``at`` stays None when fewer were counted.
+    """
+    sent = {"at": None, "count": 0}
+    seen = {}
+    deferral = process_runtime.defer_cleanup_signals.__wrapped__.__code__
+
+    def counted(frame, event, key):
+        if key in DEFERRAL:
+            # The deferral's own context manager, not any other one built by contextmanager.
+            made = getattr(frame.f_locals.get("self"), "gen", None)
+            return event == "call" and deferral in (frame.f_code, getattr(made, "gi_code", None))
+        if event in ("call", "return"):
+            return key in CHAIN
+        if event != "line" or frame.f_lineno in bare_lines(frame.f_code):
+            return False
+        if key not in CHAIN and (key not in lines or lines[key] is not None and frame.f_lineno not in lines[key]):
+            return False
+        if (key, frame.f_lineno) not in once:
+            return True
+        first = frame.f_lineno not in seen.setdefault(frame, set())
+        seen[frame].add(frame.f_lineno)
+        return first
+
+    def send(frame, event):
+        key = (frame.f_code.co_filename, frame.f_code.co_qualname)
+        if sent["at"] is None and not stop and counted(frame, event, key):
+            if sent["count"] == index:
+                sent["at"] = f"{key[1]}:{frame.f_lineno}:{event}"
+                os.kill(os.getpid(), signum)
+            sent["count"] += 1
+        return key
+
+    def local(frame, event, arg):
+        send(frame, event)
+        return local
+
+    def calls(frame, event, arg):
+        key = send(frame, event)  # a call event reaches only this function
+        return local if key in lines or key in CHAIN else None
+
+    previous = sys.gettrace()
+    sys.settrace(calls)
+    try:
+        yield sent
+    finally:
+        sys.settrace(previous)
+
+
+def outcome(call):
+    """``call``'s value, or what left it: an error's type, or an interrupt ("deferred" when a deferral raised it)."""
+    try:
+        return call()
+    except KeyboardInterrupt as error:
+        innermost = error.__traceback__
+        while innermost.tb_next is not None:
+            innermost = innermost.tb_next
+        deferral = process_runtime.defer_cleanup_signals.__wrapped__.__code__
+        return "deferred interrupt" if innermost.tb_frame.f_code is deferral else "interrupt"
+    except Exception as error:
+        return type(error).__name__
+
+
+def isolated(call):
+    """``outcome(call)`` in a generator's frame, which has an exception state of its own: what ``call`` leaves handled
+    stays there as the generator yields, not on this thread. A tracer's interrupt at an except block's POP_EXCEPT (the
+    line of a ``pass``) is outside every exception-table range: it leaves the block's exception handled."""
+    def frame():
+        yield outcome(call)
+    return next(frame())
+
+
+class InterruptedConstructionTests(RepoCase):
+    """K11: one SIGINT or SIGTERM at any line of an observation entry's construction, hand-off or cleanup leaves the
+    process's descriptors as they were, and the interruption still leaves the call."""
+
+    RUN, DISPATCH = "run_k11", "dispatch-1"
+
+    def setUp(self):
+        super().setUp()
+        self.state = self.repo / ".harness"
+        write_json(self.state / "runs" / self.RUN / "state.json",
+                   ledger(self.RUN, status="completed", dispatches=[dispatch(id=self.DISPATCH)]))
+
+    def sweep(self, call, lines, *, signum=signal.SIGINT, stop=None, once=frozenset()):
+        """Call ``call`` with one ``signum`` at each counted event in turn, then once with none left to count.
+
+        Every call leaves the descriptor count and the signal handlers as it found them and no exception handled on
+        this thread, and no signalled call goes on to ``stop`` (set where an unsignalled call would block). Returns
+        [(where, outcome)] of the signalled calls and the last call's outcome.
+        """
+        stop = [] if stop is None else stop
+        handlers = [signal.getsignal(number) for number in SIGNALS]
+        runs, leaks = [], []
+        gc.collect()  # an earlier test's garbage closing its sockets must not move the count mid-sweep
+        for index in itertools.count():
+            stop.clear()
+            before = open_descriptors()
+            with one_signal(index, lines, signum, stop, once) as sent:
+                result = isolated(call)
+            # Left handled, it would be the __context__ of every exception raised later in this process.
+            self.assertIsNone(sys.exception(), sent["at"])
+            if open_descriptors() != before:
+                leaks.append((sent["at"], open_descriptors() - before))
+            self.assertEqual([signal.getsignal(number) for number in SIGNALS], handlers, sent["at"])
+            if sent["at"] is None:
+                break
+            self.assertEqual(stop, [], f"{sent['at']}: the call went on past its signal")
+            runs.append((sent["at"], result))
+        self.assertEqual(leaks, [])
+        return runs, result
+
+    def cli(self, *argv):
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            return cli.main(list(argv))
+
+    def assertReached(self, runs, names):
+        self.assertLessEqual(set(names), {at.split(":")[0] for at, _ in runs})
+
+    def assertCleanupEntered(self, runs, expected):
+        """A signal as holding enters a cleanup (its call of _closing, before any deferral) left as ``expected``."""
+        entry = f"_closing:{observe._closing.__code__.co_firstlineno}:call"
+        self.assertIn((entry, expected), runs)
+
+    def entries(self, run_id, dispatch_id):
+        """Each CLI caller of the observer: its lines and its use's, every event (the watcher's with line once), and argv."""
+        watching = (watch_cli.__file__, "watch_run.<locals>.watching")
+        # The watcher's descriptors, closed by its own exit, are design 4's (D4-T12): its line counts as entered only.
+        handed = {(watching, line) for line in lines_between(watch_cli.watch_run, "with RunWatcher(", "with RunWatcher(")}
+        status = {(cli.__file__, "show_status"): None, (cli.__file__, "show_status.<locals>.show"): None}
+        diagnostics = {(cli.__file__, "_main"): lines_between(cli._main, "from .permission_diagnostics import",
+                                                              "raise HarnessError(str(error))"),
+                       (cli.__file__, "_main.<locals>.diagnose"): None}
+        return {"status RUN": (status, (), ("--repo", str(self.repo), "status", run_id)),
+                "permission-diagnostics": (diagnostics, (), (
+                    "--config", str(ROOT / "harness.toml"), "--repo", str(self.repo), "permission-diagnostics",
+                    self.RUN, dispatch_id)),
+                "watch": ({(watch_cli.__file__, "watch_run"): None, watching: None}, handed,
+                          ("watch", run_id, "--state", str(self.state)))}
+
+    def test_cli_entries_exit_130_with_nothing_left_open(self):
+        # Every line of each caller and of its use of the observer, through the cleanups of its normal exit.
+        write_project_config(self.repo)
+        entries = {"status": ({(cli.__file__, "show_status"): None, (cli.__file__, "show_status.<locals>.show"): None},
+                              (), ("--repo", str(self.repo), "status")), **self.entries(self.RUN, self.DISPATCH)}
+        for name, (lines, once, argv) in entries.items():
+            for signum in (signal.SIGINT, signal.SIGTERM):
+                with self.subTest(entry=name, signal=signum.name):
+                    runs, last = self.sweep(lambda: self.cli(*argv), lines, signum=signum, once=once)
+                    self.assertEqual(last, 0)
+                    self.assertEqual({result for _, result in runs}, {130})
+                    self.assertReached(runs, CONSTRUCTORS | CLEANUPS)
+                    self.assertCleanupEntered(runs, 130)
+
+    def test_a_signal_as_the_cleanup_after_a_failure_starts_still_leaves_nothing_open(self):
+        # Each use fails (a run or a dispatch that is not there), so its cleanup starts with an error leaving: one
+        # signal from the start through the end of that cleanup leaves nothing open and leaves in the error's place.
+        write_project_config(self.repo)
+        for name, (lines, once, argv) in self.entries("run_absent", "dispatch-absent").items():
+            for signum in (signal.SIGINT, signal.SIGTERM):
+                with self.subTest(entry=name, signal=signum.name):
+                    runs, last = self.sweep(lambda: self.cli(*argv), lines, signum=signum, once=once)
+                    self.assertNotIn(last, (0, 130))
+                    self.assertEqual({result for _, result in runs}, {130})
+                    self.assertReached(runs, CLEANUPS)
+                    self.assertCleanupEntered(runs, 130)
+        lines = {(observe.__file__, "run_detail"): None, (observe.__file__, "run_detail.<locals>.<lambda>"): None}
+        runs, last = self.sweep(lambda: observe.run_detail(self.state, "run_absent"), lines)
+        self.assertEqual(last, "NotFound")
+        self.assertLessEqual({result for _, result in runs}, {"interrupt", "deferred interrupt"})
+        self.assertCleanupEntered(runs, "interrupt")
+
+    def test_a_signal_kept_in_a_deferral_is_raised_where_its_owner_closes_it(self):
+        callers = {"list_runs": (lambda: observe.list_runs(self.state), {(observe.__file__, "list_runs"): None}),
+                   "run_detail": (lambda: observe.run_detail(self.state, self.RUN),
+                                  {(observe.__file__, "run_detail"): None,
+                                   (observe.__file__, "run_detail.<locals>.<lambda>"): None})}
+        for name, (call, lines) in callers.items():
+            with self.subTest(caller=name):
+                runs, last = self.sweep(call, lines)
+                self.assertIsInstance(last, dict)
+                self.assertLessEqual({result for _, result in runs}, {"interrupt", "deferred interrupt"})
+                # Kept while a constructor or the hand-off stores what it built, or while a cleanup closes it: raised
+                # as that deferral ends, inside the cleanups that close it, or once the close is done.
+                deferred = {at.split(":")[0] for at, result in runs if result == "deferred interrupt"}
+                self.assertLessEqual(CONSTRUCTORS | {"observing.<locals>.close", "Observer.close", "StateReader.close"},
+                                     deferred)
+                self.assertCleanupEntered(runs, "interrupt")
+
+    def test_dashboard_serve_owns_the_server_from_the_moment_it_is_built_until_it_is_closed(self):
+        class Unbound(socket.socket):
+            """A real socket that binds and listens to nothing: no port's state is involved."""
+
+            def bind(self, address):
+                pass
+
+            def listen(self, backlog=0):
+                pass
+        served = []
+
+        def stopped(server, poll_interval=0.5):
+            served.append(server)
+            raise KeyboardInterrupt()  # what the first Ctrl-C does while serving
+
+        def returned(server, poll_interval=0.5):
+            served.append(server)  # shut down from another thread
+
+        stopping = lines_between(dashboard.serve, "server.serve_forever(", "server.serve_forever(")
+        calls = {"serve": (lambda: dashboard.serve(self.state, 0, stdout=io.StringIO(), stderr=io.StringIO()),
+                           (signal.SIGINT,), 0, "interrupt"),
+                 "dashboard": (lambda: self.cli("--repo", str(self.repo), "dashboard", "--port", "0"),
+                               (signal.SIGTERM,), 0, 130)}
+        for (name, (call, signums, done, interrupted)), serving in itertools.product(calls.items(), (stopped, returned)):
+            for signum in signums:
+                with self.subTest(entry=name, serving=serving.__name__, signal=signum.name), \
+                        patch.object(socket, "socket", Unbound), \
+                        patch.object(dashboard.DashboardServer, "serve_forever", serving):
+                    runs, last = self.sweep(call, {}, signum=signum)
+                    self.assertEqual(last, done)
+                    for server in served:  # each server built, closed: its socket and its directory
+                        self.assertEqual(server.socket.fileno(), -1)
+                        self.assertFalse(server.observer.reader.opened)
+                    served.clear()
+                    # A signal as the serving starts is serve's own stop; every other one leaves, the handlers serve
+                    # swapped restored (sweep) even when it cut their restore short.
+                    self.assertEqual({at for at, result in runs if result == done},
+                                     {f"serve.<locals>.serving:{line}:line" for line in stopping})
+                    self.assertLessEqual({result for _, result in runs}, {done, interrupted, "deferred interrupt"})
+                    self.assertReached(runs, {"serve.<locals>.restore", "serve.<locals>.close",
+                                              "DashboardServer.server_close"} | CLEANUPS)
+                    self.assertCleanupEntered(runs, interrupted)
+                    if name == "serve":
+                        deferred = {at for at, result in runs if result == "deferred interrupt"}
+                        # Built and returned, not yet stored by serve: kept until it is, then raised inside holding.
+                        self.assertTrue(any(at.startswith("create_server:") and at.endswith(":return") for at in deferred))
+                        self.assertLessEqual({"DashboardServer.__init__.<locals>.build", "Observer.__init__",
+                                              "StateReader.__init__", "DashboardServer.server_close", "Observer.close"},
+                                             {at.split(":")[0] for at in deferred})
+
+    def socket_refused(self, refusal, expected, made=()):
+        """The constructor and serve with ``refusal`` in force: each fails with errno ``expected`` and leaves nothing
+        open, without a signal and with one at each event; each socket in ``made`` was closed."""
+        entries = {"DashboardServer": lambda: dashboard.DashboardServer(self.state, 0, log=io.StringIO()),
+                   "serve": lambda: dashboard.serve(self.state, 0, stdout=io.StringIO(), stderr=io.StringIO())}
+        gc.collect()
+        for entry, start in entries.items():
+            with self.subTest(entry=entry), refusal:
+                before = open_descriptors()
+                with self.assertRaises(OSError) as raised:
+                    start()
+                self.assertEqual((raised.exception.errno, open_descriptors()), (expected, before))
+                runs, last = self.sweep(start, {})
+                self.assertEqual(last, "OSError")
+                # Kept in a deferral an error leaves, a signal gives way to it (defer_cleanup_signals).
+                self.assertLessEqual({result for _, result in runs}, {"OSError", "interrupt", "deferred interrupt"})
+                self.assertReached(runs, {"DashboardServer._discard"} | CLEANUPS)
+                # As the constructor's own cleanup starts: holding's, before any deferral.
+                self.assertCleanupEntered(runs, "interrupt")
+        self.assertTrue(all(each.fileno() == -1 for each in made))
+
+    def test_dashboard_socket_that_cannot_be_created(self):
+        # socket() fails before TCPServer's own cleanup: only the constructor's closes the observer.
+        emfile = OSError(errno.EMFILE, "Too many open files (test)")
+        self.socket_refused(patch("socket.socket", side_effect=emfile), errno.EMFILE)
+
+    def test_dashboard_port_already_in_use(self):
+        # A real socket, created and closed; its bind fails as on a port another socket holds, whatever the ports are.
+        made = []
+
+        class Taken(socket.socket):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                made.append(self)
+
+            def bind(self, address):
+                raise OSError(errno.EADDRINUSE, "Address already in use (test)")
+        self.socket_refused(patch.object(socket, "socket", Taken), errno.EADDRINUSE, made)
+        self.assertTrue(made)
+
+    def test_search_only_and_refused_layouts(self):
+        if os.geteuid() == 0:
+            self.skipTest("permission bits do not stop root")
+        lines = {(observe.__file__, "list_runs"): None}
+        state = scratch(self).resolve() / ".harness"  # the path the reader opens
+        write_json(state / "runs" / self.RUN / "state.json", ledger(self.RUN))
+        held = os.open(state, os.O_RDONLY | os.O_DIRECTORY)  # taken while the directory still has permissions
+        self.addCleanup(os.close, held)
+        real_open, handed = os.open, []
+
+        def search_descriptor_for_any_mode(path, flags, mode=0o777, *, dir_fd=None):
+            # Linux O_PATH: a descriptor whatever the mode; a lookup through it still needs search permission.
+            if path == str(state) and flags == observe._SEARCH_FLAGS:
+                handed.append(os.dup(held))
+                return handed[-1]
+            return real_open(path, flags, mode, dir_fd=dir_fd)
+
+        layouts = {"search permission only": (0o111, contextlib.nullcontext(), True),
+                   "search descriptor that cannot search": (0, patch("harness.observe.os.open",
+                                                                      side_effect=search_descriptor_for_any_mode), False)}
+        for name, (mode, opening, bound) in layouts.items():
+            state.chmod(mode)
+            self.addCleanup(state.chmod, 0o755)
+            with self.subTest(layout=name), opening:
+                runs, last = self.sweep(lambda: observe.list_runs(state), lines)
+                self.assertEqual(last["runs"], [])
+                self.assertEqual({result for _, result in runs}, {"interrupt", "deferred interrupt"})
+                with observe.Observer(state) as observer:
+                    self.assertIs(observer.reader.opened, bound)
+        self.assertTrue(handed)  # the second layout got as far as the refused lookup
+        state.chmod(0o755)
+        # location() failing after the reader is built: the error leaves, the reader does not stay open.
+        with patch("harness.observe.location", side_effect=RuntimeError("location (test)")):
+            before = open_descriptors()
+            self.assertEqual((outcome(lambda: observe.list_runs(state)), open_descriptors()), ("RuntimeError", before))
+
+
+class InterruptedConstructionProcessTests(unittest.TestCase):
+    def test_tests_after_the_sweeps_in_their_process_chain_only_their_own_exceptions(self):
+        # The sweeps, then in the same process two tests that assert an exception chain's exact length: an exception
+        # a sweep left handled would be the __context__ of what they raise.
+        later = ("test_verification_outcomes.StopSaveChainTests."
+                 "test_an_interrupt_while_a_refused_stop_save_unlocks_keeps_the_refusal_in_its_traceback",
+                 "test_verification_outcomes.VerificationStopExitTests."
+                 "test_a_refused_stop_save_keeps_the_rule_11_error_on_its_traceback_chain")
+        swept = unittest.defaultTestLoader.loadTestsFromTestCase(InterruptedConstructionTests).countTestCases()
+        proc = subprocess.run([sys.executable, "-m", "unittest", "test_observe.InterruptedConstructionTests", *later],
+                              cwd=ROOT, env=dict(os.environ, PYTHONPATH=os.pathsep.join((str(ROOT), str(ROOT / "tests")))),
+                              stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=600)
+        self.assertEqual(proc.returncode, 0, proc.stderr[-8000:])
+        self.assertIn(f"Ran {swept + len(later)} tests", proc.stderr)
 
 
 if __name__ == "__main__":

@@ -50,20 +50,25 @@ def first_line(error):
     return lines[0] if lines else type(error).__name__
 
 
-def _git_query(root, *args):
-    """Bounded read-only Git query about the installation; None on any failure.
+def _git_query(root, *args, effect):
+    """Bounded Git query about the installation; None on any failure.
 
     Provenance must never raise or block an operation, so this does not use
-    git.git (HarnessError on failure, 60 second wait). It reuses the same argv
-    construction and GIT_* environment hygiene.
+    git.git (HarnessError on failure, 60 second wait). It takes the argv and
+    environment from git.invocation; a hook name read shares the same deadline.
     """
+    deadline = time.monotonic() + GIT_QUERY_TIMEOUT
     try:
-        process = subprocess.Popen(git._git_command(root, args), env=git._git_environment(),
-                                   stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-    except (OSError, ValueError):
+        argv, env = git.invocation(root, args, effect=effect, deadline=deadline)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        process = subprocess.Popen(argv, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                   stderr=subprocess.DEVNULL)
+    except (HarnessError, OSError, ValueError, subprocess.TimeoutExpired):
         return None
     try:
-        output, _ = process.communicate(timeout=GIT_QUERY_TIMEOUT)
+        output, _ = process.communicate(timeout=remaining)
     except subprocess.TimeoutExpired:
         process.kill()
         process.communicate()
@@ -76,12 +81,13 @@ def harness_identity():
     root = PACKAGE.parent
     identity = {"package": str(PACKAGE), "revision": None, "runtime_modified": None,
                 "python": sys.version.split()[0], "executable": sys.executable}
-    output = _git_query(root, "rev-parse", "--show-toplevel", "HEAD")
+    output = _git_query(root, "rev-parse", "--show-toplevel", "HEAD", effect=git.READ)
     lines = output.splitlines() if output else []
     # Only a checkout whose root is the package's parent describes this runtime.
     if len(lines) == 2 and Path(lines[0]).resolve() == root:
         identity["revision"] = lines[1].strip()
-        status = _git_query(root, "status", "--porcelain", "--", PACKAGE.name)
+        status = _git_query(root, "status", "--porcelain", "--untracked-files=normal", "--", PACKAGE.name,
+                            effect=git.COMPARE)
         identity["runtime_modified"] = None if status is None else bool(status.strip())
     return identity
 

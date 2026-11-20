@@ -2,8 +2,9 @@
 
 Every CLI call here loads its configuration files for real; only the model backend is
 offline. run, resume and permission-diagnostics refuse a missing project file before any
-write; a broken one fails as a broken operator file does. abandon, the commands that read
-no configuration, and the test entry points do not depend on the target's project file.
+write; a broken one fails as a broken operator file does, as invalid_input/config_file naming
+the file. abandon, the commands that read no configuration, and the test entry points do not
+depend on the target's project file.
 """
 import contextlib
 import io
@@ -12,15 +13,17 @@ import shutil
 import signal
 import sys
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from harness import cli, git
+from harness import cli, git, stops
 from harness import config as config_module
 from harness.adapters import DemoBackend
+from harness.config import Config
 from harness.runtime import Runtime
-from harness.util import read_json
+from harness.util import HarnessError, read_json
 from test_harness import ROOT, RepoCase, cli_notice, scratch, write_project_config
 
 PLAN = ROOT / "examples" / "plan.json"
@@ -144,6 +147,43 @@ class MissingProjectFileTests(GateCase):
         self.assertEqual(read_json(ledger)["status"], "completed")
 
 
+class OperatorPathTests(GateCase):
+    """The refusal names the layer load was reading, never one guessed from the path that failed."""
+    COMMANDS = (["run", "Implement greet", "--plan", str(PLAN)], ["resume", "run_missing"],
+                ["permission-diagnostics", "run_missing", "dispatch-1"])
+
+    def refusals(self, config):
+        """(exit code, kind, reason, data) of each command loading ``config``; each refused before any write."""
+        results = []
+        for argv in self.COMMANDS:
+            before = self.footprint()
+            code, output, errors = self.invoke(*argv, config=config)
+            stop = cli_notice(errors)
+            self.assertEqual(output, "", errors)
+            self.assertEqual(self.footprint(), before)
+            results.append((code, stop["kind"], stop["reason"], stop["data"]))
+        self.assertEqual((self.engines, self.backend.calls, self.quota_calls.all()), ([], [], []))
+        return results
+
+    def test_an_operator_path_at_or_leading_to_the_missing_project_file_is_the_missing_operator_file(self):
+        link = scratch(self) / "harness.toml"
+        link.symlink_to(self.project)
+        for case, config in (("the project file's place", self.project), ("a dangling link to it", link)):
+            with self.subTest(case=case):
+                self.assertEqual(self.refusals(config), [(2, "invalid_input", "cli_arguments", {"option": "--config"})] * 3)
+        # The same missing file, read as the project layer under a present operator file, is the project's.
+        self.assertEqual(self.refusals(OPERATOR), [(2, "invalid_input", "cli_arguments", {"option": "--repo"})] * 3)
+        self.assertFalse(self.project.exists() or (self.repo / ".harness").exists())
+
+    def test_an_operator_path_in_a_symlink_loop_is_local_io_on_every_python(self):
+        # Python 3.11's Path.resolve raised RuntimeError for the loop, which escaped the CLI; from 3.13 resolve
+        # leaves it to the read, which fails with ELOOP. Both now give that result: a file there that cannot be read.
+        write_project_config(self.repo, self.config.data["verification"]["commands"])
+        link = scratch(self) / "harness.toml"
+        link.symlink_to(link)
+        self.assertEqual(self.refusals(link), [(1, "runtime_failure", "io", {"error_type": "OSError"})] * 3)
+
+
 class BrokenProjectFileTests(GateCase):
     # (case, project file bytes, operator file bytes broken the same way); None is a directory at the path.
     CASES = (
@@ -167,17 +207,106 @@ class BrokenProjectFileTests(GateCase):
                     replace(self.project, valid)
                     replace(operator, broken)
                     code, output, errors = self.invoke(*argv, config=operator)
-                    reference = (code, output, cli_notice(errors))
+                    stop = cli_notice(errors)
+                    reference = (code, output, stop["kind"], stop["reason"])
                     replace(self.project, project)
                     before = self.footprint()
                     code, output, errors = self.invoke(*argv)
                     stop = cli_notice(errors)
-                    self.assertEqual((code, output, stop), reference)
-                    self.assertNotEqual(stop["kind"], "invalid_input")
+                    # The same type and exit code; the stop names the file that was refused.
+                    self.assertEqual((code, output, stop["kind"], stop["reason"]), reference)
+                    if project is None:  # a path that exists but cannot be read is local I/O
+                        self.assertEqual((stop["kind"], stop["reason"]), ("runtime_failure", "io"))
+                    else:
+                        self.assertEqual((stop["kind"], stop["reason"], stop["data"], stop["source"]),
+                                         ("invalid_input", "config_file", {"file": "project"},
+                                          {"artifact": str(self.project)}))
                     self.assertEqual(self.footprint(), before)
         self.assertEqual(ledger.read_bytes(), saved)
         self.assertFalse((self.repo / ".harness" / "operations").exists())
         self.assertEqual((self.engines, self.backend.calls, self.quota_calls.all()), ([], calls, probes))
+
+
+def nested_arrays(depth):
+    """``runtime.max_attempts`` as ``depth`` nested arrays: deeper than the TOML parser can finish."""
+    return ("[runtime]\nmax_attempts = " + "[" * depth + "]" * depth + "\n").encode()
+
+
+def deep_dotted(parts=700):
+    """``runtime.max_attempts`` followed by ``parts`` dotted key parts: the parser finishes it, a copy would not."""
+    return ("[runtime]\nmax_attempts" + ".x" * parts + " = 1\n").encode()
+
+
+def deep_header(parts=999):
+    """A table header of ``parts`` parts under ``runtime.max_attempts`` holding a key of ``parts`` dotted parts."""
+    header = ".".join(["runtime", "max_attempts"] + ["h"] * (parts - 2))
+    return f"[{header}]\n{'.'.join(['k'] * parts)} = 1\n".encode()
+
+
+class ConfigFileBoundaryTests(GateCase):
+    """K22: every refusal of a configuration file's content is invalid_input/config_file (exit 2), before any write.
+
+    One file's own check names that file (data.file, source.artifact); the merged validation cannot tell which
+    file a value came from and names neither. Nesting the parser cannot finish and nesting it finishes but no
+    configuration key accepts are both refused while the file is checked, before anything copies it.
+    """
+    COMMON = (("not UTF-8", b"\xff[runtime]\n"), ("not TOML", b"[runtime\n"),
+              ("5,000 nested arrays", nested_arrays(5000)), ("700 dotted parts", deep_dotted()),
+              ("999-part header and key", deep_header()), ("unknown key", b"[runtime]\nnot_a_budget = 1\n"))
+    OPERATOR_FILES = COMMON + (("wrong file", b"[verification]\ncommands = []\n"),)
+    PROJECT_FILES = COMMON + (("wrong file", b"[memory]\ntask_ttl_days = 1\n"),
+                              ("command shape", b'[verification]\ncommands = [["make", "test"]]\n'))
+    COMMANDS = (["run", "Implement greet", "--plan", str(PLAN)], ["resume", "run_missing"],
+                ["permission-diagnostics", "run_missing", "dispatch-1"])
+
+    def assert_refused(self, argv, config, data, source):
+        before = self.footprint()
+        code, output, errors = self.invoke(*argv, config=config)
+        stop = cli_notice(errors)
+        self.assertEqual((code, output), (2, ""), errors)
+        self.assertEqual((stop["kind"], stop["reason"], stop["exit_code"], stop["data"], stop["source"]),
+                         ("invalid_input", "config_file", 2, data, source))
+        self.assertEqual(self.footprint(), before)
+        return errors
+
+    def test_the_deep_forms_are_one_the_parser_cannot_finish_and_two_it_finishes(self):
+        with self.assertRaises((RecursionError, tomllib.TOMLDecodeError)):
+            tomllib.loads(nested_arrays(5000).decode())
+        for content in (deep_dotted(), deep_header()):
+            self.assertIsInstance(tomllib.loads(content.decode()), dict)
+
+    def test_a_broken_operator_file_is_refused_naming_it_by_every_command_that_loads_it(self):
+        write_project_config(self.repo, self.config.data["verification"]["commands"])
+        operator = scratch(self) / "harness.toml"
+        for case, content in self.OPERATOR_FILES:
+            operator.write_bytes(content)
+            for argv in self.COMMANDS + (["doctor"],):
+                with self.subTest(case=case, command=argv[0]):
+                    self.assert_refused(argv, operator, {"file": "operator"}, {"artifact": str(operator.resolve())})
+        self.assertEqual((self.engines, self.backend.calls, self.quota_calls.all()), ([], [], []))
+
+    def test_a_broken_project_file_is_refused_naming_it_by_every_command_that_loads_it(self):
+        for case, content in self.PROJECT_FILES:
+            replace(self.project, content)
+            for argv in self.COMMANDS:
+                with self.subTest(case=case, command=argv[0]):
+                    self.assert_refused(argv, OPERATOR, {"file": "project"}, {"artifact": str(self.project)})
+        self.assertEqual((self.engines, self.backend.calls, self.quota_calls.all()), ([], [], []))
+
+    def test_the_merged_validation_names_no_file_and_depth_is_refused_only_beyond_eight_levels(self):
+        # Eight levels reach the merged validation, which refuses the value at its key; nine never get that far.
+        cases = (("an invalid value", b"[runtime]\nmax_attempts = 0\n", {}, {}),
+                 ("eight levels", b"[runtime]\nmax_attempts = [[[[[[1]]]]]]\n", {}, {}),
+                 ("nine levels", b"[runtime]\nmax_attempts = [[[[[[[1]]]]]]]\n", {"file": "project"},
+                  {"artifact": str(self.project)}))
+        for case, content, data, source in cases:
+            replace(self.project, content)
+            for argv in self.COMMANDS:
+                with self.subTest(case=case, command=argv[0]):
+                    errors = self.assert_refused(argv, OPERATOR, data, source)
+                    if not data:
+                        self.assertIn("runtime.max_attempts", errors)
+        self.assertEqual((self.engines, self.backend.calls, self.quota_calls.all()), ([], [], []))
 
 
 class CommandShapeFileTests(GateCase):
@@ -219,27 +348,49 @@ class CommandShapeFileTests(GateCase):
 
 
 class EmptyVerificationTests(GateCase):
-    # run's refusal of an empty verification.commands is untyped, and spec 2.4 keeps it unchanged.
-    allow_unclassified = True
+    """K23: run without verification commands is refused as configuration, invalid_input/config_file (exit 2),
+    before any write: no operation record, private state or memory database; Runtime.start refuses the same."""
 
     def test_run_is_refused_when_the_valid_project_file_has_no_verification_commands(self):
         state = self.repo / ".harness"
-        for case, content in (("no verification section", b"[permissions]\nworker_commands = []\n"),
-                              ("empty commands", b"[verification]\ncommands = []\n")):
+        cases = (("no verification section", b"[permissions]\nworker_commands = []\n"),
+                 ("empty commands", b"[verification]\ncommands = []\n"))
+        notices = {}
+        for case, content in cases:
             with self.subTest(case=case):
                 replace(self.project, content)
-                before, records = self.footprint(), set(state.glob("operations/*.json"))
+                before = self.footprint()
                 code, output, errors = self.invoke("run", "Implement greet", "--plan", str(PLAN))
-                self.assertNotEqual(code, 0, errors)
-                self.assertEqual(output, "")
-                after = self.footprint()
-                self.assertEqual((after["refs"], after["worktrees"]), (before["refs"], before["worktrees"]))
-                self.assertFalse((state / "runs").exists())
-                self.assertFalse((state / "worktrees").exists())
-                # The gate is in the run's start, after the operation record: that record is finished with no run.
-                (record,) = set(state.glob("operations/*.json")) - records
-                self.assertEqual({key: read_json(record)[key] for key in ("status", "exit_status", "run_id")},
-                                 {"status": "finished", "exit_status": code, "run_id": None})
+                notice = notices[case] = cli_notice(errors)
+                self.assertEqual((code, output), (2, ""), errors)
+                self.assertEqual((notice["kind"], notice["reason"], notice["exit_code"], notice["data"], notice["source"]),
+                                 ("invalid_input", "config_file", 2,
+                                  {"config_key": "verification.commands", "file": "project"},
+                                  {"artifact": str(self.project)}))
+                # Refused while the configuration was loaded: the private tree, the common Git directory's
+                # exclude file and private-state lock, refs and worktrees are as they were.
+                self.assertEqual(self.footprint(), before)
+                self.assertFalse((state / "operations").exists())
+                self.assertFalse((state / "memory.sqlite3").exists())
+        self.assertEqual((self.engines, self.backend.calls, self.quota_calls.all()), ([], [], []))
+        # A caller that bypasses the CLI meets the same refusal in start, before any run exists
+        # (constructing the runtime itself sets up private state, which the CLI never reached).
+        for case, content in cases:
+            with self.subTest(case=case, entry="Runtime.start"):
+                replace(self.project, content)
+                engine = Runtime(Config.load(OPERATOR, self.project), self.repo, backend=self.backend)
+                with self.assertRaises(HarnessError) as caught:
+                    engine.start("Implement greet", read_json(PLAN))
+                projection = stops.project(stops.of(caught.exception))
+                self.assertEqual({key: value for key, value in projection.items() if key != "detail"}, notices[case])
+        # A programmatic entry without a project file: the same stop names neither a file nor an artifact.
+        engine = Runtime(Config.load(OPERATOR), self.repo, backend=self.backend)
+        with self.assertRaises(HarnessError) as caught:
+            engine.start("Implement greet", read_json(PLAN))
+        value = stops.project(stops.of(caught.exception))
+        self.assertEqual((value["kind"], value["reason"], value["exit_code"], value["data"], value["source"]),
+                         ("invalid_input", "config_file", 2, {"config_key": "verification.commands"}, {}))
+        self.assertFalse((state / "runs").exists())
         self.assertEqual((self.backend.calls, self.quota_calls.all()), ([], []))
         # The same fixture with a command runs: the refusal came from the empty list.
         write_project_config(self.repo, self.config.data["verification"]["commands"])
@@ -286,7 +437,7 @@ class CommandsWithoutTheProjectFileTests(GateCase):
         self.assertEqual(ledger.read_bytes(), saved)
         # The same two files do stop a command that loads them.
         code, _, errors = self.invoke("resume", run_id, config=operator)
-        self.assertEqual(code, 1, errors)
+        self.assertEqual(code, 2, errors)
         self.assertEqual(ledger.read_bytes(), saved)
 
 

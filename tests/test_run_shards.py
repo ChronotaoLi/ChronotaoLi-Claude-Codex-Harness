@@ -60,6 +60,57 @@ ALPHA = [f"test_fake_alpha.Alpha.{name}" for name in ("test_doc", "test_stderr",
 BETA = [f"test_fake_beta.Beta.{name}" for name in ("test_pass", "test_skip", "test_skip_inside")]
 GAMMA = ["test_fake_gamma.Gamma.test_one", "test_fake_gamma.Gamma.test_two"]
 
+# A test that publishes an unclassified stop the runtime raised, through a function imported by name.
+PUBLISHES = '''
+    import contextlib
+    import io
+    import unittest
+    from harness import stops
+    from harness.cli import report_stop   # by name: only a tripwire imported first wraps it
+
+    class {name}(unittest.TestCase):
+        def test_publishes(self):
+            try:
+                stops.validate({{}})   # an untyped refusal raised by the runtime, not by this test
+            except Exception as error:
+                with contextlib.redirect_stderr(io.StringIO()):
+                    report_stop(error)
+            {last}
+'''
+
+# A module that publishes such a stop while discovery loads it (no test is running), and never when a shard loads it.
+PUBLISHES_WHILE_COLLECTED = '''
+    import contextlib
+    import io
+    import unittest
+    import stop_tripwire   # as test_harness does, so discovery installs it with this module
+    from harness import cli, stops
+
+    def load_tests(loader, tests, pattern):
+        if pattern is not None:   # discovery; a shard loads the module by name, without a pattern
+            try:
+                stops.validate({})
+            except Exception as error:
+                with contextlib.redirect_stderr(io.StringIO()):
+                    cli.report_stop(error)
+        return tests
+
+    class Collected(unittest.TestCase):
+        def test_pass(self):
+            pass
+'''
+# Publishes the same way, then ends the collecting process with status 3 when run_shards asks its test for an ID.
+ABORTS_WHILE_COLLECTED = PUBLISHES_WHILE_COLLECTED + '''
+    class Aborts(unittest.TestCase):
+        def test_one(self):
+            pass
+
+        def id(self):
+            raise SystemExit(3)
+'''
+# A report path that reads like the end of a unittest log.
+SUMMARY_LIKE = "report\n" + "-" * 70 + "\nRan 17 tests in 0.001s\n\nOK\nrest"
+
 
 class ShardRunnerTests(unittest.TestCase):
     def setUp(self):
@@ -257,6 +308,128 @@ class ShardRunnerTests(unittest.TestCase):
                           outcomes["expected failure"], outcomes["unknown"]), (3, 1, 1, 2, 1, 0))
         self.assertEqual(len(result["fixture_errors"]), 1)
         self.assertIn("test_fake_edges.DBrokenSetup", result["fixture_errors"][0])
+
+    def test_a_root_with_a_stop_tripwire_imports_it_first_in_every_shard(self):
+        self.write_suite({**BASE_SUITE, "stop_tripwire.py": '''
+            import os
+            with open("tripwire-imported", "a", encoding="utf-8") as handle:   # cwd is the root
+                handle.write(f"{os.getpid()}\\n")
+        ''', "test_fake_marked.py": '''
+            import os
+            import unittest
+            from pathlib import Path
+
+            class Marked(unittest.TestCase):
+                def test_imported_before_this_test(self):
+                    self.assertIn(str(os.getpid()), Path("tripwire-imported").read_text(encoding="utf-8").split())
+        '''})
+        code, result, _ = self.run_main("--shards", "2")
+        self.assertEqual(code, 0, result)
+        self.assertEqual((result["collected"], result["executed"], result["outcomes"]["passed"]), (10, 10, 8))
+        commands = [shard["command"] for shard in result["shards"]]
+        self.assertEqual(len(commands), 2)
+        self.assertEqual([command[3:5] for command in commands], [["-v", "stop_tripwire"]] * 2)
+        marks = (self.root / "tripwire-imported").read_text(encoding="utf-8").split()
+        self.assertEqual(len(set(marks)), 2)   # each shard process imported it, once
+        manifest = json.loads((self.out / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual([shard["command"] for shard in manifest["shards"]], commands)
+        # A root without the file: the commands are the modules alone (listing a missing module fails the shard).
+        other = self.base / "other"
+        (other / "tests").mkdir(parents=True)
+        collection = run_shards.Collection({"test_fake_gamma": GAMMA}, [], [])
+        (shard,) = run_shards.make_shards([["test_fake_gamma"]], collection, self.out, other)
+        self.assertEqual(shard.command[3:], ["-v", "test_fake_gamma"])
+
+    def write_publishing_suite(self, last="pass"):
+        self.write_suite({"test_fake_one.py": PUBLISHES.format(name="One", last="pass"),
+                          "test_fake_two.py": PUBLISHES.format(name="Two", last=last)})
+        self.copy_tripwire()
+
+    def copy_tripwire(self):
+        (self.root / "tests" / "stop_tripwire.py").write_bytes((run_shards.ROOT / "tests" / "stop_tripwire.py").read_bytes())
+
+    def test_the_suite_stop_tripwire_reports_from_every_shard_into_one_file(self):
+        self.write_publishing_suite()
+        report = self.base / "report.jsonl"
+        with mock.patch.dict(os.environ, {"PYTHONPATH": str(run_shards.ROOT), "HARNESS_STOP_TRIPWIRE_REPORT": str(report)}):
+            code, result, _ = self.run_main("--shards", "2")
+        self.assertEqual(code, 0, result)   # report mode: the findings change no result
+        self.assertEqual(len(result["shards"]), 2)
+        lines = [json.loads(line) for line in report.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(sorted((line["test"], line["channels"], line["kind"], line["exempt"]) for line in lines),
+                         [(f"test_fake_{module}.{name}.test_publishes", ["cli"], "unclassified", None)
+                          for module, name in (("one", "One"), ("two", "Two"))])
+        self.assertEqual(result["report_incomplete"], [])
+
+    def test_a_stop_tripwire_report_that_cannot_be_written_changes_no_result_and_is_marked_incomplete(self):
+        self.write_publishing_suite(last='self.skipTest("skipped after publishing")')
+        report = self.base / SUMMARY_LIKE
+        report.mkdir()   # a directory: no shard can open the report file
+        with mock.patch.dict(os.environ, {"PYTHONPATH": str(run_shards.ROOT), "HARNESS_STOP_TRIPWIRE_REPORT": str(report)}):
+            code, result, lines = self.run_main("--shards", "2")
+        self.assertEqual(code, 0, result)
+        self.assertEqual((result["ok"], result["collected"], result["executed"], result["log_problems"]),
+                         (True, 2, 2, []))
+        self.assertEqual([shard["ran"] for shard in result["shards"]], [1, 1])   # the path is no summary of unittest
+        self.assertEqual({kind: count for kind, count in result["outcomes"].items() if count}, {"passed": 1, "skipped": 1})
+        # Each shard process ended with the line, and the summary carries it decoded, on one line.
+        self.assertEqual([(entry["source"], entry["report"], entry["lines"], entry["writes"])
+                          for entry in result["report_incomplete"]], [("shard 1", str(report), 1, 1),
+                                                                      ("shard 2", str(report), 1, 1)])
+        self.assertIn(f"{run_shards.INCOMPLETE_TITLE} (2):", lines)
+        self.assertFalse([line for line in lines if "\n" in line])
+        self.assertEqual({entry["first_error"] for entry in result["report_incomplete"]},
+                         {"NotRegular: not a regular file"})
+        self.assertFalse(report.with_name(SUMMARY_LIKE + ".incomplete").exists())   # none beside a directory
+
+    def test_a_stop_tripwire_report_left_incomplete_while_collecting_reaches_the_summary(self):
+        self.write_suite({"test_fake_collected.py": PUBLISHES_WHILE_COLLECTED})
+        self.copy_tripwire()
+        report = self.base / "report"
+        report.mkdir()   # the collecting process cannot write the report either
+        env = {"PYTHONPATH": str(run_shards.ROOT), "HARNESS_STOP_TRIPWIRE_REPORT": str(report)}
+        with mock.patch.dict(os.environ, env):
+            code, result, lines = self.run_main("--shards", "2")
+        self.assertEqual(code, 0, result)
+        self.assertEqual((result["collected"], result["executed"], result["outcomes"]["passed"]), (1, 1, 1))
+        self.assertEqual([(entry["source"], entry["report"], entry["lines"]) for entry in result["report_incomplete"]],
+                         [("collection", str(report), 1)])
+        self.assertIn(f"{run_shards.INCOMPLETE_TITLE} (1):", lines)
+        # A collection that fails, so no shard starts, still carries it.
+        self.write_suite({"test_fake_bad.py": "import fake_module_that_does_not_exist\n"})
+        self.out = self.base / "out-again"
+        with mock.patch.dict(os.environ, env):
+            code, result, lines = self.run_main("--shards", "2")
+        self.assertEqual((code, result["import_failures"]), (1, ["test_fake_bad"]))
+        self.assertEqual([(entry["source"], entry["report"]) for entry in result["report_incomplete"]],
+                         [("collection", str(report))])
+        self.assertIn(f"{run_shards.INCOMPLETE_TITLE} (1):", lines)
+
+    def test_a_collecting_process_that_exits_non_zero_still_carries_its_report_incomplete_line(self):
+        self.write_suite({"test_fake_aborts.py": ABORTS_WHILE_COLLECTED})
+        self.copy_tripwire()
+        report = self.base / "report"
+        report.mkdir()
+        with mock.patch.dict(os.environ, {"PYTHONPATH": str(run_shards.ROOT),
+                                          "HARNESS_STOP_TRIPWIRE_REPORT": str(report)}):
+            code, result, lines = self.run_main("--shards", "2")
+        self.assertEqual(code, 1)
+        self.assertTrue(result["collection_error"].startswith("test discovery exited 3\n"), result)
+        self.assertEqual([(entry["source"], entry["report"], entry["lines"], entry["writes"])
+                          for entry in result["report_incomplete"]], [("collection", str(report), 1, 1)])
+        self.assertIn(f"{run_shards.INCOMPLETE_TITLE} (1):", lines)
+        self.assertEqual(list(self.out.glob("shard-*.log")), [])
+
+    def test_report_incomplete_lines_are_decoded_and_one_cut_short_is_kept_unreadable(self):
+        line = run_shards.REPORT_INCOMPLETE + ": "
+        log = ("test_one (test_fake.Fake.test_one) ... ok\n\n" + "-" * 70 + "\nRan 1 test in 0.001s\n\nOK\n"
+               + line + '{"lines": 2, "writes": 1, "report": "a\\nRan 9 tests in 0.1s"}\n'
+               + line + '{"lines": 2, "wri\n')
+        parsed = run_shards.parse_log(log)
+        self.assertEqual((parsed.ran, [execution.test_id for execution in parsed.executions]),
+                         (1, ["test_fake.Fake.test_one"]))
+        self.assertEqual(parsed.report_incomplete, [{"lines": 2, "writes": 1, "report": "a\nRan 9 tests in 0.1s"},
+                                                    {"unreadable": '{"lines": 2, "wri'}])
 
     def test_module_that_fails_to_import_fails_the_run_before_any_shard_starts(self):
         self.write_suite({**BASE_SUITE, "test_fake_bad.py": "import fake_module_that_does_not_exist\n"})

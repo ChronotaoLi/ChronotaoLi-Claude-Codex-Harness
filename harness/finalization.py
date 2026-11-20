@@ -9,7 +9,10 @@ from pathlib import Path
 
 from . import cleanup, git, stops
 from .context import compact_checks, compact_feedback
-from .contracts import envelope, judge_review, review_approved, review_schema, review_veto
+from .contracts import (
+    REVIEW, REVIEW_OPTIONAL, core_schema, core_value, envelope, judge_review, review_approved, review_schema, review_veto,
+    validate_structure,
+)
 from .recovery import read_bound_bytes, read_evidence_json, snapshot_digest
 from .review_progress import (
     batch_after, bind_review_source, validate_review_source, required_findings, disposition_gaps, require_saved_batch,
@@ -50,6 +53,84 @@ def needs_decision(record, reverify):
     if record["status"] in ("rejected", "invalid_rejected"):
         return True
     return record["status"] == "verification_failed" and record["failure_kind"] != "timeout" and not reverify
+
+
+# The whole-run record shapes final_review and leave_attempt write: each (status, phase) pair with the
+# keys every writer of that pair writes, besides the keys every record has.
+FINAL_COMMON_KEYS = ("attempt", "head", "snapshot_digest", "snapshot_artifact", "artifact", "accepted_tasks",
+                     "verification_rounds", "approved_batches")
+_VERIFIED = ("verification", "diff_artifact")
+_CONCLUDED = (*_VERIFIED, "required_findings", "review", "review_source")
+FINAL_STATES = {("running", "verifying"): (), ("running", "reviewing"): (*_VERIFIED, "required_findings"),
+                ("verification_failed", "finished"): (*_VERIFIED, "failure_kind", "verification_failures"),
+                ("approved", "finished"): _CONCLUDED, ("rejected", "finished"): _CONCLUDED,
+                ("invalid_rejected", "finished"): _CONCLUDED,
+                ("invalidated", "finished"): (*_VERIFIED, "required_findings", "review_source", "reason")}
+
+
+def _text(value):
+    return isinstance(value, str)
+
+
+def _round(value):
+    return (isinstance(value, dict) and _text(value.get("artifact_dir")) and value.get("status") in ("running", "completed")
+            and _text(value.get("checkout_digest", "")))
+
+
+def _check(value):
+    return (isinstance(value, dict) and all(_text(value[key]) for key in ("stdout", "stderr", "log") if key in value)
+            and isinstance(value.get("process_outcome", {}), dict))
+
+
+# Wherever they appear, the values the readers index, iterate, join into paths or put in sets.
+FINAL_VALUES = {"attempt": lambda value: type(value) is int and value >= 1,
+                **dict.fromkeys(("head", "snapshot_digest", "artifact", "snapshot_artifact", "verification",
+                                 "diff_artifact", "reason"), _text),
+                "accepted_tasks": lambda value: isinstance(value, list) and all(map(_text, value)),
+                "verification_rounds": lambda value: isinstance(value, list) and all(map(_round, value)),
+                "required_findings": lambda value: isinstance(value, list),
+                "failure_kind": lambda value: value in ("timeout", "exit_code"),
+                "verification_failures": lambda value: isinstance(value, list) and all(map(_check, value)),
+                "review_source": lambda value: isinstance(value, dict)}
+REVIEW_CORE = core_schema(REVIEW, REVIEW_OPTIONAL)
+
+
+def validate_final_records(history):
+    """Refuse a whole-run record its readers would index into an unclassified crash; run after review_progress.entries.
+
+    A projection may read a record before any traversal authenticates it (trigger
+    without an operator answer), so the reviews' core structure, the one
+    judge_review held before any was written, is checked here too. Digests,
+    artifacts, mappings, dispositions and memory approvals stay with the traversals.
+    """
+    def fail(problem):
+        raise HarnessError(f"运行台账整体记录无效：{problem}；保留原文件并核对证据")
+
+    for index, record in enumerate(history):
+        field = f"final_history[{index}]"
+        status, phase = record.get("status"), record.get("phase")
+        keys = FINAL_STATES.get((status, phase)) if _text(status) and _text(phase) else None
+        if keys is None:
+            fail(f"{field}.status/phase 组合无效")
+        for key in (*FINAL_COMMON_KEYS, *keys):
+            if key not in record:
+                fail(f"{field}.{key} 缺失")
+        for key, valid in FINAL_VALUES.items():
+            if key in record and not valid(record[key]):
+                fail(f"{field}.{key} 取值无效")
+        reviews = [(f"{field}.approved_batches[{number}].review", batch["review"])
+                   for number, batch in enumerate(record["approved_batches"])]
+        if "review" in record:
+            reviews.append((f"{field}.review", record["review"]))
+        for path, review in reviews:
+            if not isinstance(review, dict):
+                fail(f"{path} 不是对象")
+            if not isinstance(review.get("finding_dispositions", {}), dict):
+                fail(f"{path}.finding_dispositions 不是对象")
+            try:
+                validate_structure(core_value(review, (*REVIEW_OPTIONAL, "finding_dispositions")), REVIEW_CORE, path)
+            except HarnessError as error:
+                fail(f"审阅不合审阅契约的核心结构（{error}）")
 
 
 class FinalAcceptance(RuntimeService):
@@ -332,9 +413,8 @@ class FinalAcceptance(RuntimeService):
         if record["phase"] == "reviewing":
             # The verdict is durable: first entry and recovery try to reclaim at this one point.
             self.reclaim_verified_checkout(record)
-            changed_paths = git.git(self.context.worktree, "diff", "--no-ext-diff", "--no-textconv",
-                                    "--name-only", "--no-renames", "-z", self.context.run["base_commit"], "HEAD",
-                                    binding=self.context.run["worktree_binding"]).split("\0")
+            changed_paths = git.range_paths(self.context.worktree, self.context.run["base_commit"],
+                                            binding=self.context.run["worktree_binding"]).split("\0")
             if "required_findings" not in record:
                 raise HarnessError("整体审阅缺少必需问题对照；保留证据", stop=stops.make("runtime_failure", "invariant"))
             required = record["required_findings"]

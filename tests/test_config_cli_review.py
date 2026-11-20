@@ -116,8 +116,11 @@ class IndependentCLICommandsTests(RepoCase):
     def test_installed_cli_without_default_config_reports_explicit_config_option(self):
         with patch("harness.cli.__file__", str(self.repo / "installed" / "harness" / "cli.py")):
             code, output, errors = self.invoke(["doctor"])
-        self.assertEqual(code, 1)
+        self.assertEqual(code, 2)
         self.assertEqual(output, "")
+        notice = json.loads(errors.splitlines()[-1].removeprefix("[harness-json] "))["stop"]
+        self.assertEqual((notice["kind"], notice["reason"], notice["data"]),
+                         ("invalid_input", "cli_arguments", {"option": "--config"}))
         self.assertIn("--config", errors)
         self.assertIn(str(self.repo / "installed" / "harness.toml"), errors)
 

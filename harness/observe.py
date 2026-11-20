@@ -18,6 +18,7 @@ with its path and version alone, and the detail refuses it.
 """
 from __future__ import annotations
 
+import contextlib
 import errno
 import json
 import math
@@ -30,6 +31,7 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePath
 
 from . import quota
+from .process_runtime import defer_cleanup_signals
 from .util import strict_json_loads
 from .versions import unsupported_ledger
 
@@ -242,42 +244,56 @@ class StateReader:
         there, as before. Bound means a lookup below the descriptor works, not just that
         one was returned. When nothing is bound, ``_failure`` keeps why.
         """
-        self._root = self._bound = self._failure = None
+        # Every slot is empty before anything is opened and the cleanup is entered first: each descriptor is
+        # opened and stored inside one deferral, whose re-raise of a signal it kept still lands in this try.
+        self.state = self._root = self._bound = self._search = self._failure = None
         try:
-            self.state = Path(state).resolve()
-        except (OSError, RuntimeError, ValueError) as error:
-            self.state, self._failure = None, error
-            if required:
-                raise NotFound(f"观察目录不可用：{state}") from error
-            return
-        try:
-            self._root = self._bound = os.open(str(self.state), _DIR_FLAGS)
-        except OSError as error:
-            if required:
-                raise NotFound(f"观察目录不可用：{self.state}") from error
-            self._failure = error
-            if isinstance(error, PermissionError):
+            try:
+                self.state = Path(state).resolve()
+            except (OSError, RuntimeError, ValueError) as error:
+                self._failure = error
+                if required:
+                    raise NotFound(f"观察目录不可用：{state}") from error
+                return
+            with defer_cleanup_signals(inherit=False):
                 try:
-                    bound = os.open(str(self.state), _SEARCH_FLAGS)
-                except OSError:
-                    return
-                try:
-                    # O_PATH needs no permission on the directory itself: bound only if a lookup below it works.
-                    # "." always exists, so a refusal here is missing search permission, never a missing name.
-                    os.stat(".", dir_fd=bound)
-                except OSError:
-                    os.close(bound)
-                else:
-                    self._bound = bound
+                    self._root = self._bound = os.open(str(self.state), _DIR_FLAGS)
+                except OSError as error:
+                    self._failure = error  # kept, not raised here: an error leaving the deferral would drop its signal
+            if self._root is not None:
+                return
+            if required:
+                raise NotFound(f"观察目录不可用：{self.state}") from self._failure
+            if not isinstance(self._failure, PermissionError):
+                return
+            with defer_cleanup_signals(inherit=False), contextlib.suppress(OSError):
+                self._search = os.open(str(self.state), _SEARCH_FLAGS)
+            if self._search is None:
+                return
+            try:
+                # O_PATH needs no permission on the directory itself: bound only if a lookup below it works.
+                # "." always exists, so a refusal here is missing search permission, never a missing name.
+                os.stat(".", dir_fd=self._search)
+            except OSError:
+                with defer_cleanup_signals(inherit=False):
+                    search, self._search = self._search, None
+                    os.close(search)
+            else:
+                self._bound, self._search = self._search, None
+        except BaseException:
+            self.close()
+            raise
 
     @property
     def opened(self):
         return self._bound is not None
 
     def close(self):
-        for fd in {self._root, self._bound} - {None}:
+        # Emptied before closing: closing again never reaches a number reused since.
+        held = {self._root, self._bound, self._search} - {None}
+        self._root = self._bound = self._search = None
+        for fd in held:
             os.close(fd)
-        self._root = self._bound = None
 
     def read_following(self, components):
         """The whole regular file below the bound root, read as a path read is: links followed, search permission enough.
@@ -649,9 +665,19 @@ class Observer:
     """Pure read projections over one `.harness` directory."""
 
     def __init__(self, state, reader=None, *, required=False, checkout=None):
-        self.reader = reader or StateReader(state, required=required)
-        # Fixed with the root descriptor: every view names the directory it reads, never recomputed.
-        self.observed = location(state, self.reader.state, checkout=checkout)
+        # A reader the caller passes stays the caller's; one built here is closed on any failure below,
+        # including the signal its deferral raises once the assignment is done.
+        self.reader, owned = reader, None
+        try:
+            if reader is None:
+                with defer_cleanup_signals(inherit=False):
+                    owned = self.reader = StateReader(state, required=required)
+            # Fixed with the root descriptor: every view names the directory it reads, never recomputed.
+            self.observed = location(state, self.reader.state, checkout=checkout)
+        except BaseException:
+            if owned is not None:
+                owned.close()
+            raise
 
     def close(self):
         self.reader.close()
@@ -1015,11 +1041,56 @@ class Observer:
                 "text": read["data"].decode("utf-8", errors="replace"), "observed": self.observed}
 
 
+def holding(use, close, *, keep=False):
+    """Return ``use()``; ``close()`` runs as it leaves (with ``keep``, only when an exception does), in two nested cleanups.
+
+    Both are set up before ``use`` opens anything, and each runs ``close`` inside a deferral of the signals. So one
+    SIGINT or SIGTERM anywhere (while ``use`` opens or uses its descriptors, at the entry of the first cleanup, where
+    no owner's own ``__exit__`` or ``close`` can see it, or while it closes) leaves with every descriptor closed: one
+    kept while closing is raised once the close is done, and the outer cleanup closes what the inner one did not
+    reach. A second signal while the first one's cleanup runs is not covered. ``use`` stores each descriptor where
+    ``close`` finds it inside a deferral of its own, so a signal as it is taken is raised inside these cleanups;
+    ``close`` closes what is still open, once, and is safe to call again or before anything is open. With ``keep``,
+    what ``use`` opened is its caller's once it returns.
+    """
+    kept = False
+    try:
+        try:
+            result = use()
+            kept = keep
+            return result
+        finally:
+            if not kept:
+                _closing(close)
+    finally:
+        if not kept:
+            _closing(close)
+
+
+def _closing(close):
+    # Kept while closing, a signal is raised only once everything is closed.
+    with defer_cleanup_signals(inherit=False):
+        close()
+
+
+def observing(state, use, **options):
+    """``use(observer)`` for an Observer of ``state`` built here, closed however this leaves (``holding``)."""
+    held = []
+
+    def opened():
+        with defer_cleanup_signals(inherit=False):
+            held.append(Observer(state, **options))
+        return use(held[0])
+
+    def close():
+        for observer in held:
+            observer.close()
+    return holding(opened, close)
+
+
 def list_runs(state):
-    with Observer(state) as observer:
-        return observer.list_runs()
+    return observing(state, Observer.list_runs)
 
 
 def run_detail(state, run_id):
-    with Observer(state) as observer:
-        return observer.run_detail(run_id)
+    return observing(state, lambda observer: observer.run_detail(run_id))

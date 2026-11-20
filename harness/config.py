@@ -1,10 +1,12 @@
 import copy
 import hashlib
+import os
 import tomllib
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import stops
 from .commands import command_key, validate_commands
 from .util import HarnessError
 
@@ -36,6 +38,9 @@ PROJECT_SECTIONS = ("verification", "permissions", "runtime")
 OPERATOR_LABEL, PROJECT_LABEL = "操作者配置", "项目配置"
 # Operator-facing hints that ask for a verification or permissions change name the file holding them.
 PROJECT_FILE = f"{PROJECT_LABEL}（目标仓库的 .harness/project.toml）"
+# A legal configuration nests at most 5 levels (top -> verification -> commands -> a command -> argv); 6 to 8
+# are left to validate's more specific diagnostics. Deeper values are refused before anything copies them.
+CONFIG_DEPTH_LIMIT = 8
 
 
 def claude_turn_limit(runtime, role):
@@ -96,34 +101,85 @@ def read_layer(path):
     return raw, hashlib.sha256(raw).hexdigest()
 
 
-def parse_layer(raw, path, label, sections):
-    """One file's bytes as read, checked on their own.
+class MissingLayer(FileNotFoundError):
+    """A configuration file load did not find; ``file`` is the layer it was reading, operator or project.
 
-    Only the file's own sections are accepted and each must be a table; those refusals,
-    unknown keys and command lists of the wrong shape name the file. UTF-8 and TOML
-    errors propagate unchanged and do not name it.
+    Named where it was read, never from its path: the operator path may be, or lead to, the project file's place.
     """
-    data = tomllib.loads(raw.decode("utf-8"))
-    for section, values in data.items():
-        if section not in sections and section in (*OPERATOR_SECTIONS, *PROJECT_SECTIONS):
-            home = (f"{PROJECT_LABEL}（目标仓库 Git 根目录下的 .harness/project.toml）" if label == OPERATOR_LABEL
-                    else f"{OPERATOR_LABEL}（--config 指定的文件）")
-            raise HarnessError(f"{label} {path} 不能包含 {section}：它应写在{home}中")
-        if section in sections and not isinstance(values, dict):
-            raise HarnessError(f"{section} 必须为配置表（{label} {path}）")
-    unknown = unknown_keys(data)
-    limits = data.get("runtime", {}).get("claude_max_turns_by_role")
-    if isinstance(limits, dict):
-        unknown.extend(f"runtime.claude_max_turns_by_role.{role}" for role in limits if role not in DISPATCH_ROLES)
-    if unknown:
-        raise HarnessError("未知配置键：" + "、".join(sorted(unknown)) + f"（{label} {path}）")
-    for section, key in (("verification", "commands"), ("verification", "setup_commands"), ("permissions", "worker_commands")):
-        if key in data.get(section, {}):
-            try:
-                validate_commands(data[section][key], f"{section}.{key}")
-            except HarnessError as error:
-                raise HarnessError(f"{error}（{label} {path}）") from error
+
+    def __init__(self, error, file):
+        super().__init__(error.errno, error.strerror, error.filename)
+        self.file = file
+
+
+def read_named(path, file):
+    """read_layer, a missing file reported as the layer being read."""
+    try:
+        return read_layer(path)
+    except FileNotFoundError as error:
+        raise MissingLayer(error, file) from error
+
+
+def container_depth(value):
+    """Nesting depth without recursion: a scalar is 0, a table or array one more than its deepest item."""
+    deepest, pending = 0, [(value, 1)]
+    while pending:
+        item, depth = pending.pop()
+        if isinstance(item, (dict, list)):
+            deepest = max(deepest, depth)
+            pending.extend((child, depth + 1) for child in (item.values() if isinstance(item, dict) else item))
+    return deepest
+
+
+def parse_layer(raw, path, label, sections):
+    """One file's bytes as read, checked on their own; every refusal is invalid_input/config_file naming the file.
+
+    Only the file's own sections are accepted and each must be a table; bytes that are not UTF-8 TOML,
+    nesting deeper than CONFIG_DEPTH_LIMIT, unknown keys and command lists of the wrong shape are refused too.
+    """
+    file = "operator" if label == OPERATOR_LABEL else "project"
+    with stops.classify("invalid_input", "config_file", data={"file": file}, source={"artifact": str(path)}):
+        try:
+            data = tomllib.loads(raw.decode("utf-8"))
+        except (ValueError, RecursionError) as error:   # UnicodeDecodeError, TOMLDecodeError; the parser's nesting and key limits
+            raise HarnessError(f"{label} {path} 不是可解析的 UTF-8 TOML：{type(error).__name__}: {error}") from error
+        if container_depth(data) > CONFIG_DEPTH_LIMIT:
+            raise HarnessError(f"{label} {path} 的嵌套超过 {CONFIG_DEPTH_LIMIT} 层；没有任何配置项接受这样的形状")
+        for section, values in data.items():
+            if section not in sections and section in (*OPERATOR_SECTIONS, *PROJECT_SECTIONS):
+                home = (f"{PROJECT_LABEL}（目标仓库 Git 根目录下的 .harness/project.toml）" if label == OPERATOR_LABEL
+                        else f"{OPERATOR_LABEL}（--config 指定的文件）")
+                raise HarnessError(f"{label} {path} 不能包含 {section}：它应写在{home}中")
+            if section in sections and not isinstance(values, dict):
+                raise HarnessError(f"{section} 必须为配置表（{label} {path}）")
+        unknown = unknown_keys(data)
+        limits = data.get("runtime", {}).get("claude_max_turns_by_role")
+        if isinstance(limits, dict):
+            unknown.extend(f"runtime.claude_max_turns_by_role.{role}" for role in limits if role not in DISPATCH_ROLES)
+        if unknown:
+            raise HarnessError("未知配置键：" + "、".join(sorted(unknown)) + f"（{label} {path}）")
+        for section, key in (("verification", "commands"), ("verification", "setup_commands"), ("permissions", "worker_commands")):
+            if key in data.get(section, {}):
+                try:
+                    validate_commands(data[section][key], f"{section}.{key}")
+                except HarnessError as error:
+                    raise HarnessError(f"{error}（{label} {path}）") from error
     return data
+
+
+def require_run_commands(config):
+    """run's precondition on the effective configuration: verification.commands is not empty.
+
+    Not in validate: the defaults have none, and doctor, abandon, smoke and sync load only the operator file.
+    The CLI checks it before the operation record; RunLifecycle.start checks it for programmatic callers.
+    """
+    if config.data["verification"]["commands"]:
+        return
+    data, source = {"config_key": "verification.commands"}, None
+    if config.project_path is not None:   # a programmatic entry has no project file to name
+        data["file"], source = "project", {"artifact": str(config.project_path)}
+    raise HarnessError(f"请先在{PROJECT_FILE}中配置 verification.commands",
+                       stop=stops.make("invalid_input", "config_file", data=data, source=source))
 
 
 @dataclass
@@ -138,14 +194,16 @@ class Config:
     @classmethod
     def load(cls, path, project_path=None):
         """Effective configuration: built-in defaults <- operator file <- project file (when given)."""
-        path = Path(path).resolve()
-        raw, digest = read_layer(path)
+        # Path.resolve as Python 3.13 has it; before 3.13 resolve raises RuntimeError on a symlink loop. Here the
+        # read reports the loop as ELOOP: local I/O, like any file that is there but cannot be read.
+        path = Path(os.path.realpath(path))
+        raw, digest = read_named(path, "operator")
         data = parse_layer(raw, path, OPERATOR_LABEL, OPERATOR_SECTIONS)
         project = project_digest = None
         if project_path is not None:
             # Its place is fixed and shown as it is: a link there is followed when read, never displayed.
             project_path = Path(project_path).absolute()
-            raw, project_digest = read_layer(project_path)
+            raw, project_digest = read_named(project_path, "project")
             project = parse_layer(raw, project_path, PROJECT_LABEL, PROJECT_SECTIONS)
         return cls(path, cls.effective(data, project), digest, project_path, project_digest)
 
@@ -160,8 +218,10 @@ class Config:
             # runtime is replaced key by key, each value whole (tables and arrays are not merged);
             # verification and permissions come only from the project file.
             operator = {**operator, **project, "runtime": {**operator.get("runtime", {}), **project.get("runtime", {})}}
-        data = normalized(operator)
-        cls.validate(data)
+        # Not in validate itself: resume_changes validates a snapshot under config_mismatch.
+        with stops.classify("invalid_input", "config_file"):
+            data = normalized(operator)
+            cls.validate(data)
         return data
 
     @staticmethod

@@ -26,43 +26,45 @@ class CommandLifecycleTests(unittest.TestCase):
 
     def test_parent_confirmation_never_hides_live_or_unknown_child(self):
         with self.assertRaises(HarnessError):
-            ensure_dispatches_exited([self.parent])
+            ensure_dispatches_exited([self.parent], state=self.root)
         self.child.update(pgid=99, process_state='running')
         self.save_child()
         with self.assertRaises(HarnessError):
-            ensure_dispatches_exited([self.parent], observe=lambda _: True)
-        ensure_dispatches_exited([self.parent], observe=lambda _: False)
+            ensure_dispatches_exited([self.parent], state=self.root, observe=lambda _: True)
+        ensure_dispatches_exited([self.parent], state=self.root, observe=lambda _: False)
 
     def test_audited_child_assertion_is_digest_bound(self):
         original = self.path.read_bytes()
         audits, saves = [], []
-        confirm_dispatches_exited([self.parent], ['parent'], audit=lambda *args, **kw: audits.append((args, kw)),
+        confirm_dispatches_exited([self.parent], ['parent'], state=self.root, audit=lambda *args, **kw: audits.append((args, kw)),
                                   save=lambda: saves.append(True))
         self.assertEqual(self.path.read_bytes(), original)
         self.assertEqual(len(audits), 1)
         self.assertEqual(len(saves), 1)
-        ensure_dispatches_exited([self.parent])
+        ensure_dispatches_exited([self.parent], state=self.root)
         self.child['pgid'] = 100
         self.save_child()
         with self.assertRaises(HarnessError):
-            ensure_dispatches_exited([self.parent], observe=lambda _: True)
+            ensure_dispatches_exited([self.parent], state=self.root, observe=lambda _: True)
 
     def test_entire_confirmation_batch_validated_before_mutation(self):
         second = dict(self.parent, id='other', exit_confirmed=False, command_directory=str(self.root / 'other' / 'commands'))
+        # A call folder without its journal: ledger 19 cannot record that confirmation, so none of the batch is written.
         corrupt = Path(second['command_directory']) / ('b' * 32)
         corrupt.mkdir(parents=True)
-        (corrupt / 'process.json').write_text('{}')
         audits = []
-        with self.assertRaises(HarnessError):
-            confirm_dispatches_exited([self.parent, second], ['parent', 'other'],
+        with self.assertRaises(HarnessError) as raised:
+            confirm_dispatches_exited([self.parent, second], ['parent', 'other'], state=self.root,
                 audit=lambda *args, **kw: audits.append(args), save=lambda: None)
+        self.assertEqual((raised.exception.stop['kind'], raised.exception.stop['data']['command_id']),
+                         ('process_unconfirmed', 'other:command:' + corrupt.name))
         self.assertEqual(audits, [])
         self.assertNotIn('command_exit_confirmations', self.parent)
 
     def test_prepared_and_legacy_dispatches_are_safe(self):
         self.child['process_state'] = 'prepared'
         self.save_child()
-        ensure_dispatches_exited([self.parent, {'id': 'legacy', 'process_state': 'prepared', 'pgid': None}])
+        ensure_dispatches_exited([self.parent, {'id': 'legacy', 'process_state': 'prepared', 'pgid': None}], state=self.root)
         validate_command_directories([self.parent, {'id': 'legacy'}], self.root)
 
     def test_invalid_directory_and_symlink_rejected(self):
@@ -94,4 +96,4 @@ class CommandLifecycleTests(unittest.TestCase):
         self.assertIsNotNone(result['error'])
         parent = {'id': job.name, 'command_directory': str(job / 'commands'), 'exit_confirmed': True}
         validate_command_directories([parent], self.root)
-        ensure_dispatches_exited([parent])
+        ensure_dispatches_exited([parent], state=self.root)

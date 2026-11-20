@@ -583,7 +583,7 @@ class ImmediateJudgmentTests(RepoCase):
         self.assertEqual((result["attempts"], work_attempts(result)), ({"greet": 2}, {"greet": 1}))
 
     def test_unconfirmed_exit_keeps_the_receipt_unjudged(self):
-        pid_file = self.repo.parent / f"descendant-{uuid.uuid4().hex}.pid"
+        pid_file = self.outside / f"descendant-{uuid.uuid4().hex}.pid"
         program = ("import subprocess,sys; print(" + repr(json.dumps(QUOTA)) + ", flush=True); "
                    "p=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'],"
                    "stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL); "

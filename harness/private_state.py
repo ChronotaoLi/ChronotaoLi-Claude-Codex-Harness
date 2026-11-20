@@ -9,7 +9,11 @@ import stat
 import sys
 
 from . import git
+from .state_files import StateFiles
 from .util import HarnessError
+
+
+CONTROL_LIMIT = 64 * 1024
 
 
 def _path(path, *, directory=False):
@@ -33,7 +37,8 @@ def _path(path, *, directory=False):
 def private_state_lock(repo):
     """A content-free common-Git lock, shared by all initializing writers."""
     repo = Path(repo)
-    common = Path(git.git(repo, 'rev-parse', '--path-format=absolute', '--git-common-dir').removesuffix('\n'))
+    common = Path(git.git(repo, 'rev-parse', '--path-format=absolute', '--git-common-dir', effect=git.READ)
+                  .removesuffix('\n'))
     _path(common, directory=True)
     path = _path(common / 'harness-private-state.lock')
     descriptor = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
@@ -58,16 +63,20 @@ def _initialize(repo, state, common):
             raise HarnessError('不能在 Harness 私有工作树内初始化私有状态')
     if state != root and state.is_relative_to(repo):
         raise HarnessError('仓库内私有状态必须使用根目录 .harness')
-    tracked = git.git_bytes(repo, 'ls-files', '--cached', '-z', '--', '.harness')
-    committed = git.git_process(repo, 'ls-tree', '-r', '--name-only', '-z', 'HEAD', '--', '.harness')
+    tracked = git.git_bytes(repo, 'ls-files', '--cached', '-z', '--', '.harness', effect=git.READ)
+    committed = git.git_process(repo, 'ls-tree', '-r', '--name-only', '-z', 'HEAD', '--', '.harness', effect=git.READ)
     if tracked or committed.returncode == 0 and committed.stdout:
         raise HarnessError('私有路径 .harness 已被跟踪或暂存；请人工处理，保留现场')
-    control = _path(root / '.gitignore')
-    previous = control.read_bytes() if control.exists() else None
+    control = root / '.gitignore'
+    # Read once from the repository, never through a link or waiting on a FIFO; absent at any level is no control file.
+    read = StateFiles(repo).read(('.harness', '.gitignore'), limit=CONTROL_LIMIT).or_local_io()
+    if read.state == 'refused':
+        raise HarnessError(f'私有状态控制路径类型无效：{control}')
+    previous = read.data if read.state == 'read' else None
     if previous is not None:
         rules = [line.strip() for line in previous.splitlines() if line.strip() and not line.lstrip().startswith(b'#')]
-        if rules != [b'*']:
-            raise HarnessError(f'私有忽略控制文件冲突：{control}；请人工将有效规则设置为单独一行 *，原字节已保留')
+    if read.state == 'too_large' or previous is not None and rules != [b'*']:
+        raise HarnessError(f'私有忽略控制文件冲突：{control}；请人工将有效规则设置为单独一行 *，原字节已保留')
     info = _path(common / 'info', directory=True)
     exclude = _path(info / 'exclude')
     old = exclude.read_bytes() if exclude.exists() else b''
@@ -82,9 +91,9 @@ def _initialize(repo, state, common):
     probes = ['.harness/.gitignore', '.harness/private-probe', '.harness/AGENTS.md',
               '.harness/probe/', '.harness/probe/deep/AGENTS.md', '.harness/probe/deep/new.json']
     for probe in probes:
-        if git.git_process(repo, 'check-ignore', '-q', '--', probe).returncode != 0:
+        if git.git_process(repo, 'check-ignore', '-q', '--', probe, effect=git.READ).returncode != 0:
             raise HarnessError(f'私有 Git 忽略规则核验失败：{probe}')
-    visible = git.git_bytes(repo, 'ls-files', '--others', '--exclude-standard', '-z', '--', '.harness')
+    visible = git.git_bytes(repo, 'ls-files', '--others', '--exclude-standard', '-z', '--', '.harness', effect=git.READ)
     if visible:
         raise HarnessError('已有私有文件仍可被 Git 看见；停止私有状态写入')
     state.mkdir(parents=True, exist_ok=True)

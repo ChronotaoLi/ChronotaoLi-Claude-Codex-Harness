@@ -225,7 +225,7 @@ class Verification(RuntimeService):
                        "setup_commands": self.context.config.data["verification"]["setup_commands"]}
         write_json(artifact, environment)
         git.git(self.context.worktree, "worktree", "add", "--detach", str(checkout), environment["head"],
-                binding=self.context.run["worktree_binding"])
+                effect=git.CHECKOUT, binding=self.context.run["worktree_binding"])
         binding = git.capture_worktree_binding(checkout, None)
         environment["binding"] = binding
         write_json(artifact, environment)

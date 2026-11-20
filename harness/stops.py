@@ -250,6 +250,9 @@ _row("invalid_input", "plan_unpublished", 2, "首版计划尚未发布，不能�
 _row("invalid_input", "stale_request", 2, "输入针对的请求或来源已失效", ("status {run}",),
      ("request_id", "continuation_id", "dispatch_id"), option=_key)
 _row("invalid_input", "run_state", 2, "该命令或选项不适用于 run 的当前状态", ("status {run}",), (), status=_key)
+# ``file`` only where one file's own check refused; the merged validation cannot tell which file it came from.
+_row("invalid_input", "config_file", 2, "配置文件不合格", (), ("artifact",),
+     file=_enum("operator", "project"), config_key=_key)
 _row("config_mismatch", "immutable_config", 2, "配置与创建时不一致", ("resume {run}",))
 _row("config_mismatch", "shared_assets", 2, "共享资产与创建时不一致", ("resume {run}",))
 _row("unsupported_ledger", "ledger_version", 2, "台账版本不受支持", (), (), schema_version=_int, supported=_int)

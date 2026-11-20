@@ -48,7 +48,7 @@ def project_report(config, location):
         return report
     try:
         Config.effective(config.data, layers.parse_layer(raw, path, layers.PROJECT_LABEL, layers.PROJECT_SECTIONS))
-    except (HarnessError, ValueError, RecursionError) as error:   # tomllib recurses per nested array, so a deep enough file raises RecursionError
+    except HarnessError as error:   # every refusal of the content, nesting included; anything else is a programming error
         report["error"] = first_line(error)
     return report
 
@@ -83,9 +83,9 @@ def demo(config, live=False, commander="astra"):
     root = Path(tempfile.mkdtemp(prefix="personal-harness-smoke-" if live else "personal-harness-demo-"))
     (root / ".gitignore").write_text(".harness/\n__pycache__/\n", encoding="utf-8")
     (root / "test_hello.py").write_text('import unittest\nfrom hello import greet\n\nclass TestGreet(unittest.TestCase):\n    def test_greet(self):\n        self.assertEqual(greet("Ada"), "Hello, Ada!")\n', encoding="utf-8")
-    git.git(root, "init", "-b", "main")
-    git.git(root, "add", ".")
-    git.git(root, "-c", "user.name=Harness Demo", "-c", "user.email=demo@localhost", "-c", "commit.gpgsign=false", "commit", "-m", "Demo fixture")
+    git.git(root, "init", "-b", "main", effect=git.CHECKOUT)
+    git.git(root, "add", ".", effect=git.INDEX)
+    git.git(root, "commit", "-m", "Demo fixture", effect=git.INDEX_REFS)
     config = copy.deepcopy(config)
     config.data["verification"]["commands"] = [{"cwd": ".", "argv": [sys.executable, "-m", "unittest", "-v"]}]
     config.data["runtime"]["agent_timeout_seconds"] = 180 if live else 1200
@@ -263,7 +263,7 @@ def show_status(args, repo):
     state = repo / ".harness"
     # One binding per call: the location line names the directory every read below goes through,
     # so a `.harness` repointed meanwhile cannot put another directory's ledger under it.
-    with observe.Observer(state, checkout=repo) as observer:
+    def show(observer):
         print("harness: " + observe.location_text(observer.observed, opened=observer.reader.opened),
               file=sys.stderr, flush=True)
         if args.run_id:
@@ -288,9 +288,12 @@ def show_status(args, repo):
             return
         # The read-only observation layer owns the list; stdout fields are unchanged.
         try:
-            listing = observer.list_runs()
+            return observer.list_runs()
         except observe.ObserveError as error:
             raise HarnessError(f"无法读取运行目录 {state / 'runs'}：{error}") from error
+    listing = observe.observing(state, show, checkout=repo)
+    if args.run_id:
+        return
     for item in listing["unsupported"]:
         print(f"harness: 运行目录 {state / item['path']}：{item['reason']}", file=sys.stderr)
     for item in listing["skipped"]:
@@ -643,12 +646,15 @@ def _main(argv=None):
         # Loading writes nothing, so every refusal below comes before the operation record and private state.
         try:
             config = Config.load(args.config, project)
-        except FileNotFoundError as e:
-            if project is not None and e.filename == str(project):
+        except layers.MissingLayer as e:
+            if e.file == "project":
                 raise HarnessError(f"找不到项目配置文件 {project}；请按 Harness 源码中的 examples/project.toml 在该位置创建它",
                                    stop=stops.make("invalid_input", "cli_arguments", data={"option": "--repo"})) from e
-            raise HarnessError(f"找不到配置文件 {Path(args.config).resolve()}；请通过 --config 指定配置文件，"
-                               "默认 harness.toml 和 shared 资源仅随源码仓库提供") from e
+            raise HarnessError(f"找不到配置文件 {e.filename}；请通过 --config 指定配置文件，"
+                               "默认 harness.toml 和 shared 资源仅随源码仓库提供",
+                               stop=stops.make("invalid_input", "cli_arguments", data={"option": "--config"})) from e
+        if args.command == "run":
+            layers.require_run_commands(config)
         if args.command == "doctor":
             return doctor(config, args.repo)
         if args.command == "permission-diagnostics":
@@ -656,38 +662,40 @@ def _main(argv=None):
             if not RUN_ID.fullmatch(args.run_id) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,119}", args.dispatch_id):
                 raise HarnessError("无效 run/dispatch ID", stop=stops.make("invalid_input", "cli_arguments", data={"option": "run_id"}))
             state = repo / ".harness"
+
+            def diagnose(observer):
+                run, error = observer._read_ledger(args.run_id)
+                if error is None and unsupported_ledger(run) is not None:
+                    require_current_ledger(run)  # the shared typed refusal (exit 2)
+                if error or run.get("id") != args.run_id:
+                    raise HarnessError(error or "运行 ID 不符")
+                entry = next((d for d in run.get("dispatches", []) if d.get("id") == args.dispatch_id), None)
+                if entry is None:
+                    raise HarnessError("派发未登记")
+                components = ["runs", args.run_id, "dispatches", args.dispatch_id]
+                terminal = None
+                roles = run.get("config_snapshot", {}).get("roles", {})
+                role_key = "fable" if entry.get("role") == "commander" and run.get("commander") == "fable" else entry.get("role")
+                provider = roles.get(role_key, {}).get("cli")
+                if provider == "claude":
+                    # Claude's only output is its JSON terminal in process.stdout.
+                    try:
+                        source = observer.reader.read(components + ["process.stdout"], limit=16*1024*1024)
+                        if not source["too_large"] and not source["changed_while_reading"]:
+                            terminal = json.loads(source["data"])
+                    except (observe.NotFound, ValueError, RecursionError):
+                        pass
+                report = permission_diagnostics(config, terminal)
+                # Presence decides: an explicit null, empty string or array is refused, never "not given".
+                if args.command_json is not None:
+                    report["local_command_capability"] = command_capability_projection(
+                        config, json.loads(args.command_json))
+                report.update(run_id=args.run_id, dispatch_id=args.dispatch_id,
+                              local_config_basis="current_configuration_not_historical_provider_policy")
+                print(dump(report))
+                return 0
             try:
-                with observe.Observer(state, required=True) as observer:
-                    run, error = observer._read_ledger(args.run_id)
-                    if error is None and unsupported_ledger(run) is not None:
-                        require_current_ledger(run)  # the shared typed refusal (exit 2)
-                    if error or run.get("id") != args.run_id:
-                        raise HarnessError(error or "运行 ID 不符")
-                    entry = next((d for d in run.get("dispatches", []) if d.get("id") == args.dispatch_id), None)
-                    if entry is None:
-                        raise HarnessError("派发未登记")
-                    components = ["runs", args.run_id, "dispatches", args.dispatch_id]
-                    terminal = None
-                    roles = run.get("config_snapshot", {}).get("roles", {})
-                    role_key = "fable" if entry.get("role") == "commander" and run.get("commander") == "fable" else entry.get("role")
-                    provider = roles.get(role_key, {}).get("cli")
-                    if provider == "claude":
-                        # Claude's only output is its JSON terminal in process.stdout.
-                        try:
-                            source = observer.reader.read(components + ["process.stdout"], limit=16*1024*1024)
-                            if not source["too_large"] and not source["changed_while_reading"]:
-                                terminal = json.loads(source["data"])
-                        except (observe.NotFound, ValueError, RecursionError):
-                            pass
-                    report = permission_diagnostics(config, terminal)
-                    # Presence decides: an explicit null, empty string or array is refused, never "not given".
-                    if args.command_json is not None:
-                        report["local_command_capability"] = command_capability_projection(
-                            config, json.loads(args.command_json))
-                    report.update(run_id=args.run_id, dispatch_id=args.dispatch_id,
-                                  local_config_basis="current_configuration_not_historical_provider_policy")
-                    print(dump(report))
-                    return 0
+                return observe.observing(state, diagnose, required=True)
             except observe.ObserveError as error:
                 raise HarnessError(str(error)) from error
         if args.command in ("demo", "smoke"):

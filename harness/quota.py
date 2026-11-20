@@ -855,7 +855,8 @@ class QuotaSampler(RuntimeService):
         """The runtime's own exit gate on the in-memory ledger, read-only; any failure means 'not confirmed'."""
         try:
             util.validate_command_directories(self.context.run["dispatches"], self.context.directory)
-            util.ensure_dispatches_exited(self.context.run["dispatches"], observe=util.group_alive)
+            util.ensure_dispatches_exited(self.context.run["dispatches"], state=self.context.state,
+                                          observe=util.group_alive)
             return True
         except Exception:
             return False

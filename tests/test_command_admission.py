@@ -1,5 +1,7 @@
+import json
 import multiprocessing
 import os
+import stat
 import sys
 import tempfile
 import time
@@ -7,8 +9,12 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from harness.command_server import Broker, command_id, create_manifest
-from harness.util import HarnessError, with_descriptors, write_json
+from harness.command_server import Broker, command_id, command_processes, create_manifest, handle
+from harness.util import HarnessError, read_json, with_descriptors, write_json
+from harness.versions import RUN_SCHEMA_VERSION
+from test_provider_failures import FifoWatchdog
+
+ADMISSION_LOCK = 'command-admission.lock'
 
 
 def invoke(path, digest, identifier, queue):
@@ -238,3 +244,128 @@ class CommandAdmissionTests(unittest.TestCase):
         self.assertIn('injected persistence interrupt', result['persistence_error'])
         self.assertNotIn('injected persistence interrupt', result['error'])
         self.assertFalse(result['evidence_complete'])
+
+
+def tree(root):
+    """Every entry below root, links listed but not followed."""
+    found = []
+    for directory, folders, names in os.walk(root):
+        found += [os.path.relpath(os.path.join(directory, name), root) for name in folders + names]
+    return sorted(found)
+
+
+class AdmissionLockTests(unittest.TestCase):
+    """The admission lock is created with the manifest; a refused call creates no file."""
+
+    COMMAND = {'cwd': '.', 'argv': [sys.executable, '-c', 'pass']}
+    SCOPE = {'task_id': 'cleanup', 'allowed_paths': ['legacy/**']}
+    CALLS = (('run_command', {'command_id': command_id(COMMAND)}), ('delete_path', {'path': 'legacy/old.txt'}))
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name).resolve()
+        self.config = {'verification': {'commands': [self.COMMAND]}, 'permissions': {'worker_commands': []},
+                       'runtime': {'verify_timeout_seconds': 5, 'agent_timeout_seconds': 30}}
+
+    def unbound(self, name):
+        job = self.root / 'dispatches' / name
+        meta = create_manifest(self.config, self.root, job, None, delete_scope=self.SCOPE)
+        return job, Broker(meta['artifact'], meta['artifact_digest'])
+
+    def bound(self, name):
+        job = self.root / 'dispatches' / name
+        run_path = self.root / 'runs' / name / 'state.json'
+        run_path.parent.mkdir(parents=True)
+        state = {'schema_version': RUN_SCHEMA_VERSION, 'status': 'running', 'worktree': str(self.root),
+                 'expected_head': 'head', 'worktree_binding': {'fixture': True},
+                 'tasks': [{'id': 'cleanup', 'allowed_paths': ['legacy/**']}],
+                 'dispatches': [{'id': name, 'role': 'worker', 'kind': 'implement', 'status': 'running', 'task_id': 'cleanup',
+                                 'invoked': True, 'command_directory': str(job / 'commands')}]}
+        write_json(run_path, state)
+        meta = create_manifest(self.config, self.root, job, run_path)
+        return job, run_path, state, Broker(meta['artifact'], meta['artifact_digest'])
+
+    def refused_without_a_file(self, job, broker, name, arguments):
+        before = tree(job)
+        response = handle({'method': 'tools/call', 'params': {'name': name, 'arguments': arguments}}, broker)
+        payload = json.loads(response['content'][0]['text'])
+        self.assertTrue(response['isError'], payload)
+        self.assertEqual((payload.get('status'), payload.get('started')), ('blocked', False), payload)
+        self.assertEqual(tree(job), before)
+        return payload
+
+    def test_manifest_creates_a_private_empty_lock_and_refuses_an_existing_one(self):
+        job, _ = self.unbound('fresh')
+        lock = os.lstat(job / ADMISSION_LOCK)
+        self.assertTrue(stat.S_ISREG(lock.st_mode))
+        self.assertEqual((stat.S_IMODE(lock.st_mode), lock.st_size), (0o600, 0))
+        stale = self.root / 'dispatches' / 'stale'
+        stale.mkdir(parents=True)
+        (stale / ADMISSION_LOCK).write_text('')
+        with self.assertRaisesRegex(HarnessError, 'admission lock already exists'):
+            create_manifest(self.config, self.root, stale, None)
+        self.assertFalse((stale / 'commands.json').exists())
+
+    def test_every_admission_refusal_on_a_first_call_leaves_the_dispatch_files_unchanged(self):
+        def version(job, run_path, state, broker):
+            write_json(run_path, {**state, 'schema_version': 18})
+        def manifest(job, run_path, state, broker):
+            write_json(broker.path, {**broker.manifest, 'timeout': 1})
+        def source(job, run_path, state, broker):
+            write_json(run_path, {**state, 'dispatches': [{**state['dispatches'][0], 'status': 'exited'}]})
+        def evidence(job, run_path, state, broker):
+            folder = job / 'commands' / ('a' * 32)
+            folder.mkdir()
+            write_json(folder / 'process.json', {'id': job.name + ':command:' + folder.name, 'command_id': command_id(self.COMMAND),
+                                                 'pgid': None, 'process_state': 'exited', 'exit_confirmed': True})
+        cases = (('ledger version', version, 'head', '18'), ('manifest changed', manifest, 'head', 'digest mismatch'),
+                 ('source not live', source, 'head', 'no longer live'), ('HEAD changed', None, 'moved', 'HEAD changed'),
+                 ('evidence incomplete', evidence, 'head', 'evidence incomplete'))
+        with patch('harness.command_server.git.check_worktree_binding'):
+            for label, tamper, head, reason in cases:
+                for name, arguments in self.CALLS:
+                    with self.subTest(refusal=label, tool=name):
+                        with patch('harness.command_server.git.head', return_value='head'):
+                            job, run_path, state, broker = self.bound(f'{name}-{label.replace(" ", "-")}')
+                        self.assertIn(ADMISSION_LOCK, tree(job))
+                        if tamper:
+                            tamper(job, run_path, state, broker)
+                        with patch('harness.command_server.git.head', return_value=head):
+                            payload = self.refused_without_a_file(job, broker, name, arguments)
+                        self.assertIn(reason, payload['error'])
+
+    def test_a_missing_or_unusable_lock_is_a_tool_error_that_creates_nothing(self):
+        target = self.root / 'through-link'
+        def missing(lock):
+            lock.unlink()
+        def link(lock):
+            lock.unlink()
+            lock.symlink_to(target)
+        def directory(lock):
+            lock.unlink()
+            lock.mkdir()
+        def fifo(lock):
+            lock.unlink()
+            os.mkfifo(lock)
+        for label, replace in (('missing', missing), ('link', link), ('directory', directory), ('fifo', fifo)):
+            for name, arguments in self.CALLS:
+                with self.subTest(lock=label, tool=name):
+                    job, broker = self.unbound(f'{name}-{label}')
+                    replace(job / ADMISSION_LOCK)
+                    # A FIFO without a writer must not block the open; the watchdog ends a regression instead of hanging.
+                    watchdog = FifoWatchdog(job / ADMISSION_LOCK, bound=10) if label == 'fifo' else None
+                    try:
+                        self.refused_without_a_file(job, broker, name, arguments)
+                    finally:
+                        self.assertFalse(watchdog and watchdog.stop())
+                    self.assertFalse(os.path.lexists(target))
+                    self.assertEqual(command_processes(job, state=self.root), [])
+
+    def test_a_deletion_refused_after_admission_still_leaves_its_journal_and_receipt(self):
+        job, broker = self.unbound('admitted')
+        result = broker.delete_path({'path': 'elsewhere/file.txt'})
+        self.assertEqual(result['outcome'], 'refused')
+        folder = job / 'commands' / result['call_id'].rsplit(':', 1)[1]
+        self.assertEqual(sorted(path.name for path in folder.iterdir()), ['process.json', 'receipt.json'])
+        self.assertEqual(read_json(folder / 'receipt.json'), result)

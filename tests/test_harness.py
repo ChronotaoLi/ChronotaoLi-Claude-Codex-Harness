@@ -1,3 +1,4 @@
+import git_isolation  # first: no Git process of a test run may read the developer's Git configuration
 import copy
 import json
 import os
@@ -9,6 +10,8 @@ import tomllib
 import unittest
 from pathlib import Path
 
+import stop_tripwire  # noqa: F401  importing it installs the stop tripwire in this test process
+from stop_tripwire import injected  # one exemption rule for G7 and the tripwire
 from harness import git
 from harness.adapters import CLIBackend, DemoBackend
 from harness.config import Config
@@ -18,7 +21,7 @@ from harness.runtime import Runtime
 from harness.mcp_server import handle
 from harness.memory import Memory
 from harness.shared import mcp_configs, toml_value
-from harness.util import HarnessError, read_json, run_process
+from harness.util import HarnessError, read_json, run_process, write_json
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -251,9 +254,11 @@ def cli_notice(errors):
 
 def run_exit(case, text, *, backend, directory, expect_status, expect_code, fill):
     import shlex
-    for placeholder, value in (fill or {}).items():
-        text = text.replace(placeholder, str(value))
-    code, errors = run_cli(case, backend, shlex.split(text))
+    # Split first, then fill whole words: a value with spaces stays one argument, and a placeholder
+    # inside a word (or one the exit no longer names) fails here instead of running another command.
+    fill, words = {name: str(value) for name, value in (fill or {}).items()}, shlex.split(text)
+    case.assertEqual(sorted(set(fill) - set(words)), [], f"placeholders not whole words of {text!r}")
+    code, errors = run_cli(case, backend, [fill.get(word, word) for word in words])
     case.assertEqual(code, expect_code, text + "\n" + errors)
     after = read_json(Path(directory) / "state.json")
     case.assertEqual(after["status"], expect_status, text + "\n" + errors)
@@ -275,9 +280,12 @@ def walk_exit(case, directory, row, *, backend, expect_status, expect_code=0, ch
                     expect_code=expect_code, fill=fill)
 
 
-def refused_by_cli(case, backend, argv, row, code):
-    """An operation refusal through the real CLI: its exit code and stderr projection; returns the projection."""
-    result, errors = run_cli(case, backend, argv)
+def refused_by_cli(case, backend, argv, row, code, *, load=False):
+    """An operation refusal through the real CLI: its exit code and stderr projection; returns the projection.
+
+    ``load`` is ``run_cli``'s: without it the case's configuration replaces loading, so a broken file is never read.
+    """
+    result, errors = run_cli(case, backend, argv, load=load)
     notice = cli_notice(errors)
     case.assertIsNotNone(notice, errors)
     case.assertEqual((result, notice["kind"], notice["reason"]), (code, *row), errors)
@@ -312,23 +320,6 @@ def continues_without_stop(case, directory, *, events_from=0):
 
 
 # ---- stop guards (spec 14.4, G7 and G10), installed on every RepoCase ---------------------
-TESTS_DIR = Path(__file__).resolve().parent
-
-
-def injected(error):
-    """Whether the exception was raised by test code (a patched function), not by the runtime."""
-    tb = error.__traceback__
-    last = None
-    while tb is not None:
-        last = tb.tb_frame.f_code.co_filename
-        tb = tb.tb_next
-    if last is None:
-        return False
-    path = Path(last).resolve()
-    # A patched side_effect raises inside unittest.mock: test machinery, not the runtime.
-    return path.is_relative_to(TESTS_DIR) or (path.name == "mock.py" and path.parent.name == "unittest")
-
-
 def install_stop_guards(case):
     """G7: no runtime stop is unclassified. G10: a published stop's listed exits are not blocked by the load checks.
 
@@ -537,6 +528,8 @@ class RepoCase(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.repo = Path(self.temp.name)
+        # Files a case keeps outside its repository: the repository's parent is the temporary root every test process shares.
+        self.outside = scratch(self)
         # After every other cleanup (cleanups run last-in first-out): whatever the runtime wrote into a
         # run directory, the observer can address it or excludes it by name.
         self.addCleanup(lambda: self.assertEqual(
@@ -845,6 +838,38 @@ class RuntimeTests(RepoCase):
         self.config.data["roles"]["reviewer"]["model"] = engine.run["config_snapshot"]["roles"]["reviewer"]["model"]
         walk_notice_exit(self, notice, ("config_mismatch", "immutable_config"), backend=DemoBackend(),
                          directory=engine.directory, expect_status="awaiting_approval")
+
+    def test_listed_exit_takes_an_answer_path_with_spaces(self):
+        from unittest.mock import patch
+        from harness import stops
+
+        class AskOperatorOnce(DemoBackend):
+            workers = 0
+            def invoke(self, **kwargs):
+                result = super().invoke(**kwargs)
+                if kwargs["role"] == "worker":
+                    self.workers += 1
+                    if self.workers == 1:
+                        result.update(status="blocked", blocker_kind="operator", blockers=["Which greeting?"])
+                return result
+        backend = AskOperatorOnce()
+        engine = self.engine(backend)
+        with self.assertRaises(HarnessError):
+            engine.start("Implement greet", read_json(ROOT / "examples" / "plan.json"))
+        answer = scratch(self) / "operator answers" / "answer.json"
+        write_json(answer, {"schema_version": 1, "request_id": engine.run["decision_requests"][-1]["id"],
+                            "task_id": "greet", "decision": "continue", "summary": "Use the documented greeting."})
+        # A placeholder inside a word, or one the exit does not name, fails before the CLI runs.
+        listed = stops.project_ledger(read_json(engine.directory / "state.json"))["exits"][0]
+        with patch.object(sys.modules[__name__], "run_cli", wraps=run_cli) as reached:
+            for text, fill in ((listed.replace(" FILE", "=FILE"), {"FILE": answer}),
+                               (listed, {"FILE": answer, "ANSWER": answer})):
+                with self.subTest(text=text, fill=sorted(fill)), self.assertRaises(self.failureException):
+                    run_exit(self, text, backend=backend, directory=engine.directory, expect_status="completed",
+                             expect_code=0, fill=fill)
+        self.assertEqual(reached.call_count, 0)
+        walk_exit(self, engine.directory, ("operator_decision", "answer_required"), backend=backend,
+                  fill={"FILE": answer}, expect_status="completed")
 
 
 class IntegrationTests(RepoCase):

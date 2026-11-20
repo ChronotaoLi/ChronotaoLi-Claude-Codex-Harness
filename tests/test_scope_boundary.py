@@ -813,6 +813,105 @@ class ProtectedAliasTests(RepoCase):
                                       "checkpoint source": False, "delete_path": "deleted"})
 
 
+# ---- K20: a link into a protected root is committed as its text; a write through it is refused ----------
+class ProtectedLinkTests(RepoCase):
+    def test_a_link_to_a_protected_root_is_accepted_as_text_and_a_write_through_it_is_refused(self):
+        # The base holds the demo worker's hello.py, so each candidate is only what the script below writes, and no
+        # .claude: the link is dangling when it is accepted, and the second worker creates the real directory itself.
+        (self.repo / "hello.py").write_text('def greet(name):\n    return f"Hello, {name}!"\n')
+        git.git(self.repo, "add", ".")
+        git.git(self.repo, "-c", "user.name=Test", "-c", "user.email=test@localhost", "-c", "commit.gpgsign=false",
+                "commit", "-qm", "base")
+        base = git.head(self.repo)
+        first = copy.deepcopy(plan()["tasks"][0])
+        first.update(id="link", allowed_paths=["docs/**"])
+        second = copy.deepcopy(first)
+        second.update(id="through", depends_on=["link"])
+        written = '{"permissions": {"allow": ["Bash"]}}\n'
+        dangling, landed = [], []
+
+        def change(backend, kwargs, packet, result):
+            if trigger_kind(kwargs, packet) == "plan":
+                result["new_tasks"] = copy.deepcopy([first, second])
+            if kwargs["role"] != "worker":
+                return
+            cwd = Path(kwargs["cwd"])
+            if kwargs["schema"]["properties"]["task_id"]["enum"][0] == "link":
+                (cwd / "docs").mkdir()
+                (cwd / "docs" / "x").symlink_to("../.claude")
+                dangling.append(not (cwd / "docs" / "x").exists())
+            else:
+                # A write through a dangling link does not create its target, so the directory comes first.
+                (cwd / ".claude").mkdir()
+                (cwd / "docs" / "x" / "settings.json").write_text(written)
+                landed.append((cwd / ".claude" / "settings.json").read_text())
+        backend = ScriptedBackend(change)
+        engine = self.engine(backend)
+        with self.assertRaises(HarnessError):
+            engine.start("Link docs")
+        run = saved(engine)
+        # The commander published both tasks; the second worker's candidate never reached verification or review.
+        self.assertEqual([d["role"] for d in run["dispatches"]],
+                         ["commander", "worker", "verification", "reviewer", "worker"])
+        self.assertEqual(sources(run), [run["dispatches"][0]["id"]])
+        # The first task was accepted with the dangling link's text alone: the commit has nothing under .claude.
+        commit = run["accepted"]["link"]["commit"]
+        show = lambda *args: git.git(engine.worktree, *args, binding=run["worktree_binding"])
+        self.assertEqual(dangling, [True])
+        self.assertEqual(show("rev-parse", commit + "^").strip(), base)
+        self.assertEqual(show("show", commit + ":docs/x"), "../.claude")
+        self.assertTrue(show("ls-tree", commit, "--", "docs/x").startswith("120000 blob "))
+        self.assertEqual(show("ls-tree", "-r", commit, "--", ".claude"), "")
+        self.assertEqual(show("diff", "--name-only", base, commit).split(), ["docs/x"])
+        # The second worker's write went through the link into .claude; the candidate check names the real path.
+        self.assertEqual(landed, [written])
+        self.assertEqual((run["stop"]["kind"], run["stop"]["reason"], run["stop"]["data"]["path"], run["stop"]["source"]),
+                         ("scope_violation", "protected_path", ".claude/settings.json", {"task_id": "through"}))
+        self.assertEqual((sorted(run["accepted"]), git.head(engine.worktree, binding=run["worktree_binding"])),
+                         (["link"], commit))
+        worker = next(d for d in run["dispatches"] if (d["role"], d["task_id"]) == ("worker", "through"))
+        self.assertEqual(worker["worker_receipt_consumed"], "scope_rejected")
+        calls = len(backend.calls)
+        with self.assertRaises(HarnessError):
+            self.engine(backend).resume(engine.run["id"])
+        after = saved(engine)
+        self.assertEqual((len(backend.calls), sorted(after["accepted"]), after["stop"]["data"]["path"]),
+                         (calls, ["link"], ".claude/settings.json"))
+
+    def test_a_link_to_an_existing_protected_root_is_still_accepted_as_text(self):
+        # The base tracks .claude/settings.json, so the link resolves to a real directory when it is accepted.
+        (self.repo / "hello.py").write_text('def greet(name):\n    return f"Hello, {name}!"\n')
+        (self.repo / ".claude").mkdir()
+        (self.repo / ".claude" / "settings.json").write_text("{}\n")
+        git.git(self.repo, "add", "--", "hello.py", ".claude/settings.json")
+        git.git(self.repo, "-c", "user.name=Test", "-c", "user.email=test@localhost", "-c", "commit.gpgsign=false",
+                "commit", "-qm", "base")
+        base = git.head(self.repo)
+        task = copy.deepcopy(plan()["tasks"][0])
+        task.update(id="link", allowed_paths=["docs/**"])
+        resolved = []
+
+        def change(backend, kwargs, packet, result):
+            if trigger_kind(kwargs, packet) == "plan":
+                result["new_tasks"] = [copy.deepcopy(task)]
+            if kwargs["role"] == "worker":
+                cwd = Path(kwargs["cwd"])
+                (cwd / "docs").mkdir()
+                (cwd / "docs" / "x").symlink_to("../.claude")
+                resolved.append((cwd / "docs" / "x" / "settings.json").is_file())
+        engine = self.engine(ScriptedBackend(change))
+        engine.start("Link docs")
+        run = saved(engine)
+        self.assertEqual((run["status"], sorted(run["accepted"]), resolved), ("completed", ["link"], [True]))
+        commit = run["accepted"]["link"]["commit"]
+        show = lambda *args: git.git(engine.worktree, *args, binding=run["worktree_binding"])
+        # Committed as the link's text, not the directory it points at; the tracked .claude is untouched.
+        entry = show("ls-tree", commit, "--", "docs/x")
+        self.assertTrue(entry.startswith("120000 blob "), entry)
+        self.assertEqual(show("show", commit + ":docs/x"), "../.claude")
+        self.assertEqual(show("diff", "--name-only", base, commit).split(), ["docs/x"])
+
+
 # ---- T6-16, T6-17: an operator answer lives until a decide lands ---------------------------------------
 class AnswerValidityTests(HeldCase):
     def test_answer_survives_hold_and_rejection(self):

@@ -106,7 +106,7 @@ def _gate(run, directory, *, terminal=False):
     validate_dispatch_indexes(directory, run['dispatches'])
     validate_input_dispatch_indexes(directory, run['dispatches'])
     validate_worker_receipt_links(run, directory)
-    ensure_dispatches_exited(run['dispatches'], observe=group_alive)
+    ensure_dispatches_exited(run['dispatches'], state=repo / '.harness', observe=group_alive)
     git.check_worktree_binding(checkout, run['worktree_binding'])
     if git.head(checkout, binding=run['worktree_binding']) != run['expected_head']:
         _fail('HEAD changed', stops.make('workspace_mismatch', 'head_changed', data={'expected_head': run['expected_head']}))
@@ -116,9 +116,9 @@ def _gate(run, directory, *, terminal=False):
 def _destination(run, name):
     path = Path(run['worktree']) / _relative(name)
     _canonical(path)
-    tracked = git.git(Path(run['worktree']), 'ls-files', '-z', '--', name,
+    tracked = git.git(Path(run['worktree']), 'ls-files', '-z', '--', name, effect=git.READ,
                       binding=run['worktree_binding'])
-    if tracked or not git.git(Path(run['worktree']), 'check-ignore', '--no-index', '--', name,
+    if tracked or not git.git(Path(run['worktree']), 'check-ignore', '--no-index', '--', name, effect=git.READ,
                               binding=run['worktree_binding']).strip():
         _fail('destination must be ignored and untracked: ' + name)
     return path

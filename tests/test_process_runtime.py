@@ -10,7 +10,11 @@ import time
 import unittest
 from unittest.mock import patch
 
-from harness.util import HarnessError, ProcessTimeout, read_json, run_process
+from harness.process_runtime import ProcessSupervisor
+from harness.util import HarnessError, ProcessStartError, ProcessTimeout, read_json, run_process
+
+# Facts two independent launches share; pid, pgid and timing are each launch's own.
+STABLE_FACTS = ('exit_code', 'exit_confirmed', 'evidence_complete', 'termination_reason', 'errors', 'cleanup_errors')
 
 
 class ProcessRuntimeTests(unittest.TestCase):
@@ -401,3 +405,77 @@ while not os.path.exists(sys.argv[2]):
         self.assertLess(time.monotonic() - started, 2.2)
         self.assertEqual(caught.exception.outcome.exit_code, -signal.SIGKILL)
         self.assertTrue(caught.exception.outcome.exit_confirmed)
+
+    def settle(self, call):
+        try:
+            left = ('returned', call())
+        except (KeyboardInterrupt, HarnessError) as error:
+            left = ('raised', error)
+        saved = read_json(self.log.with_suffix('.outcome.json'))
+        return left, {key: saved[key] for key in STABLE_FACTS}
+
+    def outside_and_inside(self, call, handled=ValueError):
+        """Run call outside any handler, then inside a caller's ``except handled``: how it left and the facts match."""
+        outside, outside_facts = self.settle(call)
+        caller = handled("the caller's own error")
+        try:
+            raise caller
+        except handled:
+            inside, inside_facts = self.settle(call)
+        shape = lambda left: (left[0], left[1] if left[0] == 'returned' else type(left[1]))
+        self.assertEqual(shape(inside), shape(outside))
+        self.assertEqual(inside_facts, outside_facts)
+        self.assertFalse(hasattr(caller, 'outcome'))
+        return inside, inside_facts
+
+    def test_normal_exit_inside_a_callers_handler_stays_normal(self):
+        for handled in (ValueError, KeyboardInterrupt):
+            with self.subTest(handled=handled.__name__):
+                left, facts = self.outside_and_inside(lambda: self.invoke('pass'), handled)
+                self.assertEqual(left, ('returned', 0))
+                self.assertEqual(facts['termination_reason'], 'normal')
+                self.assertTrue(facts['exit_confirmed'])
+                self.assertTrue(facts['evidence_complete'])
+                self.assertEqual(facts['errors'], [])
+
+    def test_real_sigint_in_start_deferral_inside_a_callers_handler_cancels(self):
+        original = ProcessSupervisor.begin_launch
+        def interrupted(supervisor):
+            os.kill(os.getpid(), signal.SIGINT)
+            return original(supervisor)
+        with patch.object(ProcessSupervisor, 'begin_launch', interrupted):
+            (how, error), facts = self.outside_and_inside(
+                lambda: self.invoke('import time; time.sleep(30)', timeout=5))
+        self.assertEqual(how, 'raised')
+        self.assertIsInstance(error, KeyboardInterrupt)
+        self.assertTrue(error.outcome.started)
+        self.assertEqual(facts['termination_reason'], 'cancelled')
+        self.assertEqual(facts['exit_code'], -signal.SIGTERM)
+        self.assertTrue(facts['exit_confirmed'])
+
+    def test_real_sigint_in_cleanup_deferral_inside_a_callers_handler_cancels(self):
+        def call():
+            seen = []
+            def on_outcome(outcome):
+                seen.append(outcome.termination_reason)
+                if len(seen) == 1:
+                    os.kill(os.getpid(), signal.SIGINT)
+            return self.invoke('pass', on_outcome=on_outcome)
+        (how, error), facts = self.outside_and_inside(call)
+        self.assertEqual(how, 'raised')
+        self.assertIsInstance(error, KeyboardInterrupt)
+        self.assertEqual(facts['termination_reason'], 'cancelled')
+        self.assertEqual(facts['exit_code'], 0)
+        self.assertTrue(facts['exit_confirmed'])
+
+    def test_timeout_and_missing_program_inside_a_callers_handler_keep_their_reason(self):
+        missing = str(self.root / 'missing-program')
+        for call, expected, reason in [
+                (lambda: self.invoke('import time; time.sleep(30)', timeout=.05), ProcessTimeout, 'timeout'),
+                (lambda: run_process([missing], self.root, self.log), ProcessStartError, 'start_failed')]:
+            with self.subTest(reason=reason):
+                (how, error), facts = self.outside_and_inside(call)
+                self.assertEqual(how, 'raised')
+                self.assertIsInstance(error, expected)
+                self.assertEqual(facts['termination_reason'], reason)
+                self.assertTrue(facts['exit_confirmed'])

@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import signal
 import subprocess
 import sys
@@ -14,6 +15,7 @@ import time
 import unittest
 from unittest.mock import patch
 
+import git_isolation
 from harness import git
 from harness import git_query
 from harness.config import Config
@@ -22,14 +24,14 @@ from harness.mcp_server import handle
 from harness.shared import mcp_configs
 from harness.util import HarnessError, write_json
 from harness.versions import RUN_SCHEMA_VERSION
+from test_git_invocation import EVENTS, config_selectors_work, configured_hooks_exist, event_switches_exist
 from test_harness import ROOT
 
 SHA = "0123456789abcdef0123456789abcdef01234567"
 USER = ("-c", "user.name=Test", "-c", "user.email=test@localhost", "-c", "commit.gpgsign=false")
 
 
-def clean_env():
-    return {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+clean_env = git_isolation.clean_environment
 
 
 def run_git(cwd, *args, check=True):
@@ -145,6 +147,42 @@ class GitQueryParserTests(unittest.TestCase):
                 self.assertFalse(covers(argv))
         for value in (None, "git ls-files -- a", [], ["git", 1], [["git"]]):
             self.assertFalse(covers(value))
+
+
+class PlainGitEnvironmentTests(unittest.TestCase):
+    """The plain Git of these fixtures and Harness's Git select the same files, so no system file comes back."""
+
+    def test_fixture_git_reads_the_configuration_files_harness_git_reads(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        folder = Path(temporary.name).resolve()
+
+        def views():
+            args = ("config", "--list", "--show-scope", "--show-origin")
+            harness = [line for line in git.git(folder, *args, effect=git.READ).splitlines()
+                       if not line.startswith("command\t")]  # the construction's own -c options
+            return run_git(folder, *args).stdout.decode().splitlines(), harness
+
+        plain, harness = views()
+        self.assertEqual(plain, harness)
+        self.assertFalse([line for line in plain if line.startswith("system\t")])
+        # Every Git finds the global file through HOME; Git 2.32 and later also read the files the selectors name.
+        with self.subTest(route="HOME"), patch.dict(os.environ), \
+                git_isolation.user_config("[selected]\n\thome = yes\n") as selected:
+            del os.environ["GIT_CONFIG_GLOBAL"]
+            plain, harness = views()
+            self.assertIn(f"global\tfile:{selected}\tselected.home=yes", plain)
+            self.assertEqual(plain, harness)
+        selectors = (("GIT_CONFIG_GLOBAL", "global"), ("GIT_CONFIG_SYSTEM", "system")) if config_selectors_work() else ()
+        for selector, scope in selectors:
+            selected = folder / f"{scope}.gitconfig"
+            selected.write_text(f"[selected]\n\t{scope} = yes\n")
+            with self.subTest(selector=selector), patch.dict(os.environ, {selector: str(selected)}):
+                if scope == "system":
+                    del os.environ["GIT_CONFIG_NOSYSTEM"]
+                plain, harness = views()
+                self.assertIn(f"{scope}\tfile:{selected}\tselected.{scope}=yes", plain)
+                self.assertEqual(plain, harness)
 
 
 class Fixture(unittest.TestCase):
@@ -388,29 +426,69 @@ class GitQueryExecutionTests(Fixture):
         run_git(other, "add", ".")
         run_git(other, *USER, "commit", "-qm", "other")
         markers = []
-        for key in ("fsmonitor", "external", "pager", "alias", "envdiff", "envpager"):
+        for key in ("fsmonitor", "external", "pager", "alias", "envdiff", "envpager", "hookdir", "confighook"):
             script, marker = self.sentinel_script(key)
             markers.append((key, script, marker))
         scripts = {key: script for key, script, _ in markers}
+        ran = {key: path for key, _, path in markers}
         run_git(self.repo, "config", "core.fsmonitor", str(scripts["fsmonitor"]))
         run_git(self.repo, "config", "diff.external", str(scripts["external"]))
         run_git(self.repo, "config", "core.pager", str(scripts["pager"]))
         for command in ("ls-files", "ls-tree", "rev-parse", "log", "show", "cat-file", "hash-object"):
             run_git(self.repo, "config", f"alias.{command}", f"!{scripts['alias']}")
         run_git(self.worktree, "ls-files", "--", "d")
-        fsmonitor = dict((key, marker) for key, _, marker in markers)["fsmonitor"]
-        self.assertTrue(fsmonitor.exists(), "fixture fsmonitor hook must be active for plain Git")
-        fsmonitor.unlink()
+        self.assertTrue(ran["fsmonitor"].exists(), "fixture fsmonitor hook must be active for plain Git")
+        ran["fsmonitor"].unlink()
+        # A replacement for the blob of d/f, then a hook-directory hook and a configured hook for every event
+        # (each lets Git go on).
+        replacement = self.root / "replacement"
+        replacement.write_bytes(b"replaced content\n")
+        blob = run_git(self.repo, "rev-parse", "HEAD:d/f").stdout.decode().strip()
+        run_git(self.repo, "replace", blob, run_git(self.repo, "hash-object", "-w", str(replacement)).stdout.decode().strip())
+        self.assertEqual(run_git(self.worktree, "cat-file", "blob", "HEAD:d/f").stdout, b"replaced content\n")
+        common = Path(self.binding["common_dir"])
+        (common / "hooks").mkdir(exist_ok=True)
+        # Set locally, so a global core.hooksPath cannot take plain Git to another hook directory.
+        run_git(self.repo, "config", "core.hooksPath", str(common / "hooks"))
+        hooks = {}
+        for key in ("hookdir", "confighook"):
+            hooks[key] = self.root / f"{key}-hook.sh"
+            hooks[key].write_text(f"#!/bin/sh\n'{scripts[key]}'\nexit 0\n")
+            hooks[key].chmod(0o755)
+        for event in EVENTS:
+            shutil.copy(hooks["hookdir"], common / "hooks" / event)
+        with (common / "config").open("a") as config:
+            config.write("".join(f'[hook "marker-{event}"]\n\tcommand = \'{hooks["confighook"]}\'\n\tevent = {event}\n'
+                                 for event in EVENTS))
+        run_git(self.worktree, "update-ref", "refs/heads/hook-control", "HEAD")
+        self.assertTrue(ran["hookdir"].exists(), "fixture hook directory must be active for plain Git")
+        self.assertEqual(ran["confighook"].exists(), configured_hooks_exist())
+        ran["hookdir"].unlink()
+        ran["confighook"].unlink(missing_ok=True)
         ambient = {"GIT_DIR": str(other / ".git"), "GIT_WORK_TREE": str(other),
                    "GIT_EXTERNAL_DIFF": str(scripts["envdiff"]), "GIT_PAGER": str(scripts["envpager"]),
                    "GIT_INDEX_FILE": str(other / ".git" / "index"),
                    "GIT_CONFIG_PARAMETERS": f"'core.fsmonitor={scripts['fsmonitor']}'"}
-        with patch.dict(os.environ, ambient):
+        started, capture = [], git_query._capture
+
+        def recording(argv, cwd, env, timeout):
+            started.append((argv, env))
+            return capture(argv, cwd, env, timeout)
+        with patch.dict(os.environ, ambient), patch("harness.git_query._capture", side_effect=recording):
             results = [self.query(argv) for argv in argvs]
         self.assertEqual([stdout_bytes(result) for result in results], baseline)
         self.assertTrue(all(result["exit_code"] == 0 for result in results))
-        for key, _, marker in markers:
-            self.assertFalse(marker.exists(), key)
+        for key, _, path in markers:
+            self.assertFalse(path.exists(), key)
+        # No query form runs a hook even under plain Git. A command that does, started as a query was, runs no
+        # hook-directory hook, nor, where Git has per-event switches, a configured one (READ reads no hook names).
+        argv, env = next((argv, env) for argv, env in started if argv[-2:] == ["rev-parse", "HEAD"])
+        replayed = subprocess.run([*argv[:-2], "update-ref", "refs/heads/hook-query", "HEAD"], env=env,
+                                  capture_output=True, timeout=60)
+        self.assertEqual(replayed.returncode, 0, replayed.stderr)
+        self.assertFalse(ran["hookdir"].exists(), "hookdir")
+        if event_switches_exist():
+            self.assertFalse(ran["confighook"].exists(), "confighook")
 
     def test_queries_write_no_objects_index_or_lock_files(self):
         (self.worktree / "untracked.txt").write_bytes(b"new content\n")

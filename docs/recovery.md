@@ -138,6 +138,7 @@
 | `options` | `invalid_input/incompatible_options`（操作） | 2 | 选项不能同用（见[恢复选项与互斥](#恢复选项与互斥)） | 拆成合法的组合后重试 | 无命令出口 |
 | `stale-request` | `invalid_input/stale_request`（操作） | 2 | 输入针对的请求或来源已失效（未知请求、之后已有模型调用、已被新答复取代；`--reject-request` 的 `request_id` 不是已判定合格而未落地的提案或当前续作） | 用 `status RUN` 读当前请求后重答 | `status RUN` |
 | `run-state` | `invalid_input/run_state`（操作） | 2 | 该命令或选项不适用于 run 的当前状态（已放弃、已完成、有待处理阶段） | 用 `status RUN` 核对状态 | `status RUN` |
+| `config-file` | `invalid_input/config_file`（操作） | 2 | 配置文件不合格：不是 UTF-8、不是合法 TOML、嵌套过深、写错文件的节、未知键、取值或命令形状不合格；`run` 的 `verification.commands` 为空（`data.config_key`）。`data.file` 指出是操作者配置还是项目配置，`source.artifact` 是文件路径；合并之后的校验不指出是哪一份，两份都要核对。拒绝在任何写入之前 | 按 stderr 的诊断修正那份文件后重试原命令 | 无命令出口 |
 
 ## 恢复步骤
 

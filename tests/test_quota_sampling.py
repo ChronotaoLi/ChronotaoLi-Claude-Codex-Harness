@@ -620,8 +620,10 @@ class FakeContext:
     """The parts of RunContext a QuotaSampler uses; the backend records snapshot requests."""
 
     def __init__(self, case, *, status="blocked", revision=5, observed=None):
-        self.directory = Path(tempfile.mkdtemp()).resolve()   # a run directory is a canonical absolute path
-        case.addCleanup(shutil.rmtree, self.directory, True)
+        self.state = Path(tempfile.mkdtemp()).resolve()
+        case.addCleanup(shutil.rmtree, self.state, True)
+        self.directory = self.state / "runs" / "run"   # a run directory is a canonical absolute path
+        self.directory.mkdir(parents=True)
         self.run = {"status": status, "store_revision": revision, "dispatches": []}
         self.operation, self.events, self.snapshots = None, [], []
 

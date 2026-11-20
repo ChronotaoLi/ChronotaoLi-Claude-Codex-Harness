@@ -16,10 +16,11 @@ import signal
 import unittest
 from pathlib import Path
 
-from harness import cli, stops
+from git_isolation import fixture_git as _git
+from harness import cli, git, stops
 from harness.commands import command_id
 from harness.contracts import apply_revision
-from harness.permission_smoke import _git
+from harness.recovery import snapshot_digest
 from harness.util import HarnessError, read_json, write_json
 from test_harness import ROOT, RepoCase, cli_notice, refused_by_cli, run_cli, scratch
 from test_runtime_changes import ScriptedBackend, trigger_kind, update
@@ -467,13 +468,52 @@ class HeldProposalCommandTests(CommandCase):
         self.assertEqual(workers(backend), ["greet", "greet"])
         self.assertEqual(events(engine, "resume_config_changed"), [relaxed(run["id"], [], [at("app")], [at("app")])])
 
-    def test_a_held_revision_names_its_missing_commands_with_their_directories(self):
+    def held_revision(self):
+        """The blocked worker's commander widens greet by docs/*.md and app's command; started inside hello.py, it is held."""
         backend = blocked_then(widen("docs/*.md", commands=[at("app"), at(".", QUERY)]))
         engine = self.engine(backend)
         row = ("scope_extension", "revision")
         data = {"suggested_scope": ["docs/**"], "gaps": {"greet": ["docs/*.md"]}, "missing_commands": {"greet": [at("app")]},
                 "scope": ["hello.py"], "widened": ["docs/**"], "config_key": GRANTS, "selected_task": "greet"}
         run = self.stopped(engine, lambda: engine.start("Implement greet", plan(), scope=["hello.py"]), row, data, self.held)
+        return engine, backend, run, row, data
+
+    def test_a_held_wildcard_revision_widened_at_once_by_its_literal_subtree_lands_the_same_original(self):
+        engine, backend, run, _, _ = self.held_revision()
+        candidate = snapshot_digest(git.snapshot(engine.worktree))
+        self.assertEqual(run["commander_receipts"]["commander:decide:run"]["snapshot_digest"], candidate)
+        # The listed exit is the first resume, without a rejection: from the initial boundary, docs/** proves docs/*.md by
+        # its literal prefix, so the held original itself lands as revision 1 with no model call, keeping the commander's
+        # candidate, and its command gates greet.
+        self.assertEqual(self.listed(engine), ["resume", run["id"], "--scope=docs/**"])
+        gate = ("missing_commands", "selected_task")
+        landed = self.landed(engine, backend, run, gate, {"config_key": GRANTS, "missing": {"greet": [at("app")]}},
+                             {"task_id": "greet"})
+        self.assertEqual(landed["scope"], ["hello.py", "docs/**"])
+        published = read_json(Path(landed["plan_history"][-1]["artifact"]))
+        self.assertEqual(published["source"], {key: run["stop"]["source"][key] for key in ("dispatch_id", "artifact", "artifact_digest")})
+        self.assertEqual(events(engine, "plan_revised"), [{"event": "plan_revised", "run_id": run["id"], "revision": 1}])
+        self.assertEqual((published["tasks"][0]["allowed_paths"], landed["tasks"], landed["tasks"][0]["required_commands"]),
+                         (["hello.py", "docs/*.md"], published["tasks"], [at("app"), at(".", QUERY)]))
+        self.assertEqual((published["candidate"], published["snapshot_digest"], landed["pending_directive"]["snapshot_digest"],
+                          snapshot_digest(git.snapshot(engine.worktree))), ("retain", candidate, candidate, candidate))
+        self.grant(at("app"))
+        self.walk(engine, backend, gate, expect_status="completed")
+        self.assertEqual(workers(backend), ["greet", "greet"])
+
+    def test_a_held_wildcard_revision_given_only_a_narrower_literal_subtree_stays_held_unchanged(self):
+        engine, backend, run, row, data = self.held_revision()
+        # docs/guide/** does not cover docs/*.md, so it proves nothing: the boundary records it, but the same original
+        # stays held under the same request with the same gaps (the whole data and source compare), and nothing is called
+        # or published.
+        calls = len(backend.calls)
+        narrow, _ = self.reported(engine, backend, ["resume", run["id"], "--scope=docs/guide/**"], row,
+                                  {**data, "scope": ["hello.py", "docs/guide/**"]}, run["stop"]["source"])
+        self.assertEqual((len(backend.calls), narrow["plan_history"], events(engine, "plan_revised")),
+                         (calls, run["plan_history"], []))
+
+    def test_a_held_revision_names_its_missing_commands_with_their_directories(self):
+        engine, backend, run, row, data = self.held_revision()
         _, notice = self.reported(engine, backend, ["resume", run["id"]], row, data, self.held)
         self.rejected(engine, backend, notice, row, data)
         # Widening the boundary lands the new revision; its command then gates the selected task.

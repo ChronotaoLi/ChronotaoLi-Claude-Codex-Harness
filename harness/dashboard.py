@@ -20,6 +20,7 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from . import observe
+from .process_runtime import defer_cleanup_signals
 from .watch import RunWatcher, WatchError
 from .dashboard_page import APP_CSS, APP_JS, INDEX_HTML
 from .util import HarnessError
@@ -276,23 +277,36 @@ class DashboardServer(ThreadingHTTPServer):
     def __init__(self, state, port=DEFAULT_PORT, *, max_connections=MAX_CONNECTIONS,
                  socket_timeout=SOCKET_TIMEOUT, log=None, max_streams=MAX_STREAMS,
                  stream_heartbeat=STREAM_HEARTBEAT, stream_wait=STREAM_WAIT, checkout=None):
-        # The `.harness` descriptor is fixed here, before the socket exists.
-        self.observer = observe.Observer(state, required=True, checkout=checkout)
-        self.max_connections = max_connections
-        self.socket_timeout = socket_timeout
-        self.log = log if log is not None else sys.stderr
-        self._lock = threading.Lock()
-        self._active = 0
-        self.max_streams = min(max_streams, max(0, max_connections - 1))
-        if stream_heartbeat <= 0 or stream_wait <= 0:
+        # Empty before anything is opened; until the server is built, a failure or a signal closes what was (holding).
+        self.observer = None
+
+        def build():
+            # Every assignment in one deferral: a signal kept meanwhile is raised inside holding's cleanups.
+            with defer_cleanup_signals(inherit=False):
+                # The `.harness` descriptor is fixed here, before the socket exists.
+                self.observer = observe.Observer(state, required=True, checkout=checkout)
+                self.max_connections = max_connections
+                self.socket_timeout = socket_timeout
+                self.log = log if log is not None else sys.stderr
+                self._lock = threading.Lock()
+                self._active = 0
+                self.max_streams = min(max_streams, max(0, max_connections - 1))
+                if stream_heartbeat <= 0 or stream_wait <= 0:
+                    raise ValueError("stream intervals must be positive")
+                self.stream_heartbeat = stream_heartbeat
+                self.stream_wait = min(stream_wait, 0.25)
+                self._streams = set()
+                self._stopping = threading.Event()
+                self._read_gate = threading.Lock()
+                super(DashboardServer, self).__init__((HOST, port), DashboardHandler)
+        observe.holding(build, self._discard, keep=True)
+
+    def _discard(self):
+        # A failed bind has closed both through server_close already; a socket that was never created has not.
+        if "socket" in self.__dict__:
+            self.socket.close()
+        if self.observer is not None:
             self.observer.close()
-            raise ValueError("stream intervals must be positive")
-        self.stream_heartbeat = stream_heartbeat
-        self.stream_wait = min(stream_wait, 0.25)
-        self._streams = set()
-        self._stopping = threading.Event()
-        self._read_gate = threading.Lock()
-        super().__init__((HOST, port), DashboardHandler)
 
     def acquire_stream(self, connection):
         with self._lock:
@@ -393,25 +407,40 @@ def serve(state, port=DEFAULT_PORT, *, stdout=None, stderr=None, checkout=None):
     """Name the bound directory on stderr, print the URL on stdout, serve until SIGINT/SIGTERM, return 0."""
     stdout = sys.stdout if stdout is None else stdout
     stderr = sys.stderr if stderr is None else stderr
-    server = create_server(state, port, log=stderr, checkout=checkout)
-    previous = {}
-    try:
-        print("harness dashboard: " + observe.location_text(server.observer.observed), file=stderr, flush=True)
-        print(server.url, file=stdout, flush=True)
-        if threading.current_thread() is threading.main_thread():
-            def interrupted(signum, frame):
-                raise KeyboardInterrupt()
-            for signum in (signal.SIGTERM, signal.SIGINT):
-                if signal.getsignal(signum) in (signal.SIG_DFL, signal.default_int_handler):
-                    previous[signum] = signal.signal(signum, interrupted)
+    held, previous = [], {}
+
+    def serving():
+        # The call and the assignment in one deferral: a signal as create_server returns is raised once it is held.
+        with defer_cleanup_signals(inherit=False):
+            held.append(create_server(state, port, log=stderr, checkout=checkout))
+        server = held[0]
         try:
-            server.serve_forever(poll_interval=0.5)
-        except KeyboardInterrupt:
-            print("harness dashboard: 已停止", file=stderr, flush=True)
-    finally:
+            print("harness dashboard: " + observe.location_text(server.observer.observed), file=stderr, flush=True)
+            print(server.url, file=stdout, flush=True)
+            if threading.current_thread() is threading.main_thread():
+                def interrupted(signum, frame):
+                    raise KeyboardInterrupt()
+                for signum in (signal.SIGTERM, signal.SIGINT):
+                    if signal.getsignal(signum) in (signal.SIG_DFL, signal.default_int_handler):
+                        previous[signum] = signal.signal(signum, interrupted)
+            try:
+                server.serve_forever(poll_interval=0.5)
+            except KeyboardInterrupt:
+                print("harness dashboard: 已停止", file=stderr, flush=True)
+        finally:
+            restore()
+
+    def restore():
         for signum, handler in previous.items():
             signal.signal(signum, handler)
-        server.server_close()
+
+    def close():
+        for server in held:
+            server.server_close()
+    try:
+        observe.holding(serving, close)
+    finally:
+        restore()  # again: a signal that cut the first one short has had the server closed by now
     return 0
 
 

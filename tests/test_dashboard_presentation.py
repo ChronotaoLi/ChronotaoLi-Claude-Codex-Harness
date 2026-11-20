@@ -14,7 +14,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from harness import observe, quota
+from harness import contracts, observe, quota
 from harness.cli import status_summary
 from harness.dashboard_page import APP_CSS, APP_JS, INDEX_HTML
 from harness.versions import RUN_SCHEMA_VERSION
@@ -1179,6 +1179,129 @@ class DashboardPresentationTests(unittest.TestCase):
   }
 ''')
 
+    def test_grant_hints_name_the_project_file_and_the_key_the_request_needs(self):
+        commands = [{"cwd": "APP-DIR", "argv": ["make", "MISSING-ARGV"]}]
+
+        def projected_grant(request=None):
+            ledger = {"status": "running", "accepted": {}, "attempts": {"t2": 1}}
+            if request is None:
+                ledger["command_requirements"] = {"missing": {"t2": commands}}
+            else:
+                ledger.update(pending_continuation="c-1", continuation_history=[
+                    {"id": "c-1", "task_id": "t2", "source": {"dispatch_id": WORKER}, "snapshot_digest": "0" * 64,
+                     "request": request}])
+            summary = status_summary(ledger)
+            return detail("run_" + (request or {}).get("kind", "missing"), "Needs grants", summary={
+                key: summary[key] for key in ("continuation", "missing_command_requirements") if key in summary})
+
+        cases = [projected_grant(), projected_grant({"kind": "commands", "commands": commands, "minimum_timeout_seconds": 0,
+                                                     "reason": "focused tests"}),
+                 projected_grant({"kind": "budget", "commands": [], "minimum_timeout_seconds": 5400, "reason": "long build"}),
+                 projected_grant({"kind": "constructor", "commands": [], "minimum_timeout_seconds": 0, "reason": "other"})]
+        project, grant, timeout = ".harness/project.toml", "permissions.worker_commands", "runtime.agent_timeout_seconds"
+        # Per case: identifiers the hint names and identifiers it must not name.
+        expected = [([project, grant], [timeout]), ([project, grant], [timeout]), ([project, timeout, "5400"], [grant]),
+                    ([project, grant, timeout], [])]
+        self.run_browser({"cases": cases, "expected": expected}, r'''
+  for (let i = 0; i < D.cases.length; i++) {
+    const item = D.cases[i], names = D.expected[i][0], absent = D.expected[i][1];
+    navigate("#/runs/" + item.id);
+    await respond("/api/runs/" + item.id, item);
+    // The plain hint of the single attention item, apart from the command line of its exit.
+    const hint = one(function (n) { return n.className === "hint" && !n.childNodes.length; },
+      one(attrIs("data-attention", "true"))).textContent;
+    for (const name of names) { assert.ok(hint.includes(name), item.id + " names " + name + ": " + hint); }
+    for (const name of absent) { assert.ok(!hint.includes(name), item.id + " does not name " + name + ": " + hint); }
+  }
+''')
+
+    @staticmethod
+    def continuation_detail(run_id, request=None, has_request=True):
+        """A pending continuation as status_summary projects it from the ledger, without the request when asked."""
+        row = {"id": "c-1", "task_id": "t2", "source": {"dispatch_id": WORKER}, "snapshot_digest": "0" * 64}
+        if has_request:
+            row["request"] = request
+        summary = status_summary({"status": "running", "accepted": {}, "attempts": {"t2": 1},
+                                  "pending_continuation": "c-1", "continuation_history": [row]})
+        return detail(run_id, "Needs grants", summary={"continuation": summary["continuation"]})
+
+    CONTINUATION_HINT = r'''
+  async function hintOf(item) {
+    navigate("#/runs/" + item.id);
+    await respond("/api/runs/" + item.id, item);
+    return one(function (n) { return n.className === "hint" && !n.childNodes.length; },
+      one(attrIs("data-attention", "true"))).textContent;
+  }
+'''
+
+    def test_a_budget_request_without_valid_seconds_names_the_key_but_no_target(self):
+        budget = {"kind": "budget", "commands": [], "reason": "long build"}
+        values = {"null": None, "true": True, "false": False, "text": "5400", "object": {"seconds": 5400}, "list": [5400]}
+        cases = [self.continuation_detail("run_missing", budget)]
+        cases += [self.continuation_detail("run_" + name, {**budget, "minimum_timeout_seconds": value})
+                  for name, value in values.items()]
+        valid = self.continuation_detail("run_valid", {**budget, "minimum_timeout_seconds": 5400})
+        self.run_browser({"cases": cases, "valid": valid}, self.CONTINUATION_HINT + r'''
+  assert.ok((await hintOf(D.valid)).includes("5400"));
+  const hints = [];
+  for (const item of D.cases) { hints.push(await hintOf(item)); }
+  for (let i = 0; i < hints.length; i++) {
+    for (const name of [".harness/project.toml", "runtime.agent_timeout_seconds"]) {
+      assert.ok(hints[i].includes(name), D.cases[i].id + " names " + name + ": " + hints[i]);
+    }
+    assert.ok(!hints[i].includes("permissions.worker_commands"), D.cases[i].id + ": " + hints[i]);
+    // No value stands in for the seconds as a target, and no plain resume is promised.
+    assert.ok(!/\d/.test(hints[i]), D.cases[i].id + ": " + hints[i]);
+    assert.ok(!hints[i].includes("resume"), D.cases[i].id + ": " + hints[i]);
+  }
+''')
+
+    def test_a_budget_target_is_offered_only_for_seconds_the_worker_request_contract_accepts(self):
+        budget = {"kind": "budget", "commands": [], "reason": "long build"}
+        maximum = contracts.WORK["properties"]["continuation_request"]["properties"]["minimum_timeout_seconds"]["maximum"]
+        values = {"zero": 0, "negative": -1, "one": 1, "typical": 5400, "fraction": 5400.5, "maximum": maximum,
+                  "above": maximum + 1}
+        schema = contracts.envelope(contracts.WORK, "t2", WORKER)
+        cases = []
+        for name, seconds in values.items():
+            request = {**budget, "minimum_timeout_seconds": seconds}
+            result = {"task_id": "t2", "dispatch_id": WORKER, "status": "blocked", "blocker_kind": "continuation",
+                      "summary": "needs time", "evidence": [], "blockers": ["needs time"], "proposed_memories": [],
+                      "continuation_request": request}
+            accepted = contracts.judge_work(result, schema, Path("/nonexistent/.harness")).state == "valid"
+            cases.append({"item": self.continuation_detail("run_" + name, request), "seconds": seconds,
+                          "accepted": accepted})
+        # The samples straddle both bounds of the contract: a fraction, the maximum and one past it included.
+        self.assertEqual([name for name, case in zip(values, cases) if case["accepted"]], ["one", "typical", "maximum"])
+        self.run_browser({"cases": cases}, self.CONTINUATION_HINT + r'''
+  for (const entry of D.cases) {
+    const hint = await hintOf(entry.item), label = entry.item.id + ": " + hint;
+    assert.ok(hint.includes("runtime.agent_timeout_seconds"), label);
+    if (entry.accepted) {
+      assert.ok(hint.includes("resume") && hint.includes(String(entry.seconds)), label);
+    } else {
+      assert.ok(!hint.includes("resume") && !/\d/.test(hint), label);
+    }
+  }
+''')
+
+    def test_an_unrecognized_continuation_request_lists_both_keys_without_a_resume(self):
+        # continuation_gate refuses a kind it does not know, so no setting lets a plain resume go on.
+        cases = [self.continuation_detail("run_" + name, request) for name, request in {
+            "scope": {"kind": "scope", "commands": [], "minimum_timeout_seconds": 0, "reason": "other"},
+            "nokind": {"commands": [], "minimum_timeout_seconds": 0, "reason": "other"},
+            "null": None, "text": "commands"}.items()]
+        cases.append(self.continuation_detail("run_absent", has_request=False))
+        self.run_browser({"cases": cases}, self.CONTINUATION_HINT + r'''
+  for (const item of D.cases) {
+    const hint = await hintOf(item);
+    for (const name of [".harness/project.toml", "permissions.worker_commands", "runtime.agent_timeout_seconds"]) {
+      assert.ok(hint.includes(name), item.id + " names " + name + ": " + hint);
+    }
+    assert.ok(!hint.includes("resume"), item.id + ": " + hint);
+  }
+''')
+
     def test_ledger_and_quota_semantics_are_not_overstated(self):
         from test_quota_view import T, WEEK, claude, codex
         rows = [dispatch(WORKER, cost=0.25, provider="claude"),
@@ -1631,6 +1754,38 @@ class DashboardPresentationTests(unittest.TestCase):
   assert.ok(note.textContent.includes(D.a.state) && note.textContent.includes(D.b.state), note.textContent);
   assert.ok(note.className.split(" ").some(function (name) { return D.breaking.indexOf(name) >= 0; }),
             "the note naming both paths breaks long words: " + note.className);
+''')
+
+    def test_longest_task_id_and_a_long_file_name_break_inside_their_chip_and_title(self):
+        # The longest task ID the plan admits and the longest file name the file view serves, neither with a break
+        # opportunity: each must break inside its own node instead of widening the page.
+        task = ("long_task_identifier_" * 4)[:64]
+        source = "dispatches/" + WORKER + "/" + ("LongFileName" * 8)[:96]
+        self.assertRegex(task, contracts.TASK_ID["pattern"])
+        observe.validate_path(source)
+        rules = class_rules(APP_CSS)
+        data = {"task": task, "source": source,
+                "anywhere": sorted(name for name, found in rules.items() if found.get("overflow-wrap") == "anywhere"),
+                "nowrap": sorted(name for name, found in rules.items() if found.get("white-space") == "nowrap"),
+                "detail": detail("run_one", "Goal", dispatches=[dispatch(WORKER, task=task)],
+                                 events=[event(1990.0, "dispatch_started", task=task, dispatch_id=WORKER)]),
+                "file": {"source": source, "size": 12, "tail_bytes": 65536, "sampled_at": 2000,
+                         "truncated": False, "changed_while_reading": False, "text": "content\n"}}
+        self.run_browser(data, r'''
+  function breaksInside(node) {
+    const names = node.className.split(" ");
+    assert.ok(names.some(function (name) { return D.anywhere.indexOf(name) >= 0; }), "no class breaks anywhere: " + node.className);
+    assert.ok(!names.some(function (name) { return D.nowrap.indexOf(name) >= 0; }), "a class forbids wrapping: " + node.className);
+  }
+  navigate("#/runs/run_one");
+  await respond("/api/runs/run_one", D.detail);
+  const chips = all(function (n) { return n.className.split(" ").indexOf("chip") >= 0 && n.textContent === D.task; });
+  // One in the call record line and one in the recent activity list.
+  assert.deepEqual(chips.map(function (n) { return n.parentNode.className; }).sort(), ["dispatch-line", "item-head"]);
+  chips.forEach(breaksInside);
+  navigate("#/runs/run_one/files/" + D.source);
+  await respond("/api/runs/run_one/files/" + D.source, D.file);
+  breaksInside(one(function (n) { return n.tagName === "h2" && n.textContent.indexOf(D.source) >= 0; }));
 ''')
 
 

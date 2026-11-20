@@ -59,17 +59,18 @@ def refuse_other_version(state):
 
 def _registered(repo):
     return {field.removeprefix("worktree ") for field in
-            git.git(repo, "worktree", "list", "--porcelain", "-z").split("\0")
+            git.git(repo, "worktree", "list", "--porcelain", "-z", effect=git.READ).split("\0")
             if field.startswith("worktree ")}
 
 
-def _ensure_exited(run):
-    ensure_dispatches_exited(run["dispatches"], observe=group_alive)
+def _ensure_exited(repo, run):
+    ensure_dispatches_exited(run["dispatches"], state=repo / ".harness", observe=group_alive)
 
 
 def common_dir(repo):
     """The repository's Git common directory, the parent of every linked worktree's admin directory."""
-    return Path(git.git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir").removesuffix("\n")).resolve()
+    return Path(git.git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir", effect=git.READ)
+                .removesuffix("\n")).resolve()
 
 
 def checkout_folder(directory, final, index):
@@ -178,13 +179,13 @@ def _gate(repo, ident, directory, confirm_exited):
         _canonical(events)
         if events.exists():
             _regular_bytes(events)
-        confirm_dispatches_exited(run["dispatches"], confirm_exited,
+        confirm_dispatches_exited(run["dispatches"], confirm_exited, state=repo / ".harness",
             audit=lambda event, **fields: append_event(events, ident, event, **fields),
             save=store.commit, observe=group_alive)
         original = _regular_bytes(state)
     elif _regular_bytes(state) != original:
         raise HarnessError("运行台账在清理前改变；保留现场")
-    _ensure_exited(run)
+    _ensure_exited(repo, run)
     artifacts = []
     for final in run["final_history"]:
         if (not isinstance(final, dict) or type(final.get("attempt")) is not int
@@ -306,7 +307,7 @@ def clean_checkout(repo, run, directory, final, index, common, remove, *, by="cl
         return result
     # Persist intent before Git changes anything, without altering raw evidence.
     write_json(receipt_path, {**receipt, "status": "pending", "by": by, "time": time.time()})
-    _ensure_exited(run)
+    _ensure_exited(repo, run)
     if _regular_bytes(artifact) != original:
         raise HarnessError("验证检出证据在清理前改变；保留现场")
     if exists:
@@ -316,7 +317,7 @@ def clean_checkout(repo, run, directory, final, index, common, remove, *, by="cl
         _check_missing_binding(checkout, binding)
     if exists or registered:
         # Exact removal also unregisters an absent checkout; never prune other runs.
-        git.git(repo, "worktree", "remove", str(checkout))
+        git.git(repo, "worktree", "remove", str(checkout), effect=git.CHECKOUT)
     if checkout.exists() or checkout.is_symlink() or str(checkout) in _registered(repo):
         raise HarnessError("验证工作树尚未完全移除；保留待清理记录")
     # Empty wrappers belong to this checkout; unexpected siblings are preserved.
@@ -332,7 +333,7 @@ def clean_checkout(repo, run, directory, final, index, common, remove, *, by="cl
 def _branch_matches(repo, branch, expected):
     """True when the retained branch still names the run's checkpoint."""
     try:
-        return git.git(repo, "rev-parse", "--verify", "refs/heads/" + branch).strip() == expected
+        return git.git(repo, "rev-parse", "--verify", "refs/heads/" + branch, effect=git.READ).strip() == expected
     except HarnessError:
         return False
 
@@ -417,7 +418,7 @@ def _clean_worktree(repo, run, directory, original, remove, remove_input_copies,
         # Completing a removal an earlier command performed keeps what that command recorded.
         record.update({key: previous[key] for key in ("remove_ignored", "ignored_paths") if key in previous})
     write_json(receipt_path, {**record, "status": "pending", "time": time.time()})
-    _ensure_exited(run)
+    _ensure_exited(repo, run)
     if _regular_bytes(state) != original:
         raise HarnessError("运行台账在清理前改变；保留现场")
     if exists:
@@ -429,7 +430,7 @@ def _clean_worktree(repo, run, directory, original, remove, remove_input_copies,
         git.check_worktree_state(checkout, binding=binding)
         git.assert_removable_worktree(checkout, binding=binding)
         _ignored_gate(checkout, binding, remove_ignored)
-        git.git(repo, "worktree", "remove", str(checkout))
+        git.git(repo, "worktree", "remove", str(checkout), effect=git.CHECKOUT)
     if checkout.exists() or checkout.is_symlink() or admin.exists() or str(checkout) in _registered(repo):
         raise HarnessError("工作树尚未完全移除；保留待清理记录")
     write_json(receipt_path, {**record, "status": "removed", "time": time.time()})

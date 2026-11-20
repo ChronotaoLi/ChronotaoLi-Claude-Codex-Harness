@@ -9,9 +9,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from git_isolation import fixture_git as _git
 from harness import command_server, git, util
 from harness.command_server import Broker, create_manifest, ensure_command_processes_exited, handle
-from harness.permission_smoke import _git
 from harness.util import HarnessError, read_json, write_json
 from harness.versions import RUN_SCHEMA_VERSION
 
@@ -173,7 +173,7 @@ class UnboundBrokerTests(unittest.TestCase):
                     # Whole on disk, so the records carry a cut tail of it.
                     self.assertGreater(len(written), 4000)
                 self.assertFalse(self.marker.exists())
-                ensure_command_processes_exited(job)
+                ensure_command_processes_exited(job, state=Path(job).parent)
                 failed, following = call(broker, "run_command", {"command_id": expected_id(top)})
                 self.assertFalse(failed)
                 self.assertEqual(following["exit_code"], 0)
@@ -181,6 +181,35 @@ class UnboundBrokerTests(unittest.TestCase):
         self.assertFalse(os.path.lexists(self.root / "absent"))
         # One journal per call: the failed start and the call admitted after it.
         self.assertEqual(len(journals(job)), 2 * len(ran))
+
+    def test_a_stderr_tail_cut_inside_a_character_is_complete_evidence_and_the_next_call_is_admitted(self):
+        # 4,201 bytes: the 4,000-byte tail starts on the last byte of a three-byte character.
+        written = b"x" + "汉".encode() * 1400
+        self.assertEqual(written[-4000] & 0xC0, 0x80)
+        expected = capture_tail(written)
+        self.assertEqual(expected, "[earlier output omitted; see log]\n�" + "汉" * 1333)
+        cut = self.command(".", "import sys; sys.stderr.buffer.write(b'x' + '\\u6c49'.encode() * 1400)")
+        top = self.command(".")
+        broker = self.broker([cut, top])
+        job = broker.manifest["job"]
+        failed, result = call(broker, "run_command", {"command_id": expected_id(cut)})
+        self.assertFalse(failed)
+        folder = Path(result["stdout_path"]).parent
+        self.assertEqual((folder / "output.stderr").read_bytes(), written)
+
+        def carries_the_cut_tail(record):
+            self.assertEqual((record.get("evidence_complete"), record.get("persistence_error")), (True, None))
+            self.assertEqual((record["exit_code"], record["stdout"]), (0, ""))
+            self.assertEqual(record.get("stderr"), expected)
+            # The digest is of the whole capture, not of the tail the record carries.
+            self.assertEqual(record["stderr_sha256"], hashlib.sha256(written).hexdigest())
+        # The response first: a tail that failed to decode leaves no receipt to read.
+        carries_the_cut_tail(result)
+        carries_the_cut_tail(read_json(folder / "receipt.json"))
+        failed, following = call(broker, "run_command", {"command_id": expected_id(top)})
+        self.assertFalse(failed, following)
+        self.assertEqual(following["exit_code"], 0)
+        self.assertEqual(len(journals(job)), 2)
 
     def test_a_symlinked_directory_inside_or_outside_the_root_does_not_start(self):
         (self.root / "inner").symlink_to(self.root / "sub", target_is_directory=True)
@@ -350,7 +379,7 @@ class UnboundBrokerTests(unittest.TestCase):
         _, result = call(broker, "run_command", {"command_id": expected_id(top)})
         Path(result["stdout_path"]).with_name("receipt.json").unlink()
         # The journal was written as exited before the receipt, so the exit gate has nothing to confirm.
-        records = ensure_command_processes_exited(job)
+        records = ensure_command_processes_exited(job, state=Path(job).parent)
         self.assertEqual([(r["process_state"], r["exit_confirmed"]) for r in records], [("exited", True)])
         failed, value = call(broker, "run_command", {"command_id": expected_id(top)})
         self.assertTrue(failed)

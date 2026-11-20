@@ -1,7 +1,6 @@
 """Project-scoped, versioned memory. Retrieval is lexical, not semantic."""
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import json
 import math
@@ -12,8 +11,9 @@ import time
 from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
 
-from . import git
+from . import git, stops
 from .contracts import PROPOSALS, REVIEW, validate
+from .state_files import LockUnavailable, StateFiles, holding
 from .util import HarnessError, uid
 from .versions import unsupported_ledger
 
@@ -49,10 +49,10 @@ def bind_source_files(repo, names):
         raise HarnessError("记忆来源最多十个不同文件")
     if not names:
         return {}
-    commit = git.git(root, "rev-parse", "--verify", "HEAD").strip()
+    commit = git.git(root, "rev-parse", "--verify", "HEAD", effect=git.READ).strip()
     hashes = {}
     for name in names:
-        tree = git.git_process(root, "ls-tree", "-z", commit, "--", ":(literal)" + name)
+        tree = git.git_process(root, "ls-tree", "-z", commit, "--", ":(literal)" + name, effect=git.READ)
         entries = tree.stdout.split(b"\0") if not tree.returncode else []
         entry = next((entry for entry in entries if b"\t" in entry
                       and entry.split(b"\t", 1)[1] == name.encode("utf-8")), None)
@@ -69,10 +69,10 @@ def bind_source_files(repo, names):
             if current.is_symlink():
                 raise HarnessError(f"不支持符号链接来源：{name}")
         path = _source_path(root, name)
-        size = git.git(root, "cat-file", "-s", metadata[2].decode("ascii"))
+        size = git.git(root, "cat-file", "-s", metadata[2].decode("ascii"), effect=git.READ)
         if int(size) > MAX_SOURCE_BYTES:
             raise HarnessError(f"记忆来源文件过大：{name}")
-        blob = git.git_process(root, "cat-file", "blob", metadata[2].decode("ascii"))
+        blob = git.git_process(root, "cat-file", "blob", metadata[2].decode("ascii"), effect=git.READ)
         data = path.read_bytes()
         if len(data) > MAX_SOURCE_BYTES:
             raise HarnessError(f"记忆来源文件过大：{name}")
@@ -155,14 +155,16 @@ class Memory:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         # WAL setup and read-then-ALTER migrations need a single initializer.
         # Wait only for this database's short initialization, not another run.
-        # Resolve aliases so callers opening the same database share its lock.
-        database = self.path.resolve()
-        with database.with_name(database.name + ".init.lock").open("a+") as initialization:
-            fcntl.flock(initialization, fcntl.LOCK_EX)
-            try:
-                self._initialize()
-            finally:
-                fcntl.flock(initialization, fcntl.LOCK_UN)
+        # The lock lies beside the database's name, in its directory resolved once.
+        files, name = StateFiles(self.path.parent), self.path.name + ".init.lock"
+        try:
+            holding(files.lock((name,), create=True, wait=True), lambda locked: self._initialize())
+            return
+        except LockUnavailable as error:
+            outcome = error.outcome
+        outcome.or_local_io()
+        raise HarnessError(f"记忆初始化锁不可用（{outcome.found or outcome.state}）：{outcome.path}",
+                           stop=stops.make("runtime_failure", "io"))
 
     def _initialize(self):
         with self.connect() as db:
@@ -305,7 +307,7 @@ class Memory:
                     raise HarnessError(f"记忆来源在审阅后改变：{name}")
                 if commit is not None:
                     try:
-                        blob = git.git_process(root, "show", f"{commit}:{name}",
+                        blob = git.git_process(root, "cat-file", "blob", f"{commit}:{name}", effect=git.READ,
                                                binding=self.binding, timeout=10)
                     except (OSError, subprocess.TimeoutExpired) as error:
                         raise HarnessError(f"无法核对记忆来源提交：{name}") from error
@@ -393,7 +395,7 @@ class Memory:
             # checks would incorrectly invalidate their provenance in the main checkout.
             if commit not in commit_cache:
                 try:
-                    result = git.git_process(root, "cat-file", "-e", f"{commit}^{{commit}}",
+                    result = git.git_process(root, "cat-file", "-e", f"{commit}^{{commit}}", effect=git.READ,
                                              binding=self.binding, timeout=10)
                     commit_cache[commit] = "commit_unavailable" if result.returncode else None
                 except (OSError, subprocess.TimeoutExpired):

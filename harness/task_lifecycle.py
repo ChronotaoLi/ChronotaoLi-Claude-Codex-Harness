@@ -297,22 +297,20 @@ class TaskLifecycle(RuntimeService):
             # A returned review exists only in the reviewing stage, whose saved
             # mapping produced its schema; never validate it against a default.
             if "required_findings" not in pending:
-                raise HarnessError("审阅阶段缺少必需问题对照；保留证据")
+                raise HarnessError("审阅阶段缺少必需问题对照；保留证据", stop=stops.make("runtime_failure", "invariant"))
             # Checked before the original is read or its digest bound, so a
             # changed mapping leaves the receipt exactly as it was.
             require_saved_batch(self.context.run, pending["task_id"], pending["snapshot_digest"],
                                 pending["required_findings"])
-            try:
+            origin = {"artifact": str(artifact), "dispatch_id": dispatch_id}
+            with stops.evidence_reads(source=origin, message="审阅原始结果缺失或已被替换；禁止通过候选变化丢弃证据"):
                 raw = artifact.read_bytes()
-            except OSError as error:
-                stops.keep_local_io(error)
-                raise HarnessError("审阅原始结果缺失或无法读取；禁止通过候选变化丢弃证据") from error
             digest = hashlib.sha256(raw).hexdigest()
             if "artifact_digest" not in source:
                 source["artifact_digest"] = digest
                 self.context.save()
             if digest != source["artifact_digest"]:
-                raise EvidenceError("审阅原始结果已改变；禁止通过候选变化丢弃证据", stop=stops.make("evidence", "runtime_integrity", source={"artifact": str(artifact)}))
+                raise EvidenceError("审阅原始结果已改变；禁止通过候选变化丢弃证据", stop=stops.make("evidence", "runtime_integrity", source=origin))
             try:
                 result = json.loads(raw)
             except (ValueError, UnicodeError):

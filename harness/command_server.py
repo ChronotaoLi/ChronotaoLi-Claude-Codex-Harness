@@ -8,6 +8,8 @@ receipts, but starts no process. It does not isolate the worktree from other
 processes running concurrently; see _remove_tracked_file.
 """
 import argparse
+import contextlib
+import fcntl
 import hashlib
 import json
 import math
@@ -24,8 +26,10 @@ from pathlib import Path
 from .process_runtime import defer_cleanup_signals
 from . import git, stops
 from .commands import command_id, valid_command, validate_command
-from .util import (DIRECTORY_FLAGS, HarnessError, ProcessStartError, ProcessTimeout, fold_name, group_alive,
-                   lock, read_json, run_process, tail, with_descriptors, write_json)
+from .state_files import StateFiles
+from .util import (DIRECTORY_FLAGS, PGID_MAX, EvidenceError, HarnessError, ProcessStartError, ProcessTimeout,
+                   fold_name, group_alive, observed_alive, read_json, run_process, strict_json_loads, tail,
+                   with_descriptors, write_json)
 from .versions import read_current_ledger
 
 
@@ -35,6 +39,11 @@ MAX_DELETE_PATH_CHARS = 4096
 # Call folders are prepared here, beside commands/, and renamed into it once
 # their journal is complete. Nothing enumerates this directory.
 STAGING_DIRECTORY = "command-staging"
+# A valid journal is under 300 bytes; a longer one is never parsed for process facts.
+JOURNAL_MAX = 64 * 1024
+JOURNAL_FIELDS = frozenset(("id", "command_id", "pgid", "process_state", "exit_confirmed"))
+# Created with the manifest; the broker only opens it, so a refused call creates no file.
+ADMISSION_LOCK = "command-admission.lock"
 
 
 def _file_digest(path):
@@ -50,6 +59,29 @@ def _safe(path):
     if any(p.is_symlink() for p in (path, *path.parents)):
         raise HarnessError(f"Command artifact symlink refused: {path}")
     return path
+
+
+@contextlib.contextmanager
+def _admission_lock(job):
+    """Hold the dispatch's existing admission lock; never create it, follow a link or block opening a FIFO."""
+    path = _safe(Path(job) / ADMISSION_LOCK)
+    try:
+        descriptor = os.open(path, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError as error:
+        raise HarnessError(f"Command admission lock cannot be opened: {path}: {error.strerror}") from error
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise HarnessError(f"Command admission lock is not a regular file: {path}")
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise HarnessError(f"已有进程持有运行锁：{path}") from error
+        try:
+            yield
+        finally:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+    finally:
+        os.close(descriptor)
 
 
 def _valid_delete_scope(scope):
@@ -120,50 +152,121 @@ def create_manifest(config, worktree, job, run_path=None, *, parent_deadline=Non
     path = _safe(job / "commands.json")
     if path.exists():
         raise HarnessError("Command manifest already exists")
+    try:
+        os.close(os.open(_safe(job / ADMISSION_LOCK), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600))
+    except FileExistsError as error:
+        raise HarnessError("Command admission lock already exists") from error
     write_json(path, manifest)
     return {"artifact": str(path), "artifact_digest": _file_digest(path),
             "commands": manifest["commands"]}
 
 
-def command_processes(job_or_dir):
-    directory = _safe(job_or_dir)
-    if directory.name != "commands":
-        directory = _safe(directory / "commands")
-    if not directory.exists():
+def _damaged_journal(message, path):
+    return EvidenceError(message, stop=stops.make("evidence", "runtime_integrity", source={"artifact": str(path)}))
+
+
+def _journal_root(job_or_dir, state):
+    """The dispatch directory holding commands/, and its reads walked from ``state`` without following any level.
+
+    ``state`` is the state directory the caller works in, resolved once as every StateFiles root is; nothing above it
+    is opened. The dispatch path must be recorded strictly below it as a ledger records one (no other spelling, no
+    ``..`` or empty segment), or it is damaged evidence. Every directory below the root, the dispatch directory
+    included, is opened from its parent with O_NOFOLLOW, so a link is refused and a lookup that fails is a failed
+    read, both decided by the primitive.
+    """
+    given = os.fspath(job_or_dir)
+    files = StateFiles(state)
+    components = files.recorded(given)
+    job = Path(given)
+    if components and components[-1] == "commands":
+        components, job = components[:-1], job.parent
+    if not components:
+        raise _damaged_journal(f"Command journal directory not recorded below the state directory {state}: {given}",
+                               given)
+    return job, files.under(*components)
+
+
+def _journal_facts(raw, call_id):
+    """The journal's five fields when ``raw`` is a whole valid journal of ``call_id``; None for anything else."""
+    if len(raw) > JOURNAL_MAX:
+        return None
+    try:
+        entry = strict_json_loads(raw)
+    except (ValueError, RecursionError):
+        return None
+    if (not isinstance(entry, dict) or set(entry) != JOURNAL_FIELDS
+            or not isinstance(entry["command_id"], str) or entry["id"] != call_id
+            or entry["process_state"] not in ("prepared", "starting", "running", "exited")
+            or type(entry["exit_confirmed"]) is not bool
+            or entry["pgid"] is not None and (type(entry["pgid"]) is not int or not 0 < entry["pgid"] <= PGID_MAX)):
+        return None
+    return entry
+
+
+def command_processes(job_or_dir, *, state):
+    """One record per call folder in a dispatch's commands/, from a single read of its process.json.
+
+    ``journal_state`` is valid, invalid (read, but over JOURNAL_MAX, not strict JSON or failing a field
+    check), absent or refused (a link, FIFO or directory, or rewritten while read). Only a valid record
+    has the journal's process facts; an invalid one has no facts but the digest of the whole file, which
+    a confirmation binds; absent and refused have neither. A read that fails is StateReadError, never a
+    record; a dispatch path not recorded below ``state``, commands/ or a directory above it refused (a link
+    included), or an entry that is not a call folder or is gone since it was listed, is EvidenceError.
+    """
+    job, files = _journal_root(job_or_dir, state)
+    listing = files.entries(("commands",)).or_local_io()
+    if listing.state == "absent":
         return []
+    if listing.state != "listed":
+        raise _damaged_journal(f"Command journal directory refused ({listing.found} at {listing.step.name}): "
+                               f"{job / 'commands'}", job / "commands")
     records = []
-    for folder in sorted(directory.iterdir()):
-        _safe(folder)
-        if not folder.is_dir() or not re.fullmatch(r"[0-9a-f]{32}", folder.name):
-            raise HarnessError("Invalid command journal directory")
-        path = _safe(folder / "process.json")
-        try:
-            entry = read_json(path)
-        except (OSError, ValueError) as error:
-            raise HarnessError(f"Unreadable command process journal: {path}") from error
-        expected_id = directory.parent.name + ":command:" + folder.name
-        if (not isinstance(entry, dict) or set(entry) != {"id", "command_id", "pgid", "process_state", "exit_confirmed"}
-                or not isinstance(entry.get("command_id"), str)
-                or entry.get("id") != expected_id
-                or entry.get("process_state") not in ("prepared", "starting", "running", "exited")
-                or type(entry.get("exit_confirmed")) is not bool
-                or entry.get("pgid") is not None and (type(entry["pgid"]) is not int or entry["pgid"] <= 0)):
-            raise HarnessError("Invalid command process journal")
-        entry["journal"] = str(path)
-        entry["journal_digest"] = _file_digest(path)
-        records.append(entry)
+    for name, kind in listing.entries:
+        folder = job / "commands" / name
+        if kind != "dir" or not re.fullmatch(r"[0-9a-f]{32}", name):
+            raise _damaged_journal(f"Invalid command journal directory ({kind}): {folder}", folder)
+        outcome = files.digest(("commands", name, "process.json"), keep=JOURNAL_MAX).or_local_io()
+        if outcome.state != "read" and not outcome.step.leaf:
+            # Listed as a directory, then gone or replaced: no call folder any more.
+            raise _damaged_journal(f"Command journal directory changed while read ({outcome.state}): {folder}", folder)
+        record = {"id": job.name + ":command:" + name, "command_id": None, "pgid": None, "process_state": None,
+                  "exit_confirmed": False}
+        facts = _journal_facts(outcome.data, record["id"]) if outcome.state == "read" else None
+        if facts is not None:
+            record.update(facts)
+        state = "valid" if facts is not None else "invalid" if outcome.state == "read" else outcome.state
+        record.update(journal=str(folder / "process.json"), journal_digest=outcome.digest, journal_state=state)
+        records.append(record)
     return records
 
 
-def ensure_command_processes_exited(directory, parent_entry=None, *, observe=group_alive):
-    records = command_processes(directory)
+def command_exit_settled(record, confirmations):
+    """A valid journal confirming its own exit, or an operator confirmation bound to this very journal.
+
+    The stored digest must be there and equal: None (no readable journal) matches only a stored None,
+    never a missing confirmation.
+    """
+    if record["journal_state"] == "valid" and record["exit_confirmed"]:
+        return True
+    confirmation = confirmations.get(record["id"])
+    return (isinstance(confirmation, dict) and "journal_digest" in confirmation
+            and confirmation["journal_digest"] == record["journal_digest"])
+
+
+def ensure_command_processes_exited(directory, parent_entry=None, *, state, observe=group_alive):
+    records = command_processes(directory, state=state)
+    parent = parent_entry or {}
     for entry in records:
-        confirmation = (parent_entry or {}).get("command_exit_confirmations", {}).get(entry["id"], {})
-        if entry["exit_confirmed"] or confirmation.get("journal_digest") == entry["journal_digest"]:
+        if command_exit_settled(entry, parent.get("command_exit_confirmations", {})):
             continue
         pgid = entry["pgid"]
-        if (pgid is not None and observe(pgid)) or (pgid is None and entry["process_state"] != "prepared"):
-            raise HarnessError(f"Cannot confirm command process exited: {entry['id']}", stop=stops.make("process_unconfirmed", "command_exit", data={"command_id": entry["id"], "returned_unsealed": False}, source={"dispatch_id": (parent_entry or {}).get("id")} if (parent_entry or {}).get("id") else {}))
+        # A group that could not be looked at (None) is as unconfirmed as one seen alive.
+        if entry["journal_state"] == "valid" and (
+                (pgid is not None and observed_alive(observe, pgid) is False)
+                or (pgid is None and entry["process_state"] == "prepared")):
+            continue
+        state = "" if entry["journal_state"] == "valid" else f" (process.json {entry['journal_state']})"
+        raise HarnessError(f"Cannot confirm command process exited: {entry['id']}{state}", stop=stops.make("process_unconfirmed", "command_exit", data={"command_id": entry["id"], "returned_unsealed": False}, source={"dispatch_id": parent.get("id")} if parent.get("id") else {}))
     return records
 
 
@@ -233,9 +336,11 @@ class Broker:
 
     def _prior_evidence(self, m):
         """Every earlier command or deletion must have exited with complete evidence."""
-        ensure_command_processes_exited(m["job"])
+        # The gate's own records, from its one read of each journal: no parent, so each one is valid.
+        # The manifest's job is the trusted path: the walk starts at its directory, the job's own level not followed.
+        records = ensure_command_processes_exited(m["job"], state=Path(m["job"]).parent)
         commands = {c["command_id"]: c["command"] for c in m["commands"]}
-        for prior in command_processes(m["job"]):
+        for prior in records:
             if prior["process_state"] == "prepared":
                 continue  # No start intent was ever committed.
             receipt_path = Path(prior["journal"]).with_name("receipt.json")
@@ -329,7 +434,7 @@ class Broker:
         return with_descriptors(lambda held: self._run_command(arguments, held))
 
     def _run_command(self, arguments, held):
-        with lock(_safe(Path(self.manifest["job"]) / "command-admission.lock")):
+        with _admission_lock(self.manifest["job"]):
             m, command, timeout, folder, entry, root = self._admit(arguments, held)
         journal = folder / "process.json"
         result = {"call_id": entry["id"], "command_id": command["command_id"], "command": command["command"], "exit_code": None,
@@ -444,7 +549,8 @@ class Broker:
         # A run-bound broker already proved HEAD equals the ledger's expected head.
         head = m["expected_head"] if m["run_path"] is not None else git.head(worktree)
         target = os.fsencode(path)
-        for record in git.git_bytes(worktree, "ls-tree", "-r", "-z", "--full-tree", head, binding=m["binding"]).split(b"\0"):
+        for record in git.git_bytes(worktree, "ls-tree", "-r", "-z", "--full-tree", head, effect=git.READ,
+                                     binding=m["binding"]).split(b"\0"):
             metadata, _, name = record.partition(b"\t")
             if name == target:
                 mode, kind, _ = metadata.split()
@@ -472,7 +578,7 @@ class Broker:
             raise HarnessError(f"delete_path accepts only path, a string of at most {MAX_DELETE_PATH_CHARS} characters")
         path = arguments["path"]
         fatal_error = None
-        with lock(_safe(Path(self.manifest["job"]) / "command-admission.lock")):
+        with _admission_lock(self.manifest["job"]):
             m = self._load()
             scope = self._delete_scope(m)
             self._prior_evidence(m)
@@ -720,9 +826,11 @@ TOOLS = [{"name": "list_commands", "description": (
               "Execute one exact authorized command: its argv in its cwd, without a shell; each admitted call "
               "attempts it anew. A receipt with termination_reason start_failed means the command did not start, "
               "for example because its cwd below the worktree root is missing, not a directory, a symlink, too long "
-              "or not permitted; its error gives the reason, which the stderr tail can cut off. Admission checks "
-              "the recorded receipt of every earlier call in this dispatch: one with evidence_complete false refuses "
-              "every later run_command whatever its termination_reason, and start_failed alone refuses none."),
+              "or not permitted; its error gives the reason, which the stderr tail can cut off. Admission of "
+              "run_command and delete_path checks the recorded receipts of earlier calls to either tool in this "
+              "dispatch, skipping journals in the prepared state, and any receipt with evidence_complete false blocks "
+              "every later call to either tool regardless of the earlier call's termination_reason, while "
+              "start_failed alone does not block admission."),
           "inputSchema": {"type": "object", "properties": {"command_id": {"type": "string"}}, "required": ["command_id"], "additionalProperties": False}}]
 
 

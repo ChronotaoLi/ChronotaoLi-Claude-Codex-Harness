@@ -58,13 +58,6 @@ _REV = re.compile(r"[0-9a-fA-F]{7,64}|HEAD(?:[~^][0-9]{1,4})?")
 # Literal argv never reaches a shell; rejecting operator-looking paths keeps a
 # declared pipeline or redirection from being counted as an available query.
 _SHELL_TOKEN = re.compile(r"[0-9]*[<>]|[|&;()`]")
-# Global options precede the subcommand. They keep every query local and free
-# of external programs configured in the repository or user config. An empty
-# core.fsmonitor disables both hook paths and the builtin daemon on old and new
-# Git; lazy fetching is disabled through the environment, which old Git ignores.
-_GLOBAL = ("--no-pager", "--literal-pathspecs",
-           "-c", "core.fsmonitor=", "-c", "log.showSignature=false",
-           "-c", "color.ui=false", "-c", "protocol.allow=never")
 
 
 class _Reject(Exception):
@@ -234,12 +227,6 @@ def _git_args(query):
     raise HarnessError(f"git_query form has no Git execution: {form}")
 
 
-def _environment(binding):
-    env = git._git_environment(binding)
-    env.update(GIT_NO_LAZY_FETCH="1", GIT_TERMINAL_PROMPT="0", GIT_OPTIONAL_LOCKS="0")
-    return env
-
-
 class _Stream:
     """Retain at most ``keep`` bytes; count and hash at most ``observe`` bytes."""
 
@@ -356,9 +343,9 @@ def _project(query, implementation, git_args, streams, exit_code, terminated, **
 
 
 def _object_format(worktree, binding, timeout):
-    streams, code, terminated = _capture(
-        git._git_command(worktree, [*_GLOBAL, "rev-parse", "--show-object-format"], binding),
-        worktree, _environment(binding), timeout)
+    argv, env = git.invocation(worktree, ["rev-parse", "--show-object-format"], effect=git.READ,
+                               deadline=time.monotonic() + timeout, binding=binding, literal_pathspecs=True)
+    streams, code, terminated = _capture(argv, worktree, env, timeout)
     value = bytes(streams["stdout"].data).decode("ascii", errors="replace").strip()
     if value == "--show-object-format":
         # Git releases that echo the unknown option predate SHA-256 repositories.
@@ -437,8 +424,11 @@ def run_git_query(query, worktree, binding, *, timeout=TIMEOUT_SECONDS):
                               object_format=algorithm, file_bytes=size, file_sha256=content)
         else:
             args = _git_args(query)
-            streams, code, terminated = _capture(git._git_command(worktree, [*_GLOBAL, *args], binding),
-                                                 worktree, _environment(binding), timeout)
+            # The shared construction keeps every query local and free of programs the
+            # repository or user configuration names; READ starts no hook name read.
+            argv, env = git.invocation(worktree, args, effect=git.READ, deadline=time.monotonic() + timeout,
+                                       binding=binding, literal_pathspecs=True)
+            streams, code, terminated = _capture(argv, worktree, env, timeout)
             result = _project(query, "git", args, streams, code, terminated)
         git.check_worktree_binding(worktree, binding)
     except OSError as error:

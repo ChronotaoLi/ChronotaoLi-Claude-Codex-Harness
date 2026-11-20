@@ -1,4 +1,5 @@
 import contextlib
+import errno
 import io
 import json
 from pathlib import Path
@@ -7,12 +8,14 @@ import sys
 import tempfile
 from unittest.mock import patch
 
-from harness import git
+from harness import git, state_files, stops
 from harness.cleanup import cleanup_run
 from harness.cli import main
+from harness.state_files import StateReadError
 from harness.util import HarnessError, lock, read_json, write_json
 from harness.versions import RUN_SCHEMA_VERSION
 from test_harness import RepoCase, ROOT
+from test_state_files import FakeOs
 
 
 class VerificationCleanupTests(RepoCase):
@@ -407,9 +410,16 @@ class VerificationCleanupTests(RepoCase):
             cleanup_run(self.repo, self.run["id"], confirm_exited=[selected["id"]])
         self.assertEqual((self.directory / "state.json").read_bytes(), before)
         self.assertEqual(self.confirmation_events(), [])
-        with patch("harness.run_store.write_json", side_effect=OSError("state unavailable")), \
-                self.assertRaisesRegex(OSError, "state unavailable"):
+        def ledger_rename_fails(real, source, target, **kwargs):  # only the ledger's rename in its locked directory
+            if target == "state.json" and kwargs.get("dst_dir_fd") is not None:
+                raise OSError(errno.EIO, "state unavailable")
+            return real(source, target, **kwargs)
+        with patch.object(state_files, "os", FakeOs(replace=ledger_rename_fails)), \
+                self.assertRaises(StateReadError) as caught:
             cleanup_run(self.repo, self.run["id"], confirm_exited=[selected["id"]])
+        step = caught.exception.outcome.step
+        self.assertEqual((step.name, step.stage, caught.exception.outcome.errno), ("state.json", "rename", errno.EIO))
+        self.assertEqual(caught.exception.stop, stops.make("runtime_failure", "io", data={"error_type": "OSError"}))
         self.assertEqual((self.directory / "state.json").read_bytes(), before)
         self.assertEqual(self.confirmation_events()[0]["dispatch_id"], selected["id"])
         self.assertTrue(self.checkout.exists())

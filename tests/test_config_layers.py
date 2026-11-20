@@ -14,7 +14,7 @@ from harness.config import DEFAULTS, Config
 from harness.operations import first_line
 from harness.shared import toml_value
 from harness.util import HarnessError
-from test_harness import ROOT, RepoCase, scratch, write_project_config
+from test_harness import ROOT, RepoCase, write_project_config
 
 
 def write_toml(path, data):
@@ -286,7 +286,6 @@ class ProjectFileLocationTests(RepoCase):
         self.deep.mkdir(parents=True)
         # A project file below the Git root is never the one loaded.
         write_project_config(self.repo / "pkg", [{"cwd": ".", "argv": ["python3", "-c", "print('decoy')"]}])
-        self.outside = scratch(self)
 
     def invoke(self, argv, cwd):
         loaded, output, errors = [], io.StringIO(), io.StringIO()

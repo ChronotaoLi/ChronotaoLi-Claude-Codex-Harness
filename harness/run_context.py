@@ -9,7 +9,8 @@ from .adapters import CLIBackend
 from .budgets import work_attempts
 from .memory import Memory
 from .process_runtime import defer_cleanup_signals
-from .run_store import RunStore
+from .run_store import RunStore, replaced
+from .state_files import LockUnavailable, StateFiles, holding
 from .util import HarnessError, append_event, confirm_dispatches_exited, ensure_dispatches_exited, group_alive, validate_command_directories, write_json
 
 class RunContext:
@@ -58,6 +59,36 @@ class RunContext:
         except (HarnessError, OSError) as error:
             return {"coverage": "paths_only_not_contents", "entries": None, "entry_count": None,
                     "omitted_count": None, "error": str(error)[:500]}
+
+    def run_lock(self, stop, use):
+        """``use()`` with run.lock held, the run directory it lies in bound to the store first.
+
+        Taken through ``holding``, so the lock is released however ``use`` ends, one signal included. A lock
+        not taken leaves before ``use`` runs: busy with ``stop``; a run directory other than the one the store
+        is bound to, told before run.lock is opened or made there, as the store's replacement stop; a link or
+        non-regular file at any level, or a missing run directory, as damaged evidence; a failed open or flock
+        as local I/O.
+        """
+        path = self.directory / "run.lock"
+        entered = False
+
+        def held(locked):
+            nonlocal entered
+            entered = True
+            self.store.bind_directory(locked.identity)
+            return use()
+        try:
+            return holding(StateFiles(self.state).lock(("runs", self.run["id"], "run.lock"), create=True,
+                                                       identity=self.store.directory_identity), held)
+        except LockUnavailable as error:
+            if entered:  # not this lock's: one taken inside ``use``
+                raise
+            if error.outcome.state == "busy":
+                raise HarnessError(f"已有进程持有运行锁：{path}", stop=stop) from None
+            if error.outcome.state == "replaced":
+                raise replaced() from None
+            error.outcome.evidence({"artifact": str(path)})
+            raise
 
     def save(self):
         """Publish through RunStore, then notify the current observer."""
@@ -114,7 +145,7 @@ class RunContext:
     def ensure_exited(self):
         validate_command_directories(self.run["dispatches"], self.directory)
         try:
-            exited = ensure_dispatches_exited(self.run["dispatches"], observe=group_alive)
+            exited = ensure_dispatches_exited(self.run["dispatches"], state=self.state, observe=group_alive)
         except HarnessError as error:
             stop = error.stop
             if isinstance(stop, dict) and stop.get("kind") == "process_unconfirmed":
@@ -129,5 +160,5 @@ class RunContext:
     def confirm_exited(self, identifiers):
         """Record an operator's explicit assertion; never signal an unowned group."""
         validate_command_directories(self.run["dispatches"], self.directory)
-        confirm_dispatches_exited(self.run["dispatches"], identifiers,
+        confirm_dispatches_exited(self.run["dispatches"], identifiers, state=self.state,
                                   audit=self.event, save=self.save, observe=group_alive)
