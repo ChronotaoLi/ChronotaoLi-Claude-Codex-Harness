@@ -4,7 +4,8 @@ from unittest.mock import patch
 
 from harness import git
 from harness.cleanup import cleanup_run
-from harness.util import HarnessError, lock, read_json, write_json
+from harness.util import HarnessError, read_json, write_json
+from test_state_files import held_lock
 from test_harness import RepoCase, ROOT
 
 
@@ -48,7 +49,7 @@ class RunCleanupTests(RepoCase):
         self.assertEqual(self.cleanup(True)["status"], "removed")
 
     def test_lock_refuses_and_nonterminal_worktree_is_retained(self):
-        with lock(self.directory / "run.lock"), self.assertRaises(HarnessError):
+        with held_lock(self.directory / "run.lock"), self.assertRaises(HarnessError):
             self.cleanup(True)
         # A run that can still be finished or abandoned keeps its worktree.
         for status in ("running", "stopped", "planning"):

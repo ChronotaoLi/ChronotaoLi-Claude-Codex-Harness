@@ -217,7 +217,8 @@ _row("workspace_mismatch", "directive_mismatch", 1, "待派发指令与已发布
 _row("workspace_mismatch", "dirty_final_workspace", 1, "整体验收要求干净的已接受提交", ("resume {run}", "abandon {run}"))
 _row("workspace_mismatch", "binding_missing", 1, "缺少已保存的工作树 Git 绑定", ("abandon {run}",))
 _row("workspace_mismatch", "binding_changed", 1, "工作树 Git 绑定已改变", ("abandon {run}",))
-for _r, _t in (("candidate_outside_scope", "候选越出任务范围"), ("protected_path", "候选修改了受保护路径")):
+for _r, _t in (("candidate_outside_scope", "候选越出任务范围"), ("protected_path", "候选修改了受保护路径"),
+               ("special_file", "候选含 Git 不能记录的特殊文件")):
     _row("scope_violation", _r, 1, _t, ("resume {run}",), ("task_id",), path=_relpath)
 _row("evidence", "load_integrity", 1, "加载核验发现证据不符", (), ("artifact", "artifact_digest", "dispatch_id", "task_id"))
 _row("evidence", "runtime_integrity", 1, "证据有问题，但加载核验此刻通过", ("resume {run}", "abandon {run}"),
@@ -654,5 +655,9 @@ def project_ledger(run, *, omit_detail=False):
 
 
 def exit_code(error):
-    value = of(error)
+    return value_exit_code(of(error))
+
+
+def value_exit_code(value):
+    """The registered exit code of an already classified stop."""
     return REGISTRY[(value["kind"], value["reason"])]["exit_code"]

@@ -10,7 +10,7 @@ from . import git, stops
 from .config import PROJECT_FILE
 from .context import compact_checks, compact_feedback, compact_reviews, instruction_file_changes
 from .contracts import envelope, judge_review, review_approved, review_schema, WORK
-from .memory import Memory, validate_proposals
+from .memory import Memory, MemoryRecordError, validate_proposals
 from .planning import attempt_limit_error
 from .input_projection import validate_dispatch_indexes as validate_input_dispatch_indexes
 from .path_evidence import validate_dispatch_indexes
@@ -64,22 +64,28 @@ class TaskLifecycle(RuntimeService):
         tid, commit = payload["task_id"], payload["commit"]
         # These IDs are committed in the same SQLite transaction as the records.
         # A crash after a successful write but before save must not create a version.
-        if not completion.get("task_memory_id"):
-            self.context.store.check_current()
-            completion["task_memory_id"] = self.context.memory.remember(
-                **completion["task_memory"], operation_id=completion["id"] + ":task")
-            self.context.save()
-        if completion["knowledge"]["status"] == "pending":
-            self.context.store.check_current()
-            try:
-                identifiers = self.context.memory.remember_proposals(
-                    completion["proposals"], completion["approved_keys"], commit, self.context.run["id"], tid,
-                    completion["knowledge_ttl_days"], operation_id=completion["id"] + ":knowledge")
-            except HarnessError as error:
-                completion["knowledge"] = {"status": "discarded", "reason": str(error)}
-            else:
-                completion["knowledge"] = {"status": "promoted", "memory_ids": identifiers}
-            self.context.save()
+        try:
+            if not completion.get("task_memory_id"):
+                self.context.store.check_current()
+                completion["task_memory_id"] = self.context.memory.remember(
+                    **completion["task_memory"], operation_id=completion["id"] + ":task")
+                self.context.save()
+            if completion["knowledge"]["status"] == "pending":
+                self.context.store.check_current()
+                try:
+                    identifiers = self.context.memory.remember_proposals(
+                        completion["proposals"], completion["approved_keys"], commit, self.context.run["id"], tid,
+                        completion["knowledge_ttl_days"], operation_id=completion["id"] + ":knowledge")
+                except MemoryRecordError:
+                    raise
+                except HarnessError as error:
+                    completion["knowledge"] = {"status": "discarded", "reason": str(error)}
+                else:
+                    completion["knowledge"] = {"status": "promoted", "memory_ids": identifiers}
+                self.context.save()
+        except MemoryRecordError as error:
+            raise HarnessError(f"已接受任务 {tid} 的记忆无法写入；保留接受证据：{error}",
+                               stop=stops.make("runtime_failure", "invariant")) from error
         if completion["knowledge"]["status"] == "discarded":
             self.acceptance_event_once("memory_proposals_discarded", completion["id"] + ":discarded",
                                        task_id=tid, reason=completion["knowledge"]["reason"])
@@ -276,69 +282,58 @@ class TaskLifecycle(RuntimeService):
             raise HarnessError(f"{error}。工作树：{self.context.worktree}；请先核对并清理越界修改，再 resume。"
                                "现场与证据已保留，本次预检不会派发 worker。", stop=error.stop) from error
 
-    def invalidated_reviews(self, pending, key):
-        """The records that keep the evidence when a changed candidate invalidates its pending gate.
+    def read_invalidated_review(self, pending, key):
+        """Read the unregistered original and its digest without changing the ledger."""
+        source = self.context.run["review_receipts"].get(key)
+        if not source:
+            return None
+        receipts = self.services.receipts
+        if not receipts.returned(source):
+            return None  # A provider invocation that never returned a result.
+        artifact = Path(source["artifact"])
+        dispatch_id = source["dispatch_id"]
+        history = self.context.run["review_history"].get(pending["task_id"], [])
+        if any(isinstance(item, dict) and item.get("dispatch_id") == dispatch_id for item in history):
+            return None
+        # Check the original batch before reading or binding the artifact.
+        if "required_findings" not in pending:
+            raise HarnessError("审阅阶段缺少必需问题对照；保留证据", stop=stops.make("runtime_failure", "invariant"))
+        require_saved_batch(self.context.run, pending["task_id"], pending["snapshot_digest"],
+                            pending["required_findings"])
+        origin = {"artifact": str(artifact), "dispatch_id": dispatch_id}
+        read = receipts.artifact_files(source).read(("returned-result.json",), limit=None)
+        # Retain the source contract of the evidence validator for unsafe file types.
+        raw = read.evidence(None if read.found in ("symlink", "fifo") else origin)
+        return raw, hashlib.sha256(raw).hexdigest(), origin
 
-        Every read and check happens here; the caller appends them in the
-        transition that ends the gate.
-        """
-        runtime = self.context
-        history = self.context.run["review_history"].setdefault(pending["task_id"], [])
-        kept = []
-        for source in [self.context.run["review_receipts"].get(key)]:
-            if not source:
-                continue
-            artifact = Path(source["artifact"])
-            if not artifact.exists() and "artifact_digest" not in source:
-                continue  # A provider invocation that never returned a result.
-            dispatch_id = source.get("dispatch_id", artifact.parent.name)
-            if any(isinstance(item, dict) and item.get("dispatch_id") == dispatch_id for item in history):
-                continue
-            # A returned review exists only in the reviewing stage, whose saved
-            # mapping produced its schema; never validate it against a default.
-            if "required_findings" not in pending:
-                raise HarnessError("审阅阶段缺少必需问题对照；保留证据", stop=stops.make("runtime_failure", "invariant"))
-            # Checked before the original is read or its digest bound, so a
-            # changed mapping leaves the receipt exactly as it was.
-            require_saved_batch(self.context.run, pending["task_id"], pending["snapshot_digest"],
-                                pending["required_findings"])
-            origin = {"artifact": str(artifact), "dispatch_id": dispatch_id}
-            with stops.evidence_reads(source=origin, message="审阅原始结果缺失或已被替换；禁止通过候选变化丢弃证据"):
-                raw = artifact.read_bytes()
-            digest = hashlib.sha256(raw).hexdigest()
-            if "artifact_digest" not in source:
-                source["artifact_digest"] = digest
-                self.context.save()
-            if digest != source["artifact_digest"]:
-                raise EvidenceError("审阅原始结果已改变；禁止通过候选变化丢弃证据", stop=stops.make("evidence", "runtime_integrity", source=origin))
-            try:
-                result = json.loads(raw)
-            except (ValueError, UnicodeError):
-                result = None
-            record = {"status": "invalidated", "attempt": pending["attempt"],
-                      "dispatch_id": dispatch_id, "artifact": str(artifact),
-                      "artifact_digest": digest, "snapshot_digest": source["snapshot_digest"],
-                      "verification": pending.get("verification"),
-                      "diff_artifact": pending.get("diff_artifact"),
-                      "reason": "候选已变化；原结果仅作待复核证据，不构成当前候选的批准"}
-            record["review_source"] = {"dispatch_id": dispatch_id, "artifact": str(artifact),
-                "artifact_digest": digest, "snapshot_digest": source["snapshot_digest"]}
-            record["required_findings"] = deepcopy(pending["required_findings"])
-            schema = review_schema(pending["required_findings"])
-            if not isinstance(result, dict):
-                record["validation_error"] = "review result is not a JSON object"
+    def invalidated_review(self, pending, source, raw, digest, origin):
+        """Prepare an independent history record once the receipt has a saved digest."""
+        if digest != source["artifact_digest"]:
+            raise EvidenceError("审阅原始结果已改变；禁止通过候选变化丢弃证据", stop=stops.make("evidence", "runtime_integrity", source=origin))
+        try:
+            result = json.loads(raw)
+        except (ValueError, UnicodeError):
+            result = None
+        review_source = {**origin, "artifact_digest": digest, "snapshot_digest": source["snapshot_digest"]}
+        record = deepcopy({
+            "status": "invalidated", "attempt": pending["attempt"], **review_source,
+            "verification": pending.get("verification"), "diff_artifact": pending.get("diff_artifact"),
+            "reason": "候选已变化；原结果仅作待复核证据，不构成当前候选的批准",
+            "review_source": review_source, "required_findings": pending["required_findings"],
+        })
+        schema = review_schema(pending["required_findings"])
+        if not isinstance(result, dict):
+            record["validation_error"] = "review result is not a JSON object"
+        else:
+            judgment = judge_review(result, envelope(schema, pending["task_id"], origin["dispatch_id"]))
+            if judgment.state == "invalid" and not judgment.readable:
+                # Malformed data remains inspectable without presenting it as a valid review.
+                record["validation_error"] = str(judgment.error)
             else:
-                judgment = judge_review(result, envelope(schema, pending["task_id"], dispatch_id))
-                if judgment.state == "invalid" and not judgment.readable:
-                    # Malformed data remains inspectable, but is not presented
-                    # as a structurally valid review of this task.
+                record["review"] = {k: v for k, v in result.items() if k not in ("task_id", "dispatch_id")}
+                if judgment.error is not None:
                     record["validation_error"] = str(judgment.error)
-                else:
-                    record["review"] = {k: v for k, v in result.items() if k not in ("task_id", "dispatch_id")}
-                    if judgment.error is not None:
-                        record["validation_error"] = str(judgment.error)
-            kept.append(record)
-        return kept
+        return record
 
     def continue_task(self):
         runtime = self.context
@@ -354,12 +349,22 @@ class TaskLifecycle(RuntimeService):
         if snapshot_digest(snapshot) != pending["snapshot_digest"]:
             # The kept original, the gate's end and the receipt's consumption are one step: a kept
             # original beside its receipt would make a resumed gate replay a registered dispatch.
-            kept = self.invalidated_reviews(pending, key)
+            original = self.read_invalidated_review(pending, key)
+            kept = []
+            if original is not None:
+                raw, digest, origin = original
+                source = self.context.run["review_receipts"][key]
+                if "artifact_digest" not in source:
+                    # A returned artifact can precede its receipt's digest. Bind the
+                    # first bytes durably before using them or accepting a later read.
+                    source["artifact_digest"] = digest
+                    self.context.save()
+                kept.append(self.invalidated_review(pending, source, raw, digest, origin))
             feedback = {"task_id": tid, "recovery": {
                 "error": "任务候选已变化；旧验证及审阅失效，重新执行任务",
                 "verification": pending.get("verification")}}
             with self.context.transition():
-                self.context.run["review_history"][tid].extend(kept)
+                self.context.run["review_history"].setdefault(tid, []).extend(kept)
                 self.context.run.pop("pending_task")
                 self.context.run["review_receipts"].pop(key, None)
                 self.context.run["feedback"] = feedback
@@ -638,9 +643,14 @@ class TaskLifecycle(RuntimeService):
         self.context.ensure_exited()
         # Reads that never touch the worktree come first: a predictable record
         # error stops before the commit, and the message is read by its digest.
+        placeholder = "0" * len(self.context.run["expected_head"])
+        knowledge_ttl_days = self.context.config.data["memory"]["knowledge_ttl_days"] or None
         try:
-            Memory.validate_record(**self.task_memory_record(task, pending, "0" * len(self.context.run["expected_head"]),
-                                                             pending["files"])[0])
+            task_memory, provenance = self.task_memory_record(task, pending, placeholder, pending["files"])
+            Memory.validate_record(**task_memory, kind="accepted_task", provenance=provenance)
+            for record in Memory.knowledge_records(pending["proposals"], pending["approved_keys"], placeholder,
+                                                   self.context.run["id"], tid, knowledge_ttl_days):
+                Memory.validate_record(**record)
         except HarnessError as error:
             raise HarnessError(f"任务记忆记录不合格；未提交：{error}", stop=stops.make("runtime_failure", "invariant")) from error
         message = self.approved_worker_message(pending)
@@ -683,7 +693,7 @@ class TaskLifecycle(RuntimeService):
             "id": f"acceptance:{self.context.run['id']}:{tid}",
             "task_memory": {**task_memory, "kind": "accepted_task", "provenance": provenance},
             "proposals": pending["proposals"], "approved_keys": pending["approved_keys"],
-            "knowledge_ttl_days": self.context.config.data["memory"]["knowledge_ttl_days"] or None,
+            "knowledge_ttl_days": knowledge_ttl_days,
             "knowledge": {"status": "pending"},
         }
         self._record_accepted(pending, accepted, completion)

@@ -20,6 +20,7 @@ class RejectionCLITests(unittest.TestCase):
 
     def invoke(self, arguments, error=None):
         engine = Mock()
+        engine.context.saved_stop = None
         engine.resume.return_value = {'id': 'run_fixture', 'status': 'paused', 'branch': 'fixture', 'worktree': '/tmp/fixture'}
         engine.resume.side_effect = error
         stdout, stderr = io.StringIO(), io.StringIO()

@@ -32,7 +32,7 @@ from pathlib import Path, PurePath
 
 from . import quota
 from .process_runtime import defer_cleanup_signals
-from .util import strict_json_loads
+from .util import one_line, strict_json_loads
 from .versions import unsupported_ledger
 
 
@@ -49,8 +49,8 @@ ROOT_DIRECTORIES = frozenset(("plans", "dispatches", "verification", "recovery",
                               "checkpoints", "path-indexes", "observations", "preflight", "continuations",
                               "continuation-rejections", "execution-guidance", "proposal-rejections",
                               "input-indexes", "finding-progress"))
-# The generated MCP configuration and the two empty lock files; *.tmp and memory.sqlite3* by pattern.
-EXCLUDED_NAMES = frozenset(("mcp.json", "run.lock", "store.lock"))
+# The generated MCP configuration and empty lock files; *.tmp and memory.sqlite3* by pattern.
+EXCLUDED_NAMES = frozenset(("mcp.json", "run.lock", "store.lock", "command-admission.lock"))
 DEFAULT_TAIL = 64 * 1024
 MAX_TAIL = 1024 * 1024
 STATE_MAX_BYTES = 64 * 1024 * 1024
@@ -210,20 +210,15 @@ def location(given, resolved, *, checkout=None):
     return {"state": state, "checkout": checkout, "checkout_basis": basis, "name": "/".join(parts[-2:]) or text}
 
 
-def _one_line(path):
-    """A path shown on one stderr line: newlines, other controls and the backslash escaped as repr() writes them."""
-    return "".join(char if char.isprintable() and char != "\\" else repr(char)[1:-1] for char in path)
-
-
 def location_text(observed, *, opened=True):
     """The one stderr wording of an entry's location, always one line; an inferred checkout says so."""
     if observed["checkout_basis"] == "git":
-        checkout = f"检出 {_one_line(observed['checkout'])}"
+        checkout = f"检出 {one_line(observed['checkout'])}"
     elif observed["checkout_basis"] == "path":
-        checkout = f"检出（按状态目录路径推定，未核实）{_one_line(observed['checkout'])}"
+        checkout = f"检出（按状态目录路径推定，未核实）{one_line(observed['checkout'])}"
     else:
         checkout = "检出 未知"
-    return f"{checkout}；状态目录 {_one_line(observed['state'])}" + ("" if opened else "（无法打开）")
+    return f"{checkout}；状态目录 {one_line(observed['state'])}" + ("" if opened else "（无法打开）")
 
 
 class StateReader:
@@ -253,7 +248,10 @@ class StateReader:
             except (OSError, RuntimeError, ValueError) as error:
                 self._failure = error
                 if required:
-                    raise NotFound(f"观察目录不可用：{state}") from error
+                    unavailable = NotFound(f"观察目录不可用：{state}")
+                    if isinstance(error, (OSError, RuntimeError)):
+                        unavailable._root_initialization_failed = True
+                    raise unavailable from error
                 return
             with defer_cleanup_signals(inherit=False):
                 try:
@@ -263,7 +261,9 @@ class StateReader:
             if self._root is not None:
                 return
             if required:
-                raise NotFound(f"观察目录不可用：{self.state}") from self._failure
+                unavailable = NotFound(f"观察目录不可用：{self.state}")
+                unavailable._root_initialization_failed = True
+                raise unavailable from self._failure
             if not isinstance(self._failure, PermissionError):
                 return
             with defer_cleanup_signals(inherit=False), contextlib.suppress(OSError):
@@ -397,6 +397,17 @@ class StateReader:
             return _scan(fd)
         finally:
             os.close(fd)
+
+    def check_run_listing_root(self):
+        """Keep the CLI's inaccessible state directory distinct from an absent one."""
+        failure = self._failure
+        if self._root is None and isinstance(failure, OSError):
+            # A loop can survive non-strict resolution. A no-follow directory open
+            # may report ENOTDIR for that remaining link, just as for a plain file.
+            unresolved_link = (failure.errno == errno.ENOTDIR and self.state is not None
+                               and os.path.islink(self.state))
+            if failure.errno not in (errno.ENOENT, errno.ELOOP) and not unresolved_link:
+                raise PathRefused(f"无法打开观察目录：{failure}") from failure
 
     def walk(self, components, *, limit, max_depth):
         """List addressable regular files below a directory, depth-first and bounded."""

@@ -28,10 +28,11 @@ def toml_value(value):
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, dict):
-        return "{" + ", ".join(f"{json.dumps(k)} = {toml_value(v)}" for k, v in value.items()) + "}"
+        return "{" + ", ".join(f"{toml_value(k)} = {toml_value(v)}" for k, v in value.items()) + "}"
     if isinstance(value, list):
         return "[" + ", ".join(toml_value(v) for v in value) + "]"
-    return json.dumps(value, ensure_ascii=False)
+    # JSON leaves DEL literal here, but TOML requires an escape.
+    return json.dumps(value, ensure_ascii=False).replace("\x7f", r"\u007f")
 
 
 ROLE_SKILLS = frozenset({"harness-commander", "harness-worker", "harness-reviewer"})
@@ -61,6 +62,14 @@ def read_skill(root: Path, name: str):
     if path.is_symlink() or path.parent.is_symlink() or not path.is_file():
         raise HarnessError(f"skill 不存在或为链接：{name}")
     return path.read_text(encoding="utf-8")
+
+
+def _require_utf8(field, values):
+    for value in values:
+        try:
+            value.encode("utf-8")
+        except UnicodeEncodeError as error:
+            raise HarnessError(f"{field} 含无法编码为 UTF-8 的文本") from error
 
 
 @stops.classifies("invalid_input", "input_schema", data={"option": "config"})
@@ -116,11 +125,17 @@ def validate_mcp(config, roles=("commander", "worker", "reviewer")):
             keys = spec.get("env_vars", [])
             if not isinstance(keys, list) or any(not text(key) for key in keys):
                 raise HarnessError(f"{field}.env_vars 必须为非空环境变量名称的数组")
+            _require_utf8(f"{field}.command", (spec["command"],))
+            _require_utf8(f"{field}.args", args)
+            _require_utf8(f"{field}.env_vars", keys)
         else:
             if not text(spec.get("url")):
                 raise HarnessError(f"{field}.url 必须为非空字符串")
             if "bearer_token_env_var" in spec and not text(spec["bearer_token_env_var"]):
                 raise HarnessError(f"{field}.bearer_token_env_var 必须为非空环境变量名称字符串")
+            _require_utf8(f"{field}.url", (spec["url"],))
+            if "bearer_token_env_var" in spec:
+                _require_utf8(f"{field}.bearer_token_env_var", (spec["bearer_token_env_var"],))
         selected[name] = spec
     return selected
 

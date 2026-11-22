@@ -9,8 +9,10 @@ from collections import namedtuple
 from copy import deepcopy
 from .continuation import continuation_gate, continuation_stop, resolve_continuation, validate_continuation_rejection
 from .finalization import needs_decision, same_snapshot_record
+from .operations import observe_terminal
 from .planning import attempt_limit_error, DECIDE_KEY, directive_mismatch
 from .recovery import invalidate_acceptance_review, snapshot_digest
+from .run_store import RunStore
 from .util import HarnessError
 from . import quota_wait, stops
 from .services import RuntimeService
@@ -107,6 +109,24 @@ class Scheduler(RuntimeService):
         return Step("final_review", None)
 
     def execute(self, supplied_plan=None, *, step=False):
+        quota = self.services.quota
+        primary = None
+        try:
+            self._execute_until_terminal(supplied_plan, step=step)
+            observe_terminal("额度终态登记", quota.terminal_saved)
+            observe_terminal("写检查点", self.context.checkpoint)
+            event = {"awaiting_approval": "plan_awaiting_approval", "paused": "run_paused",
+                     "completed": "run_completed"}[self.context.run["status"]]
+            observe_terminal(event, self.context.event, event)
+            return self.context.run
+        except BaseException as error:
+            primary = error
+            raise
+        finally:
+            # A sample is an observation of the saved terminal state and the outgoing error, if any.
+            observe_terminal("结束额度采样", quota.end_of_call, primary)
+
+    def _execute_until_terminal(self, supplied_plan, *, step):
         try:
             self.admission()
             try:
@@ -146,11 +166,7 @@ class Scheduler(RuntimeService):
                     source={"artifact": plan["artifact"], "artifact_digest": plan["artifact_digest"]})
                 # Settled like every stop before its save: a load failure stops the run instead.
                 self.services.lifecycle.settle_publication("plan_approval", "initial_plan")
-                self.context.save()
-                self.services.quota.terminal_saved()
-                self.context.checkpoint()
-                self.context.event("plan_awaiting_approval")
-                return self.context.run
+                return self.context.save(terminal=True)
             self.context.run["status"] = "running"
             self.context.run.pop("stop", None)
             quota_wait.clear(self.context.run)   # a killed process's wait is never inherited
@@ -170,11 +186,7 @@ class Scheduler(RuntimeService):
                             accepted_this_call += 1
                     elif action.kind == "pause":
                         self.context.run["status"] = "paused"
-                        self.context.save()
-                        self.services.quota.terminal_saved()
-                        self.context.checkpoint()
-                        self.context.event("run_paused")
-                        return self.context.run
+                        return self.context.save(terminal=True)
                     elif action.kind == "worker":
                         if self.services.tasks.task_attempt(*action.data):
                             accepted_this_call += 1
@@ -193,22 +205,17 @@ class Scheduler(RuntimeService):
                     raise
             self.services.planning.verify_plan_authority()
             self.context.run["status"] = "completed"
-            self.context.save()
-            self.services.quota.terminal_saved()
-            self.context.checkpoint()
-            self.context.event("run_completed")
-            return self.context.run
+            self.context.save(terminal=True)
         except BaseException as error:
             # A quota failure takes its account snapshot before the stop is settled and saved;
             # an interrupt during that probe becomes the error to stop with.
             error = self.services.quota.annotate_failure(error)
-            revision = self.context.run.get("store_revision")
+            previous_stop = self.context.saved_stop
             try:
-                self.services.workflow.stop(error)
+                outcome = self.services.workflow.stop(error)
             finally:
-                if self.context.run.get("store_revision") != revision:
-                    self.services.quota.terminal_saved()
+                if self.context.saved_stop is not previous_stop:
+                    observe_terminal("额度终态登记", self.services.quota.terminal_saved)
+            if outcome is RunStore.KEPT:
+                return
             raise error
-        finally:
-            # After the terminal state is saved (never before): one sample per provider this process used.
-            self.services.quota.end_of_call()

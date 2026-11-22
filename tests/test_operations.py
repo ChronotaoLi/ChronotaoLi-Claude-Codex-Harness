@@ -57,12 +57,13 @@ class OperationCase(RepoCase):
         self.state = self.repo / ".harness"
         self.operations = self.state / "operations"
 
-    def invoke(self, args, backend=None, errors=None, *, load=None, **patches):
+    def invoke(self, args, backend=None, errors=None, *, load=None, output=None, **patches):
         """Real CLI and Engine with a simulated model backend; provider CLIs are never executed.
 
         ``load`` replaces the case's configuration with a loader of files (``Config.load`` itself or a wrapper).
         """
-        output, errors = io.StringIO(), io.StringIO() if errors is None else errors
+        output = io.StringIO() if output is None else output
+        errors = io.StringIO() if errors is None else errors
         with contextlib.ExitStack() as stack:
             stack.enter_context(patch("harness.cli.Config.load", **({"return_value": self.config} if load is None else {"new": load})))
             stack.enter_context(patch("harness.run_context.CLIBackend", return_value=backend or DemoBackend()))

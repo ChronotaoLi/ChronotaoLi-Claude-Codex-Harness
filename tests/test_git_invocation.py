@@ -10,15 +10,18 @@ import collections
 import contextlib
 import functools
 import hashlib
+import http.client
 import io
 import json
 import os
 import random
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import traceback
 import unittest
@@ -28,11 +31,13 @@ from unittest.mock import patch
 
 import git_isolation
 import run_shards
-from harness import cleanup, cli, dashboard, git, operations, permission_smoke, stops, tool_smoke
+import stop_tripwire
+from harness import (cleanup, cli, command_server, dashboard, git, git_query, memory, operations,
+                     permission_smoke, private_state, stops, tool_smoke, workspace_inputs)
 from harness.config import Config
 from harness.util import HarnessError, read_json
 from test_decide import Script, block_first, blocked_by_task, describe, revise, task
-from test_harness import ROOT, RepoCase, write_project_config
+from test_harness import ROOT, RepoCase, cli_notice, write_project_config
 
 IDENTITY = ("-c", "user.name=Test", "-c", "user.email=test@localhost", "-c", "commit.gpgsign=false")
 # Every event githooks(5) of Git 2.56 lists.
@@ -97,6 +102,9 @@ class Markers:
         record = f"printf '%s %s\\n' \"$1\" \"$(pwd -P)\" >> '{self.log}'\n"
         self.hook = self.script("hook.sh", record + "cat >/dev/null 2>&1\nexit 0\n")
         self.filter = self.script("filter.sh", record + "exec cat\n")
+        # Protocol v2 greeting followed by an empty list of filter capabilities.
+        self.process = self.script("process.sh", record.replace('"$1"', "process")
+                                   + "printf '0016git-filter-server\\n000eversion=2\\n00000000'\ncat >/dev/null\n")
         self.textconv = self.script("textconv.sh", record.replace('"$1"', "textconv") + 'cat "$1"\n')
         self.fsmonitor = self.script("fsmonitor.sh", record.replace('"$1"', "fsmonitor") + "exit 1\n")
         self.external = self.script("external.sh", record.replace('"$1"', "external") + "exit 0\n")
@@ -123,6 +131,10 @@ class Markers:
     def common(repo):
         return Path(plain_git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir").stdout.decode().strip())
 
+    def configured(self, scope, events=EVENTS):
+        return "".join(f'[hook "{scope}-{event}"]\n\tcommand = \'{self.hook}\' config:{scope}-{event}\n'
+                       f"\tevent = {event}\n" for event in events)
+
     def arm(self, repo, *, events=EVENTS, programs=True, scopes=("repo", "glob"), hook_directory=True):
         common = self.common(repo)
         (common / "hooks").mkdir(exist_ok=True)
@@ -131,10 +143,7 @@ class Markers:
             hook.write_text(f"#!/bin/sh\nexec '{self.hook}' hookdir:{event} \"$@\"\n")
             hook.chmod(0o755)
 
-        def hooks(scope):
-            return "".join(f'[hook "{scope}-{event}"]\n\tcommand = \'{self.hook}\' config:{scope}-{event}\n'
-                           f"\tevent = {event}\n" for event in events)
-        text = hooks("repo") if "repo" in scopes else ""
+        text = self.configured("repo", events) if "repo" in scopes else ""
         if programs:
             (common / "info").mkdir(exist_ok=True)
             (common / "info" / "attributes").write_text("* filter=marker diff=marker\n")
@@ -146,7 +155,7 @@ class Markers:
         self.included.write_text(text)
         plain_git(repo, "config", "include.path", str(self.included))
         if "glob" in scopes:
-            Path(os.environ["GIT_CONFIG_GLOBAL"]).write_text(hooks("glob"))
+            Path(os.environ["GIT_CONFIG_GLOBAL"]).write_text(self.configured("glob", events))
         self.armed = (common, events if hook_directory else ())
 
     def disarm(self):
@@ -169,38 +178,65 @@ class IsolatedRepoCase(RepoCase):
     def events(self, engine):
         return [json.loads(line)["event"] for line in (engine.directory / "events.jsonl").read_text().splitlines()]
 
-    def cli(self, *argv):
-        """The real CLI; a dashboard starts and stops at once, as SIGTERM would end it."""
+    def cli(self, *argv, serve=None):
+        """The real CLI with a bounded dashboard service interval."""
         def stop_at_once(server, poll_interval=0.5):
             raise KeyboardInterrupt()
         output, errors = io.StringIO(), io.StringIO()
         previous = signal.getsignal(signal.SIGTERM)
         try:
             with contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors), \
-                    patch.object(dashboard.DashboardServer, "serve_forever", stop_at_once):
+                    patch.object(dashboard.DashboardServer, "serve_forever", serve or stop_at_once):
                 code = cli.main(["--repo", str(self.repo), "--config", str(ROOT / "harness.toml"), *argv])
         finally:
             signal.signal(signal.SIGTERM, previous)
         return code, output.getvalue(), errors.getvalue()
 
+    def files(self, *tops, skip=()):
+        """Fingerprint each entry without following symlinks or opening special files."""
+        state = {}
+
+        def visit(path, *, root=False):
+            try:
+                info = path.lstat()
+            except FileNotFoundError:
+                if root:
+                    return
+                raise
+            mode = info.st_mode
+            mtime = info.st_mtime_ns
+            payload = None
+            if stat.S_ISLNK(mode):
+                payload = os.readlink(os.fsencode(path))
+            elif stat.S_ISREG(mode):
+                payload = hashlib.sha256(path.read_bytes()).hexdigest()
+                if ".git" in path.parts and path.name.startswith("sharedindex."):
+                    mtime = None
+            elif stat.S_ISBLK(mode) or stat.S_ISCHR(mode):
+                payload = info.st_rdev
+            state[str(path)] = (mode, info.st_uid, info.st_gid, mtime, payload)
+            if stat.S_ISDIR(mode):
+                for child in path.iterdir():
+                    if not root or child.name not in skip:
+                        visit(child)
+
+        for top in tops:
+            visit(Path(top), root=True)
+        return state
+
+    def assert_no_fsmonitor_daemon_spawn(self, trace, command):
+        lines = trace.read_text().splitlines()
+        self.assertTrue(lines, f"No Git process wrote a trace for {command}")
+        spawns = [line for line in lines if "trace: run_command: git fsmonitor--daemon " in line]
+        self.assertEqual(spawns, [], f"{command} spawned fsmonitor--daemon")
+
 
 class PreviewAndObservationTests(IsolatedRepoCase):
-    """Case 2 without the read-only scope: a marked repository, an offline run, preview, observation, removal."""
+    """Case 2: a marked repository, an offline run, preview, observation and removal."""
 
     def setUp(self):
         super().setUp()
         self.config.data["verification"]["fresh_checkout"] = True
-
-    def files(self, *tops, skip=()):
-        """Digest and mtime of every file below ``tops``; a split index's shared file only by digest."""
-        state = {}
-        for top in tops:
-            for path in sorted(Path(top).rglob("*")):
-                if path.relative_to(top).parts[0] in skip or path.is_symlink() or not path.is_file():
-                    continue
-                digest = hashlib.sha256(path.read_bytes()).hexdigest()
-                state[str(path)] = digest if path.name.startswith("sharedindex.") else (digest, path.stat().st_mtime_ns)
-        return state
 
     def test_preview_and_observation_run_no_marked_program_and_change_no_git_bytes(self):
         markers = Markers(self.scratch)
@@ -244,23 +280,93 @@ class PreviewAndObservationTests(IsolatedRepoCase):
         self.assertEqual([item["status"] for item in unmarked["checkouts"]], ["eligible"], errors)
         markers.arm(self.repo)
         markers.reset()
-        before = self.files(self.repo / ".git", worktree, checkout) | self.files(self.repo, skip=(".git", ".harness"))
+        before = self.files(self.repo, worktree, checkout)
         dispatch = next(entry["id"] for entry in result["dispatches"] if entry["role"] == "worker")
-        for argv in (("cleanup-run", run_id), ("status", run_id), ("status", run_id, "--full"), ("watch", run_id),
-                     ("dashboard", "--port", "0"), ("permission-diagnostics", run_id, dispatch)):
-            code, output, errors = self.cli(*argv)
-            self.assertNotIn("Traceback", errors, argv)
-            if argv[0] == "cleanup-run":
-                self.assertEqual(json.loads(output), unmarked)
-            else:
-                self.assertEqual(code, 0, (argv, errors))
+        invocations, request_probes = [], []
+        construct = git.invocation
+        route = dashboard.DashboardHandler._route
+
+        def record(repo, args, **kwargs):
+            invocations.append((tuple(args), kwargs["effect"], git._read_only_depth()))
+            return construct(repo, args, **kwargs)
+
+        def probe_route(handler):
+            try:
+                git.clean(self.repo)
+            except HarnessError as error:
+                request_probes.append((threading.current_thread(), stops.of(error)))
+            return route(handler)
+
+        def serve_one_request(server, poll_interval=0.5):
+            host, port = server.server_address
+            client = http.client.HTTPConnection(host, port, timeout=5)
+            try:
+                client.request("GET", f"/api/runs/{run_id}")
+                server.timeout = 5
+                server.handle_request()
+                response = client.getresponse()
+                self.assertEqual(response.status, 200)
+                self.assertEqual(json.load(response)["id"], run_id)
+            finally:
+                client.close()
+            raise KeyboardInterrupt()
+
+        with patch.object(git, "invocation", side_effect=record), \
+                patch.object(dashboard.DashboardHandler, "_route", probe_route):
+            for argv in (("cleanup-run", run_id), ("cleanup-run", run_id, "--remove-input-copies"),
+                         ("cleanup-run", run_id, "--remove-ignored", "--remove-input-copies"),
+                         ("status",), ("status", run_id), ("status", run_id, "--full"), ("watch", run_id),
+                         ("dashboard", "--port", "0"), ("permission-diagnostics", run_id, dispatch)):
+                with self.subTest(argv=argv):
+                    invocations.clear()
+                    code, output, errors = self.cli(*argv, serve=serve_one_request)
+                    self.assertNotIn("Traceback", errors)
+                    self.assertEqual(invocations[0], (("rev-parse", "--show-toplevel"), git.READ, 1))
+                    self.assertTrue(all(effect is git.READ and depth >= 1 for _, effect, depth in invocations))
+                    self.assertEqual(git._read_only_depth(), 0)
+                    if argv[0] == "cleanup-run":
+                        self.assertEqual(invocations[1], (("rev-parse", "--show-toplevel"), git.READ, 2))
+                        preview = json.loads(output)
+                        if "--remove-ignored" in argv:
+                            self.assertEqual(code, 0, errors)
+                            self.assertEqual(preview["worktree"]["status"], "eligible")
+                            self.assertIn("__pycache__/", preview["worktree"]["ignored_paths"]["entries"])
+                        else:
+                            self.assertEqual(code, 1, errors)
+                            self.assertEqual(preview, unmarked)
+                    else:
+                        self.assertEqual(code, 0, errors)
+            invocations.clear()
+            preview = cleanup.cleanup_run(self.repo, run_id)
+            self.assertEqual(preview, unmarked)
+            self.assertEqual(invocations[0], (("rev-parse", "--show-toplevel"), git.READ, 1))
+            self.assertTrue(all(effect is git.READ and depth == 1 for _, effect, depth in invocations))
+
+        (thread, stop), = request_probes
+        self.assertIsNot(thread, threading.current_thread())
+        self.assertEqual((stop["kind"], stop["reason"]), ("runtime_failure", "invariant"))
         self.assertEqual(markers.read(), [])
-        after = self.files(self.repo / ".git", worktree, checkout) | self.files(self.repo, skip=(".git", ".harness"))
-        self.assertEqual(after, before)
+        self.assertEqual(self.files(self.repo, worktree, checkout), before)
+        invocations.clear()
+        with patch.object(git, "invocation", side_effect=record):
+            code, output, errors = self.cli("cleanup-run", run_id, "--remove-ignored", "--confirm-exited", dispatch)
+        self.assertEqual(code, 0, errors)
+        self.assertEqual(json.loads(output)["worktree"]["status"], "eligible")
+        self.assertTrue(invocations)
+        self.assertTrue(all(effect is git.READ and depth == 0 for _, effect, depth in invocations))
+        self.assertTrue(next(entry["exit_confirmed"] for entry in read_json(engine.directory / "state.json")["dispatches"]
+                             if entry["id"] == dispatch))
+        self.assertTrue(checkout.is_dir())
+        self.assertEqual(markers.read(), [])
         # Removal passes the real preview gates; Git's own status inside worktree remove may run the clean filter.
         expire_stats(checkout)
         markers.reset()
-        code, output, errors = self.cli("cleanup-run", run_id, "--remove")
+        invocations.clear()
+        with patch.object(git, "invocation", side_effect=record):
+            code, output, errors = self.cli("cleanup-run", run_id, "--remove")
+        self.assertTrue(invocations)
+        self.assertTrue(all(depth == 0 for _, _, depth in invocations))
+        self.assertEqual(code, 1, errors)  # the run worktree still has ignored entries
         removal = json.loads(output)
         self.assertEqual([item["status"] for item in removal["checkouts"]], ["removed"], errors)
         self.assertEqual(removal["worktree"]["status"], "blocked", removal["worktree"])
@@ -270,6 +376,42 @@ class PreviewAndObservationTests(IsolatedRepoCase):
         self.assertEqual(read_json(artifact.with_name("cleanup.json"))["status"], "removed")
         self.assertEqual(markers.kinds(), {"clean"}, markers.read())
         self.assertEqual({where for _, where in markers.read()}, {str(checkout.resolve())})
+
+    def test_cli_reports_typed_stop_when_the_first_repository_call_would_compare(self):
+        def compare(repo):
+            git.clean(repo)
+            self.fail("the first repository lookup allowed a comparison")
+
+        for argv in (("status",), ("watch", "run_fixture"), ("dashboard", "--port", "0"),
+                     ("permission-diagnostics", "run_fixture", "dispatch_fixture"),
+                     ("cleanup-run", "run_fixture", "--remove-ignored", "--remove-input-copies")):
+            with self.subTest(argv=argv), patch.object(git, "repository", side_effect=compare), \
+                    patch.object(git.subprocess, "run", wraps=subprocess.run) as processes:
+                code, output, errors = self.cli(*argv)
+                stop = cli_notice(errors)
+                self.assertEqual((stop["kind"], stop["reason"]), ("runtime_failure", "invariant"), errors)
+                self.assertEqual(code, 1, errors)
+                self.assertEqual(output, "")
+                processes.assert_not_called()
+        self.assertEqual(git._read_only_depth(), 0)
+
+
+    def test_watch_with_explicit_state_and_no_repository_lookup_still_enters_scope(self):
+        def compare(state, run_id, *, follow):
+            self.assertEqual(state, self.repo / ".harness")
+            self.assertEqual(run_id, "run_fixture")
+            self.assertFalse(follow)
+            git.clean(self.repo)
+            self.fail("watch with explicit state allowed a comparison")
+
+        with patch("harness.watch_cli.watch_run", side_effect=compare), \
+                patch.object(git.subprocess, "run", wraps=subprocess.run) as processes:
+            code, output, errors = self.cli("watch", "run_fixture", "--state", str(self.repo / ".harness"))
+        stop = cli_notice(errors)
+        self.assertEqual((stop["kind"], stop["reason"]), ("runtime_failure", "invariant"), errors)
+        self.assertEqual((code, output), (1, ""))
+        processes.assert_not_called()
+        self.assertEqual(git._read_only_depth(), 0)
 
 
 class Disguised(tuple):
@@ -315,6 +457,146 @@ class ConstructionTests(unittest.TestCase):
         self.assertEqual(stops.of(raised.exception)["kind"], "runtime_failure")
         self.assertEqual(stops.of(raised.exception)["reason"], "invariant")
         self.assertEqual(started, [])
+
+    def test_read_only_rejects_before_binding_checks_or_hook_reads_and_recovers_from_exceptions(self):
+        markers = Markers(self.root)
+        markers.arm(self.repo)
+        expire_stats(self.repo / "x")
+        linked = self.root / "linked"
+        binding = git.add_worktree(self.repo, linked, "HEAD")
+        markers.reset()
+        before = (self.repo / ".git" / "index").read_bytes()
+        with git.read_only():
+            with self.assertRaisesRegex(ValueError, "nested scope"):
+                with git.read_only():
+                    self.assert_invariant(lambda: git.clean(self.repo))
+                    self.assert_invariant(lambda: git.clean(linked, binding=binding))
+                    self.assert_invariant(lambda: git.git(self.repo, "rev-parse", "HEAD"))
+                    for effect in (git.COMPARE, git.PRIVATE, git.INDEX, git.REFS, git.INDEX_REFS, git.CHECKOUT, None):
+                        with self.subTest(effect=effect):
+                            self.assert_invariant(lambda: git.invocation(
+                                self.repo, ("rev-parse", "HEAD"), effect=effect, deadline=time.monotonic() + 5))
+                    raise ValueError("nested scope")
+            self.assert_invariant(lambda: git.clean(self.repo))
+            with self.launches() as started:
+                self.assertEqual(git.git(self.repo, "ls-files", effect=git.READ), "x\n")
+            self.assertEqual(len(started), 1)
+            self.assertEqual(markers.read(), [])
+        self.assertEqual((self.repo / ".git" / "index").read_bytes(), before)
+        with self.assertRaisesRegex(ValueError, "outer scope"):
+            with git.read_only():
+                raise ValueError("outer scope")
+
+        with self.launches() as started:
+            self.assertTrue(git.clean(self.repo))
+        self.assertEqual(len(started), 2)
+        self.assertTrue(markers.read())
+        self.assertEqual(markers.kinds(), {"clean"})
+        with self.launches() as started:
+            self.assertTrue(git.git(self.repo, "rev-parse", "HEAD").strip())
+        self.assertEqual(len(started), 1)
+
+    def test_read_only_interruptions_release_only_the_callers_layer(self):
+        acquire, close, repository = git.ReadOnlyScope.acquire, git.ReadOnlyScope.close, git.repository
+
+        def cli_status():
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(cli.main(["--repo", str(self.repo), "status"]), 130)
+
+        def direct_cleanup():
+            with self.assertRaises(KeyboardInterrupt):
+                cleanup.cleanup_run(self.repo, "run_missing")
+
+        def direct_scope():
+            with self.assertRaises(KeyboardInterrupt), git.read_only():
+                git.repository(self.repo)
+
+        for entry in (cli_status, direct_cleanup, direct_scope):
+            for point in ("before acquisition", "after acquisition", "in body", "on close"):
+                with self.subTest(entry=entry.__name__, point=point):
+                    ready, leave = threading.Event(), threading.Event()
+                    interrupted = threading.Event()
+
+                    def hold():
+                        with git.read_only():
+                            ready.set()
+                            leave.wait(10)
+
+                    owner = threading.Thread(target=hold)
+                    owner.start()
+                    try:
+                        self.assertTrue(ready.wait(10))
+
+                        def interrupt_here():
+                            if not interrupted.is_set():
+                                interrupted.set()
+                                raise KeyboardInterrupt()
+
+                        def take(scope):
+                            if point == "before acquisition":
+                                interrupt_here()
+                            acquire(scope)
+                            if point == "after acquisition":
+                                interrupt_here()
+
+                        def use(repo):
+                            located = repository(repo)
+                            if point == "in body":
+                                self.assert_invariant(lambda: git.clean(repo))
+                                interrupt_here()
+                            return located
+
+                        def release(scope):
+                            if point == "on close":
+                                interrupt_here()
+                            close(scope)
+
+                        with patch.object(git.ReadOnlyScope, "acquire", take), \
+                                patch.object(git, "repository", use), \
+                                patch.object(git.ReadOnlyScope, "close", release):
+                            entry()
+                        self.assertTrue(interrupted.is_set())
+                        self.assert_invariant(lambda: git.clean(self.repo))
+                    finally:
+                        leave.set()
+                        owner.join(10)
+                    self.assertFalse(owner.is_alive())
+                    with self.launches() as started:
+                        self.assertTrue(git.clean(self.repo))
+                    self.assertEqual(len(started), 2)
+
+    def test_read_only_context_can_be_released_after_interrupted_protocol_handoff(self):
+        for method, event in (("__enter__", "return"), ("__exit__", "call")):
+            with self.subTest(method=method):
+                ctx = git.read_only()
+                code = getattr(type(ctx), method).__code__
+                previous_trace = sys.gettrace()
+
+                def trace(frame, actual_event, arg):
+                    if frame.f_code is code and actual_event == event and frame.f_locals["self"] is ctx:
+                        raise KeyboardInterrupt
+                    return trace
+
+                try:
+                    with self.assertRaises(KeyboardInterrupt):
+                        sys.settrace(trace)
+                        try:
+                            with ctx:
+                                pass
+                        finally:
+                            sys.settrace(previous_trace)
+                    with self.launches() as started:
+                        self.assertEqual(git.git(self.repo, "ls-files", effect=git.READ), "x\n")
+                    self.assertEqual(len(started), 1)
+                    self.assert_invariant(lambda: git.clean(self.repo))
+                finally:
+                    with git.read_only():
+                        ctx.__exit__(None, None, None)
+                        ctx.__exit__(None, None, None)
+                        self.assert_invariant(lambda: git.clean(self.repo))
+                with self.launches() as started:
+                    self.assertTrue(git.clean(self.repo))
+                self.assertEqual(len(started), 2)
 
     def test_a_temporary_index_inside_the_worktree_relative_or_for_a_real_write_is_refused_before_any_process(self):
         outside = self.root / "private.index"
@@ -907,22 +1189,23 @@ class PartialCloneTests(IsolatedRepoCase):
         clone = self.clone(checkout=False)
         blob = plain_git(clone, "rev-parse", "HEAD:test_hello.py").stdout.decode().strip()
         self.assertTrue(self.missing(clone, blob))
-        try:  # not assertRaises, which drops the traceback the guard's entry is made from
-            self.engine().start("Implement greet")
+        engine = self.engine()
+        try:  # Keep the traceback for the stop guard's entry observation.
+            engine.start("Implement greet")
         except HarnessError as caught:
             error = caught
         else:
             self.fail("the run started without HEAD's blobs")
         self.assertTrue(self.missing(clone, blob))
-        # A Git failure at worktree creation is an untyped Git error by design. The guard sees this one stop
-        # twice, saved by Workflow.stop and raised out of Runtime.start; nothing else may be in its list.
-        self.assertIn("worktree add", str(error))
-        innermost = traceback.extract_tb(error.__traceback__)[-1]
-        this_stop = ("untyped_harness_error", "HarnessError", str(error)[:160],
-                     f"{innermost.filename}:{innermost.lineno}")
-        unclassified = self.stop_guard_findings["unclassified"]
-        self.assertEqual(unclassified, [this_stop, this_stop])
-        del unclassified[:2]
+        self.assertIn("git reset", str(error))
+        stop = stops.of(error)
+        self.assertEqual((stop["kind"], stop["reason"]), ("runtime_failure", "io"))
+        saved = read_json(engine.directory / "state.json")
+        self.assertEqual((saved["status"], saved["stop"], saved["dispatches"]), ("blocked", stop, []))
+        self.assertEqual(self.stop_guard_findings["unclassified"], [])
+        self.assertFalse(Path(saved["worktree"]).exists())
+        self.assertNotIn(f"worktree {saved['worktree']}\n", git.git(clone, "worktree", "list", "--porcelain"))
+        self.assertEqual(git.git(clone, "branch", "--list", saved["branch"]).strip(), saved["branch"])
 
     def test_with_head_blobs_present_the_run_completes(self):
         clone = self.clone(checkout=True)
@@ -1268,6 +1551,51 @@ class InitNameReadTests(unittest.TestCase):
             git.git(inside, "add", "--", "f", effect=git.INDEX)
         self.assertEqual(turned_off, [["hook.parent.enabled", user]])
 
+    def test_smoke_fixture_binding_reads_use_the_same_isolated_config_as_checkout(self):
+        with git_isolation.user_config("[broken\n"):
+            for name, prepare in (("permission", permission_smoke.prepare_fixture),
+                                  ("tool", tool_smoke.prepare_fixture)):
+                with self.subTest(name):
+                    directory = self.parent / name
+                    prepare(directory)
+                    repo, worktree = directory / "repo", directory / "worktree"
+                    self.assertNotEqual(plain_git(repo, "config", "--list", check=False).returncode, 0)
+                    head = git.git(repo, "rev-parse", "HEAD", effect=git.READ, isolated_config=True)
+                    self.assertEqual(git.git(worktree, "rev-parse", "HEAD", effect=git.READ, isolated_config=True),
+                                     head)
+
+    def test_isolated_init_ignores_legacy_home_and_xdg_configuration(self):
+        home, xdg = self.parent / "home", self.parent / "xdg"
+        home.mkdir()
+        (xdg / "git").mkdir(parents=True)
+        for config in (home / ".gitconfig", xdg / "git" / "config"):
+            config.write_text("[broken\n")
+        for key, directory in (("HOME", home), ("XDG_CONFIG_HOME", xdg)):
+            env = dict(os.environ)
+            for selector in ("GIT_CONFIG_GLOBAL", "HOME", "XDG_CONFIG_HOME"):
+                env.pop(selector, None)
+            env[key] = str(directory)
+            self.assertEqual(plain_git(self.parent, "config", "--list", env=env, check=False).returncode, 128)
+
+        real = git._launch
+
+        def legacy_isolated_launch(argv, env, **kwargs):
+            # Git 2.31 ignores this selector.
+            env = dict(env)
+            env.pop("GIT_CONFIG_GLOBAL", None)
+            return real(argv, env, **kwargs)
+
+        with patch.dict(os.environ, HOME=str(home), XDG_CONFIG_HOME=str(xdg)), \
+                patch.object(git, "_launch", side_effect=legacy_isolated_launch):
+            for name, prepare in (("permission", permission_smoke.prepare_fixture),
+                                  ("tool", tool_smoke.prepare_fixture)):
+                with self.subTest(name):
+                    folder = self.parent / name
+                    prepare(folder)
+                    expected = git.git(folder / "repo", "rev-parse", "HEAD", effect=git.READ, isolated_config=True)
+                    self.assertEqual(git.git(folder / "worktree", "rev-parse", "HEAD", effect=git.READ,
+                                             isolated_config=True), expected)
+
 
 @unittest.skipUnless(configured_hooks_exist(), "configured hooks start with Git 2.54")
 class ConfiguredHookTests(unittest.TestCase):
@@ -1321,6 +1649,684 @@ class ConfiguredHookTests(unittest.TestCase):
                 self.assertEqual(self.harness_calls(), set())  # the per-event switches alone
 
 
+class WorktreeCreationTests(IsolatedRepoCase):
+    """Case 15c: populate only the newly bound tree, or account for both parts of its rollback."""
+
+    def assert_registration(self, path, *, present):
+        backlinks = (self.repo / ".git" / "worktrees").glob("*/gitdir")
+        expected = os.fsencode(path.resolve() / ".git") + b"\n"
+        self.assertEqual(expected in {backlink.read_bytes() for backlink in backlinks}, present)
+
+    def test_shared_core_worktree_cannot_redirect_checkout_to_main(self):
+        head = git.head(self.repo)
+        tracked = self.repo / "test_hello.py"
+        material = b"content unique to C\n"
+        tracked.write_bytes(material)
+        plain_git(self.repo, "add", "test_hello.py")
+        plain_git(self.repo, *IDENTITY, "commit", "-qm", "C")
+        commit = git.head(self.repo)
+        plain_git(self.repo, "reset", "--hard", head)
+        plain_git(self.repo, "config", "extensions.worktreeConfig", "true")
+        plain_git(self.repo, "config", "core.worktree", str(self.repo.resolve()))
+        index = self.repo / ".git" / "index"
+        before = tracked.read_bytes(), index.read_bytes()
+
+        checkout = self.scratch / "linked tree"
+        binding = git.add_worktree(self.repo, checkout, commit)
+
+        self.assertEqual((tracked.read_bytes(), index.read_bytes()), before)
+        self.assertEqual(git.head(self.repo), head)
+        self.assertEqual((checkout / tracked.name).read_bytes(), material)
+        self.assertEqual(binding["worktree"], str(checkout.resolve()))
+        self.assertIsNone(binding["branch"])
+        self.assertEqual(binding["detached_head"], commit)
+        self.assertEqual(git.head(checkout, binding=binding), commit)
+        self.assertTrue(git.clean(checkout, binding=binding))
+
+    def fail_smudge(self, command):
+        (self.repo / ".git" / "info" / "attributes").write_text("*.txt filter=fixture\n")
+        (self.repo / "fixture.txt").write_text("tracked content\n")
+        plain_git(self.repo, "add", "fixture.txt")
+        plain_git(self.repo, *IDENTITY, "commit", "-qm", "File requiring smudge")
+        plain_git(self.repo, "config", "filter.fixture.clean", "cat")
+        plain_git(self.repo, "config", "filter.fixture.smudge", command)
+        plain_git(self.repo, "config", "filter.fixture.required", "true")
+
+    def failed_run(self, *, fails_during_reset=True, expect_rollback_error=False):
+        engine = self.engine()
+        real_process = git.git_process
+        results = []
+
+        def process(repo, *args, **kwargs):
+            result = real_process(repo, *args, **kwargs)
+            if args == ("reset", "-q", "--hard", "--no-recurse-submodules"):
+                results.append(result)
+            return result
+
+        with patch.object(git, "git_process", side_effect=process):
+            try:
+                engine.start("Implement greet")
+            except HarnessError as failure:
+                error = failure
+            else:
+                self.fail("the run started despite a failed checkout")
+
+        message = str(error)
+        state = read_json(engine.directory / "state.json")
+        if fails_during_reset:
+            result, = results
+            self.assertNotEqual(result.returncode, 0)
+            expected = "git reset -q --hard failed: " + result.stderr.decode("utf-8", errors="replace").strip()
+            if expect_rollback_error:
+                self.assertEqual(str(error.__cause__), expected)
+                self.assertTrue(message.startswith(expected + "；"))
+            else:
+                self.assertEqual(message, expected)
+            value = stops.of(error)
+            self.assertEqual((value["kind"], value["reason"]), ("runtime_failure", "io"))
+            self.assertEqual(state["stop"], value)
+            self.assertEqual(self.stop_guard_findings["unclassified"], [])
+        else:
+            self.assertEqual(results, [])
+            innermost = traceback.extract_tb(error.__traceback__)[-1]
+            finding = ("untyped_harness_error", "HarnessError", message[:160],
+                       f"{innermost.filename}:{innermost.lineno}")
+            self.assertEqual(self.stop_guard_findings["unclassified"], [finding, finding])
+            self.stop_guard_findings["unclassified"].clear()
+            self.assertEqual(len(stop_tripwire.consume(self)), 1)
+        self.assertEqual(state["status"], "blocked")
+        self.assertEqual(state["worktree_binding"], {})
+        self.assertEqual(state["dispatches"], [])
+        self.assertEqual(git.head(self.repo),
+                         plain_git(self.repo, "rev-parse", state["branch"]).stdout.decode().strip())
+        return Path(state["worktree"]), message
+
+    def test_failed_smudge_removes_worktree_and_registration_but_keeps_branch(self):
+        self.fail_smudge("false")
+        control = self.scratch / "control"
+        ordinary = plain_git(self.repo, "worktree", "add", "-b", "control", str(control), "HEAD", check=False)
+        self.assertNotEqual(ordinary.returncode, 0)
+        self.assertFalse(os.path.lexists(control))
+        self.assert_registration(control, present=False)
+        self.assertEqual(plain_git(self.repo, "rev-parse", "control").stdout.decode().strip(), git.head(self.repo))
+
+        path, message = self.failed_run()
+        self.assertIn("git reset -q --hard failed", message)
+        self.assertIn("fixture.txt", message)
+        self.assertNotIn("未能完全撤回", message)
+        self.assertFalse(os.path.lexists(path))
+        self.assert_registration(path, present=False)
+
+    def test_rollback_with_a_native_relative_registration(self):
+        volume = self.scratch.resolve() / "other disk"
+        volume.mkdir()
+        other = volume / "another\ncheckout"
+        result = plain_git(self.repo, "worktree", "add", "--detach", "--relative-paths",
+                           str(other), "HEAD", check=False)
+        if result.returncode == 129 and b"unknown option" in result.stderr:
+            self.skipTest("Git does not support native relative worktree registration")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+        registry = self.repo / ".git" / "worktrees"
+        backlink, = registry.glob("*/gitdir")
+        original = backlink.read_bytes()
+        expected = os.path.relpath(other.resolve() / ".git", backlink.parent.resolve())
+        self.assertEqual(original, os.fsencode(expected) + b"\n")
+        self.assertEqual(plain_git(self.repo, "config", "extensions.relativeWorktrees").stdout, b"true\n")
+
+        plain_git(self.repo, "config", "worktree.useRelativePaths", "true")
+        self.fail_smudge("false")
+        path = self.scratch / "failing\ncheckout"
+        offline = self.scratch / "offline disk"
+        real_launch = git._launch
+        scenarios = [(False, False, False), (False, True, False), (True, True, False)]
+        if os.geteuid() != 0:
+            scenarios += [(False, False, True), (True, False, True)]
+        for locked, missing, inaccessible in scenarios:
+            if locked:
+                plain_git(self.repo, "worktree", "lock", "--reason", "offline disk", str(other))
+            if missing:
+                volume.rename(offline)
+            try:
+                with self.subTest(locked=locked, missing=missing, inaccessible=inaccessible):
+                    before = plain_git(self.repo, "worktree", "list", "--porcelain", "-z").stdout
+                    self.assertIn(b"worktree " + os.fsencode(other), before.split(b"\0"))
+                    self.assertEqual(b"locked offline disk" in before.split(b"\0"), locked)
+                    self.assertEqual(b"\0prunable " in before, missing and not locked)
+
+                    def launch(argv, env, **kwargs):
+                        result = real_launch(argv, env, **kwargs)
+                        if inaccessible and argv[-4:] == ["worktree", "list", "--porcelain", "-z"]:
+                            self.assertEqual(result.stdout, before)
+                            volume.chmod(0o600)
+                            with self.assertRaises(PermissionError):
+                                other.lstat()
+                        return result
+
+                    mode = volume.stat().st_mode if inaccessible else None
+                    try:
+                        with patch.object(git, "_launch", side_effect=launch), \
+                                self.assertRaisesRegex(HarnessError, "git reset -q --hard failed") as error:
+                            git.add_worktree(self.repo, path, "HEAD")
+                    finally:
+                        if mode is not None:
+                            volume.chmod(mode)
+                    self.assertFalse(os.path.lexists(path))
+                    self.assertEqual(list(registry.glob("*/gitdir")), [backlink])
+                    self.assertEqual(backlink.read_bytes(), original)
+                    self.assertEqual(plain_git(self.repo, "worktree", "list", "--porcelain", "-z").stdout, before)
+                    self.assertNotIn("未能完全撤回", str(error.exception))
+            finally:
+                if missing:
+                    offline.rename(volume)
+                if locked:
+                    plain_git(self.repo, "worktree", "unlock", str(other))
+
+    def test_failed_remove_reports_its_error_and_the_remaining_checkout(self):
+        self.fail_smudge("false")
+        real = git.git
+
+        def fail_remove(repo, *args, **kwargs):
+            if args[:3] == ("worktree", "remove", "--force"):
+                raise HarnessError("fixture remove failure")
+            return real(repo, *args, **kwargs)
+
+        with patch.object(git, "git", side_effect=fail_remove):
+            path, message = self.failed_run(expect_rollback_error=True)
+        self.assertIn("git reset -q --hard failed", message)
+        self.assertIn("fixture remove failure", message)
+        self.assertIn(f"{path}：目录 present，登记 present", message)
+        self.assertTrue(path.is_dir())
+        self.assert_registration(path, present=True)
+
+    def test_rollback_checks_ordinary_and_multiline_registrations_with_and_without_nul_listing(self):
+        source = (self.scratch / "source").resolve()
+        binding = git.add_worktree(self.repo, source, "HEAD")
+        self.fail_smudge("false")
+        head = git.head(self.repo)
+        real_launch, real_git = git._launch, git.git
+
+        def without_nul_listing(argv, env, **kwargs):
+            if argv[-4:] == ["worktree", "list", "--porcelain", "-z"]:
+                self.assertEqual(env["LC_ALL"], "C")
+                return subprocess.CompletedProcess(argv, 129, b"", b"error: unknown switch `z'\n"
+                                                   b"usage: git worktree add [<options>] <path> [<commit-ish>]\n")
+            return real_launch(argv, env, **kwargs)
+
+        for launch in (real_launch, without_nul_listing):
+            for name, repo, origin in (("ordinary path", self.repo, None), ("multiline\npath\n", source, binding)):
+                path = self.scratch / name
+                for retained in (True, False):
+                    def remove(repo, *args, **kwargs):
+                        if retained and args[:3] == ("worktree", "remove", "--force"):
+                            raise HarnessError("fixture remove failure")
+                        return real_git(repo, *args, **kwargs)
+
+                    with self.subTest(launch=launch.__name__, name=name, retained=retained):
+                        with patch.object(git, "_launch", side_effect=launch), \
+                                patch.object(git, "git", side_effect=remove), \
+                                self.assertRaisesRegex(HarnessError, "git reset -q --hard failed") as error:
+                            git.add_worktree(repo, path, head, binding=origin)
+                        self.assertEqual(path.is_dir(), retained)
+                        self.assert_registration(path, present=retained)
+                        if retained:
+                            self.assertIn("目录 present，登记 present", str(error.exception))
+                            plain_git(self.repo, "worktree", "remove", "--force", str(path))
+                        else:
+                            self.assertNotIn("未能完全撤回", str(error.exception))
+
+    def test_a_relative_backlink_is_ambiguous_without_nul_listing(self):
+        path = self.scratch / "retained checkout"
+        native_nul = plain_git(self.repo, "worktree", "list", "--porcelain", "-z", check=False).returncode == 0
+        real_process, real_launch = git.git_process, git._launch
+        reset_bindings = []
+
+        def fail_checkout(repo, *args, **kwargs):
+            if args == ("reset", "-q", "--hard", "--no-recurse-submodules"):
+                binding = kwargs["binding"]
+                reset_bindings.append(binding["worktree"])
+                admin = Path(binding["git_dir"])
+                relative = os.path.relpath(Path(binding["worktree"]) / ".git", admin)
+                (admin / "gitdir").write_bytes(os.fsencode(relative) + b"\n")
+                raise HarnessError("fixture reset failure")
+            return real_process(repo, *args, **kwargs)
+
+        def launch(argv, env, **kwargs):
+            # Exercise real removal and option parsing on old Git. Reproduce those
+            # outcomes on newer Git, which can recognize relative registrations.
+            if native_nul:
+                if argv[-4:-1] == ["worktree", "remove", "--force"]:
+                    return subprocess.CompletedProcess(argv, 128, b"", b"fixture remove failure")
+                if argv[-4:] == ["worktree", "list", "--porcelain", "-z"]:
+                    return subprocess.CompletedProcess(argv, 129, b"", b"error: unknown switch `z'\n"
+                                                       b"usage: git worktree add [<options>] <path> [<commit-ish>]\n")
+            return real_launch(argv, env, **kwargs)
+
+        with patch.object(git, "git_process", side_effect=fail_checkout), patch.object(git, "_launch", side_effect=launch), \
+                self.assertRaisesRegex(HarnessError, "fixture reset failure") as error:
+            git.add_worktree(self.repo, path, "HEAD")
+        self.assertEqual(reset_bindings, [str(path.resolve())])
+        self.assertTrue(path.is_dir())
+        if not native_nul:
+            listing = plain_git(self.repo, "worktree", "list", "--porcelain")
+            self.assertIn(b"\nprunable ", listing.stdout)
+        self.assertIn("git worktree remove --force failed", str(error.exception))
+        self.assertIn(f"{path}：目录 present，登记 unknown", str(error.exception))
+
+    def test_failed_binding_capture_still_checks_ordinary_and_multiline_registrations(self):
+        real = git._launch
+        alias = self.scratch / "parent alias"
+        alias.symlink_to(self.scratch, target_is_directory=True)
+        for path in (self.scratch / "ordinary path", alias / "multiline\npath\n"):
+            for retained in (False, True):
+                def fail_capture(argv, env, **kwargs):
+                    if argv[-2:] == ["rev-parse", "--absolute-git-dir"] and Path(argv[2]) == path.resolve():
+                        return subprocess.CompletedProcess(argv, 128, b"", b"fixture binding capture failure")
+                    if retained and argv[-4:-1] == ["worktree", "remove", "--force"]:
+                        return subprocess.CompletedProcess(argv, 128, b"", b"fixture remove failure")
+                    return real(argv, env, **kwargs)
+
+                with self.subTest(path=path, retained=retained):
+                    with patch.object(git, "_launch", side_effect=fail_capture), \
+                            self.assertRaisesRegex(HarnessError, "fixture binding capture failure") as error:
+                        git.add_worktree(self.repo, path, "HEAD")
+                    self.assertEqual(path.is_dir(), retained)
+                    self.assert_registration(path, present=retained)
+                    if retained:
+                        self.assertIn("目录 present，登记 present", str(error.exception))
+                        self.assertIn("fixture remove failure", str(error.exception))
+                        plain_git(self.repo, "worktree", "remove", "--force", str(path))
+                    else:
+                        self.assertNotIn("未能完全撤回", str(error.exception))
+
+    def test_rollback_uses_the_creation_binding_for_the_registration_query(self):
+        canonical_parent = self.scratch.resolve()
+        path = canonical_parent / "multiline\ncheckout\n"
+        changed_target = canonical_parent / "other checkout"
+        registered = os.fsencode(path)
+        head_field = b"\0HEAD " + git.head(self.repo).encode("ascii")
+        main = b"worktree " + os.fsencode(self.repo.resolve()) + head_field + b"\0branch refs/heads/main\0\0"
+        real_git, real_process, real_resolve = git.git, git.git_process, Path.resolve
+
+        for supports_nul in (True, False):
+            with self.subTest(supports_nul=supports_nul):
+                reset_failed = False
+
+                def resolve(checkout, *args, **kwargs):
+                    if reset_failed and checkout == path:
+                        return changed_target
+                    return real_resolve(checkout, *args, **kwargs)
+
+                def command(repo, *args, **kwargs):
+                    if args[:3] == ("worktree", "remove", "--force"):
+                        raise HarnessError("fixture remove failure")
+                    return real_git(repo, *args, **kwargs)
+
+                def process(repo, *args, **kwargs):
+                    nonlocal reset_failed
+                    if args == ("reset", "-q", "--hard", "--no-recurse-submodules"):
+                        self.assertEqual(kwargs["binding"]["worktree"], str(path))
+                        reset_failed = True
+                        raise HarnessError("fixture reset failure")
+                    if args == ("worktree", "list", "--porcelain", "-z"):
+                        if supports_nul:
+                            return subprocess.CompletedProcess(
+                                args, 0, main + b"worktree " + registered + head_field + b"\0detached\0\0", b"")
+                        return subprocess.CompletedProcess(
+                            args, 129, b"", b"error: unknown switch `z'\nusage: git worktree add ...\n")
+                    return real_process(repo, *args, **kwargs)
+
+                with patch.object(Path, "resolve", resolve), patch.object(git, "git", side_effect=command), \
+                        patch.object(git, "git_process", side_effect=process), \
+                        self.assertRaisesRegex(HarnessError, "fixture reset failure") as error:
+                    git.add_worktree(self.repo, path, "HEAD")
+                self.assertTrue(reset_failed)
+                self.assertIn(f"{path}：目录 present，登记 present", str(error.exception))
+                self.assert_registration(path, present=True)
+                plain_git(self.repo, "worktree", "remove", "--force", str(path))
+
+    def test_a_failed_new_checkout_hook_read_rolls_back_without_starting_reset(self):
+        real, resets = git._launch, []
+        parent = self.repo.resolve() / ".harness" / "worktrees"
+
+        def launch(argv, env, **kwargs):
+            if Path(argv[2]).parent == parent:
+                if "--get-regexp" in argv:
+                    return subprocess.CompletedProcess(argv, 128, b"", b"fixture hook read failure")
+                if "reset" in argv:
+                    resets.append(argv)
+            return real(argv, env, **kwargs)
+
+        with patch.object(git, "_launch", side_effect=launch):
+            path, message = self.failed_run(fails_during_reset=False)
+        self.assertEqual(resets, [])
+        self.assertIn("fixture hook read failure", message)
+        self.assertFalse(os.path.lexists(path))
+        self.assert_registration(path, present=False)
+
+    def test_a_failed_registration_query_does_not_hide_the_directory_result(self):
+        self.fail_smudge("false")
+        real = git._launch
+
+        def fail_list(argv, env, **kwargs):
+            if argv[-4:] == ["worktree", "list", "--porcelain", "-z"]:
+                return subprocess.CompletedProcess(argv, 129, b"", b"error: fixture list I/O failure\n")
+            return real(argv, env, **kwargs)
+
+        with patch.object(git, "_launch", side_effect=fail_list):
+            path, message = self.failed_run(expect_rollback_error=True)
+        self.assertIn("git reset -q --hard failed", message)
+        self.assertIn(f"{path}：目录 absent，登记 unknown", message)
+        self.assertFalse(os.path.lexists(path))
+        self.assert_registration(path, present=False)
+
+    def test_incomplete_or_contradictory_nul_records_leave_registration_unknown(self):
+        self.fail_smudge("false")
+        real = git._launch
+        path = self.scratch / "multiline\ncheckout"
+        head_field = b"\0HEAD " + git.head(self.repo).encode("ascii")
+        main = b"worktree " + os.fsencode(self.repo.resolve()) + head_field + b"\0branch refs/heads/main\0\0"
+        checkout = b"worktree " + os.fsencode(path.resolve())
+        records = {
+            "path only": checkout,
+            "missing HEAD": checkout + b"\0detached",
+            "missing branch or detached": checkout + head_field,
+            "branch and detached": checkout + head_field + b"\0branch refs/heads/fixture\0detached",
+            "duplicate branch": checkout + head_field + b"\0branch refs/heads/fixture\0branch refs/heads/other",
+            "malformed record after a match": checkout + head_field + b"\0detached\0\0worktree /incomplete",
+        }
+        for case, record in records.items():
+            def launch(argv, env, **kwargs):
+                if argv[-4:] == ["worktree", "list", "--porcelain", "-z"]:
+                    return subprocess.CompletedProcess(argv, 0, main + record + b"\0\0", b"")
+                return real(argv, env, **kwargs)
+
+            with self.subTest(case=case):
+                with patch.object(git, "_launch", side_effect=launch), \
+                        self.assertRaisesRegex(HarnessError, "git reset -q --hard failed") as error:
+                    git.add_worktree(self.repo, path, "HEAD")
+                self.assertIn(f"{path}：目录 absent，登记 unknown", str(error.exception))
+                self.assertFalse(os.path.lexists(path))
+                self.assert_registration(path, present=False)
+
+    def test_a_missing_nul_between_worktree_records_leaves_registration_unknown(self):
+        listing_args = ("worktree", "list", "--porcelain", "-z")
+        probe = plain_git(self.repo, *listing_args, env={**os.environ, "LC_ALL": "C"}, check=False)
+        if probe.returncode == 129 and probe.stderr.startswith(b"error: unknown switch `z'\n"):
+            self.skipTest("Git does not support NUL worktree listings")
+        self.assertEqual(probe.returncode, 0, probe.stderr)
+        self.fail_smudge("false")
+        real = git._launch
+        path = self.scratch / "multiline\ncheckout"
+        before_remove = None
+
+        def launch(argv, env, **kwargs):
+            nonlocal before_remove
+            if argv[-4:-1] == ["worktree", "remove", "--force"]:
+                before_remove = plain_git(self.repo, *listing_args).stdout
+            result = real(argv, env, **kwargs)
+            if tuple(argv[-4:]) == listing_args:
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIsNotNone(before_remove)
+                main, separator, checkout = before_remove.partition(b"\0\0")
+                self.assertEqual(result.stdout, main + separator)
+                self.assertTrue(checkout.startswith(b"worktree " + os.fsencode(path.resolve()) + b"\0"))
+                # Drop one NUL so the stale linked record is merged into the main one.
+                return subprocess.CompletedProcess(argv, 0, main + b"\0" + checkout, result.stderr)
+            return result
+
+        with patch.object(git, "_launch", side_effect=launch), \
+                self.assertRaisesRegex(HarnessError, "git reset -q --hard failed") as error:
+            git.add_worktree(self.repo, path, "HEAD")
+        self.assertFalse(os.path.lexists(path))
+        self.assert_registration(path, present=False)
+        self.assertIn(f"{path}：目录 absent，登记 unknown", str(error.exception))
+
+    def test_a_locked_record_also_marked_prunable_leaves_registration_unknown(self):
+        listing_args = ("worktree", "list", "--porcelain", "-z")
+        probe = plain_git(self.repo, *listing_args, env={**os.environ, "LC_ALL": "C"}, check=False)
+        if probe.returncode == 129 and probe.stderr.startswith(b"error: unknown switch `z'\n"):
+            self.skipTest("Git does not support NUL worktree listings")
+        self.assertEqual(probe.returncode, 0, probe.stderr)
+        self.fail_smudge("false")
+        real = git._launch
+        path = self.scratch / "multiline\ncheckout"
+        locked = b"\0locked offline disk\0\0"
+
+        def launch(argv, env, **kwargs):
+            if argv[-4:-1] == ["worktree", "remove", "--force"]:
+                plain_git(self.repo, "worktree", "lock", "--reason", "offline disk", str(path))
+                return subprocess.CompletedProcess(argv, 128, b"", b"fixture remove failure")
+            listing = real(argv, env, **kwargs)
+            if tuple(argv[-4:]) == listing_args:
+                self.assertEqual(listing.returncode, 0, listing.stderr)
+                self.assertEqual(listing.stdout.count(locked), 1)
+                return subprocess.CompletedProcess(argv, 0, listing.stdout.replace(
+                    locked, b"\0locked offline disk\0prunable fixture reason\0\0"), listing.stderr)
+            return listing
+
+        with patch.object(git, "_launch", side_effect=launch), \
+                self.assertRaisesRegex(HarnessError, "git reset -q --hard failed") as error:
+            git.add_worktree(self.repo, path, "HEAD")
+        self.assertTrue(path.is_dir())
+        self.assert_registration(path, present=True)
+        self.assertIn(locked, plain_git(self.repo, *listing_args).stdout)
+        self.assertIn("fixture remove failure", str(error.exception))
+        self.assertIn(f"{path}：目录 present，登记 unknown", str(error.exception))
+
+    @unittest.skipIf(os.geteuid() == 0, "Git needs to run without root to observe an unreadable backlink")
+    def test_an_unreadable_registration_omitted_by_git_is_unknown(self):
+        real = git.git_process
+        path = self.scratch / "retained checkout"
+        backlinks = []
+
+        def fail_checkout(repo, *args, **kwargs):
+            if args == ("reset", "-q", "--hard", "--no-recurse-submodules"):
+                backlink = Path(kwargs["binding"]["git_dir"]) / "gitdir"
+                backlinks.append(backlink)
+                self.addCleanup(backlink.chmod, 0o644)
+                backlink.chmod(0)
+                raise HarnessError("fixture reset failure")
+            return real(repo, *args, **kwargs)
+
+        with patch.object(git, "git_process", side_effect=fail_checkout), self.assertRaises(HarnessError) as error:
+            git.add_worktree(self.repo, path, "HEAD")
+        self.assertTrue(path.is_dir())
+        backlink, = backlinks
+        self.assertTrue(backlink.is_file())
+        self.assertIn("fixture reset failure", str(error.exception))
+        self.assertIn("git worktree remove --force failed", str(error.exception))
+        self.assertIn("目录 present，登记 unknown", str(error.exception))
+        listing = plain_git(self.repo, "worktree", "list", "--porcelain", "-z", check=False)
+        if listing.returncode == 0:
+            self.assertEqual(listing.stderr, b"")
+            self.assertNotIn(b"worktree " + os.fsencode(path.resolve()), listing.stdout.split(b"\0"))
+
+    def test_a_truncated_listing_hit_does_not_confirm_registration(self):
+        listing_args = ("worktree", "list", "--porcelain", "-z")
+        probe = plain_git(self.repo, *listing_args, env={**os.environ, "LC_ALL": "C"}, check=False)
+        if probe.returncode == 129 and probe.stderr.startswith(b"error: unknown switch `z'\n"):
+            self.skipTest("Git does not support NUL worktree listings")
+        self.assertEqual(probe.returncode, 0, probe.stderr)
+        self.fail_smudge("false")
+        real = git.git
+        path = self.scratch / "retained\ncheckout"
+        original = None
+
+        def fail_remove(repo, *args, **kwargs):
+            nonlocal original
+            if args[:3] == ("worktree", "remove", "--force"):
+                backlink, = (self.repo / ".git" / "worktrees").glob("*/gitdir")
+                original = backlink.read_bytes()
+                self.addCleanup(backlink.write_bytes, original)
+                backlink.write_bytes(original.removesuffix(b"/.git\n") + b"\0trailing bytes/.git\n")
+                raise HarnessError("fixture remove failure")
+            return real(repo, *args, **kwargs)
+
+        with patch.object(git, "git", side_effect=fail_remove), \
+                self.assertRaisesRegex(HarnessError, "git reset -q --hard failed") as error:
+            git.add_worktree(self.repo, path, "HEAD")
+        listing = plain_git(self.repo, *listing_args)
+        self.assertEqual(listing.stderr, b"")
+        self.assertIn(b"worktree " + original.removesuffix(b"/.git\n"), listing.stdout.split(b"\0"))
+        self.assertTrue(path.is_dir())
+        self.assertIn("fixture remove failure", str(error.exception))
+        self.assertIn(f"{path}：目录 present，登记 unknown", str(error.exception))
+
+    def test_a_listing_that_disagrees_with_the_registry_is_unknown(self):
+        self.fail_smudge("false")
+        real = git._launch
+        path = self.scratch / "retained checkout"
+        head_field = b"\0HEAD " + git.head(self.repo).encode("ascii")
+        main_only = b"worktree " + os.fsencode(self.repo.resolve()) + head_field + b"\0branch refs/heads/main\0\0"
+
+        def launch(argv, env, **kwargs):
+            if argv[-4:] == ["worktree", "list", "--porcelain", "-z"]:
+                return subprocess.CompletedProcess(argv, 0, main_only, b"")
+            if "worktree" in argv and "remove" in argv:
+                return subprocess.CompletedProcess(argv, 128, b"", b"fixture remove failure")
+            return real(argv, env, **kwargs)
+
+        with patch.object(git, "_launch", side_effect=launch), self.assertRaises(HarnessError) as error:
+            git.add_worktree(self.repo, path, "HEAD")
+        self.assertIn("目录 present，登记 unknown", str(error.exception))
+        self.assert_registration(path, present=True)
+
+    @unittest.skipIf(os.geteuid() == 0, "Git needs to run without root to observe a directory deletion failure")
+    def test_partially_undone_checkout_is_reported_and_the_path_can_be_reused(self):
+        script = self.scratch / "failed-smudge"
+        script.write_text("#!/bin/sh\nmkdir retained\nprintf retained > retained/entry\nchmod a-w retained\nexit 1\n")
+        script.chmod(0o755)
+        self.fail_smudge(f"'{script}'")
+        self.addCleanup(self.restore_permissions)
+        path, message = self.failed_run(expect_rollback_error=True)
+        retained = path / "retained"
+        self.assertEqual((retained / "entry").read_text(), "retained")
+        self.assertIn("git reset -q --hard failed", message)
+        self.assertIn("git worktree remove --force failed", message)
+        self.assertIn(f"{path}：目录 present，登记 absent", message)
+        self.assert_registration(path, present=False)
+
+        retained.chmod(0o755)
+        shutil.rmtree(path)
+        plain_git(self.repo, "config", "filter.fixture.smudge", "cat")
+        binding = git.add_worktree(self.repo, path, "HEAD")
+        self.assertEqual((path / "fixture.txt").read_text(), "tracked content\n")
+        self.assertEqual(binding["worktree"], str(path))
+
+    def restore_permissions(self):
+        for path in (self.repo / ".harness" / "worktrees").glob("*/retained"):
+            path.chmod(0o755)
+
+    def test_interrupt_before_population_preserves_unbound_registration(self):
+        engine = self.engine()
+        with patch.object(git, "capture_worktree_binding", side_effect=KeyboardInterrupt), \
+                self.assertRaises(KeyboardInterrupt):
+            engine.start("Implement greet")
+        state = read_json(engine.directory / "state.json")
+        path = Path(state["worktree"])
+        self.assertEqual((state["status"], state["worktree_binding"], state["dispatches"]), ("interrupted", {}, []))
+        self.assert_registration(path, present=True)
+        self.assertEqual({p.name for p in path.iterdir()}, {".git"})
+        admin = Path(plain_git(path, "rev-parse", "--absolute-git-dir").stdout.decode().strip())
+        self.assertFalse((admin / "index").exists())
+        with self.assertRaises(HarnessError) as resumed:
+            self.engine().resume(state["id"])
+        stop = stops.of(resumed.exception)
+        self.assertEqual((stop["kind"], stop["reason"]), ("workspace_mismatch", "binding_missing"))
+        self.assertEqual(self.engine().abandon(state["id"])["status"], "abandoned")
+
+
+@unittest.skipUnless(configured_hooks_exist(), "configured hooks start with Git 2.54")
+class NewCheckoutHookTests(IsolatedRepoCase):
+    """Case 15c: configuration visible only inside a new checkout or newly initialized repository."""
+
+    def setUp(self):
+        super().setUp()
+        self.markers = Markers(self.scratch)
+        self.plan = read_json(ROOT / "examples" / "plan.json")
+
+    def include(self, condition, label):
+        self.markers.included.write_text(self.markers.configured(label))
+        plain_git(self.repo, "config", f"includeIf.{condition}.path", str(self.markers.included))
+
+    def test_run_creation_reads_hooks_from_its_new_branch(self):
+        self.include("onbranch:harness/**", "onbranch")
+        control = self.scratch / "control"
+        plain_git(self.repo, "worktree", "add", "-b", "harness/control", str(control), "HEAD")
+        self.assertTrue({"config:onbranch-post-index-change", "config:onbranch-reference-transaction"}
+                        <= {label for label, _ in self.markers.read()})
+        self.markers.reset()
+
+        # Prove the name read suffices even where Git also supports per-event switches.
+        with patch.object(git, "HOOK_EVENTS", ()):
+            result = self.engine().start("Implement greet", self.plan, pause_after_plan=True)
+        self.assertEqual(result["status"], "awaiting_approval")
+        self.assertEqual(self.markers.read(), [])
+        worktree = Path(result["worktree"])
+        self.assertEqual(plain_git(worktree, "symbolic-ref", "HEAD").stdout,
+                         f"refs/heads/{result['branch']}\n".encode())
+        for args in (("ls-files", "--stage", "-z"), ("status", "--porcelain")):
+            self.assertEqual(plain_git(worktree, *args).stdout, plain_git(control, *args).stdout)
+        paths = plain_git(control, "ls-files", "-z").stdout.rstrip(b"\0").split(b"\0")
+        for path in map(os.fsdecode, paths):
+            self.assertEqual((worktree / path).read_bytes(), (control / path).read_bytes())
+
+    def test_fresh_verification_reads_hooks_from_its_own_gitdir(self):
+        self.include("gitdir:worktrees/checkout*", "gitdir")
+        self.config.data["verification"]["fresh_checkout"] = True
+        engine = self.engine()
+        with patch.object(tempfile, "tempdir", str(self.scratch)), patch.object(git, "HOOK_EVENTS", ()), \
+                patch.object(cleanup, "clean_checkout", side_effect=HarnessError("retain fixture for inspection")):
+            result = engine.start("Implement greet", self.plan)
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(self.markers.read(), [])
+        artifact, = engine.directory.glob("verification/final/*/verification-*/checkout.json")
+        environment = read_json(artifact)
+        checkout = Path(environment["worktree"])
+        head = result["expected_head"]
+        self.assertNotEqual(head, result["base_commit"])
+        self.assertEqual((environment["status"], environment["head"]), ("verified", head))
+        self.assertEqual(environment["binding"]["detached_head"], head)
+        self.assertEqual(git.head(checkout, binding=environment["binding"]), head)
+        self.assertEqual(plain_git(checkout, "symbolic-ref", "-q", "HEAD", check=False).returncode, 1)
+        # Only this Git directory sees the include; it was absent in the source run worktree.
+        key = "hook.gitdir-post-index-change.command"
+        self.assertEqual(plain_git(engine.worktree, "config", "--get", key, check=False).returncode, 1)
+        self.assertIn(b"config:gitdir-post-index-change", plain_git(checkout, "config", "--get", key).stdout)
+
+    def test_demo_init_excludes_template_and_globals_visible_only_after_init(self):
+        template = self.scratch / "template"
+        template.mkdir()
+        (template / "config").write_text(self.markers.configured("template"))
+        self.markers.included.write_text(self.markers.configured("new-gitdir"))
+        isolated_global = (f'[init]\n\ttemplateDir = "{template}"\n'
+                           f'[includeIf "gitdir:{self.scratch.resolve()}/"]\n\tpath = "{self.markers.included}"\n')
+        with git_isolation.user_config(isolated_global):
+            for name, options in (("with-template", ()), ("without-template", ("--template=",))):
+                control = self.scratch / name
+                control.mkdir()
+                plain_git(control, "init", "-b", "main", *options)
+                labels = {label for label, _ in self.markers.read()}
+                self.assertIn("config:new-gitdir-reference-transaction", labels)
+                if not options:
+                    self.assertIn("config:template-reference-transaction", labels)
+                self.markers.reset()
+            output = io.StringIO()
+            with patch.object(tempfile, "tempdir", str(self.scratch)), patch.object(git, "HOOK_EVENTS", ()), \
+                    contextlib.redirect_stdout(output), contextlib.redirect_stderr(io.StringIO()):
+                cli.demo(self.config, live=False)
+            result = json.loads(output.getvalue())
+            self.assertEqual((result["status"], result["models_called"]), ("completed", False))
+            self.assertEqual(self.markers.read(), [])
+            demo = Path(result["repo"])
+            self.assertEqual(plain_git(demo, "config", "--local", "--name-only", "--get-regexp",
+                                       r"^hook\..*\.command$", check=False).returncode, 1)
+            self.assertFalse((demo / ".git" / "description").exists())
+            self.assertIn(b"config:new-gitdir-reference-transaction",
+                          plain_git(demo, "config", "--get", "hook.new-gitdir-reference-transaction.command").stdout)
+
+
 class Trace2Tests(IsolatedRepoCase):
     """Case 16: Trace2 targets in the global configuration receive nothing from Harness Git calls."""
 
@@ -1337,6 +2343,484 @@ class Trace2Tests(IsolatedRepoCase):
         self.assertEqual({key: path.read_bytes() for key, path in logs.items()}, dict.fromkeys(logs, b""))
         plain_git(self.repo, "rev-parse", "HEAD")
         self.assertTrue(all(path.stat().st_size for path in logs.values()))  # positive control
+
+
+# R2 and case 1 share this table: (module, Python qualified name) maps to (declaration count, trigger).
+READ_SITES = {
+    ("git", "_configured_hooks"): (1, lambda c: git.invocation(
+        c.repo, ("status",), effect=git.COMPARE, deadline=time.monotonic() + 60)),
+    ("git", "_worktree_registration"): (2, lambda c: git._worktree_registration(
+        c.repo, os.fsencode(c.linked), binding=None, isolated_config=False)),
+    ("git", "capture_worktree_binding"): (3, lambda c: git.capture_worktree_binding(c.detached, None)),
+    ("git", "_check_binding"): (1, lambda c: git.check_worktree_binding(c.linked, c.binding)),
+    ("git", "repository"): (1, lambda c: git.repository(c.linked)),
+    ("git", "head"): (1, lambda c: git.head(c.linked, binding=c.binding)),
+    ("git", "check_starting_checkout"): (1, lambda c: git.check_starting_checkout(c.repo)),
+    ("git", "reject_submodules"): (1, lambda c: git.reject_submodules(c.linked, binding=c.binding)),
+    ("git", "assert_removable_worktree"): (5, lambda c: git.assert_removable_worktree(c.linked, binding=c.binding)),
+    ("git", "ignored_paths"): (1, lambda c: git.ignored_paths(c.linked, binding=c.binding)),
+    ("git", "snapshot"): (2, lambda c: git.snapshot(c.linked, binding=c.binding)),
+    ("git", "changed"): (1, lambda c: git.changed(c.linked, binding=c.binding)),
+    ("git", "diff_bytes"): (1, lambda c: git.diff_bytes(c.linked, binding=c.binding)),
+    ("git", "_range_diff"): (1, lambda c: c.range_comparison()),
+    ("git", "archive_and_reset"): (1, lambda c: c.archive_candidate()),
+    ("git", "accept"): (1, lambda c: c.accept_candidate()),
+    ("cleanup", "_registered"): (1, lambda c: c.registered_worktrees()),
+    ("cleanup", "common_dir"): (1, lambda c: cleanup.common_dir(c.repo)),
+    ("cleanup", "_branch_matches"): (1, lambda c: cleanup._branch_matches(c.repo, "main", c.tip)),
+    ("private_state", "private_state_lock"): (1, lambda c: c.lock_private_state()),
+    ("private_state", "_initialize"): (4, lambda c: private_state.ensure_private_state(c.repo)),
+    ("memory", "bind_source_files"): (4, lambda c: memory.bind_source_files(c.linked, ["test_hello.py"])),
+    ("memory", "Memory._check_proposals"): (1, lambda c: c.memory.check_proposals(c.proposals, ["fixture"], c.tip)),
+    ("memory", "Memory._staleness"): (1, lambda c: c.memory.read(c.memory_id)),
+    ("command_server", "Broker._delete_eligibility"): (1, lambda c: c.broker._delete_eligibility(
+        c.broker.manifest, c.broker.manifest["delete_scope"], "test_hello.py")),
+    ("workspace_inputs", "_destination"): (2, lambda c: workspace_inputs._destination(
+        {"worktree": str(c.linked), "worktree_binding": c.binding}, "__pycache__/input.pyc")),
+    ("operations", "harness_identity"): (1, lambda c: c.installation_identity()),
+    ("git_query", "_object_format"): (1, lambda c: c.query("hash-object", "--no-filters", "--", "test_hello.py")),
+    ("git_query", "run_git_query"): (1, lambda c: c.query("show", "HEAD:test_hello.py")),
+}
+MIXED_READ_SITES = {("git", name) for name in ("check_starting_checkout", "changed", "diff_bytes",
+                                              "archive_and_reset", "accept")} | {("operations", "harness_identity")}
+
+
+class ReadSiteTests(IsolatedRepoCase):
+    """Case 1: execute every registered READ in a marked repository with stale stat data."""
+
+    def setUp(self):
+        super().setUp()
+        self.base = git.head(self.repo)
+        name = "test_hello.py"
+        source = self.repo / name
+        source.write_bytes(source.read_bytes() + b"\n# committed fixture change\n")
+        (self.repo / "added.txt").write_text("added range fixture\n")
+        plain_git(self.repo, "add", ".")
+        plain_git(self.repo, *IDENTITY, "commit", "-qm", "READ fixture")
+        self.tip = git.head(self.repo)
+        self.linked = (self.scratch / "linked").resolve()
+        self.detached = (self.scratch / "detached").resolve()
+        self.binding = git.add_worktree(self.repo, self.linked, self.tip, branch="linked")
+        detached_binding = git.add_worktree(self.repo, self.detached, self.tip)
+        listing = plain_git(self.repo, "worktree", "list", "--porcelain", "-z",
+                            env=dict(os.environ, LC_ALL="C"), check=False)
+        self.worktree_list_has_z = listing.returncode == 0
+        if not self.worktree_list_has_z:
+            self.assertEqual((listing.returncode, listing.stdout), (129, b""), listing.stderr)
+            self.assertTrue(listing.stderr.startswith(b"error: unknown switch `z'\nusage: git worktree "), listing.stderr)
+        private_state.ensure_private_state(self.repo)
+        self.memory = memory.Memory(self.scratch / "memories" / "memory.sqlite3", self.linked, binding=self.binding)
+        self.proposals = memory.validate_proposals([{"key": "fixture", "abstract": "Source fixture",
+            "content": "A tracked source file", "source_paths": [name]}], self.linked)
+        self.memory_id, = self.memory.remember_proposals(self.proposals, ["fixture"], self.tip, "fixture", "task")
+        manifest = command_server.create_manifest(
+            self.config, self.linked, self.scratch.resolve() / "broker",
+            delete_scope={"task_id": "fixture", "allowed_paths": [name]})
+        self.broker = command_server.Broker(manifest["artifact"], manifest["artifact_digest"])
+
+        plain_git(self.repo, "replace", self.tip, self.base)
+        plain_git(self.repo, "config", "extensions.worktreeConfig", "true")
+        self.markers = Markers(self.scratch)
+        self.markers.arm(self.repo)
+        # The main checkout has the fsmonitor hook, the linked checkout selects the built-in monitor.
+        plain_git(self.linked, "config", "--worktree", "core.fsmonitor", "true")
+        self.read_trace = self.outside / "read-git.trace"
+        builtins = plain_git(self.linked, "--list-cmds=builtins").stdout.splitlines()
+        self.has_fsmonitor_daemon = (b"fsmonitor--daemon" in builtins and
+                                     plain_git(self.linked, "fsmonitor--daemon", "status", check=False).returncode in (0, 1))
+        if self.has_fsmonitor_daemon:
+            self.addCleanup(plain_git, self.linked, "fsmonitor--daemon", "stop", check=False)
+        admins = ((self.repo, self.repo / ".git"), (self.linked, Path(self.binding["git_dir"])),
+                  (self.detached, Path(detached_binding["git_dir"])))
+        self.read_trees = tuple(tree for tree, _ in admins)
+        tracked = plain_git(self.repo, "ls-files", "-z").stdout
+        self.tracked_paths = tuple(os.fsdecode(path) for path in tracked.split(b"\0") if path)
+        for tree, admin in admins:
+            plain_git(tree, "-c", "core.fsmonitor=false", "update-index", "--split-index")
+            self.assertTrue(list(admin.glob("sharedindex.*")), admin)
+        trace = self.scratch / "trace"
+        trace.mkdir()
+        with self.global_config.open("a") as config:
+            config.write("[trace2]\n")
+            for kind in ("event", "normal", "perf"):
+                path = trace / kind
+                path.write_bytes(b"")
+                config.write(f"\t{kind}Target = {path}\n")
+        plain_git(self.repo, "rev-parse", "HEAD")
+        self.assertTrue(all(path.stat().st_size for path in trace.iterdir()))
+
+    def registered_worktrees(self):
+        if self.worktree_list_has_z:
+            self.assertEqual(cleanup._registered(self.repo), {str(self.repo.resolve()), str(self.linked), str(self.detached)})
+        else:
+            with patch.dict(os.environ, LC_ALL="C"), self.assertRaisesRegex(
+                    HarnessError, r"^git worktree list --porcelain failed: error: unknown switch `z'"):
+                cleanup._registered(self.repo)
+
+    def lock_private_state(self):
+        with private_state.private_state_lock(self.repo):
+            pass
+
+    def query(self, *argv):
+        query, _ = git_query.parse_git_query(["git", *argv])
+        result = git_query.run_git_query(query, self.linked, self.binding)
+        self.assertEqual(result["exit_code"], 0, result)
+
+    def range_comparison(self):
+        self.assertIn(b"committed fixture change", git.range_diff_bytes(self.linked, self.base, binding=self.binding))
+        self.assertIn("added.txt\0", git.range_paths(self.linked, self.base, binding=self.binding))
+
+    def installation_identity(self):
+        with patch.object(operations, "PACKAGE", self.repo.resolve() / "harness"):
+            self.assertEqual(operations.harness_identity()["revision"], self.tip)
+
+    def archive_candidate(self):
+        (self.linked / "draft.txt").write_text("discarded draft\n")
+        archive = self.scratch / "archive"
+        git.archive_and_reset(self.linked, self.tip, archive, self.scratch, binding=self.binding)
+        self.assertEqual((archive / "files" / "draft.txt").read_text(), "discarded draft\n")
+        self.assertFalse((self.linked / "draft.txt").exists())
+
+    def accept_candidate(self):
+        (self.linked / "accepted.txt").write_text("accepted content\n")
+        self.assertNotEqual(git.accept(self.linked, ["accepted.txt"], "fixture", "task",
+                                       {"subject": "Accept", "body": ""}, binding=self.binding), self.tip)
+
+    def fingerprint(self):
+        return self.files(self.repo, self.global_config) | self.files(self.scratch, skip=("memories",))
+
+    def test_read_fingerprint_covers_links_and_special_entries_without_reading_targets(self):
+        outside_file = self.outside / "target.txt"
+        outside_dir = self.outside / "target-dir"
+        outside_dir.mkdir()
+        outside_file.write_text("outside\n")
+        (outside_dir / "child").write_text("outside child\n")
+        checkout = self.scratch / self.linked.name
+        file_link = checkout / "file-link"
+        dir_link = checkout / "dir-link"
+        file_link.symlink_to(outside_file)
+        dir_link.symlink_to(outside_dir, target_is_directory=True)
+        pipe = checkout / "pipe"
+        os.mkfifo(pipe)
+
+        initial = self.fingerprint()
+        self.assertEqual(initial[str(file_link)][-1], os.fsencode(outside_file))
+        self.assertEqual(initial[str(dir_link)][-1], os.fsencode(outside_dir))
+        self.assertNotIn(str(dir_link / "child"), initial)
+        self.assertTrue(stat.S_ISFIFO(initial[str(pipe)][0]))
+        outside_file.write_text("changed target\n")
+        (outside_dir / "child").write_text("changed child\n")
+        self.assertEqual(self.fingerprint(), initial)
+
+        info = dir_link.lstat()
+        os.utime(dir_link, ns=(info.st_atime_ns, info.st_mtime_ns - 10**9), follow_symlinks=False)
+        self.assertEqual(self.fingerprint()[str(dir_link)][3], info.st_mtime_ns - 10**9)
+        info = file_link.lstat()
+        file_link.unlink()
+        self.assertNotIn(str(file_link), self.fingerprint())
+        file_link.symlink_to(self.outside / "missing")
+        os.utime(file_link, ns=(info.st_atime_ns, info.st_mtime_ns), follow_symlinks=False)
+        changed = self.fingerprint()
+        self.assertEqual(changed[str(file_link)][-1], os.fsencode(self.outside / "missing"))
+        self.assertNotEqual(changed[str(file_link)], initial[str(file_link)])
+        pipe.unlink()
+        pipe.symlink_to(outside_file)
+        self.assertNotEqual(self.fingerprint()[str(pipe)][0], initial[str(pipe)][0])
+
+    def trace_read(self, env):
+        # Use the classic trace outside the fingerprint and leave the configured Trace2 targets in place.
+        return dict(env, GIT_TRACE=str(self.read_trace))
+
+    def test_every_registered_read_preserves_git_and_worktree_files_and_runs_no_programs(self):
+        self.assert_plain_git_runs_filters(clean="clean", smudge="smudge")
+        self.assert_registered_reads(READ_SITES)
+
+    def test_every_registered_read_runs_no_programs_with_a_process_filter_on_all_paths(self):
+        # Git gives process precedence over clean and smudge for the same path.
+        # Run the same sites in a fresh fixture with process added to the wildcard driver.
+        with self.markers.included.open("a") as config:
+            config.write(f'[filter "marker"]\n\tprocess = \'{self.markers.process}\'\n')
+        self.assert_plain_git_runs_filters(clean="process", smudge="process")
+        self.assert_registered_reads(READ_SITES)
+
+    def assert_plain_git_runs_filters(self, *, clean, smudge):
+        options = ("--no-replace-objects", "-c", "core.fsmonitor=", "-c", "diff.autoRefreshIndex=false")
+        for tree in self.read_trees:
+            cwd = str(tree.resolve())
+            for path in self.tracked_paths:
+                with self.subTest(checkout=tree, path=path):
+                    self.markers.reset()
+                    expire_stats(tree / path)
+                    plain_git(tree, *options, "diff", "--no-ext-diff", "--no-textconv", "--", path)
+                    self.assertEqual(set(self.markers.read()), {(clean, cwd)})
+                    self.markers.reset()
+                    plain_git(tree, *options, "cat-file", "--filters", f"HEAD:{path}")
+                    self.assertEqual(set(self.markers.read()), {(smudge, cwd)})
+
+    def test_a_registered_nested_read_passes_the_tripwire_and_the_runtime_checks(self):
+        module = "read_site_fixture"
+        source = '''
+from harness import git
+
+def read_head(repo):
+    def nested():
+        return git.git(repo, "rev-parse", "HEAD", effect=git.READ)
+    return nested()
+'''
+        namespace = {"__name__": f"harness.{module}"}
+        exec(source, namespace)
+
+        def trigger(case):
+            case.assertEqual(namespace["read_head"](case.linked).strip(), case.tip)
+
+        site = (module, "read_head.<locals>.nested")
+        self.assert_registered_reads({site: (1, trigger)})
+        reads = collections.Counter()
+        problems, _ = call_shape_problems({module: source}, reads=reads)
+        self.assertEqual(problems, [])
+        self.assertEqual(reads, {site: 1})
+
+    def assert_registered_reads(self, read_sites):
+        # Run the pure queries on the original fixture before commands that reset or commit.
+        ordered = sorted(read_sites, key=lambda site: site in MIXED_READ_SITES)
+        invocation, launch, capture, install_query = git.invocation, git._launch, git_query._capture, operations._git_query
+        forwarded = {git.git.__code__, git.git_bytes.__code__, git.git_process.__code__,
+                     git._run_git.__code__, install_query.__code__}
+        observed = collections.defaultdict(set)
+
+        def record(frame, effect):
+            if effect is not git.READ:
+                return
+            while frame.f_code in forwarded:
+                frame = frame.f_back
+            site = (frame.f_globals["__name__"].removeprefix("harness."), frame.f_code.co_qualname)
+            # A loop or repeated call to the trigger may reach one declaration many times.
+            observed[site].add(frame.f_lasti)
+
+        def unchanged(function, *args, **kwargs):
+            before = self.fingerprint()
+            try:
+                return function(*args, **kwargs)
+            finally:
+                self.assertEqual(self.fingerprint(), before, function.__qualname__)
+
+        def construct(*args, effect, **kwargs):
+            record(sys._getframe(1), effect)
+            if effect is git.READ:
+                argv, env = unchanged(invocation, *args, effect=effect, **kwargs)
+                return argv, self.trace_read(env)
+            return invocation(*args, effect=effect, **kwargs)
+
+        def launch_checked(argv, env, *, effect, **kwargs):
+            if sys._getframe(1).f_code is git._configured_hooks.__code__:
+                record(sys._getframe(1), effect)
+                if effect is git.READ:
+                    env = self.trace_read(env)
+            if effect is git.READ:
+                return unchanged(launch, argv, env, effect=effect, **kwargs)
+            return launch(argv, env, effect=effect, **kwargs)
+
+        def install_query_checked(*args, effect):
+            if effect is git.READ:
+                return unchanged(install_query, *args, effect=effect)
+            return install_query(*args, effect=effect)
+
+        forwarded.update((unchanged.__code__, install_query_checked.__code__))
+        with patch.object(git, "invocation", construct), patch.object(git, "_launch", launch_checked), \
+                patch.object(git_query, "_capture", functools.partial(unchanged, capture)), \
+                patch.object(operations, "_git_query", install_query_checked):
+            for site in ordered:
+                with self.subTest(site=".".join(site)):
+                    for tree in self.read_trees:
+                        for path in self.tracked_paths:
+                            expire_stats(tree / path)
+                    self.markers.reset()
+                    self.read_trace.write_text("")
+                    observed.clear()
+                    declarations, trigger = read_sites[site]
+                    if site in MIXED_READ_SITES:
+                        trigger(self)
+                    else:
+                        unchanged(trigger, self)
+                        self.assertEqual(self.markers.read(), [])
+                    self.assert_no_fsmonitor_daemon_spawn(self.read_trace, "READ")
+                    self.assertEqual(len(observed[site]), declarations)
+
+    def test_read_trace_detects_daemon_spawn_with_one_override_removed(self):
+        if not self.has_fsmonitor_daemon:
+            self.skipTest("Git has no built-in fsmonitor daemon on this platform")
+        launch = git._launch
+        mutated = []
+
+        def remove_override(argv, env, *, effect, **kwargs):
+            if effect is git.READ and argv[-4:] == ["ls-files", "--others", "--exclude-standard", "-z"]:
+                argv = list(argv)
+                index = argv.index("core.fsmonitor=")
+                self.assertEqual(argv[index - 1], "-c")
+                del argv[index - 1:index + 1]
+                env = self.trace_read(env)
+                mutated.append(argv)
+            return launch(argv, env, effect=effect, **kwargs)
+
+        self.read_trace.write_text("")
+        with patch.object(git, "_launch", remove_override):
+            git.assert_removable_worktree(self.linked, binding=self.binding)
+        self.assertEqual(len(mutated), 1)
+        with self.assertRaisesRegex(AssertionError, "READ spawned fsmonitor--daemon"):
+            self.assert_no_fsmonitor_daemon_spawn(self.read_trace, "READ")
+
+
+class LifecycleEffectTests(IsolatedRepoCase):
+    """Cases 3 and 15b: observe actual effects during checkout, archive/reset and acceptance."""
+
+    def setUp(self):
+        super().setUp()
+        self.markers = Markers(self.scratch)
+        self.markers.arm(self.repo)
+        self.config.data["verification"]["commands"] = [{"cwd": ".", "argv": [sys.executable, "-c", "pass"]}]
+        self.config.data["verification"]["fresh_checkout"] = True
+
+    def preserved_state(self, effect):
+        """Observe the index entries, refs and worktree files that this call must preserve."""
+        admin = (self.repo / ".git").resolve()
+        linked = sorted(path for path in (admin / "worktrees").glob("*") if (path / "gitdir").is_file())
+        state = {}
+        if not effect.real_index:
+            state["index"] = {path: plain_git(self.repo, "--git-dir=" + str(path), "-c", "core.fsmonitor=false",
+                                             "ls-files", "--stage", "-z").stdout for path in (admin, *linked)}
+        if not effect.refs:
+            state["refs"] = plain_git(self.repo, "for-each-ref", "--format=%(refname) %(objectname) %(symref)").stdout
+            state["heads"] = {path: path.read_bytes() for directory in (admin, *linked)
+                              for path in (directory / "HEAD", directory / "ORIG_HEAD", directory / "gitdir")
+                              if path.is_file()}
+            state["reflogs"] = self.files(*(directory / "logs" for directory in (admin, *linked)))
+        if not effect.worktree:
+            worktrees = [Path(os.fsdecode((path / "gitdir").read_bytes().removesuffix(b"\n"))).parent for path in linked]
+            state["files"] = self.files(self.repo, *worktrees, skip=(".git", ".harness"))
+        return state
+
+    def test_the_run_obeys_each_git_effect_across_two_step_checkout_archive_and_acceptance(self):
+        self.assert_lifecycle_effects()
+
+    def test_the_run_suppresses_builtin_fsmonitor_across_two_step_checkouts(self):
+        with self.markers.included.open("a") as config:
+            config.write("[core]\n\tfsmonitor = true\n")
+        self.assert_lifecycle_effects(builtin_fsmonitor=True)
+
+    def assert_lifecycle_effects(self, *, builtin_fsmonitor=False):
+        # A plain checkout proves the hooks in both config sources are live on this Git.
+        if configured_hooks_exist():
+            control = self.scratch / "control"
+            plain_git(self.repo, "-c", "core.fsmonitor=false", "worktree", "add", "-b", "control", str(control), "HEAD")
+            labels = {label for label, _ in self.markers.read()}
+            for scope in ("repo", "glob"):
+                for event in ("post-checkout", "reference-transaction"):
+                    self.assertIn(f"config:{scope}-{event}", labels)
+            plain_git(self.repo, "-c", "core.fsmonitor=false", "worktree", "remove", str(control))
+        self.markers.reset()
+
+        def decide(script, trigger, packet):
+            if trigger["kind"] == "task" and blocked_by_task(trigger["feedback"]):
+                return revise(selected="p", instruction="prepare first", new_tasks=[task("p", paths=["a.txt"])],
+                              updates=[describe("a", deps=["p"])])
+            return None
+
+        def work(script, tid, n, kwargs, result):
+            if tid == "a" and n == 1:
+                (kwargs["cwd"] / "test_hello.py").write_text("# discarded tracked change\n")
+                block_first("a")(script, tid, n, kwargs, result)
+            elif tid == "p":
+                self.assertFalse((kwargs["cwd"] / "a.txt").exists())
+                (kwargs["cwd"] / "p.txt").rename(kwargs["cwd"] / "a.txt")
+                result["evidence"] = ["a.txt"]
+
+        launch = git._launch
+        calls = []
+        trace = self.scratch / "lifecycle-git.trace"
+        populate = ("reset", "-q", "--hard", "--no-recurse-submodules")
+
+        def observe(argv, env, *, effect, **kwargs):
+            self.assertIsNotNone(effect, argv)
+            first = next(i for i in range(3, len(argv)) if not argv[i].startswith("-") and argv[i - 1] != "-c")
+            command = tuple(argv[first:])
+            path = Path(argv[2]).resolve()
+            if builtin_fsmonitor and command == populate:
+                self.addCleanup(plain_git, path, "fsmonitor--daemon", "stop", check=False)
+            marker_count = len(self.markers.read())
+            before = self.preserved_state(effect)
+            trace.write_text("")
+            result = launch(argv, dict(env, GIT_TRACE=str(trace)), effect=effect, **kwargs)
+            self.assert_no_fsmonitor_daemon_spawn(trace, f"{command!r} in {path}")
+            after = self.preserved_state(effect)
+            new_marks = {label.split(":")[0] for label, _ in self.markers.read()[marker_count:]}
+            self.assertLessEqual(new_marks, {"clean", "smudge"} if effect.filters else set(), (command, effect))
+            for field in before.keys() | after.keys():
+                self.assertEqual(before.get(field), after.get(field), (command, effect.name, field))
+            calls.append((command, effect, path, new_marks))
+            return result
+
+        engine = self.engine(Script(decide, work=work))
+        # Name-based suppression must cover the whole run, including on Git with per-event switches.
+        # The test owns the fresh checkout's root even if runtime reclamation fails.
+        with patch.object(git, "_launch", observe), patch.object(git, "HOOK_EVENTS", ()), \
+                patch.object(tempfile, "tempdir", str(self.scratch)):
+            result = engine.start("Archive a rejected candidate, then accept changes",
+                                  {"tasks": [task("a", paths=["a.txt", "test_hello.py"])]})
+        self.assertEqual(result["status"], "completed")
+        artifact, = engine.directory.glob("verification/final/*/verification-*/checkout.json")
+        checkout = Path(read_json(artifact)["worktree"]).resolve()
+        self.assertTrue(checkout.is_relative_to(self.scratch.resolve()), checkout)
+        self.assertIn("revision_edits_archived", self.events(engine))
+        archive = engine.directory / "recovery" / "revision-1" / "files"
+        self.assertEqual((archive / "test_hello.py").read_text(), "# discarded tracked change\n")
+        self.assertEqual((archive / "a.txt").read_text(), "a attempt 1\n")
+        worktree = Path(result["worktree"]).resolve()
+        self.assertEqual((worktree / "a.txt").read_text(), "a attempt 2\n")
+        self.assertEqual((worktree / "test_hello.py").read_bytes(), (self.repo / "test_hello.py").read_bytes())
+        self.assertEqual(set().union(*(marks for _, _, _, marks in calls)), {"clean", "smudge"})
+        self.assertEqual(self.markers.kinds(), {"clean", "smudge"}, self.markers.read())
+        # Check that all relevant phases actually ran, in order and in the expected Git context.
+        registered = [(i, path, Path(cmd[-2]).resolve()) for i, (cmd, effect, path, _) in enumerate(calls)
+                      if cmd[:3] == ("worktree", "add", "--no-checkout") and effect is git.CHECKOUT]
+        populated = [(i, path) for i, (cmd, effect, path, _) in enumerate(calls)
+                     if cmd == populate and effect is git.CHECKOUT]
+        self.assertEqual([(source, target) for _, source, target in registered],
+                         [(self.repo.resolve(), worktree), (worktree, checkout)])
+        self.assertEqual([path for _, path in populated], [worktree, checkout])
+        reset = next(i for i, (cmd, effect, path, _) in enumerate(calls)
+                     if cmd[:2] == ("reset", "--hard") and effect is git.CHECKOUT and path == worktree)
+        accepted = next(i for i, (cmd, effect, path, _) in enumerate(calls)
+                        if cmd[0] == "commit" and effect is git.INDEX_REFS and path == worktree)
+        phases = [registered[0][0], populated[0][0], reset, accepted, registered[1][0], populated[1][0]]
+        self.assertEqual(sorted(set(phases)), phases)
+
+    def test_acceptance_disables_automatic_maintenance_with_a_traced_positive_control(self):
+        launch = git._launch
+        path = self.repo / "accepted.txt"
+        for enabled in (False, True):
+            with self.subTest(automatic_maintenance=enabled):
+                trace = self.scratch / f"maintenance-{enabled}.log"
+                path.write_text(f"fixture content {enabled}\n")
+
+                def trace_commit(argv, env, *, effect, **kwargs):
+                    if effect is git.INDEX_REFS and "--cleanup=verbatim" in argv:
+                        argv = list(argv)
+                        for setting in ("maintenance.auto=false", "gc.auto=0"):
+                            index = argv.index(setting)
+                            self.assertEqual(argv[index - 1], "-c")
+                            if enabled:
+                                del argv[index - 1:index + 1]
+                        env = dict(env, GIT_TRACE=str(trace))
+                    return launch(argv, env, effect=effect, **kwargs)
+
+                before = git.head(self.repo)
+                with patch.object(git, "_launch", trace_commit):
+                    commit = git.accept(self.repo, [path.name], "fixture", "task", {"subject": "Accept", "body": ""})
+                self.assertNotEqual(commit, before)
+                lines = trace.read_text().splitlines()
+                self.assertTrue(any("built-in: git commit" in line for line in lines), lines)
+                self.assertEqual(any("run_command:" in line and "maintenance run --auto" in line for line in lines),
+                                 enabled, lines)
 
 
 class DeadlineTests(unittest.TestCase):
@@ -1471,8 +2955,8 @@ CONFIG_FORWARDS = {("git_bytes", "git_process"), ("git_process", "invocation")}
 STARTERS = {f"subprocess.{name}" for name in ("run", "Popen", "call", "check_call", "check_output")}
 
 
-def call_shape_problems(sources):
-    """R1 over {module: source} of harness/: the problems as (place, what), and how many Git calls each module has."""
+def call_shape_problems(sources, *, reads=None):
+    """R1 over {module: source} of harness/, optionally collecting the READ declarations for R2."""
     problems, checked = [], collections.Counter()
     for module, source in sources.items():
         tree = ast.parse(source)
@@ -1509,28 +2993,36 @@ def call_shape_problems(sources):
                 return [*found, f"passes a {CONFIG} other than {CONFIG_CONSTANT}"]
             return found
 
-        def nodes(parent, scope):
-            """Every node with its innermost enclosing function or lambda."""
+        def nodes(parent, scope, owner=None):
+            """Every node with its enclosing scope and that scope's Python qualified name."""
             for child in ast.iter_child_nodes(parent):
-                yield child, scope
-                yield from nodes(child, child if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))
-                                 else scope)
+                yield child, scope, owner
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+                    name = "<lambda>" if isinstance(child, ast.Lambda) else child.name
+                    if owner:
+                        separator = "." if isinstance(scope, ast.ClassDef) else ".<locals>."
+                        name = f"{owner}{separator}{name}"
+                    yield from nodes(child, child, name)
+                else:
+                    yield from nodes(child, scope, owner)
         for node, local, target in imports:
             if target in RUNNERS or target in RUNNER_MODULES and local != target.rsplit(".", 1)[1]:
                 problems.append((f"harness/{module}.py:{node.lineno}", "imports a Git runner under another name"))
         tops = {node: node.name for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
         called = set()
-        for node, scope in nodes(tree, None):
+        for node, scope, owner in nodes(tree, None):
             place = f"harness/{module}.py:{getattr(node, 'lineno', 0)}"
             function = tops.get(scope)  # forwards and _launch are top-level functions, never nested ones
             if not isinstance(node, ast.Call):
                 continue
+            effect = next((keyword.value for keyword in node.keywords if keyword.arg == "effect"), None)
+            if reads is not None and qualified(effect) == "harness.git.READ":
+                reads[module, owner] += 1
             name = RUNNERS.get(qualified(node.func))
             if name is not None:
                 checked[module] += 1
                 called.add(node.func)
                 problems += [(place, what) for what in config_problems(function, scope, node, name)]
-                effect = next((keyword.value for keyword in node.keywords if keyword.arg == "effect"), None)
                 forward = FORWARDS.get((module, function, name))
                 if forward is not None:
                     passing, passed = forward
@@ -1555,6 +3047,21 @@ def call_shape_problems(sources):
                 for option in REQUIRED_OPTIONS.get(subcommand, ()):
                     if option not in literals:
                         problems.append((place, f"runs {subcommand} without {option}"))
+                if subcommand == "worktree" and len(words) > 1:
+                    action = word(words[1])
+                    if action == "add":
+                        if (module, function) != ("git", "add_worktree"):
+                            problems.append((place, "runs worktree add outside harness.git.add_worktree"))
+                        if "--no-checkout" not in literals:
+                            problems.append((place, "runs worktree add without --no-checkout"))
+                    if action == "remove" and "--force" in literals and (module, function) != ("git", "add_worktree"):
+                        problems.append((place, "forces worktree removal outside harness.git.add_worktree"))
+                if subcommand == "init":
+                    if "--template=" not in literals:
+                        problems.append((place, "runs init without --template="))
+                    isolated = next((k.value for k in node.keywords if k.arg == "isolated_config"), None)
+                    if not isinstance(isolated, ast.Constant) or isolated.value is not True:
+                        problems.append((place, "runs init without isolated_config=True"))
             starter = qualified(node.func) or ""
             if starter in STARTERS or starter.startswith(("os.exec", "os.posix_spawn")):
                 if module == "git":
@@ -1677,6 +3184,67 @@ class CallShapeTripwireTests(unittest.TestCase):
         self.assertEqual(problems, [])
         self.assertGreater(checked.pop("git"), 0)
         self.assertGreater(sum(checked.values()), 0)
+
+    def test_strictly_read_only_git_calls_are_all_registered(self):
+        sources = {path.stem: path.read_text(encoding="utf-8") for path in sorted((ROOT / "harness").glob("*.py"))}
+        reads = collections.Counter()
+        call_shape_problems(sources, reads=reads)
+        registered = collections.Counter({site: declarations for site, (declarations, _) in READ_SITES.items()})
+        self.assertEqual((reads - registered, registered - reads), (collections.Counter(), collections.Counter()),
+                         "Unregistered READ declarations and registrations without a declaration")
+
+    def test_the_read_site_tripwire_finds_new_callers_and_the_hook_name_read(self):
+        sources = {
+            "git": '''
+def _configured_hooks(repo):
+    _launch([], {}, effect=READ)
+def head(repo):
+    def nested():
+        git(repo, "rev-parse", "HEAD", effect=READ)
+    if repo is None:
+        return git(repo, "rev-parse", "--show-toplevel", effect=READ)
+    return git(repo, "rev-parse", "HEAD", effect=READ)
+''',
+            "memory": '''
+from .git import READ as READ_EFFECT
+from . import git
+class Other:
+    def _staleness(self, repo):
+        return git.git(repo, "rev-parse", "HEAD", effect=READ_EFFECT)
+''',
+        }
+        reads = collections.Counter()
+        problems, _ = call_shape_problems(sources, reads=reads)
+        self.assertEqual(problems, [])
+        registered = collections.Counter({site: declarations for site, (declarations, _) in READ_SITES.items()})
+        self.assertEqual(reads[("git", "_configured_hooks")], 1)
+        self.assertEqual(reads - registered, {("git", "head"): 1, ("git", "head.<locals>.nested"): 1,
+                                             ("memory", "Other._staleness"): 1})
+
+    def test_only_two_step_checkout_and_isolated_init_are_allowed(self):
+        sources = {
+            "git": ("def add_worktree(repo, path):\n"
+                    "    git(repo, 'worktree', 'add', '--no-checkout', path, effect=CHECKOUT)\n"
+                    "    git(repo, 'worktree', 'remove', '--force', path, effect=CHECKOUT)\n"
+                    "    git(repo, 'worktree', 'add', path, effect=CHECKOUT)\n"),
+            "other": ("from . import git\n"
+                      "def add_worktree(repo, path):\n"
+                      "    git.git(repo, 'worktree', 'add', '--no-checkout', path, effect=git.CHECKOUT)\n"
+                      "    git._run_git(repo, ('worktree', 'remove', '--force', path), effect=git.CHECKOUT)\n"
+                      "    git.git(repo, 'worktree', 'remove', path, effect=git.CHECKOUT)\n"
+                      "    git.git(repo, 'init', '--template=', effect=git.CHECKOUT, isolated_config=True)\n"
+                      "    git.git(repo, 'init', '--template=', effect=git.CHECKOUT, isolated_config=1)\n"
+                      "    git.git(repo, 'init', '--template=somewhere', effect=git.CHECKOUT, isolated_config=True)\n"),
+        }
+        problems, checked = call_shape_problems(sources)
+        self.assertEqual(problems, [
+            ("harness/git.py:4", "runs worktree add without --no-checkout"),
+            ("harness/other.py:3", "runs worktree add outside harness.git.add_worktree"),
+            ("harness/other.py:4", "forces worktree removal outside harness.git.add_worktree"),
+            ("harness/other.py:7", "runs init without isolated_config=True"),
+            ("harness/other.py:8", "runs init without --template="),
+        ])
+        self.assertEqual(checked, {"git": 3, "other": 6})
 
     def test_the_tripwire_finds_each_kind_of_breach(self):
         sources = {

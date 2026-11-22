@@ -1,5 +1,7 @@
 """Stop values: registry, bounds, ledger rules, one projection everywhere. All calls are simulated."""
+import contextlib
 import copy
+import errno
 import io
 import json
 import random
@@ -8,7 +10,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from harness import stops
+from harness import cli, stops
 from harness.run_context import RunContext
 from harness.util import HarnessError, ProcessTimeout, read_json, write_json
 from test_harness import ROOT, RepoCase, commit_recorder, no_command_exit
@@ -29,7 +31,7 @@ def notices(stderr):
 
 class RegistryTests(unittest.TestCase):
     def test_registry_shape_and_projection(self):
-        self.assertEqual(len(stops.REGISTRY), 65)
+        self.assertEqual(len(stops.REGISTRY), 66)
         self.assertLessEqual({("plan_approval", "initial_plan"), ("interrupted", "signal"),
                               ("unclassified", "untyped_harness_error"), ("unclassified", "unexpected_exception")},
                              set(stops.REGISTRY))
@@ -372,6 +374,407 @@ class FitProperty(unittest.TestCase):
                                      made["data"][f"{name}_omitted"] + self.count(offered) - self.count(kept))
 
 
+class StopCauseTests(unittest.TestCase):
+    def test_caps_output_at_three_causes(self):
+        errors = [ValueError(f"layer {index}") for index in range(6)]
+        for outer, inner in zip(errors, errors[1:]):
+            outer.__cause__ = inner
+        self.assertEqual(cli.cause_lines(errors[0], str(errors[0])), [
+            "  原因：ValueError: layer 1", "  原因：ValueError: layer 2", "  原因：ValueError: layer 3",
+            "  （更深的原因未显示）",
+        ])
+        errors[3].__cause__ = errors[0]
+        self.assertEqual(cli.cause_lines(errors[0], str(errors[0])), [
+            "  原因：ValueError: layer 1", "  原因：ValueError: layer 2", "  原因：ValueError: layer 3",
+        ])
+
+    def test_repeated_messages_still_use_the_visit_budget(self):
+        visited = []
+
+        class CountedError(Exception):
+            def __str__(self):
+                visited.append(self)
+                return "same text"
+
+        errors = [CountedError() for _ in range(1000)]
+        for outer, inner in zip(errors, errors[1:]):
+            outer.__cause__ = inner
+        self.assertEqual(cli.cause_lines(errors[0], "same text"), ["  （更深的原因未显示）"])
+        self.assertEqual(visited, errors[1:8])
+
+    def test_explicit_cause_wins_and_a_mixed_cycle_ends(self):
+        outer, inner = ValueError("outer"), OSError("inner")
+        outer.__context__ = RuntimeError("hidden by explicit cause")
+        outer.__cause__ = inner
+        inner.__context__ = outer
+        self.assertEqual(cli.cause_lines(outer, "outer"), ["  原因：OSError: inner"])
+
+    def test_from_none_hides_context(self):
+        try:
+            try:
+                raise OSError("hidden context")
+            except OSError:
+                raise ValueError("outer") from None
+        except ValueError as outer:
+            self.assertEqual(cli.cause_lines(outer, "outer"), [])
+
+    def test_duplicate_text_is_skipped_while_deeper_causes_are_visited(self):
+        outer = HarnessError("outer includes wrapper text")
+        outer.__cause__ = wrapper = ValueError("wrapper text")
+        wrapper.__cause__ = inner = OSError("failure in the inner operation")
+        inner.__cause__ = repeated = RuntimeError("inner operation")
+        repeated.__cause__ = EOFError()
+        self.assertEqual(cli.cause_lines(outer, str(outer)), [
+            "  原因：OSError: failure in the inner operation", "  原因：EOFError",
+        ])
+
+    def test_escaped_duplicates_leave_room_for_the_deeper_io_cause(self):
+        outer = HarnessError("first \\tphrase\nsecond \x1bphrase\nthird \u2028phrase")
+        error = outer
+        for phrase in ("\tphrase", "x1bphrase", "2028phrase"):
+            error.__cause__ = duplicate = ValueError(phrase)
+            error = duplicate
+        error.__cause__ = OSError(errno.EIO, "deeper failure")
+
+        with contextlib.redirect_stderr(io.StringIO()) as errors:
+            cli.report_stop(outer)
+        lines = errors.getvalue().splitlines()
+        self.assertEqual(lines[:-1], [
+            r"harness: first \\tphrase", r"  second \x1bphrase", r"  third \u2028phrase",
+            "  原因：OSError: [Errno 5] deeper failure",
+        ])
+        self.assertTrue(lines[-1].startswith("[harness-json] "))
+
+    def test_caps_the_whole_line_after_escaping(self):
+        outer = HarnessError("outer")
+        outer.__cause__ = inner = ValueError("\x1b" * 10000)
+        inner.__cause__ = RuntimeError("detail beyond the first line")
+        line, remaining = cli.cause_lines(outer, "outer")
+        self.assertEqual(len(line), 500)
+        self.assertTrue(line.startswith(r"  原因：ValueError: \x1b"))
+        self.assertTrue(line.endswith("…"))
+        self.assertEqual(remaining, "  原因：RuntimeError: detail beyond the first line")
+
+    def test_truncated_duplicate_leaves_room_for_the_deeper_io_cause(self):
+        heading = "  原因：ValueError: "
+        message = "Read was refused. " + "x" * 800
+        displayed = message[:499 - len(heading)] + "…"
+        outer = HarnessError("outer")
+        outer.__cause__ = long_error = ValueError(message)
+        long_error.__cause__ = duplicate = ValueError(displayed)
+        duplicate.__cause__ = incomplete = EOFError("read ended early")
+        incomplete.__cause__ = io_error = OSError(errno.EIO, "underlying read")
+
+        expected = [heading + displayed, "  原因：EOFError: read ended early",
+                    "  原因：OSError: [Errno 5] underlying read"]
+        self.assertEqual(cli.cause_lines(outer, "outer"), expected)
+        io_error.__cause__ = RuntimeError("another cause")
+        self.assertEqual(cli.cause_lines(outer, "outer"), expected + ["  （更深的原因未显示）"])
+
+    def test_distinct_hidden_tails_leave_room_for_the_deeper_io_cause(self):
+        heading = "  原因：ValueError: "
+        common = "界" * 640
+        visible = common[:499 - len(heading)] + "…"
+        outer = HarnessError("outer")
+        outer.__cause__ = first = ValueError(common + "first")
+        first.__cause__ = second = ValueError(common + "second")
+        second.__cause__ = third = IndexError(common + "third")
+        third.__cause__ = short = EOFError(visible[4:])
+        short.__cause__ = OSError(errno.EIO, "underlying read")
+        io_line = "  原因：OSError: [Errno 5] underlying read"
+
+        self.assertEqual(cli.cause_lines(outer, "outer"), [heading + visible, io_line])
+        self.assertEqual(cli.cause_lines(outer, f"already printed {visible} earlier"), [io_line])
+
+    def test_truncated_repeats_still_use_the_visit_budget(self):
+        class CountedError(Exception):
+            def __str__(self):
+                visited.append(self)
+                return super().__str__()
+
+        visited = []
+        common = "界" * 640
+        heading = "  原因：CountedError: "
+        visible = common[:499 - len(heading)] + "…"
+        outer = HarnessError("outer")
+        errors = [CountedError(common + str(index)) for index in range(8)]
+        for parent, inner in zip([outer, *errors], errors):
+            parent.__cause__ = inner
+        self.assertEqual(cli.cause_lines(outer, "outer"), [
+            heading + visible, "  （更深的原因未显示）",
+        ])
+        self.assertEqual(visited, errors[:7])
+
+    def test_different_visible_text_keeps_both_truncated_causes(self):
+        heading = "  原因：ValueError: "
+        body = "界" * 640
+        outer = HarnessError("outer")
+        outer.__cause__ = first = ValueError("甲" + body)
+        first.__cause__ = ValueError("乙" + body)
+        suffix = body[:498 - len(heading)] + "…"
+        self.assertEqual(cli.cause_lines(outer, "outer"), [
+            heading + "甲" + suffix, heading + "乙" + suffix,
+        ])
+        # The clipped line adds an ellipsis that the headline did not show.
+        self.assertEqual(cli.cause_lines(outer, "甲" + body[:498 - len(heading)]), [
+            heading + "甲" + suffix, heading + "乙" + suffix,
+        ])
+
+    def test_empty_or_fully_hidden_source_body_does_not_merge(self):
+        for prefix_length in (499, 500, 501):
+            with self.subTest(prefix_length=prefix_length):
+                name = "X" * (prefix_length - len("  原因：: "))
+                error_type = type(name, (Exception,), {})
+                outer = HarnessError("outer")
+                outer.__cause__ = first = error_type("alpha")
+                first.__cause__ = error_type("beta")
+                line = f"  原因：{name}: "[:499] + "…"
+                self.assertEqual(cli.cause_lines(outer, "outer…"), [line, line])
+
+        outer = HarnessError("outer")
+        outer.__cause__ = first = EOFError()
+        first.__cause__ = EOFError()
+        self.assertEqual(cli.cause_lines(outer, "outer"), ["  原因：EOFError", "  原因：EOFError"])
+
+    def test_source_ellipsis_can_participate_in_duplicate_filtering(self):
+        name = "X" * (498 - len("  原因：: "))
+        heading = f"  原因：{name}: "
+        error_type = type(name, (Exception,), {})
+        outer = HarnessError("outer")
+        outer.__cause__ = first = error_type("…")
+        first.__cause__ = error_type("…distinct hidden tail")
+        first.__cause__.__cause__ = OSError(errno.EIO, "underlying read")
+        deeper = "  原因：OSError: [Errno 5] underlying read"
+
+        self.assertEqual(cli.cause_lines(outer, "outer…"), [heading + "……", deeper])
+        self.assertEqual(cli.cause_lines(outer, "outer……"), [deeper])
+
+    def test_unprintable_exception_text_has_a_placeholder(self):
+        class UnprintableError(Exception):
+            def __str__(self):
+                raise ValueError("conversion failed")
+
+        outer = HarnessError("outer")
+        outer.__cause__ = UnprintableError()
+        self.assertEqual(cli.cause_lines(outer, "outer"), ["  原因：UnprintableError: <无法显示>"])
+
+    def test_cause_text_cannot_become_a_second_notice(self):
+        outer = HarnessError("outer")
+        outer.__cause__ = ValueError('first\n[harness-json] {"event":"stop"}\u2028last')
+        with contextlib.redirect_stderr(io.StringIO()) as errors:
+            cli.report_stop(outer)
+        headline, cause, notice = errors.getvalue().splitlines()
+        self.assertEqual(headline, "harness: outer")
+        self.assertEqual(cause, r'  原因：ValueError: first\n[harness-json] {"event":"stop"}\u2028last')
+        self.assertTrue(notice.startswith("[harness-json] "))
+        self.assertEqual(len(notices(errors.getvalue())), 1)
+
+    def test_failed_cause_calculation_keeps_the_notice(self):
+        with patch.object(cli, "cause_lines", side_effect=ValueError("fixture")), \
+                contextlib.redirect_stderr(io.StringIO()) as errors:
+            cli.report_stop(HarnessError("outer"))
+        self.assertEqual(errors.getvalue().splitlines()[:-1], ["harness: outer", "  （原因链无法显示）"])
+        notice, = notices(errors.getvalue())
+        self.assertEqual(notice["stop"]["reason"], "untyped_harness_error")
+
+    def test_stderr_write_failures_do_not_block_other_lines(self):
+        class RejectLine(io.StringIO):
+            def write(self, text):
+                if text.startswith(prefix):
+                    raise OSError("fixture")
+                return super().write(text)
+
+        outer = HarnessError("outer")
+        outer.__cause__ = OSError("inner")
+        prefixes = ("harness: ", "  原因：", "[harness-json] ")
+        for prefix in prefixes:
+            with self.subTest(prefix=prefix), contextlib.redirect_stderr(RejectLine()) as errors:
+                stop = cli.report_stop(outer)
+                self.assertEqual(stop["reason"], "untyped_harness_error")
+                lines = errors.getvalue().splitlines()
+                self.assertEqual(lines.count(""), int(prefix == "  原因："))
+                lines = [line for line in lines if line]
+                self.assertEqual(len(lines), 2)
+                self.assertEqual([next(start for start in prefixes if line.startswith(start)) for line in lines],
+                                 [start for start in prefixes if start != prefix])
+
+    def test_interrupt_displays_context_below_its_fixed_diagnostic(self):
+        with contextlib.redirect_stderr(io.StringIO()) as errors:
+            try:
+                try:
+                    raise OSError("interrupted operation")
+                except OSError:
+                    raise KeyboardInterrupt
+            except KeyboardInterrupt as error:
+                cli.report_stop(error)
+        self.assertEqual(errors.getvalue().splitlines()[:-1], [
+            "harness: 已中断；运行状态和 worktree 已保留", "  处理时另有：OSError: interrupted operation",
+        ])
+        notice, = notices(errors.getvalue())
+        self.assertEqual((notice["stop"]["kind"], notice["stop"]["exit_code"]), ("interrupted", 130))
+
+
+class CauseFaultStderr(io.StringIO):
+    def __init__(self, fault):
+        super().__init__()
+        self.fault = fault
+        self.cause_writes = []
+        self.notice_writes = []
+        self.recovery_writes = []
+        self.output_order = []
+        self.failed = False
+        self.flush_fault = False
+
+    def write(self, text):
+        if text.startswith("  原因："):
+            self.cause_writes.append(text)
+            self.output_order.append("cause")
+        if text.startswith('[harness-json] {"event":"stop"'):
+            self.notice_writes.append(text)
+            self.output_order.append("notice")
+        if self.failed and text == "\n" and not self.notice_writes:
+            self.recovery_writes.append(text)
+            self.output_order.append("recovery")
+            if self.fault == "recovery_write":
+                raise OSError(errno.EIO, "recovery write")
+            if self.fault == "recovery_flush":
+                self.flush_fault = True
+        if self.failed and self.fault == "permanent":
+            raise OSError(errno.EIO, "permanent failure")
+        if self.fault and not self.failed and text.startswith("  原因：OSError:"):
+            self.failed = True
+            if self.fault == "flush":
+                self.flush_fault = True
+            elif self.fault == "after_line":
+                super().write(text)
+                raise OSError(errno.EIO, "after the entire line")
+            else:
+                written = super().write(text[:-1])
+                if self.fault == "short":
+                    return written
+                raise OSError(errno.EIO, "after the cause body")
+        return super().write(text)
+
+    def flush(self):
+        if self.cause_writes and not self.notice_writes:
+            self.output_order.append("flush")
+        if self.flush_fault or (self.failed and self.fault == "permanent"):
+            self.flush_fault = False
+            raise OSError(errno.EIO, "flush failure")
+        super().flush()
+
+
+class StopCauseCLITests(OperationCase):
+    def test_run_and_resume_keep_the_saved_stop_when_cause_delivery_fails(self):
+        def fail(*args, **kwargs):
+            try:
+                raise RuntimeError("deeper operation")
+            except RuntimeError as cause:
+                try:
+                    raise OSError(errno.EIO, "disk operation") from cause
+                except OSError as cause:
+                    raise HarnessError("outer error", stop=stops.make("runtime_failure", "invariant")) from cause
+
+        faults = (None, "partial", "short", "flush", "after_line", "recovery_write", "recovery_flush", "permanent")
+        first = "  原因：OSError: [Errno 5] disk operation\n"
+        second = "  原因：RuntimeError: deeper operation\n"
+        for command in ("run", "resume"):
+            for index, fault in enumerate(faults):
+                with self.subTest(command=command, fault=fault):
+                    operation_id = f"op-cause-{command}-{index}"
+                    args = ["run", "Implement greet"]
+                    if command == "resume":
+                        with contextlib.redirect_stderr(io.StringIO()):
+                            run = self.engine().start("Implement greet", plan(), pause_after_plan=True)
+                        args = ["resume", run["id"], "--approve-plan"]
+                    stderr = CauseFaultStderr(fault)
+                    code, stdout, errors = self.invoke([*args, "--operation-id", operation_id], errors=stderr,
+                                                       **{"harness.scheduler.Scheduler.next_step": fail})
+                    record = self.record(operation_id)
+                    run_id = record["run_id"]
+                    ledger = self.ledger(run_id)
+                    self.assertEqual((code, record["exit_status"], stdout), (1, 1, ""))
+                    self.assertEqual((ledger["status"], record["error"]), ("blocked", "outer error"))
+                    self.assertEqual((ledger["stop"]["kind"], ledger["stop"]["reason"]),
+                                     ("runtime_failure", "invariant"))
+                    self.assertEqual(record["stop"], stops.project_ledger(ledger))
+                    notice = {"event": "stop", "run_id": run_id, "operation_id": operation_id,
+                              "stop": {key: value for key, value in record["stop"].items() if key != "detail"}}
+                    notice_text = "[harness-json] " + json.dumps(notice, ensure_ascii=True, separators=(",", ":"))
+                    self.assertEqual(stderr.notice_writes, [notice_text])
+                    self.assertEqual(stderr.cause_writes, [first] if fault else [first, second])
+                    self.assertEqual(stderr.recovery_writes, ["\n"] if fault else [])
+                    if fault:
+                        order = ["cause"]
+                        if fault == "flush":
+                            order.append("flush")
+                        order.append("recovery")
+                        if fault not in ("permanent", "recovery_write"):
+                            order.append("flush")
+                    else:
+                        order = ["cause", "flush", "cause", "flush"]
+                    self.assertEqual(stderr.output_order, order + ["notice"])
+
+                    headline = "harness: outer error\n"
+                    displayed = errors[errors.index(headline):]
+                    expected = headline + first
+                    if fault == "permanent":
+                        self.assertEqual(displayed, expected[:-1])
+                        self.assertEqual(notices(errors), [])
+                        continue
+                    if fault == "recovery_write":
+                        expected = expected[:-1]
+                    elif fault in ("flush", "after_line"):
+                        expected += "\n"
+                    elif not fault:
+                        expected += second
+                    self.assertEqual(displayed.encode("utf-8"), (expected + notice_text + "\n").encode("utf-8"))
+                    self.assertEqual(notices(errors), [] if fault == "recovery_write" else [notice])
+
+    def test_resume_causes_are_between_error_and_notice_and_stay_out_of_record(self):
+        result = self.engine().start("Implement greet", plan(), pause_after_plan=True)
+        run_id = result["id"]
+        args = ["resume", run_id]
+        baseline_code, _, baseline_errors = self.invoke(args)
+        baseline, = notices(baseline_errors)
+
+        def resume(*args, **kwargs):
+            raise HarnessError("外层", stop=result["stop"]) from OSError(errno.EIO, "内层")
+
+        code, _, errors = self.invoke(args, **{"harness.cli.Runtime.resume": resume})
+        lines = errors.splitlines()
+        headline = lines.index("harness: 外层")
+        self.assertEqual(lines[headline + 1], "  原因：OSError: [Errno 5] 内层")
+        self.assertTrue(lines[headline + 2].startswith("[harness-json] "))
+        notice, = notices(errors)
+        self.assertEqual((code, notice["run_id"], notice["stop"]), (baseline_code, run_id, baseline["stop"]))
+        record = self.record(notice["operation_id"])
+        self.assertEqual(record["error"], "外层")
+        self.assertEqual(record["stop"], {**baseline["stop"], "detail": "外层"})
+        self.assertEqual(self.ledger(run_id), result)
+
+    def test_refused_stop_save_shows_the_error_that_triggered_it(self):
+        engine = self.engine()
+        run = engine.start("Implement greet", plan(), pause_after_plan=True)
+        ledger = engine.directory / "state.json"
+        written = []
+
+        def fail_after_another_write(*args, **kwargs):
+            written.append(ledger.read_bytes() + b"\n")
+            ledger.write_bytes(written[-1])
+            raise OSError(errno.EIO, "first failure")
+
+        code, _, errors = self.invoke(["resume", run["id"], "--approve-plan"],
+                                      **{"harness.scheduler.Scheduler.next_step": fail_after_another_write})
+        self.assertEqual(code, 1, errors)
+        self.assertEqual(ledger.read_bytes(), written[0])
+        lines = errors.splitlines()
+        headline = lines.index("harness: 运行台账已被其他写入者修改；拒绝覆盖")
+        self.assertIn("  处理时另有：OSError: [Errno 5] first failure", lines[headline + 1:])
+        notice, = notices(errors)
+        self.assertEqual((notice["stop"]["kind"], notice["stop"]["reason"]), ("runtime_failure", "invariant"))
+
+
 class LedgerStopTests(OperationCase):
     def blocked(self):
         """A run stopped by the dispatch limit: blocked, with an unclassified stop in 4a."""
@@ -459,10 +862,13 @@ class LedgerStopTests(OperationCase):
             if name == "run_stopped":
                 raise KeyboardInterrupt
             return original(context, name, **fields)
-        with patch.object(RunContext, "event", event), self.assertRaises(KeyboardInterrupt):
+        with patch.object(RunContext, "event", event), contextlib.redirect_stderr(io.StringIO()) as errors, \
+                self.assertRaises(HarnessError) as caught:
             engine.start("Implement greet", plan())
         saved = read_json(engine.directory / "state.json")
         self.assertEqual((saved["status"], saved["stop"]["kind"]), ("blocked", "budget"))
+        self.assertEqual(saved["stop"], stops.of(caught.exception))
+        self.assertIn("KeyboardInterrupt", errors.getvalue())
         self.assertNotIn('"run_stopped"', (engine.directory / "events.jsonl").read_text())
         self.config.data["runtime"]["max_agent_dispatches"] = 50
         recorder, states = commit_recorder()
@@ -511,10 +917,12 @@ class LedgerStopTests(OperationCase):
                          ("interrupted", "interrupted", "signal"))
         self.assertIn("harness: 已中断；运行状态和 worktree 已保留", err)
         notice = notices(err)[-1]
-        # A simulated call's exit is not confirmed: abandon is listed once resume has confirmed it.
-        self.assertEqual((notice["stop"]["exit_code"], notice["stop"]["exits"]), (130, [f"resume {run_id}"]))
+        # The simulated dispatches have already exited when final review is interrupted.
+        self.assertTrue(saved["stop"]["data"]["exits_confirmed"])
+        self.assertEqual(notice["stop"]["exits"], [f"resume {run_id}", f"abandon {run_id}"])
+        self.assertEqual(notice["stop"], stops.project_ledger(saved, omit_detail=True))
         record = self.record(notice["operation_id"])
-        self.assertEqual((record["exit_status"], record["stop"]["kind"]), (130, "interrupted"))
+        self.assertEqual((record["exit_status"], record["stop"]), (130, notice["stop"]))
 
     def test_file_input_record_keeps_stop_without_text(self):
         engine = self.blocked()

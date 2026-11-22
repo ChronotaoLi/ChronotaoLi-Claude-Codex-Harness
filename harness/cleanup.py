@@ -16,45 +16,59 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import stat
+import re
 import time
 from pathlib import Path
 
-from .versions import require_current_ledger
-from . import git
+from .versions import parse_current_ledger, precheck_run
+from . import git, stops
+from .commands import valid_command
+from .context import compact_checks
 from .input_projection import validate_dispatch_indexes as validate_input_dispatch_indexes
 from .path_evidence import validate_dispatch_indexes
 from .run_store import RunStore
+from .state_files import LockUnavailable, StateFiles, holding
 from .worker_receipts import validate_worker_receipt_links
 from .util import (HarnessError, append_event, confirm_dispatches_exited,
-                   ensure_dispatches_exited, group_alive, lock, readonly_lock,
+                   ensure_dispatches_exited, group_alive, strict_json_loads,
                    validate_command_directories, write_json)
 
 TERMINAL = ("completed", "abandoned")
 
 
 def _canonical(path):
-    if not path.is_absolute() or path.resolve() != path or path.is_symlink():
+    if not path.is_absolute() or path.is_symlink() or path.resolve() != path:
         raise HarnessError(f"清理路径含符号链接或不规范路径；保留现场：{path}")
 
 
-def _regular_bytes(path):
-    if not stat.S_ISREG(path.lstat().st_mode):
-        raise HarnessError(f"清理证据或 Git 绑定必须为普通文件：{path}")
-    return path.read_bytes()
+def with_run_lock(files, use, *, write):
+    """Use the run lock, or preview without it when only the lock file is absent."""
+    entered = False
 
+    def held(locked):
+        nonlocal entered
+        entered = True
+        return use(locked)
 
-def refuse_other_version(state):
-    """Refuse a readable ledger of another version before the run lock is created or taken.
-
-    A missing or unreadable ledger is left to the entry's read under the lock,
-    which reports it as before and checks the version again.
-    """
     try:
-        run = json.loads(_regular_bytes(state))
-    except (OSError, ValueError, RecursionError, HarnessError):
-        return
-    require_current_ledger(run)
+        return holding(files.lock(("run.lock",), mode="exclusive" if write else "shared", create=write), held)
+    except LockUnavailable as error:
+        if entered:
+            raise
+        outcome = error.outcome
+        if not write and outcome.state == "absent" and outcome.step.leaf:
+            return use(None)
+        if outcome.state == "busy":
+            prefix = "已有进程持有运行锁" if write else "运行正被写入，暂不能预览"
+            raise HarnessError(f"{prefix}：{outcome.path}", stop=stops.make("busy", "run_lock")) from None
+        outcome.evidence({"artifact": outcome.path})
+        raise
+
+
+def read_run_state(files, locked):
+    outcome = (locked.read("state.json", limit=None) if locked is not None
+               else files.read(("state.json",), limit=None))
+    return outcome.evidence({"artifact": outcome.path})
 
 
 def _registered(repo):
@@ -63,8 +77,8 @@ def _registered(repo):
             if field.startswith("worktree ")}
 
 
-def _ensure_exited(repo, run):
-    ensure_dispatches_exited(run["dispatches"], state=repo / ".harness", observe=group_alive)
+def _ensure_exited(run, state):
+    ensure_dispatches_exited(run["dispatches"], state=state, observe=group_alive)
 
 
 def common_dir(repo):
@@ -78,19 +92,30 @@ def checkout_folder(directory, final, index):
     return Path(directory) / "verification" / "final" / str(final["attempt"]) / f"verification-{index}"
 
 
-def checkout_record_digest(artifact):
+def checkout_record_digest(directory, final, index, *, state):
     """SHA256 of a checkout record read as a canonical regular file; the verdict save binds it."""
-    _canonical(artifact)
-    return hashlib.sha256(_regular_bytes(artifact)).hexdigest()
+    folder = checkout_folder(directory, final, index)
+    artifact = folder / "checkout.json"
+    source = {"artifact": str(artifact)}
+    with stops.evidence_reads(source=source):
+        if final["verification_rounds"][index - 1]["artifact_dir"] != str(folder):
+            raise HarnessError("整体验证证据目录与运行台账不符")
+    outcome = StateFiles(state).digest(artifact.relative_to(state).parts)
+    if outcome.state != "read":
+        outcome.evidence(source)
+    return outcome.digest
 
 
-def recorded_worktree(artifact):
+def recorded_worktree(artifact, *, state):
     """The directory a checkout record names, unverified: for diagnostics, never for removal."""
-    try:
-        value = json.loads(_regular_bytes(artifact)).get("worktree")
-    except (OSError, ValueError, AttributeError, HarnessError):
+    raw = StateFiles(state).read(artifact.relative_to(state).parts, limit=None).bytes_or_none()
+    if raw is None:
         return None
-    return value if isinstance(value, str) else None
+    try:
+        value = json.loads(raw)
+    except (ValueError, RecursionError):
+        return None
+    return value["worktree"] if isinstance(value, dict) and isinstance(value.get("worktree"), str) else None
 
 
 def cleanup_run(repo: Path, ident: str, *, remove=False, confirm_exited=(), remove_input_copies=False,
@@ -103,37 +128,64 @@ def cleanup_run(repo: Path, ident: str, *, remove=False, confirm_exited=(), remo
     files in the worktree are removed only with ``remove_ignored``; those in a
     checkout always go with it.
     """
+    write = bool(remove or confirm_exited)
+    scope = git.read_only()
+    try:
+        try:
+            if not write:
+                scope.__enter__()
+            return _cleanup_run(repo, ident, remove=remove, confirm_exited=confirm_exited,
+                                remove_input_copies=remove_input_copies, remove_ignored=remove_ignored, write=write)
+        finally:
+            scope.__exit__(None, None, None)
+    finally:
+        scope.__exit__(None, None, None)
+
+
+def _cleanup_run(repo, ident, *, remove, confirm_exited, remove_input_copies, remove_ignored, write):
     repo = git.repository(repo)
-    if not ident.startswith("run_") or not ident[4:].isalnum():
-        raise HarnessError("无效 run ID")
-    directory = repo / ".harness" / "runs" / ident
-    _canonical(directory)
-    if not directory.is_dir():
-        raise HarnessError(f"运行不存在：{ident}")
-    for name in ("state.json", "run.lock", "worktree-cleanup.json"):
-        _canonical(directory / name)
-    refuse_other_version(directory / "state.json")
-    if remove or confirm_exited:
+    state = repo / ".harness"
+    precheck_run(state, ident)
+    directory = state / "runs" / ident
+    for path in (directory, directory / "state.json", directory / "run.lock", directory / "worktree-cleanup.json"):
+        with stops.evidence_reads(source={"artifact": str(path)}):
+            _canonical(path)
+    if write:
         from .private_state import ensure_private_state
         ensure_private_state(repo)
-    with (lock if remove or confirm_exited else readonly_lock)(directory / "run.lock"):
-        run, original, common, artifacts = _gate(repo, ident, directory, confirm_exited)
+    files = StateFiles(state).under("runs", ident)
+
+    def clean(locked):
+        def read_state():
+            return read_run_state(files, locked)
+
+        store = None
+        if confirm_exited:
+            store = RunStore(state)
+            store.bind_directory(locked.identity)
+        run, original, common, checkout_rounds = _gate(repo, ident, directory, files, read_state, store, confirm_exited)
         checkouts = []
-        for artifact, final, index in artifacts:
+        for artifact, final, index, verified_worktree in checkout_rounds:
             try:
-                checkouts.append(clean_checkout(repo, run, directory, final, index, common, remove))
+                outcome = files.probe(artifact.relative_to(directory).parts).or_local_io()
+                if outcome.state == "absent" and "checkout_digest" not in final["verification_rounds"][index - 1]:
+                    continue
+                checkouts.append(clean_checkout(repo, run, directory, final, index, common, remove,
+                                                state=state, verified_worktree=verified_worktree))
             except (HarnessError, OSError, ValueError) as error:
                 # The recorded directory is unverified: a diagnostic, never an authority to remove.
-                checkouts.append({"artifact": str(artifact), "recorded_worktree": recorded_worktree(artifact),
+                checkouts.append({"artifact": str(artifact), "recorded_worktree": recorded_worktree(artifact, state=state),
                                   "status": "blocked", "error": str(error)})
         try:
             worktree = _clean_worktree(repo, run, directory, original, remove, remove_input_copies,
-                                       remove_ignored)
+                                       remove_ignored, files=files, read_state=read_state)
         except (HarnessError, OSError, ValueError) as error:
             worktree = {"worktree": run["worktree"], "branch": run["branch"],
                         "status": "blocked", "error": str(error)}
         return {"id": ident, "remove": remove, "remove_ignored": remove_ignored,
                 "run_status": run.get("status"), "checkouts": checkouts, "worktree": worktree}
+
+    return with_run_lock(files, clean, write=write)
 
 
 def blocked(result):
@@ -142,16 +194,139 @@ def blocked(result):
             or any(item["status"] == "blocked" for item in result["checkouts"]))
 
 
-def _gate(repo, ident, directory, confirm_exited):
+def _gate(repo, ident, directory, files, read_state, store, confirm_exited):
     """Validate ownership and exit evidence once; return the bound ledger state."""
-    state = directory / "state.json"
-    original = _regular_bytes(state)
-    run = json.loads(original)
-    require_current_ledger(run)
-    checkout = repo / ".harness" / "worktrees" / ident
+    source = {"artifact": str(directory / "state.json")}
+    original = read_state()
+    with stops.evidence_reads(source=source):
+        run = parse_current_ledger(original)
+    common = common_dir(repo)
+    with stops.evidence_reads(source=source):
+        rounds = _validate_cleanup_ledger(repo, ident, directory, files.path, run, common)
+    if store is not None:
+        store.attach(run)
+        events = ("events.jsonl",)
+        outcome = files.read(events, limit=None)
+        if not (outcome.state == "absent" and outcome.step.leaf):
+            outcome.evidence({"artifact": outcome.path})
+
+        def audit(event, **fields):
+            store.check_current()
+            append_event(directory / events[0], ident, event, **fields)
+
+        confirm_dispatches_exited(run["dispatches"], confirm_exited, state=files.path,
+                                  audit=audit, save=store.commit, observe=group_alive)
+        original = read_state()
+    elif read_state() != original:
+        raise HarnessError("运行台账在清理前改变；保留现场", stop=stops.make("runtime_failure", "invariant"))
+    _ensure_exited(run, files.path)
+    return run, original, common, rounds
+
+
+def _published_check_matches(check, dispatch):
+    """Compare the result with the exit facts and identity saved by its own dispatch."""
+    reason = check.get("termination_reason")
+    code = check.get("exit_code")
+    outcome = check.get("process_outcome")
+    if (not isinstance(outcome, dict) or "exit_code" not in check or "exit_code" not in outcome
+            or "exit_code" not in dispatch or check.get("exit_confirmed") is not True
+            or check.get("evidence_complete") is not True or check.get("timed_out") is not (reason == "timeout")
+            or dispatch.get("process_state") != "exited" or dispatch.get("process_outcome") != outcome):
+        return False
+    for key in ("exit_code", "termination_reason", "exit_confirmed", "evidence_complete"):
+        value = check.get(key)
+        if any(type(row.get(key)) is not type(value) or row.get(key) != value for row in (outcome, dispatch)):
+            return False
+    if outcome.get("started") is True:
+        pgid = dispatch.get("pgid")
+        if (type(code) is not int or type(pgid) is not int or pgid <= 0
+                or outcome.get("startup_state") != "started"
+                or outcome.get("pid") != pgid or outcome.get("pgid") != pgid):
+            return False
+    elif (outcome.get("started") is not False or outcome.get("startup_state") != "not_started"
+          or code is not None or any(outcome.get(key) is not None for key in ("pid", "pgid"))
+          or dispatch.get("pgid") is not None):
+        return False
+    status = check.get("status")
+    if dispatch.get("status") != ("completed" if status == "passed" else status):
+        return False
+    if reason == "normal":
+        return code is not None and status == ("passed" if code == 0 else "failed")
+    if reason == "timeout":
+        return status == "timed_out"
+    return reason == "start_failed" and code is None and status == "failed"
+
+
+def _validate_published_verification(files, folder, final, commands, dispatches, seen, *, worktree, fresh_checkout):
+    """Check a round's complete result set before any explicit cleanup can touch resources."""
+    from .finalization import verification_failure_kind
+
+    artifact = folder / "results.json"
+    source = {"artifact": str(artifact)}
+    with stops.evidence_reads(source=source):
+        def fail():
+            raise HarnessError(f"第 {final['attempt']} 次整体验证的轮次结果、派发或结论不符；保留现场")
+
+        results = strict_json_loads(files.read(artifact.relative_to(files.path).parts, limit=None).evidence(source))
+        if not isinstance(results, list) or len(results) != len(commands):
+            fail()
+        verified_worktree = None
+        for index, (check, command) in enumerate(zip(results, commands)):
+            if (not isinstance(check, dict) or check.get("command") != command
+                    or check.get("log") != str(folder / f"check-{index}")
+                    or any(not isinstance(check.get(key), str) for key in ("stdout", "stderr"))):
+                fail()
+            timing = check.get("timing_source")
+            ident = timing.get("dispatch_id") if isinstance(timing, dict) else None
+            if not isinstance(ident, str) or ident in seen:
+                fail()
+            dispatch = dispatches.get(ident)
+            if (dispatch is None or dispatch.get("role") != "verification" or dispatch.get("task_id") != "final"
+                    or "phase" in dispatch or "phase" in check or dispatch.get("command") != command
+                    or timing.get("scope") != "formal_verification_command_including_cleanup"
+                    or timing.get("scope") != dispatch.get("timing_scope")
+                    or any(check.get(key) != dispatch.get(key)
+                           for key in ("started_at", "finished_at", "duration_seconds"))
+                    or not _published_check_matches(check, dispatch)):
+                fail()
+            if fresh_checkout:
+                if (not isinstance(check.get("worktree"), str) or check["worktree"] != dispatch.get("worktree")
+                        or check.get("checkout_artifact") != str(folder / "checkout.json")
+                        or (verified_worktree is not None and check["worktree"] != verified_worktree)):
+                    fail()
+                verified_worktree = check["worktree"]
+            elif dispatch.get("worktree") != worktree:
+                fail()
+            seen.add(ident)
+        failure_kind = verification_failure_kind(results)
+        if final["status"] == "verification_failed":
+            if failure_kind is None or failure_kind != final["failure_kind"]:
+                fail()
+            saved = final["verification_failures"]
+            if len(saved) != len(results):
+                fail()
+            expected = compact_checks(results)
+            for actual, projected in zip(saved, expected):
+                # Older summaries may omit display fields. The full round
+                # results still supply the logs and outcome for every check.
+                for key in ("stdout", "stderr", "log"):
+                    if key not in actual:
+                        projected.pop(key, None)
+                if json.dumps(actual, sort_keys=True, allow_nan=False) != json.dumps(
+                        projected, sort_keys=True, allow_nan=False):
+                    fail()
+        elif failure_kind is not None or "verification_failures" in final or "failure_kind" in final:
+            fail()
+        return verified_worktree
+
+
+def _validate_cleanup_ledger(repo, ident, directory, state_root, run, common):
+    from .finalization import validate_final_records
+    from .review_progress import entries
+
+    checkout = state_root / "worktrees" / ident
     _canonical(checkout)
     branch = "harness/" + ident
-    common = common_dir(repo)
     if (run.get("id") != ident or run.get("repo") != str(repo)
             or run.get("worktree") != str(checkout) or run.get("branch") != branch
             or not isinstance(run.get("expected_head"), str)
@@ -172,37 +347,68 @@ def _gate(repo, ident, directory, confirm_exited):
     validate_dispatch_indexes(directory, run["dispatches"])
     validate_input_dispatch_indexes(directory, run["dispatches"])
     validate_worker_receipt_links(run, directory)
-    if confirm_exited:
-        store = RunStore(repo / ".harness")
-        store.attach(run)
-        events = directory / "events.jsonl"
-        _canonical(events)
-        if events.exists():
-            _regular_bytes(events)
-        confirm_dispatches_exited(run["dispatches"], confirm_exited, state=repo / ".harness",
-            audit=lambda event, **fields: append_event(events, ident, event, **fields),
-            save=store.commit, observe=group_alive)
-        original = _regular_bytes(state)
-    elif _regular_bytes(state) != original:
-        raise HarnessError("运行台账在清理前改变；保留现场")
-    _ensure_exited(repo, run)
-    artifacts = []
-    for final in run["final_history"]:
-        if (not isinstance(final, dict) or type(final.get("attempt")) is not int
-                or final["attempt"] < 1 or not isinstance(final.get("head"), str)
-                or not isinstance(final.get("verification_rounds"), list)):
-            raise HarnessError("整体验证台账无效；保留现场")
-        for index, round_record in enumerate(final["verification_rounds"], 1):
+    history = run["final_history"]
+    entries(history, whole_run=True)
+    validate_final_records(history)
+    if run.get("status") == "completed" and not any(
+            final["status"] == "approved" and final["head"] == run["expected_head"] for final in history):
+        raise HarnessError("已完成的 run 缺少对应 HEAD 的整体批准记录；保留现场")
+    if not history:
+        return []
+    config = run.get("config_snapshot")
+    verification = config.get("verification") if isinstance(config, dict) else None
+    if not isinstance(verification, dict) or type(verification.get("fresh_checkout")) is not bool:
+        raise HarnessError("整体验证的全新检出配置快照缺失或无效；保留现场")
+    fresh_checkout = verification["fresh_checkout"]
+    commands = verification.get("commands")
+    dispatches = {}
+    for dispatch in run["dispatches"]:
+        ident_value = dispatch.get("id")
+        if isinstance(ident_value, str):
+            dispatches[ident_value] = None if ident_value in dispatches else dispatch
+    files = StateFiles(state_root)
+    seen_checks = set()
+    checkouts = []
+    for attempt, final in enumerate(history, 1):
+        if final["attempt"] != attempt:
+            raise HarnessError(f"整体验证台账的第 {attempt} 次尝试编号不符；保留现场")
+        if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", final["head"]):
+            raise HarnessError(f"第 {attempt} 次整体记录的 HEAD 无效；保留现场")
+        attempt_dir = directory / "verification" / "final" / str(attempt)
+        if (final["artifact"] != str(attempt_dir / "final.json")
+                or final["snapshot_artifact"] != str(attempt_dir / "snapshot.json")):
+            raise HarnessError(f"第 {attempt} 次整体记录的证据路径不符；保留现场")
+        rounds = final["verification_rounds"]
+        # Publication completes the last round and binds its results and fresh checkout in one save.
+        published = final["phase"] != "verifying"
+        verdict_fields = ("verification", "verification_failures", "failure_kind", "diff_artifact")
+        if (published and not rounds) or (not published and any(key in final for key in verdict_fields)):
+            raise HarnessError(f"第 {attempt} 次整体验证的结论与轮次不符；保留现场")
+        for index, round_record in enumerate(rounds, 1):
             folder = checkout_folder(directory, final, index)
-            if not isinstance(round_record, dict) or round_record.get("artifact_dir") != str(folder):
+            if round_record["artifact_dir"] != str(folder):
                 raise HarnessError("整体验证证据目录与运行台账不符")
-            artifact = folder / "checkout.json"
-            _canonical(artifact)
-            if artifact.exists():
-                artifacts.append((artifact, final, index))
-    if len({artifact for artifact, _, _ in artifacts}) != len(artifacts):
-        raise HarnessError("整体验证台账重复引用检出证据")
-    return run, original, common, artifacts
+            completed = published and index == len(rounds)
+            if (round_record["status"] != ("completed" if completed else "running")
+                    or (completed and final["verification"] != str(folder / "results.json"))):
+                raise HarnessError(f"第 {attempt} 次整体验证的结论与第 {index} 轮不符；保留现场")
+            if completed and fresh_checkout:
+                valid_digest = re.fullmatch(r"[0-9a-f]{64}", round_record.get("checkout_digest", "")) is not None
+            else:
+                valid_digest = "checkout_digest" not in round_record
+            if not valid_digest:
+                raise HarnessError(f"第 {attempt} 次整体验证第 {index} 轮的检出摘要缺失或无效；保留现场")
+            verified_worktree = None
+            if completed:
+                # Verification settings cannot change across a resume. Use the
+                # saved settings, even if the project's configuration changed.
+                if not isinstance(commands, list) or not all(map(valid_command, commands)):
+                    raise HarnessError("整体验证的命令配置快照缺失或无效；保留现场")
+                verified_worktree = _validate_published_verification(
+                    files, folder, final, commands, dispatches, seen_checks,
+                    worktree=run["worktree"], fresh_checkout=fresh_checkout)
+            checkouts.append((folder / "checkout.json", final, index, verified_worktree))
+    return checkouts
 
 
 def _checkout_identity(repo, run, environment, expected_head, common):
@@ -230,22 +436,43 @@ def _checkout_identity(repo, run, environment, expected_head, common):
     return checkout, binding
 
 
+def _root_missing(checkout):
+    try:
+        os.lstat(checkout.parents[1])
+    except FileNotFoundError:
+        return True
+    return False
+
+
 def _check_missing_binding(checkout, binding):
     """A missing checkout can still have an exact, inspectable registration."""
+    if _root_missing(checkout):
+        raise HarnessError("检出根目录已不在；保留 Git 登记")
     admin = Path(binding["git_dir"])
     for name, digest_key, target in (
         ("gitdir", "backlink_sha256", checkout / ".git"),
         ("commondir", "commondir_sha256", Path(binding["common_dir"])),
     ):
-        data = _regular_bytes(admin / name)
+        data = git._binding_file(admin / name)
         resolved = (admin / Path(os.fsdecode(data.removesuffix(b"\n")))).resolve()
         if hashlib.sha256(data).hexdigest() != binding[digest_key] or resolved != target:
             raise HarnessError("缺失检出的 Git 反向或公共目录绑定已改变；保留注册")
-    if _regular_bytes(admin / "HEAD").strip() != binding["detached_head"].encode("ascii"):
+    if git._binding_file(admin / "HEAD").strip() != binding["detached_head"].encode("ascii"):
         raise HarnessError("缺失检出的 detached HEAD 绑定已改变；保留注册")
 
 
-def clean_checkout(repo, run, directory, final, index, common, remove, *, by="cleanup-run"):
+def _read_receipt(files, components):
+    outcome = files.read(components, limit=None)
+    if outcome.state == "absent" and outcome.step.leaf:
+        return None
+    with stops.evidence_reads(source={"artifact": outcome.path}):
+        value = json.loads(outcome.evidence({"artifact": outcome.path}))
+        if not isinstance(value, dict):
+            raise HarnessError(f"清理记录不是对象；保留现场：{outcome.path}")
+        return value
+
+
+def clean_checkout(repo, run, directory, final, index, common, remove, *, state, by="cleanup-run", verified_worktree=None):
     """One fresh verification checkout; its receipt is cleanup.json beside the evidence.
 
     Round ``index`` of the whole-run record ``final`` names the evidence
@@ -253,35 +480,38 @@ def clean_checkout(repo, run, directory, final, index, common, remove, *, by="cl
     and a round whose verdict was saved also binds the record's bytes; only
     then do the identity, binding and removability gates run. Ignored files
     inside this runtime-owned checkout are removed with it. ``by`` names the
-    writer of the receipt (the runtime or cleanup-run).
+    writer of the receipt (the runtime or cleanup-run). The caller supplies
+    the state directory for the command exit check.
     """
     folder = checkout_folder(directory, final, index)
     round_record = final["verification_rounds"][index - 1]
     if not isinstance(round_record, dict) or round_record.get("artifact_dir") != str(folder):
         raise HarnessError("整体验证证据目录与运行台账不符")
     artifact = folder / "checkout.json"
-    _canonical(artifact)
+    files = StateFiles(state).under(*folder.relative_to(state).parts)
+    source = {"artifact": str(artifact)}
     expected_head = final["head"]
-    original = _regular_bytes(artifact)
-    environment = json.loads(original)
+    original = files.read(("checkout.json",), limit=None).evidence(source)
+    with stops.evidence_reads(source=source):
+        if round_record["status"] == "completed" and "checkout_digest" not in round_record:
+            raise HarnessError("已完成的验证检出缺少结论摘要；保留现场")
+        environment = json.loads(original)
     if not isinstance(environment, dict) or environment.get("owner") != {
             "run_id": run["id"], "attempt": final["attempt"], "round": index}:
         raise HarnessError("验证检出记录不属于该 run 的这一轮验证；保留现场")
-    if ("checkout_digest" in round_record
-            and hashlib.sha256(original).hexdigest() != round_record["checkout_digest"]):
+    digest = hashlib.sha256(original).hexdigest()
+    if "checkout_digest" in round_record and digest != round_record["checkout_digest"]:
         raise HarnessError("验证检出记录与整体验证结论保存的摘要不符；保留现场")
     checkout, binding = _checkout_identity(repo, run, environment, expected_head, common)
+    if verified_worktree is not None and str(checkout) != verified_worktree:
+        raise HarnessError("验证检出与该轮检查派发记录不符；保留现场")
     receipt_path = artifact.with_name("cleanup.json")
-    _canonical(receipt_path)
-    digest = hashlib.sha256(original).hexdigest()
     receipt = {"run_id": run["id"], "artifact": str(artifact), "artifact_digest": digest,
                "worktree": str(checkout), "head": expected_head}
-    previous = None
-    if receipt_path.exists():
-        previous = json.loads(_regular_bytes(receipt_path))
-        if (not isinstance(previous, dict) or any(previous.get(key) != value for key, value in receipt.items())
-                or previous.get("status") not in ("pending", "removed")):
-            raise HarnessError("清理记录与原验证证据不符；保留现场")
+    previous = _read_receipt(files, ("cleanup.json",))
+    if previous is not None and (any(previous.get(key) != value for key, value in receipt.items())
+                                 or previous.get("status") not in ("pending", "removed")):
+        raise HarnessError("清理记录与原验证证据不符；保留现场")
     exists = checkout.exists()
     registered = str(checkout) in _registered(repo)
     if previous and previous["status"] == "removed":
@@ -307,8 +537,8 @@ def clean_checkout(repo, run, directory, final, index, common, remove, *, by="cl
         return result
     # Persist intent before Git changes anything, without altering raw evidence.
     write_json(receipt_path, {**receipt, "status": "pending", "by": by, "time": time.time()})
-    _ensure_exited(repo, run)
-    if _regular_bytes(artifact) != original:
+    _ensure_exited(run, state)
+    if files.read(("checkout.json",), limit=None).evidence(source) != original:
         raise HarnessError("验证检出证据在清理前改变；保留现场")
     if exists:
         git.check_worktree_binding(checkout, binding)
@@ -347,12 +577,12 @@ def _ignored_gate(checkout, binding, remove_ignored):
     return git.bounded_paths(names) if remove_ignored else None
 
 
-def _clean_worktree(repo, run, directory, original, remove, remove_input_copies, remove_ignored):
+def _clean_worktree(repo, run, directory, original, remove, remove_input_copies, remove_ignored, *, files, read_state):
     """The run's branch worktree; its receipt is worktree-cleanup.json in the run directory."""
     checkout, branch = Path(run["worktree"]), run["branch"]
     binding = run["worktree_binding"]
     admin = Path(binding["git_dir"])
-    state, receipt_path = directory / "state.json", directory / "worktree-cleanup.json"
+    receipt_path = directory / "worktree-cleanup.json"
     result = {"worktree": str(checkout), "branch": branch}
     if run.get("status") not in TERMINAL:
         # Policy, not a refusal: the run can still be finished or abandoned.
@@ -364,13 +594,10 @@ def _clean_worktree(repo, run, directory, original, remove, remove_input_copies,
     # --confirm-exited may rewrite the ledger between an interruption and its rerun.
     identity = {"id": run["id"], "worktree": str(checkout), "branch": branch,
                 "head": expected, "binding": binding}
-    previous = None
-    if receipt_path.exists():
-        previous = json.loads(_regular_bytes(receipt_path))
-        if (not isinstance(previous, dict)
-                or any(previous.get(k) != v for k, v in identity.items())
-                or previous.get("status") not in ("pending", "removed")):
-            raise HarnessError("清理记录与运行证据不符；保留现场")
+    previous = _read_receipt(files, ("worktree-cleanup.json",))
+    if previous is not None and (any(previous.get(k) != v for k, v in identity.items())
+                                 or previous.get("status") not in ("pending", "removed")):
+        raise HarnessError("清理记录与运行证据不符；保留现场")
     exists = checkout.exists()
     input_summary = {"status": "none", "files": []}
     registered = str(checkout) in _registered(repo)
@@ -418,8 +645,8 @@ def _clean_worktree(repo, run, directory, original, remove, remove_input_copies,
         # Completing a removal an earlier command performed keeps what that command recorded.
         record.update({key: previous[key] for key in ("remove_ignored", "ignored_paths") if key in previous})
     write_json(receipt_path, {**record, "status": "pending", "time": time.time()})
-    _ensure_exited(repo, run)
-    if _regular_bytes(state) != original:
+    _ensure_exited(run, files.path)
+    if read_state() != original:
         raise HarnessError("运行台账在清理前改变；保留现场")
     if exists:
         if not _branch_matches(repo, branch, expected):

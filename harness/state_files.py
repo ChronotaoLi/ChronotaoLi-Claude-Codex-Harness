@@ -719,6 +719,14 @@ class StateFiles(_Files):
     Holds no descriptor: each call opens the root by path and closes what it opened.
     """
 
+    @classmethod
+    def nofollow_directory(cls, path):
+        """Walk an absolute evidence directory too, so it cannot redirect reads by being a link."""
+        directory = Path(path)
+        if not directory.is_absolute():
+            raise ValueError("evidence directory must be absolute")
+        return cls(directory.anchor, prefix=directory.parts[1:])
+
     @staticmethod
     def held(path):
         """For an observation: the HeldFiles that opens the root once, when its ``with`` block is entered."""

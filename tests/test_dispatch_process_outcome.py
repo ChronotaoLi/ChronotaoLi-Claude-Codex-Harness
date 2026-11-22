@@ -79,8 +79,8 @@ class DispatchProcessOutcomeTests(RepoCase):
         from harness.run_store import RunStore
         commits, original = [], RunStore.commit
 
-        def record(store):
-            revision = original(store)
+        def record(store, **kwargs):
+            revision = original(store, **kwargs)
             commits.append(deepcopy(store.run))
             return revision
         # The fallback probe fails; the judgment's own exit check is a separate, later observation.

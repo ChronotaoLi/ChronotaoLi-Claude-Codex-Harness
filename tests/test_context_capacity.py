@@ -5,7 +5,8 @@ import json
 import unittest
 from pathlib import Path
 
-from harness.context import compact_plan, prompt_json
+from harness.config import DEFAULTS
+from harness.context import ContextCapacityError, compact_plan, compose, prompt_json
 from harness.contracts import apply_revision
 from harness.util import HarnessError, dump, read_json
 from test_harness import RepoCase, ROOT, walk_exit
@@ -146,22 +147,70 @@ class FinalContextCapacityTests(RepoCase):
             task = copy.deepcopy(self.plan()["tasks"][0])
             task.update(id=f"task{index}", title=f"Task {index}", description="x" * 400)
             tasks.append(task)
+        goal = "Implement greeting throughout the project"
+        plan = {"tasks": tasks}
+        limits = self.config.data["runtime"]
+
+        def largest_required(engine, result):
+            reports = [
+                read_json(engine.directory / "dispatches" / entry["id"] / "context-report.json")
+                for entry in result["dispatches"] if entry["role"] in ("commander", "worker", "reviewer")
+            ]
+            self.assertEqual([(report["role"], report["kind"]) for report in reports],
+                             [("commander", "decide"), ("worker", "implement"), ("reviewer", "review")])
+            return max(report["required_chars"] for report in reports)
+
+        # Calibrate only the first task, using the same ready set and real packets.
+        limits["context_chars"] = DEFAULTS["runtime"]["context_chars"]
+        calibration = self.engine(ScriptedBackend())
+        with contextlib.redirect_stderr(io.StringIO()):
+            calibrated = calibration.start(goal, plan, step=True)
+        estimate = calibrated["context_capacity"]
+        lower = max(estimate["required_chars"], largest_required(calibration, calibrated))
+        upper = estimate["projected_chars"]
+        budget = (lower + upper) // 2
+        self.assertLess(lower, budget)
+        self.assertLess(budget, upper)
+        limits["context_chars"] = budget
+
+        required_inputs = []
+
+        def capture_input(backend, kwargs, packet):
+            required_inputs.append(json.loads(kwargs["prompt"].split("\n\nREFERENCE MEMORY", 1)[0]))
+
         backend = ScriptedBackend()
+        backend.before_result = capture_input
         engine = self.engine(backend)
         output = io.StringIO()
         with contextlib.redirect_stderr(output):
-            result = engine.start("Implement greeting throughout the project", {"tasks": tasks}, step=True)
+            result = engine.start(goal, plan, step=True)
         self.assertEqual(result["status"], "paused")
         self.assertEqual(sum(result["attempts"].values()), 1)
         self.assertEqual(set(result["accepted"]), {"task0"})
+        self.assertEqual(backend.calls[0]["packet"]["trigger"]["ready"], [task["id"] for task in tasks])
         report = result["context_capacity"]
         self.assertEqual(report["status"], "projected_overflow")
+        self.assertEqual(report["budget_chars"], budget)
+        self.assertGreater(report["projected_chars"], budget)
+        self.assertGreater(budget, report["required_chars"])
+        required_chars = largest_required(engine, result)
+        self.assertGreater(budget, required_chars)
+
+        heaviest = max(required_inputs, key=lambda required: len(prompt_json(required)))
+        self.assertEqual(len(prompt_json(heaviest)), required_chars)
+        with self.assertRaises(ContextCapacityError) as rejected:
+            compose(heaviest, [], required_chars - 1)
+        self.assertEqual(rejected.exception.report["required_chars"], required_chars)
+        _, fitted = compose(heaviest, [], budget)
+        self.assertEqual(fitted["required_chars"], required_chars)
+
         events = [json.loads(line) for line in (engine.directory / "events.jsonl").read_text().splitlines()]
         preflight_index = next(i for i, event in enumerate(events) if event["event"] == "final_context_preflight")
         worker_index = next(i for i, event in enumerate(events)
                             if event["event"] == "dispatch_started" and event["role"] == "worker")
         self.assertLess(preflight_index, worker_index)
-        before_worker = output.getvalue().split("[harness] dispatch_started task0")[0]
+        before_worker, worker_started, _ = output.getvalue().partition("[harness] dispatch_started task0")
+        self.assertTrue(worker_started)
         self.assertIn(str(report["projected_chars"]), before_worker)
         self.assertIn(str(report["budget_chars"]), before_worker)
 

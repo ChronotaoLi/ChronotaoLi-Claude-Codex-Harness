@@ -452,6 +452,7 @@ while not os.path.exists(sys.argv[2]):
         self.assertEqual(facts['termination_reason'], 'cancelled')
         self.assertEqual(facts['exit_code'], -signal.SIGTERM)
         self.assertTrue(facts['exit_confirmed'])
+        self.assertTrue(facts['evidence_complete'])
 
     def test_real_sigint_in_cleanup_deferral_inside_a_callers_handler_cancels(self):
         def call():
@@ -467,6 +468,7 @@ while not os.path.exists(sys.argv[2]):
         self.assertEqual(facts['termination_reason'], 'cancelled')
         self.assertEqual(facts['exit_code'], 0)
         self.assertTrue(facts['exit_confirmed'])
+        self.assertTrue(facts['evidence_complete'])
 
     def test_timeout_and_missing_program_inside_a_callers_handler_keep_their_reason(self):
         missing = str(self.root / 'missing-program')

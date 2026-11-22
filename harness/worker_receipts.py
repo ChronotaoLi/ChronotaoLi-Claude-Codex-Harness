@@ -1,18 +1,18 @@
 """Durable worker handoff: immutable returned candidates, replayable local gates."""
 from copy import deepcopy
+from fnmatch import fnmatchcase
 import hashlib
 import json
-import os
 from pathlib import Path
 import re
-import stat
 
 from . import git, stops
 from .contracts import judge_work, validate_work_core
 from .recovery import read_bound_result, snapshot_digest
 from .services import RuntimeService
+from .state_files import StateFiles, StateReadError
 from .util import EvidenceError, HarnessError, dump, read_json, write_json
-from .worker_returns import inspect_return, validate_return_evidence
+from .worker_returns import inspect_return, validate_return_evidence, worker_evidence_files
 
 # Worker inputs live beside the dispatch as immutable files; the ledger keeps
 # their paths and SHA256.
@@ -22,30 +22,16 @@ INPUTS = {'packet': 'packet.json', 'schema': 'schema.json'}
 @stops.reads_evidence
 def read_worker_input(directory, entry, intent, field):
     """Read one referenced input after checking its path, file type and SHA256."""
-    job = Path(directory) / 'dispatches' / entry['id']
+    dispatch_id = entry['id']
+    if (not isinstance(dispatch_id, str) or dispatch_id in ('', '.', '..')
+            or '/' in dispatch_id or '\0' in dispatch_id):
+        raise HarnessError('worker input dispatch identity invalid; preserve evidence')
+    job = Path(directory) / 'dispatches' / dispatch_id
     path = job / INPUTS[field]
     digest = intent.get(field + '_artifact_digest')
     if intent.get(field + '_artifact') != str(path) or not isinstance(digest, str):
         raise HarnessError(f'worker {field} reference invalid; preserve evidence')
-    if any(item.is_symlink() for item in (job, job.parent)):
-        raise HarnessError(f'worker {field} directory is a symlink; preserve evidence')
-    try:
-        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    except OSError as error:
-        stops.keep_local_io(error)
-        raise HarnessError(f'worker {field} artifact missing or a symlink; preserve evidence: {path}') from error
-    try:
-        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-            raise HarnessError(f'worker {field} artifact must be a regular file; preserve evidence: {path}')
-        with os.fdopen(descriptor, 'rb') as stream:
-            descriptor = None
-            raw = stream.read()
-    except OSError as error:
-        stops.keep_local_io(error)
-        raise HarnessError(f'cannot read worker {field} artifact; preserve evidence: {path}') from error
-    finally:
-        if descriptor is not None:
-            os.close(descriptor)
+    raw = worker_evidence_files(job).read((INPUTS[field],), limit=None).evidence({'artifact': str(path)})
     if hashlib.sha256(raw).hexdigest() != digest:
         raise HarnessError(f'worker {field} artifact changed; preserve evidence: {path}')
     try:
@@ -222,6 +208,9 @@ class WorkerReceipts(RuntimeService):
         self.context.ensure_exited()
         try:
             return self._pending()
+        except StateReadError:
+            # A filesystem failure is neither a verdict nor a reason to update the receipt.
+            raise
         except HarnessError as error:
             receipts = self.context.run['worker_receipts']
             receipt = next(iter(receipts.values())) if isinstance(receipts, dict) and len(receipts) == 1 else None
@@ -432,13 +421,17 @@ def returned_unsealed(run, directory, dispatch_id):
     receipts = run.get('worker_receipts')
     receipt = next((r for r in receipts.values() if isinstance(r, dict) and r.get('dispatch_id') == dispatch_id),
                    None) if isinstance(receipts, dict) else None
-    if receipt is None or not isinstance(dispatch_id, str) or not dispatch_id or '/' in dispatch_id:
+    if (receipt is None or not isinstance(dispatch_id, str) or dispatch_id in ("", ".", "..")
+            or "/" in dispatch_id or "\0" in dispatch_id):
         return False
-    job = Path(directory) / 'dispatches' / dispatch_id
-    if any(job.glob('worker-seal.*.json')):
+    directory = Path(directory)
+    files = StateFiles(directory.parent.parent).under("runs", directory.name, "dispatches", dispatch_id)
+    listing = files.entries()
+    if listing.state != "listed":
         return False
-    return any((job / name).is_file() and not (job / name).is_symlink()
-               for name in ('response.json', 'returned-result.json'))
+    if any(kind == "file" and fnmatchcase(name, "worker-seal.*.json") for name, kind in listing.entries):
+        return False
+    return any(files.probe((name,)).state == "present" for name in ("response.json", "returned-result.json"))
 
 
 def validate_worker_receipt_links(run, directory):

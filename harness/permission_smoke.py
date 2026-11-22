@@ -21,7 +21,7 @@ from pathlib import Path
 from . import git
 from .adapters import CLIBackend
 from .config import Config
-from .util import HarnessError, dump, run_process, write_json
+from .util import HarnessError, display_text, dump, one_line, run_process, write_json
 
 
 def prepare_fixture(directory):
@@ -33,10 +33,10 @@ def prepare_fixture(directory):
     (repo / "permission_control.py").write_text(
         'from pathlib import Path\nPath("command-control.txt").write_text("command allowed\\n")\n'
         'print("permission command control succeeded")\n', encoding="utf-8")
-    git.git(repo, "init", "-q", "-b", "main", effect=git.CHECKOUT, isolated_config=True)
+    git.git(repo, "init", "--template=", "-q", "-b", "main", effect=git.CHECKOUT, isolated_config=True)
     git.git(repo, "add", ".", effect=git.INDEX, isolated_config=True)
     git.git(repo, "commit", "-qm", "Permission fixture", effect=git.INDEX_REFS, isolated_config=True)
-    git.git(repo, "worktree", "add", "--detach", str(worktree), effect=git.CHECKOUT, isolated_config=True)
+    git.add_worktree(repo, worktree, "HEAD", isolated_config=True)
     outside = directory / "outside.txt"
     outside_text = "outside read control " + uuid.uuid4().hex + "\n"
     outside.write_text(outside_text, encoding="utf-8")
@@ -200,8 +200,8 @@ def permission_smoke(config, repo, *, timeout=180, max_turns=16, max_budget_usd=
                                     "one of them inside a read-only prefix; external MCP disabled",
               "outside_read_policy": "allowed by the adapter's Read grant",
               "limitations": "one CLI version and fixture; not OS isolation or an exhaustive Bash allowlist"}
-    print(f"[harness] LIVE PERMISSION SMOKE model={model['model']} max_budget_usd={max_budget_usd} "
-          f"evidence={directory}", file=sys.stderr, flush=True)
+    print(f"[harness] LIVE PERMISSION SMOKE model={one_line(model['model'])} max_budget_usd={max_budget_usd} "
+          f"evidence={one_line(directory)}", file=sys.stderr, flush=True)
     env = os.environ.copy()
     env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] = "1"
     try:
@@ -234,7 +234,7 @@ def _main(argv=None):
         print(dump(report))
         return 0 if report["passed"] else 1
     except (HarnessError, OSError, ValueError, subprocess.TimeoutExpired) as e:
-        print(f"harness: {e}", file=sys.stderr)
+        print("harness: " + display_text(e), file=sys.stderr)
         return 1
     except KeyboardInterrupt:
         return 130

@@ -1,5 +1,6 @@
 """Command directories on formal verification's side: task and whole-run gates, fresh checkouts, the bound root."""
 import contextlib
+import errno
 import json
 import os
 import shutil
@@ -12,7 +13,9 @@ from unittest.mock import patch
 
 from git_isolation import clean_environment, fixture_git as _git
 from harness import git, verification
+from harness.commands import command_id
 from harness.config import Config
+from harness.input_projection import validate_indexes
 from harness.util import HarnessError, read_json
 from test_command_cwd_broker import capture_tail
 from test_harness import ROOT, RepoCase, walk_exit, write_project_config
@@ -121,7 +124,30 @@ class CommandDirectoryVerificationTests(RepoCase):
         self.assertEqual((ledger["stop"]["kind"], ledger["stop"]["reason"]), ("budget", "task_attempts"))
 
     def test_a_missing_directory_fails_the_task_check_and_the_rest_of_its_commands_still_run(self):
-        missing, check = {"cwd": "build", "argv": [sys.executable, "-c", "pass"]}, {"cwd": "app", "argv": CHECK}
+        missing = {"cwd": "build", "argv": ["python3", "-c", "pass"]}
+        _, rework = self.check_missing_directory_rework(missing)
+        self.assertEqual(rework["feedback"]["verification"][0]["command"], missing)
+
+    def test_a_missing_directory_reports_the_exact_command_by_reference_on_rework(self):
+        missing = {"cwd": "build", "argv": ["python3", "-c", "pass  # " + "x" * 2000]}
+        engine, rework = self.check_missing_directory_rework(missing)
+        expected_id = command_id(missing)
+        self.assertEqual(rework["feedback"]["verification"][0]["command"], {"exact_command_ref": expected_id})
+
+        # The worker resolves the ID in this packet's catalog, validating an indexed catalog before reading it.
+        catalog = rework["exact_command_catalog"]
+        if isinstance(catalog, dict):
+            digest = catalog["input_index"]
+            index = rework["input_evidence_indexes"][digest]
+            self.assertEqual(catalog, {"input_index": index["artifact_digest"], "count": index["count"]})
+            validate_indexes(engine.directory, [index])
+            catalog = read_json(Path(index["artifact"]))["records"]
+        records = [record for record in catalog if record["id"] == expected_id]
+        self.assertEqual(records, [{"id": expected_id, "command": missing}])
+
+    def check_missing_directory_rework(self, missing):
+        # Keep both configured commands independent of the interpreter's installation path.
+        check = {"cwd": "app", "argv": ["python3", *CHECK[1:]]}
         self.configure([missing, check])
 
         def second_attempt_builds(backend, kwargs, packet, result):
@@ -144,9 +170,15 @@ class CommandDirectoryVerificationTests(RepoCase):
         entry = self.checks(ledger, command=missing)[0]
         self.assertEqual((facts(entry), entry["process_state"]), (NOT_STARTED, "exited"))
         # The rework was told which check failed and why.
-        told = [call["packet"] for call in backend.calls if call["role"] == "worker"][1]["feedback"]["verification"][0]
-        self.assertEqual((told["command"], facts(told)), (missing, NOT_STARTED))
+        _, rework = [call["packet"] for call in backend.calls if call["role"] == "worker"]
+        told = rework["feedback"]["verification"][0]
+        self.assertEqual(facts(told), NOT_STARTED)
         self.assertIn("'build' 不存在", told["stderr"])
+        retried = read_json(engine.directory / "verification" / "tasks" / "greet" / "2" / "results.json")
+        self.assertEqual([(row["command"], row["status"], row["exit_code"]) for row in retried],
+                         [(missing, "passed", 0), (check, "passed", 0)])
+        self.assertEqual(self.events(engine).count("task_accepted"), 1)
+        return engine, rework
 
     def test_a_check_whose_stderr_tail_is_cut_inside_a_character_is_a_failed_check_and_the_task_is_reworked(self):
         # 4,201 bytes of stderr, the 4,000-byte tail starting on the last byte of a three-byte character; fails until build/ exists.
@@ -229,6 +261,62 @@ class CommandDirectoryVerificationTests(RepoCase):
                          [(command, NOT_STARTED)])
         trigger = [call for call in backend.calls if call["kind"] == "decide"][-1]["packet"]["trigger"]
         self.assertEqual(trigger["final_review"]["status"], "verification_failed")
+
+    def program_failure(self, error_number):
+        program = self.outside / f"check-{errno.errorcode[error_number]}"
+        program.unlink(missing_ok=True)
+        if error_number != errno.ENOENT:
+            program.write_text("exit 0\n")
+            program.chmod(0o755 if error_number == errno.ENOEXEC else 0o644)
+        return program
+
+    def test_program_start_failure_reaches_task_rework_and_final_decision(self):
+        for number in (errno.ENOENT, errno.EACCES, errno.ENOEXEC):
+            with self.subTest(errno=number):
+                program = self.program_failure(number)
+                command = {"cwd": ".", "argv": [str(program)]}
+                self.configure([command])
+
+                def change(backend, kwargs, packet, result):
+                    if kwargs["role"] == "worker" and (packet["feedback"] or {}).get("verification"):
+                        program.write_text("#!/bin/sh\nexit 0\n")
+                        program.chmod(0o755)
+                    if kwargs["kind"] == "review":
+                        self.program_failure(number)
+
+                backend = ScriptedBackend(change)
+                engine, error, ledger = self.stopped(backend)
+                self.assertEqual(stop_of(error), ("operator_decision", "answer_required"))
+                _, retry = (call for call in backend.calls if call["role"] == "worker")
+                told, = retry["packet"]["feedback"]["verification"]
+                self.assertEqual((told["command"], facts(told)), (command, NOT_STARTED))
+                self.assertIn(str(program), told["stderr"])
+                self.assertIn(os.strerror(number), told["stderr"])
+                record = ledger["final_history"][-1]
+                self.assertEqual((record["status"], record["failure_kind"]), ("verification_failed", "exit_code"))
+                final, = record["verification_failures"]
+                self.assertEqual((final["command"], facts(final)), (command, NOT_STARTED))
+                trigger = [call["packet"]["trigger"] for call in backend.calls if call["kind"] == "decide"][-1]
+                self.assertEqual(trigger["final_review"]["status"], "verification_failed")
+                self.assertEqual([entry["status"] for entry in self.checks(ledger)], ["failed", "completed", "failed"])
+                row, = read_json(engine.directory / "verification/tasks/greet/1/results.json")
+                self.assertEqual(row["process_outcome"]["errors"][0]["type"], "ProgramStartError")
+
+    def test_program_start_failure_in_fresh_checkout_setup_is_a_setup_failure(self):
+        for number in (errno.ENOENT, errno.EACCES, errno.ENOEXEC):
+            with self.subTest(errno=number):
+                program = self.program_failure(number)
+                command = {"cwd": ".", "argv": [str(program)]}
+                self.configure([{"cwd": "app", "argv": CHECK}], setup=[command])
+                engine, error, ledger = self.stopped()
+                self.assertEqual(stop_of(error), ("verification", "setup_failed"))
+                self.assertEqual((ledger["stop"]["kind"], ledger["stop"]["reason"]), stop_of(error))
+                artifact, = engine.directory.glob("verification/final/*/verification-*/checkout.json")
+                self.assertEqual(read_json(artifact)["status"], "setup_failed")
+                row, = read_json(artifact.parent / "setup/results.json")
+                self.assertEqual((row["command"], facts(row)), (command, NOT_STARTED))
+                self.assertEqual(row["process_outcome"]["errors"][0]["type"], "ProgramStartError")
+                self.assertIn(str(program), row["stderr"])
 
     # ---- rule 12: the binding is checked on the root the command starts from ---------------------------
 

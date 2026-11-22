@@ -7,16 +7,14 @@ from pathlib import Path
 from . import stops
 from .commands import command_id
 from .context import prompt_json
+from .state_files import StateFiles
 from .util import HarnessError, dump, write_json
 
 INLINE_CHARS = 4000
 
 
-def _path(directory, digest):
-    path = Path(directory) / 'input-indexes' / (digest + '.json')
-    if not path.is_absolute() or any(p.is_symlink() for p in (path, *path.parents)):
-        raise HarnessError('input index path is unsafe')
-    return path
+def _components(digest):
+    return 'input-indexes', digest + '.json'
 
 
 @stops.reads_evidence
@@ -31,16 +29,14 @@ def validate_indexes(directory, references):
                 or any(c not in '0123456789abcdef' for c in digest)
                 or type(ref['count']) is not int or ref['count'] < 0):
             raise HarnessError('invalid input index identity')
-        path = _path(directory, digest)
+        components = _components(digest)
+        path = Path(directory).joinpath(*components)
         if ref['artifact'] != str(path):
             raise HarnessError('input index reference path changed')
-        if not path.is_file():
-            raise HarnessError('input index must be a regular file')
+        raw = StateFiles.nofollow_directory(directory).read(components, limit=None).evidence()
         try:
-            raw = path.read_bytes()
             value = json.loads(raw)
-        except (OSError, ValueError) as error:
-            stops.keep_local_io(error)
+        except ValueError as error:
             raise HarnessError('input index missing or unreadable') from error
         if (hashlib.sha256(raw).hexdigest() != digest or not isinstance(value, dict)
                 or set(value) != {'version', 'records'} or type(value['version']) is not int or value['version'] != 1
@@ -52,9 +48,14 @@ def _index(directory, records):
     value = {'version': 1, 'records': records}
     raw = (dump(value) + '\n').encode('utf-8')
     digest = hashlib.sha256(raw).hexdigest()
-    path = _path(directory, digest)
-    if not path.exists():
+    components = _components(digest)
+    path = Path(directory).joinpath(*components)
+    with stops.evidence_reads():
+        probe = StateFiles.nofollow_directory(directory).probe(components).or_local_io()
+    if probe.state == 'absent':
         write_json(path, value)
+    elif probe.state != 'present':
+        probe.evidence()
     ref = {'artifact': str(path), 'artifact_digest': digest, 'count': len(records)}
     validate_indexes(directory, [ref])
     return ref

@@ -380,6 +380,7 @@ class DecisionRecovery(RuntimeService):
             self.context.save()
         except BaseException:
             run.update(old)
+            self.context.store.discard_attempt()
             raise
 
     def _decision_index(self, records):

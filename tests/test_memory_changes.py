@@ -6,7 +6,7 @@ import time
 import unittest
 from pathlib import Path
 
-from harness import git
+from harness import git, stops
 from harness.memory import Memory, validate_proposals
 from harness.util import HarnessError
 from harness.versions import RUN_SCHEMA_VERSION
@@ -45,6 +45,23 @@ class KnowledgeMemoryTests(unittest.TestCase):
         with self.assertRaises(HarnessError):
             self.promote(approved=["unknown"])
         self.assertEqual(self.memory.export(), [])
+
+    def test_promotion_scope_conflict_keeps_the_shared_error_and_previous_record(self):
+        ident, = self.promote()
+        with self.memory.connect() as db:
+            provenance = self.memory.read(ident)["provenance"]
+            provenance["scope"] = "run"
+            db.execute("UPDATE memories SET provenance=? WHERE id=?", (json.dumps(provenance), ident))
+
+        with self.assertRaisesRegex(HarnessError, "记忆 key 已绑定其他作用域") as caught:
+            self.promote()
+        self.assertIs(type(caught.exception), HarnessError)
+        self.assertIsNone(caught.exception.stop)
+        value = stops.of(caught.exception)
+        self.assertEqual((value["kind"], value["reason"], value["data"]["error_type"]),
+                         ("unclassified", "untyped_harness_error", "HarnessError"))
+        self.assertEqual(self.memory.read(ident)["provenance"], provenance)
+        self.assertEqual([item["id"] for item in self.memory.history("knowledge:architecture.storage")], [ident])
 
     def test_promotion_keeps_sources_and_only_approved_keys(self):
         another = {**self.proposal, "key": "architecture.other"}

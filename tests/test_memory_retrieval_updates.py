@@ -11,12 +11,13 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from harness import git
+from harness import git, stops
 from harness.cli import main
 from harness.memory import Memory, MAX_SOURCE_BYTES, bind_source_files, source_status, ranking_group
 from harness.mcp_server import handle
 from harness.util import HarnessError
 from harness.versions import RUN_SCHEMA_VERSION
+from test_harness import cli_notice
 
 
 class RetrievalUpdatesTests(unittest.TestCase):
@@ -102,16 +103,35 @@ class RetrievalUpdatesTests(unittest.TestCase):
         before = self.memory.export()
         bad = ['../docs/x.md', '/docs/x.md', 'docs/../docs/x.md', r'docs\x.md', '.git/config',
                './.harness/memory.sqlite3', 'docs/absent', 'DOCS/x.md', 'docs/\0bad']
+        command = ('add', '--key', 'fact', '--title', 'New', '--text', 'new')
         for name in bad:
-            code, _, _ = self.invoke('add', '--key', 'fact', '--title', 'New', '--text', 'new',
-                                     '--source-file', 'docs/x.md', '--source-file', name)
-            self.assertEqual(code, 1, name)
-            self.assertEqual(self.memory.export(), before)
+            with self.subTest(name=name):
+                code, _, errors = self.invoke(*command, '--source-file', 'docs/x.md', '--source-file', name)
+                stop = cli_notice(errors)
+                self.assertEqual((code, stop['kind'], stop['reason'], stop['data']['option']),
+                                 (2, 'invalid_input', 'cli_arguments', '--source-file'))
+                self.assertEqual(self.memory.export(), before)
         self.assertTrue(self.memory.read(original)['active'])
         self.file.write_bytes(b'initial\r\n')
-        self.assertIn('原始字节不同', self.invoke('add', '--key', 'fact', '--title', 'New', '--text', 'new',
-                                             '--source-file', 'docs/x.md')[2])
+        code, _, errors = self.invoke(*command, '--source-file', 'docs/x.md')
+        stop = cli_notice(errors)
+        self.assertEqual((code, stop['kind'], stop['reason'], stop['data']['option']),
+                         (2, 'invalid_input', 'cli_arguments', '--source-file'))
+        self.assertIn('原始字节不同', errors)
         self.assertEqual(self.memory.export(), before)
+
+    def test_source_git_failures_are_not_reported_as_bad_arguments(self):
+        run_git = git.git_process
+        for command in ('ls-tree', 'cat-file'):
+            with self.subTest(command=command):
+                def failed(repo, *args, **kwargs):
+                    if args[0] == command and (command != 'cat-file' or args[1] == 'blob'):
+                        return subprocess.CompletedProcess(args, 128, b'', b'failed')
+                    return run_git(repo, *args, **kwargs)
+
+                with patch.object(git, 'git_process', failed), self.assertRaises(HarnessError) as caught:
+                    bind_source_files(self.repo, ['docs/x.md'], cli_option='--source-file')
+                self.assertEqual(stops.of(caught.exception)['kind'], 'unclassified')
 
     def test_source_limits_and_symlinks_are_rejected(self):
         self.file.write_bytes(b'x' * (MAX_SOURCE_BYTES + 1))
@@ -162,8 +182,12 @@ class RetrievalUpdatesTests(unittest.TestCase):
             db.execute('UPDATE memories SET expires=1 WHERE key=?', ('version',))
         self.assertEqual(self.memory.search(key='version'), [])
         self.path.unlink()
-        for args in [('search',), ('search', 'x', '--key', 'y'), ('search', '--key', '')]:
-            self.assertEqual(self.invoke(*args)[0], 1)
+        for args, option in ((('search',), 'query'), (('search', 'x', '--key', 'y'), '--key'),
+                             (('search', '--key', ''), '--key')):
+            code, _, errors = self.invoke(*args)
+            stop = cli_notice(errors)
+            self.assertEqual((code, stop['kind'], stop['reason'], stop['data']['option']),
+                             (2, 'invalid_input', 'cli_arguments', option))
         self.assertEqual(json.loads(self.invoke('search', '')[1]), [])
         self.assertFalse(self.path.exists())
 

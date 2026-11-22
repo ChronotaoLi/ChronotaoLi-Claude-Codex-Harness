@@ -8,6 +8,7 @@ Every quota number and time is synthetic; the one real envelope is the de-identi
 connection failure ``test_provider_failures.REAL_CONNECTION_REFUSED``.
 """
 import copy
+import errno
 import json
 import math
 import os
@@ -29,8 +30,9 @@ from harness.run_lifecycle import RunLifecycle
 from harness.run_store import RunStore
 from harness.runtime import Runtime
 from harness.task_lifecycle import TaskLifecycle
-from harness.util import HarnessError, lock, read_json, write_json
+from harness.util import EvidenceError, HarnessError, read_json, write_json
 from harness.worker_receipts import WorkerReceipts
+from test_state_files import held_lock
 from test_harness import (ROOT, FakeClock, RepoCase, cli_notice, commit_recorder, crash_after_save,
                           install_clock, run_cli, scratch, walk_exit, write_operator_config, write_project_config)
 from test_provider_failures import REAL_CONNECTION_REFUSED
@@ -263,10 +265,10 @@ class WaitTests(WaitCase):
                 return
             disk = read_json(engine.directory / "state.json")
             seen.update(status=disk["status"], wait=disk.get("quota_wait"), summary=status_summary(disk).get("quota_wait"))
-            with lock(engine.directory / "store.lock"):
+            with held_lock(engine.directory / "store.lock"):
                 seen["store_free"] = True
-            with self.assertRaises(HarnessError):
-                with lock(engine.directory / "run.lock"):
+            with self.assertRaises(BlockingIOError):
+                with held_lock(engine.directory / "run.lock"):
                     pass
         self.clock.on_sleep = during
         self.windows(window("session", 100, 3600))
@@ -638,7 +640,7 @@ class InterruptionTests(WaitCase):
                 engine = self.engine(self.backend("worker"))
                 commit, state = RunStore.commit, {"armed": False, "failed": False}
 
-                def failing(store):
+                def failing(store, **kwargs):
                     run = store.run
                     if predicate is not None and predicate(run) and not state["failed"]:
                         state["failed"] = True
@@ -646,7 +648,7 @@ class InterruptionTests(WaitCase):
                     if predicate is None and state["armed"] and not state["failed"]:
                         state["failed"] = True
                         raise OSError(28, "synthetic disk full")
-                    return commit(store)
+                    return commit(store, **kwargs)
 
                 def arm(clock, seconds):
                     state["armed"] = True
@@ -1331,8 +1333,8 @@ class ContractTests(WaitCase):
         commit = RunStore.commit
 
         def damaging(bypass):   # a load-checked original damaged right after the judgment's save
-            def damage(store):
-                result = commit(store)
+            def damage(store, **kwargs):
+                result = commit(store, **kwargs)
                 entry = next((entry for entry in store.run["dispatches"]
                               if entry.get("worker_receipt_consumed") == "provider_failure"), None)
                 if entry is not None and not getattr(store, "damaged", False):
@@ -1502,11 +1504,84 @@ class WakeCheckTests(WaitCase):
                 engine, value, exit_code = self.waking_into(change, at_wake_sample=at_wake)
                 self.assertEqual(((value["kind"], value["reason"]), exit_code), (expected, 1))
                 if name.startswith("load-checked"):
-                    self.assertNotIn("superseded", value["data"])   # the load failure is the settled value itself
+                    self.assertEqual(value["data"]["superseded"], {"kind": "evidence", "reason": "runtime_integrity"})
                 if name.startswith("ledger"):
                     # The other writer's ledger is never overwritten, not even by the stop.
                     self.assertEqual(read_json(engine.directory / "state.json")["goal"], "rewritten by another writer")
                 damaged["index"] = False
+
+    def test_wake_load_failure_is_settled_on_the_published_ledger(self):
+        for case, direct_reason, final_reason, can_load in (
+                ("restored schema", "load_integrity", "runtime_integrity", True),
+                ("missing schema", "load_integrity", "load_integrity", False),
+                ("unregistered command", "load_integrity", "runtime_integrity", True),
+                ("committed command", "load_integrity", "load_integrity", False),
+                ("transient I/O", "io", "io", True)):
+            with self.subTest(case=case):
+                self.clock.sleeps.clear()
+                self.clock.on_sleep = None
+                wake_checks = RunLifecycle.wake_checks
+                seen = []
+                fault = OSError(errno.EIO, "schema read")
+
+                def change(engine):
+                    self.assertNotIn("quota_wait", read_json(engine.directory / "state.json"))
+                    if case.endswith("command"):
+                        engine.run["tasks"][0]["self_checks"] = [{"cwd": "..", "argv": ["true"]}]
+                        if case == "committed command":
+                            engine.context.save()
+                    elif case.endswith("schema"):
+                        receipt = next(entry["worker_receipt"] for entry in engine.run["dispatches"]
+                                       if entry.get("worker_receipt"))
+                        schema = Path(receipt["schema_artifact"])
+                        original = schema.read_bytes()
+                        schema.unlink()
+                        if case == "restored schema":
+                            seen.append((schema, original))
+
+                def check(lifecycle):
+                    try:
+                        if case == "transient I/O":
+                            with patch.object(lifecycle, "load_checks", side_effect=fault):
+                                wake_checks(lifecycle)
+                        else:
+                            wake_checks(lifecycle)
+                    except HarnessError as error:
+                        if case == "restored schema":
+                            schema, original = seen.pop()
+                            schema.write_bytes(original)
+                        seen.append((error, error.__cause__, error.__context__, stops.of(error)))
+                        raise
+
+                with patch.object(RunLifecycle, "wake_checks", check):
+                    engine, value, code = self.waking_into(change, at_wake_sample=True)
+                (error, cause, context, direct), = seen
+                self.assertEqual((direct["reason"], stops.project(direct)["exits"]), (direct_reason, []))
+                self.assertEqual((value["reason"], code), (final_reason, 1))
+                self.assertIs(engine.context.saved_stop[0], error)
+                self.assertIs(error.__cause__, cause)
+                self.assertIs(error.__context__, context)
+                if case == "transient I/O":
+                    self.assertIs(cause, fault)
+                else:
+                    self.assertIsInstance(cause, EvidenceError)
+                saved = read_json(engine.directory / "state.json")
+                ident = saved["id"]
+                self.assertEqual((saved["status"], saved["stop"]), ("blocked", value))
+                self.assertNotIn("quota_wait", saved)
+                self.assertEqual(len(self.events(engine, "run_stopped")), 1)
+                exits = [f"resume {ident}", f"abandon {ident}"] if final_reason == "runtime_integrity" else []
+                self.assertEqual(stops.project(value, ident)["exits"], exits)
+                if can_load:
+                    reloaded = self.engine(self.backend())
+                    reloaded.load_run(ident)
+                    self.assertEqual(reloaded.run["stop"], value)
+                    self.assertEqual(self.engine(self.backend()).abandon(ident)["status"], "abandoned")
+                else:
+                    for name in ("load_run", "abandon"):
+                        with self.assertRaises(HarnessError) as caught:
+                            getattr(self.engine(self.backend()), name)(ident)
+                        self.assertEqual(stops.of(caught.exception)["reason"], "load_integrity")
 
     def test_wake_checks_write_nothing(self):  # T8-33 (read-only)
         import ast

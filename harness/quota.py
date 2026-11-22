@@ -3,7 +3,7 @@
 Only observation. A probe is not a ledger dispatch: it runs in an empty temporary
 directory, executes no tools and its result is read once in this process. Every
 failure is "unavailable + reason"; nothing here changes scheduling, budgets,
-receipts, acceptance or recovery. A user interrupt always propagates.
+receipts, acceptance or recovery. A user interrupt propagates from a probe to its caller.
 
 A query is complete once its answer is read: Claude's result line, Codex's answer
 with id 1. The CLI then gets a bounded time to end on its own (Codex's input is closed
@@ -34,7 +34,6 @@ import shutil
 import signal
 import stat
 import subprocess
-import sys
 import tempfile
 import threading
 import time
@@ -914,32 +913,24 @@ class QuotaSampler(RuntimeService):
             pass  # the stop stays as constructed; the sample file is an unreferenced observation
         return record
 
-    def end_of_call(self):
-        """From ``Scheduler.execute``'s finally: sample each used provider once if the terminal state was saved.
-
-        Only user interrupts leave; any other failure here is an observation gap and
-        never replaces the exception being propagated.
-        """
+    def end_of_call(self, primary):
+        """Sample each used provider once after a terminal save, using the outgoing error explicitly."""
         final, self.final = self.final, None
         used, self.used = sorted(self.used), set()
         if final is None or not used or not self.enabled():
             return
-        try:
-            current = sys.exc_info()[1]
-            if isinstance(current, (KeyboardInterrupt, SystemExit)):
-                return
-            status, revision = final
-            if (status not in END_TRIGGERS or status != self.context.run.get("status")
-                    or revision != self.context.run.get("store_revision")):
-                return
-            if current is not None and _exit_unconfirmed(stops.of(current)):
-                return
-            if not self.no_live_model_process():
-                return
-            for provider in used:
-                self.sample(provider, END_TRIGGERS[status])
-        except Exception:
+        if isinstance(primary, (KeyboardInterrupt, SystemExit)):
             return
+        status, revision = final
+        if (status not in END_TRIGGERS or status != self.context.run.get("status")
+                or revision != self.context.run.get("store_revision")):
+            return
+        if primary is not None and _exit_unconfirmed(stops.of(primary)):
+            return
+        if not self.no_live_model_process():
+            return
+        for provider in used:
+            self.sample(provider, END_TRIGGERS[status])
 
     def sample(self, provider, trigger, *, dispatch_id=None, role=None):
         """Take, publish and announce one sample; the record with ``file`` (published name or None).

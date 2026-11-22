@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import argparse
 import copy
+import errno
 import json
+import os
 import re
 import shutil
 import signal
@@ -10,6 +12,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+from contextlib import suppress
 from pathlib import Path
 
 from . import config as layers, dashboard, git, observe, quota_wait, scope as boundary, stops
@@ -18,12 +21,13 @@ from .budgets import attempts_total, work_attempts
 from .cleanup import blocked, cleanup_run
 from .config import Config
 from .convergence import convergence_summary, review_rounds
-from .memory import Memory, bind_source_files
-from .operations import RUN_ID, OperationRecord, config_identity, digest_assets, first_line, harness_identity, shared_paths
+from .memory import Memory, MemoryRecordError, _cli_input_option, bind_source_files
+from .operations import (RUN_ID, OperationRecord, config_identity, digest_assets, first_line, harness_identity,
+                         shared_paths, warn)
 from .runtime import Runtime
 from .shared import mcp_configs, toml_value
-from .util import HarnessError, dump, read_json, write_json
-from .versions import missing_ledger, parse_current_ledger, require_current_ledger, unsupported_ledger
+from .util import HarnessError, display_text, dump, escape_json_controls, one_line, read_json, write_json
+from .versions import missing_ledger, parse_current_ledger, precheck_run, require_current_ledger, unsupported_ledger
 
 
 def project_report(config, location):
@@ -83,14 +87,14 @@ def demo(config, live=False, commander="astra"):
     root = Path(tempfile.mkdtemp(prefix="personal-harness-smoke-" if live else "personal-harness-demo-"))
     (root / ".gitignore").write_text(".harness/\n__pycache__/\n", encoding="utf-8")
     (root / "test_hello.py").write_text('import unittest\nfrom hello import greet\n\nclass TestGreet(unittest.TestCase):\n    def test_greet(self):\n        self.assertEqual(greet("Ada"), "Hello, Ada!")\n', encoding="utf-8")
-    git.git(root, "init", "-b", "main", effect=git.CHECKOUT)
+    git.git(root, "init", "--template=", "-b", "main", effect=git.CHECKOUT, isolated_config=True)
     git.git(root, "add", ".", effect=git.INDEX)
     git.git(root, "commit", "-m", "Demo fixture", effect=git.INDEX_REFS)
     config = copy.deepcopy(config)
     config.data["verification"]["commands"] = [{"cwd": ".", "argv": [sys.executable, "-m", "unittest", "-v"]}]
     config.data["runtime"]["agent_timeout_seconds"] = 180 if live else 1200
     config.data["runtime"]["max_attempts"] = 1 if live else 3
-    print(f"[harness] {'LIVE SMOKE' if live else 'OFFLINE DEMO'} repo={root}", file=sys.stderr, flush=True)
+    print(f"[harness] {'LIVE SMOKE' if live else 'OFFLINE DEMO'} repo={one_line(root)}", file=sys.stderr, flush=True)
     result = Runtime(config, root, backend=None if live else DemoBackend(), commander=commander).start(
         "Implement greet(name) in hello.py, returning 'Hello, {name}!'. Keep the existing test unchanged.")
     print(dump({"simulation": not live, "models_called": live, "verification": "real unittest + git", "repo": str(root),
@@ -112,36 +116,37 @@ def main(argv=None):
             signal.signal(signum, handler)
 
 
-def status_work_attempts(run):
+def status_work_attempts(run, *, integrity_stop=None):
     """Reject damaged accounting before deriving a read-only status summary."""
     diagnostic = "运行台账尝试计数字段无效；使用 status --full 查看原始内容"
     attempts = run.get("attempts", {})
     if (not isinstance(attempts, dict)
             or any(not isinstance(key, str) or type(value) is not int or value < 0
                    for key, value in attempts.items())):
-        raise HarnessError(diagnostic)
+        raise HarnessError(diagnostic, stop=integrity_stop)
     dispatches = run.get("dispatches", [])
     if not isinstance(dispatches, list):
-        raise HarnessError(diagnostic)
+        raise HarnessError(diagnostic, stop=integrity_stop)
     for entry in dispatches:
         if isinstance(entry, dict) and entry.get("attempt_exemption"):
             task_id = entry.get("task_id")
             if (not isinstance(entry["attempt_exemption"], dict)
                     or not isinstance(task_id, str) or task_id not in attempts):
-                raise HarnessError(diagnostic)
+                raise HarnessError(diagnostic, stop=integrity_stop)
     result = work_attempts(run)
     if any(value < 0 for value in result.values()):
-        raise HarnessError(diagnostic)
+        raise HarnessError(diagnostic, stop=integrity_stop)
     return result
 
 
-def status_summary(run):
+def status_summary(run, *, integrity_stop=None):
     if not isinstance(run.get("accepted", {}), dict):
-        raise HarnessError("运行台账 accepted 字段无效；使用 status --full 查看原始内容")
+        raise HarnessError("运行台账 accepted 字段无效；使用 status --full 查看原始内容",
+                           stop=integrity_stop)
     result = {key: run.get(key) for key in ("id", "status", "goal", "branch", "worktree", "current_task")}
     result["accepted_tasks"] = list(run.get("accepted", {}))
     result["budgets"] = {key: run.get(key) for key in ("attempts", "agent_dispatches")}
-    result["budgets"]["work_attempts"] = status_work_attempts(run)
+    result["budgets"]["work_attempts"] = status_work_attempts(run, integrity_stop=integrity_stop)
     # Every worker invocation, summed from the validated per-task counters.
     result["budgets"]["attempts_total"] = attempts_total(run)
     result["convergence"] = convergence_summary(run, result["budgets"]["work_attempts"])
@@ -277,50 +282,81 @@ def show_status(args, repo):
                 # A FIFO or device, never read: local I/O, as a directory in its place is.
                 raise HarnessError(f"无法读取运行台账 {path}：{error}", stop=stops.make(
                     "runtime_failure", "io", data={"error_type": type(error).__name__})) from error
-            ledger = parse_current_ledger(raw)
+            try:
+                ledger = parse_current_ledger(raw)
+            except json.JSONDecodeError as error:
+                raise HarnessError(str(error), stop=stops.make("evidence", "load_integrity")) from error
             if args.full:
                 print(dump(ledger))
                 return
-            summary = status_summary(ledger)
+            summary = status_summary(ledger, integrity_stop=stops.make("evidence", "load_integrity"))
             # Read after the ledger's version gate; saved samples only, never a CLI.
             summary["quota"] = observer.quota_block(args.run_id)
             print(dump(summary))
             return
         # The read-only observation layer owns the list; stdout fields are unchanged.
         try:
+            observer.reader.check_run_listing_root()
             return observer.list_runs()
-        except observe.ObserveError as error:
-            raise HarnessError(f"无法读取运行目录 {state / 'runs'}：{error}") from error
+        except (observe.ObserveError, OSError) as error:
+            cause = error.__cause__
+            failure = (cause if isinstance(cause, OSError) and
+                       cause.errno not in (errno.ELOOP, errno.ENOTDIR, errno.ENOENT) else error)
+            hint = ("；列表需要运行目录的读权限；按 ID 查看（status RUN）对此目录只需搜索权限"
+                    if isinstance(failure, PermissionError) else "")
+            raise HarnessError(f"无法读取运行目录 {state / 'runs'}：{error}{hint}", stop=stops.make(
+                "runtime_failure", "io", data={"error_type": type(failure).__name__})) from error
     listing = observe.observing(state, show, checkout=repo)
     if args.run_id:
         return
     for item in listing["unsupported"]:
-        print(f"harness: 运行目录 {state / item['path']}：{item['reason']}", file=sys.stderr)
+        print(f"harness: 运行目录 {one_line(state / item['path'])}：{one_line(item['reason'])}", file=sys.stderr)
     for item in listing["skipped"]:
-        print(f"harness: 跳过无法读取的运行台账 {state / item['path']}：{item['reason']}", file=sys.stderr)
+        print(f"harness: 跳过无法读取的运行台账 {one_line(state / item['path'])}：{one_line(item['reason'])}",
+              file=sys.stderr)
     for path in listing["incomplete"]:
-        print(f"harness: 运行台账字段不完整 {state / path}", file=sys.stderr)
+        print(f"harness: 运行台账字段不完整 {one_line(state / path)}", file=sys.stderr)
     print(dump([{key: item[key] for key in ("id", "status", "goal", "branch")} for item in listing["runs"]]))
 
 
 def manage_memory(args, repo, state):
+    try:
+        return _manage_memory(args, repo, state)
+    except HarnessError as error:
+        option = _cli_input_option(error)
+        if option is not None and error.stop is None:
+            error.stop = stops.make("invalid_input", "cli_arguments", data={"option": option})
+        raise
+
+
+def _manage_memory(args, repo, state):
     path = state / "memory.sqlite3"
     adding = args.memory_command == "add"
     if args.memory_command == "search":
         Memory.validate_search(args.query, key=getattr(args, "key", None), level=args.level)
     if adding:
-        source_binding = bind_source_files(repo, getattr(args, "source_file", []))
+        try:
+            Memory.validate_record(args.key, args.title, args.text, args.text, args.source, args.ttl_days)
+        except MemoryRecordError as error:
+            option = {"key": "--key", "abstract": "--title", "overview": "--text", "detail": "--text",
+                      "source": "--source", "ttl_days": "--ttl-days"}[error.field]
+            raise HarnessError(f"记忆参数 {option} 无效：{error}",
+                               stop=stops.make("invalid_input", "cli_arguments", data={"option": option})) from error
         run_id = getattr(args, "run", None)
+        if run_id is not None and not re.fullmatch(r"[A-Za-z0-9_-]+", run_id):
+            raise HarnessError("无效运行 ID",
+                               stop=stops.make("invalid_input", "cli_arguments", data={"option": "--run"}))
+        source_binding = bind_source_files(repo, getattr(args, "source_file", []), cli_option="--source-file")
         if run_id:
-            if not re.fullmatch(r"[A-Za-z0-9_-]+", run_id):
-                raise HarnessError("无效运行 ID")
             source_status, _ = Memory(path, repo=repo, read_only=True)._source_ledger(run_id)
             if source_status in ("missing", "invalid", "unsupported"):
-                raise HarnessError("记忆来源运行缺失、无效、不属于当前项目或台账版本不支持")
+                raise HarnessError("记忆来源运行缺失、无效、不属于当前项目或台账版本不支持",
+                                   stop=stops.make("invalid_input", "cli_arguments", data={"option": "--run"}))
         git.ignore_state(repo)
     elif not path.exists():
         if args.memory_command == "read":
-            raise HarnessError(f"没有此记忆：{args.id}")
+            raise HarnessError(f"没有此记忆：{args.id}",
+                               stop=stops.make("invalid_input", "cli_arguments", data={"option": "id"}))
         print(dump([]))
         return
     memory = Memory(path, repo=repo, read_only=not adding)
@@ -366,19 +402,82 @@ def stop_notice(value, run_id, operation_id):
         pass  # Observation output never changes the exit status or the operation record.
 
 
+def cause_lines(error, shown):
+    """Render a bounded exception chain, skipping text already shown on stderr."""
+    lines, shown_causes = [], []
+    seen = {id(error)}
+    while True:
+        cause = error.__cause__
+        label = "原因"
+        if cause is None and not error.__suppress_context__:
+            cause = error.__context__
+            label = "处理时另有"
+        if cause is None or id(cause) in seen:
+            break
+        if len(seen) == 8 or len(lines) == 3:
+            lines.append("  （更深的原因未显示）")
+            break
+        error = cause
+        seen.add(id(error))
+        try:
+            message = str(error)[:2000]
+        except Exception:
+            message = "<无法显示>"
+        text = one_line(message)
+        if text and (text in shown or any(text in previous for previous in shown_causes)):
+            continue
+        heading = f"  {label}：{one_line(type(error).__name__)}"
+        prefix = f"{heading}: " if text else heading
+        line = prefix + text
+        body_end = len(line)
+        if body_end > 500:
+            body_end = 499
+            line = line[:body_end] + "…"
+        visible = line[len(prefix):]
+        # A clipping marker alone does not count as source text.
+        if body_end > len(prefix) and (
+            visible in shown or any(visible in previous for previous in shown_causes)
+        ):
+            continue
+        lines.append(line)
+        shown_causes.append(visible)
+    return lines
+
+
 def report_stop(error, run_id=None, operation_id=None, value=None):
-    """stderr: the full text as before, then the projection; returns the projection."""
+    """Report the diagnostic and its causes, then emit and return the stop projection."""
     value = value if value is not None else stops.project(stops.of(error), run_id)
-    if isinstance(error, KeyboardInterrupt):
-        text = "已中断；运行状态和 worktree 已保留"
-    elif isinstance(error, sqlite3.Error):
-        text = f"SQLite 记忆数据库错误：{error}"
-    else:
-        text = str(error)
+
+    shown = ""
     try:
-        print(f"harness: {text}", file=sys.stderr, flush=True)
+        if isinstance(error, KeyboardInterrupt):
+            text = "已中断；运行状态和 worktree 已保留"
+        elif isinstance(error, sqlite3.Error):
+            text = f"SQLite 记忆数据库错误：{error}"
+        else:
+            text = str(error)
+        rendered = display_text(text)
+        print("harness: " + rendered, file=sys.stderr, flush=True)
+        shown = rendered
     except Exception:
         pass
+
+    try:
+        lines = cause_lines(error, shown)
+    except Exception:
+        lines = ["  （原因链无法显示）"]
+    try:
+        for line in lines:
+            line += "\n"
+            written = sys.stderr.write(line)
+            if written is not None and written < len(line):
+                raise OSError("short stderr write")
+            sys.stderr.flush()
+    except Exception:
+        # A failed write or flush may leave a cause prefix in front of the notice.
+        with suppress(Exception):
+            sys.stderr.write("\n")
+            sys.stderr.flush()
     stop_notice(value, run_id, operation_id)
     return value
 
@@ -440,19 +539,85 @@ def persisted_run_id(args, engine, state):
     return None
 
 
+def observe_command_result(observe_result, *, saved_run_id=None):
+    """Protect projection and delivery after the command has chosen its result."""
+    try:
+        observe_result()
+    except (HarnessError, OSError, ValueError, KeyboardInterrupt) as error:
+        with suppress(KeyboardInterrupt):
+            outcome = (f"终态已保存，用 status {saved_run_id} 查看" if saved_run_id is not None
+                       else "按原命令结果退出")
+            warn(f"结果输出失败（{first_line(error)}）；{outcome}")
+        return error
+    return None
+
+
+def print_saved_result(result):
+    """Flush stdout while the caller can still handle an observation failure."""
+    stream = sys.stdout
+    if stream is None:
+        raise OSError("stdout is unavailable")
+    payload = dump(result)
+    try:
+        print(payload, file=stream)
+        stream.flush()
+    except (OSError, ValueError, KeyboardInterrupt) as error:
+        # Encoding fails before writing bytes. A write or flush failure can leave buffered output behind.
+        if not isinstance(error, UnicodeEncodeError):
+            with suppress(AttributeError, OSError, ValueError, KeyboardInterrupt):
+                target = stream.fileno()
+                replacement = os.open(os.devnull, os.O_WRONLY)
+                # open may already have installed /dev/null as stdout if its fd was closed.
+                if replacement != target:
+                    try:
+                        os.dup2(replacement, target)
+                    finally:
+                        os.close(replacement)
+        raise
+
+
+def finish_saved_operation(operation, run, keys, *, code=0, error=None):
+    """Observe the confirmed outcome, then finish the operation with that outcome."""
+    run_id = run["id"]
+    status = run["status"]
+    value = None
+
+    def project_stop():
+        nonlocal value
+        value = stops.project_ledger(run)
+
+    def observe_result():
+        project_stop()
+        if error is None:
+            print_saved_result({**{key: run[key] for key in keys}, "operation_id": operation.id})
+            if value is not None:
+                stop_notice(value, run_id, operation.id)
+        elif reported(error):
+            report_stop(error, run_id, operation.id, value)
+
+    output_error = observe_command_result(observe_result, saved_run_id=run_id)
+    if output_error is not None and value is None and status in stops.STOP_STATUSES:
+        # Recover record metadata after an interrupted projection without replaying any output.
+        observe_command_result(project_stop, saved_run_id=run_id)
+    operation.finish(exit_status=code, result_status=status if error is None else None,
+                     error=output_error if output_error is not None else error, stop=value, run_id=run_id)
+    return code
+
+
 def operate(args, config, repo, state):
     """Run or resume under an exclusive operation record; the record never alters the exit code."""
     if args.command == "run":
-        print(f"[harness] config={config.path}", file=sys.stderr)
-        print(f"[harness] project={config.project_path}", file=sys.stderr)
-        print(f"[harness] verification={dump(config.data['verification']['commands'])}", file=sys.stderr)
+        print(f"[harness] config={one_line(config.path)}", file=sys.stderr)
+        print(f"[harness] project={one_line(config.project_path)}", file=sys.stderr)
+        verification = escape_json_controls(dump(config.data["verification"]["commands"]))
+        print(f"[harness] verification={verification}", file=sys.stderr)
     operation = OperationRecord.create(state, kind=args.command, arguments=operation_arguments(args),
                                        config=config, repo=repo, operation_id=args.operation_id,
                                        file_inputs=file_inputs_present(args))
     engine = None
-    # From here every failure, including diagnostic output, finishes the record.
+    # The engine either returns a result or reports an error, which may already be saved.
     try:
-        print(f"[harness] operation_id={operation.id} record={operation.path}", file=sys.stderr)
+        print(f"[harness] operation_id={one_line(operation.id)} record={one_line(operation.path)}", file=sys.stderr)
         if args.command == "run":
             engine = Runtime(config, repo, commander=args.commander, operation=operation)
             try:
@@ -460,38 +625,49 @@ def operate(args, config, repo, state):
             except (OSError, ValueError) as error:
                 raise HarnessError(f"计划文件无法读取或不是有效 JSON：{error}",
                                    stop=stops.make("invalid_input", "input_schema", data={"option": "--plan"})) from error
+            keys = ("id", "status", "branch", "worktree", "accepted")
             result = engine.start(args.goal, supplied, scope=args.scope or (),
                                   pause_after_plan=args.pause_after_plan, step=args.step)
-            keys = ("id", "status", "branch", "worktree", "accepted")
         else:
             engine = Runtime(config, repo, operation=operation)
+            keys = ("id", "status", "branch", "worktree")
             result = engine.resume(args.run_id, approve_plan=args.approve_plan, step=args.step,
                                    reverify=args.reverify, **resume_options(args))
-            keys = ("id", "status", "branch", "worktree")
-        print(dump({**{key: result[key] for key in keys}, "operation_id": operation.id}))
     except BaseException as error:
-        run_id = persisted_run_id(args, engine, state)
+        saved = engine.context.saved_stop if engine is not None else None
+        if saved is not None and saved[0] is error:
+            code = exit_status(error) if isinstance(error, SystemExit) else saved[1]
+            finish_saved_operation(operation, engine.run, keys, code=code, error=error)
+            if not reported(error):
+                raise
+            return code
+
         code = exit_status(error)
-        # Every failure is recorded with its projection; only the reported ones
-        # also get the stderr diagnostic and return, the rest propagate as before.
-        value = stops.project(stops.of(error), run_id)
-        if reported(error):
-            report_stop(error, run_id, operation.id, value)
+        run_id = operation.run_id
+        value = None
+
+        def observe_failure():
+            nonlocal run_id, value
+            if run_id is None:
+                run_id = persisted_run_id(args, engine, state)
+            value = stops.project(stops.of(error), run_id)
+            if reported(error):
+                report_stop(error, run_id, operation.id, value)
+
+        observe_command_result(observe_failure)
         operation.finish(exit_status=code, error=error, stop=value, run_id=run_id)
         if not reported(error):
             raise
         return code
-    saved = None
-    if isinstance(result, dict):
-        try:
-            saved = stops.project_ledger(result)
-        except HarnessError:
-            saved = None
-        if saved is not None:
-            stop_notice(saved, result.get("id"), operation.id)
-    operation.finish(exit_status=0, result_status=result.get("status") if isinstance(result, dict) else None,
-                     stop=saved, run_id=persisted_run_id(args, engine, state))
-    return 0
+
+    # A normal engine return already confirms the ledger identity.
+    return finish_saved_operation(operation, result, keys)
+
+
+class Parser(argparse.ArgumentParser):
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        self.exit(2, f"{one_line(self.prog)}: error: {one_line(message)}\n")
 
 
 def _command(group, name, text):
@@ -500,7 +676,7 @@ def _command(group, name, text):
 
 
 def _main(argv=None):
-    parser = argparse.ArgumentParser(description="Personal Harness — fresh task agents, independent review")
+    parser = Parser(description="Personal Harness — fresh task agents, independent review")
     parser.add_argument("--config", default=str(Path(__file__).resolve().parent.parent / "harness.toml"),
                         help="操作者配置文件（模型、预算、记忆、共用资源）；默认是源码目录下的 harness.toml。"
                              "run、resume、permission-diagnostics 另读目标仓库 Git 根目录下的 .harness/project.toml")
@@ -602,121 +778,166 @@ def _main(argv=None):
     args = parser.parse_args(argv)
     if args.command == "status" and args.full and not args.run_id:
         parser.error("status --full 需要 run_id")
+    readonly = args.command in ("status", "watch", "dashboard", "permission-diagnostics") or (
+        args.command == "cleanup-run" and not (args.remove or args.confirm_exited))
+    scope = git.read_only()
     try:
-        if args.command in ("prepare-run", "supervise"):
-            repo = git.repository(args.repo)
-            if args.command == "prepare-run":
-                from .workspace_inputs import prepare_run
-                print(dump(prepare_run(repo, args.run_id, args.manifest)))
-            else:
-                from .supervisor import supervise
-                arguments = args.arguments[1:] if args.arguments[:1] == ["--"] else args.arguments
-                receipt = supervise(repo, arguments, config_path=args.config, operation_id=args.operation_id)
-                print(dump(receipt), file=sys.stderr)
-                code = receipt.get("exit_code")
-                return (128 - code if code < 0 else code) if type(code) is int else 1
-            return 0
-        if args.command == "watch":
-            from .watch_cli import watch_run
-            state = args.state if args.state is not None else git.repository(args.repo) / ".harness"
-            return watch_run(state, args.run_id, follow=args.follow)
-        if args.command in ("status", "dashboard", "memory", "cleanup-run"):
-            repo = git.repository(args.repo)
-            state = repo / ".harness"
-            if args.command == "status":
-                show_status(args, repo)
-            elif args.command == "dashboard":
-                # Serves until SIGINT/SIGTERM (main() maps them to KeyboardInterrupt,
-                # which serve() absorbs) and then returns 0; stdout is only the URL.
-                return dashboard.serve(state, args.port, checkout=repo)
-            elif args.command == "cleanup-run":
-                result = cleanup_run(repo, args.run_id, remove=args.remove,
-                                     remove_input_copies=args.remove_input_copies,
-                                     remove_ignored=args.remove_ignored,
-                                     confirm_exited=args.confirm_exited or ())
-                print(dump(result))
-                return 1 if blocked(result) else 0
-            else:
-                manage_memory(args, repo, state)
-            return 0
-        # Only these commands act on the target repository's verification and permissions;
-        # its project file has one fixed place: no upward search, no fallback, no option.
-        repo = git.repository(args.repo) if args.command in ("run", "resume", "permission-diagnostics") else None
-        project = repo / ".harness" / "project.toml" if repo is not None else None
-        # Loading writes nothing, so every refusal below comes before the operation record and private state.
         try:
-            config = Config.load(args.config, project)
-        except layers.MissingLayer as e:
-            if e.file == "project":
-                raise HarnessError(f"找不到项目配置文件 {project}；请按 Harness 源码中的 examples/project.toml 在该位置创建它",
-                                   stop=stops.make("invalid_input", "cli_arguments", data={"option": "--repo"})) from e
-            raise HarnessError(f"找不到配置文件 {e.filename}；请通过 --config 指定配置文件，"
-                               "默认 harness.toml 和 shared 资源仅随源码仓库提供",
-                               stop=stops.make("invalid_input", "cli_arguments", data={"option": "--config"})) from e
-        if args.command == "run":
-            layers.require_run_commands(config)
-        if args.command == "doctor":
-            return doctor(config, args.repo)
-        if args.command == "permission-diagnostics":
-            from .permission_diagnostics import command_capability_projection, permission_diagnostics
-            if not RUN_ID.fullmatch(args.run_id) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,119}", args.dispatch_id):
-                raise HarnessError("无效 run/dispatch ID", stop=stops.make("invalid_input", "cli_arguments", data={"option": "run_id"}))
-            state = repo / ".harness"
-
-            def diagnose(observer):
-                run, error = observer._read_ledger(args.run_id)
-                if error is None and unsupported_ledger(run) is not None:
-                    require_current_ledger(run)  # the shared typed refusal (exit 2)
-                if error or run.get("id") != args.run_id:
-                    raise HarnessError(error or "运行 ID 不符")
-                entry = next((d for d in run.get("dispatches", []) if d.get("id") == args.dispatch_id), None)
-                if entry is None:
-                    raise HarnessError("派发未登记")
-                components = ["runs", args.run_id, "dispatches", args.dispatch_id]
-                terminal = None
-                roles = run.get("config_snapshot", {}).get("roles", {})
-                role_key = "fable" if entry.get("role") == "commander" and run.get("commander") == "fable" else entry.get("role")
-                provider = roles.get(role_key, {}).get("cli")
-                if provider == "claude":
-                    # Claude's only output is its JSON terminal in process.stdout.
-                    try:
-                        source = observer.reader.read(components + ["process.stdout"], limit=16*1024*1024)
-                        if not source["too_large"] and not source["changed_while_reading"]:
-                            terminal = json.loads(source["data"])
-                    except (observe.NotFound, ValueError, RecursionError):
-                        pass
-                report = permission_diagnostics(config, terminal)
-                # Presence decides: an explicit null, empty string or array is refused, never "not given".
-                if args.command_json is not None:
-                    report["local_command_capability"] = command_capability_projection(
-                        config, json.loads(args.command_json))
-                report.update(run_id=args.run_id, dispatch_id=args.dispatch_id,
-                              local_config_basis="current_configuration_not_historical_provider_policy")
-                print(dump(report))
+            if readonly:
+                scope.__enter__()
+            if args.command in ("prepare-run", "supervise"):
+                repo = git.repository(args.repo)
+                if args.command == "prepare-run":
+                    from .workspace_inputs import prepare_run
+                    print(dump(prepare_run(repo, args.run_id, args.manifest)))
+                else:
+                    from .supervisor import supervise
+                    arguments = args.arguments[1:] if args.arguments[:1] == ["--"] else args.arguments
+                    receipt = supervise(repo, arguments, config_path=args.config, operation_id=args.operation_id)
+                    print(dump(receipt), file=sys.stderr)
+                    code = receipt.get("exit_code")
+                    return (128 - code if code < 0 else code) if type(code) is int else 1
                 return 0
+            if args.command == "watch":
+                from .watch_cli import watch_run
+                state = args.state if args.state is not None else git.repository(args.repo) / ".harness"
+                return watch_run(state, args.run_id, follow=args.follow)
+            if args.command in ("status", "dashboard", "memory", "cleanup-run"):
+                repo = git.repository(args.repo)
+                state = repo / ".harness"
+                if args.command == "status":
+                    show_status(args, repo)
+                elif args.command == "dashboard":
+                    # Serves until SIGINT/SIGTERM (main() maps them to KeyboardInterrupt,
+                    # which serve() absorbs) and then returns 0; stdout is only the URL.
+                    try:
+                        return dashboard.serve(state, args.port, checkout=repo)
+                    except HarnessError as error:
+                        cause = error.__cause__
+                        if getattr(error, "_dashboard_invalid_port", False):
+                            error.stop = stops.make("invalid_input", "cli_arguments", data={"option": "--port"})
+                        elif isinstance(cause, observe.NotFound) and getattr(cause, "_root_initialization_failed", False):
+                            error.stop = stops.make("runtime_failure", "io",
+                                                    data={"error_type": type(cause.__cause__).__name__})
+                        raise
+                elif args.command == "cleanup-run":
+                    result = cleanup_run(repo, args.run_id, remove=args.remove,
+                                         remove_input_copies=args.remove_input_copies,
+                                         remove_ignored=args.remove_ignored,
+                                         confirm_exited=args.confirm_exited or ())
+                    print(dump(result))
+                    return 1 if blocked(result) else 0
+                else:
+                    manage_memory(args, repo, state)
+                return 0
+            # Only these commands act on the target repository's verification and permissions;
+            # its project file has one fixed place: no upward search, no fallback, no option.
+            repo = git.repository(args.repo) if args.command in ("run", "resume", "permission-diagnostics") else None
+            project = repo / ".harness" / "project.toml" if repo is not None else None
+            # Loading writes nothing, so every refusal below comes before the operation record and private state.
             try:
-                return observe.observing(state, diagnose, required=True)
-            except observe.ObserveError as error:
-                raise HarnessError(str(error)) from error
-        if args.command in ("demo", "smoke"):
-            demo(config, live=args.command == "smoke", commander=getattr(args, "commander", "astra"))
+                config = Config.load(args.config, project)
+            except layers.MissingLayer as e:
+                if e.file == "project":
+                    raise HarnessError(f"找不到项目配置文件 {project}；请按 Harness 源码中的 examples/project.toml 在该位置创建它",
+                                       stop=stops.make("invalid_input", "cli_arguments", data={"option": "--repo"})) from e
+                raise HarnessError(f"找不到配置文件 {e.filename}；请通过 --config 指定配置文件，"
+                                   "默认 harness.toml 和 shared 资源仅随源码仓库提供",
+                                   stop=stops.make("invalid_input", "cli_arguments", data={"option": "--config"})) from e
+            if args.command == "run":
+                layers.require_run_commands(config)
+            if args.command == "doctor":
+                return doctor(config, args.repo)
+            if args.command == "permission-diagnostics":
+                from .permission_diagnostics import command_capability_projection, permission_diagnostics
+                for option, pattern in (("run_id", RUN_ID), ("dispatch_id", r"[A-Za-z0-9][A-Za-z0-9_.-]{0,119}")):
+                    if not re.fullmatch(pattern, getattr(args, option)):
+                        raise HarnessError("无效 run/dispatch ID", stop=stops.make(
+                            "invalid_input", "cli_arguments", data={"option": option}))
+                state = repo / ".harness"
+
+                def diagnose(observer):
+                    try:
+                        run, error = observer._read_ledger(args.run_id)
+                    except observe.NotFound as failure:
+                        cause = failure.__cause__
+                        if cause is not None and not (isinstance(cause, OSError) and cause.errno == errno.ENOENT):
+                            raise
+                        raise HarnessError(str(failure), stop=stops.make(
+                            "invalid_input", "cli_arguments", data={"option": "run_id"})) from failure
+                    if error is None and unsupported_ledger(run) is not None:
+                        require_current_ledger(run)  # the shared typed refusal (exit 2)
+                    if error:
+                        raise HarnessError(error, stop=stops.make("runtime_failure", "io"))
+                    if run.get("id") != args.run_id:
+                        raise HarnessError("运行 ID 不符", stop=stops.make(
+                            "invalid_input", "cli_arguments", data={"option": "run_id"}))
+                    entry = next((d for d in run.get("dispatches", []) if d.get("id") == args.dispatch_id), None)
+                    if entry is None:
+                        raise HarnessError("派发未登记", stop=stops.make(
+                            "invalid_input", "cli_arguments", data={"option": "dispatch_id"}))
+                    components = ["runs", args.run_id, "dispatches", args.dispatch_id]
+                    terminal = None
+                    roles = run.get("config_snapshot", {}).get("roles", {})
+                    role_key = "fable" if entry.get("role") == "commander" and run.get("commander") == "fable" else entry.get("role")
+                    provider = roles.get(role_key, {}).get("cli")
+                    if provider == "claude":
+                        # Claude's only output is its JSON terminal in process.stdout.
+                        try:
+                            source = observer.reader.read(components + ["process.stdout"], limit=16*1024*1024)
+                            if not source["too_large"] and not source["changed_while_reading"]:
+                                terminal = json.loads(source["data"])
+                        except (observe.NotFound, ValueError, RecursionError):
+                            pass
+                    report = permission_diagnostics(config, terminal)
+                    # Presence decides: an explicit null, empty string or array is refused, never "not given".
+                    if args.command_json is not None:
+                        with stops.classify("invalid_input", "cli_arguments", data={"option": "--command-json"}):
+                            try:
+                                command = json.loads(args.command_json)
+                            except (ValueError, RecursionError) as failure:
+                                raise HarnessError(str(failure)) from failure
+                            report["local_command_capability"] = command_capability_projection(config, command)
+                    report.update(run_id=args.run_id, dispatch_id=args.dispatch_id,
+                                  local_config_basis="current_configuration_not_historical_provider_policy")
+                    print(dump(report))
+                    return 0
+                try:
+                    return observe.observing(state, diagnose, required=True)
+                except observe.ObserveError as error:
+                    cause = error.__cause__
+                    failure = (cause if isinstance(cause, OSError) and
+                               cause.errno not in (errno.ELOOP, errno.ENOTDIR, errno.ENOENT) else error)
+                    raise HarnessError(str(error), stop=stops.make(
+                        "runtime_failure", "io", data={"error_type": type(failure).__name__})) from error
+            if args.command in ("demo", "smoke"):
+                demo(config, live=args.command == "smoke", commander=getattr(args, "commander", "astra"))
+                return 0
+            repo = repo if repo is not None else git.repository(args.repo)
+            state = repo / ".harness"
+            if args.command in ("run", "resume"):
+                return operate(args, config, repo, state)
+            if args.command == "abandon":
+                precheck_run(state, args.run_id, load=True)
+                options = {"confirm_exited": args.confirm_exited} if args.confirm_exited else {}
+                result = Runtime(config, repo).abandon(args.run_id, **options)
+                observe_command_result(lambda: print_saved_result(status_summary(result)), saved_run_id=args.run_id)
+            elif args.command == "sync":
+                claude, codex = mcp_configs(config, state, args.role)
+                try:
+                    codex_toml = ("mcp_servers = " + toml_value(codex) + "\n").encode("utf-8")
+                except UnicodeEncodeError as error:
+                    raise HarnessError("MCP 配置含无法编码为 UTF-8 的文本",
+                                       stop=stops.make("invalid_input", "input_schema", data={"option": "config"})) from error
+                git.ignore_state(repo)
+                folder = state / "generated" / args.role
+                write_json(folder / "claude.mcp.json", claude)
+                (folder / "codex.mcp.toml").write_bytes(codex_toml)
+                print(str(folder))
             return 0
-        repo = repo if repo is not None else git.repository(args.repo)
-        state = repo / ".harness"
-        if args.command in ("run", "resume"):
-            return operate(args, config, repo, state)
-        if args.command == "abandon":
-            options = {"confirm_exited": args.confirm_exited} if args.confirm_exited else {}
-            result = Runtime(config, repo).abandon(args.run_id, **options)
-            print(dump(status_summary(result)))
-        elif args.command == "sync":
-            git.ignore_state(repo)
-            claude, codex = mcp_configs(config, state, args.role)
-            folder = state / "generated" / args.role
-            write_json(folder / "claude.mcp.json", claude)
-            (folder / "codex.mcp.toml").write_text("mcp_servers = " + toml_value(codex) + "\n", encoding="utf-8")
-            print(str(folder))
-        return 0
+        finally:
+            if readonly:
+                scope.__exit__(None, None, None)
     except (HarnessError, OSError, ValueError, subprocess.TimeoutExpired, sqlite3.Error, KeyboardInterrupt) as e:
         if not reported(e):
             raise
@@ -724,3 +945,7 @@ def _main(argv=None):
         if args.command == "cleanup-run" and not isinstance(e, KeyboardInterrupt):
             return 1  # cleanup-run reports per-resource results, not the run stop protocol
         return value["exit_code"]
+    finally:
+        # The signal may have arrived at the entry of the first close.
+        if readonly:
+            scope.__exit__(None, None, None)

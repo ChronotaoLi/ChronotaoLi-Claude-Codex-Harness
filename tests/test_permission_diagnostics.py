@@ -8,7 +8,7 @@ import sys
 import unittest
 from types import SimpleNamespace
 
-from harness import cli
+from harness import cli, observe
 from harness.diagnostics import permission_denial_projection
 from harness.permission_diagnostics import command_capability_projection, permission_diagnostics
 from harness.util import HarnessError, write_json
@@ -165,12 +165,60 @@ class PermissionDiagnosticsCliTests(RepoCase):
                            ('{"cwd": "app", "argv": []}', '--command-json.argv')):
             with self.subTest(raw=raw):
                 code, output, errors = self.diagnose('--command-json', raw)
-                self.assertEqual((code, output, cli_notice(errors)['kind']), (1, '', 'unclassified'))
-                self.assertEqual(re.findall(r'--command-json(?:\.cwd|\.argv)?\b(?!\.)', errors), [field] if field else [], errors)
+                stop = cli_notice(errors)
+                self.assertEqual((code, output, stop['kind'], stop['reason'], stop['data']['option']),
+                                 (2, '', 'invalid_input', 'cli_arguments', '--command-json'))
+                human = '\n'.join(line for line in errors.splitlines() if line.startswith('harness:'))
+                self.assertEqual(re.findall(r'--command-json(?:\.cwd|\.argv)?\b(?!\.)', human),
+                                 [field] if field else [], human)
                 self.assertEqual(path.read_bytes(), before)
         with self.assertRaises(SystemExit) as raised:
             self.diagnose('--argv-json', '["flutter", "test"]')
         self.assertEqual(raised.exception.code, 2)
+
+    def test_explicit_ids_are_distinguished_from_observer_failures(self):
+        path = self.ledger({}, schema_version=RUN_SCHEMA_VERSION)
+        run = json.loads(path.read_bytes())
+        for value, option in ((None, 'run_id'), ({**run, 'id': 'run_other'}, 'run_id'),
+                              ({**run, 'dispatches': []}, 'dispatch_id')):
+            with self.subTest(option=option, value=value):
+                if value is None:
+                    path.unlink()
+                else:
+                    write_json(path, value)
+                code, output, errors = self.diagnose()
+                stop = cli_notice(errors)
+                self.assertEqual((code, output, stop['kind'], stop['reason'], stop['data']),
+                                 (2, '', 'invalid_input', 'cli_arguments', {'option': option}))
+        for label in ('malformed', 'oversized'):
+            with self.subTest(label=label):
+                with path.open('wb') as stream:
+                    if label == 'malformed':
+                        stream.write(b'{')
+                    else:
+                        stream.truncate(observe.STATE_MAX_BYTES + 1)
+                before = path.stat()
+                code, output, errors = self.diagnose()
+                stop = cli_notice(errors)
+                self.assertEqual((code, output, stop['kind'], stop['reason']), (1, '', 'runtime_failure', 'io'))
+                self.assertNotIn('error_type', stop['data'])
+                self.assertIn('未解析' if label == 'oversized' else '无法解析', errors)
+                self.assertEqual((path.stat().st_size, path.stat().st_mtime_ns), (before.st_size, before.st_mtime_ns))
+        path.unlink()
+        path.symlink_to('missing')
+        code, output, errors = self.diagnose()
+        stop = cli_notice(errors)
+        self.assertEqual((code, output, stop['kind'], stop['reason']), (1, '', 'runtime_failure', 'io'))
+        self.assertEqual(stop['data'], {'error_type': 'PathRefused'})
+        self.assertTrue(path.is_symlink())
+
+        shutil.rmtree(path.parent)
+        path.parent.write_text('a file in place of a run directory')
+        code, output, errors = self.diagnose()
+        stop = cli_notice(errors)
+        self.assertEqual((code, output, stop['kind'], stop['reason'], stop['data']),
+                         (1, '', 'runtime_failure', 'io', {'error_type': 'NotFound'}))
+        self.assertIn('NotADirectoryError', errors)
 
     def test_dispatch_reads_stdout_even_beside_a_stream_manifest(self):
         path = self.ledger({'process.stdout': terminal('json_tool'),

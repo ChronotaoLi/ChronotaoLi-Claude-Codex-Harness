@@ -1,7 +1,9 @@
+import errno
 import json
-import multiprocessing
 import os
+import signal
 import stat
+import subprocess
 import sys
 import tempfile
 import time
@@ -9,19 +11,14 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from harness import command_server, state_files
 from harness.command_server import Broker, command_id, command_processes, create_manifest, handle
 from harness.util import HarnessError, read_json, with_descriptors, write_json
 from harness.versions import RUN_SCHEMA_VERSION
 from test_provider_failures import FifoWatchdog
+from test_state_files import FakeOs, failing, held_lock, open_descriptors
 
 ADMISSION_LOCK = 'command-admission.lock'
-
-
-def invoke(path, digest, identifier, queue):
-    try:
-        queue.put(Broker(path, digest).run_command({'command_id': identifier}))
-    except HarnessError as error:
-        queue.put({'blocked': str(error)})
 
 
 class CommandAdmissionTests(unittest.TestCase):
@@ -142,21 +139,88 @@ class CommandAdmissionTests(unittest.TestCase):
                 self.broker.run_command({'command_id': command_id(self.command)})
 
     def test_two_process_callers_cannot_overlap(self):
-        context = multiprocessing.get_context('spawn')
-        queue = context.Queue()
-        args = (self.meta['artifact'], self.meta['artifact_digest'], command_id(self.command), queue)
-        first = context.Process(target=invoke, args=args)
-        first.start()
-        until = time.monotonic() + 3
-        while not list((self.job / 'commands').iterdir()) and time.monotonic() < until:
-            time.sleep(.005)
-        second = context.Process(target=invoke, args=args)
-        second.start()
-        first.join(5)
-        second.join(5)
-        results = [queue.get(timeout=2), queue.get(timeout=2)]
-        self.assertEqual(sum('blocked' in result for result in results), 1, results)
-        self.assertEqual(sum(result.get('exit_code') == 0 for result in results), 1, results)
+        ready, release = self.root / 'ready', self.root / 'release'
+        command = {'cwd': '.', 'argv': [sys.executable, '-c', """
+from pathlib import Path
+import time
+
+ready, release = Path('ready'), Path('release')
+ready.touch()
+deadline = time.monotonic() + 30
+while not release.exists():
+    if not ready.exists() or time.monotonic() >= deadline:
+        raise SystemExit('command was not released')
+    time.sleep(.01)
+print('done')
+"""]}
+        config = {'verification': {'commands': [command]}, 'permissions': {'worker_commands': []},
+                  'runtime': {'verify_timeout_seconds': 35, 'agent_timeout_seconds': 45}}
+        job = self.root / 'overlap-worker'
+        meta = create_manifest(config, self.root, job)
+        entry = Path(__file__).resolve().parents[1] / 'harness' / 'command_entry.py'
+        argv = [sys.executable, str(entry), '--manifest', str(meta['artifact']), '--sha256', meta['artifact_digest']]
+        request = json.dumps({'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call',
+                              'params': {'name': 'run_command', 'arguments': {'command_id': command_id(command)}}}) + '\n'
+
+        def reap(caller):
+            try:
+                caller.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                if caller.poll() is None:
+                    caller.kill()
+                caller.communicate(timeout=5)
+
+        def start_call():
+            caller = subprocess.Popen(argv, cwd=self.root, text=True, stdin=subprocess.PIPE,
+                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            self.addCleanup(reap, caller)
+            caller.stdin.write(request)
+            caller.stdin.flush()
+            return caller
+
+        def finish_call(caller):
+            stdout, stderr = caller.communicate(timeout=10)
+            self.assertEqual(caller.returncode, 0, stderr)
+            response = json.loads(stdout)['result']
+            return response['isError'], json.loads(response['content'][0]['text'])
+
+        try:
+            first = start_call()
+            deadline = time.monotonic() + 10
+            # The command signals readiness, and its supervisor must have committed the start.
+            while first.poll() is None and time.monotonic() < deadline:
+                if ready.exists():
+                    journal_path = next((job / 'commands').glob('*/process.json'), None)
+                    if journal_path and read_json(journal_path)['process_state'] == 'running':
+                        break
+                time.sleep(.01)
+            else:
+                self.fail('first command did not signal readiness with a running journal')
+            running = read_json(journal_path)
+            second = start_call()
+            self.assertNotEqual(first.pid, second.pid)
+            refused, result = finish_call(second)
+            self.assertTrue(refused, result)
+            self.assertEqual(result, {'status': 'blocked', 'started': False,
+                                      'error': 'Cannot confirm command process exited: ' + running['id']})
+            self.assertIsNone(first.poll())
+            self.assertEqual(list((job / 'commands').iterdir()), [journal_path.parent])
+            self.assertEqual(read_json(journal_path), running)
+
+            release.touch()
+            refused, result = finish_call(first)
+            self.assertFalse(refused, result)
+            self.assertEqual(result['call_id'], running['id'])
+            self.assertEqual(result['exit_code'], 0, result)
+            self.assertEqual(result['termination_reason'], 'normal', result)
+            self.assertTrue(result['lifecycle']['started'], result)
+            self.assertEqual(result['stdout'], 'done\n')
+            self.assertTrue(result['exit_confirmed'], result)
+            self.assertTrue(result['evidence_complete'], result)
+            self.assertEqual(read_json(journal_path.with_name('receipt.json')), result)
+        finally:
+            # Release the supervised command before the registered caller cleanups.
+            release.touch()
 
     def test_slow_admission_intent_exhausts_parent_budget_without_start(self):
         witness = self.root / 'started'
@@ -307,6 +371,54 @@ class AdmissionLockTests(unittest.TestCase):
             create_manifest(self.config, self.root, stale, None)
         self.assertFalse((stale / 'commands.json').exists())
 
+    def test_manifest_lock_creation_preserves_signal_handlers_and_closes_the_descriptor(self):
+        mask = signal.pthread_sigmask(signal.SIG_BLOCK, ())
+        for sig in (signal.SIGINT, signal.SIGHUP):
+            for behavior in ('ignore', 'record', 'interrupt'):
+                with self.subTest(signal=sig.name, handler=behavior):
+                    job = self.root / f'{sig.name}-{behavior}'
+                    opened_with = []
+                    received = []
+
+                    def receive(signum, _frame):
+                        received.append(signum)
+                        if behavior == 'interrupt':
+                            raise KeyboardInterrupt
+
+                    def after_open(real, path, flags, *args, **kwargs):
+                        fd = real(path, flags, *args, **kwargs)
+                        if path == job / ADMISSION_LOCK and flags & os.O_EXCL:
+                            opened_with.append(signal.getsignal(sig))
+                            signal.raise_signal(sig)
+                        return fd
+
+                    handler = signal.SIG_IGN if behavior == 'ignore' else receive
+                    previous = signal.signal(sig, handler)
+                    before = open_descriptors()
+                    result = None
+                    try:
+                        with patch.object(command_server, 'os', FakeOs(open=after_open)):
+                            try:
+                                result = create_manifest(self.config, self.root, job)
+                            except KeyboardInterrupt:
+                                if behavior != 'interrupt':
+                                    self.fail('The caller handler allows manifest creation to continue')
+                        self.assertIs(signal.getsignal(sig), handler)
+                        self.assertEqual(signal.pthread_sigmask(signal.SIG_BLOCK, ()), mask)
+                    finally:
+                        signal.signal(sig, previous)
+
+                    self.assertEqual(open_descriptors(), before)
+                    self.assertEqual(opened_with, [handler])
+                    self.assertEqual(received, [] if behavior == 'ignore' else [sig])
+                    self.assertEqual((job / ADMISSION_LOCK).stat().st_size, 0)
+                    if behavior == 'interrupt':
+                        self.assertIsNone(result)
+                        self.assertFalse((job / 'commands.json').exists())
+                    else:
+                        broker = Broker(result['artifact'], result['artifact_digest'])
+                        self.assertEqual(broker.list_commands()[0]['command'], self.COMMAND)
+
     def test_every_admission_refusal_on_a_first_call_leaves_the_dispatch_files_unchanged(self):
         def version(job, run_path, state, broker):
             write_json(run_path, {**state, 'schema_version': 18})
@@ -328,7 +440,6 @@ class AdmissionLockTests(unittest.TestCase):
                     with self.subTest(refusal=label, tool=name):
                         with patch('harness.command_server.git.head', return_value='head'):
                             job, run_path, state, broker = self.bound(f'{name}-{label.replace(" ", "-")}')
-                        self.assertIn(ADMISSION_LOCK, tree(job))
                         if tamper:
                             tamper(job, run_path, state, broker)
                         with patch('harness.command_server.git.head', return_value=head):
@@ -336,19 +447,23 @@ class AdmissionLockTests(unittest.TestCase):
                         self.assertIn(reason, payload['error'])
 
     def test_a_missing_or_unusable_lock_is_a_tool_error_that_creates_nothing(self):
-        target = self.root / 'through-link'
+        dangling = self.root / 'dangling'
+        target = self.root / 'target'
+        target.write_bytes(b'untouched')
         def missing(lock):
             lock.unlink()
-        def link(lock):
+        def link(lock, destination):
             lock.unlink()
-            lock.symlink_to(target)
+            lock.symlink_to(destination)
         def directory(lock):
             lock.unlink()
             lock.mkdir()
         def fifo(lock):
             lock.unlink()
             os.mkfifo(lock)
-        for label, replace in (('missing', missing), ('link', link), ('directory', directory), ('fifo', fifo)):
+        cases = (('missing', missing), ('link', lambda lock: link(lock, target)),
+                 ('dangling', lambda lock: link(lock, dangling)), ('directory', directory), ('fifo', fifo))
+        for label, replace in cases:
             for name, arguments in self.CALLS:
                 with self.subTest(lock=label, tool=name):
                     job, broker = self.unbound(f'{name}-{label}')
@@ -359,8 +474,107 @@ class AdmissionLockTests(unittest.TestCase):
                         self.refused_without_a_file(job, broker, name, arguments)
                     finally:
                         self.assertFalse(watchdog and watchdog.stop())
-                    self.assertFalse(os.path.lexists(target))
+                    self.assertFalse(os.path.lexists(dangling))
+                    self.assertEqual(target.read_bytes(), b'untouched')
                     self.assertEqual(command_processes(job, state=self.root), [])
+
+    def test_a_busy_lock_and_a_failed_lock_open_refuse_both_tools(self):
+        job, broker = self.unbound('unavailable')
+        with held_lock(job / ADMISSION_LOCK):
+            for name, arguments in self.CALLS:
+                with self.subTest(tool=name, failure='busy'):
+                    self.refused_without_a_file(job, broker, name, arguments)
+        for name, arguments in self.CALLS:
+            with self.subTest(tool=name, failure='EIO'):
+                reads = FakeOs(open=failing(errno.EIO, ADMISSION_LOCK))
+                with patch.object(state_files, 'os', reads):
+                    self.refused_without_a_file(job, broker, name, arguments)
+                self.assertEqual(reads.count('open', ADMISSION_LOCK), 1)
+
+    def test_interrupt_at_lock_open_releases_the_lock_and_descriptors(self):
+        for name, arguments in self.CALLS:
+            with self.subTest(tool=name):
+                job, broker = self.unbound(name)
+                before = tree(job), open_descriptors()
+                acquired = []
+
+                def interrupt(real, leaf, *args, **kwargs):
+                    fd = real(leaf, *args, **kwargs)
+                    if leaf == ADMISSION_LOCK:
+                        acquired.append(fd)
+                        signal.raise_signal(signal.SIGINT)
+                    return fd
+
+                with patch.object(state_files, 'os', FakeOs(open=interrupt)), self.assertRaises(KeyboardInterrupt):
+                    handle({'method': 'tools/call', 'params': {'name': name, 'arguments': arguments}}, broker)
+                self.assertEqual(len(acquired), 1)
+                self.assertEqual((tree(job), open_descriptors()), before)
+                with held_lock(job / ADMISSION_LOCK):
+                    pass
+
+    def test_manifest_and_live_ledger_refuse_unreadable_evidence(self):
+        with (patch('harness.command_server.git.check_worktree_binding'),
+              patch('harness.command_server.git.head', return_value='head')):
+            job, run_path, _, broker = self.bound('authority')
+            for path in (broker.path, run_path):
+                with self.subTest(artifact=path.name):
+                    reads = FakeOs(open=failing(errno.EIO, path.name))
+                    with patch.object(state_files, 'os', reads):
+                        for name, arguments in self.CALLS:
+                            self.refused_without_a_file(job, broker, name, arguments)
+                    self.assertEqual(reads.count('open', path.name), len(self.CALLS))
+
+                    raw = path.read_bytes()
+                    target = self.root / ('copy-' + path.name)
+                    path.replace(target)
+                    path.symlink_to(target)
+                    for name, arguments in self.CALLS:
+                        self.refused_without_a_file(job, broker, name, arguments)
+                    path.unlink()
+                    os.mkfifo(path)
+                    watchdog = FifoWatchdog(path, bound=3)
+                    try:
+                        for name, arguments in self.CALLS:
+                            self.refused_without_a_file(job, broker, name, arguments)
+                    finally:
+                        self.assertFalse(watchdog.stop())
+                    path.unlink()
+                    target.replace(path)
+                    self.assertEqual(path.read_bytes(), raw)
+            self.assertEqual(broker.list_commands()[0]['command'], self.COMMAND)
+
+    def test_delete_scope_rechecks_the_ledger_and_blocks_on_read_failure(self):
+        with (patch('harness.command_server.git.check_worktree_binding'),
+              patch('harness.command_server.git.head', return_value='head')):
+            job, run_path, _, broker = self.bound('scope')
+            opened = []
+
+            def fail_second(real, leaf, *args, **kwargs):
+                if leaf == run_path.name:
+                    opened.append(leaf)
+                    if len(opened) == 2:
+                        raise OSError(errno.EIO, os.strerror(errno.EIO))
+                return real(leaf, *args, **kwargs)
+
+            with patch.object(state_files, 'os', FakeOs(open=fail_second)):
+                self.refused_without_a_file(job, broker, *self.CALLS[1])
+            self.assertEqual(opened, [run_path.name, run_path.name])
+
+    def test_worktree_ancestor_lookup_failure_refuses_both_tools(self):
+        job, broker = self.unbound('worktree-ancestor')
+        original = Path.lstat
+        lookups = []
+
+        def fail_ancestor(path, *args, **kwargs):
+            if path == self.root.parent:
+                lookups.append(path)
+                raise OSError(errno.EIO, os.strerror(errno.EIO))
+            return original(path, *args, **kwargs)
+
+        with patch.object(Path, 'lstat', fail_ancestor):
+            for name, arguments in self.CALLS:
+                self.refused_without_a_file(job, broker, name, arguments)
+        self.assertEqual(lookups, [self.root.parent] * len(self.CALLS))
 
     def test_a_deletion_refused_after_admission_still_leaves_its_journal_and_receipt(self):
         job, broker = self.unbound('admitted')

@@ -20,6 +20,7 @@ class EnvironmentCLITests(unittest.TestCase):
 
     def invoke(self, extra, error=None):
         engine = Mock()
+        engine.context.saved_stop = None
         engine.resume.return_value = dict(id="run_abc", status="paused", branch="test", worktree="/tmp/test")
         engine.resume.side_effect = error
         output, errors = io.StringIO(), io.StringIO()

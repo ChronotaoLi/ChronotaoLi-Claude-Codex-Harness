@@ -9,7 +9,8 @@ import unittest
 
 from harness.context import compose, ContextCapacityError, prompt_json
 from harness.input_projection import project_history, project_commands, validate_indexes
-from harness.util import HarnessError
+from harness import stops
+from harness.util import EvidenceError, HarnessError
 
 
 def rule5_id(command):
@@ -245,8 +246,9 @@ class InputProjectionTests(unittest.TestCase):
         path = Path(ref['artifact'])
         path.unlink()
         os.mkfifo(path)
-        with self.assertRaisesRegex(HarnessError, 'regular file'):
+        with self.assertRaises(EvidenceError) as raised:
             validate_indexes(self.root, [ref])
+        self.assertEqual(stops.of(raised.exception)['reason'], 'runtime_integrity')
 
     def test_small_payload_stays_inline_and_symlink_index_is_rejected(self):
         packet = {'tool_constraints': {'verification_commands': [{'cwd': '.', 'argv': ['python3', '-V']}]}}

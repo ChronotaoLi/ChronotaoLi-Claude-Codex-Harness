@@ -268,9 +268,11 @@ class LifecycleTests(SamplingCase):
     def test_an_interrupt_in_an_end_sample_keeps_the_saved_completion(self):  # L8
         calls = quota_stubs.install(self, claude="sigint_after:1")
         engine = self.engine(self.backend())
-        with self.assertRaises(KeyboardInterrupt):
-            engine.start("Implement greet", plan())
-        self.assertEqual(read_json(engine.directory / "state.json")["status"], "completed")
+        with contextlib.redirect_stderr(io.StringIO()) as errors:
+            result = engine.start("Implement greet", plan())
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(read_json(engine.directory / "state.json"), result)
+        self.assertIn("警告", errors.getvalue())
         self.assertEqual([suffix(name) for name in self.names(engine)],
                          ["claude-before_use.json", "codex-before_use.json"])
         self.assertTrue(group_gone(calls.probes("claude")[-1]["pid"]))
@@ -379,8 +381,8 @@ class QuotaFailureTests(SamplingCase):
             marks.setdefault("raised", time.monotonic())
             return annotate(sampler, error)
 
-        def timed_commit(store):
-            value = commit(store)
+        def timed_commit(store, **kwargs):
+            value = commit(store, **kwargs)
             if store.run.get("status") == "blocked":
                 marks.setdefault("saved", time.monotonic())
             return value
@@ -453,10 +455,10 @@ class AdmissionTests(SamplingCase):
         calls, engine = self.budget_stop(claude="hang_after:1")
         real = RunStore.commit
 
-        def failing(store):
+        def failing(store, **kwargs):
             if store.run.get("status") == "blocked":
                 raise OSError("synthetic stop save failure")
-            return real(store)
+            return real(store, **kwargs)
         with patch.object(RunStore, "commit", failing), self.assertRaises(OSError) as caught:
             engine.start("Implement greet", plan())
         self.assertEqual(str(caught.exception), "synthetic stop save failure")
@@ -491,19 +493,14 @@ class AdmissionTests(SamplingCase):
         sampler.terminal_saved()
         unconfirmed = stops.make("process_unconfirmed", "dispatch_exit", data={"returned_unsealed": False},
                                  source={"dispatch_id": "d1"})
-        with self.assertRaises(HarnessError):
-            try:
-                raise HarnessError("exit not confirmed", stop=unconfirmed)
-            finally:
-                sampler.end_of_call()
+        sampler.end_of_call(HarnessError("exit not confirmed", stop=unconfirmed))
         self.assertEqual(context.snapshots, [])
         sampler.mark_used("claude")
         sampler.terminal_saved()
-        with self.assertRaises(HarnessError):
-            try:
-                raise HarnessError("budget", stop=stops.make("budget", "task_attempts"))
-            finally:
-                sampler.end_of_call()
+        try:
+            raise KeyboardInterrupt("unrelated caller exception")
+        except KeyboardInterrupt:
+            sampler.end_of_call(HarnessError("budget", stop=stops.make("budget", "task_attempts")))
         self.assertEqual(context.snapshots, ["claude"])   # an ordinary stop after the same save is sampled
 
     def test_an_ordinary_error_in_end_sampling_never_replaces_the_stop(self):  # A4
@@ -514,11 +511,16 @@ class AdmissionTests(SamplingCase):
         self.assertEqual(stops.of(caught.exception)["reason"], "agent_dispatches")
         self.assertEqual(len(calls.probes("claude")), 1)
 
-    def test_an_interrupt_in_end_sample_cleanup_replaces_the_stop_but_not_the_ledger(self):  # A5
+    def test_an_interrupt_in_end_sample_cleanup_keeps_the_budget_stop(self):  # A5
         calls, engine = self.budget_stop(claude="sigint_on_term_after:1")
-        with patch.object(quota, "SETTLE_SECONDS", 0.5), self.assertRaises(KeyboardInterrupt):
+        with patch.object(quota, "SETTLE_SECONDS", 0.5), contextlib.redirect_stderr(io.StringIO()) as errors, \
+                self.assertRaises(HarnessError) as caught:
             engine.start("Implement greet", plan())
-        self.assertEqual(read_json(engine.directory / "state.json")["status"], "blocked")
+        saved = read_json(engine.directory / "state.json")
+        self.assertEqual(saved["status"], "blocked")
+        self.assertEqual(saved["stop"], stops.of(caught.exception))
+        self.assertEqual((saved["stop"]["kind"], saved["stop"]["reason"]), ("budget", "agent_dispatches"))
+        self.assertIn("警告", errors.getvalue())
         self.assertFalse(any(name.endswith("claude-stop.json") for name in self.names(engine)))
         self.assertEqual(len(calls.probes("claude")), 2)
         self.assertTrue(group_gone(calls.probes("claude")[-1]["pid"]))

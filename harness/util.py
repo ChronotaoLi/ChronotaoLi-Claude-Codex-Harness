@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import contextlib
 import errno
-import fcntl
 import json
 import math
 import os
@@ -21,6 +20,7 @@ from . import stops
 
 PROCESS_HEARTBEAT_SECONDS = 60
 DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+_STDERR_JSON_ESCAPES = {code: f"\\u{code:04x}" for code in range(0x7f, 0xa0)}
 
 
 class HarnessError(Exception):
@@ -42,7 +42,11 @@ class EvidenceError(HarnessError):
 
 
 class ProcessStartError(HarnessError):
-    """Popen rejected startup synchronously; no child process was created."""
+    """The process failed to start synchronously."""
+
+
+class ProgramStartError(ProcessStartError):
+    """The child could not execute the requested program."""
 
 
 class CommandDirectoryError(ProcessStartError):
@@ -70,6 +74,25 @@ def fold_name(segment: str) -> str:
     """
     kept = "".join(char for char in segment if unicodedata.category(char) != "Cf")
     return unicodedata.normalize("NFKC", kept).casefold().rstrip(". ")
+
+
+def one_line(value) -> str:
+    """Escape non-printable characters and backslashes as repr() writes them."""
+    return "".join(char if char.isprintable() and char != "\\" else repr(char)[1:-1] for char in str(value))
+
+
+def display_text(text) -> str:
+    """Render a diagnostic with escaped controls and indented continuation lines."""
+    lines = str(text).split("\n")
+    if len(lines) > 1 and not lines[-1]:
+        lines.pop()
+    return "\n".join([one_line(lines[0]), *("  " + one_line(line) for line in lines[1:])])
+
+
+def escape_json_controls(text: str) -> str:
+    """Render serialized JSON for stderr, keeping the Unicode line separators literal."""
+    # JSON already escapes C0 controls. DEL and C1 can still be literal in strings.
+    return text.translate(_STDERR_JSON_ESCAPES)
 
 
 def dump(value) -> str:
@@ -128,21 +151,6 @@ def strict_json_loads(raw):
         raw = bytes(raw).decode("utf-8")
     return json.loads(raw, object_pairs_hook=_unique_pairs, parse_constant=_reject_constant,
                       parse_float=_finite_float)
-
-
-@contextlib.contextmanager
-def lock(path: Path, stop=None):
-    """An exclusive non-blocking lock; ``stop`` is the stop value a busy lock reports."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a+") as f:
-        try:
-            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as e:
-            raise HarnessError(f"已有进程持有运行锁：{path}", stop=stop) from e
-        try:
-            yield
-        finally:
-            fcntl.flock(f, fcntl.LOCK_UN)
 
 
 def group_alive(pgid: int) -> bool:
@@ -225,6 +233,25 @@ def _exit_unconfirmed(entry):
                       source={"dispatch_id": ident} if isinstance(ident, str) else {})
 
 
+def _check_dispatch_journals(dispatches, state, directory_for, check):
+    """Check in dispatch order, holding a shared root from the first journal check onward."""
+    from .state_files import StateFiles, holding
+
+    pending = ((entry, _dispatch_pgid(entry), directory_for(entry)) for entry in dispatches)
+    for entry, pgid, directory in pending:
+        if directory is None:
+            check(entry, pgid, directory, None)
+            continue
+
+        def check_remaining(files):
+            check(entry, pgid, directory, files)
+            for next_entry, next_pgid, next_directory in pending:
+                check(next_entry, next_pgid, next_directory, files)
+
+        holding(StateFiles.held(state), check_remaining)
+        return
+
+
 def ensure_dispatches_exited(dispatches, *, state, observe=group_alive):
     """Use the same conservative exit gate for execution and cleanup.
 
@@ -233,14 +260,15 @@ def ensure_dispatches_exited(dispatches, *, state, observe=group_alive):
     its callback, including for older ledgers without process_state. Command
     journals are read from ``state``, the state directory of the run.
     """
+    from .command_server import ensure_command_processes_exited
+
     exited = []
-    for entry in dispatches:
-        pgid = _dispatch_pgid(entry)
-        if entry.get("command_directory") is not None:
-            from .command_server import ensure_command_processes_exited
-            ensure_command_processes_exited(entry["command_directory"], entry, state=state, observe=observe)
+
+    def check(entry, pgid, directory, files):
+        if directory is not None:
+            ensure_command_processes_exited(directory, entry, state=files, observe=observe)
         if entry.get("exit_confirmed") is True:
-            continue
+            return
         hint = ("核实旧进程已退出后，可用 --confirm-exited <dispatch_id> 留痕确认；"
                 "已完成或已放弃的 run 使用 cleanup-run 的同名选项")
         if pgid is not None:
@@ -249,6 +277,8 @@ def ensure_dispatches_exited(dispatches, *, state, observe=group_alive):
             exited.append(entry)
         elif entry.get("process_state") != "prepared":
             raise HarnessError(f"无法确认旧 dispatch {entry.get('id', '<unknown>')} 已退出；{hint}", stop=_exit_unconfirmed(entry))
+
+    _check_dispatch_journals(dispatches, state, lambda entry: entry.get("command_directory"), check)
     return exited
 
 
@@ -270,15 +300,16 @@ def confirm_dispatches_exited(dispatches, identifiers, *, state, audit, save, ob
     # Read and validate every selected journal before audit or mutation.
     from .command_server import command_exit_settled, command_processes
     children = {}
-    for ident in identifiers:
-        entry = entries[ident]
-        _dispatch_pgid(entry)
-        children[ident] = (command_processes(entry["command_directory"], state=state)
-                           if entry.get("command_directory") else [])
+
+    def read_journals(entry, _pgid, directory, files):
+        children[entry["id"]] = command_processes(directory, state=files) if directory is not None else []
         confirmations = entry.get("command_exit_confirmations", {})
         if (not isinstance(confirmations, dict)
                 or any(not isinstance(value, dict) for value in confirmations.values())):
             raise HarnessError("命令退出确认无效")
+
+    _check_dispatch_journals((entries[ident] for ident in identifiers), state,
+                             lambda entry: entry.get("command_directory") or None, read_journals)
     # The whole batch to write, decided before the first audit; the gate's own rules say what is settled.
     pending = {ident: [child for child in children[ident]
                        if not command_exit_settled(child, entries[ident].get("command_exit_confirmations", {}))]
@@ -333,26 +364,9 @@ def append_event(path, run_id, event, **fields):
         os.fsync(output.fileno())
 
 
-@contextlib.contextmanager
-def readonly_lock(path):
-    """Lock existing evidence without creating a file during a preview."""
-    try:
-        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-    except FileNotFoundError:
-        yield
-        return
-    try:
-        try:
-            fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
-        except BlockingIOError as error:
-            raise HarnessError(f"运行正被写入，暂不能预览：{path}") from error
-        yield
-    finally:
-        os.close(descriptor)
-
-
 # Failures that describe the directory itself; other errors (descriptors, devices) stay local I/O.
 _DIRECTORY_ERRNOS = frozenset((errno.ENOENT, errno.ENOTDIR, errno.ELOOP, errno.EACCES, errno.EPERM, errno.ENAMETOOLONG))
+_PROGRAM_ERRNOS = _DIRECTORY_ERRNOS | {errno.ENOEXEC}
 
 
 def _directory_failure(name, parent, error):
@@ -524,6 +538,9 @@ def run_process(argv: list[str], cwd: Path, log: Path, *, stdin: str = "",
                     except (OSError, ValueError) as e:
                         message = f"无法启动进程 {argv[0] if argv else '<empty argv>'}：{e}；日志：{log}"
                         err.write(message + "\n")
+                        # Exec errors name the requested program; local startup faults need not.
+                        if isinstance(e, OSError) and e.errno in _PROGRAM_ERRNOS and argv and e.filename == argv[0]:
+                            raise ProgramStartError(message) from e
                         raise ProcessStartError(message) from e
                     # Ownership first: a failing close below must not leave the child unsupervised.
                     supervision.started(p)
@@ -544,7 +561,7 @@ def run_process(argv: list[str], cwd: Path, log: Path, *, stdin: str = "",
                     p.wait(timeout=min(PROCESS_HEARTBEAT_SECONDS, remaining))
                     return p.returncode
                 except subprocess.TimeoutExpired:
-                    print(f"[harness] {argv[0]} 仍在运行；日志 {log}", file=sys.stderr)
+                    print(f"[harness] {one_line(argv[0])} 仍在运行；日志 {one_line(log)}", file=sys.stderr)
 
 
 def tail(path: Path, size=4000) -> str:

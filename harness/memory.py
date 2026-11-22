@@ -22,11 +22,33 @@ MAX_SOURCE_BYTES = 2 * 1024 * 1024
 KIND_WEIGHTS = {"operator": 1.15, "project_knowledge": 1.1, "accepted_task": 0.9}
 
 
+class MemoryRecordError(HarnessError):
+    """A record cannot be represented in the memory store."""
+
+    def __init__(self, field, message):
+        self.field = field
+        super().__init__(f"记忆字段 {field}：{message}")
+
+
 def terms(text: str) -> set[str]:
     words = set(re.findall(r"[a-z0-9_./-]+", text.lower()))
     for chunk in re.findall(r"[\u3400-\u9fff]+", text):
         words.update(chunk[i:i + 2] for i in range(max(1, len(chunk) - 1)))
     return words
+
+
+_CLI_INPUT = object()
+
+
+def _input_error(message, option):
+    error = HarnessError(message)
+    error._memory_input = (_CLI_INPUT, option)
+    return error
+
+
+def _cli_input_option(error):
+    source, option = getattr(error, "_memory_input", (None, None))
+    return option if source is _CLI_INPUT else None
 
 
 def normalize_source_path(name):
@@ -41,10 +63,16 @@ def normalize_source_path(name):
     return relative.as_posix()
 
 
-def bind_source_files(repo, names):
+def bind_source_files(repo, names, *, cli_option=None):
     """Bind a complete batch to one HEAD using raw regular-file blob bytes."""
     root = Path(repo).resolve()
-    names = list(dict.fromkeys(normalize_source_path(name) for name in names))
+    input_stop = stops.make("invalid_input", "cli_arguments", data={"option": cli_option}) if cli_option else None
+    try:
+        names = list(dict.fromkeys(normalize_source_path(name) for name in names))
+    except HarnessError as error:
+        if error.stop is None:
+            error.stop = input_stop
+        raise
     if len(names) > 10:
         raise HarnessError("记忆来源最多十个不同文件")
     if not names:
@@ -57,7 +85,7 @@ def bind_source_files(repo, names):
         entry = next((entry for entry in entries if b"\t" in entry
                       and entry.split(b"\t", 1)[1] == name.encode("utf-8")), None)
         if entry is None:
-            raise HarnessError(f"HEAD 无此精确路径：{name}")
+            raise HarnessError(f"HEAD 无此精确路径：{name}", stop=input_stop if not tree.returncode else None)
         metadata = entry.split(b"\t", 1)[0].split()
         if metadata[0] == b"120000":
             raise HarnessError(f"不支持符号链接来源：{name}")
@@ -77,7 +105,7 @@ def bind_source_files(repo, names):
         if len(data) > MAX_SOURCE_BYTES:
             raise HarnessError(f"记忆来源文件过大：{name}")
         if blob.returncode or data != blob.stdout:
-            raise HarnessError(f"工作区与 blob 原始字节不同：{name}")
+            raise HarnessError(f"工作区与 blob 原始字节不同：{name}", stop=input_stop if not blob.returncode else None)
         hashes[name] = hashlib.sha256(data).hexdigest()
     return {"commit": commit, "source_hashes": hashes}
 
@@ -196,18 +224,47 @@ class Memory:
             db.close()
 
     @staticmethod
-    def validate_record(key, abstract, overview, detail, source, ttl_days):
-        if not key or not abstract or not source:
-            raise HarnessError("记忆必须有 key、摘要和来源")
-        if len(detail) > 100000 or len(overview) > 8000 or len(abstract) > 500:
-            raise HarnessError("记忆超过字段大小上限")
-        if ttl_days is not None and (isinstance(ttl_days, bool) or not isinstance(ttl_days, (int, float))
-                                     or not math.isfinite(ttl_days) or ttl_days <= 0):
-            raise HarnessError("ttl_days 必须为正数")
+    def _text(field, value):
+        if not isinstance(value, str):
+            raise MemoryRecordError(field, "必须为文本")
+        try:
+            value.encode("utf-8")
+        except UnicodeEncodeError as error:
+            raise MemoryRecordError(field, "无法编码为 UTF-8") from error
+
+    @classmethod
+    def validate_record(cls, key, abstract, overview, detail, source, ttl_days, *, kind="operator", provenance=None):
+        for field, value in (("key", key), ("abstract", abstract), ("overview", overview),
+                             ("detail", detail), ("source", source), ("kind", kind)):
+            cls._text(field, value)
+            if field in ("key", "abstract", "source") and not value:
+                raise MemoryRecordError(field, "不能为空")
+        for field, size, limit in (("abstract", len(abstract), 500), ("overview", len(overview), 8000),
+                                   ("detail", len(detail), 100000)):
+            if size > limit:
+                raise MemoryRecordError(field, "超过字段大小上限")
+        now = time.time()
+        expires = None
+        if ttl_days is not None:
+            if isinstance(ttl_days, bool) or not isinstance(ttl_days, (int, float)) or ttl_days <= 0:
+                raise MemoryRecordError("ttl_days", "必须为有限的正数")
+            try:
+                expires = now + ttl_days * 86400
+            except OverflowError as error:
+                raise MemoryRecordError("ttl_days", "到期时间超过存储范围") from error
+            if not math.isfinite(expires):
+                raise MemoryRecordError("ttl_days", "到期时间必须为有限值")
+        try:
+            # Provenance contains filesystem names. JSON escapes preserve their bytes on read.
+            provenance_json = json.dumps(provenance or {}, allow_nan=False)
+        except (TypeError, ValueError, OverflowError, RecursionError) as error:
+            raise MemoryRecordError("provenance", "无法编码为 JSON") from error
+        return now, expires, provenance_json
 
     @classmethod
     def _insert(cls, db, *, key, abstract, overview, detail, source, kind, ttl_days, provenance):
-        now = time.time()
+        now, expires, provenance_json = cls.validate_record(
+            key, abstract, overview, detail, source, ttl_days, kind=kind, provenance=provenance)
         old = db.execute("SELECT * FROM memories WHERE key=? AND active=1", (key,)).fetchone()
         if old:
             # Keys remain global. Legacy unscoped records share the project scope;
@@ -224,21 +281,21 @@ class Memory:
             new_scope = identity({"key": key, "kind": kind, "source": source,
                                   "provenance": provenance})
             if old_scope is None or new_scope != old_scope:
-                raise HarnessError(f"记忆 key 已绑定其他作用域，不能替代：{key}")
+                raise _input_error(f"记忆 key 已绑定其他作用域，不能替代：{key}", "--key")
         db.execute("UPDATE memories SET active=0 WHERE key=?", (key,))
         ident = uid("mem")
         db.execute("""INSERT INTO memories
             (id,key,abstract,overview,detail,source,kind,created,expires,supersedes,active,provenance)
             VALUES (?,?,?,?,?,?,?,?,?,?,1,?)""",
-                   (ident, key, abstract, overview, detail, source, kind, now,
-                    now + ttl_days * 86400 if ttl_days else None, old[0] if old else None,
-                    json.dumps(provenance or {}, ensure_ascii=False)))
+                   (ident, key, abstract, overview, detail, source, kind, now, expires,
+                    old[0] if old else None, provenance_json))
         return ident
 
     @staticmethod
     def _operation_digest(operation_id, request):
         if not isinstance(operation_id, str) or not operation_id or len(operation_id) > 256:
             raise HarnessError("记忆写入操作 ID 无效")
+        Memory._text("operation_id", operation_id)
         data = json.dumps(request, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
         return hashlib.sha256(data.encode("utf-8")).hexdigest()
 
@@ -261,7 +318,6 @@ class Memory:
 
     def remember(self, *, key, abstract, overview, detail, source, kind="operator", ttl_days=None,
                  provenance=None, operation_id=None):
-        self.validate_record(key, abstract, overview, detail, source, ttl_days)
         record = dict(key=key, abstract=abstract, overview=overview, detail=detail,
                       source=source, kind=kind, ttl_days=ttl_days, provenance=provenance)
         request = {"method": "remember", **record}
@@ -320,10 +376,19 @@ class Memory:
         with self.connect() as db:
             return self._check_proposals(db, proposals, approved_keys, commit)
 
+    @staticmethod
+    def knowledge_records(proposals, approved_keys, commit, run_id, task_id, ttl_days):
+        for proposal in proposals:
+            if proposal["key"] in approved_keys:
+                yield dict(key="knowledge:" + proposal["key"], abstract=proposal["abstract"],
+                           overview=proposal["content"], detail=proposal["content"],
+                           source=f"git:{commit};run:{run_id};task:{task_id}", kind="project_knowledge",
+                           ttl_days=ttl_days, provenance={"commit": commit, "run_id": run_id,
+                               "task_id": task_id, "source_hashes": proposal["source_hashes"]})
+
     def remember_proposals(self, proposals, approved_keys, commit, run_id, task_id, ttl_days=180,
                            *, operation_id=None):
         """Atomically promote only independently approved keys; preserve operator ownership."""
-        self.validate_record("knowledge", "knowledge", "", "", "review", ttl_days)
         if commit is None:
             raise HarnessError("提升项目知识必须提供接受的提交")
         request = {"method": "remember_proposals", "proposals": proposals, "approved_keys": approved_keys,
@@ -334,14 +399,8 @@ class Memory:
             if previous is not None:
                 return previous
             approved = self._check_proposals(db, proposals, approved_keys, commit)
-            identifiers = []
-            for proposal in approved:
-                provenance = {"commit": commit, "run_id": run_id, "task_id": task_id,
-                              "source_hashes": proposal["source_hashes"]}
-                identifiers.append(self._insert(db, key="knowledge:" + proposal["key"],
-                    abstract=proposal["abstract"], overview=proposal["content"], detail=proposal["content"],
-                    source=f"git:{commit};run:{run_id};task:{task_id}", kind="project_knowledge",
-                    ttl_days=ttl_days, provenance=provenance))
+            identifiers = [self._insert(db, **record) for record in
+                           self.knowledge_records(approved, approved_keys, commit, run_id, task_id, ttl_days)]
             self._complete_operation(db, operation_id, request, identifiers)
             return identifiers
 
@@ -491,7 +550,7 @@ class Memory:
         with self.connect() as db:
             row = db.execute("SELECT * FROM memories WHERE id=?", (ident,)).fetchone()
         if not row:
-            raise HarnessError(f"没有此记忆：{ident}")
+            raise _input_error(f"没有此记忆：{ident}", "id")
         result = self._decode(row)
         result["expired"] = result["expires"] is not None and result["expires"] < time.time()
         result.update(self._staleness(result))
@@ -502,9 +561,9 @@ class Memory:
     @staticmethod
     def validate_search(query=None, *, key=None, level=1, limit=6):
         if (query is None) == (key is None):
-            raise HarnessError("query 和 key 必须且只能提供一个")
+            raise _input_error("query 和 key 必须且只能提供一个", "query" if key is None else "--key")
         if query is not None and not isinstance(query, str) or key is not None and (not isinstance(key, str) or not key):
-            raise HarnessError("query 必须为字符串，key 必须为非空字符串")
+            raise _input_error("query 必须为字符串，key 必须为非空字符串", "--key" if query is None else "query")
         if isinstance(level, bool) or not isinstance(level, int) or level not in (0, 1, 2) or isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 20:
             raise HarnessError("level 应为 0/1/2，limit 应为 1..20")
 

@@ -115,6 +115,18 @@ class UnboundBrokerTests(unittest.TestCase):
         self.assertEqual((journal["process_state"], journal["exit_confirmed"], journal["pgid"]), ("exited", True, None))
         return captures["stderr"]
 
+    def test_missing_program_keeps_a_complete_start_failed_receipt(self):
+        command = {"cwd": ".", "argv": [str(self.root / "missing-program")]}
+        broker = self.broker([command])
+        tool_error, result = call(broker, "run_command", {"command_id": expected_id(command)})
+        self.assertFalse(tool_error)
+        receipt = read_json(Path(result["stdout_path"]).parent / "receipt.json")
+        for row in (result, receipt):
+            self.assertEqual((row["exit_code"], row["termination_reason"], row["exit_confirmed"],
+                              row["evidence_complete"]), (None, "start_failed", True, True))
+            self.assertFalse(row["lifecycle"]["started"])
+            self.assertIn(command["argv"][0], row["stderr"])
+
     def test_manifest_version_3_lists_each_command_with_its_directory_and_records_the_root_once(self):
         sub, top = self.command("sub"), self.command(".")
         scope = {"task_id": "task", "allowed_paths": ["a.txt"]}

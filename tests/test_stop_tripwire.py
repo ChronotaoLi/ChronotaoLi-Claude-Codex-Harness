@@ -812,7 +812,7 @@ class LedgerAndRecordChannels(unittest.TestCase):
         store = RunStore(state)
         store.attach(read_json(path))
         # No operation attribute, like the stand-in contexts other tests give Workflow.
-        context = SimpleNamespace(run=store.run, save=store.commit, checkpoint=lambda: None,
+        context = SimpleNamespace(run=store.run, store=store, save=store.commit, checkpoint=lambda: None,
                                   event=lambda *args, **kwargs: None)
         return Workflow(context, SimpleNamespace(lifecycle=SimpleNamespace(settle_stop=stops.of)))
 
@@ -875,7 +875,7 @@ class LedgerAndRecordChannels(unittest.TestCase):
         self.assertEqual(found[0].errors, (id(written),))
         self.assertEqual(found[0].exempt, "injected")
 
-    def test_a_commit_that_wrote_then_failed_to_read_back_counts_once(self):
+    def test_a_successful_commit_never_reads_back_and_counts_once(self):
         state, path = self.ledger()
         workflow, error = self.workflow(state, path), runtime_error()
         original, reads = LockedDirectory.read, []
@@ -883,15 +883,26 @@ class LedgerAndRecordChannels(unittest.TestCase):
         def read(locked, name, **kwargs):   # the store reads its ledger through the locked directory
             if name == run_store.LEDGER:
                 reads.append(name)
-                if len(reads) == 2:   # commit reads the source, writes, then reads the written bytes back
-                    raise OSError(errno.EIO, "read back failed")
+                self.assertNotIn("stop", read_json(path), "unexpected ledger read after writing")
             return original(locked, name, **kwargs)
-        with patch.object(LockedDirectory, "read", read), self.assertRaises(OSError):
-            workflow.stop(error)
+        with patch.object(LockedDirectory, "read", read):
+            self.assertIs(workflow.stop(error), Workflow.WRITTEN)
+        self.assertTrue(reads)
         self.assertEqual(read_json(path)["stop"]["kind"], "unclassified")
         found = stop_tripwire.consume(self)
         self.assertEqual(summary(found), [(["ledger"], "unclassified", "untyped_harness_error")])
         self.assertEqual(found[0].errors, (id(error),))
+
+    def test_kept_terminal_counts_no_stop_publication(self):
+        state, path = self.ledger()
+        workflow = self.workflow(state, path)
+        store = workflow.context.store
+        store.run["status"] = "completed"
+        store.commit(terminal=True)
+        before = path.read_bytes()
+        self.assertIs(workflow.stop(runtime_error()), Workflow.KEPT)
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(stop_tripwire.consume(self), [])
 
     def test_a_commit_whose_write_failed_counts_nothing(self):
         state, path = self.ledger()

@@ -12,7 +12,8 @@ from . import git, stops
 from .context import compact_checks
 from .recovery import snapshot_digest
 from .services import RuntimeService
-from .util import CommandDirectoryError, HarnessError, ProcessTimeout, run_process, tail, with_descriptors, write_json
+from .util import (CommandDirectoryError, HarnessError, ProcessStartError, ProcessTimeout, ProgramStartError,
+                   run_process, tail, with_descriptors, write_json)
 
 
 def checks_failed(result):
@@ -70,6 +71,7 @@ class Verification(RuntimeService):
                     # Every error that leaves this command, the exit gate's included, is its feedback (rule 11).
                     self.context.run["feedback"] = {"task_id": task_id,
                         "verification_error": {"command": deepcopy(command), "error": str(failure), "log": str(log)}}
+                    self.context.save_fact("feedback")
 
                 try:
                     code = run_process(command["argv"], cwd, log, relative_cwd=command["cwd"], root_fd=root_fd,
@@ -79,16 +81,18 @@ class Verification(RuntimeService):
                     error = caught
                     outcome = getattr(caught, "outcome", outcome)
                 finally:
+                    interrupted = isinstance(error, (KeyboardInterrupt, SystemExit))
                     facts = outcome.to_dict() if outcome is not None else {
                         "exit_code": code, "exit_confirmed": False, "evidence_complete": False,
-                        "termination_reason": "cancelled" if isinstance(error, KeyboardInterrupt) else "error",
+                        "termination_reason": ("cancelled" if isinstance(error, KeyboardInterrupt)
+                                               else "interrupted" if interrupted else "error"),
                         "cleanup_errors": [], "cleanup_actions": [], "errors": []}
                     code = facts["exit_code"]
                     reason = facts["termination_reason"]
-                    status = ("passed" if code == 0 and reason == "normal"
+                    status = ("interrupted" if interrupted or reason in {"cancelled", "interrupted"}
+                              else "passed" if code == 0 and reason == "normal"
                               and facts["exit_confirmed"] and facts["evidence_complete"] and error is None
                               else "timed_out" if reason == "timeout"
-                              else "interrupted" if reason in {"cancelled", "interrupted"}
                               else "failed" if facts["exit_confirmed"] else "unknown")
                     entry.update(status="completed" if status == "passed" else status,
                         command=deepcopy(command), exit_code=code, termination_reason=reason,
@@ -112,11 +116,12 @@ class Verification(RuntimeService):
                     # Persist the receipt independently of the run ledger. A failed
                     # save must still leave the owned process and partial results inspectable.
                     persistence_error = None
+                    incomplete_status = "interrupted" if status == "interrupted" else "failed"
                     try:
                         result.update(stdout=tail(log.with_suffix(".stdout")), stderr=tail(log.with_suffix(".stderr")))
                     except BaseException as caught:
                         result["evidence_complete"] = False
-                        result["status"] = "failed"
+                        result["status"] = incomplete_status
                         persistence_error = caught
                     try:
                         write_json(folder / "results.json", results)
@@ -127,9 +132,9 @@ class Verification(RuntimeService):
                     except BaseException as caught:
                         persistence_error = persistence_error or caught
                     if persistence_error is not None:
-                        result.update(status="failed", evidence_complete=False,
+                        result.update(status=incomplete_status, evidence_complete=False,
                                       persistence_error=str(persistence_error))
-                        entry.update(status="failed", evidence_complete=False,
+                        entry.update(status=incomplete_status, evidence_complete=False,
                                      persistence_error=str(persistence_error))
                         # Either destination can fail independently. Retry once with
                         # the incomplete-evidence fact, without masking the cause.
@@ -140,18 +145,16 @@ class Verification(RuntimeService):
                                 pass
                     if error is None:
                         error = persistence_error
-                # The command boundary (spec 4.3 cells 1-2): process facts come first. A timeout or a
-                # command that never started for its directory is a verification result only when its
-                # cleanup and persistence were clean. Otherwise the process facts decide the stop and a
-                # failed write is the error raised, with the process error as its cause.
+                # Interrupts keep their own stop (K6-1). Otherwise process facts take
+                # precedence over verification writes and local startup faults.
                 from .dispatch import process_stop
-                stop = process_stop(error, entry["id"]) if error is not None else None
-                replaced = isinstance(error, (ProcessTimeout, CommandDirectoryError)) and persistence_error is not None
+                stop = process_stop(error, entry["id"]) if error is not None and not interrupted else None
+                check_failure = isinstance(error, (ProcessTimeout, CommandDirectoryError, ProgramStartError))
+                replaced = check_failure and persistence_error is not None
                 if replaced:
                     persistence_error.__cause__ = error
                     error = persistence_error
-                recordable = (isinstance(error, (ProcessTimeout, CommandDirectoryError))
-                              and (stop is None or stop["kind"] != "evidence"))
+                recordable = check_failure and not replaced and (stop is None or stop["kind"] != "evidence")
                 if error is not None and not recordable:
                     # The feedback names the very error that leaves, so it is decided first.
                     # A replaced write error carries the process facts' stop even when it has its own.
@@ -163,6 +166,12 @@ class Verification(RuntimeService):
                             typed.outcome = outcome
                             report(typed)
                             raise typed from error
+                    if not check_failure and isinstance(error, ProcessStartError) and error.stop is None:
+                        cause = error.__cause__
+                        if isinstance(cause, ValueError):
+                            error.stop = stops.make("runtime_failure", "invariant")
+                        else:
+                            error.stop = stops.make("runtime_failure", "io", data={"error_type": type(cause).__name__})
                     report(error)
                     raise error
                 try:
@@ -196,6 +205,7 @@ class Verification(RuntimeService):
             write_json(folder / "file-changes.json", changes)
             self.context.run["feedback"] = {"task_id": task_id, "verification": compact_checks(results),
                 "verification_changes": {**changes, "artifact": str(folder / "file-changes.json")}}
+            self.context.save_fact("feedback")
             raise HarnessError("验证命令修改了待审阅文件；验证必须为只读检查。"
                                f"新增未跟踪文件：{changes['added']}；修改：{changes['modified']}；删除：{changes['deleted']}。"
                                "请配置构建/测试输出位置或显式忽略生成产物；不自动豁免文件。"
@@ -224,9 +234,8 @@ class Verification(RuntimeService):
                        "head": self.context.run["expected_head"], "status": "preparing",
                        "setup_commands": self.context.config.data["verification"]["setup_commands"]}
         write_json(artifact, environment)
-        git.git(self.context.worktree, "worktree", "add", "--detach", str(checkout), environment["head"],
-                effect=git.CHECKOUT, binding=self.context.run["worktree_binding"])
-        binding = git.capture_worktree_binding(checkout, None)
+        binding = git.add_worktree(self.context.worktree, checkout, environment["head"],
+                                   binding=self.context.run["worktree_binding"])
         environment["binding"] = binding
         write_json(artifact, environment)
         baseline = git.snapshot(checkout, binding=binding)

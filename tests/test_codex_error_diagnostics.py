@@ -2,44 +2,58 @@
 import json
 import sys
 import tempfile
-import unittest
 from pathlib import Path
-from types import SimpleNamespace
+from unittest.mock import patch
 
-from harness.adapters import CLIBackend, _CODEX_ERROR_TAIL_BYTES, cli_error_summary
-from harness.util import HarnessError
+from harness.adapters import DemoBackend, _CODEX_ERROR_TAIL_BYTES, cli_error_summary
+from harness.runtime import Runtime
+from harness.util import HarnessError, read_json
+from test_harness import ROOT, RepoCase
 
 
 def jsonl(*events):
     return b"".join(json.dumps(event, ensure_ascii=False).encode() + b"\n" for event in events)
 
 
-class FailedCodexBackend(CLIBackend):
-    def __init__(self, raw):
-        super().__init__(SimpleNamespace(data={"runtime": {"agent_timeout_seconds": 10}}), None)
+class FailedCodexBackend(DemoBackend):
+    def __init__(self, cli, raw):
+        self.cli = cli
         self.raw = raw
+        self.job = None
 
-    def command(self, *args):
-        return [sys.executable, "-c",
+    def invoke(self, **kwargs):
+        if kwargs["role"] != "reviewer":
+            return super().invoke(**kwargs)
+        self.job = kwargs["job"]
+        argv = [sys.executable, "-c",
                 "import sys; sys.stdout.buffer.write(bytes.fromhex(sys.argv[1])); sys.exit(1)",
                 self.raw.hex()]
+        with patch.object(self.cli, "command", return_value=argv):
+            return self.cli.invoke(**kwargs)
 
 
-class CodexErrorDiagnosticTests(unittest.TestCase):
+class CodexErrorDiagnosticTests(RepoCase):
     def invoke_failure(self, raw):
-        with tempfile.TemporaryDirectory() as temporary:
-            job = Path(temporary)
-            backend = FailedCodexBackend(raw)
-            with self.assertRaises(HarnessError) as caught:
-                backend.invoke(role="reviewer", model={"cli": "codex", "model": "exact-model"},
-                               cwd=job, job=job, schema={}, prompt="fixture", run_path=job,
-                               on_start=None)
-            self.assertEqual((job / "process.stdout").read_bytes(), raw)
-            error = str(caught.exception)
-            self.assertIn("reviewer CLI exit=1", error)
-            self.assertIn(str(job), error)
-            self.assertFalse((job / "response.json").exists())
-            return error
+        self.config.data["roles"]["reviewer"].update(cli="codex", model="exact-model")
+        self.config.data["runtime"]["agent_timeout_seconds"] = 10
+        runtime = Runtime(self.config, self.repo)
+        backend = FailedCodexBackend(runtime.backend, raw)
+        runtime.backend = backend
+        with self.assertRaises(HarnessError) as caught:
+            runtime.start("Implement greet", read_json(ROOT / "examples/plan.json"))
+        job = backend.job
+        self.assertIsNotNone(job)
+        outcome = read_json(job / "process.outcome.json")
+        self.assertEqual((outcome["started"], outcome["termination_reason"], outcome["exit_code"]),
+                         (True, "normal", 1))
+        self.assertEqual((job / "process.stdout").read_bytes(), raw)
+        error = str(caught.exception)
+        self.assertIn("reviewer CLI exit=1", error)
+        self.assertIn(str(job), error)
+        self.assertFalse((job / "response.json").exists())
+        self.assertFalse((job / "terminal-capture.json").exists())
+        self.assertEqual(getattr(caught.exception, "__notes__", []), [])
+        return error
 
     def test_failed_process_reports_capacity_rate_and_auth_envelopes(self):
         for message in ("Selected model is at capacity. Please try a different model.",

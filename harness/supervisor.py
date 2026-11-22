@@ -12,7 +12,7 @@ import time
 
 from .operations import OPERATION_ID
 from .private_state import ensure_private_state, _path
-from .util import HarnessError, uid, write_json
+from .util import HarnessError, display_text, uid, write_json
 
 
 def _linked_run(state, operation_id):
@@ -145,6 +145,6 @@ def _write_receipt(path, receipt, propagating):
         # The CLI reports an interrupt in one line without notes; keep the diagnostic
         # visible, but a broken stderr must not replace the propagating exception either.
         try:
-            print(f'harness: {note}', file=sys.stderr, flush=True)
+            print("harness: " + display_text(note), file=sys.stderr, flush=True)
         except Exception:
             pass

@@ -16,7 +16,7 @@ from .adapters import CLIBackend
 from .command_server import DELETE_COMMAND_ID, ensure_command_processes_exited
 from .commands import command_id
 from .config import Config
-from .util import HarnessError, dump, read_json, run_process, write_json
+from .util import HarnessError, display_text, dump, one_line, read_json, run_process, write_json
 from .versions import RUN_SCHEMA_VERSION
 
 
@@ -35,10 +35,10 @@ def prepare_fixture(directory):
     # Git keeps no empty directory: a tracked file makes sub/ exist in the worktree.
     (repo / 'sub').mkdir()
     (repo / 'sub' / 'marker.txt').write_text('subdirectory command fixture\n', encoding='utf-8')
-    git.git(repo, 'init', '-q', '-b', 'main', effect=git.CHECKOUT, isolated_config=True)
+    git.git(repo, 'init', '--template=', '-q', '-b', 'main', effect=git.CHECKOUT, isolated_config=True)
     git.git(repo, 'add', '.', effect=git.INDEX, isolated_config=True)
     git.git(repo, 'commit', '-qm', 'Tool fixture', effect=git.INDEX_REFS, isolated_config=True)
-    git.git(repo, 'worktree', 'add', '--detach', str(worktree), effect=git.CHECKOUT, isolated_config=True)
+    binding = git.add_worktree(repo, worktree, 'HEAD', isolated_config=True)
     values = ['with spaces', "single'quote", 'double"quote', '*', ';', 'literal\nnewline', '$(printf unintended)']
     commands = [{'cwd': '.', 'argv': [sys.executable, 'argv_fixture.py', *values]},
                 {'cwd': '.', 'argv': ['/bin/sh', '-c', "printf '%s\\n' 'pipeline fixture' | /usr/bin/tr a-z A-Z"]},
@@ -73,7 +73,6 @@ def prepare_fixture(directory):
     case('external_diff', 'mcp__harness__file_diff', {'left': str(left), 'right': str(right)},
          {'different': True, 'binary': False, 'diff': '--- left\n+++ right\n@@ -1 +1 @@\n-before\n+after\n'})
     # The read-only harness MCP sees a bound run worktree; the broker does not.
-    binding = git.capture_worktree_binding(worktree, None)
     # The harness MCP reads only a current-version ledger, so the stand-in declares it.
     write_json(directory / 'run-state.json', {'schema_version': RUN_SCHEMA_VERSION, 'worktree': binding['worktree'],
                                               'worktree_binding': binding})
@@ -283,7 +282,8 @@ def tool_smoke(config, repo, *, timeout=180, max_turns=20, max_budget_usd=1.0):
     report = dict(cli_attempted=True, models_called=False, simulation=False, model=model['model'], dispatch_id=job.name, evidence=str(directory),
                   limitations=('One CLI version and bounded fixture; not OS isolation or exhaustive coverage; '
                                'delete_path is not exercised against concurrent renames'))
-    print(f"[harness] LIVE TOOL SMOKE model={model['model']} max_budget_usd={max_budget_usd} evidence={directory}", file=sys.stderr, flush=True)
+    print(f"[harness] LIVE TOOL SMOKE model={one_line(model['model'])} max_budget_usd={max_budget_usd} "
+          f"evidence={one_line(directory)}", file=sys.stderr, flush=True)
     env = dict(os.environ, CLAUDE_CODE_DISABLE_AUTO_MEMORY='1')
     try:
         code = run_process(argv, Path(fixture['worktree']), job / 'process', stdin=prompt, timeout=timeout, env=env)
@@ -319,7 +319,7 @@ def _main(argv=None):
         print(dump(report))
         return 0 if report['passed'] else 1
     except (HarnessError, OSError, ValueError, subprocess.TimeoutExpired) as error:
-        print(f'harness: {error}', file=sys.stderr)
+        print("harness: " + display_text(error), file=sys.stderr)
         return 1
     except KeyboardInterrupt:
         return 130

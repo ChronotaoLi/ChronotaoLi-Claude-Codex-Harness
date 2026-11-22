@@ -171,14 +171,17 @@ def journal_opens(fail=None):
 
     An open there for which ``fail(name, dir_fd)`` is true raises EIO instead: the opens the enumeration really makes.
     """
-    opened, reading, enumerate_journals = [], [], command_server.command_processes
+    opened, reading = [], []
+    enumerate_journals, enter_root = command_server.command_processes, state_files.HeldFiles.__enter__
 
-    def records(*args, **kwargs):
-        reading.append(True)
-        try:
-            return enumerate_journals(*args, **kwargs)
-        finally:
-            reading.pop()
+    def trace(operation):
+        def traced(*args, **kwargs):
+            reading.append(True)
+            try:
+                return operation(*args, **kwargs)
+            finally:
+                reading.pop()
+        return traced
 
     def open_(real, name, *args, **kwargs):
         dir_fd = kwargs.get("dir_fd")
@@ -188,7 +191,9 @@ def journal_opens(fail=None):
         if reading:
             opened.append((os.fspath(name) if dir_fd is None else None, identity(fd)))
         return fd
-    with patch.object(command_server, "command_processes", records), patch.object(state_files, "os", FakeOs(open=open_)):
+    with patch.object(command_server, "command_processes", trace(enumerate_journals)), \
+            patch.object(state_files.HeldFiles, "__enter__", trace(enter_root)), \
+            patch.object(state_files, "os", FakeOs(open=open_)):
         yield opened
 
 
@@ -235,6 +240,79 @@ class JournalFixture(unittest.TestCase):
 
 
 class JournalRecordTests(JournalFixture):
+    def test_root_resolution_failure_is_local_io(self):
+        entry = self.dispatch()
+        original_resolve = Path.resolve
+
+        def resolve(path, *args, **kwargs):
+            if path == self.root:
+                raise OSError(errno.EIO, "fixture root resolution failure")
+            return original_resolve(path, *args, **kwargs)
+
+        with patch.object(Path, "resolve", resolve), self.assertRaises(StateReadError) as raised:
+            command_processes(entry["command_directory"], state=self.root)
+        self.assertEqual(raised.exception.outcome.step.stage, "resolve")
+        self.assertEqual(raised.exception.outcome.errno, errno.EIO)
+        self.assertEqual(stop_of(raised.exception), stops.make("runtime_failure", "io", data={"error_type": "OSError"}))
+
+    def test_root_with_nul_has_typed_resolution_failure(self):
+        entry = self.dispatch()
+        with self.assertRaises(StateReadError) as raised:
+            command_processes(entry["command_directory"], state=str(self.root) + "\0")
+        self.assertEqual(raised.exception.outcome.step.stage, "resolve")
+        self.assertEqual(raised.exception.outcome.errno, errno.EINVAL)
+
+    def test_root_open_failure_preserves_path_validation_and_permission_error(self):
+        entry = self.dispatch(exit_confirmed=False)
+        valid = entry["command_directory"]
+        invalid = str(self.root / "dispatches" / ".." / "dispatches" / entry["id"] / "commands")
+
+        def open_(real, name, *args, **kwargs):
+            if kwargs.get("dir_fd") is None and os.fspath(name) == str(self.root):
+                raise OSError(errno.EACCES, "fixture root open failure")
+            return real(name, *args, **kwargs)
+
+        for path in (valid, invalid):
+            spelled = dict(entry, command_directory=path)
+            before, audits, saves = copy.deepcopy(spelled), [], []
+            gates = {
+                "records": lambda: command_processes(path, state=self.root),
+                "exit gate": lambda: ensure_dispatches_exited([spelled], state=self.root),
+                "confirmation": lambda: self.confirm([spelled], [entry["id"]], audits, saves),
+            }
+            for name, gate in gates.items():
+                with self.subTest(gate=name, valid=path == valid), patch.object(state_files, "os", FakeOs(open=open_)):
+                    if path == valid:
+                        with self.assertRaises(StateReadError) as raised:
+                            gate()
+                        self.assertEqual((raised.exception.outcome.step.stage, raised.exception.outcome.errno),
+                                         ("open", errno.EACCES))
+                        self.assertEqual(stop_of(raised.exception), local_io("PermissionError"))
+                    else:
+                        with self.assertRaises(EvidenceError) as raised:
+                            gate()
+                        self.assertEqual(stop_of(raised.exception),
+                                         stops.make("evidence", "runtime_integrity", source={"artifact": path}))
+                    self.assertEqual((audits, saves, spelled), ([], [], before))
+
+    def test_resolves_the_state_root_once_for_listing_and_all_journals(self):
+        entry = self.dispatch()
+        for _ in range(2):
+            folder, call = self.call(entry)
+            write_json(folder / "process.json", exited(call))
+        original_resolve = Path.resolve
+        resolved = []
+
+        def resolve(path, *args, **kwargs):
+            if path == self.root:
+                resolved.append(path)
+            return original_resolve(path, *args, **kwargs)
+
+        with patch.object(Path, "resolve", resolve):
+            records = command_processes(entry["command_directory"], state=self.root)
+        self.assertEqual([record["journal_state"] for record in records], ["valid", "valid"])
+        self.assertEqual(resolved, [self.root])
+
     def test_facts_and_digest_come_from_one_read(self):
         entry = self.dispatch()
         folder, call = self.call(entry)
@@ -540,6 +618,46 @@ class JournalRecordTests(JournalFixture):
 
 
 class JournalConfirmationTests(JournalFixture):
+    def test_batch_gates_resolve_and_open_one_root_for_both_dispatches(self):
+        original_resolve = Path.resolve
+        dispatches = [self.dispatch(ident) for ident in ("d1", "d2")]
+        journals = []
+        for entry in dispatches:
+            folder, call = self.call(entry)
+            (folder / "process.json").write_bytes(encoded(exited(call)))
+            journals.append(identity(folder))
+
+        def resolve(path, *args, **kwargs):
+            if path == self.root:
+                resolutions.append(path)
+                if len(resolutions) > 1:
+                    raise OSError(errno.EIO, "fixture rejects a second state root resolution")
+            return original_resolve(path, *args, **kwargs)
+
+        def open_(real, name, *args, **kwargs):
+            parent = kwargs.get("dir_fd")
+            if parent is None and os.fspath(name) == str(self.root):
+                root_opens.append(name)
+            if parent is not None and name == "process.json":
+                journal_reads.append(identity(parent))
+            return real(name, *args, **kwargs)
+
+        for gate in ("exit gate", "confirmation"):
+            with self.subTest(gate=gate):
+                resolutions, root_opens, journal_reads = [], [], []
+                with patch.object(Path, "resolve", resolve), patch.object(state_files, "os", FakeOs(open=open_)):
+                    if gate == "exit gate":
+                        self.assertEqual(ensure_dispatches_exited(iter(dispatches), state=self.root), [])
+                    else:
+                        selected = [dict(entry, exit_confirmed=False) for entry in dispatches]
+                        audits, saves = self.confirm(selected, ["d1", "d2"])
+                        self.assertEqual([(event, fields["dispatch_id"]) for event, fields in audits],
+                                         [("dispatch_exit_confirmed_by_operator", ident) for ident in ("d1", "d2")])
+                        self.assertEqual(len(saves), 2)
+                self.assertEqual(resolutions, [self.root])
+                self.assertEqual(root_opens, [str(self.root)])
+                self.assertEqual(journal_reads, journals)
+
     def test_an_invalid_journal_is_confirmed_bound_to_the_whole_file_until_it_changes(self):
         for layout in ("shape", "oversized", "not_json"):
             with self.subTest(layout=layout):
@@ -713,7 +831,15 @@ class BrokerJournalTests(unittest.TestCase):
             for path in journals:
                 path.write_text(json.dumps(json.loads(path.read_text())), encoding="utf-8")
             return records
-        reads = FakeOs(open=passing)
+        prior_directories = {identity(path.parent) for path in journals}
+        prior_opens = []
+
+        def opened(real, name, *args, dir_fd=None, **kwargs):
+            if name == "process.json" and identity(dir_fd) in prior_directories:
+                prior_opens.append(identity(dir_fd))
+            return real(name, *args, dir_fd=dir_fd, **kwargs)
+
+        reads = FakeOs(open=opened)
         listing = command_server.command_processes
         with patch.object(command_server, "ensure_command_processes_exited", gate_then_rewrite), \
                 patch.object(command_server, "command_processes",
@@ -722,7 +848,8 @@ class BrokerJournalTests(unittest.TestCase):
             response = self.call()
         self.assertFalse(response["isError"], response)
         self.assertEqual(json.loads(response["content"][0]["text"])["exit_code"], 0)
-        self.assertEqual((len(listings), reads.count("open", "process.json")), (1, len(journals)))
+        self.assertEqual(len(listings), 1)
+        self.assertCountEqual(prior_opens, list(prior_directories))
 
     def test_admission_reads_journals_from_the_job_s_own_directory_down(self):
         self.assertFalse(self.call()["isError"])
@@ -733,6 +860,23 @@ class BrokerJournalTests(unittest.TestCase):
         self.assertEqual({path for path, _ in opened if path is not None}, {str(self.root)})
         self.assertIn(identity(self.job), {ident for _, ident in opened})
         self.assertFalse({ident for _, ident in opened} & above)
+
+    def test_admission_opens_the_once_resolved_journal_root(self):
+        self.assertFalse(self.call()["isError"])
+        original_resolve = Path.resolve
+        resolved = []
+
+        def resolve(path, *args, **kwargs):
+            if path == self.root:
+                resolved.append(path)
+            return original_resolve(path, *args, **kwargs)
+
+        with patch.object(Path, "resolve", resolve), journal_opens() as opened:
+            response = self.call()
+        self.assertFalse(response["isError"], response)
+        self.assertEqual(resolved, [self.root])
+        self.assertEqual([path for path, _ in opened if path is not None], [str(self.root)])
+        self.assertIn(identity(self.root), {parent for _, parent in opened})
 
     def test_a_journal_without_a_confirmed_exit_refuses_the_next_call_at_once(self):
         for layout in ("fifo", "absent", "shape"):

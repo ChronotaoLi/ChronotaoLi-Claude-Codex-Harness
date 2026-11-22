@@ -8,7 +8,7 @@ from .file_tools import file_diff, file_sha256, json_check
 from . import git_query as git_queries
 from .memory import Memory
 from .shared import read_skill, skills_catalog
-from .util import HarnessError
+from .util import HarnessError, display_text
 from .versions import read_current_ledger
 
 TOOLS = [
@@ -121,7 +121,7 @@ def main():
         run_state = run_ledger(args.run)
     except HarnessError as error:
         # No request is served for a ledger this version does not interpret.
-        print(f"harness: {error}", file=sys.stderr, flush=True)
+        print("harness: " + display_text(error), file=sys.stderr, flush=True)
         return 1
     repo = Path(run_state["worktree"]) if run_state.get("worktree") else (
         args.state.parent if args.state.name == ".harness" else None)

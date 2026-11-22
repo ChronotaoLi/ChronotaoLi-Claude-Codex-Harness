@@ -3,6 +3,7 @@
 Every case uses real Git in a temporary repository and simulated agents.
 """
 import contextlib
+import errno
 import hashlib
 import io
 import json
@@ -12,12 +13,14 @@ import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
-from harness import git
+from harness import git, state_files
 from harness.cleanup import cleanup_run
 from harness.cli import main
 from harness.util import HarnessError, read_json, write_json
 from test_harness import RepoCase, ROOT, crash_after_save, crash_point
+from test_readonly_cleanup import tree_bytes
 from test_runtime_changes import ScriptedBackend
+from test_state_files import FakeOs
 
 
 def events(engine):
@@ -120,6 +123,65 @@ class ReclamationTests(RepoCase):
         self.assertFalse(Path(read_json(second)["worktree"]).exists())
         preview = cleanup_run(self.repo, result["id"])["checkouts"]
         self.assertEqual([i["status"] for i in preview], ["eligible", "absent"])
+
+    def test_schema_19_previews_non_fresh_retries_without_round_owners(self):
+        self.config.data["verification"]["fresh_checkout"] = False
+        for verbosity in ("-v", "-q"):
+            with self.subTest(verbosity=verbosity):
+                command = {"cwd": ".", "argv": [sys.executable, "-B", "-m", "unittest", verbosity]}
+                self.config.data["verification"]["commands"] = [command]
+                backend = ScriptedBackend()
+                engine = self.engine(backend)
+                crash, die = crash_point(engine)
+                verify = engine.services.verification.verify
+
+                def verify_then_die(*args, **kwargs):
+                    result = verify(*args, **kwargs)
+                    if kwargs.get("whole_run"):
+                        die()
+                    return result
+
+                with crash, patch.object(engine.services.verification, "verify", side_effect=verify_then_die), \
+                        self.assertRaises(KeyboardInterrupt):
+                    engine.start("Implement greet", self.plan())
+                result = self.engine(backend).resume(engine.run["id"])
+                self.assertEqual((result["schema_version"], result["status"]), (19, "completed"))
+                final, = result["final_history"]
+                first, second = final["verification_rounds"]
+                self.assertEqual((first["status"], second["status"]), ("running", "completed"))
+                self.assertEqual(final["verification"], str(Path(second["artifact_dir"]) / "results.json"))
+
+                dispatch_ids = []
+                dispatches = {entry["id"]: entry for entry in self.final_checks(result)}
+                for record in (first, second):
+                    folder = Path(record["artifact_dir"])
+                    check, = read_json(folder / "results.json")
+                    log = folder / "check-0"
+                    self.assertEqual((check["log"], check["status"]), (str(log), "passed"))
+                    dispatch_id = check["timing_source"]["dispatch_id"]
+                    dispatch_ids.append(dispatch_id)
+                    entry = dispatches[dispatch_id]
+                    self.assertEqual(check["command"], command)
+                    self.assertEqual(entry["command"], command)
+                    outcome = read_json(log.with_suffix(".outcome.json"))
+                    self.assertEqual(outcome, check["process_outcome"])
+                    self.assertEqual(outcome, entry["process_outcome"])
+                    self.assertEqual(entry["worktree"], result["worktree"])
+                    # Process facts are recorded, but the original does not bind
+                    # itself to the round or dispatch that produced it.
+                    self.assertTrue({"owner", "run_id", "attempt", "round", "dispatch_id"}.isdisjoint(outcome))
+                    self.assertNotIn("owner", entry)
+                    self.assertNotIn("checkout_digest", record)
+                self.assertEqual(set(dispatch_ids), set(dispatches))
+                self.assertNotEqual(*dispatch_ids)
+
+                worktree = Path(result["worktree"])
+                before = (tree_bytes(engine.directory), tree_bytes(worktree))
+                preview = cleanup_run(self.repo, result["id"])
+                self.assertEqual((preview["remove"], preview["checkouts"]), (False, []))
+                self.assertEqual((preview["worktree"]["worktree"], preview["worktree"]["status"]),
+                                 (str(worktree), "eligible"), preview["worktree"])
+                self.assertEqual((tree_bytes(engine.directory), tree_bytes(worktree)), before)
 
     def test_crash_after_verdict_save_reclaims_on_resume_without_reverifying(self):
         backend = ScriptedBackend()
@@ -310,6 +372,111 @@ class ReclamationTests(RepoCase):
         for path in kept:
             self.assertTrue(path.is_dir(), str(path))
         return removal
+
+    def removed_receipt(self, artifact, environment):
+        return {"run_id": environment["owner"]["run_id"], "artifact": str(artifact),
+                "artifact_digest": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+                "worktree": environment["worktree"], "head": environment["head"],
+                "status": "removed", "by": "cleanup-run"}
+
+    def test_reclamation_cannot_bypass_the_removed_receipt_checks(self):
+        for damaged in ("incomplete", "run_id", "artifact_digest", "worktree", "reappeared"):
+            with self.subTest(damaged=damaged):
+                backend = ScriptedBackend()
+                engine = self.stop_at_verdict(backend)
+                artifact, = self.artifacts(engine)
+                checkout_record = read_json(artifact)
+                checkout = Path(checkout_record["worktree"])
+                receipt = artifact.with_name("cleanup.json")
+                value = self.removed_receipt(artifact, checkout_record)
+                if damaged == "incomplete":
+                    value = {"status": "removed"}
+                elif damaged != "reappeared":
+                    value[damaged] = "does-not-match"
+                write_json(receipt, value)
+                original = receipt.read_bytes()
+
+                removal = self.assert_both_kept_and_refused(engine, backend, [checkout])
+                self.assertIn("重新出现" if damaged == "reappeared" else "清理记录", removal[0]["error"])
+                self.assertEqual(receipt.read_bytes(), original)
+                self.assertIn(str(checkout), git.git(self.repo, "worktree", "list", "--porcelain"))
+                self.assertEqual(sum(call["kind"] == "final_review" for call in backend.calls), 1)
+
+    def test_runtime_accepts_an_already_removed_verified_checkout_without_another_event(self):
+        backend = ScriptedBackend()
+        engine = self.stop_at_verdict(backend)
+        artifact, = self.artifacts(engine)
+        removed, = cleanup_run(self.repo, engine.run["id"], remove=True)["checkouts"]
+        self.assertEqual(removed["status"], "removed")
+        receipt = artifact.with_name("cleanup.json")
+        original = receipt.read_bytes()
+        real = git.git
+
+        def query(repo, *args, **kwargs):
+            self.assertNotEqual(args[:2], ("worktree", "remove"))
+            return real(repo, *args, **kwargs)
+
+        with patch.object(git, "git", side_effect=query):
+            result = self.engine(backend).resume(engine.run["id"])
+        self.assertEqual(result["status"], "completed")
+        self.assertFalse(any(event["event"].startswith("verification_checkout_reclaim") for event in events(engine)))
+        self.assertEqual(receipt.read_bytes(), original)
+
+    def test_reclamation_reads_the_receipt_once_and_retains_checkout_on_eio(self):
+        backend = ScriptedBackend()
+        engine = self.stop_at_verdict(backend)
+        artifact, = self.artifacts(engine)
+        checkout = Path(read_json(artifact)["worktree"])
+        receipt = artifact.with_name("cleanup.json")
+        write_json(receipt, {**self.removed_receipt(artifact, read_json(artifact)), "status": "pending"})
+        original = receipt.read_bytes()
+        opens, removals = [], []
+        real_git = git.git
+
+        def open_once(real, name, *args, **kwargs):
+            if name == "cleanup.json":
+                opens.append(name)
+                if len(opens) == 1:
+                    raise OSError(errno.EIO, "injected fault")
+            return real(name, *args, **kwargs)
+
+        def record_git(repo, *args, **kwargs):
+            if args[:2] == ("worktree", "remove"):
+                removals.append(args[2])
+            return real_git(repo, *args, **kwargs)
+
+        with patch.object(state_files, "os", FakeOs(open=open_once)), patch.object(git, "git", side_effect=record_git):
+            result = self.engine(backend).resume(engine.run["id"])
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["final_history"][-1]["status"], "approved")
+        self.assertEqual(opens, ["cleanup.json"])
+        self.assertEqual(removals, [])
+        self.assertEqual(receipt.read_bytes(), original)
+        self.assertTrue(checkout.is_dir())
+        failure, = [event for event in events(engine) if event["event"] == "verification_checkout_reclaim_failed"]
+        self.assertIn("cleanup.json", failure["error"])
+        self.assertEqual(sum(call["kind"] == "final_review" for call in backend.calls), 1)
+
+    def test_reclamation_diagnostics_use_the_derived_directory_when_ledger_path_changes(self):
+        backend = ScriptedBackend()
+        engine = self.stop_at_verdict(backend)
+        artifact, = self.artifacts(engine)
+        checkout = Path(read_json(artifact)["worktree"])
+        foreign = self.outside / "foreign"
+        write_json(foreign / "cleanup.json", {"status": "removed"})
+        write_json(foreign / "checkout.json", {"worktree": "foreign"})
+        state = engine.directory / "state.json"
+        changed = read_json(state)
+        changed["final_history"][-1]["verification_rounds"][-1]["artifact_dir"] = str(foreign)
+        write_json(state, changed)
+
+        result = self.engine(backend).resume(engine.run["id"])
+        self.assertEqual(result["status"], "completed")
+        failure, = [event for event in events(engine) if event["event"] == "verification_checkout_reclaim_failed"]
+        self.assertEqual((failure["artifact"], failure["recorded_worktree"]), (str(artifact), str(checkout)))
+        self.assertTrue(checkout.is_dir())
+        self.assertEqual(read_json(foreign / "cleanup.json"), {"status": "removed"})
+        self.assertEqual(read_json(foreign / "checkout.json"), {"worktree": "foreign"})
 
     def test_another_runs_record_at_the_same_head_is_refused_by_both_entries(self):
         backend = ScriptedBackend()

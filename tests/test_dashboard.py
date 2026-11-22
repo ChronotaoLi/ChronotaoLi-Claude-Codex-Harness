@@ -21,12 +21,12 @@ import uuid
 from pathlib import Path
 from unittest.mock import patch
 
-from harness import cli, dashboard, observe
+from harness import cli, dashboard, observe, stops
 from harness.cli import status_summary
 from harness.dashboard_page import APP_JS
-from harness.util import read_json, write_json
+from harness.util import HarnessError, read_json, write_json
 from harness.versions import RUN_SCHEMA_VERSION
-from test_harness import ROOT, RepoCase
+from test_harness import ROOT, RepoCase, cli_notice
 
 # Every module that binds run_process by name; patching harness.util alone misses them.
 RUN_PROCESS_SITES = ("harness.adapters.run_process", "harness.verification.run_process",
@@ -549,6 +549,29 @@ class ServeEntryTests(RepoCase):
                 self.assertNotIn("Traceback", errors.getvalue())
         self.assertFalse((base / "absent").exists())
 
+    def test_shared_server_errors_keep_original_type_and_cause(self):
+        state = self.repo / "missing" / ".harness"
+        output, errors = io.StringIO(), io.StringIO()
+        for start in (dashboard.create_server, lambda state, port: dashboard.serve(
+                state, port, stdout=output, stderr=errors)):
+            for given, port, failure in ((state, 70000, None), (state, 0, FileNotFoundError),
+                                         (str(state) + "\x00", 0, ValueError)):
+                with self.subTest(given=given, port=port, start=start):
+                    with self.assertRaises(HarnessError) as caught:
+                        start(given, port)
+                    error = caught.exception
+                    self.assertIs(type(error), HarnessError)
+                    self.assertEqual(stops.of(error)["kind"], "unclassified")
+                    cause = error.__cause__
+                    if failure is None:
+                        self.assertIsNone(cause)
+                    else:
+                        self.assertIs(type(cause), observe.NotFound)
+                        self.assertIs(type(cause.__cause__), failure)
+                        self.assertIsNone(cause.__cause__.__cause__)
+        self.assertEqual((output.getvalue(), errors.getvalue()), ("", ""))
+        self.assertFalse(state.parent.exists())
+
     def test_add_arguments_and_port_validation(self):
         import argparse
         parser = argparse.ArgumentParser()
@@ -598,7 +621,10 @@ class CLIWiringTests(RepoCase):
         self.assertNotIn("已中断", stderr)
         self.assertEqual(stderr.splitlines()[0], self.location_line("harness dashboard: "))
         code, output, errors = self.invoke(["dashboard", "--port", "70000"])
-        self.assertEqual((code, output), (1, ""))
+        self.assertEqual((code, output), (2, ""))
+        stop = cli_notice(errors)
+        self.assertEqual((stop["kind"], stop["reason"], stop["data"]["option"]),
+                         ("invalid_input", "cli_arguments", "--port"))
         self.assertIn("端口", errors)
 
     def test_status_list_keeps_fields_order_and_stderr_diagnostics(self):
@@ -642,6 +668,8 @@ class CLIWiringTests(RepoCase):
         code, output, errors = self.invoke(["status", "run_broken"])
         self.assertEqual((code, output), (1, ""))
         self.assertEqual(errors.splitlines()[0], self.location_line("harness: "))  # the stop lines follow it
+        stop = cli_notice(errors)
+        self.assertEqual((stop["kind"], stop["reason"]), ("evidence", "load_integrity"))
         self.assertNotIn("Traceback", errors)
 
     def test_dashboard_entry_spawns_nothing_after_service_starts(self):
@@ -696,6 +724,9 @@ class CLIWiringTests(RepoCase):
         code, output, errors = self.invoke(["dashboard", "--port", "0"])
         self.assertEqual((code, output), (1, ""))
         self.assertIn("观察目录不可用", errors)
+        stop = cli_notice(errors)
+        self.assertEqual((stop["kind"], stop["reason"], stop["data"]["error_type"]),
+                         ("runtime_failure", "io", "FileNotFoundError"))
         self.assertNotIn("Traceback", errors)
         self.assertFalse((self.repo / ".harness").exists())
         # A `.harness` linked to itself cannot be resolved (3.11) or opened (3.13 on): the same as a missing one.
@@ -705,6 +736,11 @@ class CLIWiringTests(RepoCase):
         code, output, errors = self.invoke(["dashboard", "--port", "0"])
         self.assertEqual((code, output), (1, ""))
         self.assertNotIn("Traceback", errors)
+        stop = cli_notice(errors)
+        self.assertEqual((stop["kind"], stop["reason"]), ("runtime_failure", "io"))
+        with self.assertRaises(observe.NotFound) as cause:
+            observe.StateReader(self.repo / ".harness", required=True)
+        self.assertEqual(stop["data"]["error_type"], type(cause.exception.__cause__).__name__)
         self.assertTrue((self.repo / ".harness").is_symlink())
 
 

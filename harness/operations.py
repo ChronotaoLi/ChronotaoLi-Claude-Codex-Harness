@@ -20,7 +20,7 @@ from pathlib import Path
 
 from . import git
 from .shared import asset_digest
-from .util import _cli_arguments, HarnessError, dump, uid, write_json
+from .util import _cli_arguments, HarnessError, display_text, dump, uid, write_json
 
 OPERATION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
 RUN_ID = re.compile(r"run_[A-Za-z0-9]+")
@@ -36,7 +36,7 @@ def warn(message):
     """Diagnostic output that never raises: observation must not alter lifecycle or exit status."""
     try:
         if sys.stderr is not None:
-            print(f"[harness] 警告：{message}", file=sys.stderr, flush=True)
+            print("[harness] 警告：" + display_text(message), file=sys.stderr, flush=True)
     except Exception:
         pass
 
@@ -48,6 +48,24 @@ def utc_text(seconds):
 def first_line(error):
     lines = str(error).splitlines()
     return lines[0] if lines else type(error).__name__
+
+
+def warn_kept_terminal(error):
+    try:
+        warn(f"终态已保存，之后的错误不改写台账：{first_line(error)}")
+    except BaseException:
+        pass  # The saved result takes precedence over failure to report it.
+
+
+def observe_terminal(step, action, /, *args, **kwargs):
+    """A saved result takes precedence over a failure in its observations."""
+    try:
+        action(*args, **kwargs)
+    except BaseException as error:
+        try:
+            warn(f"终态已保存；{step} 失败不改变结果：{first_line(error)}")
+        except BaseException:
+            pass  # Reporting an observation failure is best-effort too.
 
 
 def _git_query(root, *args, effect):

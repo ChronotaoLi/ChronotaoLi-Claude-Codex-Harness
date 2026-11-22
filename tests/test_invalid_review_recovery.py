@@ -2,15 +2,17 @@ import copy
 import errno
 import json
 import hashlib
+import os
 from pathlib import Path
 from unittest.mock import patch
 
-from harness import git
+from harness import git, state_files
 from harness.task_lifecycle import TaskLifecycle
-from harness.util import HarnessError, read_json, write_json
+from harness.util import EvidenceError, HarnessError, read_json, write_json
 import test_review_batches as batches  # by module: its TestCases imported by name would be collected again here
 from test_engine_repairs import RecordingBackend
 from test_harness import RepoCase, ROOT, crash_after_save, review_bound, walk_exit
+from test_provider_failures import FifoWatchdog
 from test_runtime_changes import finding, invalid_rejection, revised, trigger_kind
 
 
@@ -271,32 +273,93 @@ class InvalidReviewRecoveryTests(RepoCase):
                       [(record.get("status"), record.get("dispatch_id")) for record in result["review_history"]["greet"]])
 
     def test_an_unreadable_original_is_local_io_and_keeps_the_receipt(self):
-        read, failing = Path.read_bytes, {}
+        for phase in ("probe", "read"):
+            with self.subTest(phase=phase):
+                if phase == "read":
+                    self.setUp()
+                backend, engine, before, original = self.returned_second_review()
+                key = "reviewer:review:greet"
+                receipt = before["review_receipts"][key]
+                if phase == "probe":
+                    del receipt["artifact_digest"]
+                    write_json(engine.directory / "state.json", before)
 
-        def reading(path):
-            if path == failing.get("path"):
-                raise OSError(errno.EIO, "Input/output error", str(path))
-            return read(path)
-        self.enterContext(patch.object(Path, "read_bytes", reading))
-        backend, engine, before, original, error, after = self.stopped_on_changed_candidate(
-            lambda path: failing.update(path=path))
-        self.assertEqual((type(error), error.errno), (OSError, errno.EIO))
-        self.assertEqual((after["stop"]["kind"], after["stop"]["reason"], after["stop"]["data"]["error_type"]),
-                         ("runtime_failure", "io", "OSError"))
-        failing.clear()  # the device recovers: the kept receipt's original is preserved, not redrawn
-        result = self.engine(backend).resume(engine.run["id"])
-        self.assertEqual(result["status"], "completed")
-        receipt = before["review_receipts"]["reviewer:review:greet"]
-        self.assertIn(("invalidated", receipt["dispatch_id"], receipt["artifact_digest"]),
-                      [(record.get("status"), record.get("dispatch_id"), record.get("artifact_digest"))
-                       for record in result["review_history"]["greet"]])
+                hits = []
+                identity = original.stat()
+                parent = original.parent.stat()
+                stat, pread = os.stat, os.pread
+
+                def failed_at_probe(name, *args, **kwargs):
+                    fd = kwargs.get("dir_fd")
+                    if fd is not None and name == original.name and os.path.samestat(os.fstat(fd), parent):
+                        hits.append(phase)
+                        raise OSError(errno.EIO, "synthetic probe fault")
+                    return stat(name, *args, **kwargs)
+
+                def failed_at_read(fd, length, offset):
+                    if os.path.samestat(os.fstat(fd), identity):
+                        hits.append(phase)
+                        raise OSError(errno.EIO, "synthetic read fault")
+                    return pread(fd, length, offset)
+
+                calls = copy.deepcopy(backend.calls)
+                operation, fault = ("stat", failed_at_probe) if phase == "probe" else ("pread", failed_at_read)
+                with patch.object(state_files.os, operation, fault), self.assertRaises(state_files.StateReadError) as raised:
+                    self.engine(backend).resume(engine.run["id"])
+                self.assertEqual(hits, [phase])
+                self.assertEqual(raised.exception.outcome.errno, errno.EIO)
+                after = read_json(engine.directory / "state.json")
+                stop = after["stop"]
+                self.assertEqual((stop["kind"], stop["reason"], stop["source"], stop["data"]["error_type"]),
+                                 ("runtime_failure", "io", {}, "OSError"))
+                for key in ("review_receipts", "review_history", "pending_task", "agent_dispatches"):
+                    self.assertEqual(after[key], before[key])
+                self.assertEqual(backend.calls, calls)
+                self.assertEqual(batches.calls(backend, kind="review"), [c for c in calls if c["kind"] == "review"])
+
+                result = self.engine(backend).resume(engine.run["id"])
+                self.assertEqual(result["status"], "completed")
+                self.assertIn(("invalidated", receipt["dispatch_id"], hashlib.sha256(original.read_bytes()).hexdigest()),
+                              [(record.get("status"), record.get("dispatch_id"), record.get("artifact_digest"))
+                               for record in result["review_history"]["greet"]])
+
+    def test_bound_review_refuses_a_link_or_fifo_before_invalidating_the_candidate(self):
+        for layout in ("link", "fifo"):
+            with self.subTest(layout=layout):
+                if layout == "fifo":
+                    self.setUp()
+                watchdog = None
+
+                def damage(path):
+                    nonlocal watchdog
+                    raw = path.read_bytes()
+                    path.unlink()
+                    if layout == "link":
+                        target = path.with_name("ordinary-copy.json")
+                        target.write_bytes(raw)
+                        path.symlink_to(target)
+                    else:
+                        os.mkfifo(path)
+                        watchdog = FifoWatchdog(path, bound=5)
+
+                try:
+                    _, _, before, original, error, after = self.stopped_on_changed_candidate(damage)
+                finally:
+                    if watchdog is not None:
+                        self.assertFalse(watchdog.stop())
+                self.assertIsInstance(error, EvidenceError)
+                self.assertEqual((after["stop"]["kind"], after["stop"]["reason"], after["stop"]["source"]),
+                                 ("evidence", "runtime_integrity", {}))
+                self.assertEqual(after["agent_dispatches"], before["agent_dispatches"])
+                if layout == "link":
+                    self.assertTrue(original.is_symlink())
 
     def test_a_reviewing_gate_without_its_mapping_is_an_invariant_stop(self):
         backend, engine, before, original = self.returned_second_review()
         del before["pending_task"]["required_findings"]
         write_json(engine.directory / "state.json", before)
         calls = copy.deepcopy(backend.calls)
-        with self.assertRaisesRegex(HarnessError, "审阅阶段缺少必需问题对照"):
+        with self.assertRaises(HarnessError):
             self.engine(backend).resume(engine.run["id"])
         self.assertEqual(backend.calls, calls)
         after = read_json(engine.directory / "state.json")

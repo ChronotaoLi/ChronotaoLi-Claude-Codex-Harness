@@ -1,5 +1,4 @@
 """Bounded, read-only file evidence; deliberately independent of Git and processes."""
-from decimal import Decimal
 import difflib
 import hashlib
 import json
@@ -70,7 +69,11 @@ def json_check(path, base):
         raise _InvalidJSON(f"Non-finite number is not JSON: {value}")
     try:
         text = data.decode("utf-8")
-        value = json.loads(text, object_pairs_hook=pairs, parse_constant=constant, parse_int=Decimal)
+        # The decoder checks integer syntax. The receipt only needs to count
+        # each integer and identify its type, so its magnitude can be discarded.
+        integer = object()
+        value = json.loads(text, object_pairs_hook=pairs, parse_constant=constant,
+                           parse_int=lambda digits: integer)
         # JSON's finite lexical numbers may overflow Python floats; reject these too.
         stack, count = [value], 0
         import math

@@ -1,4 +1,5 @@
 import contextlib
+import errno
 import io
 import json
 import tempfile
@@ -8,7 +9,7 @@ from unittest.mock import patch
 
 from test_harness import stopped
 from harness import stops
-from harness import cli
+from harness import cli, observe
 from harness.util import HarnessError, write_json
 from harness.versions import RUN_SCHEMA_VERSION
 from harness.watch_cli import watch_run
@@ -111,9 +112,40 @@ class WatchCliTests(unittest.TestCase):
             watch_run(self.state, "run_test", follow=True, stdout=io.StringIO())
         self.assertEqual(closed, [True])
 
-    def test_missing_or_mismatched_run_is_not_reported_as_success(self):
-        with self.assertRaises(HarnessError):
+    def test_missing_run_identifies_the_run_argument(self):
+        with self.assertRaises(HarnessError) as caught:
             watch_run(self.state, "run_missing", stdout=io.StringIO())
-        write_json(self.path, {**self.run, "id": "run_other"})
-        with self.assertRaisesRegex(HarnessError, "ID"):
-            watch_run(self.state, "run_test", stdout=io.StringIO())
+        stop = stops.of(caught.exception)
+        self.assertEqual((stop["kind"], stop["reason"], stop["data"]["option"]),
+                         ("invalid_input", "cli_arguments", "run_id"))
+
+    def test_only_missing_initial_run_directory_identifies_the_argument(self):
+        self.path.unlink()
+        for state, run_id, missing in (
+            (self.state, "run_test", "state.json"),
+            (self.state / "absent", "run_test", "absent"),
+        ):
+            with self.subTest(missing=missing):
+                output = io.StringIO()
+                with self.assertRaises(HarnessError) as caught:
+                    watch_run(state, run_id, stdout=output)
+                self.assertIsNone(caught.exception.stop)
+                cause = caught.exception.__cause__
+                self.assertIs(type(cause), observe.NotFound)
+                self.assertEqual(cause.__cause__.errno, errno.ENOENT)
+                self.assertEqual(Path(cause.__cause__.filename).name, missing)
+                self.assertEqual(output.getvalue(), "")
+
+    def test_watch_keeps_shared_ledger_refusals_untyped(self):
+        for fields, message in ((None, "无法解析"), ({"id": "run_other"}, "ID"),
+                                ({"accepted": []}, "accepted"), ({"attempts": {"t": -1}}, "尝试计数")):
+            with self.subTest(fields=fields):
+                if fields is None:
+                    self.path.write_bytes(b"{")
+                else:
+                    write_json(self.path, {**self.run, **fields})
+                output = io.StringIO()
+                with self.assertRaisesRegex(HarnessError, message) as caught:
+                    watch_run(self.state, "run_test", stdout=output)
+                self.assertIsNone(caught.exception.stop)
+                self.assertEqual(output.getvalue(), "")

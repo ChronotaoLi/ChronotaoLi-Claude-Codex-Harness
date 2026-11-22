@@ -4,12 +4,17 @@ import json
 import sqlite3
 import tempfile
 import unittest
+from argparse import Namespace
 from pathlib import Path
+from unittest.mock import patch
 
-from harness import git
-from harness.cli import main
+from harness import git, stops
+from harness.cli import main, manage_memory
+from harness.mcp_server import handle
 from harness.memory import Memory
+from harness.util import HarnessError
 from harness.versions import RUN_SCHEMA_VERSION
+from test_harness import cli_notice
 
 
 class MemoryCLIReadTests(unittest.TestCase):
@@ -38,8 +43,9 @@ class MemoryCLIReadTests(unittest.TestCase):
             with self.subTest(arguments=arguments):
                 code, output, errors = self.invoke(*arguments)
                 if arguments[0] == "read":
-                    self.assertEqual(code, 1)
-                    self.assertEqual(output, "")
+                    stop = cli_notice(errors)
+                    self.assertEqual((code, output, stop["kind"], stop["reason"], stop["data"]["option"]),
+                                     (2, "", "invalid_input", "cli_arguments", "id"))
                     self.assertIn("mem_missing", errors)
                 else:
                     self.assertEqual(code, 0, errors)
@@ -126,11 +132,66 @@ class MemoryCLIReadTests(unittest.TestCase):
             with self.subTest(value=value):
                 code, output, errors = self.invoke("add", "--key", "decision", "--title", "Upgrade",
                                                   "--text", "Reference", "--run", "run_current")
-                self.assertEqual(code, 1)
-                self.assertEqual(output, "")
+                stop = cli_notice(errors)
+                self.assertEqual((code, output, stop["kind"], stop["reason"], stop["data"]["option"]),
+                                 (2, "", "invalid_input", "cli_arguments", "--run"))
                 self.assertIn("记忆来源运行", errors)
                 self.assertFalse(self.path.exists())
                 self.assertEqual(self.exclude.read_bytes(), original_exclude)
+
+    def test_shared_read_and_search_failures_are_typed_only_at_the_memory_cli(self):
+        Memory(self.path)
+        memory = Memory(self.path, read_only=True)
+        for method, arguments, options, message in (
+            ("read", ("mem_missing",), {}, "没有此记忆"),
+            ("search", (), {"key": ""}, "key 必须为非空字符串"),
+        ):
+            with self.subTest(method=method):
+                with self.assertRaisesRegex(HarnessError, message) as caught:
+                    getattr(memory, method)(*arguments, **options)
+                self.assertIs(type(caught.exception), HarnessError)
+                self.assertIsNone(caught.exception.stop)
+                self.assertEqual(stops.of(caught.exception)["data"]["error_type"], "HarnessError")
+        for argv, option in ((("read", "mem_missing"), "id"), (("search", "--key", ""), "--key")):
+            code, output, errors = self.invoke(*argv)
+            stop = cli_notice(errors)
+            self.assertEqual((code, output, stop["kind"], stop["reason"], stop["data"]),
+                             (2, "", "invalid_input", "cli_arguments", {"option": option}))
+
+        mcp_errors = []
+
+        def read(*args, **kwargs):
+            try:
+                return real_read(*args, **kwargs)
+            except HarnessError as error:
+                mcp_errors.append(error)
+                raise
+
+        real_read = memory.read
+        request = {"id": 1, "method": "tools/call",
+                   "params": {"name": "memory_read", "arguments": {"id": "mem_missing"}}}
+        with patch.object(memory, "read", side_effect=read):
+            response = handle(request, memory, None, None)
+        self.assertEqual(response, {"isError": True,
+                                   "content": [{"type": "text", "text": "没有此记忆：mem_missing"}]})
+        error, = mcp_errors
+        self.assertIs(type(error), HarnessError)
+        self.assertIsNone(error.stop)
+        self.assertEqual(stops.of(error)["data"]["error_type"], "HarnessError")
+
+        def wrapped_read(memory, ident):
+            try:
+                return real_read(ident)
+            except HarnessError as cause:
+                raise HarnessError("wrapped memory failure") from cause
+
+        # The CLI checks the error received from the call, even when a marked
+        # input error appears deeper in its cause chain.
+        with patch.object(Memory, "read", wrapped_read):
+            with self.assertRaisesRegex(HarnessError, "wrapped memory failure") as caught:
+                manage_memory(Namespace(memory_command="read", id="mem_missing"), self.repo, self.state)
+        self.assertIsNone(caught.exception.stop)
+        self.assertIsNone(caught.exception.__cause__.stop)
 
     def test_run_note_cannot_hide_same_key_project_fact(self):
         ledger = self.state / "runs" / "run_current" / "state.json"
@@ -143,8 +204,9 @@ class MemoryCLIReadTests(unittest.TestCase):
         original_id = output.strip()
         before = json.loads(self.invoke("export")[1])
         code, output, errors = self.invoke(*arguments, "--run", "run_current")
-        self.assertEqual(code, 1)
-        self.assertEqual(output, "")
+        stop = cli_notice(errors)
+        self.assertEqual((code, output, stop["kind"], stop["reason"], stop["data"]["option"]),
+                         (2, "", "invalid_input", "cli_arguments", "--key"))
         self.assertIn("作用域", errors)
         self.assertEqual(json.loads(self.invoke("export")[1]), before)
         for extra in ((), ("--run", "run_current"), ("--run", "run_other")):

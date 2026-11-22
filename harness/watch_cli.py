@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import sys
 
-from . import observe
+from . import observe, stops
 from .util import HarnessError
 from .versions import require_current_ledger
 from .watch import RunWatcher
@@ -53,7 +53,11 @@ def watch_run(state, run_id, *, follow=False, stdout=None):
                     return 0
                 while not watcher.wait(30):
                     pass  # timeout is only an interrupt boundary; no state read
+
     try:
         return observe.observing(state, watching, required=True)
     except observe.ObserveError as error:
-        raise HarnessError(f"无法观察运行 {run_id}：{error}") from error
+        stop = None
+        if getattr(error, "_initial_run_missing", False):
+            stop = stops.make("invalid_input", "cli_arguments", data={"option": "run_id"})
+        raise HarnessError(f"无法观察运行 {run_id}：{error}", stop=stop) from error

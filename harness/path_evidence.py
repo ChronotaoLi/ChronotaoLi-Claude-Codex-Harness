@@ -7,31 +7,39 @@ import json
 from pathlib import Path
 
 from . import stops
+from .state_files import StateFiles
 from .util import HarnessError, dump, write_json
 
 
 INLINE_PATH_CHARS = 4000
 
 
-def _folder(directory):
-    folder = Path(directory) / "path-indexes"
-    if not folder.is_absolute() or any(p.is_symlink() for p in (folder, *folder.parents)):
-        raise HarnessError(f"path evidence index directory is a symlink: {ascii(str(folder))}")
-    return folder
+def _read_index(files, components, artifact):
+    outcome = files.read(components, limit=None).or_local_io()
+    if outcome.found == "symlink":
+        raise HarnessError(
+            f"path evidence index reference changed: expected {ascii(str(artifact))}, actual {ascii(str(artifact))}")
+    if outcome.state != "read":
+        raise HarnessError(f"path evidence index missing or unreadable: {ascii(str(artifact))}")
+    return outcome.data
 
 
+@stops.reads_evidence
 def _write_index(directory, paths):
     value = {"version": 1, "paths": paths}
     raw = (dump(value) + "\n").encode("utf-8")
     digest = hashlib.sha256(raw).hexdigest()
-    artifact = _folder(directory) / (digest + ".json")
+    components = ("path-indexes", digest + ".json")
+    artifact = Path(directory).joinpath(*components)
+    files = StateFiles.nofollow_directory(directory)
+    probe = files.probe(components).or_local_io()
     try:
-        if not artifact.exists() and not artifact.is_symlink():
+        if probe.state == "absent":
             write_json(artifact, value)
-        if artifact.is_symlink() or artifact.read_bytes() != raw:
-            raise HarnessError(f"path evidence index changed: {ascii(str(artifact))}; preserve the original evidence")
     except OSError as error:
         raise HarnessError(f"cannot read or write path evidence index: {ascii(str(artifact))}", stop=stops.make("runtime_failure", "io", data={"error_type": type(error).__name__})) from error
+    if probe.state == "refused" or _read_index(files, components, artifact) != raw:
+        raise HarnessError(f"path evidence index changed: {ascii(str(artifact))}; preserve the original evidence")
     return {"artifact": str(artifact), "artifact_digest": digest, "count": len(paths)}
 
 
@@ -48,18 +56,18 @@ def validate_indexes(directory, references):
                 or any(c not in "0123456789abcdef" for c in digest)
                 or type(ref["count"]) is not int or ref["count"] < 0):
             raise HarnessError("invalid path evidence digest or count")
-        artifact = _folder(directory) / (digest + ".json")
-        if ref["artifact"] != str(artifact) or artifact.is_symlink():
+        components = ("path-indexes", digest + ".json")
+        artifact = Path(directory).joinpath(*components)
+        if ref["artifact"] != str(artifact):
             raise HarnessError(
                 f"path evidence index reference changed: expected {ascii(str(artifact))}, "
                 f"actual {ascii(ref['artifact'])}")
+        raw = _read_index(StateFiles.nofollow_directory(directory), components, artifact)
+        if hashlib.sha256(raw).hexdigest() != digest:
+            raise HarnessError(f"path evidence index changed: {ascii(str(artifact))}")
         try:
-            raw = artifact.read_bytes()
-            if hashlib.sha256(raw).hexdigest() != digest:
-                raise HarnessError(f"path evidence index changed: {ascii(str(artifact))}")
             value = json.loads(raw)
-        except (OSError, ValueError, UnicodeError) as error:
-            stops.keep_local_io(error)
+        except ValueError as error:
             raise HarnessError(f"path evidence index missing or unreadable: {ascii(str(artifact))}") from error
         if (not isinstance(value, dict) or set(value) != {"version", "paths"}
                 or type(value["version"]) is not int or value["version"] != 1

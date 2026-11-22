@@ -320,6 +320,8 @@ class LedgerReferenceTests(RepoCase):
         return engine, backend
 
     def test_changed_worker_inputs_stop_resume_and_preserve_evidence(self):
+        from harness import stops
+
         cases = [(name, mode) for name in INPUTS for mode in ('delete', 'byte', 'symlink')]
         for index, (name, mode) in enumerate(cases):
             with self.subTest(name=name, mode=mode):
@@ -333,8 +335,10 @@ class LedgerReferenceTests(RepoCase):
                 tamper(path, mode)
                 state = (engine.directory / 'state.json').read_bytes()
                 calls = len(backend.calls)
-                with self.assertRaisesRegex(HarnessError, 'preserve evidence'):
+                with self.assertRaises(HarnessError) as raised:
                     self.engine(backend).resume(engine.run['id'])
+                stop = stops.of(raised.exception)
+                self.assertEqual((stop['kind'], stop['reason']), ('evidence', 'load_integrity'))
                 self.assertEqual((engine.directory / 'state.json').read_bytes(), state)
                 self.assertEqual(len(backend.calls), calls)
                 assert_tampered(self, path, mode, original)

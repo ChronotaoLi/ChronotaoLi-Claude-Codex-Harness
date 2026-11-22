@@ -1,5 +1,6 @@
 import hashlib
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -7,10 +8,12 @@ import unittest
 from unittest.mock import patch
 from pathlib import Path
 
+from harness import state_files
 from harness.command_server import (Broker, command_id, command_processes, create_manifest,
                                     ensure_command_processes_exited, handle)
 from harness.util import HarnessError, write_json
 from harness.versions import RUN_SCHEMA_VERSION
+from test_state_files import FakeOs
 
 
 class CommandServerTests(unittest.TestCase):
@@ -141,16 +144,22 @@ class CommandServerTests(unittest.TestCase):
     def test_large_output_hashing_does_not_load_full_log(self):
         argv = {'cwd': '.', 'argv': [sys.executable, '-c', 'import sys;sys.stdout.write("x" * 2000000)']}
         broker = self.broker([argv])
-        original_read = Path.read_bytes
-        def bounded_read(path):
-            if path.name.startswith('output.'):
-                raise AssertionError('log must be hashed incrementally')
-            return original_read(path)
-        with patch.object(Path, 'read_bytes', bounded_read):
+        reads = []
+
+        def bounded_read(real, fd, size, offset):
+            if os.fstat(fd).st_size == 2_000_000:
+                reads.append((size, offset))
+            return real(fd, size, offset)
+
+        with patch.object(state_files, 'os', FakeOs(pread=bounded_read)):
             result = broker.run_command({'command_id': command_id(argv)})
         self.assertEqual(result['exit_code'], 0)
-        self.assertLess(len(result['stdout']), 4100)
+        self.assertEqual(result['stdout'], '[earlier output omitted; see log]\n' + 'x' * 4000)
         self.assertEqual(result['stdout_sha256'], hashlib.sha256(b'x' * 2000000).hexdigest())
+        self.assertIn((4000, 1_996_000), reads)
+        self.assertIn((1024 * 1024, 0), reads)
+        self.assertIn((1024 * 1024, 1024 * 1024), reads)
+        self.assertLessEqual(max(size for size, _ in reads), 1024 * 1024)
 
     def test_standard_progress_metadata_and_version_negotiation(self):
         argv = {'cwd': '.', 'argv': [sys.executable, '-c', 'print("metadata call executed")']}

@@ -1,8 +1,11 @@
 """Offline dispatch preparation/recovery exercises; no provider integration."""
 from copy import deepcopy
+import hashlib
+import json
 from pathlib import Path
 from unittest.mock import patch
 
+from harness.commands import command_id
 from harness.context import ContextCapacityError
 from harness.packets import PacketBuilder
 from harness.util import HarnessError, read_json
@@ -59,7 +62,8 @@ class ContextProjectionLifecycleTests(RepoCase):
         self.assertEqual(sum(result['attempts'].values()), 2)
 
     def test_saved_command_index_tamper_blocks_recovery_before_any_model_call(self):
-        self.config.data['permissions']['worker_commands'] = [{'cwd': '.', 'argv': ['python3', '-c', '#' + 'x' * 9000]}]
+        grant = {'cwd': '.', 'argv': ['python3', '-c', '#' + 'x' * 9000]}
+        self.config.data['permissions']['worker_commands'] = [grant]
         plan = read_json(ROOT / 'examples/plan.json')
         second = deepcopy(plan['tasks'][0])
         second.update(id='second', title='Second greeting', depends_on=['greet'])
@@ -68,16 +72,32 @@ class ContextProjectionLifecycleTests(RepoCase):
         engine = self.engine(backend)
         result = engine.start('Implement greeting', plan, step=True)
         self.assertEqual(result['status'], 'paused')
-        entry = next(row for row in result['dispatches'] if row.get('input_evidence'))
-        ref = entry['input_evidence'][0]
+        saved = read_json(engine.directory / 'state.json')
+        (entry,) = [row for row in saved['dispatches']
+                    if row['role'] == 'worker' and row['task_id'] == 'greet']
+        (worker_packet,) = [call['packet'] for call in backend.calls
+                            if call['role'] == 'worker' and call['task_id'] == 'greet']
+        identity = command_id(grant)
+        self.assertEqual(worker_packet['tool_constraints']['worker_commands'],
+                         [{'exact_command_ref': identity}])
+        catalog_ref = worker_packet['exact_command_catalog']
+        (ref,) = [ref for ref in entry['input_evidence']
+                  if ref['artifact_digest'] == catalog_ref['input_index']]
         path = Path(ref['artifact'])
         original = path.read_bytes()
-        catalog = read_json(path)
-        self.assertEqual(catalog['records'][0]['command'], self.config.data['permissions']['worker_commands'][0])
-        path.write_text('{}')
+        self.assertEqual(hashlib.sha256(original).hexdigest(), ref['artifact_digest'])
+        records = json.loads(original)['records']
+        self.assertEqual(len(records), ref['count'])
+        self.assertEqual(len(records), catalog_ref['count'])
+        self.assertEqual([record['command'] for record in records if record['id'] == identity], [grant])
+
+        tampered = b'{}'
+        path.write_bytes(tampered)
         count = len(backend.calls)
-        with self.assertRaisesRegex(HarnessError, 'input index'):
-            self.engine(backend).resume(engine.run['id'])
-        self.assertEqual(len(backend.calls), count)
-        self.assertEqual(path.read_text(), '{}')
-        path.write_bytes(original)
+        try:
+            with self.assertRaisesRegex(HarnessError, 'input index'):
+                self.engine(backend).resume(engine.run['id'])
+            self.assertEqual(len(backend.calls), count)
+            self.assertEqual(path.read_bytes(), tampered)
+        finally:
+            path.write_bytes(original)

@@ -400,8 +400,8 @@ class RuntimeChangesTests(RepoCase):
                         updates=[{"id": task["id"], "description": task["description"], "add_depends_on": ["prepare"], "add_allowed_paths": [], "add_required_commands": []}])
         engine = self.engine(ScriptedBackend(revise))
         save = engine.context.save
-        def interrupt_after_application():
-            save()
+        def interrupt_after_application(**kwargs):
+            save(**kwargs)
             if len(engine.run["plan_history"]) == 2:
                 raise KeyboardInterrupt()
         engine.context.save = interrupt_after_application

@@ -137,8 +137,11 @@ class RunWatcher:
                     fd = self.reader.open_directory(list(path))
                 else:
                     fd, _ = self.reader.open_file(list(path))
-            except NotFound:
+            except NotFound as error:
                 if initial and len(path) == 2:
+                    cause = error.__cause__
+                    if isinstance(cause, OSError) and cause.errno == errno.ENOENT and cause.filename == self.run_id:
+                        error._initial_run_missing = True
                     raise
                 self._drop(path)
                 continue

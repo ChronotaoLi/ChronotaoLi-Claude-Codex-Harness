@@ -8,10 +8,12 @@ from . import git
 from .adapters import CLIBackend
 from .budgets import work_attempts
 from .memory import Memory
+from .operations import first_line, warn
 from .process_runtime import defer_cleanup_signals
 from .run_store import RunStore, replaced
 from .state_files import LockUnavailable, StateFiles, holding
-from .util import HarnessError, append_event, confirm_dispatches_exited, ensure_dispatches_exited, group_alive, validate_command_directories, write_json
+from .util import (HarnessError, append_event, confirm_dispatches_exited, ensure_dispatches_exited, group_alive,
+                   one_line, validate_command_directories, write_json)
 
 class RunContext:
     def __init__(self, config, repo, state=None, backend=None, commander="astra", operation=None):
@@ -24,6 +26,7 @@ class RunContext:
         self.commander = commander
         self.operation = operation
         self.store = RunStore(self.state)
+        self.saved_stop = None  # (outgoing error, exit code) for a confirmed stop in this call
         self.reverify_requested = False
         # Optional post-commit observer; failures propagate after durable state.
         self.on_save = None
@@ -90,28 +93,42 @@ class RunContext:
             error.outcome.evidence({"artifact": str(path)})
             raise
 
-    def save(self):
+    def save(self, *, terminal=False, stop=False):
         """Publish through RunStore, then notify the current observer."""
-        self.store.commit()
-        if self.on_save is not None:
+        revision = self.store.commit(terminal=terminal, stop=stop) if terminal or stop else self.store.commit()
+        if revision is not RunStore.KEPT and self.on_save is not None:
             self.on_save(self.run)
+        return revision
+
+    def save_fact(self, *keys):
+        """Publish verification feedback, carrying it into the stop if the save fails."""
+        for key in keys:
+            self.store.carry(key, self.run[key])
+        try:
+            self.save()
+        except Exception as error:
+            try:
+                detail = first_line(error)
+            except Exception:
+                detail = type(error).__name__
+            warn(f"验证反馈的提交失败（{detail}）；停止仍按原错误保存")
+            return False
+        return True
 
     @contextlib.contextmanager
     def transition(self):
         """Change the ledger in one step, then save it.
 
-        A stop saves the in-memory ledger as it stands, so the body only assigns
-        values computed before it; a signal arriving inside is raised after the
-        body's last assignment. Stop handling sees the whole old ledger or the
-        whole new one, never a half step.
+        The body only assigns values computed before it. Keep its save in
+        the same signal deferral scope so a held signal cannot skip the save.
         """
         with defer_cleanup_signals(inherit=False):
             yield
-        self.save()
+            self.save()
 
     def event(self, event, **fields):
         append_event(self.directory / "events.jsonl", self.run["id"], event, **fields)
-        print(f"[harness] {event} {fields.get('task_id', '')}", file=sys.stderr, flush=True)
+        print(f"[harness] {event} {one_line(fields.get('task_id', ''))}", file=sys.stderr, flush=True)
 
     def observe(self, event, **fields):
         """Append a best-effort observation that cannot change the lifecycle.
@@ -142,7 +159,7 @@ class RunContext:
         # handoff.json is the only handoff artifact.
         write_json(self.directory / "handoff.json", handoff)
 
-    def ensure_exited(self):
+    def ensure_exited(self, *, commit=True):
         validate_command_directories(self.run["dispatches"], self.directory)
         try:
             exited = ensure_dispatches_exited(self.run["dispatches"], state=self.state, observe=group_alive)
@@ -154,8 +171,11 @@ class RunContext:
                 stop["data"]["returned_unsealed"] = returned_unsealed(
                     self.run, self.directory, stop["source"].get("dispatch_id"))
             raise
+        save = commit and exited and self.store.matches_commit()
         for entry in exited:
             entry["exit_confirmed"] = True
+        if save:
+            self.save()
 
     def confirm_exited(self, identifiers):
         """Record an operator's explicit assertion; never signal an unowned group."""

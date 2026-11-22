@@ -8,8 +8,6 @@ receipts, but starts no process. It does not isolate the worktree from other
 processes running concurrently; see _remove_tracked_file.
 """
 import argparse
-import contextlib
-import fcntl
 import hashlib
 import json
 import math
@@ -26,11 +24,11 @@ from pathlib import Path
 from .process_runtime import defer_cleanup_signals
 from . import git, stops
 from .commands import command_id, valid_command, validate_command
-from .state_files import StateFiles
+from .state_files import SIGNALS, HeldFiles, LockUnavailable, StateFiles, holding
 from .util import (DIRECTORY_FLAGS, PGID_MAX, EvidenceError, HarnessError, ProcessStartError, ProcessTimeout,
-                   fold_name, group_alive, observed_alive, read_json, run_process, strict_json_loads, tail,
+                   fold_name, group_alive, observed_alive, run_process, strict_json_loads,
                    with_descriptors, write_json)
-from .versions import read_current_ledger
+from .versions import missing_ledger, parse_current_ledger
 
 
 # Journal identity of delete_path records. Configured commands use 64-hex IDs.
@@ -46,42 +44,48 @@ JOURNAL_FIELDS = frozenset(("id", "command_id", "pgid", "process_state", "exit_c
 ADMISSION_LOCK = "command-admission.lock"
 
 
-def _file_digest(path):
-    digest = hashlib.sha256()
-    with path.open("rb") as source:
-        for chunk in iter(lambda: source.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+def _evidence_digest(files, components):
+    outcome = files.digest(components)
+    outcome.evidence()
+    return outcome.digest
+
+
+def _read_ledger(path):
+    path = Path(path).absolute()
+    outcome = StateFiles.nofollow_directory(path.parent).read((path.name,), limit=None)
+    if outcome.state == "absent":
+        raise missing_ledger(path)
+    return parse_current_ledger(outcome.evidence({"artifact": str(path)}))
+
+
+def _check_directory(files, name):
+    outcome = files.probe((name,), expect="directory").or_local_io()
+    if outcome.state == "refused":
+        raise HarnessError(f"Command directory refused ({outcome.found} at {outcome.step.name}): {outcome.path}")
 
 
 def _safe(path):
     path = Path(path).absolute()
-    if any(p.is_symlink() for p in (path, *path.parents)):
-        raise HarnessError(f"Command artifact symlink refused: {path}")
+    for entry in (path, *path.parents):
+        try:
+            info = entry.lstat()
+        except FileNotFoundError:
+            continue  # The name may be about to be created.
+        if stat.S_ISLNK(info.st_mode):
+            raise HarnessError(f"Command artifact symlink refused: {path}")
     return path
 
 
-@contextlib.contextmanager
-def _admission_lock(job):
-    """Hold the dispatch's existing admission lock; never create it, follow a link or block opening a FIFO."""
-    path = _safe(Path(job) / ADMISSION_LOCK)
+def _with_admission(job, use):
+    """Run under the dispatch's existing exclusive admission lock."""
+    lock = StateFiles.nofollow_directory(job).lock((ADMISSION_LOCK,), create=False)
     try:
-        descriptor = os.open(path, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
-    except OSError as error:
-        raise HarnessError(f"Command admission lock cannot be opened: {path}: {error.strerror}") from error
-    try:
-        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-            raise HarnessError(f"Command admission lock is not a regular file: {path}")
-        try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as error:
-            raise HarnessError(f"已有进程持有运行锁：{path}") from error
-        try:
-            yield
-        finally:
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
-    finally:
-        os.close(descriptor)
+        return holding(lock, lambda _locked: use())
+    except LockUnavailable as error:
+        outcome = error.outcome.or_local_io()
+        if outcome.state == "busy":
+            raise HarnessError(f"已有进程持有运行锁：{outcome.path}") from error
+        raise HarnessError(f"Command admission lock {outcome.state}: {outcome.path} ({outcome.step.name})") from error
 
 
 def _valid_delete_scope(scope):
@@ -115,12 +119,16 @@ def create_manifest(config, worktree, job, run_path=None, *, parent_deadline=Non
     ``delete_scope`` of {task_id, allowed_paths} enables the tool.
     """
     data = config.data if hasattr(config, "data") else config
-    worktree, job = _safe(Path(worktree).resolve()), _safe(job)
+    worktree, job = _safe(Path(worktree).resolve()), Path(job).absolute()
     # The ledger's version is checked before anything is created or written.
-    run_path = _safe(run_path).resolve() if run_path is not None else None
-    state = read_current_ledger(run_path) if run_path else {}
+    run_path = Path(run_path).absolute() if run_path is not None else None
+    state = _read_ledger(run_path) if run_path is not None else {}
+    parent = StateFiles.nofollow_directory(job.parent)
+    _check_directory(parent, job.name)
     job.mkdir(parents=True, exist_ok=True)
-    _safe(job / "commands").mkdir(exist_ok=True)
+    files = parent.under(job.name)
+    _check_directory(files, "commands")
+    (job / "commands").mkdir(exist_ok=True)
     commands = {}
     for command in data["verification"]["commands"] + data["permissions"]["worker_commands"]:
         if not valid_command(command):
@@ -145,19 +153,27 @@ def create_manifest(config, worktree, job, run_path=None, *, parent_deadline=Non
     root = os.stat(worktree, follow_symlinks=False)
     manifest = {"version": 3, "role": "worker", "dispatch_id": job.name, "worktree": str(worktree),
                 "root_identity": [root.st_dev, root.st_ino],
-                "job": str(job.resolve()), "run_path": str(run_path) if run_path else None,
+                "job": str(job), "run_path": str(run_path) if run_path is not None else None,
                 "binding": state.get("worktree_binding"), "expected_head": state.get("expected_head"),
                 "timeout": timeout, "parent_deadline": parent_deadline, "cleanup_margin": 2.0,
                 "commands": list(commands.values()), "delete_scope": delete_scope}
-    path = _safe(job / "commands.json")
-    if path.exists():
+    path = job / "commands.json"
+    if files.probe((path.name,)).or_local_io().state != "absent":
         raise HarnessError("Command manifest already exists")
+    # Keep the caller's handlers in place and defer delivery until the descriptor is closed.
+    previous = signal.pthread_sigmask(signal.SIG_BLOCK, ())
     try:
-        os.close(os.open(_safe(job / ADMISSION_LOCK), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600))
-    except FileExistsError as error:
-        raise HarnessError("Command admission lock already exists") from error
+        signal.pthread_sigmask(signal.SIG_BLOCK, SIGNALS)
+        try:
+            fd = os.open(job / ADMISSION_LOCK,
+                         os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        except FileExistsError as error:
+            raise HarnessError("Command admission lock already exists") from error
+        os.close(fd)
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous)
     write_json(path, manifest)
-    return {"artifact": str(path), "artifact_digest": _file_digest(path),
+    return {"artifact": str(path), "artifact_digest": _evidence_digest(files, (path.name,)),
             "commands": manifest["commands"]}
 
 
@@ -165,7 +181,7 @@ def _damaged_journal(message, path):
     return EvidenceError(message, stop=stops.make("evidence", "runtime_integrity", source={"artifact": str(path)}))
 
 
-def _journal_root(job_or_dir, state):
+def _journal_root(job_or_dir, files):
     """The dispatch directory holding commands/, and its reads walked from ``state`` without following any level.
 
     ``state`` is the state directory the caller works in, resolved once as every StateFiles root is; nothing above it
@@ -175,13 +191,17 @@ def _journal_root(job_or_dir, state):
     read, both decided by the primitive.
     """
     given = os.fspath(job_or_dir)
-    files = StateFiles(state)
     components = files.recorded(given)
     job = Path(given)
     if components and components[-1] == "commands":
         components, job = components[:-1], job.parent
     if not components:
-        raise _damaged_journal(f"Command journal directory not recorded below the state directory {state}: {given}",
+        if not files.opened:
+            # A held root replays its failure. Only resolution failure made the path comparison impossible.
+            root = files.entries()
+            if root.step.stage == "resolve":
+                root.or_local_io()
+        raise _damaged_journal(f"Command journal directory not recorded below the state directory {files.path}: {given}",
                                given)
     return job, files.under(*components)
 
@@ -206,6 +226,7 @@ def _journal_facts(raw, call_id):
 def command_processes(job_or_dir, *, state):
     """One record per call folder in a dispatch's commands/, from a single read of its process.json.
 
+    ``state`` is a state directory path or the held root borrowed from a batch exit gate.
     ``journal_state`` is valid, invalid (read, but over JOURNAL_MAX, not strict JSON or failing a field
     check), absent or refused (a link, FIFO or directory, or rewritten while read). Only a valid record
     has the journal's process facts; an invalid one has no facts but the digest of the whole file, which
@@ -213,7 +234,13 @@ def command_processes(job_or_dir, *, state):
     record; a dispatch path not recorded below ``state``, commands/ or a directory above it refused (a link
     included), or an entry that is not a call folder or is gone since it was listed, is EvidenceError.
     """
-    job, files = _journal_root(job_or_dir, state)
+    if isinstance(state, HeldFiles):
+        return _read_command_processes(job_or_dir, state)
+    return holding(StateFiles.held(state), lambda files: _read_command_processes(job_or_dir, files))
+
+
+def _read_command_processes(job_or_dir, files):
+    job, files = _journal_root(job_or_dir, files)
     listing = files.entries(("commands",)).or_local_io()
     if listing.state == "absent":
         return []
@@ -272,12 +299,13 @@ def ensure_command_processes_exited(directory, parent_entry=None, *, state, obse
 
 class Broker:
     def __init__(self, manifest, digest):
-        self.path, self.digest = _safe(manifest), digest
+        self.path, self.digest = Path(manifest).absolute(), digest
+        self.files = StateFiles.nofollow_directory(self.path.parent)
         self.manifest = None
         self._load()
 
     def _load(self):
-        raw = _safe(self.path).read_bytes()
+        raw = self.files.read((self.path.name,), limit=None).evidence({"artifact": str(self.path)})
         if hashlib.sha256(raw).hexdigest() != self.digest:
             raise HarnessError("Command manifest digest mismatch")
         m = json.loads(raw)
@@ -286,7 +314,7 @@ class Broker:
                 or not isinstance(m["root_identity"], list) or len(m["root_identity"]) != 2
                 or not all(type(value) is int and value >= 0 for value in m["root_identity"])
                 or m["delete_scope"] is not None and not _valid_delete_scope(m["delete_scope"])
-                or str(self.path) != str(_safe(Path(m["job"]) / "commands.json"))
+                or m["job"] != str(self.path.parent) or self.path.name != "commands.json"
                 or Path(m["job"]).name != m["dispatch_id"]
                 or type(m["timeout"]) not in (int, float) or not math.isfinite(m["timeout"])
                 or not 0 < m["timeout"] or not isinstance(m["commands"], list)
@@ -302,7 +330,7 @@ class Broker:
                 raise HarnessError("Invalid or duplicate command ID")
             ids.add(c["command_id"])
         _safe(m["worktree"])
-        _safe(Path(m["job"]) / "commands")
+        _check_directory(self.files, "commands")
         if self.manifest is not None and m != self.manifest:
             raise HarnessError("Command manifest changed")
         self.manifest = m
@@ -313,7 +341,7 @@ class Broker:
         m = self.manifest
         if m["run_path"] is None:
             return
-        state = read_current_ledger(_safe(m["run_path"]))
+        state = _read_ledger(m["run_path"])
         entries = [d for d in state.get("dispatches", []) if d.get("id") == m["dispatch_id"]]
         if (state.get("status") != "running" or len(entries) != 1
                 or state.get("dispatches", [])[-1].get("id") != m["dispatch_id"]
@@ -343,9 +371,10 @@ class Broker:
         for prior in records:
             if prior["process_state"] == "prepared":
                 continue  # No start intent was ever committed.
-            receipt_path = Path(prior["journal"]).with_name("receipt.json")
+            folder = Path(prior["journal"]).parent
+            files = self.files.under("commands", folder.name)
             try:
-                receipt = read_json(_safe(receipt_path))
+                receipt = json.loads(files.read(("receipt.json",), limit=None).evidence().decode("utf-8"))
                 if (receipt["call_id"] != prior["id"] or receipt["command_id"] != prior["command_id"]
                         or receipt.get("evidence_complete") is not True
                         or receipt.get("manifest_sha256") != self.digest
@@ -356,17 +385,17 @@ class Broker:
                     if receipt.get("operation") != "delete_path":
                         raise ValueError("deletion receipt kind")
                     if receipt["intent_path"] is not None:
-                        expected = receipt_path.with_name("delete-intent.json")
-                        if receipt["intent_path"] != str(expected) or _file_digest(_safe(expected)) != receipt["intent_sha256"]:
+                        name = "delete-intent.json"
+                        if receipt["intent_path"] != str(folder / name) or _evidence_digest(files, (name,)) != receipt["intent_sha256"]:
                             raise ValueError("deletion intent digest")
                     continue
                 if receipt["command"] != commands[prior["command_id"]]:
                     raise ValueError("receipt command")
                 for stream in ("stdout", "stderr"):
-                    expected = receipt_path.with_name("output." + stream)
-                    if receipt[stream + "_path"] != str(expected) or _file_digest(_safe(expected)) != receipt[stream + "_sha256"]:
+                    name = "output." + stream
+                    if receipt[stream + "_path"] != str(folder / name) or _evidence_digest(files, (name,)) != receipt[stream + "_sha256"]:
                         raise ValueError("capture digest")
-            except (OSError, ValueError, KeyError, TypeError) as error:
+            except (HarnessError, ValueError, KeyError, TypeError, RecursionError) as error:
                 raise HarnessError("Command evidence incomplete: " + prior["id"]) from error
 
     def _admit(self, arguments, held):
@@ -434,8 +463,9 @@ class Broker:
         return with_descriptors(lambda held: self._run_command(arguments, held))
 
     def _run_command(self, arguments, held):
-        with _admission_lock(self.manifest["job"]):
-            m, command, timeout, folder, entry, root = self._admit(arguments, held)
+        m, command, timeout, folder, entry, root = _with_admission(
+            self.manifest["job"], lambda: self._admit(arguments, held))
+        files = self.files.under("commands", folder.name)
         journal = folder / "process.json"
         result = {"call_id": entry["id"], "command_id": command["command_id"], "command": command["command"], "exit_code": None,
                   "error": None, "evidence_complete": False, "effective_timeout": timeout}
@@ -483,14 +513,16 @@ class Broker:
                     try:
                         write_json(journal, entry)
                         for stream in ("stdout", "stderr"):
-                            path = folder / ("output." + stream)
-                            if not path.exists():
-                                raise HarnessError("Missing command capture: " + stream)
-                            result[stream] = tail(path, 4000)
-                            result[stream + "_path"] = str(path)
-                            result[stream + "_sha256"] = _file_digest(path)
+                            name = "output." + stream
+                            snippet = files.read((name,), limit=4000, part="tail")
+                            data = snippet.bytes_or_none()
+                            if data is not None:
+                                prefix = "[earlier output omitted; see log]\n" if snippet.size > 4000 else ""
+                                result[stream] = prefix + data.decode("utf-8", errors="replace")
+                            result[stream + "_path"] = str(folder / name)
+                            result[stream + "_sha256"] = _evidence_digest(files, (name,))
                         result["exit_confirmed"] = entry["exit_confirmed"]
-                        result["journal_sha256"] = _file_digest(journal)
+                        result["journal_sha256"] = _evidence_digest(files, (journal.name,))
                         result["manifest_sha256"] = self.digest
                         write_json(folder / "receipt.json", result)
                     except (Exception, KeyboardInterrupt, SystemExit) as error:
@@ -536,7 +568,7 @@ class Broker:
             raise HarnessError("delete_path is unavailable: this dispatch has no current task scope")
         if m["run_path"] is not None:
             # _load already proved the dispatch live; its task scope must still match.
-            state = read_current_ledger(_safe(m["run_path"]))
+            state = _read_ledger(m["run_path"])
             if _ledger_delete_scope(state, m["dispatch_id"]) != {k: scope[k] for k in ("task_id", "allowed_paths")}:
                 raise HarnessError("delete_path task scope no longer matches the run ledger")
         return scope
@@ -576,58 +608,60 @@ class Broker:
         if (not isinstance(arguments, dict) or set(arguments) != {"path"} or not isinstance(arguments["path"], str)
                 or len(arguments["path"]) > MAX_DELETE_PATH_CHARS):
             raise HarnessError(f"delete_path accepts only path, a string of at most {MAX_DELETE_PATH_CHARS} characters")
-        path = arguments["path"]
+        return _with_admission(self.manifest["job"], lambda: self._delete_path(arguments["path"]))
+
+    def _delete_path(self, path):
         fatal_error = None
-        with _admission_lock(self.manifest["job"]):
-            m = self._load()
-            scope = self._delete_scope(m)
-            self._prior_evidence(m)
-            with defer_cleanup_signals():
-                folder, entry = self._publish_journal(m, DELETE_COMMAND_ID, process_state="exited",
-                                                      exit_confirmed=True)
-                journal = folder / "process.json"
-                started_clock = time.monotonic()
-                result = {"call_id": entry["id"], "command_id": DELETE_COMMAND_ID, "operation": "delete_path",
-                          "path": path, "task_id": scope["task_id"], "head": None, "head_mode": None,
-                          "outcome": None, "deleted": False, "sha256": None, "bytes": None, "error": None,
-                          "concurrent_change": None, "intent_path": None, "intent_sha256": None,
-                          "started_at": datetime.now(timezone.utc).isoformat()}
-                facts = {"deleted": False}
-                def intent(found):
-                    # Written before the final check: the verified file that is
-                    # about to be removed. A refusal at that check keeps the
-                    # intent and records deleted=false.
-                    result.update(sha256=found["sha256"], bytes=found["bytes"])
-                    value = {"call_id": entry["id"], "path": path, "head": result["head"],
-                             "head_mode": result["head_mode"], "sha256": found["sha256"],
-                             "bytes": found["bytes"], "time": datetime.now(timezone.utc).isoformat()}
-                    write_json(folder / "delete-intent.json", value)
-                    result.update(intent_path=str(folder / "delete-intent.json"),
-                                  intent_sha256=_file_digest(folder / "delete-intent.json"))
+        m = self._load()
+        scope = self._delete_scope(m)
+        self._prior_evidence(m)
+        with defer_cleanup_signals():
+            folder, entry = self._publish_journal(m, DELETE_COMMAND_ID, process_state="exited",
+                                                  exit_confirmed=True)
+            journal = folder / "process.json"
+            files = self.files.under("commands", folder.name)
+            started_clock = time.monotonic()
+            result = {"call_id": entry["id"], "command_id": DELETE_COMMAND_ID, "operation": "delete_path",
+                      "path": path, "task_id": scope["task_id"], "head": None, "head_mode": None,
+                      "outcome": None, "deleted": False, "sha256": None, "bytes": None, "error": None,
+                      "concurrent_change": None, "intent_path": None, "intent_sha256": None,
+                      "started_at": datetime.now(timezone.utc).isoformat()}
+            facts = {"deleted": False}
+            def intent(found):
+                # Written before the final check: the verified file that is
+                # about to be removed. A refusal at that check keeps the
+                # intent and records deleted=false.
+                result.update(sha256=found["sha256"], bytes=found["bytes"])
+                value = {"call_id": entry["id"], "path": path, "head": result["head"],
+                         "head_mode": result["head_mode"], "sha256": found["sha256"],
+                         "bytes": found["bytes"], "time": datetime.now(timezone.utc).isoformat()}
+                write_json(folder / "delete-intent.json", value)
+                result.update(intent_path=str(folder / "delete-intent.json"),
+                              intent_sha256=_evidence_digest(files, ("delete-intent.json",)))
+            try:
+                result["head"], result["head_mode"] = self._delete_eligibility(m, scope, path)
+                _remove_tracked_file(Path(m["worktree"]), m["root_identity"], path, facts, intent)
+                result["concurrent_change"] = facts.get("concurrent_change")
+                result["outcome"] = "concurrent_change" if result["concurrent_change"] else "deleted"
+                if result["concurrent_change"]:
+                    result["error"] = result["concurrent_change"]
+            except _DeleteRefused as error:
+                result.update(outcome="refused", error=str(error))
+            except BaseException as error:
+                if not isinstance(error, (Exception, KeyboardInterrupt, SystemExit)):
+                    fatal_error = error
+                result.update(outcome="failed", error=str(error) or type(error).__name__)
+            finally:
+                result["deleted"] = bool(facts["deleted"])
+                result.update(finished_at=datetime.now(timezone.utc).isoformat(),
+                              duration_seconds=max(0.0, time.monotonic() - started_clock),
+                              exit_confirmed=True, evidence_complete=True, manifest_sha256=self.digest)
                 try:
-                    result["head"], result["head_mode"] = self._delete_eligibility(m, scope, path)
-                    _remove_tracked_file(Path(m["worktree"]), m["root_identity"], path, facts, intent)
-                    result["concurrent_change"] = facts.get("concurrent_change")
-                    result["outcome"] = "concurrent_change" if result["concurrent_change"] else "deleted"
-                    if result["concurrent_change"]:
-                        result["error"] = result["concurrent_change"]
-                except _DeleteRefused as error:
-                    result.update(outcome="refused", error=str(error))
-                except BaseException as error:
-                    if not isinstance(error, (Exception, KeyboardInterrupt, SystemExit)):
-                        fatal_error = error
-                    result.update(outcome="failed", error=str(error) or type(error).__name__)
-                finally:
-                    result["deleted"] = bool(facts["deleted"])
-                    result.update(finished_at=datetime.now(timezone.utc).isoformat(),
-                                  duration_seconds=max(0.0, time.monotonic() - started_clock),
-                                  exit_confirmed=True, evidence_complete=True, manifest_sha256=self.digest)
-                    try:
-                        result["journal_sha256"] = _file_digest(journal)
-                        write_json(folder / "receipt.json", result)
-                    except (Exception, KeyboardInterrupt, SystemExit) as error:
-                        result.update(evidence_complete=False,
-                                      persistence_error="Deletion evidence persistence failed: " + str(error))
+                    result["journal_sha256"] = _evidence_digest(files, (journal.name,))
+                    write_json(folder / "receipt.json", result)
+                except (Exception, KeyboardInterrupt, SystemExit) as error:
+                    result.update(evidence_complete=False,
+                                  persistence_error="Deletion evidence persistence failed: " + str(error))
         if fatal_error is not None:
             raise fatal_error
         return result

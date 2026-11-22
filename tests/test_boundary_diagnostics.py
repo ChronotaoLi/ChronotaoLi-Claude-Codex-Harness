@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from harness import git, mcp_server
+from harness import git, mcp_server, stops
 from harness.adapters import DemoBackend
 from harness.config import Config
 from harness.runtime import Runtime
@@ -262,8 +262,11 @@ class BoundaryDiagnosticsTests(unittest.TestCase):
         (self.repo / "vendor/lib").mkdir(parents=True)
         self.assertTrue(git.clean(self.repo))
         engine = Runtime(self.config, self.repo, backend=DemoBackend())
-        with self.assertRaisesRegex(HarnessError, "submodule.*vendor/lib"):
+        with self.assertRaisesRegex(HarnessError, "submodule.*vendor/lib") as caught:
             engine.start("Implement greet", self.plan())
+        stop = stops.of(caught.exception)
+        self.assertEqual((stop["kind"], stop["reason"], stop["data"]["option"]),
+                         ("invalid_input", "cli_arguments", "--repo"))
         self.assertIsNone(engine.run)
         self.assertFalse((engine.state / "worktrees").exists())
         self.assertFalse((engine.state / "runs").exists())

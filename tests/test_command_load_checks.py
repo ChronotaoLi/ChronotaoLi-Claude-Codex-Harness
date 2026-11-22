@@ -5,6 +5,7 @@ included, so that only a command's shape is wrong. Each case breaks one place al
 one task, one command column, one way. No model or CLI is called.
 """
 import copy
+import errno
 import hashlib
 import os
 import shutil
@@ -18,7 +19,7 @@ from harness import stops
 from harness.config import Config
 from harness.packets import PacketBuilder
 from harness.scheduler import Scheduler
-from harness.util import HarnessError, read_json, write_json
+from harness.util import EvidenceError, HarnessError, read_json, write_json
 from test_harness import ROOT, RepoCase, crash_after_save, write_project_config
 from test_runtime_changes import ScriptedBackend, current_tasks, finding, revised, trigger_kind
 
@@ -436,6 +437,8 @@ class CommandLoadCheckTests(RepoCase):
             if not seen and at(run, options):
                 seen.update(run=copy.deepcopy(run), calls=len(backend.calls), options=options)
                 rewrite(scheduler.context.directory, revision, change)(run)
+                # Keep the intentionally corrupted ledger authoritative for the load-settling check.
+                scheduler.context.save()
             result = next_step(scheduler, **options)
             steps.append((result.kind, result.data[0]["id"] if result.kind == "worker"
                           else result.data.get("kind") if result.kind == "decide" else None, labels))
@@ -601,6 +604,7 @@ class CommandLoadCheckTests(RepoCase):
         def preflight_then_changed(builder, *args, **kwargs):
             result = preflight(builder, *args, **kwargs)
             rewrite(builder.context.directory, 0, column(0, "self_checks", BAD["parent cwd"]))(builder.context.run)
+            builder.context.save()  # The bad command is in a complete candidate, so it survives stop rebasing.
             return result
         with patch.object(PacketBuilder, "preflight_final_context", preflight_then_changed), \
                 self.assertRaises(HarnessError) as caught:
@@ -611,3 +615,68 @@ class CommandLoadCheckTests(RepoCase):
                           backend.calls), ("blocked", "evidence", "load_integrity",
                                            {"kind": "plan_approval", "reason": "initial_plan"}, []))
         self.assertNotIn('"plan_awaiting_approval"', (engine.directory / "events.jsonl").read_text())
+
+
+    def test_settling_a_published_stop_rechecks_the_rebased_candidate(self):
+        backend = ScriptedBackend()
+        engine = self.engine(backend)
+        preflight = PacketBuilder.preflight_final_context
+
+        def preflight_then_changed(builder, *args, **kwargs):
+            result = preflight(builder, *args, **kwargs)
+            column(0, "self_checks", BAD["parent cwd"])(builder.context.run)
+            return result
+
+        lifecycle = engine.services.lifecycle
+        settle = lifecycle.settle_stop
+        leaving = []
+
+        def settle_recorded(error):
+            leaving.append((error, error.__cause__, error.__context__))
+            return settle(error)
+
+        with patch.object(PacketBuilder, "preflight_final_context", preflight_then_changed), \
+                patch.object(lifecycle, "settle_stop", side_effect=settle_recorded), \
+                self.assertRaises(HarnessError) as caught:
+            engine.start("Implement greet", plan(), pause_after_plan=True)
+        error, cause, context = leaving[0]
+        self.assertIs(caught.exception, error)
+        self.assertIs(error.__cause__, cause)
+        self.assertIs(error.__context__, context)
+        self.assertIsInstance(cause, EvidenceError)
+        self.assert_stop(error, "runtime_integrity")
+        run = read_json(engine.directory / "state.json")
+        self.assertEqual((run["status"], run["tasks"], run["stop"], backend.calls),
+                         ("blocked", plan()["tasks"], stops.of(caught.exception), []))
+        events = (engine.directory / "events.jsonl").read_text()
+        self.assertNotIn('"plan_awaiting_approval"', events)
+        self.assertEqual(events.count('"run_stopped"'), 1)
+        self.assertEqual(self.engine(backend).abandon(run["id"])["status"], "abandoned")
+
+
+    def test_approval_check_io_failure_remains_io_when_the_rebased_candidate_loads(self):
+        backend = ScriptedBackend()
+        engine = self.engine(backend)
+        lifecycle = engine.services.lifecycle
+        load_checks = lifecycle.load_checks
+        fault = OSError(errno.EIO, "approval load check")
+        checked = []
+
+        def load_check():
+            status = engine.run["status"]
+            checked.append(status)
+            if status == "awaiting_approval":
+                raise fault
+            load_checks()
+
+        with patch.object(lifecycle, "load_checks", side_effect=load_check), \
+                self.assertRaises(HarnessError) as caught:
+            engine.start("Implement greet", plan(), pause_after_plan=True)
+        self.assertIs(caught.exception.__cause__, fault)
+        self.assertEqual(checked[-2:], ["awaiting_approval", "blocked"])
+        run = read_json(engine.directory / "state.json")
+        stop = run["stop"]
+        self.assertEqual((stop["kind"], stop["reason"], stop["data"]["error_type"]),
+                         ("runtime_failure", "io", "OSError"))
+        self.assertEqual((run["status"], stop, backend.calls), ("blocked", stops.of(caught.exception), []))
+        self.assertEqual(self.engine(backend).abandon(run["id"])["status"], "abandoned")

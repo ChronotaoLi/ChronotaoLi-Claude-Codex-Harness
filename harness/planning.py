@@ -81,7 +81,7 @@ class Planner(RuntimeService):
 
     def decide_returned(self):
         receipt = self.context.run["commander_receipts"].get(DECIDE_KEY)
-        return bool(receipt and ("artifact_digest" in receipt or Path(receipt["artifact"]).exists()))
+        return receipt is not None and self.services.receipts.returned(receipt)
 
     # ---- the decide request -------------------------------------------------
     def gated_tasks(self):
@@ -305,6 +305,7 @@ class Planner(RuntimeService):
         except BaseException:
             run["commander_receipts"] = receipts
             entry.pop("proposal_rejection", None)
+            self.context.store.discard_attempt()
             raise
         self.context.observe("proposal_rejected", request_id=record["request_id"], dispatch_id=entry["id"],
                              artifact=str(artifact))

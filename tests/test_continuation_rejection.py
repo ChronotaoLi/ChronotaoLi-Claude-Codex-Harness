@@ -293,8 +293,8 @@ class RejectionLifecycleTests(RepoCase):
         engine, backend, path, _, _ = self.waiting()
         resumed = self.engine(backend)
         save = resumed.context.save
-        def interrupt_after_save():
-            save()
+        def interrupt_after_save(**kwargs):
+            save(**kwargs)
             if resumed.run.get('continuation_rejections'):
                 raise KeyboardInterrupt()
         with patch.object(resumed.context, 'save', side_effect=interrupt_after_save), self.assertRaises(KeyboardInterrupt):

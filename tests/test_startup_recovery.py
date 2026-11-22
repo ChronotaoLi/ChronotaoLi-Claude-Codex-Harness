@@ -3,7 +3,7 @@ import copy
 from pathlib import Path
 from unittest.mock import patch
 
-from harness import git
+from harness import git, stops
 from harness.cleanup import cleanup_run
 from harness.util import HarnessError, read_json, write_json
 from test_engine_repairs import RecordingBackend
@@ -55,9 +55,9 @@ class StartupRecoveryTests(RepoCase):
         save = engine.context.save
         interrupted = False
 
-        def interrupt():
+        def interrupt(**options):
             nonlocal interrupted
-            save()
+            save(**options)
             if not interrupted and predicate(engine.run):
                 interrupted = True
                 raise KeyboardInterrupt()
@@ -218,20 +218,27 @@ class StartupRecoveryTests(RepoCase):
         self.assertEqual(git.git(self.repo, "show-ref"), refs)
         self.assert_unbound_resume_rejected(engine, backend)
 
-    def test_created_worktree_without_captured_binding_is_preserved_for_manual_cleanup(self):
+    def test_failed_binding_capture_removes_checkout_but_leaves_branch_and_unbound_run(self):
         backend = RecordingBackend()
         engine = self.engine(backend)
         plan = self.plan()
-        with patch("harness.git.capture_worktree_binding", side_effect=HarnessError("injected binding capture failure")):
-            with self.assertRaises(HarnessError):
+        initial_registrations = git.git(self.repo, "worktree", "list", "--porcelain")
+        binding_failure = HarnessError("injected binding capture failure",
+                                       stop=stops.make("workspace_mismatch", "binding_changed"))
+        with patch("harness.git.capture_worktree_binding", side_effect=binding_failure):
+            with self.assertRaisesRegex(HarnessError, "injected binding capture failure") as error:
                 engine.start("Implement messages", plan)
+        self.assertIs(error.exception, binding_failure)
+        stop = stops.of(error.exception)
+        self.assertEqual((stop["kind"], stop["reason"]), ("workspace_mismatch", "binding_changed"))
         saved = self.saved(engine)
         self.assertEqual(saved["worktree_binding"], {})
         self.assertEqual(saved["original_tasks"], plan["tasks"])
-        before = (engine.worktree / "test_hello.py").read_bytes()
         refs = git.git(self.repo, "show-ref")
-        registered = git.git(self.repo, "worktree", "list", "--porcelain")
+        self.assertIn(f"refs/heads/{saved['branch']}\n", refs)
+        self.assertFalse(engine.worktree.exists())
+        self.assertEqual(git.git(self.repo, "worktree", "list", "--porcelain"), initial_registrations)
         self.assert_unbound_resume_rejected(engine, backend)
-        self.assertEqual((engine.worktree / "test_hello.py").read_bytes(), before)
+        self.assertFalse(engine.worktree.exists())
         self.assertEqual(git.git(self.repo, "show-ref"), refs)
-        self.assertEqual(git.git(self.repo, "worktree", "list", "--porcelain"), registered)
+        self.assertEqual(git.git(self.repo, "worktree", "list", "--porcelain"), initial_registrations)

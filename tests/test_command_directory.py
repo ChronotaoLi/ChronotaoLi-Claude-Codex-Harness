@@ -4,6 +4,7 @@ import errno
 import gc
 import os
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -39,21 +40,28 @@ def closed(descriptor):
     return False
 
 
+def is_directory(descriptor):
+    # Linux O_TMPFILE includes O_DIRECTORY but opens a regular file.
+    return stat.S_ISDIR(os.fstat(descriptor).st_mode)
+
+
 @contextlib.contextmanager
 def recorded_opens(*, directories_only, into=None):
-    """Every descriptor os.open (and os.dup) hands out inside the block."""
+    """Record descriptors opened or duplicated inside the block."""
     real_open, real_dup = os.open, os.dup
     opened = [] if into is None else into
 
     def tracked_open(path, flags, *args, **kwargs):
         descriptor = real_open(path, flags, *args, **kwargs)
-        if not directories_only or flags & os.O_DIRECTORY:
+        if not directories_only or is_directory(descriptor):
             opened.append(descriptor)
         return descriptor
 
     def tracked_dup(descriptor):
-        opened.append(real_dup(descriptor))
-        return opened[-1]
+        duplicate = real_dup(descriptor)
+        if not directories_only or is_directory(duplicate):
+            opened.append(duplicate)
+        return duplicate
 
     with patch("harness.util.os.open", side_effect=tracked_open), \
             patch("harness.util.os.dup", side_effect=tracked_dup):
@@ -528,7 +536,7 @@ class CommandDirectoryLaunchTests(InterruptSweep, unittest.TestCase):
 
         def interrupted_at_first_level(path, flags, *args, **kwargs):
             descriptor = real_open(path, flags, *args, **kwargs)
-            if flags & os.O_DIRECTORY:
+            if is_directory(descriptor):
                 opened.append((path, descriptor))
             if path == "a":
                 signal.raise_signal(signal.SIGINT)
@@ -550,7 +558,7 @@ class CommandDirectoryLaunchTests(InterruptSweep, unittest.TestCase):
 
         def interrupted_at_open(path, flags, *args, **kwargs):
             descriptor = real_open(path, flags, *args, **kwargs)
-            if flags & os.O_DIRECTORY:
+            if is_directory(descriptor):
                 opened.append(descriptor)
             if path == "sub":
                 signal.raise_signal(signal.SIGINT)
@@ -704,6 +712,7 @@ class BoundRootTests(InterruptSweep, unittest.TestCase):
     def verify(self, path, binding, name, started):
         """Run one formal check on ``path``; the stand-in for its process records the root it was given."""
         context = SimpleNamespace(run={"dispatches": []}, ensure_exited=lambda: None, save=lambda: None,
+                                  save_fact=lambda *keys: True,
                                   config=SimpleNamespace(data={"runtime": {"verify_timeout_seconds": 5}}))
 
         def process(argv, cwd, log, **kwargs):

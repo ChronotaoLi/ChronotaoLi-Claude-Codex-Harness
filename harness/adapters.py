@@ -14,6 +14,7 @@ from . import stops
 from .command_server import create_manifest
 from .provider_failures import LIMIT, claude_http_status, display_label, read_original
 from .shared import mcp_configs, toml_value
+from .state_files import StateFiles
 from .util import EvidenceError, HarnessError, dump, read_json, run_process, strict_json_loads, tail_text, write_json
 from .worker_returns import decode_terminal
 
@@ -38,21 +39,13 @@ _CODEX_ERROR_TAIL_BYTES = 64 * 1024
 OPERATOR_SKILL = "harness-operator"
 
 
-def _original_bytes(path, message, *, local_io=True):
-    """One of a call's originals (``read_original``); any miss is HarnessError(message).
-
-    With ``local_io``, a returned result (exit 0): read whole, as it always was (the CLI's envelope
-    has no size bound: Claude's ``permission_denials`` accumulate), and local I/O leaves as itself.
-    Without it, a failed call's terminal: at most ``LIMIT`` bytes, over is a miss as the classifier
-    and the worker judgment treat the same file, and no read can replace the failure being reported.
-    """
-    state, raw = read_original(path, lambda stream: stream.read(-1 if local_io else LIMIT + 1))
-    if state == "read" and (local_io or len(raw) <= LIMIT):
+def _original_bytes(path, message):
+    """Read a successful call's original whole, preserving local I/O."""
+    state, raw = read_original(path, lambda stream: stream.read())
+    if state == "read":
         return raw
-    error = raw if state != "read" else None
-    if local_io:
-        stops.keep_local_io(error)
-    raise HarnessError(message) from error
+    stops.keep_local_io(raw)
+    raise HarnessError(message) from raw
 
 
 def codex_error_summary(path):
@@ -358,30 +351,39 @@ class CLIBackend:
     def preserve_terminal(self, job, provider, outcome, *, terminal_only=False):
         """Save designated terminal evidence separately from process success.
 
-        Called only after a failed process end: the terminal is read once, and a read that
-        misses is a HarnessError, never local I/O (``_original_bytes`` without ``local_io``).
-        No path check precedes a read: ``read_original`` refuses a link or anything but a
-        regular file itself, and a separate stat could raise on Python 3.11 to 3.13.
+        Read each original once, below the state root. A failed read propagates
+        even if there is insufficient process evidence to require a capture.
         """
-        source = job / ("response.json" if provider == "codex" else "process.stdout")
+        job, state = Path(job), Path(self.state)
+        if not job.is_relative_to(state):
+            # An explicitly supplied state root may have a system path alias.
+            state = state.resolve()
+        files = StateFiles(state).under(*job.relative_to(state).parts)
+        source = "response.json" if provider == "codex" else "process.stdout"
+        read = files.read((source,), limit=LIMIT).or_local_io()
+        if read.state in ("absent", "refused") and not read.step.leaf:
+            read.evidence()
         known_completion = (outcome.get("exit_code") is not None
                             and (outcome.get("termination_reason") == "normal" or outcome["exit_code"] == 0))
-        value = terminal = None
+        if read.state != "read":
+            if terminal_only or not known_completion:
+                return False
+            raise HarnessError("Terminal evidence must be a regular file")
+        terminal, value = read.data, None
         if terminal_only or not known_completion:
             # A timeout before any terminal remains retryable. A whole provider
             # terminal followed by timeout/cancellation is retained, never used
             # as success. Partial JSON and ordinary event output are insufficient.
             try:
-                terminal = _original_bytes(source, "Terminal evidence must be a regular file", local_io=False)
                 value = self.completed_result(job, provider, terminal)
             except HarnessError:
                 return False
-        if terminal is None:
-            terminal = _original_bytes(source, "Terminal evidence must be a regular file", local_io=False)
-        record = _original_bytes(job / "process.outcome.json", "Terminal evidence must be a regular file", local_io=False)
-        capture = {"version": 1, "provider": provider, "source": source.name,
+        record = files.read(("process.outcome.json",), limit=LIMIT).or_local_io()
+        if record.state != "read":
+            raise HarnessError("Terminal evidence must be a regular file")
+        capture = {"version": 1, "provider": provider, "source": source,
                    "source_digest": hashlib.sha256(terminal).hexdigest(),
-                   "outcome_digest": hashlib.sha256(record).hexdigest()}
+                   "outcome_digest": hashlib.sha256(record.data).hexdigest()}
         # Publish intent before parsing or result publication. Incomplete intent
         # is a permanent evidence blocker, never permission to redraw a decision.
         write_json(job / "terminal-capture.json", capture)

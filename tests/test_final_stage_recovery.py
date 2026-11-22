@@ -217,9 +217,9 @@ class FinalStageRecoveryTests(RepoCase):
         save = engine.context.save
         interrupted = False
 
-        def interrupt_after_approval():
+        def interrupt_after_approval(**kwargs):
             nonlocal interrupted
-            save()
+            save(**kwargs)
             if not interrupted and engine.run["final_history"] and engine.run["final_history"][-1]["status"] == "approved":
                 interrupted = True
                 raise KeyboardInterrupt()
@@ -251,9 +251,9 @@ class FinalStageRecoveryTests(RepoCase):
         save = engine.context.save
         interrupted = False
 
-        def interrupt_after_rejection():
+        def interrupt_after_rejection(**kwargs):
             nonlocal interrupted
-            save()
+            save(**kwargs)
             if not interrupted and engine.run["final_history"] and engine.run["final_history"][-1]["status"] == "rejected":
                 interrupted = True
                 raise KeyboardInterrupt()

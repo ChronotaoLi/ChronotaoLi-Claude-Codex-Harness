@@ -104,6 +104,7 @@
 | `invalid-blocker-task` | 非停止 | — | worker 的 blocked 输出结构或语义不合法（例如 `blocker_kind=operator` 而 `blockers` 为空），或 task 阻断只有界限失败 | 不停止：按 task 阻断交给指挥决定，反馈带 `output_error`，结构或语义不合法时不带原结果、不登记决定请求；不给尝试豁免 | — |
 | `scope-violation` | `scope_violation/candidate_outside_scope` | 1 | `… 请先核对并清理越界修改，再 resume`（`data.path`、`source.task_id`） | 核对并清理范围外改动，不自动删除 | `resume RUN` |
 | `protected-path` | `scope_violation/protected_path` | 1 | `任务修改了受保护路径：…`（`.git`、`.harness`、`.codex`、`.claude` 下，按折叠后的名称判定，`.CLAUDE` 这类别名写法同样算；`data.path` 是原始拼写） | 同上 | `resume RUN` |
+| `special-file` | `scope_violation/special_file` | 1 | `候选含 Git 不能记录的特殊文件：…`（管道、套接字或设备；`data.path`、`source.task_id`） | 删除它或换回普通文件，不自动删除 | `resume RUN` |
 | `redo-exhausted` | `invalid_output/redo_exhausted` | 3 | `<role> 输出连续两次无效：…；原件 PATH；普通 resume 重新请求，或 abandon` | 读原件与错误（派发条目的 `error`、`invalid_output`）；首次判定时计划超出整体审阅的必要上下文同样是无效输出；普通 `resume` 是新请求，最多再两次调用 | `resume RUN`；`abandon RUN` |
 | `invalid-original-changed` | `evidence/runtime_integrity` | 1 | `无效输出原始结果缺失或无法读取`、`无效输出原始结果已改变` | 上一次无效输出的原件被删改，调用计费前的核对停止（这次核对在本地准备之后，留下一个 `invoked=false` 的失败准备条目）；恢复原字节后普通 `resume`，或放弃 | `resume RUN`；`abandon RUN` |
 | `head-changed` | `workspace_mismatch/head_changed`（操作） | 1 | `worktree HEAD 与检查点不同` | 核对是否有含 `Harness-Run`／`Harness-Task` 的提交（见下一节第 1 条；读取命令见 [README](../README.md#对自己的项目执行任务)）；不手工伪造接受；恢复可信现场后 `resume`，或放弃 | `resume RUN`；`abandon RUN`；〔`question_registered`〕`resume RUN --operator-decision FILE` |

@@ -22,6 +22,7 @@ import shutil
 import signal
 import socket
 import stat
+import symtable
 import sys
 import tempfile
 import threading
@@ -44,7 +45,7 @@ UNLESS_ROOT = unittest.skipIf(os.geteuid() == 0, "permission bits do not bind ro
 
 @contextlib.contextmanager
 def held_lock(path):
-    """Another holder of the lock at ``path``, taking it as ``util.lock`` does.
+    """Another holder of the lock at ``path``.
 
     Opened ``a+`` (made, with its directory, when missing), then flocked exclusively without waiting. flock
     conflicts across descriptors, so every lock the primitive takes on the same file is busy meanwhile.
@@ -1933,7 +1934,32 @@ class HoldingInterruptTests(SignalCase):
 # Modules whose every state-file read goes through harness.state_files, each with the raw filesystem
 # calls its functions may still make, as (function, call) pairs (design 4, 3.7). The task that migrates
 # a module's last read and deletes the old reading helpers it defines adds it here; state_files.py never.
-MIGRATED = {"run_store.py": []}
+MIGRATED = {
+    "run_store.py": [], "worker_returns.py": [], "path_evidence.py": [], "input_projection.py": [],
+    "command_server.py": [
+        # Worktree identity and traversal, path checks before writes, lock creation and directory fsync.
+        ("_safe", "lstat"), ("create_manifest", "resolve"), ("create_manifest", "os.stat"),
+        ("create_manifest", "os.open"), ("_open_root", "open"), ("_openat", "os.open"),
+        ("_lstatat", "os.stat"), ("_chain_change", "os.stat"), ("_fsync_directory", "os.open"),
+    ],
+    "cleanup.py": [
+        ("_canonical", "is_symlink"), ("_canonical", "resolve"), ("common_dir", "resolve"),
+        ("_root_missing", "os.lstat"), ("_check_missing_binding", "resolve"),
+        ("clean_checkout", "exists"), ("clean_checkout", "exists"), ("clean_checkout", "exists"),
+        ("clean_checkout", "is_symlink"),
+        ("_clean_worktree", "exists"), ("_clean_worktree", "exists"), ("_clean_worktree", "exists"),
+        ("_clean_worktree", "exists"), ("_clean_worktree", "exists"), ("_clean_worktree", "is_symlink"),
+    ],
+    "workspace_inputs.py": [
+        ("_parent", "os.open"), ("_directories", "os.open"), ("_identity", "os.open"), ("_identity", "stat"),
+        ("_read", "lstat"), ("_read", "read_bytes"), ("validate_inputs", "exists"),
+        ("prepare_locked", "open"), ("prepare_locked", "exists"), ("prepare_locked", "exists"),
+        ("prepare_locked", "exists"), ("prepare_locked", "exists"),
+        ("prepare_locked", "lstat"), ("prepare_locked", "lstat"),
+        ("prepare_locked", "os.open"), ("prepare_locked", "os.open"),
+        ("cleanup_inputs", "exists"), ("cleanup_inputs", "exists"),
+    ],
+}
 
 METHODS = frozenset(("read_text", "read_bytes", "open", "exists", "is_file", "is_dir", "is_symlink", "stat", "lstat",
                      "iterdir", "glob", "rglob", "readlink", "resolve"))
@@ -1948,15 +1974,143 @@ HELPERS = frozenset(("util.read_json", "util.tail", "util.lock", "util.readonly_
                      "worker_returns._read_limited", "command_server._file_digest"))
 
 
+DEFINITIONS = (ast.FunctionDef, ast.AsyncFunctionDef)
+RESOLVE_DISPATCH_NAMES = frozenset(("resolve", "__getattr__", "__getattribute__", "__setattr__", "__delattr__"))
+
+
+def binds_name(node, names):
+    # Some binding targets are stored as strings rather than ast.Name nodes.
+    if isinstance(node, ast.Name):
+        return isinstance(node.ctx, (ast.Store, ast.Del)) and node.id in names
+    if isinstance(node, ast.alias):
+        return (node.asname or node.name.split(".")[0]) in names
+    if isinstance(node, (ast.Global, ast.Nonlocal)):
+        return any(name in names for name in node.names)
+    named_bindings = DEFINITIONS + (ast.ClassDef, ast.ExceptHandler, ast.MatchAs, ast.MatchStar)
+    if isinstance(node, named_bindings):
+        return node.name in names
+    return isinstance(node, ast.MatchMapping) and node.rest in names
+
+
+def class_body_nodes(node):
+    """Walk a class namespace, including control-flow branches and definition headers."""
+    yield node
+    for field, value in ast.iter_fields(node):
+        if field == "body" and isinstance(node, DEFINITIONS + (ast.ClassDef, ast.Lambda)):
+            continue
+        for child in value if isinstance(value, list) else (value,):
+            if isinstance(child, ast.AST):
+                yield from class_body_nodes(child)
+
+
+def plain_run_store(tree):
+    """Return the class when its resolve method has no conflicting visible dispatch."""
+    stores = [node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "RunStore"]
+    if len(stores) != 1:
+        return None
+    store, = stores
+    if store.bases or store.keywords or store.decorator_list:
+        return None
+
+    methods = [node for node in store.body
+               if isinstance(node, ast.FunctionDef) and node.name == "resolve" and not node.decorator_list]
+    if len(methods) != 1 or not instance_method(methods[0]):
+        return None
+    if any(binds_name(node, RESOLVE_DISPATCH_NAMES)
+           for statement in store.body for node in class_body_nodes(statement) if node is not methods[0]):
+        return None
+
+    # An explicit attribute write can reach the class or an instance through an alias.
+    # The source check deliberately does not infer aliases to classes or interpret reflection.
+    for node in ast.walk(tree):
+        if node is not store and binds_name(node, {"RunStore"}):
+            return None
+        if (isinstance(node, ast.Attribute) and node.attr in RESOLVE_DISPATCH_NAMES
+                and isinstance(node.ctx, (ast.Store, ast.Del))):
+            return None
+        if isinstance(node, ast.ClassDef) and any(
+                isinstance(part, ast.Name) and part.id == "RunStore"
+                for base in node.bases for part in ast.walk(base)):
+            return None
+    return store
+
+
+def instance_method(node):
+    if not isinstance(node, DEFINITIONS) or node.decorator_list:
+        return False
+    parameters = node.args.posonlyargs + node.args.args
+    return bool(parameters) and parameters[0].arg == "self"
+
+
+def store_resolution_calls(source, tree):
+    """Find direct calls on RunStore's own instance in the run_store module."""
+    calls = set()
+
+    class MethodBody(ast.NodeVisitor):
+        def visit_Call(self, node):
+            target = node.func
+            if (isinstance(target, ast.Attribute) and target.attr == "resolve"
+                    and isinstance(target.value, ast.Name) and target.value.id == "self"
+                    and not node.args and not node.keywords):
+                calls.add(node)
+            self.generic_visit(node)
+
+        def skip_scope(self, node):
+            pass
+
+        visit_FunctionDef = visit_AsyncFunctionDef = visit_ClassDef = visit_Lambda = skip_scope
+        visit_ListComp = visit_SetComp = visit_DictComp = visit_GeneratorExp = visit_TypeAlias = skip_scope
+
+    store = plain_run_store(tree)
+    if store is None:
+        return calls
+
+    def scope_for(parent, node):
+        scope = next(child for child in parent.get_children()
+                     if (child.get_name(), child.get_lineno()) == (node.name, node.lineno))
+        # Generic classes and methods have an enclosing type parameter scope on Python 3.12+.
+        if getattr(node, "type_params", ()):
+            scope = next(child for child in scope.get_children() if child.get_name() == node.name)
+        return scope
+
+    def rebinds_nonlocal_receiver(scope):
+        if "self" in scope.get_identifiers():
+            receiver = scope.lookup("self")
+            if receiver.is_nonlocal() and (receiver.is_assigned() or receiver.is_imported()):
+                return True
+            if receiver.is_local() and scope.get_type() == "function":
+                return False
+        return any(rebinds_nonlocal_receiver(child) for child in scope.get_children())
+
+    module_scope = symtable.symtable(source, "run_store.py", "exec")
+    visitor = MethodBody()
+    class_scope = scope_for(module_scope, store)
+    for node in store.body:
+        if not instance_method(node):
+            continue
+        # The symbol table tracks rebindings including imports, match captures and
+        # assignment expressions. Closures can also write to the receiver via nonlocal.
+        method_scope = scope_for(class_scope, node)
+        receiver = method_scope.lookup("self")
+        if (receiver.is_assigned() or receiver.is_imported()
+                or any(rebinds_nonlocal_receiver(child) for child in method_scope.get_children())):
+            continue
+        for statement in node.body:
+            visitor.visit(statement)
+    return calls
+
+
 def raw_calls(source, module):
     """Counter of (function, call) for each raw filesystem call and old reading helper in one module's source.
 
     Imports are followed to the names they bind (``from .util import lock as held`` makes ``held()``
     ``util.lock``, ``import harness.util as util`` makes ``util.tail()`` ``util.tail``); an unbound bare
     name is the module's own. A method is matched by its name alone, except that an ``open`` passing
-    ``into=`` is the primitive's hand-over (``held.open(..., into=owner)``), not a raw open.
+    ``into=`` is the primitive's hand-over (``held.open(..., into=owner)``), not a raw open. A call to
+    RunStore's own commit reconciliation method is also excluded.
     """
     tree = ast.parse(source)
+    store_calls = store_resolution_calls(source, tree) if module == "run_store" else set()
     bound = {}
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -1983,7 +2137,7 @@ def raw_calls(source, module):
         return name.removeprefix("harness.")
 
     def method(call):
-        if not isinstance(call.func, ast.Attribute) or call.func.attr not in METHODS:
+        if call in store_calls or not isinstance(call.func, ast.Attribute) or call.func.attr not in METHODS:
             return None
         if call.func.attr == "open" and any(keyword.arg == "into" for keyword in call.keywords):
             return None
@@ -2067,6 +2221,157 @@ class MigratedModuleGuard(unittest.TestCase):
     def test_migrated_modules_make_exactly_their_listed_raw_calls(self):
         self.assertNotIn("state_files.py", MIGRATED)
         self.assertEqual(guard(ROOT / "harness", MIGRATED), {})
+        source = (ROOT / "harness" / "run_store.py").read_text(encoding="utf-8")
+        self.assertIsNotNone(plain_run_store(ast.parse(source)))
+        self.assertEqual(raw_calls(source, "other_module"), {("keep_terminal", "resolve"): 1})
+
+    def test_only_direct_run_store_instance_calls_are_excluded(self):
+        source = """
+from pathlib import Path
+
+class RunStore:
+    def resolve(self, strict=False):
+        pass
+
+    def keep_terminal(self, path):
+        self.resolve()
+        self.path.resolve()
+        Path(path).resolve()
+        self.resolve(strict=True)
+        self.resolve(True)
+
+    def outer(self):
+        def inner():
+            self.resolve()
+        lambda: self.resolve()
+        [self.resolve() for item in ()]
+        class Nested:
+            def call(self):
+                self.resolve()
+
+    def rebound(self, path):
+        self = path
+        self.resolve()
+
+    def rebound_by_import(self):
+        from .paths import root as self
+        self.resolve()
+
+    def rebound_in_inner(self, path):
+        def rebind():
+            nonlocal self
+            self = path
+        rebind()
+        self.resolve()
+
+    def shadowed_in_inner(self, path):
+        def inner():
+            self = path
+            def rebind():
+                nonlocal self
+                self = self.parent
+            rebind()
+            self.resolve()
+        self.resolve()
+
+    def different_receiver(receiver, self):
+        self.resolve()
+
+    @staticmethod
+    def static(self):
+        self.resolve()
+
+class Other:
+    def resolve(self):
+        pass
+
+    def ordinary(self):
+        self.resolve()
+"""
+        expected = collections.Counter({
+            ("keep_terminal", "resolve"): 4,
+            ("outer", "resolve"): 2,
+            ("inner", "resolve"): 2,
+            ("call", "resolve"): 1,
+            ("rebound", "resolve"): 1,
+            ("rebound_by_import", "resolve"): 1,
+            ("rebound_in_inner", "resolve"): 1,
+            ("different_receiver", "resolve"): 1,
+            ("static", "resolve"): 1,
+            ("ordinary", "resolve"): 1,
+        })
+        self.assertEqual(raw_calls(source, "run_store"), expected)
+        expected.update([("keep_terminal", "resolve"), ("shadowed_in_inner", "resolve")])
+        self.assertEqual(raw_calls(source, "another_module"), expected)
+
+    def test_run_store_requires_a_top_level_class_and_its_own_resolve_definition(self):
+        source = """
+class Resolver:
+    def resolve(self):
+        pass
+
+class RunStore(Resolver):
+    def inherited(self):
+        self.resolve()
+
+class Outer:
+    class RunStore:
+        def resolve(self):
+            pass
+
+        def nested(self):
+            self.resolve()
+"""
+        self.assertEqual(raw_calls(source, "run_store"), {("inherited", "resolve"): 1, ("nested", "resolve"): 1})
+
+    def test_class_and_instance_replacements_restore_the_path_call_count(self):
+        original = """
+from pathlib import Path
+
+class RunStore:
+    def resolve(self):
+        pass
+
+    def keep_terminal(self):
+        self.resolve()
+"""
+        self.assertEqual(raw_calls(original, "run_store"), {})
+        replacements = (
+            "    resolve = Path('.').resolve\n",
+            "    def __init__(self):\n        self.resolve = Path('.').resolve\n",
+        )
+        for replacement in replacements:
+            with self.subTest(replacement=replacement):
+                source = original + replacement
+                self.assertIsNone(plain_run_store(ast.parse(source)))
+                self.assertEqual(raw_calls(source, "run_store"), {("keep_terminal", "resolve"): 1})
+
+    def test_visible_dispatch_changes_keep_only_actual_calls_in_the_count(self):
+        original = """
+class RunStore:
+    def resolve(self):
+        pass
+
+    def keep_terminal(self):
+        self.resolve()
+"""
+        changes = (
+            "    if configured:\n        from paths import resolve\n",
+            "    if configured:\n        del resolve\n",
+            "    if configured:\n        def resolve(self):\n            pass\n",
+            "    match options:\n        case {'resolve': resolve}:\n            pass\n",
+            "    def __getattribute__(self, name):\n        return lookup(name)\n",
+            "RunStore.resolve = alternate.resolve\n",
+            "del RunStore.resolve\n",
+            "class Child(RunStore):\n    resolve = alternate.resolve\n",
+            "class RunStore:\n    pass\n",
+            "from paths import Store as RunStore\n",
+        )
+        for change in changes:
+            with self.subTest(change=change):
+                source = original + change
+                self.assertIsNone(plain_run_store(ast.parse(source)))
+                self.assertEqual(raw_calls(source, "run_store"), {("keep_terminal", "resolve"): 1})
 
     def test_the_guard_fails_on_a_weak_read_and_on_a_stale_entry(self):
         directory = Path(tempfile.mkdtemp())

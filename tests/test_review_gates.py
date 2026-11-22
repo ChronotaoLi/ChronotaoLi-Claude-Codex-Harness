@@ -342,13 +342,13 @@ class FinalCompletionGateTests(RepoCase):
             if Path(path).name == "final.json" and value.get("phase") == "finished":
                 written.append(Path(path).read_bytes())
 
-        def saving():
+        def saving(**kwargs):
             if dead["fired"]:
                 return None
             if written:
                 dead["fired"] = True
                 raise KeyboardInterrupt()   # the process dies between the record file and the ledger
-            return original_save()
+            return original_save(**kwargs)
         with patch.object(finalization, "write_json", side_effect=writing), \
                 patch.object(engine.context, "save", side_effect=saving), self.assertRaises(KeyboardInterrupt):
             engine.start("Implement greet", plan())
@@ -367,9 +367,10 @@ class FinalCompletionGateTests(RepoCase):
             if Path(path) == artifact:
                 steps.append(("record", artifact.read_bytes()))
 
-        def counting():
-            save()
+        def counting(**kwargs):
+            revision = save(**kwargs)
             steps.append(("save", state(engine)))
+            return revision
 
         def checkpointing():
             checkpoint()

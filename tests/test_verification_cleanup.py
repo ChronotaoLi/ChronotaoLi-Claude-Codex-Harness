@@ -1,7 +1,9 @@
 import contextlib
+from copy import deepcopy
 import errno
 import io
 import json
+import os
 from pathlib import Path
 import shutil
 import sys
@@ -11,11 +13,17 @@ from unittest.mock import patch
 from harness import git, state_files, stops
 from harness.cleanup import cleanup_run
 from harness.cli import main
-from harness.state_files import StateReadError
-from harness.util import HarnessError, lock, read_json, write_json
+from harness.path_evidence import project_paths
+from harness.run_store import RunStore
+from harness.state_files import LockedDirectory, StateReadError
+from harness.util import HarnessError, read_json, write_json, run_process
 from harness.versions import RUN_SCHEMA_VERSION
-from test_harness import RepoCase, ROOT
-from test_state_files import FakeOs
+from harness.worker_returns import inspect_return
+from test_harness import RepoCase, ROOT, add_worker_dispatch, cli_notice, run_cli, write_project_config
+from test_readonly_cleanup import nonregular, tree_bytes
+from test_run_store import swap
+from test_state_files import FakeOs, held_lock
+from test_stop_exits import final_failure_scenario
 
 
 class VerificationCleanupTests(RepoCase):
@@ -60,21 +68,325 @@ class VerificationCleanupTests(RepoCase):
         self.roots.append(root)
         checkout = root / ".harness" / "checkout"
         git.git(self.repo, "worktree", "add", "--detach", str(checkout), self.environment["head"])
-        final = self.run["final_history"][-1]
-        index = len(final["verification_rounds"]) + 1
-        # A later round of the same attempt records its own run, attempt and round.
+        history = self.run["final_history"]
+        attempt = len(history) + 1
+        # A later attempt has a retained round whose verdict was never published.
         environment = {**self.environment, "worktree": str(checkout),
-                       "owner": {**self.environment["owner"], "round": index},
+                       "owner": {"run_id": self.run["id"], "attempt": attempt, "round": 1},
                        "binding": git.capture_worktree_binding(checkout, None)}
-        folder = self.artifact.parent.parent / f"verification-{index}"
+        attempt_dir = self.directory / "verification" / "final" / str(attempt)
+        folder = attempt_dir / "verification-1"
         artifact = folder / "checkout.json"
         write_json(artifact, environment)
-        final["verification_rounds"].append({"artifact_dir": str(folder), "status": "completed"})
+        history.append({"attempt": attempt, "head": environment["head"],
+                        "snapshot_digest": self.environment["snapshot_digest"],
+                        "snapshot_artifact": str(attempt_dir / "snapshot.json"),
+                        "artifact": str(attempt_dir / "final.json"), "accepted_tasks": sorted(self.run["accepted"]),
+                        "status": "running", "phase": "verifying", "approved_batches": [],
+                        "verification_rounds": [{"artifact_dir": str(folder), "status": "running"}]})
         write_json(self.directory / "state.json", self.run)
         return checkout, artifact
 
     def statuses(self, result):
         return [item["status"] for item in result["checkouts"]], result["worktree"]["status"]
+
+    def cleanup_cli(self, *options, run_id=None):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = main(["--repo", str(self.repo), "cleanup-run", run_id or self.run["id"], *options])
+        return code, stdout.getvalue(), stderr.getvalue()
+
+    def test_preview_rejects_special_files_across_cleanup_gates_without_writing(self):
+        worker = next(entry for entry in self.run["dispatches"] if entry["role"] == "worker")
+        packet = Path(worker["worker_receipt"]["packet_artifact"])
+        job = self.directory / "dispatches" / "ended"
+        dispatch = add_worker_dispatch(self.run, self.directory, job.name, worker["task_id"],
+                                       exit_confirmed=True, worker_receipt_consumed="provider_failure")
+        original = job / "process.stdout"
+        original.write_bytes(b"")
+        dispatch["worker_return_evidence"] = inspect_return(job)
+        ref, = project_paths({"changed_files": ["path" * 1100]}, self.directory)["path_evidence_indexes"].values()
+        dispatch["path_evidence"] = [ref]
+        commands = job / "commands"
+        dispatch["command_directory"] = str(commands)
+        journal = commands / ("a" * 32) / "process.json"
+        write_json(journal, {"id": f"ended:command:{journal.parent.name}", "command_id": "test",
+                             "pgid": None, "process_state": "exited", "exit_confirmed": True})
+        write_json(self.directory / "state.json", self.run)
+        self.assertEqual(self.statuses(self.cleanup()), (["eligible"], "eligible"))
+
+        files = {
+            journal: ("process_unconfirmed", "command_exit"),
+            self.directory / "run.lock": ("evidence", "runtime_integrity"),
+            self.artifact: ("resource", "checkouts"),
+            self.artifact.with_name("cleanup.json"): ("resource", "checkouts"),
+            self.directory / "worktree-cleanup.json": ("resource", "worktree"),
+            packet: ("evidence", "runtime_integrity"),
+            original: ("evidence", "runtime_integrity"),
+            Path(ref["artifact"]): ("evidence", "runtime_integrity"),
+        }
+        for path, expected in files.items():
+            for form in ("fifo", "symlink"):
+                with self.subTest(path=path.name, form=form), nonregular(self, path, form):
+                    before = tree_bytes(self.engine_instance.context.state)
+                    code, output, error = self.cleanup_cli()
+                    self.assertEqual(code, 1, output + error)
+                    if expected[0] == "resource" and output:
+                        item = json.loads(output)[expected[1]]
+                        if isinstance(item, list):
+                            item, = item
+                        self.assertEqual(item["status"], "blocked")
+                    else:
+                        stop = cli_notice(error)
+                        self.assertIsNotNone(stop, error)
+                        self.assertEqual((stop["kind"], stop["reason"]),
+                                         ("evidence", "runtime_integrity") if expected[0] == "resource" else expected)
+                    self.assertEqual(tree_bytes(self.engine_instance.context.state), before)
+                    self.assertTrue(self.checkout.is_dir())
+
+    def test_damaged_final_records_block_preview_and_removal_before_any_resource_changes(self):
+        variants = {
+            "missing_head": lambda record: record.pop("head"),
+            "empty_head": lambda record: record.update(head=""),
+            "bad_head": lambda record: record.update(head=None),
+            "unapproved_head": lambda record: record.update(head=self.run["base_commit"]),
+            "attempt_type": lambda record: record.update(attempt="1"),
+            "attempt_identity": lambda record: record.update(attempt=2),
+            "attempt_artifact": lambda record: record.update(artifact=str(self.artifact)),
+            "empty_rounds": lambda record: record.update(verification_rounds=[]),
+            "round_element": lambda record: record.update(verification_rounds=[None]),
+            "round_status": lambda record: record["verification_rounds"][0].update(status=[]),
+            "uncompleted_round": lambda record: record["verification_rounds"][0].update(status="running"),
+            "missing_round_digest": lambda record: record["verification_rounds"][0].pop("checkout_digest"),
+            "round_digest": lambda record: record["verification_rounds"][0].update(checkout_digest=None),
+            "invalid_round_digest": lambda record: record["verification_rounds"][0].update(checkout_digest="not a digest"),
+            "verdict_for_another_round": lambda record: record.update(
+                verification=str(self.artifact.parent.parent / "verification-2" / "results.json")),
+        }
+        for label, damage in variants.items():
+            with self.subTest(label=label):
+                run = deepcopy(self.run)
+                damage(run["final_history"][0])
+                write_json(self.directory / "state.json", run)
+                self.assert_corrupt_ledger_rejected(self.engine_instance, self.checkout)
+        write_json(self.directory / "state.json", {**self.run, "final_history": []})
+        self.assert_corrupt_ledger_rejected(self.engine_instance, self.checkout)
+        self.add_unknown_dispatch("needs-confirmation")
+        variants["missing_round_digest"](self.run["final_history"][0])
+        write_json(self.directory / "state.json", self.run)
+        self.assert_corrupt_ledger_rejected(self.engine_instance, self.checkout,
+                                           options=(("--remove", "--confirm-exited", "needs-confirmation"),))
+
+    def assert_corrupt_ledger_rejected(self, engine, checkout, *, options=((), ("--remove",))):
+        before = tree_bytes(engine.context.state)
+        checkout_before = tree_bytes(checkout)
+        registered = git.git(self.repo, "worktree", "list", "--porcelain")
+        for args in options:
+            with self.subTest(options=args):
+                code, output, error = self.cleanup_cli(*args, run_id=engine.run["id"])
+                self.assertEqual((code, output), (1, ""), error)
+                stop = cli_notice(error)
+                self.assertIsNotNone(stop, error)
+                self.assertEqual((stop["kind"], stop["reason"]), ("evidence", "runtime_integrity"))
+                self.assertIn("整体", error)
+                self.assertEqual(tree_bytes(engine.context.state), before)
+                self.assertTrue(checkout.is_dir() and engine.worktree.is_dir())
+                self.assertEqual(tree_bytes(checkout), checkout_before)
+                self.assertEqual(git.git(self.repo, "worktree", "list", "--porcelain"), registered)
+
+    def test_malformed_verification_checks_refuse_cleanup_of_a_failed_attempt(self):
+        self.config.data["verification"]["commands"].append(
+            {"cwd": ".", "argv": [sys.executable, "-c", "pass"]})
+        _, engine, _ = final_failure_scenario(self)
+        artifact, = engine.directory.glob("verification/final/*/verification-*/checkout.json")
+        checkout = Path(read_json(artifact)["worktree"])
+        self.roots.append(checkout.parents[1])
+        state = engine.directory / "state.json"
+        original = read_json(state)
+        final, = original["final_history"]
+        check, passing = final["verification_failures"]
+        self.assertEqual((final["status"], check["exit_code"]), ("verification_failed", 1))
+        self.assertEqual(passing["status"], "passed")
+        code, output, error = self.cleanup_cli(run_id=original["id"])
+        self.assertEqual(code, 0, error)
+        self.assertEqual(self.statuses(json.loads(output)), (["eligible"], "retained"))
+        for label, checks in {
+            "exit_code_type": [{**check, "exit_code": []}],
+            "empty_object": [{}],
+            "null": [None],
+            "process_outcome_type": [{**check, "process_outcome": None}],
+            "empty_list": [],
+            "empty_termination_reason": [{**check, "termination_reason": ""}],
+            "only_passing": [passing],
+            "only_failed": [check],
+            "reordered": [passing, check],
+            "failed_zero_exit": [{**check, "exit_code": 0}],
+            "inconsistent_timeout": [{**check, "timed_out": True}],
+        }.items():
+            with self.subTest(label=label):
+                damaged = deepcopy(original)
+                damaged["final_history"][0]["verification_failures"] = checks
+                write_json(state, damaged)
+                self.assert_corrupt_ledger_rejected(engine, checkout)
+        damaged = deepcopy(original)
+        damaged["final_history"][0]["failure_kind"] = "timeout"
+        write_json(state, damaged)
+        self.assert_corrupt_ledger_rejected(engine, checkout)
+        write_json(state, original)
+        # Editing today's project file does not change the historical command set.
+        write_project_config(self.repo, commands=[])
+        code, output, error = self.cleanup_cli("--remove", run_id=original["id"])
+        self.assertEqual(code, 0, error)
+        self.assertEqual(self.statuses(json.loads(output)), (["removed"], "retained"))
+        self.assertFalse(checkout.exists())
+
+    def run_failed_check(self, expected_reason, **patches):
+        engine = self.engine()
+        with patch("harness.verification.run_process", wraps=run_process, **patches), self.assertRaises(HarnessError):
+            engine.start("Implement greet", read_json(ROOT / "examples/plan.json"))
+        state = engine.directory / "state.json"
+        original = read_json(state)
+        artifact, = engine.directory.glob("verification/final/*/verification-*/checkout.json")
+        checkout = Path(read_json(artifact)["worktree"])
+        self.roots.append(checkout.parents[1])
+        final, = original["final_history"]
+        check, = final["verification_failures"]
+        self.assertEqual(check["termination_reason"], expected_reason)
+        return engine, checkout, state, original
+
+    def test_timeout_exit_and_result_dispatch_must_agree(self):
+        self.config.data["runtime"]["verify_timeout_seconds"] = 0.5
+        self.config.data["verification"]["commands"] = [{"cwd": ".", "argv": [sys.executable, "-c",
+            "from pathlib import Path; import time; time.sleep(5) if Path.cwd().name == 'checkout' else None"]}]
+        engine, checkout, state, original = self.run_failed_check("timeout")
+        final, = original["final_history"]
+        check, = final["verification_failures"]
+        self.assertIs(type(check["exit_code"]), int)
+        self.assertTrue(check["exit_confirmed"] and check["evidence_complete"])
+        damaged = deepcopy(original)
+        damaged["final_history"][0]["verification_failures"][0]["exit_code"] = None
+        write_json(state, damaged)
+        self.assert_corrupt_ledger_rejected(engine, checkout)
+        write_json(state, original)
+
+        artifact = Path(final["verification"])
+        results = read_json(artifact)
+        damaged = deepcopy(results)
+        damaged[0]["timing_source"]["dispatch_id"] = "not-this-check"
+        write_json(artifact, damaged)
+        self.assert_corrupt_ledger_rejected(engine, checkout)
+        write_json(artifact, [])
+        self.assert_corrupt_ledger_rejected(engine, checkout)
+        write_json(artifact, results)
+        code, output, error = self.cleanup_cli("--remove", run_id=original["id"])
+        self.assertEqual(code, 0, error)
+        self.assertEqual(self.statuses(json.loads(output)), (["removed"], "retained"))
+
+    def test_completed_start_failure_can_be_cleaned_up(self):
+        def missing_directory(argv, cwd, log, **kwargs):
+            if cwd.name == "checkout":
+                kwargs["relative_cwd"] = "absent-directory"
+            return run_process(argv, cwd, log, **kwargs)
+
+        _, checkout, _, original = self.run_failed_check("start_failed", side_effect=missing_directory)
+        check, = original["final_history"][0]["verification_failures"]
+        self.assertIsNone(check["exit_code"])
+        self.assertTrue(check["exit_confirmed"] and check["evidence_complete"])
+        code, output, error = self.cleanup_cli("--remove", run_id=original["id"])
+        self.assertEqual(code, 0, error)
+        self.assertEqual(self.statuses(json.loads(output)), (["removed"], "retained"))
+        self.assertFalse(checkout.exists())
+
+    def test_abandon_accepts_optional_fields_missing_from_old_failure_records(self):
+        backend, engine, _ = final_failure_scenario(self)
+        state = engine.directory / "state.json"
+        original = read_json(state)
+        artifact, = engine.directory.glob("verification/final/*/verification-*/checkout.json")
+        self.roots.append(Path(read_json(artifact)["worktree"]).parents[1])
+        for field in ("stdout", "stderr", "log"):
+            with self.subTest(field=field):
+                legacy = deepcopy(original)
+                del legacy["final_history"][0]["verification_failures"][0][field]
+                write_json(state, legacy)
+                code, error = run_cli(self, backend, ["abandon", original["id"]])
+                self.assertEqual(code, 0, error)
+                self.assertEqual(read_json(state)["status"], "abandoned")
+                code, output, error = self.cleanup_cli(run_id=original["id"])
+                self.assertEqual(code, 0, error)
+                self.assertEqual(self.statuses(json.loads(output)), (["eligible"], "eligible"))
+
+    def test_confirmation_refuses_replaced_directory_before_attach_or_audit(self):
+        selected = self.add_unknown_dispatch()
+        attach = RunStore.attach
+        for boundary in ("attach", "audit"):
+            with self.subTest(boundary=boundary):
+                moved = self.outside / boundary
+                snapshots = []
+
+                def replace_directory():
+                    swap(self.directory, moved)
+                    (self.directory / "store.lock").unlink()
+                    snapshots.append(tree_bytes(self.directory))
+
+                def replace_at_attach(store, run):
+                    replace_directory()
+                    return attach(store, run)
+
+                selected["pgid"] = 2_000_000_000
+                write_json(self.directory / "state.json", self.run)
+                before = tree_bytes(self.directory)
+                hook = (patch.object(RunStore, "attach", replace_at_attach) if boundary == "attach" else
+                        patch("harness.cleanup.group_alive", side_effect=lambda pgid: replace_directory()))
+                try:
+                    with hook:
+                        code, output, error = self.cleanup_cli("--remove", "--confirm-exited", selected["id"])
+                    self.assertEqual((code, output), (1, ""), error)
+                    stop = cli_notice(error)
+                    self.assertEqual((stop["kind"], stop["reason"]), ("runtime_failure", "invariant"))
+                    self.assertEqual(len(snapshots), 1)
+                    self.assertEqual(tree_bytes(self.directory), snapshots[0])
+                    self.assertEqual(tree_bytes(moved), before)
+                    self.assertTrue(self.checkout.is_dir() and self.engine_instance.worktree.is_dir())
+                finally:
+                    if moved.exists():
+                        shutil.rmtree(self.directory)
+                        moved.rename(self.directory)
+
+    def test_cleanup_validates_the_ledger_in_the_locked_directory(self):
+        damaged = deepcopy(self.run)
+        damaged["final_history"][0].pop("head")
+        state = self.directory / "state.json"
+        write_json(state, damaged)
+        before = tree_bytes(self.directory)
+        entered = LockedDirectory.__enter__
+        for options in ((), ("--remove",)):
+            with self.subTest(options=options):
+                moved = self.outside / "moved"
+                snapshots = []
+
+                def replace_after_lock(lock):
+                    locked = entered(lock)
+                    if locked.outcome.path == str(self.directory / "run.lock"):
+                        swap(self.directory, moved)
+                        write_json(state, self.run)
+                        snapshots.append(tree_bytes(self.directory))
+                    return locked
+
+                try:
+                    with patch.object(LockedDirectory, "__enter__", replace_after_lock):
+                        code, output, error = self.cleanup_cli(*options)
+                    self.assertEqual((code, output), (1, ""), error)
+                    self.assertIn("final_history[0].head", error)
+                    stop = cli_notice(error)
+                    self.assertEqual((stop["kind"], stop["reason"]), ("evidence", "runtime_integrity"))
+                    self.assertEqual(len(snapshots), 1)
+                    self.assertEqual(tree_bytes(self.directory), snapshots[0])
+                    self.assertEqual(tree_bytes(moved), before)
+                    self.assertTrue(self.checkout.is_dir() and self.engine_instance.worktree.is_dir())
+                finally:
+                    if moved.exists():
+                        shutil.rmtree(self.directory)
+                        moved.rename(self.directory)
 
     def test_one_removal_clears_checkout_and_worktree_and_keeps_branch_and_evidence(self):
         worktree = self.engine_instance.worktree
@@ -234,7 +546,7 @@ class VerificationCleanupTests(RepoCase):
                     git.git(self.checkout, "update-index", "--no-" + variant, "hello.py")
 
     def test_run_lock_and_live_or_unknown_process_refuse_all_removal(self):
-        with lock(self.directory / "run.lock"), self.assertRaisesRegex(HarnessError, "运行锁"):
+        with held_lock(self.directory / "run.lock"), self.assertRaisesRegex(HarnessError, "运行锁"):
             self.cleanup(remove=True)
         self.run["dispatches"].append({"id": "old", "role": "verification", "pgid": 12345,
                                        "status": "running", "exit_confirmed": False})
@@ -274,7 +586,7 @@ class VerificationCleanupTests(RepoCase):
         shutil.rmtree(self.checkout)
         shutil.rmtree(other)
         # The unreferenced stale checkout must never be touched by a broad prune.
-        self.run["final_history"][-1]["verification_rounds"].pop()
+        self.run["final_history"].pop()
         write_json(self.directory / "state.json", self.run)
         other_artifact.unlink()
         self.assertEqual(self.cleanup()["checkouts"][0]["status"], "stale_registration")
@@ -344,6 +656,39 @@ class VerificationCleanupTests(RepoCase):
         self.assertFalse(self.artifact.with_name("cleanup.json").exists())
         self.assertFalse(self.engine_instance.worktree.exists())
 
+    def test_checkout_probe_io_failure_blocks_only_that_checkout(self):
+        other, _ = self.additional_checkout()
+        ledger = (self.directory / "state.json").read_bytes()
+        checkout_before = tree_bytes(self.checkout)
+
+        def fail_first_checkout_probe(stat, name, *args, **kwargs):
+            if name == "checkout.json" and not injected:
+                injected.append(name)
+                raise OSError(errno.EIO, "checkout probe")
+            return stat(name, *args, **kwargs)
+
+        for options, expected in (((), "eligible"), (("--remove",), "removed")):
+            with self.subTest(options=options):
+                injected = []
+                with patch.object(state_files, "os", FakeOs(stat=fail_first_checkout_probe)):
+                    code, output, error = self.cleanup_cli(*options)
+                self.assertEqual((code, error), (1, ""), output)
+                self.assertEqual(injected, ["checkout.json"])
+                result = json.loads(output)
+                self.assertEqual(self.statuses(result), (["blocked", expected], expected))
+                blocked = result["checkouts"][0]
+                self.assertEqual(blocked["artifact"], str(self.artifact))
+                self.assertIn("读取失败", blocked["error"])
+                self.assertIn(os.strerror(errno.EIO), blocked["error"])
+                self.assertEqual(tree_bytes(self.checkout), checkout_before)
+                self.assertFalse(self.artifact.with_name("cleanup.json").exists())
+                self.assertEqual((self.directory / "state.json").read_bytes(), ledger)
+                registered = git.git(self.repo, "worktree", "list", "--porcelain")
+                self.assertIn(str(self.checkout), registered)
+                for checkout in (other, self.engine_instance.worktree):
+                    self.assertEqual(checkout.is_dir(), not options)
+                    self.assertEqual(str(checkout) in registered, not options)
+
     def add_unknown_dispatch(self, ident="unknown"):
         entry = {"id": ident, "role": "verification", "status": "running",
                  "pgid": None, "exit_confirmed": False}
@@ -379,7 +724,7 @@ class VerificationCleanupTests(RepoCase):
         entry = self.add_unknown_dispatch()
         state = (self.directory / "state.json").read_bytes()
         events = (self.directory / "events.jsonl").read_bytes()
-        with lock(self.directory / "run.lock"), self.assertRaisesRegex(HarnessError, "运行锁"):
+        with held_lock(self.directory / "run.lock"), self.assertRaisesRegex(HarnessError, "运行锁"):
             cleanup_run(self.repo, self.run["id"], confirm_exited=[entry["id"]])
         with patch("harness.cleanup.group_alive") as observe, self.assertRaisesRegex(HarnessError, "unknown-id"):
             cleanup_run(self.repo, self.run["id"], confirm_exited=[entry["id"], "unknown-id"])

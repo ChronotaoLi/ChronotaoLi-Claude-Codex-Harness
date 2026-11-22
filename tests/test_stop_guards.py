@@ -9,7 +9,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from harness import stops
+from harness import state_files, stops
 from harness.adapters import DemoBackend
 from harness.dispatch import invocation_stop, process_stop
 from harness.process_runtime import ProcessOutcome, failure
@@ -51,8 +51,8 @@ class RegistryGuard(unittest.TestCase):
                     "unclassified": 1, "interrupted": 130, "plan_approval": 0, "invalid_input": 2,
                     "config_mismatch": 2, "unsupported_ledger": 2}
         # 53 from step 4, four provider types from step 5, six scope boundary types from step 6,
-        # one transport failure type, one configuration file type
-        self.assertEqual(len(stops.REGISTRY), 65)
+        # one transport failure type, one configuration file type, one special file type
+        self.assertEqual(len(stops.REGISTRY), 66)
         for (kind, reason), entry in stops.REGISTRY.items():
             with self.subTest(row=(kind, reason)):
                 self.assertEqual(entry["exit_code"], expected.get(kind, 3))
@@ -66,8 +66,8 @@ class RegistryGuard(unittest.TestCase):
 
 
 # ---- G6: no runtime code reads the ledger's stop ------------------------------------------
-WRITERS = {("workflow.py", "stop"), ("scheduler.py", "execute"), ("cli.py", "status_summary")}
-DELETERS = {("scheduler.py", "execute"), ("run_lifecycle.py", "abandon_locked")}  # abandon's body under run.lock
+WRITERS = {("workflow.py", "stop"), ("scheduler.py", "_execute_until_terminal"), ("cli.py", "status_summary")}
+DELETERS = {("scheduler.py", "_execute_until_terminal"), ("run_lifecycle.py", "abandon_locked")}
 OUTPUT_KEYS = {("cli.py", "stop_notice"), ("operations.py", "create"), ("watch_cli.py", "watching")}
 READERS = {("observe.py", "_operation_summary"), ("watch_cli.py", "watching")}  # projections and records only
 
@@ -129,7 +129,7 @@ class StopLiteralGuard(unittest.TestCase):
             "itemgetter": "import operator\ndef f(run):\n    return operator.itemgetter('stop')(run)\n",
             "match": "def f(run):\n    match run:\n        case {'stop': s}:\n            return s\n",
             "alias": "def f(self):\n    c = self.context.run\n    return c.get('stop')\n",
-            "inside execute": "def execute(self):\n    if self.context.run.get('stop'):\n        return 1\n",
+            "inside writer": "def _execute_until_terminal(self):\n    if self.context.run.get('stop'):\n        return 1\n",
             "operate branches": "def operate(args):\n    if result.get('stop'):\n        return 3\n",
         }
         for name, text in samples.items():
@@ -334,15 +334,20 @@ class LoadFailureClasses(RepoCase):
         return stops.of(caught.exception)
 
     def test_worker_input_chain(self):
+        from test_state_files import FakeOs
+
         backend, engine = self.blocked_run()
         packet = worker_packet(engine.run)
-        real_open = os.open
+        parent = packet.parent.stat()
 
-        def denied(path, *args, **kwargs):
-            if str(path) == str(packet):
-                raise PermissionError(errno.EACCES, "Permission denied", str(path))
-            return real_open(path, *args, **kwargs)
-        with patch("harness.worker_receipts.os.open", denied):
+        def denied(real, name, *args, dir_fd=None, **kwargs):
+            if name == packet.name and dir_fd is not None:
+                directory = os.fstat(dir_fd)
+                if (directory.st_dev, directory.st_ino) == (parent.st_dev, parent.st_ino):
+                    raise PermissionError(errno.EACCES, "Permission denied", str(packet))
+            return real(name, *args, dir_fd=dir_fd, **kwargs)
+
+        with patch.object(state_files, "os", FakeOs(open=denied)):
             value = self.resume_error(backend, engine.run["id"])
         self.assertEqual((value["kind"], value["reason"]), ("runtime_failure", "io"))
         self.assertEqual(stops.project(value, "run_x")["exits"], [])
@@ -766,7 +771,7 @@ class PreflightRefusals(RepoCase):
 
     def test_every_preflight_refusal_leaves_the_run_unchanged(self):
         from harness import git
-        from harness.util import lock
+        from test_state_files import held_lock
         backend, engine = self.operator_run()
         path = engine.directory / "state.json"
         request = read_json(path)["decision_requests"][-1]
@@ -854,7 +859,7 @@ class PreflightRefusals(RepoCase):
                     if undo:
                         undo()
         path.write_bytes(original)
-        with self.subTest(refusal="run lock held"), lock(engine.directory / "run.lock"):
+        with self.subTest(refusal="run lock held"), held_lock(engine.directory / "run.lock"):
             self.check(backend, engine, [], ("busy", "run_lock"), 3)
         with self.subTest(refusal="invalid run ID"):
             self.check(backend, engine, [], ("invalid_input", "cli_arguments"), 2, run_id="run_bad-id")
@@ -929,7 +934,7 @@ class GuardCoverage(DecideCase):
         manifest = scratch(self).resolve() / "manifest.json"
         write_json(manifest, {"files": []})
         # A failure raised by library code inside the operation (innermost frame json), not by the test.
-        with patch.object(workspace_inputs, "_manifest", lambda run, value: json.loads("{not json")):
+        with patch.object(workspace_inputs, "manifest_shape", lambda ident, value: json.loads("{not json")):
             code, _ = run_cli(self, ScriptedBackend(), ["prepare-run", engine.run["id"], "--manifest", str(manifest)])
         self.assertEqual(code, 1)
         findings = self.stop_guard_findings["unclassified"]

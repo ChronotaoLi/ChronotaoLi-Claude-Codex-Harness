@@ -7,7 +7,8 @@ import unittest
 
 from harness import git
 from harness.config import Config
-from harness.util import HarnessError, read_json
+from harness.runtime import Runtime
+from harness.util import HarnessError, read_json, write_json
 from test_harness import RepoCase, ROOT, walk_exit
 from test_runtime_changes import ScriptedBackend
 
@@ -113,6 +114,36 @@ class FreshVerificationTests(RepoCase):
         self.assertEqual(setup_evidence[0]["exit_code"], 0)
         self.assertEqual(setup_evidence[0]["phase"], "setup")
         self.assertEqual(len(self.final_checks(result)), 2)
+
+    def assert_reclaims_checkout_using_state(self, state):
+        def worker_journal(backend, kwargs, packet, result):
+            if kwargs["role"] == "worker":
+                job = Path(kwargs["job"])
+                folder = job / "commands" / ("a" * 32)
+                folder.mkdir()
+                write_json(folder / "process.json", {"id": f"{job.name}:command:{folder.name}",
+                    "command_id": "fixture", "process_state": "exited", "pgid": None, "exit_confirmed": True})
+
+        engine = Runtime(self.config, self.repo, state=state, backend=ScriptedBackend(worker_journal))
+        self.engines.append(engine)
+        result = engine.start("Implement greet", self.plan())
+        self.assertEqual(result["status"], "completed")
+        [artifact] = self.checkout_artifacts(engine)
+        checkout = Path(read_json(artifact)["worktree"])
+        receipt = read_json(artifact.with_name("cleanup.json"))
+        self.assertEqual((receipt["status"], receipt["by"]), ("removed", "runtime"))
+        self.assertFalse(checkout.exists())
+        self.assertNotIn(str(checkout), git.git(self.repo, "worktree", "list", "--porcelain"))
+
+    def test_reclaims_verified_checkout_with_external_state(self):
+        self.assert_reclaims_checkout_using_state(self.outside.resolve() / "state")
+
+    def test_reclaims_verified_checkout_with_alternate_case_state_path(self):
+        repo = self.repo.resolve()
+        alias = repo.with_name(repo.name.upper())
+        if alias == repo or not alias.exists() or not alias.samefile(repo):
+            self.skipTest("requires a case-insensitive fixture volume")
+        self.assert_reclaims_checkout_using_state(alias / "custom-state")
 
     def test_setup_cannot_modify_tracked_checkout_files(self):
         self.config.data["verification"]["setup_commands"] = [{"cwd": ".", "argv": [sys.executable, "-c",

@@ -133,6 +133,13 @@ def validate_final_records(history):
                 fail(f"审阅不合审阅契约的核心结构（{error}）")
 
 
+def verification_failure_kind(checks):
+    failures = [check for check in checks if checks_failed(check)]
+    if not failures:
+        return None
+    return "timeout" if all(check.get("timed_out") for check in failures) else "exit_code"
+
+
 class FinalAcceptance(RuntimeService):
     def trigger(self, record):
         """The derived final-stage decision input; nothing persistent marks it."""
@@ -151,25 +158,20 @@ class FinalAcceptance(RuntimeService):
         rounds = record["verification_rounds"]
         if not rounds or rounds[-1].get("status") != "completed" or "checkout_digest" not in rounds[-1]:
             return
-        artifact = Path(rounds[-1]["artifact_dir"]) / "checkout.json"
-        receipt = artifact.with_name("cleanup.json")
-        try:
-            previous = read_json(receipt) if receipt.is_file() and not receipt.is_symlink() else None
-        except (OSError, ValueError):
-            previous = None
-        # Anything but a completed receipt goes to clean_checkout, which validates it
-        # and reports what is wrong with it as a reclamation failure.
-        if isinstance(previous, dict) and previous.get("status") == "removed":
-            return
+        artifact = cleanup.checkout_folder(self.context.directory, record, len(rounds)) / "checkout.json"
         self.context.store.check_current()
         self.context.ensure_exited()
         try:
             result = cleanup.clean_checkout(self.context.repo, self.context.run, self.context.directory, record,
-                                            len(rounds), cleanup.common_dir(self.context.repo), True, by="runtime")
+                                            len(rounds), cleanup.common_dir(self.context.repo), True,
+                                            state=self.context.state, by="runtime")
         except (HarnessError, OSError, ValueError) as error:
             self.context.observe("verification_checkout_reclaim_failed", attempt=record["attempt"],
-                                 artifact=str(artifact), recorded_worktree=cleanup.recorded_worktree(artifact),
+                                 artifact=str(artifact),
+                                 recorded_worktree=cleanup.recorded_worktree(artifact, state=self.context.state),
                                  error=str(error)[:2000])
+            return
+        if "removed_by" in result:
             return
         self.context.observe("verification_checkout_reclaimed", attempt=record["attempt"],
                              artifact=str(artifact), worktree=result["worktree"])
@@ -240,7 +242,7 @@ class FinalAcceptance(RuntimeService):
         else:
             if receipt is None:
                 return False
-            if "artifact_digest" not in receipt and not Path(receipt["artifact"]).exists():
+            if not receipts.returned(receipt):
                 receipts.discard_unreturned(key)
                 return True
             if receipt.get("snapshot_digest") != record["snapshot_digest"]:
@@ -381,7 +383,8 @@ class FinalAcceptance(RuntimeService):
             checks = self.services.verification.verify("final", attempt, whole_run=True, artifact_dir=verification_folder,
                                                        before=snapshot, round_index=len(rounds))
             # Read before any record change: the verdict save binds this round's checkout record.
-            checkout_digest = (cleanup.checkout_record_digest(verification_folder / "checkout.json")
+            checkout_digest = (cleanup.checkout_record_digest(self.context.directory, record, len(rounds),
+                                                              state=self.context.state)
                                if self.context.config.data["verification"]["fresh_checkout"] else None)
             evidence = folder / "change.diff"
             evidence.write_bytes(git.range_diff_bytes(self.context.worktree, self.context.run["base_commit"], binding=self.context.run["worktree_binding"]))
@@ -392,12 +395,11 @@ class FinalAcceptance(RuntimeService):
             if checkout_digest is not None:
                 completed["checkout_digest"] = checkout_digest
             updated.update(verification=str(verification_folder / "results.json"), diff_artifact=str(evidence))
-            failures = [check for check in checks if checks_failed(check)]
+            failure_kind = verification_failure_kind(checks)
             feedback = None
-            if failures:
+            if failure_kind is not None:
                 updated.update(status="verification_failed", phase="finished",
-                               failure_kind="timeout" if all(check.get("timed_out") for check in failures) else "exit_code",
-                               verification_failures=compact_checks(checks))
+                               failure_kind=failure_kind, verification_failures=compact_checks(checks))
                 if updated["failure_kind"] != "timeout":
                     feedback = {"final_review": feedback_view(updated)}
             else:

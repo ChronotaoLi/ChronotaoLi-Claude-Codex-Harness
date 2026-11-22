@@ -23,7 +23,7 @@ from . import observe
 from .process_runtime import defer_cleanup_signals
 from .watch import RunWatcher, WatchError
 from .dashboard_page import APP_CSS, APP_JS, INDEX_HTML
-from .util import HarnessError
+from .util import HarnessError, display_text, one_line
 
 HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
@@ -88,7 +88,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def log_message(self, format, *args):
         self.server.log.write("%s - - [%s] %s\n" % (self.address_string(), self.log_date_time_string(),
-                                                   format % args))
+                                                   one_line(format % args)))
 
     def send_error(self, code, message=None, explain=None):
         # Used by the base parser for malformed requests; never echo request text.
@@ -370,8 +370,8 @@ class DashboardServer(ThreadingHTTPServer):
 
     def handle_error(self, request, client_address):
         error = sys.exc_info()[1]
-        self.log.write(f"harness dashboard: request from {client_address[0]} failed: "
-                       f"{type(error).__name__}: {error}\n")
+        self.log.write("harness dashboard: " + display_text(
+            f"request from {client_address[0]} failed: {type(error).__name__}: {error}") + "\n")
 
     def server_close(self):
         self._stopping.set()
@@ -391,7 +391,9 @@ class DashboardServer(ThreadingHTTPServer):
 
 def create_server(state, port=DEFAULT_PORT, **options):
     if type(port) is not int or not 0 <= port <= 65535:
-        raise HarnessError("端口必须是 0 到 65535 之间的整数")
+        error = HarnessError("端口必须是 0 到 65535 之间的整数")
+        error._dashboard_invalid_port = True
+        raise error
     try:
         return DashboardServer(state, port, **options)
     except observe.NotFound as error:
@@ -452,7 +454,7 @@ def main(argv=None):
     try:
         return serve(args.state, args.port)
     except (HarnessError, OSError) as error:
-        print(f"harness: {error}", file=sys.stderr)
+        print("harness: " + display_text(error), file=sys.stderr)
         return 1
 
 

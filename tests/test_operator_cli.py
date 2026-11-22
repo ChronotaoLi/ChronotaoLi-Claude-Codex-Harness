@@ -19,6 +19,7 @@ class OperatorCLITests(unittest.TestCase):
 
     def test_explicit_decision_path_reaches_engine_and_failure_is_reported(self):
         engine = Mock()
+        engine.context.saved_stop = None
         engine.resume.side_effect = HarnessError("decision source has changed")
         errors = io.StringIO()
         with patch("harness.cli.Config.load"), patch("harness.cli.git.repository", return_value=self.repo), \
@@ -32,6 +33,7 @@ class OperatorCLITests(unittest.TestCase):
 
     def test_repeated_decision_paths_reach_engine_as_one_batch(self):
         engine = Mock()
+        engine.context.saved_stop = None
         engine.resume.side_effect = HarnessError("batch rejected")
         with patch("harness.cli.Config.load"), patch("harness.cli.git.repository", return_value=self.repo), \
                 patch("harness.operations.probe_cli", return_value={"path": None, "version": None}), \

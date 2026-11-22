@@ -9,6 +9,7 @@ from . import git, stops
 from .contracts import envelope, judge_review, review_schema, validate
 from .recovery import read_bound_bytes, read_bound_result, snapshot_digest
 from .services import RuntimeService
+from .state_files import StateFiles
 from .util import EvidenceError, HarnessError, read_json, strict_json_loads
 
 # Error text carried into the next request's previous_invalid and events; the
@@ -75,6 +76,46 @@ def judged_decide(entry):
 
 
 class ResultReceipts(RuntimeService):
+    def artifact_files(self, receipt):
+        dispatch_id = receipt["dispatch_id"]
+        job = self.context.directory / "dispatches" / dispatch_id
+        artifact = job / "returned-result.json"
+        if receipt["artifact"] != str(artifact):
+            raise EvidenceError("返回结果的回执路径与派发不符；保留证据",
+                                stop=stops.make("evidence", "runtime_integrity",
+                                                source={"dispatch_id": dispatch_id}))
+        return self._dispatch_files(dispatch_id)
+
+    def _dispatch_files(self, dispatch_id):
+        return StateFiles(self.context.state).under("runs", self.context.run["id"], "dispatches", dispatch_id)
+
+    @staticmethod
+    def _present(files, name, source, *, message):
+        outcome = files.probe((name,)).or_local_io()
+        if outcome.state == "present":
+            return True
+        if outcome.state == "absent" and outcome.step.leaf:
+            return False
+        try:
+            outcome.evidence(source)
+        except EvidenceError as error:
+            raise EvidenceError(f"{message}：{error}", stop=error.stop) from error
+
+    def returned(self, receipt):
+        """Check a saved intent for a returned result without writing evidence."""
+        if "artifact_digest" in receipt:
+            return True
+        return self._present(self.artifact_files(receipt), "returned-result.json",
+                             {"dispatch_id": receipt["dispatch_id"], "artifact": receipt["artifact"]},
+                             message="返回结果证据缺失或改变")
+
+    def _capture_present(self, dispatch_id):
+        name = "terminal-capture.json"
+        marker = self.context.directory / "dispatches" / dispatch_id / name
+        return self._present(self._dispatch_files(dispatch_id), name,
+                             {"dispatch_id": dispatch_id, "artifact": str(marker)},
+                             message="终端结果证据缺失或改变")
+
     @staticmethod
     def terminal_capture_required(outcome):
         return (outcome and not outcome.get("evidence_complete")
@@ -85,18 +126,16 @@ class ResultReceipts(RuntimeService):
     def has_terminal_capture(self, receipt):
         """Whether the receipt's result was, or must be, recovered from the provider terminal."""
         entry = next(d for d in self.context.run["dispatches"] if d["id"] == receipt["dispatch_id"])
-        marker = self.context.directory / "dispatches" / entry["id"] / "terminal-capture.json"
-        return bool(marker.exists() or receipt.get("terminal_capture_digest")
-                    or self.terminal_capture_required(entry.get("process_outcome")))
+        return bool("terminal_capture_digest" in receipt
+                    or self.terminal_capture_required(entry.get("process_outcome"))
+                    or self._capture_present(entry["id"]))
 
     def validate_pending_terminal_captures(self):
         for field in ("review_receipts", "commander_receipts"):
             for receipt in self.context.run[field].values():
                 entry = next(d for d in self.context.run["dispatches"] if d["id"] == receipt["dispatch_id"])
-                marker = self.context.directory / "dispatches" / entry["id"] / "terminal-capture.json"
-                outcome = entry.get("process_outcome")
-                if (marker.exists() or receipt.get("terminal_capture_digest")
-                        or outcome):
+                if ("terminal_capture_digest" in receipt or "process_outcome" in entry
+                        or self._capture_present(entry["id"])):
                     self.validate_terminal_capture(receipt)
                     if (self.has_terminal_capture(receipt)
                             and snapshot_digest(self.context.snapshot()) != receipt["snapshot_digest"]):
@@ -112,12 +151,14 @@ class ResultReceipts(RuntimeService):
         job = self.context.directory / "dispatches" / entry["id"]
         marker = job / "terminal-capture.json"
         outcome = entry.get("process_outcome")
-        if (not marker.exists() and outcome and outcome.get("started") is True
+        captured = self._capture_present(entry["id"])
+        if (not captured and outcome and outcome.get("started") is True
                 and (outcome.get("termination_reason") != "normal" or outcome.get("exit_code") not in (None, 0))):
             from .adapters import CLIBackend
-            CLIBackend(self.context.config, self.context.directory).preserve_terminal(
+            CLIBackend(self.context.config, self.context.state).preserve_terminal(
                 job, self.context.config.role(entry["role"], self.context.commander)["cli"], outcome, terminal_only=True)
-        if not marker.exists():
+            captured = self._capture_present(entry["id"])
+        if not captured:
             if receipt.get("terminal_capture_digest") or self.terminal_capture_required(outcome):
                 raise HarnessError("终端结果的进程证据不完整；保留证据，禁止重新抽取结论",
                                    stop=stops.make("evidence", "process_incomplete", data={"exit_unconfirmed": False},
@@ -184,7 +225,7 @@ class ResultReceipts(RuntimeService):
         receipt = receipts.get(key)
         if receipt is None:
             return
-        if "artifact_digest" in receipt or Path(receipt["artifact"]).exists():
+        if self.returned(receipt):
             raise HarnessError("已有返回、尚未处理的结果；先普通 resume，不能丢弃")
         self.context.ensure_exited()
         self.validate_terminal_capture(receipt)

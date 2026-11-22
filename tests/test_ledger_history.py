@@ -28,11 +28,12 @@ from harness.command_server import Broker, create_manifest
 from harness.mcp_server import handle
 from harness.memory import Memory
 from harness.recovery import snapshot_digest
-from harness.util import HarnessError, ProcessTimeout, lock, read_json, write_json
+from harness.util import HarnessError, ProcessTimeout, read_json, write_json
 from harness.versions import RUN_SCHEMA_VERSION
 from harness.watch_cli import watch_run
 from harness.workspace_inputs import prepare_run
 from harness.worker_returns import SOURCES
+from test_state_files import held_lock
 from test_dashboard import DashboardCase, tree_snapshot
 from test_harness import ROOT, RepoCase, write_project_config
 from test_runtime_changes import ScriptedBackend
@@ -437,7 +438,7 @@ class UnsupportedLedgerTests(DashboardCase):
 
     def test_a_held_lock_reports_another_version_not_the_lock(self):
         lock_path = self.runtime.directory / 'run.lock'
-        with lock(lock_path):
+        with held_lock(lock_path):
             for version in self.VERSIONS:
                 with self.subTest(version=version):
                     self.save(version)

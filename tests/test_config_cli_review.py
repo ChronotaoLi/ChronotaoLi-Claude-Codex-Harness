@@ -3,18 +3,21 @@ import copy
 import io
 import json
 import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 from harness.cli import main
 from harness import git
 from harness.cleanup import cleanup_run
 from harness.config import Config
+from harness.runtime import Runtime
 from harness.shared import toml_value
-from harness.util import HarnessError, read_json
-from test_harness import ROOT, RepoCase, write_project_config
+from harness.util import HarnessError, read_json, run_process
+from test_dashboard import tree_snapshot
+from test_harness import ROOT, RepoCase, cli_notice, write_project_config
 from test_runtime_changes import ScriptedBackend
 
 
@@ -126,18 +129,72 @@ class IndependentCLICommandsTests(RepoCase):
 
     def test_cli_passes_repeated_dispatch_exit_confirmations_to_recovery(self):
         write_project_config(self.repo)
-        result = {"id": "run_test", "status": "paused", "branch": "harness/run_test", "worktree": "worktree"}
-        for command in ("resume", "abandon"):
-            engine = Mock()
-            getattr(engine, command).return_value = result
-            with self.subTest(command=command), patch("harness.cli.Runtime", return_value=engine):
+
+        def first_plan_is_invalid(backend, kwargs, packet, result):
+            # A plan redo registers a second dispatch before the run pauses for approval.
+            if len(backend.calls) == 1:
+                result["new_tasks"].append(result["new_tasks"][0])
+
+        def exit_child(backend, kwargs, packet):
+            run_process([sys.executable, "-c", "pass"], kwargs["cwd"], kwargs["job"] / "process",
+                        on_start=kwargs["on_start"], on_outcome=kwargs["on_outcome"])
+
+        for command, status in (("resume", "awaiting_approval"), ("abandon", "abandoned")):
+            with self.subTest(command=command):
+                backend = ScriptedBackend(first_plan_is_invalid)
+                backend.before_result = exit_child
+                engine = self.engine(backend)
+                engine.start("Implement greet", pause_after_plan=True)
+                ledger = engine.directory / "state.json"
+                paused = read_json(ledger)
+                self.assertEqual(paused["status"], "awaiting_approval")
+                first, second = paused["dispatches"]
+                for entry in (first, second):
+                    self.assertGreater(entry["pgid"], 0)
+                    self.assertEqual(entry["exit_code"], 0)
+                    self.assertIs(entry["exit_confirmed"], True)
+                self.assertNotEqual(first["id"], second["id"])
+                ledger_ids = [first["id"], second["id"]]
+                run_id = paused["id"]
+                recovery = getattr(Runtime, command)
+                # Both orders catch UUID sorting and reordering to match the ledger.
+                # The second abandon exercises the idempotent path for the same run.
+                for order, ids in (("ledger", ledger_ids), ("reverse ledger", ledger_ids[::-1])):
+                    with self.subTest(order=order):
+                        with patch("harness.run_context.CLIBackend", return_value=backend), \
+                                patch.object(Runtime, command, autospec=True, side_effect=recovery) as recover:
+                            code, output, errors = self.invoke([
+                                command, run_id, "--confirm-exited", ids[0], "--confirm-exited", ids[1],
+                            ], ROOT / "harness.toml")
+                        self.assertEqual(code, 0, errors)
+                        reply = json.loads(output)
+                        self.assertEqual((reply["id"], reply["status"]), (run_id, status))
+                        recover.assert_called_once()
+                        self.assertEqual(recover.call_args.args[1:], (run_id,))
+                        self.assertEqual(recover.call_args.kwargs["confirm_exited"], ids)
+                        saved = read_json(ledger)
+                        self.assertEqual((saved["status"], saved["dispatches"]), (status, paused["dispatches"]))
+                        self.assertNotIn("dispatch_exit_confirmed_by_operator",
+                                         (engine.directory / "events.jsonl").read_text())
+                        self.assertEqual(len(backend.calls), 2)
+                        if command == "resume":
+                            record = read_json(engine.state / "operations" / f"{reply['operation_id']}.json")
+                            self.assertEqual(record["run_id"], run_id)
+                            self.assertEqual(record["arguments"]["confirm_exited"], ids)
+
+    def test_abandon_with_repeated_confirmations_rejects_invalid_or_missing_run_without_writes(self):
+        before = tree_snapshot(self.repo)
+        for run_id in ("run_test", "bad-id"):
+            with self.subTest(run_id=run_id):
                 code, output, errors = self.invoke([
-                    command, "run_test", "--confirm-exited", "dispatch_one", "--confirm-exited", "dispatch_two",
+                    "abandon", run_id, "--confirm-exited", "dispatch_one", "--confirm-exited", "dispatch_two",
                 ], ROOT / "harness.toml")
-            self.assertEqual(code, 0, errors)
-            self.assertEqual(json.loads(output)["id"], "run_test")
-            self.assertEqual(getattr(engine, command).call_args.kwargs["confirm_exited"],
-                             ["dispatch_one", "dispatch_two"])
+                self.assertEqual((code, output), (2, ""), errors)
+                stop = cli_notice(errors)
+                self.assertIsNotNone(stop, errors)
+                self.assertEqual((stop["kind"], stop["reason"], stop["data"]),
+                                 ("invalid_input", "cli_arguments", {"option": "run_id"}))
+                self.assertEqual(tree_snapshot(self.repo), before)
 
 
 class ExitConfirmationRecoveryTests(RepoCase):

@@ -484,6 +484,23 @@ class FileIndexCapTests(StateCase):
         self.assertEqual(self.index(run_id, 10)[1:], (False, 10))
         self.assertEqual(len(self.index(run_id, 10)[0]), 4)
 
+    def test_admission_locks_leave_all_dispatch_evidence_visible_at_the_cap(self):
+        rows = [dispatch(), dispatch()]
+        run_id = self.save(ledger("run_locks", dispatches=rows))
+        expected = {"state.json"}
+        for row in rows:
+            relative = Path("dispatches") / row["id"]
+            job = self.state / "runs" / run_id / relative
+            write_json(job / "packet.json", {})
+            (job / "command-admission.lock").touch()
+            expected.add((relative / "packet.json").as_posix())
+
+        paths, truncated, _ = self.index(run_id, len(expected))
+        self.assertEqual(set(paths), expected)
+        self.assertFalse(truncated)
+        detail = observe.run_detail(self.state, run_id)
+        self.assertEqual([row["files"] for row in detail["dispatches"]], [["packet.json"], ["packet.json"]])
+
 
 class FirstEventTimeTests(StateCase):
     def first(self, run_id, data):
@@ -873,15 +890,13 @@ class StatusLayoutTests(RepoCase):
 
         location = f"harness: 检出 {repo}；状态目录 {state}（无法打开）"
         with patch("harness.observe.os.open", side_effect=descriptor_for_any_mode):
-            for extra in ((), ("--full",)):
-                with self.subTest(extra=extra):
-                    code, output, errors = self.status(repo, "run_same", *extra)
+            for args in ((), ("run_same",), ("run_same", "--full")):
+                with self.subTest(args=args):
+                    code, output, errors = self.status(repo, *args)
                     notice = cli_notice(errors)
                     self.assertEqual((code, output, errors.splitlines()[0]), (1, "", location), errors)
                     self.assertEqual((notice["kind"], notice["reason"], notice["exit_code"], notice["data"]["error_type"]),
                                      ("runtime_failure", "io", 1, "PermissionError"), errors)
-            code, output, errors = self.status(repo)
-        self.assertEqual((code, output, errors.splitlines()), (0, "[]\n", [location]))
         self.assertEqual(len(handed), 3)  # each call was handed a descriptor and gave it back
         for fd in handed:
             with self.assertRaises(OSError):
@@ -1181,7 +1196,7 @@ class InterruptedConstructionTests(RepoCase):
         handed = {(watching, line) for line in lines_between(watch_cli.watch_run, "with RunWatcher(", "with RunWatcher(")}
         status = {(cli.__file__, "show_status"): None, (cli.__file__, "show_status.<locals>.show"): None}
         diagnostics = {(cli.__file__, "_main"): lines_between(cli._main, "from .permission_diagnostics import",
-                                                              "raise HarnessError(str(error))"),
+                                                              'data={"error_type": type(failure).__name__})) from error'),
                        (cli.__file__, "_main.<locals>.diagnose"): None}
         return {"status RUN": (status, (), ("--repo", str(self.repo), "status", run_id)),
                 "permission-diagnostics": (diagnostics, (), (
@@ -1212,7 +1227,7 @@ class InterruptedConstructionTests(RepoCase):
             for signum in (signal.SIGINT, signal.SIGTERM):
                 with self.subTest(entry=name, signal=signum.name):
                     runs, last = self.sweep(lambda: self.cli(*argv), lines, signum=signum, once=once)
-                    self.assertNotIn(last, (0, 130))
+                    self.assertEqual(last, 2)
                     self.assertEqual({result for _, result in runs}, {130})
                     self.assertReached(runs, CLEANUPS)
                     self.assertCleanupEntered(runs, 130)

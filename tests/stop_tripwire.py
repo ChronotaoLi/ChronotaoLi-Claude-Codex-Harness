@@ -691,12 +691,12 @@ def _wrote(name, path, value):
 
 
 def _ledger_written(store, candidate):
-    """The ledger channel's one observation point: ``RunStore._publish_candidate(locked, candidate)`` returned.
+    """The ledger channel's one observation point: ``RunStore._publish_candidate(locked, candidate, data)`` returned.
 
     It marks the innermost ``RunStore.commit`` in progress on this thread, when ``store``'s ledger is that commit's, as
     having written ``candidate``: a write of another thread or of another call never marks it. It relies on one step of
     ``RunStore.commit`` (harness/run_store.py): ``_publish_candidate``, called under ``store.lock`` after the
-    compare-and-swap check, which returns once the write succeeded and before the written bytes are read back,
+    compare-and-swap check, which returns once the write succeeded and before the candidate is adopted,
     ``candidate`` being the ledger it publishes with its new ``store_revision``. However that write is made, this
     observation point stays.
     """

@@ -181,7 +181,7 @@ class Dispatcher(RuntimeService):
             self.context.ensure_exited()
             receipts = self.context.run[{"commander": "commander_receipts", "worker": "worker_receipts"}.get(role, "review_receipts")]
             receipt = receipts.get(key)
-            if role != "worker" and receipt and "artifact_digest" not in receipt and not Path(receipt["artifact"]).exists():
+            if role != "worker" and receipt and not self.services.receipts.returned(receipt):
                 # Intent was saved before invoke; the provider never returned a
                 # usable result. Retrying still consumes a fresh dispatch budget.
                 self.services.receipts.discard_unreturned(key)

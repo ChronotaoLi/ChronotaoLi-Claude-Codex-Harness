@@ -3,17 +3,31 @@ from __future__ import annotations
 from pathlib import Path
 from . import git, quota_wait, stops
 from .decisions import validate_handoff_question
+from .operations import observe_terminal, warn_kept_terminal
+from .run_store import RunStore
 from .util import HarnessError
 from .services import RuntimeService
 
 class Workflow(RuntimeService):
+    WRITTEN = object()
+    KEPT = RunStore.KEPT
+
     def stop(self, error):
-        """Save the status and its settled stop value in one commit, then report the projection.
+        """Preserve a committed terminal result or save the status and settled stop together.
 
         A non-interrupt stop is settled first (spec 2.2): the load checks run on the
         ledger about to be saved, and a load failure becomes the final value, written
         back to ``error`` so every later view shows the same stop.
         """
+        if self.context.store.keep_terminal(error):
+            return self.KEPT
+
+        self.context.store.rebase_for_stop()
+        try:
+            self.context.ensure_exited(commit=False)
+        except Exception:
+            pass  # An incomplete exit check leaves the original stop in charge.
+
         interrupted = isinstance(error, (KeyboardInterrupt, SystemExit))
         value = stops.of(error)
         self.context.run["status"] = "interrupted" if interrupted else "blocked"
@@ -28,12 +42,26 @@ class Workflow(RuntimeService):
                 value = stops.of(signal)
                 value["data"]["exits_confirmed"] = self.exits_confirmed()
                 self.context.run["status"], self.context.run["stop"] = "interrupted", value
-                self.context.save()
+                if self._save_stop(signal, value) is self.KEPT:
+                    return self.KEPT
                 raise
             self.context.run["stop"] = value
-        self.context.save()
-        self.context.checkpoint()
-        self.context.event("run_stopped", stop=stops.project(value, self.context.run["id"]))
+        def stopped_event():
+            self.context.event("run_stopped", stop=stops.project(value, self.context.run["id"]))
+
+        if self._save_stop(error, value) is self.KEPT:
+            return self.KEPT
+        observe_terminal("写检查点", self.context.checkpoint)
+        observe_terminal("run_stopped", stopped_event)
+        return self.WRITTEN
+
+    def _save_stop(self, error, value):
+        code = stops.value_exit_code(value)
+        if self.context.save(stop=True) is self.KEPT:
+            warn_kept_terminal(error)
+            return self.KEPT
+        self.context.saved_stop = (error, code)
+        return self.WRITTEN
 
     def exits_confirmed(self):
         """Whether every dispatch that may have started has a confirmed exit (abandon needs no confirmation)."""

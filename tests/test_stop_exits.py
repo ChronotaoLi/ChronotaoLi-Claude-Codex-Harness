@@ -24,6 +24,7 @@ from harness.budgets import work_attempts
 from harness.process_runtime import ProcessOutcome
 from harness.runtime import Runtime
 from harness.util import HarnessError, read_json, write_json
+from test_state_files import held_lock
 from test_decide import DecideCase, Script, ask, block_first, blocked_by_task, implement, task
 from test_harness import (ROOT, RepoCase, cli_notice, continues_without_stop, no_command_exit, refused_by_cli, scratch,
                           run_cli, walk_exit, walk_notice_exit, write_operator_config, write_project_config)
@@ -137,6 +138,9 @@ ROW_COVERAGE = {
                            "test_worker_receipts.WorkerReceiptTests."
                            "test_scope_rejection_retains_recovery_and_requires_cleanup_before_fresh_worker"),
     "protected-path": Row(("scope_violation", "protected_path"), RUN, "test_stop_exits.WorkspaceRowTests.test_protected_path"),
+    "special-file": Row(("scope_violation", "special_file"), RUN,
+                        "test_candidate_special_files.CandidateSpecialFileTests."
+                        "test_tracked_fifo_recovers_with_a_fresh_worker"),
     "redo-exhausted": Row(("invalid_output", "redo_exhausted"), RUN, "test_stop_exits.ExitRowTests.test_redo_exhausted"),
     "invalid-original-changed": Row(("evidence", "runtime_integrity"), RUN,
                                     "test_stop_exits.ExitRowTests.test_invalid_original_changed"),
@@ -785,11 +789,10 @@ class OperationRowTests(RepoCase):
                          directory=engine.directory, expect_status="completed")
 
     def test_busy(self):
-        from harness.util import lock
         backend, engine = self.blocked_at_limit()
         state_file = engine.directory / "state.json"
         before = state_file.read_bytes()
-        with lock(engine.directory / "run.lock"):
+        with held_lock(engine.directory / "run.lock"):
             notice = refused_by_cli(self, backend, ["resume", engine.run["id"]], ("busy", "run_lock"), 3)
             no_command_exit(self, notice, ("busy", "run_lock"))
             self.assertEqual(state_file.read_bytes(), before)

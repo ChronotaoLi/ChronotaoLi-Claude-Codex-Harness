@@ -6,12 +6,12 @@ import sys
 from copy import deepcopy
 from pathlib import Path
 
-from .versions import RUN_SCHEMA_VERSION, missing_ledger, parse_current_ledger
+from .versions import RUN_SCHEMA_VERSION, missing_ledger, parse_current_ledger, require_run_id
 from .commands import validate_commands
 from .config import normalized, require_run_commands
 from .contracts import validate_required_commands
 from . import git, quota_wait, scope as boundary, stops
-from .operations import warn
+from .operations import observe_terminal, warn
 from .input_projection import validate_dispatch_indexes as validate_input_dispatch_indexes
 from .path_evidence import validate_dispatch_indexes
 from .review_progress import entries
@@ -21,12 +21,14 @@ from .continuation import (packet as continuation_packet, prepare_continuation_r
                            record_execution_guidance)
 from .shared import asset_digest, validate_mcp
 from .state_files import StateFiles
-from .util import HarnessError, fold_name, uid, validate_command_directories
+from .util import HarnessError, escape_json_controls, fold_name, uid, validate_command_directories
+from .workflow import Workflow
 
 
 class RunLifecycle(RuntimeService):
     def start(self, goal, plan=None, *, scope=(), pause_after_plan=False, step=False):
         runtime = self.context
+        self.context.saved_stop = None
         if not goal.strip():
             raise HarnessError("目标不能为空", stop=stops.make("invalid_input", "cli_arguments", data={"option": "goal"}))
         scope = boundary.declared(scope)
@@ -73,12 +75,12 @@ class RunLifecycle(RuntimeService):
 
         def start_locked():
             try:
-                git.git(self.context.repo, "worktree", "add", "-b", self.context.run["branch"], str(worktree), "HEAD",
-                        effect=git.CHECKOUT)
-                self.context.run["worktree_binding"] = git.capture_worktree_binding(worktree, self.context.run["branch"])
+                self.context.run["worktree_binding"] = git.add_worktree(
+                    self.context.repo, worktree, "HEAD", branch=self.context.run["branch"])
                 self.context.save()
             except BaseException as error:
-                self.services.workflow.stop(error)
+                if self.services.workflow.stop(error) is Workflow.KEPT:
+                    return self.context.run
                 raise
             self.context.memory.repo = self.context.worktree
             self.context.memory.binding = self.context.run["worktree_binding"]
@@ -110,8 +112,7 @@ class RunLifecycle(RuntimeService):
 
     def load_run(self, ident):
         """Load a run; a failure is classified by its own nature (spec 2.2), never as one blanket type."""
-        if not ident.startswith("run_") or not ident[4:].isalnum():
-            raise HarnessError("无效 run ID", stop=stops.make("invalid_input", "cli_arguments", data={"option": "run_id"}))
+        require_run_id(ident)
         path = self.context.state / "runs" / ident / "state.json"
         try:
             # Version and identity are checked on a local value: binding the store
@@ -189,19 +190,18 @@ class RunLifecycle(RuntimeService):
         replaces in ``superseded``; the final value is written back to the error.
         Interrupts are not settled. Returns the final value (``stops.of``).
         """
-        if isinstance(error, (KeyboardInterrupt, SystemExit)) or getattr(error, "_stop_settled", False):
+        if isinstance(error, (KeyboardInterrupt, SystemExit)):
             return stops.of(error)
-        original = stops.of(error)
+        wake_stop = getattr(error, "_wake_stop", None)
+        original = getattr(error, "_unpublished_stop", None) or wake_stop or stops.of(error)
         final, _ = self._settled(original, ident)
+        if final is None:
+            final = wake_stop
         if final is not None:
             try:
                 error.stop = final
             except (AttributeError, TypeError):
                 pass
-        try:
-            error._stop_settled = True
-        except (AttributeError, TypeError):
-            pass
         return stops.of(error)
 
     def settle_publication(self, kind, reason, *, ident=None):
@@ -209,13 +209,21 @@ class RunLifecycle(RuntimeService):
 
         Called before that stop is saved (``ident`` None: the in-memory ledger that already
         holds it) or reported again by resume (``ident``: the ledger on disk). A failure is
-        raised, already settled, as the load failure's own type with ``superseded`` naming
-        the publication; the caller's boundary then stops the run with it.
+        raised with the attempted publication's identity. When reporting from disk, that
+        is the final result. Before a save, Workflow.stop will rebase and settle again.
         """
-        final, failure = self._settled({"kind": kind, "reason": reason}, ident)
+        original = {"kind": kind, "reason": reason}
+        final, failure = self._settled(original, ident)
         if final is not None:
+            if ident is None:
+                # The invalid staged ledger may be discarded by the stop rebase.
+                # Preserve this failure, but reserve load_integrity for the final base.
+                if (final["kind"], final["reason"]) == ("evidence", "load_integrity"):
+                    final["reason"] = "runtime_integrity"
+                final["data"].pop("superseded")
             error = HarnessError(f"{failure}（未发布停止 {kind}/{reason}）", stop=final)
-            error._stop_settled = True
+            if ident is None:
+                error._unpublished_stop = original
             raise error from failure
 
     def _settled(self, original, ident):
@@ -272,8 +280,8 @@ class RunLifecycle(RuntimeService):
         """After a quota wait, before the scheduling loop: resume()'s read-only preconditions, in its order.
 
         The ledger on disk is still the one this process just committed (``check_current``),
-        and the load checks run on it as ``load_run`` would; a load failure is the settled
-        stop itself. Then the three functions resume() calls. Nothing is written: the steps
+        and the load checks run as ``load_run`` would. A refusal still needs settling on
+        the stop's actual ledger if published. Then run the three shared checks. The steps
         of resume() that write (exit confirmation, landing a returned ask, terminal capture
         digests, recovery inputs) and the configuration comparison (this process never
         reloads its configuration) are not part of it.
@@ -284,8 +292,11 @@ class RunLifecycle(RuntimeService):
         except (KeyboardInterrupt, SystemExit):
             raise
         except Exception as failure:
-            error = HarnessError(str(failure) or type(failure).__name__, stop=stops.load_failure(failure))
-            error._stop_settled = True   # the load failure is already the final value
+            value = stops.load_failure(failure)
+            error = HarnessError(str(failure) or type(failure).__name__, stop=value)
+            # Keep the triggering failure for settlement on the ledger that will be published.
+            error._wake_stop = ({**value, "reason": "runtime_integrity"}
+                                if (value["kind"], value["reason"]) == ("evidence", "load_integrity") else value)
             raise error from failure
         self.verify_assets_and_plan()
         self.verify_binding_and_indexes()
@@ -476,18 +487,20 @@ class RunLifecycle(RuntimeService):
                                        stop=stops.make("invalid_input", "run_state", data={"status": "completed"}))
                 self.context.confirm_exited(confirm_exited)
                 self.context.ensure_exited()
-                if self.context.run["status"] != "abandoned":
-                    self.context.run["status"] = "abandoned"
-                    self.context.run.pop("stop", None)
-                    quota_wait.clear(self.context.run)   # a killed process's leftover record
-                    self.context.save()
-                    self.context.checkpoint()
-                    self.context.event("run_abandoned")
-                return self.context.run
+                if self.context.run["status"] == "abandoned":
+                    return self.context.run
+                self.context.run["status"] = "abandoned"
+                self.context.run.pop("stop", None)
+                quota_wait.clear(self.context.run)   # a killed process's leftover record
+                self.context.save(terminal=True)
             except BaseException as error:
                 # The operation boundary: a refusal after a successful load is settled once.
-                self.settle_stop(error, ident=ident)
-                raise
+                if not self.context.store.keep_terminal(error):
+                    self.settle_stop(error, ident=ident)
+                    raise
+            observe_terminal("写检查点", self.context.checkpoint)
+            observe_terminal("run_abandoned", self.context.event, "run_abandoned")
+            return self.context.run
         # A busy lock points to a wait the ledger read outside the lock records.
         return self.context.run_lock(quota_wait.busy_stop(self.context.run), abandon_locked)
 
@@ -495,10 +508,12 @@ class RunLifecycle(RuntimeService):
                scope=(), environment_update=None, operator_decision=None,
                execution_guidance=None, reject_request=None):
         runtime = self.context
+        self.context.saved_stop = None
         self.load_run(ident)
 
         def resume_locked():
             self.load_run(ident)
+            reporting_approval = False
             try:
                 def state(status):
                     return stops.make("invalid_input", "run_state", data={"status": status})
@@ -571,7 +586,8 @@ class RunLifecycle(RuntimeService):
                 try:
                     self.services.planning.land_returned_ask()
                 except BaseException as error:
-                    self.services.workflow.stop(error)
+                    if self.services.workflow.stop(error) is Workflow.KEPT:
+                        return self.context.run
                     raise
                 self.verify_head_and_inputs()
                 with stops.classify("invalid_input", "input_schema", data={"option": "--environment-update"}):
@@ -597,7 +613,8 @@ class RunLifecycle(RuntimeService):
                 if changes:
                     self.context.event("resume_config_changed", changes=changes)
                 if added:
-                    print("[harness] 范围边界已扩大：" + json.dumps(added, ensure_ascii=False)
+                    displayed = escape_json_controls(json.dumps(added, ensure_ascii=False))
+                    print("[harness] 范围边界已扩大：" + displayed
                           + "；当前与之后的提案都可复用这些条目", file=sys.stderr, flush=True)
                 if operator_decision is not None:
                     stopped = next((value for value in decision_values if value["decision"] == "stop"), None)
@@ -606,7 +623,8 @@ class RunLifecycle(RuntimeService):
                                        if item["id"] == stopped["request_id"])
                         error = HarnessError("操作者决定停止；决定与原证据已保存，未派发模型",
                                              stop=self.services.workflow.operator_stopped(request))
-                        self.services.workflow.stop(error)
+                        if self.services.workflow.stop(error) is Workflow.KEPT:
+                            return self.context.run
                         raise error
                 self.context.memory.repo = self.context.worktree
                 self.context.memory.binding = self.context.run["worktree_binding"]
@@ -620,6 +638,7 @@ class RunLifecycle(RuntimeService):
                     if not approve_plan and self.context.run["status"] == "awaiting_approval":
                         # Reported again, unchanged: the plan still waits for an explicit approval.
                         # Settled first, as any reported stop: its exits must not meet a load failure.
+                        reporting_approval = True
                         self.settle_publication("plan_approval", "initial_plan", ident=ident)
                         return self.context.run
                     if approve_plan:
@@ -631,8 +650,10 @@ class RunLifecycle(RuntimeService):
                 self.announce("run_resumed")
                 return self.services.scheduler.execute(step=step)
             except BaseException as error:
-                # The operation boundary: a refusal after a successful load is settled once.
-                self.settle_stop(error, ident=ident)
+                # The disk approval report and a saved stop already checked their own ledgers.
+                saved = self.context.saved_stop
+                if not reporting_approval and (saved is None or saved[0] is not error):
+                    self.settle_stop(error, ident=ident)
                 raise
         # A busy lock points to a wait the ledger read outside the lock records.
         return self.context.run_lock(quota_wait.busy_stop(self.context.run), resume_locked)

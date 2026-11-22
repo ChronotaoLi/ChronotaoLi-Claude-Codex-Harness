@@ -8,41 +8,61 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import stat
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
-from .versions import require_current_ledger
+from .versions import parse_current_ledger, precheck_run
 from . import git, stops
-from .cleanup import _canonical, _regular_bytes, refuse_other_version
+from .cleanup import _canonical, read_run_state, with_run_lock
 from .path_evidence import validate_dispatch_indexes
 from .input_projection import validate_dispatch_indexes as validate_input_dispatch_indexes
 from .worker_receipts import validate_worker_receipt_links
+from .workspace_input_names import NAME_ERRORS, check_destination_layout
 from .run_store import RunStore
-from .util import (HarnessError, ensure_dispatches_exited, fold_name, group_alive, lock,
+from .state_files import StateFiles
+from .util import (HarnessError, ensure_dispatches_exited, fold_name, group_alive,
                    validate_command_directories, write_json)
 
 _RESERVED = frozenset(map(fold_name, (*git.PROTECTED_ROOTS, 'agents.md', 'claude.md')))
+_CREDENTIAL_NAMES = frozenset(('.env', '.ssh', '.aws', '.gnupg', 'credentials', 'credentials.json'))
+_COPY_TEMP_PREFIX = '.harness-input-'
 _PENDING = ('pending_task', 'pending_acceptance', 'pending_post_accept',
             'pending_revision', 'pending_directive', 'worker_recovery', 'worker_receipts')
 
 def _fail(message, stop=None):
     raise HarnessError('workspace inputs: ' + message, stop=stop)
 
+def _manifest_failure(message):
+    _fail(message, stops.make('invalid_input', 'input_schema', data={'option': 'manifest'}))
+
+def _evidence_failure(message):
+    _fail(message, stops.make('evidence', 'runtime_integrity'))
+
 def _relative(value):
     if (not isinstance(value, str) or not value or '\\' in value or '\x00' in value
             or any(p in ('', '.', '..') for p in value.split('/'))
             or Path(value).is_absolute() or any(fold_name(p) in _RESERVED for p in value.split('/'))):
         _fail('invalid or reserved relative path')
+    try:
+        os.fsencode(value)
+    except UnicodeEncodeError:
+        _fail('relative path cannot be encoded for the filesystem')
     return value
 
 @contextmanager
 def _parent(path, *, create=False):
     """Walk every directory with no-follow descriptors before a mutation."""
     _canonical(path)
-    fd = os.open('/', os.O_RDONLY | os.O_DIRECTORY)
+    with _directories(os.open('/', os.O_RDONLY | os.O_DIRECTORY), path.parent.parts[1:], create=create) as fd:
+        yield fd
+
+@contextmanager
+def _directories(fd, parts, *, create):
+    """Walk from an owned descriptor, closing it and any subsequently opened descriptor."""
     try:
-        for part in path.parent.parts[1:]:
+        for part in parts:
             if create:
                 try:
                     os.mkdir(part, dir_fd=fd)
@@ -58,6 +78,9 @@ def _parent(path, *, create=False):
 def _unlink(path):
     with _parent(path) as fd:
         os.unlink(path.name, dir_fd=fd)
+
+def _copy_temp_name():
+    return _COPY_TEMP_PREFIX + uuid.uuid4().hex
 
 def _publish(temp, dest):
     with _parent(dest) as fd:
@@ -84,9 +107,16 @@ def _identity(path, *, allowed_links=(1,)):
     finally:
         os.close(fd)
 
+@stops.reads_evidence
+def _registered_identity(path, *, allowed_links=(1,)):
+    return _identity(path, allowed_links=allowed_links)
+
 def _read(path):
+    """Read the operator's manifest, whose path and contents are CLI input."""
     _canonical(path)
-    return json.loads(_regular_bytes(path))
+    if not stat.S_ISREG(path.lstat().st_mode):
+        _fail(f'manifest must be a regular file: {path}')
+    return json.loads(path.read_bytes())
 
 def _gate(run, directory, *, terminal=False):
     repo, checkout = Path(run['repo']), Path(run['worktree'])
@@ -97,7 +127,8 @@ def _gate(run, directory, *, terminal=False):
         _fail('run path binding mismatch', stops.make('workspace_mismatch', 'binding_changed'))
     if terminal:
         if run.get('status') not in ('completed', 'abandoned'):
-            _fail('cleanup requires terminal run')
+            _fail('cleanup requires terminal run',
+                  stops.make('invalid_input', 'run_state', data={'status': str(run.get('status'))}))
     elif (run.get('status') not in ('awaiting_approval', 'paused')
           or any(run.get(k) for k in _PENDING)):
         _fail('prepare requires paused/awaiting_approval with no pending stage',
@@ -123,39 +154,68 @@ def _destination(run, name):
         _fail('destination must be ignored and untracked: ' + name)
     return path
 
-def _manifest(run, value):
+def _check_source_names(parts):
+    for part in parts:
+        name = part.lower()
+        if name in _CREDENTIAL_NAMES or name.endswith(('.pem', '.key')):
+            _fail('credential-like source is not a dependency input')
+
+def manifest_shape(ident, value):
+    """Validate the operator's declaration without consulting the run or filesystem."""
     if (not isinstance(value, dict) or set(value) != {'schema_version', 'run_id', 'head',
             'source_root', 'max_files', 'max_bytes', 'files'}
-            or value['schema_version'] != 1 or value['run_id'] != run['id']
-            or value['head'] != run['expected_head'] or value['source_root'] != '.'
+            or value['schema_version'] != 1 or value['run_id'] != ident or value['source_root'] != '.'
+            or not isinstance(value['head'], str) or not re.fullmatch(r'[a-f0-9]{40}|[a-f0-9]{64}', value['head'])
             or type(value['max_files']) is not int or value['max_files'] < 1
             or type(value['max_bytes']) is not int or value['max_bytes'] < 0
             or not isinstance(value['files'], list)
             or not 0 < len(value['files']) <= value['max_files']):
         _fail('invalid manifest v1 or run/HEAD binding')
-    sources, destinations, total = set(), set(), 0
+    sources, destinations = set(), set()
     for entry in value['files']:
         if (not isinstance(entry, dict) or set(entry) != {'source', 'destination', 'sha256', 'mode', 'type', 'ownership'}
                 or entry['type'] != 'file' or entry['ownership'] != 'input_copy'
+                or not isinstance(entry['sha256'], str) or not re.fullmatch(r'[a-f0-9]{64}', entry['sha256'])
                 or type(entry['mode']) is not int or entry['mode'] not in (0o600, 0o644, 0o700, 0o755)):
             _fail('invalid file declaration')
-        source = Path(run['repo']) / _relative(entry['source'])
-        dest = _destination(run, entry['destination'])
-        # Refuse common credential names even when explicitly listed.
-        if any(p.lower() in ('.env', '.ssh', '.aws', '.gnupg', 'credentials', 'credentials.json')
-               or p.lower().endswith(('.pem', '.key')) for p in source.parts):
-            _fail('credential-like source is not a dependency input')
-        if source in sources or dest in destinations or source == dest:
+        source = _relative(entry['source'])
+        dest = _relative(entry['destination'])
+        _check_source_names(source.split('/'))
+        if source in sources or dest in destinations:
             _fail('duplicate or overlapping input')
-        sources.add(source); destinations.add(dest)
+        sources.add(source)
+        destinations.add(dest)
+    for field, names in (('sources', sources), ('destinations', destinations)):
+        for name in names:
+            if any(parent.as_posix() in names for parent in Path(name).parents):
+                _fail(f'overlapping file {field}')
+
+def _manifest(run, value):
+    manifest_shape(run['id'], value)
+    if value['head'] != run['expected_head']:
+        _fail('invalid manifest v1 or run/HEAD binding')
+    destinations, total = [], 0
+    for entry in value['files']:
+        source = Path(run['repo']) / entry['source']
+        try:
+            dest = _destination(run, entry['destination'])
+        except OSError as error:
+            if error.errno not in NAME_ERRORS:
+                raise
+            _fail(f'invalid destination on this volume: {entry["destination"]!r} ({error.strerror})')
+        destinations.append(dest)
+        _check_source_names(source.parts)
+        if source == dest:
+            _fail('duplicate or overlapping input')
         identity = _identity(source)
         if identity['sha256'] != entry['sha256'] or identity['mode'] != entry['mode']:
             _fail('source digest/mode differs from declaration')
         total += identity['size']
     if total > value['max_bytes']:
         _fail('manifest byte limit exceeded')
-    return value
+    return destinations
 
+@stops.reads_evidence
 def _registered(run, directory):
     binding = run.get('workspace_inputs')
     if binding is None:
@@ -165,18 +225,21 @@ def _registered(run, directory):
     if (not isinstance(binding, dict) or set(binding) != {'schema_version', 'manifest_sha256'}
             or binding['schema_version'] != 1):
         _fail('invalid input ledger binding')
-    path = directory / 'workspace-inputs-manifest.json'
-    _canonical(path)
-    raw = _regular_bytes(path)
+    files = StateFiles(directory.parent.parent).under('runs', directory.name)
+    outcome = files.read(('workspace-inputs-manifest.json',), limit=None)
+    raw = outcome.evidence({'artifact': outcome.path})
     if hashlib.sha256(raw).hexdigest() != binding['manifest_sha256']:
         _fail('frozen manifest missing or changed')
     manifest = json.loads(raw)
-    if manifest.get('run_id') != run['id'] or manifest.get('source_root') != '.':
+    if (not isinstance(manifest, dict) or manifest.get('run_id') != run['id']
+            or manifest.get('source_root') != '.' or not isinstance(manifest.get('files'), list)):
         _fail('frozen manifest binding changed')
-    journal = _read(directory / 'workspace-inputs.json')
-    if (journal.get('manifest_sha256') != binding['manifest_sha256']
+    outcome = files.read(('workspace-inputs.json',), limit=None)
+    journal = json.loads(outcome.evidence({'artifact': outcome.path}))
+    if (not isinstance(journal, dict) or journal.get('manifest_sha256') != binding['manifest_sha256']
             or journal.get('run_id') != run['id'] or journal.get('schema_version') != 1
-            or len(journal.get('files', [])) != len(manifest['files'])):
+            or not isinstance(journal.get('files'), list) or len(journal['files']) != len(manifest['files'])
+            or not all(isinstance(receipt, dict) for receipt in journal['files'])):
         _fail('input journal binding invalid')
     return manifest, journal
 
@@ -199,44 +262,53 @@ def validate_inputs(run, directory, *, allow_removed=False):
 def prepare_run(repo, ident, manifest):
     """Prepare explicitly declared files. Acquires the run lock itself."""
     repo = git.repository(Path(repo))
-    if not ident.startswith('run_') or not ident[4:].isalnum():
-        _fail('invalid run ID', stops.make('invalid_input', 'cli_arguments', data={'option': 'run_id'}))
-    directory = repo / '.harness' / 'runs' / ident
-    _canonical(directory)
-    _canonical(directory / 'run.lock')
-    refuse_other_version(directory / 'state.json')
+    state = repo / '.harness'
+    precheck_run(state, ident)
+    directory = state / 'runs' / ident
+    for path in (directory, directory / 'run.lock'):
+        with stops.evidence_reads(source={'artifact': str(path)}):
+            _canonical(path)
+    with stops.classify('invalid_input', 'input_schema', data={'option': 'manifest'}):
+        if isinstance(manifest, (str, Path)):
+            try:
+                value = _read(Path(manifest).absolute())
+            except (OSError, ValueError, RecursionError) as error:
+                # The operator's file (missing, unreadable, or unparsable JSON): this call's input is refused.
+                raise HarnessError(f'manifest cannot be read as JSON: {error}') from error
+        else:
+            value = manifest
+        manifest_shape(ident, value)
     from .private_state import ensure_private_state
     ensure_private_state(repo)
-    with lock(directory / 'run.lock', stop=stops.make('busy', 'run_lock')):
-        run = _read(directory / 'state.json')
-        require_current_ledger(run)
+    files = StateFiles(state).under('runs', ident)
+
+    def prepare_locked(locked):
+        store = RunStore(state)
+        store.bind_directory(locked.identity)
+        with stops.evidence_reads(source={'artifact': str(directory / 'state.json')}):
+            run = parse_current_ledger(read_run_state(files, locked))
         if run.get('id') != ident or run.get('repo') != str(repo):
             _fail('run ledger does not belong to this repository',
                   stops.make('invalid_input', 'cli_arguments', data={'option': 'run_id'}))
-        store = RunStore(repo / '.harness')
         store.attach(run)
         before = _gate(run, directory)
         with stops.classify('invalid_input', 'input_schema', data={'option': 'manifest'}):
-            if isinstance(manifest, (str, Path)):
-                try:
-                    value = _read(Path(manifest).absolute())
-                except (OSError, ValueError, RecursionError) as error:
-                    # The operator's file (missing, unreadable, not UTF-8 JSON): this call's input is refused.
-                    raise HarnessError(f'manifest cannot be read as JSON: {error}') from error
-            else:
-                value = manifest
-            value = _manifest(run, value)
+            destinations = _manifest(run, value)
         frozen, journal = _registered(run, directory)
         journal_path = directory / 'workspace-inputs.json'
         if frozen is None:
-            for entry in value['files']:
-                if _destination(run, entry['destination']).exists():
-                    _fail('unknown destination already exists')
             frozen_path = directory / 'workspace-inputs-manifest.json'
-            for path in (frozen_path, journal_path):
-                _canonical(path)
-                if path.exists():
-                    _fail('unbound preparation evidence already exists')
+            for name in (frozen_path.name, journal_path.name):
+                outcome = files.probe((name,)).or_local_io()
+                if outcome.state == 'absent' and outcome.step.leaf:
+                    continue
+                if outcome.state in ('present', 'refused'):
+                    _fail('unbound preparation evidence already exists',
+                          stops.make('evidence', 'runtime_integrity', source={'artifact': outcome.path}))
+                outcome.evidence({'artifact': outcome.path})
+            with stops.classify('invalid_input', 'input_schema', data={'option': 'manifest'}):
+                name_observations = check_destination_layout(
+                    destinations, Path(run['worktree']), state, _copy_temp_name(), run_id=ident)
             # Ledger authority is saved first. A crash is fail-closed: missing
             # frozen evidence cannot silently revert to legacy dispatch behavior.
             raw = (json.dumps(value, sort_keys=True, indent=2) + '\n').encode()
@@ -246,57 +318,59 @@ def prepare_run(repo, ident, manifest):
             with frozen_path.open('xb') as stream:
                 stream.write(raw); stream.flush(); os.fsync(stream.fileno())
             journal = {'schema_version': 1, 'run_id': ident, 'manifest_sha256': digest,
-                       'files': [{'stage': 'declared'} for _ in value['files']]}
+                       'files': [{'stage': 'declared'} for _ in value['files']],
+                       'destination_name_observations': name_observations}
             write_json(journal_path, journal)
         elif frozen != value:
-            _fail('registered manifest is immutable')
+            _manifest_failure('registered manifest is immutable')
         for entry, receipt in zip(value['files'], journal['files']):
             source = repo / entry['source']
             dest = _destination(run, entry['destination'])
             if receipt['stage'] == 'copied':
-                if _identity(dest) != receipt['identity']:
-                    _fail('completed copy changed')
+                if _registered_identity(dest) != receipt['identity']:
+                    _evidence_failure('completed copy changed')
                 continue
             if receipt['stage'] == 'published_intent':
                 # Publication uses rename through hardlink: while both names
                 # exist nlink=2. Never infer ownership from bytes alone.
                 temp = Path(receipt['temp'])
-                _canonical(temp)
-                if temp.parent != dest.parent or not temp.name.startswith('.harness-input-'):
-                    _fail('temporary path binding changed')
+                with stops.evidence_reads():
+                    _canonical(temp)
+                if temp.parent != dest.parent or not temp.name.startswith(_COPY_TEMP_PREFIX):
+                    _evidence_failure('temporary path binding changed')
                 if dest.exists():
                     if temp.exists():
                         ds, ts = dest.lstat(), temp.lstat()
                         if (ds.st_dev, ds.st_ino) != (ts.st_dev, ts.st_ino):
-                            _fail('destination is not the owned published inode')
-                        if _identity(temp, allowed_links=(2,)) != receipt['identity']:
-                            _fail('published temporary inode is unknown or modified')
+                            _evidence_failure('destination is not the owned published inode')
+                        if _registered_identity(temp, allowed_links=(2,)) != receipt['identity']:
+                            _evidence_failure('published temporary inode is unknown or modified')
                         _unlink(temp)
-                    elif _identity(dest) != receipt['identity']:
-                        _fail('destination saved inode identity changed')
+                    elif _registered_identity(dest) != receipt['identity']:
+                        _evidence_failure('destination saved inode identity changed')
                 elif temp.exists():
-                    if _identity(temp) != receipt['identity']:
-                        _fail('temporary input changed')
+                    if _registered_identity(temp) != receipt['identity']:
+                        _evidence_failure('temporary input changed')
                     _publish(temp, dest)
                     _unlink(temp)
                 else:
-                    _fail('publication identity evidence missing')
-                if _identity(dest) != receipt['identity']:
-                    _fail('published identity changed')
+                    _evidence_failure('publication identity evidence missing')
+                if _registered_identity(dest) != receipt['identity']:
+                    _evidence_failure('published identity changed')
                 receipt['stage'] = 'copied'; write_json(journal_path, journal)
                 continue
             if receipt['stage'] != 'declared':
-                _fail('interrupted temporary copy needs explicit inspection')
+                _evidence_failure('interrupted temporary copy needs explicit inspection')
             if dest.exists():
-                _fail('unknown destination collision')
+                _manifest_failure('unknown destination collision')
             source_identity = _identity(source)
             if (source_identity['sha256'] != entry['sha256'] or source_identity['mode'] != entry['mode']):
-                _fail('source changed since manifest preflight')
+                _manifest_failure('source changed since manifest preflight')
             receipt.update(stage='copy_intent', source_identity=source_identity)
             write_json(journal_path, journal)
             with _parent(dest, create=True):
                 pass
-            temp = dest.parent / ('.harness-input-' + uuid.uuid4().hex)
+            temp = dest.with_name(_copy_temp_name())
             # Save name before exclusive creation; an interrupted creation with
             # no saved inode is deliberately not claimed on retry.
             receipt['temp'] = str(temp); write_json(journal_path, journal)
@@ -307,7 +381,7 @@ def prepare_run(repo, ident, manifest):
                 if (not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1
                         or (opened.st_dev, opened.st_ino, opened.st_size, stat.S_IMODE(opened.st_mode)) !=
                            (source_identity['device'], source_identity['inode'], source_identity['size'], source_identity['mode'])):
-                    _fail('source identity changed before copy')
+                    _manifest_failure('source identity changed before copy')
                 with _parent(temp) as temp_parent:
                     temp_fd = os.open(temp.name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, entry['mode'], dir_fd=temp_parent)
                 with os.fdopen(temp_fd, 'wb') as out:
@@ -315,26 +389,28 @@ def prepare_run(repo, ident, manifest):
                     while chunk := inp.read(1024 * 1024):
                         copied += len(chunk)
                         if copied > source_identity['size']:
-                            _fail('source grew during copy')
+                            _manifest_failure('source grew during copy')
                         out.write(chunk)
                     out.flush(); os.fchmod(out.fileno(), entry['mode']); os.fsync(out.fileno())
             identity = _identity(temp)
             if (_identity(source) != source_identity or identity['sha256'] != entry['sha256']
                     or identity['size'] != source_identity['size']):
-                _fail('source changed while copying')
+                _manifest_failure('source changed while copying')
             receipt.update(stage='published_intent', identity=identity)
             write_json(journal_path, journal)
             _destination(run, entry['destination'])
             _publish(temp, dest)
             _unlink(temp)
-            if _identity(dest) != identity:
-                _fail('copy changed while publishing')
+            if _registered_identity(dest) != identity:
+                _evidence_failure('copy changed while publishing')
             receipt['stage'] = 'copied'; write_json(journal_path, journal)
         if _gate(run, directory) != before:
-            _fail('candidate changed during preparation')
+            _fail('candidate changed during preparation', stops.make('workspace_mismatch', 'candidate_changed'))
         validate_inputs(run, directory)
         return {'id': ident, 'status': 'prepared', 'files': len(value['files']),
                 'manifest_sha256': run['workspace_inputs']['manifest_sha256']}
+
+    return with_run_lock(files, prepare_locked, write=True)
 
 def cleanup_inputs(run, directory, *, remove=False):
     """Caller holds run lock. Preview/delete only registered unchanged copies."""
@@ -347,20 +423,20 @@ def cleanup_inputs(run, directory, *, remove=False):
     # Complete batch preflight before recording any deletion or unlinking.
     for entry, receipt in zip(manifest['files'], journal['files']):
         dest = _destination(run, entry['destination'])
-        if _identity(Path(run['repo']) / entry['source']) != receipt.get('source_identity'):
-            _fail('source changed; retain input copies for explicit review')
+        if _registered_identity(Path(run['repo']) / entry['source']) != receipt.get('source_identity'):
+            _evidence_failure('source changed; retain input copies for explicit review')
         if not dest.exists() and receipt.get('stage') in ('delete_intent', 'removed'):
             paths.append(dest); continue
-        if receipt.get('stage') not in ('copied', 'delete_intent') or _identity(dest) != receipt.get('identity'):
-            _fail('unknown or modified input retained: ' + str(dest))
+        if receipt.get('stage') not in ('copied', 'delete_intent') or _registered_identity(dest) != receipt.get('identity'):
+            _evidence_failure('unknown or modified input retained: ' + str(dest))
         paths.append(dest)
     if remove:
         for path, receipt in zip(paths, journal['files']):
             if path.exists():
                 receipt['stage'] = 'delete_intent'
                 write_json(directory / 'workspace-inputs.json', journal)
-                if _identity(path) != receipt['identity']:
-                    _fail('input changed before deletion')
+                if _registered_identity(path) != receipt['identity']:
+                    _evidence_failure('input changed before deletion')
                 _unlink(path)
             receipt['stage'] = 'removed'
             write_json(directory / 'workspace-inputs.json', journal)

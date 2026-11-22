@@ -47,11 +47,17 @@ class FileToolsTests(unittest.TestCase):
         self.assertIsInstance(result['error']['column'], int)
 
     def test_large_integer_is_valid_and_depth_limit_is_tool_error(self):
-        self.put('integer.json', b'9' * 5000)
-        result = json_check('integer.json', self.base)
-        self.assertTrue(result['valid'])
-        self.assertEqual(result['root_type'], 'number')
-        self.assertEqual(result['value_count'], 1)
+        for sign in (b'', b'-'):
+            with self.subTest(sign=sign):
+                data = sign + b'9' * 5000
+                self.put('integer.json', data)
+                result = json_check('integer.json', self.base)
+                self.assertTrue(result['valid'])
+                self.assertEqual(result['root_type'], 'number')
+                self.assertEqual(result['value_count'], 1)
+                self.assertEqual(result['bytes'], len(data))
+                self.assertEqual(result['sha256'], hashlib.sha256(data).hexdigest())
+                self.assertIsNone(result['error'])
         self.put('deep.json', b'[' * 2000 + b'0' + b']' * 2000)
         # Python versions differ in whether this nesting exceeds parser limits.
         try:

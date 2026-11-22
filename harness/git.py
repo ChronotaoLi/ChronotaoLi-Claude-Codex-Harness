@@ -4,9 +4,11 @@ import errno
 import hashlib
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
+import threading
 import time
 from fnmatch import fnmatchcase
 from pathlib import Path
@@ -46,6 +48,73 @@ REFS = Effect("REFS", False, True, False, False)
 INDEX_REFS = Effect("INDEX_REFS", True, True, False, True)
 CHECKOUT = Effect("CHECKOUT", True, True, True, True)
 
+_read_only_scopes = set()
+_read_only_lock = threading.Lock()
+
+
+class ReadOnlyScope:
+    """An independently owned layer, prepared before its cleanup is registered."""
+
+    def acquire(self):
+        from .process_runtime import defer_cleanup_signals
+
+        with defer_cleanup_signals(inherit=False):
+            with _read_only_lock:
+                _read_only_scopes.add(self)
+
+    def close(self):
+        from .process_runtime import defer_cleanup_signals
+
+        # A retry, or cleanup before acquisition, can only affect this layer.
+        # Each holder acquires and closes its own token.
+        if self not in _read_only_scopes:
+            return
+        with defer_cleanup_signals(inherit=False):
+            with _read_only_lock:
+                _read_only_scopes.discard(self)
+
+
+class _ReadOnlyContext:
+    def __init__(self):
+        self._scope = ReadOnlyScope()
+        self._entered = False
+
+    def __enter__(self):
+        if self._entered:
+            raise RuntimeError("A Git read-only context can only be entered once")
+        self._entered = True
+        try:
+            self._scope.acquire()
+        except BaseException:
+            self.__exit__(None, None, None)
+            raise
+
+    def __exit__(self, exc_type, exc, traceback):
+        # A retained context can retry even if an interrupt prevented the first
+        # call to __exit__ or arrived before __enter__ returned to its caller.
+        try:
+            self._scope.close()
+        finally:
+            self._scope.close()
+
+
+def read_only():
+    """Require explicit READ effects throughout the process, including server threads."""
+    return _ReadOnlyContext()
+
+
+def _read_only_depth():
+    with _read_only_lock:
+        return len(_read_only_scopes)
+
+
+def _check_read_only(effect):
+    refused = effect is not READ and _read_only_depth() > 0
+    if refused:
+        raise HarnessError("Git 只读作用域只允许声明为 READ 的调用",
+                           stop=stops.make("runtime_failure", "invariant"))
+
+
 # githooks(5) of Git 2.56. Git without per-event switches ignores these keys; the hook name read covers it.
 HOOK_EVENTS = ("applypatch-msg", "pre-applypatch", "post-applypatch", "pre-commit", "pre-merge-commit",
                "prepare-commit-msg", "commit-msg", "post-commit", "pre-rebase", "post-checkout", "post-merge",
@@ -74,7 +143,7 @@ def _fixed_options():
 
 
 def invocation(repo, args, *, effect, deadline, binding=None, index_file=None, literal_pathspecs=False,
-               isolated_config=False, _config=None):
+               isolated_config=False, _config=None, _c_locale=False):
     """The argv and environment of one Harness Git call; ``args`` are passed through unchanged.
 
     ``_config`` is None or _RANGE_DIFF_CONFIG itself, whose settings follow the fixed ones as ``-c``:
@@ -82,10 +151,11 @@ def invocation(repo, args, *, effect, deadline, binding=None, index_file=None, l
     A declared call that is not READ first reads the configured hook names in the
     very context of the call (same prefix and environment) and disables each one,
     within ``deadline`` (a time.monotonic() value), which the call itself then shares.
-    Besides naming the call in errors, only the first word of ``args`` is looked at:
     ``init`` makes ``repo/.git`` rather than finding a repository, so its name read
     chooses its own configuration context, pinned to that directory (_configured_hooks).
+    The rollback listing requests ``_c_locale`` to recognize Git's unsupported -z diagnostic.
     """
+    _check_read_only(effect)
     _check_config(_config)
     _check_index_file(repo, binding, effect, index_file)
     prefix = ["git", "-C", str(repo)]
@@ -99,8 +169,13 @@ def invocation(repo, args, *, effect, deadline, binding=None, index_file=None, l
     env = {key: value for key, value in os.environ.items()
            if not key.startswith("GIT_") or key in _KEPT_ENVIRONMENT}
     env.update(_FIXED_ENVIRONMENT)
+    if _c_locale:
+        env["LC_ALL"] = "C"
     if isolated_config:
         env.pop("GIT_CONFIG_SYSTEM", None)
+        # Git 2.31 finds global config via these variables and ignores GIT_CONFIG_GLOBAL.
+        env.pop("HOME", None)
+        env.pop("XDG_CONFIG_HOME", None)
         env.update(GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_NOSYSTEM="1")
     if binding is not None:
         env["GIT_COMMON_DIR"] = binding["common_dir"]
@@ -231,32 +306,35 @@ def _launch(argv, env, *, effect, input, deadline):
 
 
 def _run_git(repo, args, binding=None, *, effect=None, input=None, index_file=None, literal_pathspecs=False,
-             timeout=60):
+             timeout=60, isolated_config=False):
     """One call without binding checks: the binding check itself runs through here, so it cannot recurse."""
     deadline = time.monotonic() + timeout
     try:
         argv, env = invocation(repo, args, effect=effect, deadline=deadline, binding=binding,
-                               index_file=index_file, literal_pathspecs=literal_pathspecs)
+                               index_file=index_file, literal_pathspecs=literal_pathspecs,
+                               isolated_config=isolated_config)
         return _launch(argv, env, effect=effect, input=input, deadline=deadline)
     except (OSError, subprocess.TimeoutExpired) as error:
         raise HarnessError(f"git {' '.join(args[:3])} failed: {error}") from error
 
 
 def git_process(repo: Path, *args: str, effect=None, binding=None, timeout=60, input=None, index_file=None,
-                literal_pathspecs=False, isolated_config=False, _config=None):
+                literal_pathspecs=False, isolated_config=False, _config=None, _c_locale=False):
     """Run a pinned command, preserving exit status for provenance checks."""
     # Before the binding check, which starts a process.
+    _check_read_only(effect)
     _check_config(_config)
     _check_index_file(repo, binding, effect, index_file)
     if binding is not None:
-        check_worktree_binding(repo, binding)
+        check_worktree_binding(repo, binding, isolated_config=isolated_config)
     # Measured after the check: the binding checks are calls of their own, with their own budget.
     deadline = time.monotonic() + timeout
     argv, env = invocation(repo, args, effect=effect, deadline=deadline, binding=binding, index_file=index_file,
-                           literal_pathspecs=literal_pathspecs, isolated_config=isolated_config, _config=_config)
+                           literal_pathspecs=literal_pathspecs, isolated_config=isolated_config, _config=_config,
+                           _c_locale=_c_locale)
     p = _launch(argv, env, effect=effect, input=input, deadline=deadline)
     if binding is not None:
-        check_worktree_binding(repo, binding)
+        check_worktree_binding(repo, binding, isolated_config=isolated_config)
     return p
 
 
@@ -279,6 +357,169 @@ def git(repo: Path, *args: str, effect=None, binding=None, input=None, index_fil
                                  literal_pathspecs=literal_pathspecs, isolated_config=isolated_config))
 
 
+def add_worktree(repo: Path, path: Path, commit: str, *, branch=None, binding=None, isolated_config=False):
+    """Register a linked worktree, then populate it in its own pinned Git context."""
+    path = Path(repo).absolute() / path
+    mode = ["-b", branch] if branch is not None else ["--detach"]
+    git(repo, "worktree", "add", "--no-checkout", *mode, str(path), commit,
+        effect=CHECKOUT, binding=binding, isolated_config=isolated_config)
+    registered_path = None
+    try:
+        # The registration can be checked even if reading the new checkout's Git binding fails.
+        registered_path = os.fsencode(path.resolve())
+        created = capture_worktree_binding(path, branch, isolated_config=isolated_config)
+        registered_path = os.fsencode(created["worktree"])
+        try:
+            result = git_process(path, "reset", "-q", "--hard", "--no-recurse-submodules",
+                                 effect=CHECKOUT, binding=created, isolated_config=isolated_config)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise HarnessError(f"git reset -q --hard failed: {error}") from error
+        if result.returncode:
+            detail = result.stderr.decode("utf-8", errors="replace").strip()
+            raise HarnessError(f"git reset -q --hard failed: {detail}",
+                               stop=stops.make("runtime_failure", "io"))
+    except (HarnessError, OSError) as error:
+        # Like a failed checkout inside worktree add, this leaves the new branch in place.
+        undo = None
+        try:
+            git(repo, "worktree", "remove", "--force", str(path),
+                effect=CHECKOUT, binding=binding, isolated_config=isolated_config)
+        except (HarnessError, OSError) as failure:
+            undo = failure
+        directory, registration = _worktree_remains(repo, path, registered_path, binding=binding,
+                                                    isolated_config=isolated_config)
+        if undo is None and directory == registration == "absent":
+            raise
+        detail = f"；{undo}" if undo is not None else ""
+        raise HarnessError(f"{error}；新检出未能完全撤回，保留现场：{path}："
+                           f"目录 {directory}，登记 {registration}{detail}",
+                           stop=stops.of(error)) from error
+    return created
+
+
+def _worktree_remains(repo, path, registered_path, *, binding, isolated_config):
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        directory = "absent"
+    except OSError:
+        directory = "unknown"
+    else:
+        directory = "present"
+    if registered_path is None:
+        return directory, "unknown"
+    try:
+        registration = _worktree_registration(repo, registered_path, binding=binding, isolated_config=isolated_config)
+    except (HarnessError, OSError, RuntimeError, ValueError, subprocess.TimeoutExpired):
+        registration = "unknown"
+    return directory, registration
+
+
+def _worktree_registration(repo, path_bytes, *, binding, isolated_config):
+    # Use the path recorded before rollback, even if the directory now points elsewhere.
+    listing = git_process(repo, "worktree", "list", "--porcelain", "-z",
+                          effect=READ, binding=binding, isolated_config=isolated_config, _c_locale=True)
+    listed = None
+    if listing.returncode:
+        # Git 2.31–2.35 reject -z in the option parser, before reading the registry.
+        if (listing.returncode != 129 or listing.stdout
+                or not listing.stderr.startswith(b"error: unknown switch `z'\nusage: git worktree ")):
+            return "unknown"
+    else:
+        if listing.stderr:
+            return "unknown"
+        listed = _worktree_listing_paths(listing.stdout, path_bytes)
+        if listed is None:
+            return "unknown"
+
+    # Git can silently omit or truncate malformed backlinks. Both a hit and a
+    # miss in the listing need to agree with the complete administrative paths.
+    common = Path(binding["common_dir"] if binding is not None else
+                  git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir", effect=READ,
+                      isolated_config=isolated_config).removesuffix("\n"))
+    registered = with_descriptors(
+        lambda held: _scan_worktree_registrations(held, common, allow_relative=listed is not None))
+    if registered is None or (listed is not None and listed != registered):
+        return "unknown"
+    return "present" if path_bytes in registered else "absent"
+
+
+def _worktree_listing_paths(output, target):
+    """Read linked path identities and check explicit contradictions on the target."""
+    if not output.endswith(b"\0\0"):
+        return None
+    paths = set()
+    for index, record in enumerate(output[:-2].split(b"\0\0")):
+        field, *fields = record.split(b"\0")
+        path = field.removeprefix(b"worktree ")
+        if path == field or not path.startswith(b"/") or path in paths:
+            return None
+        # A missing record separator can leave another path among the attributes.
+        if any(field.startswith(b"worktree ") for field in fields):
+            return None
+        if path == target and (index == 0 or not _target_worktree_fields_valid(fields)):
+            return None
+        paths.add(path)
+        if index == 0:
+            main = path  # Git lists the main worktree first.
+    paths.remove(main)
+    return paths
+
+
+def _target_worktree_fields_valid(fields):
+    attributes = {}
+    for field in fields:
+        name, separator, value = field.partition(b" ")
+        if name in attributes:
+            return False
+        attributes[name] = value if separator else None
+    head = attributes.pop(b"HEAD", None)
+    if head is None or not re.fullmatch(rb"(?:[0-9a-f]{40}|[0-9a-f]{64})", head):
+        return False
+    if b"detached" in attributes:
+        if attributes.pop(b"detached") is not None or b"branch" in attributes:
+            return False
+    else:
+        branch = attributes.pop(b"branch", None)
+        if branch is None or not re.fullmatch(rb"refs/[^\x00-\x20\x7f]+", branch):
+            return False
+    return (not attributes.keys() - {b"locked", b"prunable"}
+            and b"" not in attributes.values()
+            and not {b"locked", b"prunable"} <= attributes.keys())
+
+
+def _scan_worktree_registrations(held, common, *, allow_relative):
+    """Read the linked-worktree backlinks without following links in the administrative registry."""
+    if not common.is_absolute():
+        return None
+    root = held.open(common, DIRECTORY_FLAGS)
+    try:
+        worktrees = held.open("worktrees", DIRECTORY_FLAGS, dir_fd=root)
+    except FileNotFoundError:
+        return set()
+    paths = set()
+    for name in os.listdir(worktrees):
+        entry = held.open(name, DIRECTORY_FLAGS, dir_fd=worktrees)
+        admin = common / "worktrees" / name
+        backlink = _binding_file_at(held, entry, admin / "gitdir")
+        held.close(entry)
+        checkout = backlink.removesuffix(b"/.git\n")
+        if not checkout or checkout == backlink or b"\0" in checkout:
+            return None
+        if not os.path.isabs(checkout):
+            if not allow_relative:
+                return None
+            # Git writes relative paths from the administrative directory to the
+            # registered path. Compare them without accessing the user directory.
+            checkout = os.path.normpath(os.path.join(os.fsencode(admin), checkout))
+        elif os.path.normpath(checkout) != checkout:
+            return None
+        if checkout in paths:
+            return None
+        paths.add(checkout)
+    return paths
+
+
 def _binding_file(path):
     try:
         if not stat.S_ISREG(path.lstat().st_mode):
@@ -295,7 +536,7 @@ def _binding_path(parent, data):
     return (parent / value).resolve()
 
 
-def capture_worktree_binding(worktree: Path, expected_branch: str | None):
+def capture_worktree_binding(worktree: Path, expected_branch: str | None, *, isolated_config=False):
     """Persist the newly created linked worktree's actual Git identity.
 
     A detached binding also pins its commit, for disposable verification
@@ -303,8 +544,10 @@ def capture_worktree_binding(worktree: Path, expected_branch: str | None):
     """
     worktree = worktree.resolve()
     gitfile = _binding_file(worktree / ".git")
-    git_dir = Path(git(worktree, "rev-parse", "--absolute-git-dir", effect=READ).removesuffix("\n")).resolve()
-    common_dir = Path(git(worktree, "rev-parse", "--path-format=absolute", "--git-common-dir", effect=READ)
+    git_dir = Path(git(worktree, "rev-parse", "--absolute-git-dir", effect=READ,
+                       isolated_config=isolated_config).removesuffix("\n")).resolve()
+    common_dir = Path(git(worktree, "rev-parse", "--path-format=absolute", "--git-common-dir", effect=READ,
+                          isolated_config=isolated_config)
                       .removesuffix("\n")).resolve()
     if git_dir == common_dir:
         raise HarnessError("只能绑定独立的链接 worktree，不能使用主仓库 Git 目录")
@@ -315,20 +558,21 @@ def capture_worktree_binding(worktree: Path, expected_branch: str | None):
                "backlink_sha256": hashlib.sha256(_binding_file(git_dir / "gitdir")).hexdigest(),
                "commondir_sha256": hashlib.sha256(_binding_file(git_dir / "commondir")).hexdigest()}
     if branch is None:
-        binding["detached_head"] = git(worktree, "rev-parse", "HEAD", effect=READ).strip()
-    check_worktree_binding(worktree, binding)
+        binding["detached_head"] = git(worktree, "rev-parse", "HEAD", effect=READ,
+                                       isolated_config=isolated_config).strip()
+    check_worktree_binding(worktree, binding, isolated_config=isolated_config)
     return binding
 
 
 def _binding_file_at(held, root_fd, path):
-    """Read the root's .git through an open root descriptor; ``path`` only names it in errors.
+    """Read a binding file from its open parent descriptor.
 
-    The .git descriptor is opened into ``held`` and closed here once read; after a
+    The file descriptor is opened into ``held`` and closed here once read; after a
     failure the caller's cleanup of ``held`` closes it.
     """
     try:
         # Nonblocking: a FIFO without a writer must not hang the open before fstat refuses it.
-        descriptor = held.open(".git", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=root_fd)
+        descriptor = held.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=root_fd)
         if not stat.S_ISREG(os.fstat(descriptor).st_mode):
             raise HarnessError(f"worktree Git 绑定文件必须为普通文件：{path}")
         # Not deferred: an interrupt ends a slow read as it would a read by path.
@@ -351,10 +595,11 @@ def _check_binding_record(binding):
 
 
 @stops.classifies("workspace_mismatch", "binding_changed")
-def check_worktree_binding(worktree: Path, binding):
+def check_worktree_binding(worktree: Path, binding, *, isolated_config=False):
     """Refuse redirected metadata before any run-worktree Git command."""
     _check_binding_record(binding)
-    _check_binding(worktree, binding, lambda checked: _binding_file(checked / ".git"))
+    _check_binding(worktree, binding, lambda checked: _binding_file(checked / ".git"),
+                   isolated_config=isolated_config)
 
 
 @stops.classifies("workspace_mismatch", "binding_changed")
@@ -376,7 +621,7 @@ def open_bound_root(held, worktree: Path, binding) -> int:
     return root
 
 
-def _check_binding(worktree, binding, read_gitfile):
+def _check_binding(worktree, binding, read_gitfile, *, isolated_config=False):
     # read_gitfile gets the path resolved and compared here, never a second resolution of the caller's path.
     worktree = worktree.resolve()
     git_dir, common_dir = Path(binding["git_dir"]), Path(binding["common_dir"])
@@ -399,7 +644,8 @@ def _check_binding(worktree, binding, read_gitfile):
     _binding_file(git_dir / "HEAD")
     # symbolic-ref follows nested refs as Git commit does. Reading only HEAD
     # would miss a run branch changed into a symbolic ref pointing to main.
-    result = _run_git(worktree, ("symbolic-ref", "-q", "HEAD"), binding, effect=READ)
+    result = _run_git(worktree, ("symbolic-ref", "-q", "HEAD"), binding, effect=READ,
+                      isolated_config=isolated_config)
     if binding["branch"] is not None:
         if result.returncode or os.fsdecode(result.stdout).strip() != binding["branch"]:
             raise HarnessError("worktree Git 分支绑定已改变；保留现场")
@@ -445,7 +691,9 @@ def describe_paths(names):
 
 def reject_submodules(repo: Path, *, binding=None):
     """Reject indexed gitlinks, including uninitialized or missing submodules."""
-    _reject_indexed_submodules(git_bytes(repo, "ls-files", "--stage", "-z", effect=READ, binding=binding))
+    index = git_bytes(repo, "ls-files", "--stage", "-z", effect=READ, binding=binding)
+    with stops.classify("invalid_input", "cli_arguments", data={"option": "--repo"}):
+        _reject_indexed_submodules(index)
 
 
 def _reject_indexed_submodules(index):
@@ -581,7 +829,7 @@ def _type_changed(name):
                         stop=stops.make("workspace_mismatch", "candidate_changed"))
 
 
-def _parents(held, root, names):
+def _parents(held, root, names, *, verify_type_changes=True):
     """Yield ``(name, parent, leaf)`` for sorted worktree-relative ``names``.
 
     ``parent`` is the descriptor of the directory holding ``leaf``, opened level by
@@ -589,6 +837,7 @@ def _parents(held, root, names):
     ancestor is missing or no directory (a link, a file): Git then lists the name as
     deleted. Sorted names sharing a prefix are adjacent, so each directory opens once
     and at most depth + 1 stay open. Permission and I/O failures propagate.
+    Snapshots confirm the type on an ambiguous open failure to detect a directory replacement.
     """
     stack, gone = [((), root)], None
     for name in names:
@@ -606,7 +855,10 @@ def _parents(held, root, names):
                 stack.append((above[:depth + 1], held.open(
                     segment, _SEARCH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent)))
             except OSError as error:
-                if error.errno != errno.ENOENT:
+                if not verify_type_changes:
+                    if error.errno not in (errno.ENOENT, errno.ENOTDIR, errno.ELOOP):
+                        raise
+                elif error.errno != errno.ENOENT:
                     if error.errno not in _TYPE_ERRNOS:
                         raise
                     try:
@@ -717,6 +969,31 @@ def changed(repo: Path, *, binding=None):
     return sorted((set(tracked) | set(staged) | set(untracked)) - {""})
 
 
+def special_files(repo: Path, paths):
+    """Find FIFOs, sockets and devices among the given Git paths using only metadata."""
+    def inspect(held):
+        expected = os.lstat(repo)
+        root = held.open(repo, _SEARCH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        opened = os.fstat(root)
+        if not stat.S_ISDIR(opened.st_mode):
+            raise NotADirectoryError(errno.ENOTDIR, "Worktree root is not a directory", repo)
+        if not os.path.samestat(expected, opened):
+            raise OSError(errno.ESTALE, "Worktree root changed while opening", repo)
+        found = []
+        for name, parent, leaf in _parents(held, root, sorted(paths), verify_type_changes=False):
+            if parent is None:
+                continue
+            try:
+                mode = os.stat(leaf, dir_fd=parent, follow_symlinks=False).st_mode
+            except (FileNotFoundError, NotADirectoryError):
+                continue
+            if stat.S_IFMT(mode) in (stat.S_IFIFO, stat.S_IFSOCK, stat.S_IFCHR, stat.S_IFBLK):
+                found.append(name)
+        return found
+
+    return with_descriptors(inspect)
+
+
 def validate_scope_pattern(pattern: str):
     """Require a root-relative pattern without changing literal filename bytes."""
     parts = pattern.split("/")
@@ -752,7 +1029,13 @@ def path_matches(name: str, pattern: str) -> bool:
 
 
 class ScopeViolation(HarnessError):
-    """A validated Git candidate contains paths outside its task authority."""
+    """A Git candidate contains paths forbidden by scope or unrecordable by Git."""
+
+
+def _require_recordable(repo, path, *, source=None):
+    if special_files(repo, (path,)):
+        raise ScopeViolation(f"候选含 Git 不能记录的特殊文件：{describe_paths([path])}",
+                             stop=stops.make("scope_violation", "special_file", data={"path": path}, source=source))
 
 
 def check_scope(repo: Path, allowed: list[str], *, binding=None, task_id=None):
@@ -772,6 +1055,7 @@ def check_scope(repo: Path, allowed: list[str], *, binding=None, task_id=None):
             raise ScopeViolation(f"任务修改了受保护路径：{path}", stop=stops.make("scope_violation", "protected_path", data={"path": path}, source=source))
         if not any(path_matches(path, pattern) for pattern in allowed):
             raise ScopeViolation(f"任务越界修改：{path}；允许范围：{allowed}", stop=stops.make("scope_violation", "candidate_outside_scope", data={"path": path}, source=source))
+        _require_recordable(repo, path, source=source)
     return paths
 
 
@@ -846,6 +1130,8 @@ def archive_and_reset(repo: Path, expected_head: str, archive: Path, owned_root:
     if head(repo, binding=binding) != expected_head:
         raise HarnessError("重置前 HEAD 与检查点不同；保留现场")
     paths = changed(repo, binding=binding)
+    for name in paths:
+        _require_recordable(repo, name)
     # Refuse obstructed tracked descendants instead of following a replacement
     # symlink out of the worktree while archiving or creating such a link in it.
     for name in paths:

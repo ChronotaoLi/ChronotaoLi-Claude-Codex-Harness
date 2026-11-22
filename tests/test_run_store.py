@@ -7,6 +7,7 @@ hanging.
 from concurrent.futures import ThreadPoolExecutor
 import contextlib
 import errno
+import hashlib
 import threading
 import json
 import os
@@ -20,8 +21,8 @@ from unittest.mock import patch
 from harness import run_lifecycle, state_files, stops
 from harness.run_lifecycle import RunLifecycle
 from harness.run_store import RunStore
-from harness.state_files import StateReadError
-from harness.util import EvidenceError, HarnessError, read_json
+from harness.state_files import LockedDirectory, StateReadError
+from harness.util import EvidenceError, HarnessError, dump, read_json
 from test_harness import ROOT, RepoCase
 from test_provider_failures import FifoWatchdog
 from test_state_files import FakeOs, failing, held_lock
@@ -151,13 +152,104 @@ class RunStoreTests(unittest.TestCase):
         with self.assertRaisesRegex(HarnessError, "其他写入者"):
             self.store.commit()
 
+    def test_noncanonical_source_has_a_canonical_baseline_and_raw_compare_and_swap(self):
+        self.store.attach(self.state())
+        self.store.commit()
+        path = self.root / "runs/run_one/state.json"
+        run = self.load()
+        source = json.dumps(run, indent=1).encode()
+        path.write_bytes(source)
+        self.store.attach(self.load())
+        self.assertTrue(self.store.matches_commit())
+        self.assertEqual(self.store._digest, hashlib.sha256(source).hexdigest())
+        self.store.run["status"] = "有变化"
+        self.assertFalse(self.store.matches_commit())
+        self.assertEqual(self.store.commit(), 2)
+        self.assertEqual(path.read_bytes(), (dump(self.store.run) + "\n").encode())
+        self.assertTrue(self.store.matches_commit())
+
+    def test_success_adopts_the_single_serialization_without_reading_back(self):
+        self.store.attach(self.state())
+        self.store.commit()
+        path = self.root / "runs/run_one/state.json"
+        self.store.run["status"] = "写出的字节"
+        written = []
+        replace, read = LockedDirectory.replace, LockedDirectory.read
+
+        def record(locked, name, data):
+            written.append(data)
+            return replace(locked, name, data)
+
+        def before_write(locked, name, **kwargs):
+            self.assertFalse(written, "successful commit read back its write")
+            return read(locked, name, **kwargs)
+
+        with patch.object(LockedDirectory, "replace", record), patch.object(LockedDirectory, "read", before_write), \
+                patch("harness.run_store.dump", wraps=dump) as serialize:
+            self.assertEqual(self.store.commit(), 2)
+        self.assertEqual(serialize.call_count, 1)
+        self.assertEqual(written, [path.read_bytes()])
+        self.assertEqual(self.store._digest, hashlib.sha256(written[0]).hexdigest())
+        self.assertTrue(self.store.matches_commit())
+
+    def test_current_check_reconciles_an_ambiguous_write_and_keeps_third_bytes_untouched(self):
+        self.store.attach(self.state())
+        self.store.commit()
+        path = self.root / "runs/run_one/state.json"
+        self.store.run["status"] = "new"
+        write_error = OSError(errno.EIO, "replace reported failure")
+        read_error = OSError(errno.EIO, "ledger unreadable")
+        replace, read = LockedDirectory.replace, LockedDirectory.read
+        written = []
+
+        def fail_after_write(locked, name, data):
+            replace(locked, name, data)
+            written.append(data)
+            raise write_error
+
+        def fail_reread(locked, name, **kwargs):
+            if written:
+                raise read_error
+            return read(locked, name, **kwargs)
+
+        with patch.object(LockedDirectory, "replace", fail_after_write), \
+                patch.object(LockedDirectory, "read", fail_reread), self.assertRaises(OSError) as caught:
+            self.store.commit()
+        self.assertIs(caught.exception, write_error)
+        pending = self.store._pending
+        self.assertIs(pending.candidate, self.store._attempted)
+        self.assertEqual(self.store.run["store_revision"], 1)
+
+        external = written[0] + b"\n"
+        path.write_bytes(external)
+        self.store.resolve()
+        self.assertIs(self.store._pending, pending)
+        with self.assertRaisesRegex(HarnessError, "其他写入者"):
+            self.store.check_current()
+        self.assertEqual(path.read_bytes(), external)
+        self.assertEqual(self.store.run["store_revision"], 1)
+
+        path.write_bytes(written[0])
+        self.store.check_current()
+        self.assertIsNone(self.store._pending)
+        self.assertEqual(self.store.run["store_revision"], 2)
+        self.assertTrue(self.store.matches_commit())
+        self.assertEqual(self.store.commit(), 3)
+
     def test_stale_attachment_does_not_adopt_new_source(self):
         self.store.attach(self.state())
         self.store.commit()
         stale = self.load()
         self.store.commit()
-        with self.assertRaisesRegex(HarnessError, "来源不一致"):
-            RunStore(self.root).attach(stale)
+        reader = RunStore(self.root)
+        ledger = self.root / "runs" / stale["id"] / "state.json"
+        original = ledger.read_bytes()
+        with self.assertRaisesRegex(HarnessError, "来源不一致") as caught:
+            reader.attach(stale)
+        self.assertEqual(kind(caught.exception), ("runtime_failure", "invariant"))
+        self.assertEqual(ledger.read_bytes(), original)
+        reader.attach(self.load())
+        self.assertTrue(reader.matches_commit())
 
     def test_switching_runs_preserves_separate_revisions(self):
         self.store.attach(self.state())
@@ -177,6 +269,21 @@ class RunStoreTests(unittest.TestCase):
         self.assertNotIn("store_revision", self.store.run)
         self.assertFalse((self.root / "runs/run_one/state.json").exists())
         self.assertEqual(self.store.commit(), 1)
+
+    def test_stop_rebase_excludes_a_candidate_the_caller_deliberately_rolled_back(self):
+        run = self.state()
+        self.store.attach(run)
+        self.store.commit()
+        before = self.load()
+        run["operator_decisions"] = [{"answer": "unpublished"}]
+        with patch.object(LockedDirectory, "replace", side_effect=OSError(errno.EIO, "write failed")):
+            with self.assertRaises(OSError):
+                self.store.commit()
+        run.pop("operator_decisions")
+        self.store.discard_attempt()
+        self.store.rebase_for_stop()
+        self.assertIs(self.store.run, run)
+        self.assertEqual(run, before)
 
     def test_revision_and_identity_tampering_rejected(self):
         self.store.attach(self.state())

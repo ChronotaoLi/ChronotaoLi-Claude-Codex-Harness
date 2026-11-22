@@ -4,8 +4,10 @@ There is one transport: Claude's JSON output in process.stdout. A retryable
 record also carries the provider classification of the failure (version 2,
 ``provider``), derived from the same bytes. These records never bind a candidate.
 """
-import hashlib
+from pathlib import Path
 
+from . import stops
+from .state_files import StateFiles
 from .util import HarnessError, strict_json_loads
 
 
@@ -18,22 +20,39 @@ SOURCES = (
 STATES = ('retryable', 'invalid', 'returned', 'unknown')
 LIMIT = 16 * 1024 * 1024
 _DECODE_ERRORS = (ValueError, UnicodeError, RecursionError)
+_INSPECTED = frozenset(('process.stdout', 'process.outcome.json', 'provider-result.json'))
 
 
-def fingerprint(job, names):
-    if job.is_symlink() or job.resolve() != job or not job.is_dir():
-        raise HarnessError('unsafe worker return evidence directory')
-    result = {}
+def worker_evidence_files(job):
+    """Require the dispatch directory before inspecting any of its evidence."""
+    job = Path(job)
+    parent = StateFiles.nofollow_directory(job.parent)
+    probe = parent.probe((job.name,), expect='directory').or_local_io()
+    if probe.state != 'present':
+        probe.evidence({'artifact': str(job)})
+    return parent.under(job.name)
+
+
+def _read_sources(job, names, *, keep=()):
+    files = worker_evidence_files(job)
+    sources = {}
     for name in names:
-        path = job / name
-        if path.is_symlink() or path.exists() and not path.is_file():
-            raise HarnessError('unsafe worker return evidence: ' + name)
-        if not path.exists():
-            result[name] = None
-        else:
-            with path.open('rb') as stream:
-                result[name] = hashlib.file_digest(stream, 'sha256').hexdigest()
-    return result
+        outcome = files.digest((name,), keep=LIMIT if name in keep else 0)
+        if outcome.state == 'absent' and outcome.step.leaf:
+            sources[name] = None
+            continue
+        outcome.evidence({'artifact': outcome.path})
+        sources[name] = outcome
+    return sources
+
+
+def _digests(sources):
+    return {name: outcome.digest if outcome is not None else None for name, outcome in sources.items()}
+
+
+@stops.reads_evidence
+def fingerprint(job, names):
+    return _digests(_read_sources(job, names))
 
 
 def decode_terminal(raw):
@@ -71,14 +90,7 @@ def decode_terminal(raw):
     return 'object', envelope, payload, ''
 
 
-def _read_limited(job, name):
-    with (job / name).open('rb') as stream:
-        raw = stream.read(LIMIT + 1)
-    if len(raw) > LIMIT:
-        raise ValueError('worker return evidence exceeds inspection limit')
-    return raw
-
-
+@stops.reads_evidence
 def inspect_return(job):
     """Classify an exited, unsealed worker's evidence: retryable, invalid, returned or unknown.
 
@@ -87,8 +99,17 @@ def inspect_return(job):
     object result without a candidate seal stays returned (it may be a blocker).
     """
     from .provider_failures import classify
-    sources = fingerprint(job, SOURCES)
+    inputs = _read_sources(job, SOURCES, keep=_INSPECTED)
+    sources = _digests(inputs)
     provider = None
+
+    def inspected(name, default=None):
+        outcome = inputs[name]
+        if outcome is None:
+            return default
+        if len(outcome.data) > LIMIT:
+            raise ValueError('worker return evidence exceeds inspection limit')
+        return outcome.data
 
     def result(state, reason):
         # A writer or external edit must not race the classification.
@@ -100,19 +121,18 @@ def inspect_return(job):
     if sources['returned-result.json'] is not None or sources['response.json'] is not None:
         return result('returned', 'worker result exists without a candidate seal')
     try:
-        raw = _read_limited(job, 'process.stdout') if sources['process.stdout'] is not None else b''
+        raw = inspected('process.stdout', b'')
         kind, envelope, _, detail = decode_terminal(raw)
-        outcome = (_read_limited(job, 'process.outcome.json')
-                   if sources['process.outcome.json'] is not None else None)
+        outcome = inspected('process.outcome.json')
         # Worker calls are Claude only (the configuration refuses a Codex worker).
         provider = classify(outcome, raw, 'claude')
         if sources['provider-result.json'] is not None:
-            published = strict_json_loads(_read_limited(job, 'provider-result.json'))
+            published = strict_json_loads(inspected('provider-result.json'))
             if envelope is None or published != envelope:
                 return result('unknown', 'provider result conflicts with original output')
-    except (ValueError, UnicodeError, RecursionError) as error:
+    except _DECODE_ERRORS as error:
         # Over the limit or not strictly decodable: a property of the bytes. An
-        # OSError is not; it leaves (local I/O) and no verdict is recorded.
+        # I/O failure leaves without a verdict.
         return result('unknown', 'unreadable worker return evidence: ' + type(error).__name__)
     if kind == 'absent':
         return result('retryable', 'direct JSON output is absent or empty after exit')
@@ -133,13 +153,15 @@ def _provider_shape(record):
             and (provider['http_status'] is None or type(provider['http_status']) is int))
 
 
+@stops.reads_evidence
 def validate_return_evidence(job, record):
     if (not isinstance(record, dict) or set(record) != {'version', 'state', 'reason', 'sources', 'provider'}
             or record['version'] != 2 or record['state'] not in STATES or not _provider_shape(record)
             or not isinstance(record['reason'], str)
             or not isinstance(record['sources'], dict) or set(record['sources']) != set(SOURCES)):
         raise HarnessError('invalid worker return evidence record')
-    if fingerprint(job, SOURCES) != record['sources']:
+    actual = inspect_return(job)
+    if actual['sources'] != record['sources']:
         raise HarnessError('worker return evidence changed; preserve original dispatch')
-    if inspect_return(job) != record:
+    if actual != record:
         raise HarnessError('worker return classification does not match bound evidence')
