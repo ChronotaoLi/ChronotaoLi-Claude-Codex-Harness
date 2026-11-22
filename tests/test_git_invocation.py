@@ -2823,6 +2823,267 @@ class LifecycleEffectTests(IsolatedRepoCase):
                                  enabled, lines)
 
 
+class AcceptanceGitFormsTests(IsolatedRepoCase):
+    """Design 1 §3.6, as called through the Git layer (design 6 case 11)."""
+
+    def setUp(self):
+        super().setUp()
+        self.worktree = self.scratch / "candidate"
+        self.ref = "refs/heads/harness/run"
+        self.parent = plain_git(self.repo, "rev-parse", "HEAD").stdout.decode().strip()
+        plain_git(self.repo, "worktree", "add", "-b", self.ref.removeprefix("refs/heads/"), str(self.worktree))
+        self.binding = git.capture_worktree_binding(self.worktree, self.ref.removeprefix("refs/heads/"))
+        self.common = Path(self.binding["common_dir"])
+        self.branch_log = self.common / "logs" / self.ref
+        self.head_log = Path(self.binding["git_dir"]) / "logs" / "HEAD"
+        self.other = self.scratch / "other"
+        plain_git(self.repo, "worktree", "add", "-b", "other", str(self.other), self.parent)
+        self.other_admin = self.common / "worktrees" / self.other.name
+        self.private_index = self.scratch / "private.index"
+        self.literal = "new[1].txt"
+        (self.worktree / self.literal).write_bytes(b"candidate\r\n")
+        (self.worktree / "new1.txt").write_bytes(b"glob decoy\n")
+        (self.worktree / "real-only").write_bytes(b"real index sentinel\n")
+        plain_git(self.worktree, "add", "--", "real-only")
+        (self.worktree / "__pycache__").mkdir()
+        (self.worktree / "__pycache__" / "ignored").write_bytes(b"ignored file\n")
+        self.alias = "refs/heads/alias"
+        plain_git(self.worktree, "symbolic-ref", self.alias, self.ref)
+        plain_git(self.repo, "pack-refs", "--all", "--no-prune")
+        self.assertIn(f"{self.parent} refs/heads/main".encode(),
+                      (self.common / "packed-refs").read_bytes().splitlines())
+        for linked in (self.worktree, self.other):
+            for ref in ("refs/worktree/independent", "refs/bisect/sentinel"):
+                plain_git(linked, "update-ref", "--create-reflog", ref, self.parent)
+        self.markers = Markers(self.scratch)
+        self.markers.arm(self.repo, scopes=("repo",))
+        with (self.common / "info" / "attributes").open("a") as attributes:
+            attributes.write("*.txt text eol=lf\n")
+        with self.markers.included.open("a") as config:
+            config.write("[author]\n\tname = Other Author\n\temail = other@author.invalid\n"
+                         "[committer]\n\tname = Other Committer\n\temail = other@committer.invalid\n"
+                         "[i18n]\n\tcommitEncoding = ISO-8859-1\n")
+
+    def objects(self):
+        return set(plain_git(self.repo, "cat-file", "--batch-all-objects",
+                             "--batch-check=%(objectname)").stdout.decode().splitlines())
+
+    def run_form(self, row, *args, effect=git.READ, private=False, input=None, literal=False, code=0,
+                 objects_written=0, ref_moved=False, index_written=False, clean_required=False,
+                 worktree=None, binding=None):
+        worktree = self.worktree if worktree is None else worktree
+        binding = self.binding if binding is None else binding
+        private_index = self.private_index if private else None
+        admin = Path(binding["git_dir"])
+        real_index = admin / "index"
+
+        def preserved():
+            # Moving the checked-out branch appends both reflogs (design 1 §9).
+            moved = (self.common / self.ref, self.branch_log, self.head_log)
+            omitted = {str(path) for path in moved} if ref_moved else set()
+            admins = dict.fromkeys((self.common, Path(self.binding["git_dir"]), self.other_admin, admin))
+            refs = self.files(self.common / "packed-refs",
+                              *(directory / name for directory in admins
+                                for name in ("refs", "logs", "HEAD", "ORIG_HEAD")))
+            # A failed CAS may briefly create a lock file, changing the containing directory's mtime.
+            return ({path: value[:3] if stat.S_ISDIR(value[0]) else value
+                     for path, value in refs.items() if path not in omitted},
+                    self.files(self.repo, self.other, worktree, skip=(".git", ".harness")),
+                    self.files(self.common / "index", self.other_admin / "index"),
+                    {} if index_written else self.files(real_index),
+                    {} if private and effect is git.PRIVATE else self.files(self.private_index))
+
+        with self.subTest(row=row, argv=args):
+            before = preserved()
+            old_objects = self.objects()
+            self.markers.reset()
+            launch = git._launch
+            seen = []
+
+            def observe(argv, env, *, effect, **kwargs):
+                result = launch(argv, env, effect=effect, **kwargs)
+                seen.append((effect, argv, env, result))
+                return result
+
+            with patch.object(git, "_launch", observe):
+                if row == "G10":  # The binding check itself uses _run_git to avoid recursion.
+                    git.check_worktree_binding(worktree, binding)
+                    result, = (record[3] for record in seen)
+                else:
+                    result = git.git_process(worktree, *args, effect=effect, binding=binding,
+                                             index_file=private_index, input=input, literal_pathspecs=literal)
+            (launched_effect, argv, env, _), = (record for record in seen if record[3] is result)
+            self.assertEqual(tuple(argv[-len(args):]), args)
+            self.assertIn("--git-dir=" + binding["git_dir"], argv)
+            self.assertIn("--work-tree=" + binding["worktree"], argv)
+            self.assertEqual(env.get("GIT_COMMON_DIR"), binding["common_dir"])
+            self.assertEqual(env.get("GIT_INDEX_FILE"), str(private_index) if private else None)
+            self.assertEqual("--literal-pathspecs" in argv[:-len(args)], literal)
+            self.assertIs(launched_effect, effect)
+            # G16/G17 cover Git effects here. Inheritance of run.lock is verified by D1-A1.
+            self.assertEqual(launched_effect.interruptible, row not in ("G16", "G17"))
+            if code is None:
+                self.assertNotEqual(result.returncode, 0, result.stderr)
+            else:
+                self.assertEqual(result.returncode, code, result.stderr)
+            after = preserved()
+            for key in before[0].keys() | after[0].keys():
+                self.assertEqual(before[0].get(key), after[0].get(key), key)
+            self.assertEqual(before[1:], after[1:])
+            after_objects = self.objects()
+            self.assertLessEqual(old_objects, after_objects)
+            self.assertEqual(len(after_objects - old_objects), objects_written)
+            marks = self.markers.read()
+            clean = ("clean", str(worktree.resolve()))
+            # Git can recheck stat data and run clean during write-tree and read-tree --reset.
+            allowed = {clean} if row in ("G4", "G5", "G17", "G21") and effect.filters else set()
+            self.assertLessEqual(set(marks), allowed, marks)
+            if clean_required:
+                self.assertIn(clean, marks)
+        return result.stdout
+
+    def test_acceptance_and_completion_git_forms(self):
+        run = self.run_form
+        parent = self.parent
+        # Check that plain Git reaches the installed hook and signing programs.
+        plain_git(self.worktree, "update-ref", "refs/heads/control", parent)
+        control_env = dict(os.environ, GIT_INDEX_FILE=str(self.scratch / "control.index"))
+        plain_git(self.worktree, "-c", "core.fsmonitor=false", "read-tree", parent, env=control_env)
+        labels = {label for label, _ in self.markers.read()}
+        for event in ("reference-transaction", "post-index-change"):
+            self.assertIn(f"hookdir:{event}", labels)
+            if configured_hooks_exist():
+                self.assertIn(f"config:repo-{event}", labels)
+        signed = plain_git(self.worktree, *IDENTITY, "commit-tree", "-S", f"{parent}^{{tree}}",
+                           "-m", "signing control", check=False)
+        self.assertNotEqual(signed.returncode, 0, signed.stderr)
+        self.assertIn("gpg", self.markers.kinds())
+        parent_tree = run("G7", "rev-parse", "--verify", f"{parent}^{{tree}}").decode().strip()
+        real_before = run("G15", "ls-files", "--stage", "-z")
+        self.assertIn(b"\treal-only\0", real_before)
+
+        run("G1", "read-tree", parent, private=True, effect=git.PRIVATE)
+        self.assertTrue(self.private_index.is_file())
+        self.assertEqual(run("G2", "ls-files", "-z", private=True), b".gitignore\0test_hello.py\0")
+        run("G3", "update-index", "-z", "--force-remove", "--stdin", private=True, effect=git.PRIVATE,
+            input=b"test_hello.py\0")
+        self.assertTrue((self.worktree / "test_hello.py").is_file())
+        self.assertEqual(run("G2", "ls-files", "-z", private=True), b".gitignore\0")
+        run("G4", "add", "--", self.literal, private=True, effect=git.PRIVATE, literal=True,
+            objects_written=1, clean_required=True)
+        staged = run("G6", "ls-files", "--stage", "-z", private=True)
+        staged_names = [entry.split(b"\t", 1)[1] for entry in staged.split(b"\0")[:-1]]
+        self.assertEqual(staged_names, [b".gitignore", os.fsencode(self.literal)])
+        blob = staged.split(b"\0")[1].split()[1].decode()
+        self.assertEqual(plain_git(self.repo, "cat-file", "blob", blob).stdout, b"candidate\n")
+        tree = run("G5", "write-tree", private=True, effect=git.PRIVATE, objects_written=1).decode().strip()
+        self.assertNotEqual(tree, parent_tree)
+        raw = run("G8", "diff-tree", "-r", "-z", "--no-renames", "--no-ext-diff", "--no-textconv", parent, tree)
+        added, literal_name, removed, removed_name, end = raw.split(b"\0")
+        self.assertEqual((literal_name, removed_name, end), (os.fsencode(self.literal), b"test_hello.py", b""))
+        self.assertEqual((added.split()[-1], removed.split()[-1]), (b"A", b"D"))
+
+        message = "Accept café\n\n# retained\n  indented  \n\n".encode()
+        commit = run("G9", "commit-tree", tree, "-p", parent, "-F", "-", effect=git.PRIVATE,
+                     input=message, objects_written=1).decode().strip()
+        self.assertEqual(run("G7", "rev-parse", "--verify", f"{commit}^{{tree}}").decode().strip(), tree)
+        self.assertEqual(run("G10", "symbolic-ref", "-q", "HEAD"), self.ref.encode() + b"\n")
+        self.assertEqual(run("G11", "symbolic-ref", "-q", self.alias), self.ref.encode() + b"\n")
+        self.assertEqual(run("G11", "symbolic-ref", "-q", self.ref, code=1), b"")
+        self.assertEqual(run("G12", "rev-parse", "--verify", "-q", self.ref), parent.encode() + b"\n")
+        self.assertEqual(run("G12", "rev-parse", "--verify", "-q", "refs/heads/absent", code=1), b"")
+        missing = "0" * len(parent)
+        kinds = run("G13", "cat-file", "--batch-check", input=f"{parent}\n{commit}\n{tree}\n{missing}\n".encode())
+        self.assertEqual([line.decode().split()[:2] for line in kinds.splitlines()],
+                         [[parent, "commit"], [commit, "commit"], [tree, "tree"], [missing, "missing"]])
+        original = run("G14", "cat-file", "commit", parent)
+        self.assertEqual(original.splitlines()[0], f"tree {parent_tree}".encode())
+        raw_commit = run("G14", "cat-file", "commit", commit)
+        headers, body = raw_commit.split(b"\n\n", 1)
+        tree_header, parent_header, author, committer = headers.splitlines()
+        self.assertEqual((tree_header, parent_header), (f"tree {tree}".encode(), f"parent {parent}".encode()))
+        self.assertEqual(author.rsplit(b" ", 2)[0], b"author Personal Harness <harness@localhost>")
+        self.assertEqual(committer.rsplit(b" ", 2)[0], b"committer Personal Harness <harness@localhost>")
+        self.assertEqual(body, message)
+        run("G25", "cat-file", "tree", tree)
+
+        self.assertEqual(run("G18", "ls-files", "--stage", "-z"), real_before)
+        self.assertEqual(run("G18", "rev-parse", "HEAD"), parent.encode() + b"\n")
+        listing = run("G18", "ls-files", "-z", "--cached", "--others", "--exclude-standard")
+        self.assertCountEqual(listing.split(b"\0"), [b".gitignore", b"real-only", b"test_hello.py",
+                                                     os.fsencode(self.literal), b"new1.txt", b""])
+        entries = run("G19", "ls-tree", "-r", "-z", commit)
+        self.assertEqual([entry.split(b"\t", 1)[1] for entry in entries.split(b"\0")[:-1]], staged_names)
+        self.assertIn(b"100644 blob " + blob.encode() + b"\t" + os.fsencode(self.literal) + b"\0", entries)
+        commit_entries = plain_git(self.worktree, "ls-tree", "-r", "-z", commit).stdout
+        expected_stage = b""
+        for entry in commit_entries.split(b"\0")[:-1]:
+            header, path = entry.split(b"\t", 1)
+            mode, kind, oid = header.split()
+            self.assertEqual(kind, b"blob")
+            expected_stage += mode + b" " + oid + b" 0\t" + path + b"\0"
+
+        private_env = dict(os.environ, GIT_INDEX_FILE=str(self.private_index))
+        plain_git(self.worktree, "-c", "core.fsmonitor=false", "-c", "core.splitIndex=false",
+                  "read-tree", parent, env=private_env)
+        parent_stage = plain_git(self.worktree, "ls-files", "--stage", "-z", env=private_env).stdout
+        self.assertIn(b"\ttest_hello.py\0", parent_stage)
+        self.assertNotEqual(parent_stage, expected_stage)
+        self.assertEqual(plain_git(self.worktree, "ls-files", "--stage", "-z").stdout, real_before)
+        run("G20", "read-tree", commit, private=True, effect=git.PRIVATE)
+        self.assertEqual(plain_git(self.worktree, "ls-files", "--stage", "-z", env=private_env).stdout,
+                         expected_stage)
+        self.assertEqual(run("G6", "ls-files", "--stage", "-z", private=True), staged)
+        lock = self.private_index.with_name(self.private_index.name + ".lock")
+        lock.touch()
+        run("G21", "add", "-A", private=True, effect=git.PRIVATE, code=None)
+        self.assertTrue(lock.is_file())
+        lock.unlink()
+        self.assertEqual(run("G6", "ls-files", "--stage", "-z", private=True), staged)
+        run("G21", "add", "-A", private=True, effect=git.PRIVATE, objects_written=1, clean_required=True)
+        alternate_tree = run("G5", "write-tree", private=True, effect=git.PRIVATE, objects_written=1).decode().strip()
+        self.assertEqual(run("G22", "diff-tree", "-r", "--name-only", "--no-renames", "-z", tree, alternate_tree),
+                         b"new1.txt\0real-only\0test_hello.py\0")
+        comparison = run("G23", "diff-tree", "-r", "-p", "--binary", "--no-ext-diff", "--no-textconv",
+                         "--no-renames", parent, commit, "--")
+        self.assertIn(b"+candidate\n", comparison)
+        self.assertIn(b"deleted file mode", comparison)
+        self.assertEqual(run("G24", "diff-tree", "-r", "--no-ext-diff", "--no-textconv", "--name-only",
+                             "--no-renames", "-z", parent, commit), os.fsencode(self.literal) + b"\0test_hello.py\0")
+
+        args = ("update-ref", "--no-deref", "-m", "harness accept task", self.ref, commit)
+        run("G16", *args, commit, effect=git.REFS, code=None)  # This old value is wrong.
+        branch_before = self.branch_log.read_bytes()
+        head_before = self.head_log.read_bytes()
+        run("G16", *args, parent, effect=git.REFS, ref_moved=True)
+        self.assertEqual(run("G12", "rev-parse", "--verify", "-q", self.ref), commit.encode() + b"\n")
+        branch_after = self.branch_log.read_bytes()
+        self.assertTrue(branch_after.startswith(branch_before))
+        entry, = branch_after[len(branch_before):].splitlines(keepends=True)
+        self.assertTrue(entry.startswith(f"{parent} {commit} ".encode()), entry)
+        self.assertTrue(entry.endswith(b"\tharness accept task\n"), entry)
+        # When Git also logs the movement via HEAD, only this bound worktree's log can get the same entry.
+        self.assertIn(self.head_log.read_bytes(), (head_before, head_before + entry))
+        self.assertEqual(run("G15", "ls-files", "--stage", "-z"), real_before)
+        run("G17", "read-tree", "--reset", commit, effect=git.INDEX, index_written=True)
+        self.assertEqual(run("G15", "ls-files", "--stage", "-z"), staged)
+
+    def test_symbolic_ref_binding_check_accepts_detached_head_status_one(self):
+        detached = self.scratch / "detached"
+        plain_git(self.repo, *IDENTITY, "worktree", "add", "--detach", str(detached), self.parent)
+        binding = git.capture_worktree_binding(detached, None)
+        self.assertEqual(self.run_form("G10", "symbolic-ref", "-q", "HEAD", code=1,
+                                       worktree=detached, binding=binding), b"")
+
+    def test_hash_object_without_write_leaves_the_object_store_untouched(self):
+        # Design 6 case 11 independently of the final G table.
+        payload = b"contents that were never added\n"
+        oid = self.run_form("case 11", "hash-object", "--stdin", effect=git.COMPARE, input=payload)
+        expected = plain_git(self.worktree, "hash-object", "--stdin", input=payload).stdout
+        self.assertEqual(oid, expected)
+        self.assertNotIn(oid.decode().strip(), self.objects())
+
+
 class DeadlineTests(unittest.TestCase):
     """Case 18: the hook name read and the call share one monotonic deadline."""
 
