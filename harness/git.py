@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import errno
+import fcntl
 import hashlib
 import json
 import os
@@ -8,8 +9,10 @@ import re
 import shutil
 import stat
 import subprocess
+import tempfile
 import threading
 import time
+from collections import Counter
 from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import NamedTuple
@@ -296,13 +299,29 @@ def _configured_hooks(repo, prefix, env, args, deadline):
     return names
 
 
-def _launch(argv, env, *, effect, input, deadline):
+def _launch(argv, env, *, effect, input, deadline, pass_fds=()):
     """The only place Harness starts a Git process; it gets what is left of the call's deadline."""
     remaining = deadline - time.monotonic()
     if remaining <= 0:
         raise subprocess.TimeoutExpired(argv, 0)
-    return subprocess.run(argv, env=env, capture_output=True, timeout=remaining, input=input,
-                          stdin=subprocess.DEVNULL if input is None else None)
+    temporary_fds = []
+    inherited_fds = []
+    try:
+        for fd in pass_fds:
+            if fd in (0, 1, 2):
+                # Redirection replaces these slots in the child. Preserve the same open file description.
+                fd = fcntl.fcntl(fd, fcntl.F_DUPFD_CLOEXEC, 3)
+                temporary_fds.append(fd)
+            inherited_fds.append(fd)
+        return subprocess.run(argv, env=env, capture_output=True, timeout=remaining, input=input,
+                              stdin=subprocess.DEVNULL if input is None else None, pass_fds=tuple(inherited_fds))
+    finally:
+        for fd in temporary_fds:
+            os.close(fd)
+
+
+class GitLaunchError(HarnessError):
+    """A Git process could not start or did not exit by its deadline."""
 
 
 def _run_git(repo, args, binding=None, *, effect=None, input=None, index_file=None, literal_pathspecs=False,
@@ -315,11 +334,11 @@ def _run_git(repo, args, binding=None, *, effect=None, input=None, index_file=No
                                isolated_config=isolated_config)
         return _launch(argv, env, effect=effect, input=input, deadline=deadline)
     except (OSError, subprocess.TimeoutExpired) as error:
-        raise HarnessError(f"git {' '.join(args[:3])} failed: {error}") from error
+        raise GitLaunchError(f"git {' '.join(args[:3])} failed: {error}") from error
 
 
 def git_process(repo: Path, *args: str, effect=None, binding=None, timeout=60, input=None, index_file=None,
-                literal_pathspecs=False, isolated_config=False, _config=None, _c_locale=False):
+                literal_pathspecs=False, isolated_config=False, _config=None, _c_locale=False, pass_fds=()):
     """Run a pinned command, preserving exit status for provenance checks."""
     # Before the binding check, which starts a process.
     _check_read_only(effect)
@@ -332,7 +351,7 @@ def git_process(repo: Path, *args: str, effect=None, binding=None, timeout=60, i
     argv, env = invocation(repo, args, effect=effect, deadline=deadline, binding=binding, index_file=index_file,
                            literal_pathspecs=literal_pathspecs, isolated_config=isolated_config, _config=_config,
                            _c_locale=_c_locale)
-    p = _launch(argv, env, effect=effect, input=input, deadline=deadline)
+    p = _launch(argv, env, effect=effect, input=input, deadline=deadline, pass_fds=pass_fds)
     if binding is not None:
         check_worktree_binding(repo, binding, isolated_config=isolated_config)
     return p
@@ -417,6 +436,19 @@ def _worktree_remains(repo, path, registered_path, *, binding, isolated_config):
 
 def _worktree_registration(repo, path_bytes, *, binding, isolated_config):
     # Use the path recorded before rollback, even if the directory now points elsewhere.
+    registry = worktree_registry(repo, binding=binding, isolated_config=isolated_config,
+                                 rollback_target=path_bytes)
+    if registry is None:
+        return "unknown"
+    return "present" if path_bytes in registry.values() else "absent"
+
+
+def worktree_registry(repo, *, binding=None, isolated_config=False, rollback_target=None):
+    """Return registered paths keyed by admin directory, with None for the main checkout.
+
+    Rollback retains its set-or-unknown contract. Cleanup needs multiplicity
+    and the admin directory of its exact match.
+    """
     listing = git_process(repo, "worktree", "list", "--porcelain", "-z",
                           effect=READ, binding=binding, isolated_config=isolated_config, _c_locale=True)
     listed = None
@@ -424,13 +456,13 @@ def _worktree_registration(repo, path_bytes, *, binding, isolated_config):
         # Git 2.31–2.35 reject -z in the option parser, before reading the registry.
         if (listing.returncode != 129 or listing.stdout
                 or not listing.stderr.startswith(b"error: unknown switch `z'\nusage: git worktree ")):
-            return "unknown"
+            return None
     else:
         if listing.stderr:
-            return "unknown"
-        listed = _worktree_listing_paths(listing.stdout, path_bytes)
+            return None
+        listed = _worktree_listing_paths(listing.stdout, rollback_target)
         if listed is None:
-            return "unknown"
+            return None
 
     # Git can silently omit or truncate malformed backlinks. Both a hit and a
     # miss in the listing need to agree with the complete administrative paths.
@@ -438,31 +470,41 @@ def _worktree_registration(repo, path_bytes, *, binding, isolated_config):
                   git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir", effect=READ,
                       isolated_config=isolated_config).removesuffix("\n"))
     registered = with_descriptors(
-        lambda held: _scan_worktree_registrations(held, common, allow_relative=listed is not None))
-    if registered is None or (listed is not None and listed != registered):
-        return "unknown"
-    return "present" if path_bytes in registered else "absent"
+        lambda held: _scan_worktree_registrations(held, common, allow_relative=listed is not None,
+                                                  rollback=rollback_target is not None))
+    if registered is None or (listed is not None and Counter(listed[1:]) != Counter(registered.values())):
+        return None
+    if rollback_target is not None:
+        return registered
+    # The legacy reader derives the main path from the real common directory,
+    # stripping a trailing /.git. No legacy porcelain lines are interpreted.
+    main = os.fsencode(common.resolve()).removesuffix(b"/.git")
+    if not main or (listed is not None and listed[0] != main):
+        return None
+    return {None: main, **registered}
 
 
-def _worktree_listing_paths(output, target):
-    """Read linked path identities and check explicit contradictions on the target."""
+def _worktree_listing_paths(output, rollback_target):
+    """Read NUL-framed path identities and reject contradictory records."""
     if not output.endswith(b"\0\0"):
         return None
-    paths = set()
+    paths = []
+    seen = set()
     for index, record in enumerate(output[:-2].split(b"\0\0")):
         field, *fields = record.split(b"\0")
         path = field.removeprefix(b"worktree ")
-        if path == field or not path.startswith(b"/") or path in paths:
+        if path == field or not path.startswith(b"/"):
             return None
         # A missing record separator can leave another path among the attributes.
         if any(field.startswith(b"worktree ") for field in fields):
             return None
-        if path == target and (index == 0 or not _target_worktree_fields_valid(fields)):
+        if rollback_target is not None:
+            if path in seen or (path == rollback_target and (index == 0 or not _target_worktree_fields_valid(fields))):
+                return None
+            seen.add(path)
+        elif (index != 0 or fields != [b"bare"]) and not _target_worktree_fields_valid(fields):
             return None
-        paths.add(path)
-        if index == 0:
-            main = path  # Git lists the main worktree first.
-    paths.remove(main)
+        paths.append(path)
     return paths
 
 
@@ -488,7 +530,7 @@ def _target_worktree_fields_valid(fields):
             and not {b"locked", b"prunable"} <= attributes.keys())
 
 
-def _scan_worktree_registrations(held, common, *, allow_relative):
+def _scan_worktree_registrations(held, common, *, allow_relative, rollback):
     """Read the linked-worktree backlinks without following links in the administrative registry."""
     if not common.is_absolute():
         return None
@@ -496,8 +538,9 @@ def _scan_worktree_registrations(held, common, *, allow_relative):
     try:
         worktrees = held.open("worktrees", DIRECTORY_FLAGS, dir_fd=root)
     except FileNotFoundError:
-        return set()
-    paths = set()
+        return {}
+    registry = {}
+    seen = set()
     for name in os.listdir(worktrees):
         entry = held.open(name, DIRECTORY_FLAGS, dir_fd=worktrees)
         admin = common / "worktrees" / name
@@ -514,10 +557,12 @@ def _scan_worktree_registrations(held, common, *, allow_relative):
             checkout = os.path.normpath(os.path.join(os.fsencode(admin), checkout))
         elif os.path.normpath(checkout) != checkout:
             return None
-        if checkout in paths:
-            return None
-        paths.add(checkout)
-    return paths
+        if rollback:
+            if checkout in seen:
+                return None
+            seen.add(checkout)
+        registry[admin] = checkout
+    return registry
 
 
 def _binding_file(path):
@@ -647,10 +692,18 @@ def _check_binding(worktree, binding, read_gitfile, *, isolated_config=False):
     result = _run_git(worktree, ("symbolic-ref", "-q", "HEAD"), binding, effect=READ,
                       isolated_config=isolated_config)
     if binding["branch"] is not None:
-        if result.returncode or os.fsdecode(result.stdout).strip() != binding["branch"]:
-            raise HarnessError("worktree Git 分支绑定已改变；保留现场")
-    elif result.returncode != 1 or _binding_file(git_dir / "HEAD").strip().decode("ascii", errors="replace") != binding["detached_head"]:
-        raise HarnessError("验证 worktree 的 detached HEAD 绑定已改变；保留现场")
+        matches = result.returncode == 0 and os.fsdecode(result.stdout).strip() == binding["branch"]
+        message = "worktree Git 分支绑定已改变；保留现场"
+    else:
+        matches = (result.returncode == 1
+                   and _binding_file(git_dir / "HEAD").strip().decode("ascii", errors="replace") == binding["detached_head"])
+        message = "验证 worktree 的 detached HEAD 绑定已改变；保留现场"
+    if not matches:
+        error = HarnessError(message)
+        if result.returncode not in (0, 1):
+            # Retain the failed Git observation without changing the existing binding stop.
+            error.binding_git_result = result
+        raise error
 
 
 def repository(path: Path):
@@ -928,7 +981,8 @@ def _open_snapshot_root(held, worktree: Path, binding) -> int:
     return root
 
 
-def snapshot(repo: Path, *, binding=None):
+def read_worktree(repo: Path, *, binding=None):
+    """Return the snapshot and the exact real-index listing hashed into it."""
     index = git_bytes(repo, "ls-files", "--stage", "-z", effect=READ, binding=binding)
     _reject_indexed_submodules(index)
     result = {"head": head(repo, binding=binding), "index": hashlib.sha256(index).hexdigest(),
@@ -944,7 +998,12 @@ def snapshot(repo: Path, *, binding=None):
             mode, data = ("deleted", b"") if parent is None else _entry(held, parent, leaf, name)
             result["files"][name] = mode + ":" + hashlib.sha256(data).hexdigest()
     with_descriptors(read)
-    return result
+    return result, index
+
+
+def snapshot(repo: Path, *, binding=None):
+    observation, _ = read_worktree(repo, binding=binding)
+    return observation
 
 
 def snapshot_changes(before, after):
@@ -1091,8 +1150,8 @@ _RANGE_DIFF_CONFIG = ("diff.suppressBlankEmpty=false", "diff.indentHeuristic=tru
 _ABSENT_INDEX_FOLDER = os.path.dirname(os.devnull)
 
 
-def _range_diff(repo, base, *output, binding):
-    """diff-tree from ``base`` to HEAD: the bytes of porcelain diff under default configuration.
+def _range_diff(repo, base, commit, *output, binding):
+    """diff-tree from ``base`` to ``commit``: the bytes of porcelain diff under default configuration.
 
     An absent private index, a new unguessable name for each call, keeps Git from
     reusing a work tree file whose stat data matches a real index entry, so the result
@@ -1104,7 +1163,7 @@ def _range_diff(repo, base, *output, binding):
     """
     index = Path(_ABSENT_INDEX_FOLDER) / f"harness-index-{os.urandom(16).hex()}"
     value = git_bytes(repo, "diff-tree", "-r", "--no-ext-diff", "--no-textconv", "--no-renames",
-                      "--ignore-submodules=none", "--diff-algorithm=myers", *output, base, "HEAD", "--",
+                      "--ignore-submodules=none", "--diff-algorithm=myers", *output, base, commit, "--",
                       effect=READ, binding=binding, index_file=index, _config=_RANGE_DIFF_CONFIG)
     if os.path.lexists(index):
         raise HarnessError(f"整体比较的私有索引应当不存在，Git 调用之后却存在：{index}",
@@ -1112,14 +1171,14 @@ def _range_diff(repo, base, *output, binding):
     return value
 
 
-def range_diff_bytes(repo: Path, base: str, *, binding=None):
+def range_diff_bytes(repo: Path, base: str, commit: str, *, binding=None):
     """The whole committed result, independent of task boundaries."""
-    return _range_diff(repo, base, "-p", "--binary", binding=binding)
+    return _range_diff(repo, base, commit, "-p", "--binary", binding=binding)
 
 
-def range_paths(repo: Path, base: str, *, binding=None) -> str:
+def range_paths(repo: Path, base: str, commit: str, *, binding=None) -> str:
     """The paths of the whole committed result, NUL-terminated as Git lists them."""
-    return os.fsdecode(_range_diff(repo, base, "--name-only", "-z", binding=binding))
+    return os.fsdecode(_range_diff(repo, base, commit, "--name-only", "-z", binding=binding))
 
 
 def archive_and_reset(repo: Path, expected_head: str, archive: Path, owned_root: Path, *, binding=None):
@@ -1171,8 +1230,7 @@ def archive_and_reset(repo: Path, expected_head: str, archive: Path, owned_root:
     return str(archive)
 
 
-# Every Harness Git call pins this identity and the commit encoding on the command line (_fixed_options), and
-# accept also pins the cleanup mode, so repository configuration cannot change the commit's author or bytes.
+# Every Harness Git call pins this identity and the commit encoding through _fixed_options.
 COMMIT_IDENTITY = ("Personal Harness", "harness@localhost")
 
 
@@ -1182,20 +1240,208 @@ def commit_message_text(message, run_id, task_id):
     return f"{message['subject']}\n\n{body}Harness-Run: {run_id}\nHarness-Task: {task_id}\n"
 
 
-def accept(repo: Path, paths: list[str], run_id: str, task_id: str, message, *, binding=None):
-    # The worker does not own the acceptance index. Rebuild it from the reviewed
-    # worktree so hidden staged content can never enter the runtime's commit.
-    git(repo, "reset", "--mixed", "HEAD", effect=INDEX_REFS, binding=binding)
-    tracked = set(git(repo, "ls-files", "-z", effect=READ, binding=binding).split("\0"))
-    # A worker may stage a new file and then delete it. Reset already removes
-    # that index-only addition; git add cannot match it afterward. Keep real
-    # tracked deletions and dangling symlinks in the reviewed acceptance set.
-    stage = [name for name in paths
-             if name in tracked or (repo / name).exists() or (repo / name).is_symlink()]
-    if stage:
-        git(repo, "add", "--", *stage, effect=INDEX, binding=binding, literal_pathspecs=True)
-    if git(repo, "diff", "--cached", "--no-ext-diff", "--no-textconv", "--name-only", "HEAD", effect=COMPARE,
-           binding=binding).strip():
-        git(repo, "commit", "--cleanup=verbatim", "-m", commit_message_text(message, run_id, task_id),
-            effect=INDEX_REFS, binding=binding)
-    return head(repo, binding=binding)
+class BuiltCommit(NamedTuple):
+    tree: str
+    commit: str
+    index_synced: str
+
+
+class ImageProof(NamedTuple):
+    paths: tuple[str, ...]
+    detail: str | None
+
+    @property
+    def equal(self) -> bool:
+        return not self.paths and self.detail is None
+
+
+def prove_image(repo: Path, commit: str, tree: str, *, binding) -> ImageProof:
+    """Compare the image Git would stage against the caller's tree for commit."""
+    with tempfile.TemporaryDirectory(prefix="harness-image-") as directory:
+        index = Path(directory) / "index"
+        git_bytes(repo, "read-tree", commit, effect=PRIVATE, binding=binding, index_file=index)
+        added = git_process(repo, "add", "-A", effect=PRIVATE, binding=binding, index_file=index)
+        if added.returncode:
+            lines = added.stderr.decode("utf-8", errors="replace").splitlines()
+            first_line = lines[0] if lines else ""
+            return ImageProof((), first_line or f"git add -A exited with status {added.returncode}")
+        image = git(repo, "write-tree", effect=PRIVATE, binding=binding, index_file=index).strip()
+    if image == tree:
+        return ImageProof((), None)
+    raw = git_bytes(repo, "diff-tree", "-r", "--name-only", "--no-renames", "--no-ext-diff", "--no-textconv", "-z",
+                    tree, image, effect=READ, binding=binding)
+    paths = tuple(os.fsdecode(path) for path in raw.split(b"\0") if path)
+    # A recursive diff omits empty subtree entries; tree identity still decides the proof.
+    return ImageProof(paths, None if paths else f"Git tree differs ({tree} != {image}) without changed leaf paths")
+
+
+class BranchState(NamedTuple):
+    symbolic: bool
+    oid: str | None
+
+
+class CommitHeader(NamedTuple):
+    tree: str
+    parents: tuple[str, ...]
+
+
+def _accept_paths(repo, files, tracked, task_id, binding):
+    candidates = {name.rstrip("/"): name for name in files}
+    source = {"task_id": task_id}
+
+    def inspect(held):
+        root = _open_snapshot_root(held, repo, binding)
+        remove, add = [], []
+        for name, parent, leaf in _parents(held, root, sorted(candidates)):
+            mode = None
+            if parent is not None:
+                try:
+                    mode = os.stat(leaf, dir_fd=parent, follow_symlinks=False).st_mode
+                except FileNotFoundError:
+                    pass
+            if mode is None or stat.S_ISDIR(mode):
+                if name in tracked:
+                    remove.append(name)
+                elif mode is not None:
+                    path = candidates[name]
+                    raise ScopeViolation(f"候选含未跟踪的目录：{describe_paths([path])}", stop=stops.make(
+                        "scope_violation", "candidate_outside_scope", data={"path": path}, source=source))
+            elif stat.S_ISREG(mode) or stat.S_ISLNK(mode):
+                add.append(name)
+            else:
+                raise ScopeViolation(f"候选含 Git 不能记录的特殊文件：{describe_paths([name])}", stop=stops.make(
+                    "scope_violation", "special_file", data={"path": name}, source=source))
+        return remove, add
+
+    return with_descriptors(inspect)
+
+
+def _check_candidate_tree(repo, parent, tree, files, allowed, task_id, binding):
+    raw = git_bytes(repo, "diff-tree", "-r", "-z", "--no-renames", "--no-ext-diff", "--no-textconv",
+                    parent, tree, effect=READ, binding=binding)
+    source = {"task_id": task_id}
+    reviewed = set(files)
+    fields = raw.split(b"\0")
+    if fields[-1] or len(fields) % 2 != 1:
+        raise HarnessError("git diff-tree 返回无效的路径记录")
+    for header, path in zip(fields[0:-1:2], fields[1:-1:2]):
+        metadata = header.split()
+        if len(metadata) != 5 or not header.startswith(b":") or not path:
+            raise HarnessError("git diff-tree 返回无效的路径记录")
+        new_mode = metadata[1]
+        name = os.fsdecode(path)
+        if protected_name(name.split("/", 1)[0]):
+            reason = "protected_path"
+        elif not any(path_matches(name, pattern) for pattern in allowed):
+            reason = "candidate_outside_scope"
+        elif new_mode not in (b"000000", b"100644", b"100755", b"120000"):
+            reason = "candidate_outside_scope"
+        elif name not in reviewed:
+            raise HarnessError(f"候选路径已改变；保留现场：{describe_paths([name])}",
+                               stop=stops.make("workspace_mismatch", "candidate_changed", source=source))
+        else:
+            continue
+        raise ScopeViolation(f"候选树含不允许的路径：{describe_paths([name])}", stop=stops.make(
+            "scope_violation", reason, data={"path": name}, source=source))
+
+
+def build_commit(repo: Path, parent, files, allowed, task_id, message: str, *, binding):
+    """Build a candidate from reviewed paths. The message is the complete commit text."""
+    with tempfile.TemporaryDirectory(prefix="harness-accept-") as directory:
+        index = Path(directory) / "index"
+        git_bytes(repo, "read-tree", parent, effect=PRIVATE, binding=binding, index_file=index)
+        tracked = set(git(repo, "ls-files", "-z", effect=READ, binding=binding, index_file=index).split("\0"))
+        remove, add = _accept_paths(repo, files, tracked, task_id, binding)
+        if remove:
+            git_bytes(repo, "update-index", "-z", "--force-remove", "--stdin", effect=PRIVATE, binding=binding,
+                      index_file=index, input=b"".join(os.fsencode(name) + b"\0" for name in remove))
+        if add:
+            git_bytes(repo, "add", "--", *add, effect=PRIVATE, binding=binding, index_file=index,
+                      literal_pathspecs=True)
+        tree = git(repo, "write-tree", effect=PRIVATE, binding=binding, index_file=index).strip()
+        stage = git_bytes(repo, "ls-files", "--stage", "-z", effect=READ, binding=binding, index_file=index)
+        synced = hashlib.sha256(stage).hexdigest()
+        parent_tree = git(repo, "rev-parse", "--verify", f"{parent}^{{tree}}", effect=READ, binding=binding).strip()
+        if tree == parent_tree:
+            return BuiltCommit(tree, parent, synced)
+        _check_candidate_tree(repo, parent, tree, files, allowed, task_id, binding)
+        commit = git(repo, "commit-tree", tree, "-p", parent, "-F", "-", effect=PRIVATE,
+                     binding=binding, input=message.encode("utf-8")).strip()
+        return BuiltCommit(tree, commit, synced)
+
+
+def _require_git_result(result, *allowed):
+    if result.returncode not in allowed:
+        raise HarnessError(result.stderr.decode("utf-8", errors="replace").strip())
+
+
+def branch_state(repo: Path, ref, *, binding):
+    symbolic = git_process(repo, "symbolic-ref", "-q", ref, effect=READ, binding=binding)
+    _require_git_result(symbolic, 0, 1)
+    if symbolic.returncode == 0:
+        return BranchState(True, None)
+    value = git_process(repo, "rev-parse", "--verify", "-q", ref, effect=READ, binding=binding)
+    _require_git_result(value, 0, 1)
+    if value.returncode == 1:
+        return BranchState(False, None)
+    oid = value.stdout.removesuffix(b"\n")
+    if re.fullmatch(rb"([0-9a-f]{40}|[0-9a-f]{64})", oid) is None:
+        raise HarnessError("git rev-parse 返回无效的分支对象名")
+    return BranchState(False, oid.decode("ascii"))
+
+
+def object_kinds(repo: Path, oids, *, binding):
+    requested = tuple(oids)
+    data = b"".join(oid.encode("ascii") + b"\n" for oid in requested)
+    result = git_bytes(repo, "cat-file", "--batch-check", effect=READ, binding=binding, input=data)
+    lines = result.splitlines()
+    if len(lines) != len(requested):
+        raise HarnessError("git cat-file --batch-check 返回的行数不符")
+    kinds = {}
+    for oid, line in zip(requested, lines):
+        fields = line.split(b" ")
+        if fields == [oid.encode("ascii"), b"missing"]:
+            kinds[oid] = None
+        elif (len(fields) == 3 and fields[0] == oid.encode("ascii") and fields[2].isdigit()
+              and fields[1] in (b"blob", b"tree", b"commit", b"tag")):
+            kinds[oid] = fields[1].decode("ascii")
+        else:
+            raise HarnessError(f"git cat-file --batch-check 返回无效对象记录：{line!r}")
+    return kinds
+
+
+def commit_header(repo: Path, oid, *, binding):
+    raw = git_bytes(repo, "cat-file", "commit", oid, effect=READ, binding=binding)
+    header, separator, _ = raw.partition(b"\n\n")
+    trees, parents = [], []
+    for line in header.split(b"\n"):
+        key, _, value = line.partition(b" ")
+        if key in (b"tree", b"parent"):
+            if len(value) != len(oid) or re.fullmatch(rb"[0-9a-f]+", value) is None:
+                raise HarnessError(f"git cat-file commit 返回无效的对象头：{oid}")
+            (trees if key == b"tree" else parents).append(value.decode("ascii"))
+    if len(trees) != 1 or not separator:
+        raise HarnessError(f"git cat-file commit 返回无效的树头：{oid}")
+    return CommitHeader(trees[0], tuple(parents))
+
+
+def tree_readable(repo: Path, tree, *, binding):
+    result = git_process(repo, "cat-file", "tree", tree, effect=READ, binding=binding)
+    _require_git_result(result, 0)
+
+
+def index_digest(repo: Path, *, binding):
+    stage = git_bytes(repo, "ls-files", "--stage", "-z", effect=READ, binding=binding)
+    return hashlib.sha256(stage).hexdigest()
+
+
+def move_branch(repo: Path, ref, commit, parent, task_id, *, binding, lock_fd: int | None = None):
+    """Compare-and-swap the run ref. The caller interprets a nonzero Git status."""
+    return git_process(repo, "update-ref", "--no-deref", "-m", f"harness accept {task_id}", ref, commit, parent,
+                       effect=REFS, binding=binding, pass_fds=() if lock_fd is None else (lock_fd,))
+
+
+def sync_index(repo: Path, commit, *, binding, lock_fd: int | None = None):
+    """Synchronize the real index while preserving worktree files."""
+    return git_process(repo, "read-tree", "--reset", commit, effect=INDEX, binding=binding,
+                       pass_fds=() if lock_fd is None else (lock_fd,))

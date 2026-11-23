@@ -202,6 +202,7 @@ class ExitConfirmationRecoveryTests(RepoCase):
         engine = self.engine()
         engine.start("Implement greet", read_json(ROOT / "examples/plan.json"), pause_after_plan=True)
         entries = [{"id": f"dispatch_old_{index}", "role": "verification", "task_id": "greet",
+                    "process_record": f"verification/fixture/dispatch_old_{index}/check-0.outcome.json",
                     "status": "interrupted", "pgid": 2_000_000_000 + index, "exit_confirmed": False}
                    for index in range(1, count + 1)]
         engine.run["dispatches"].extend(entries)

@@ -97,8 +97,11 @@ def demo(config, live=False, commander="astra"):
     print(f"[harness] {'LIVE SMOKE' if live else 'OFFLINE DEMO'} repo={one_line(root)}", file=sys.stderr, flush=True)
     result = Runtime(config, root, backend=None if live else DemoBackend(), commander=commander).start(
         "Implement greet(name) in hello.py, returning 'Hello, {name}!'. Keep the existing test unchanged.")
-    print(dump({"simulation": not live, "models_called": live, "verification": "real unittest + git", "repo": str(root),
-                "run": result["id"], "branch": result["branch"], "status": result["status"]}))
+    output = {"simulation": not live, "models_called": live, "verification": "real unittest + git", "repo": str(root),
+              "run": result["id"], "branch": result["branch"], "status": result["status"]}
+    if "result" in result:
+        output["result"] = result["result"]
+    print(dump(output))
 
 
 def main(argv=None):
@@ -139,11 +142,32 @@ def status_work_attempts(run, *, integrity_stop=None):
     return result
 
 
+def observed_completion_result(run):
+    """Project the saved completion identity only when its ledger fields agree."""
+    if run.get("status") != "completed" or not isinstance(run.get("expected_head"), str):
+        return None
+    snapshot = run.get("config_snapshot")
+    verification = snapshot.get("verification") if isinstance(snapshot, dict) else None
+    if not isinstance(verification, dict) or type(verification.get("fresh_checkout")) is not bool:
+        return None
+    from .finalization import validate_final_records, validate_result
+
+    try:
+        validate_final_records(run.get("final_history"))
+        validate_result(run)
+    except HarnessError:
+        return None
+    return run["result"]
+
+
 def status_summary(run, *, integrity_stop=None):
     if not isinstance(run.get("accepted", {}), dict):
         raise HarnessError("运行台账 accepted 字段无效；使用 status --full 查看原始内容",
                            stop=integrity_stop)
     result = {key: run.get(key) for key in ("id", "status", "goal", "branch", "worktree", "current_task")}
+    completion = observed_completion_result(run)
+    if completion is not None:
+        result["result"] = completion
     result["accepted_tasks"] = list(run.get("accepted", {}))
     result["budgets"] = {key: run.get(key) for key in ("attempts", "agent_dispatches")}
     result["budgets"]["work_attempts"] = status_work_attempts(run, integrity_stop=integrity_stop)
@@ -589,7 +613,11 @@ def finish_saved_operation(operation, run, keys, *, code=0, error=None):
     def observe_result():
         project_stop()
         if error is None:
-            print_saved_result({**{key: run[key] for key in keys}, "operation_id": operation.id})
+            output = {key: run[key] for key in keys}
+            output["operation_id"] = operation.id
+            if "result" in run:
+                output["result"] = run["result"]
+            print_saved_result(output)
             if value is not None:
                 stop_notice(value, run_id, operation.id)
         elif reported(error):

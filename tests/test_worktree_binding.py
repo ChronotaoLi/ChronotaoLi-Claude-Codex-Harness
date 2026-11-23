@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from acceptance_support import accept_now
 from harness import git
 from harness.adapters import DemoBackend
 from harness.cleanup import cleanup_run
@@ -13,7 +14,6 @@ from test_harness import ROOT, RepoCase, after_save, walk_exit
 from test_runtime_changes import ScriptedBackend
 
 
-# git.accept commits the reviewed worker's message; these checks only need some message.
 ACCEPT_MESSAGE = {"subject": "Accept reviewed change", "body": ""}
 
 
@@ -46,7 +46,7 @@ class WorktreeBindingTests(unittest.TestCase):
             lambda: git.head(self.worktree, binding=self.binding),
             lambda: git.snapshot(self.worktree, binding=self.binding),
             lambda: git.check_scope(self.worktree, ["a.txt"], binding=self.binding),
-            lambda: git.accept(self.worktree, ["a.txt"], "run", "task", ACCEPT_MESSAGE, binding=self.binding),
+            lambda: accept_now(self.worktree, ["a.txt"], "run", "task", ACCEPT_MESSAGE, binding=self.binding),
             lambda: git.archive_and_reset(self.worktree, self.base, archive, self.worktree.parent,
                                           binding=self.binding),
             lambda: git.assert_removable_worktree(self.worktree, binding=self.binding),
@@ -63,7 +63,7 @@ class WorktreeBindingTests(unittest.TestCase):
         binding = read_json(saved)
         (self.worktree / "a.txt").write_text("reviewed\n")
         paths = git.check_scope(self.worktree, ["a.txt"], binding=binding)
-        accepted = git.accept(self.worktree, paths, "run", "task", ACCEPT_MESSAGE, binding=binding)
+        accepted = accept_now(self.worktree, paths, "run", "task", ACCEPT_MESSAGE, binding=binding)
         self.assertNotEqual(accepted, self.base)
         self.assertEqual(git.git(self.repo, "rev-parse", "harness/run").strip(), accepted)
         self.assertTrue(git.clean(self.worktree, binding=binding))
@@ -88,7 +88,7 @@ class WorktreeBindingTests(unittest.TestCase):
         metadata.unlink()
         metadata.mkdir()
         with self.assertRaisesRegex(HarnessError, "绑定"):
-            git.accept(self.worktree, [], "run", "task", ACCEPT_MESSAGE, binding=self.binding)
+            accept_now(self.worktree, [], "run", "task", ACCEPT_MESSAGE, binding=self.binding)
         self.assert_main_unchanged()
 
     def test_branch_redirect_at_unchanged_commit_is_rejected(self):
@@ -135,7 +135,7 @@ class WorktreeBindingTests(unittest.TestCase):
                "GIT_INDEX_FILE": str(self.repo / ".git" / "index"),
                "GIT_COMMON_DIR": str(self.root / "missing")}
         with patch.dict(os.environ, env):
-            accepted = git.accept(self.worktree, ["a.txt"], "run", "task", ACCEPT_MESSAGE, binding=self.binding)
+            accepted = accept_now(self.worktree, ["a.txt"], "run", "task", ACCEPT_MESSAGE, binding=self.binding)
         self.assertNotEqual(accepted, self.base)
         self.assert_main_unchanged()
 
@@ -143,14 +143,14 @@ class WorktreeBindingTests(unittest.TestCase):
         (self.worktree / "a.txt").write_text("reviewed\n")
         subprocess_run = git.subprocess.run
 
-        def redirect_before_commit(argv, **kwargs):
-            if "commit" in argv:
+        def redirect_before_ref_write(argv, **kwargs):
+            if "update-ref" in argv:
                 (self.worktree / ".git").write_text(f"gitdir: {self.repo / '.git'}\n")
             return subprocess_run(argv, **kwargs)
 
-        with patch("harness.git.subprocess.run", side_effect=redirect_before_commit):
+        with patch("harness.git.subprocess.run", side_effect=redirect_before_ref_write):
             with self.assertRaisesRegex(HarnessError, "绑定"):
-                git.accept(self.worktree, ["a.txt"], "run", "task", ACCEPT_MESSAGE, binding=self.binding)
+                accept_now(self.worktree, ["a.txt"], "run", "task", ACCEPT_MESSAGE, binding=self.binding)
         self.assert_main_unchanged()
         self.assertNotEqual(git.git(self.repo, "rev-parse", "harness/run").strip(), self.base)
 

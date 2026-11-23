@@ -4,14 +4,14 @@ import sqlite3
 import sys
 from pathlib import Path
 
-from harness import git
+from acceptance_support import accept_now, acceptance_checkout
+from harness import git, stops
 from harness.adapters import DemoBackend
 from harness.contracts import WORK, validate_work_bounds, validate_work_core
 from harness.util import HarnessError, read_json
 from test_harness import RepoCase, ROOT, interrupt_started_agent
 
 
-# git.accept commits the reviewed worker's message; these checks only need some message.
 ACCEPT_MESSAGE = {"subject": "Accept reviewed change", "body": ""}
 
 
@@ -154,8 +154,39 @@ class RuntimeChangesTests(RepoCase):
         answer = self.outside / "continue.json"
         answer.write_text(json.dumps({"schema_version": 1, "request_id": request["id"], "task_id": "final",
                                       "decision": "continue", "summary": "Proceed with the edited tree."}))
-        with self.assertRaisesRegex(HarnessError, "干净的已接受提交"):
+        backend_call_count = len(backend.calls)
+        dirty_path = engine.worktree / "hello.py"
+        dirty_contents = dirty_path.read_bytes()
+        accepted_commit = run["accepted"]["greet"]["commit"]
+        self.assertEqual(run["review_history"]["greet"][-1]["review"]["verdict"], "approve")
+        rejected, = run["final_history"]
+        self.assertEqual(rejected["status"], "rejected")
+        self.assertEqual(rejected["head"], accepted_commit)
+        snapshot = Path(rejected["snapshot_artifact"])
+        snapshot_contents = snapshot.read_bytes()
+
+        with self.assertRaises(HarnessError) as caught:
             self.engine(backend).resume(engine.run["id"], operator_decision=[str(answer)])
+
+        after = read_json(engine.directory / "state.json")
+        stop = stops.of(caught.exception)
+        self.assertEqual(str(caught.exception), "'hello.py'")
+        self.assertEqual(after["stop"], stop)
+        self.assertEqual((stop["kind"], stop["reason"]), ("workspace_mismatch", "dirty_final_workspace"))
+        self.assertEqual(stop["data"], {"detail": "'hello.py'"})
+        self.assertEqual(stops.exit_code(caught.exception), 1)
+        self.assertEqual(stops.project(stop)["title"], "整体验收要求干净的已接受提交")
+        self.assertEqual(after["status"], "blocked")
+        self.assertNotIn("result", after)
+        self.assertEqual(after["expected_head"], accepted_commit)
+        self.assertEqual(git.head(engine.worktree), accepted_commit)
+        self.assertEqual(after["accepted"], run["accepted"])
+        self.assertEqual(after["review_history"], run["review_history"])
+        self.assertEqual(after["final_history"], run["final_history"])
+        self.assertEqual(snapshot.read_bytes(), snapshot_contents)
+        self.assertEqual(after["dispatches"], run["dispatches"])
+        self.assertEqual(len(backend.calls), backend_call_count)
+        self.assertEqual(dirty_path.read_bytes(), dirty_contents)
 
     def test_final_rejection_adds_corrective_task_without_weakening_original(self):
         def corrective(backend, kwargs, packet, result):
@@ -466,14 +497,16 @@ class RuntimeChangesTests(RepoCase):
         self.assertEqual(engine.run["accepted"], {})
 
     def test_accept_rebuilds_index_from_reviewed_paths(self):
-        original = (self.repo / "test_hello.py").read_text()
-        (self.repo / "test_hello.py").write_text("# hidden staged change\n")
-        git.git(self.repo, "add", "test_hello.py")
-        (self.repo / "test_hello.py").write_text(original)
-        (self.repo / "hello.py").write_text("# allowed\n")
-        commit = git.accept(self.repo, ["hello.py"], "run_test", "test", ACCEPT_MESSAGE)
-        self.assertEqual(git.git(self.repo, "show", f"{commit}:test_hello.py"), original)
-        self.assertEqual(git.git(self.repo, "show", f"{commit}:hello.py"), "# allowed\n")
+        worktree = self.outside / "acceptance"
+        binding = acceptance_checkout(self.repo, worktree)
+        original = (worktree / "test_hello.py").read_text()
+        (worktree / "test_hello.py").write_text("# hidden staged change\n")
+        git.git(worktree, "add", "test_hello.py")
+        (worktree / "test_hello.py").write_text(original)
+        (worktree / "hello.py").write_text("# allowed\n")
+        commit = accept_now(worktree, ["hello.py"], "run_test", "test", ACCEPT_MESSAGE, binding=binding)
+        self.assertEqual(git.git(worktree, "show", f"{commit}:test_hello.py"), original)
+        self.assertEqual(git.git(worktree, "show", f"{commit}:hello.py"), "# allowed\n")
 
     def test_archive_refuses_symlink_ancestor_without_reset(self):
         (self.repo / "folder").mkdir()

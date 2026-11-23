@@ -804,19 +804,19 @@ class OperationRowTests(RepoCase):
         backend, engine = self.blocked_at_limit()
         path = engine.directory / "state.json"
         run = read_json(path)
-        run["schema_version"] = 18
+        run["schema_version"] = 19
         write_json(path, run)
         before = path.read_bytes()
         notice = refused_by_cli(self, backend, ["resume", engine.run["id"]], ("unsupported_ledger", "ledger_version"), 2)
         no_command_exit(self, notice, ("unsupported_ledger", "ledger_version"))
-        self.assertEqual((notice["data"]["schema_version"], notice["data"]["supported"]), (18, 19))
+        self.assertEqual((notice["data"]["schema_version"], notice["data"]["supported"]), (19, 20))
         for argv in (["abandon", engine.run["id"]], ["status", engine.run["id"]]):
             self.assertEqual(run_cli(self, backend, argv)[0], 2, argv)
         self.assertEqual(run_cli(self, backend, ["cleanup-run", engine.run["id"]])[0], 1)
         code, errors = run_cli(self, backend, ["status"])  # the list still shows its path and version
         self.assertEqual(code, 0)
         self.assertIn(f"runs/{engine.run['id']}", errors)
-        self.assertIn("18", errors)
+        self.assertIn("19", errors)
         self.assertEqual(path.read_bytes(), before)
 
     def test_runtime_database(self):

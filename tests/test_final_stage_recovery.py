@@ -214,23 +214,24 @@ class FinalStageRecoveryTests(RepoCase):
     def test_saved_approval_survives_crash_before_run_completion_without_more_calls(self):
         backend = ScriptedBackend()
         engine = self.engine(backend)
-        save = engine.context.save
-        interrupted = False
-
-        def interrupt_after_approval(**kwargs):
-            nonlocal interrupted
-            save(**kwargs)
-            if not interrupted and engine.run["final_history"] and engine.run["final_history"][-1]["status"] == "approved":
-                interrupted = True
-                raise KeyboardInterrupt()
-
-        with patch.object(engine.context, "save", side_effect=interrupt_after_approval), self.assertRaises(KeyboardInterrupt):
+        crash, interrupted = crash_after_save(
+            engine, lambda run: bool(run["final_history"] and run["final_history"][-1]["status"] == "approved"))
+        with crash, self.assertRaises(KeyboardInterrupt):
             engine.start("Implement greet", self.plan())
+        self.assertTrue(interrupted["fired"])
+        saved = read_json(engine.directory / "state.json")
+        self.assertEqual(saved["status"], "running")
+        self.assertNotIn("result", saved)
+        attempt, = saved["final_history"]
         calls = list(backend.calls)
-        checks = self.final_checks(engine.run)
+        checks = self.final_checks(saved)
         result = self.engine(backend).resume(engine.run["id"])
         self.assertEqual(result["status"], "completed")
-        self.assertEqual(len(result["final_history"]), 1)
+        self.assertEqual(result["final_history"], [attempt])
+        self.assertEqual(result["result"], {
+            "commit": attempt["head"], "tree": attempt["tree"], "snapshot_digest": attempt["snapshot_digest"],
+            "attempts": [1], "verification_mode": "run_worktree",
+        })
         self.assertEqual(backend.calls, calls)
         self.assertEqual(self.final_checks(result), checks)
 

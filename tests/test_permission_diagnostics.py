@@ -229,7 +229,7 @@ class PermissionDiagnosticsCliTests(RepoCase):
         self.assertEqual([item['tool_id'] for item in report['provider_denials']], ['json_tool'])
 
     def test_other_ledger_versions_are_refused_before_any_evidence_is_read(self):
-        for version, shown in ((None, '缺失或无效'), ('19', '缺失或无效'), (18, ' 18 '), (17, ' 17 ')):
+        for version, shown in ((None, '缺失或无效'), (str(RUN_SCHEMA_VERSION), '缺失或无效'), (19, ' 19 '), (17, ' 17 ')):
             with self.subTest(version=version):
                 shutil.rmtree(self.repo / '.harness', ignore_errors=True)
                 fields = {} if version is None else {'schema_version': version}
@@ -243,5 +243,5 @@ class PermissionDiagnosticsCliTests(RepoCase):
                                      'permission-diagnostics', self.RUN, self.DISPATCH])
                 self.assertEqual((code, output.getvalue()), (2, ''))  # an unsupported ledger is an input refusal
                 self.assertIn(f'台账版本{shown}', errors.getvalue())
-                self.assertIn('不支持（当前版本 19）', errors.getvalue())
+                self.assertIn(f'不支持（当前版本 {RUN_SCHEMA_VERSION}）', errors.getvalue())
                 self.assertEqual(path.read_bytes(), before)

@@ -8,8 +8,9 @@ from datetime import datetime, timezone
 import uuid
 from pathlib import Path
 
-from . import git, stops
+from . import checkout_identity, git, stops
 from .context import compact_checks
+from .process_runtime import defer_cleanup_signals
 from .recovery import snapshot_digest
 from .services import RuntimeService
 from .util import (CommandDirectoryError, HarnessError, ProcessStartError, ProcessTimeout, ProgramStartError,
@@ -44,8 +45,10 @@ class Verification(RuntimeService):
             def run_check(held):
                 root_fd = git.open_bound_root(held, cwd, binding)
                 log = folder / f"check-{i}"
+                record = log.with_suffix(".outcome.json").relative_to(self.context.directory)
                 entry = {"id": str(uuid.uuid4()), "role": "verification", "task_id": task_id,
-                         "status": "running", "pgid": None, "process_state": "starting"}
+                         "status": "running", "pgid": None, "process_state": "starting",
+                         "process_record": record.as_posix()}
                 entry["worktree"] = str(cwd)
                 if phase:
                     entry["phase"] = phase
@@ -76,7 +79,7 @@ class Verification(RuntimeService):
                 try:
                     code = run_process(command["argv"], cwd, log, relative_cwd=command["cwd"], root_fd=root_fd,
                         timeout=self.context.config.data["runtime"]["verify_timeout_seconds"],
-                        on_start=on_start, on_outcome=on_outcome)
+                        on_start=on_start, on_outcome=on_outcome, record_owner=entry["id"])
                 except BaseException as caught:
                     error = caught
                     outcome = getattr(caught, "outcome", outcome)
@@ -194,9 +197,8 @@ class Verification(RuntimeService):
         # verification process has run since. The exit gate always rehashes files.
         before = self.context.snapshot() if before is None else before
         if whole_run and self.context.config.data["verification"]["fresh_checkout"]:
-            # The checkout record names its run, whole-run attempt and verification round.
             return self.verify_fresh_checkout(task_id, folder, before, {
-                "run_id": self.context.run["id"], "attempt": attempt, "round": round_index})
+                "attempt": attempt, "round": round_index})
         results = self.run_verification_commands(task_id, self.context.config.data["verification"]["commands"],
                                                   self.context.worktree, folder, self.context.run["worktree_binding"])
         after = self.context.snapshot()
@@ -215,12 +217,7 @@ class Verification(RuntimeService):
         return results
 
     def verify_fresh_checkout(self, task_id, folder, source_snapshot, owner):
-        """Verify committed bytes in a new external checkout with explicit setup.
-
-        ``owner`` ({run_id, attempt, round}) is in the record from its first
-        write, before the checkout exists, so cleanup can tell this round's
-        checkout from any other legitimate one.
-        """
+        """Verify committed bytes in a new external checkout with explicit setup."""
         self.context.store.check_current()
         self.context.ensure_exited()
         git.check_worktree_binding(self.context.worktree, self.context.run["worktree_binding"])
@@ -228,16 +225,34 @@ class Verification(RuntimeService):
         if root.is_relative_to(self.context.repo.resolve()):
             root.rmdir()
             raise HarnessError("全新整体验证要求临时目录位于目标仓库之外；请设置外部 TMPDIR")
+        root_id = checkout_identity.directory_identity(root)
         checkout = root / ".harness" / "checkout"
         artifact = folder / "checkout.json"
-        environment = {"mode": "fresh_checkout", "owner": owner, "worktree": str(checkout),
-                       "head": self.context.run["expected_head"], "status": "preparing",
+        run = self.context.run
+        commit = run["final_history"][owner["attempt"] - 1]["head"]
+        environment = {"mode": "fresh_checkout", "worktree": str(checkout),
+                       "head": commit, "status": "preparing",
                        "setup_commands": self.context.config.data["verification"]["setup_commands"]}
         write_json(artifact, environment)
-        binding = git.add_worktree(self.context.worktree, checkout, environment["head"],
-                                   binding=self.context.run["worktree_binding"])
-        environment["binding"] = binding
-        write_json(artifact, environment)
+        checkout.parent.mkdir()
+        checkout.mkdir()
+        checkout_id = checkout_identity.directory_identity(checkout)
+        with defer_cleanup_signals(inherit=False):
+            binding = git.add_worktree(self.context.worktree, checkout, commit, binding=run["worktree_binding"])
+            with stops.classify("workspace_mismatch", "binding_changed"):
+                if binding.get("detached_head") != commit:
+                    raise HarnessError("全新验证检出未绑定至本次尝试的提交")
+                git.check_worktree_binding(checkout, binding)
+                identity = {"root": checkout_identity.directory_identity(root),
+                            "worktree": checkout_identity.directory_identity(checkout),
+                            "git_dir": checkout_identity.directory_identity(Path(binding["git_dir"]))}
+                if identity["root"] != root_id or identity["worktree"] != checkout_id:
+                    raise HarnessError("全新验证检出的目录身份已改变")
+                entry = checkout_identity.build_entry(owner, root, checkout, identity, binding)
+                entries = run["verification_checkouts"]
+                checkout_identity.validate_checkout_entries({**run, "verification_checkouts": [*entries, entry]})
+            entries.append(entry)
+            self.context.save()
         baseline = git.snapshot(checkout, binding=binding)
         setup = self.run_verification_commands(task_id, environment["setup_commands"], checkout,
                                                folder / "setup", binding, phase="setup")

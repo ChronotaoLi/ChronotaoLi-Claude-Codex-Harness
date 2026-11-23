@@ -67,10 +67,20 @@ class RunCleanupTests(RepoCase):
     def test_removed_receipt_does_not_hide_recreated_git_admin_directory(self):
         admin = Path(self.run["worktree_binding"]["git_dir"])
         self.assertEqual(self.cleanup(True)["status"], "removed")
+        receipt = self.receipt.read_bytes()
         admin.mkdir(parents=True)
-        (admin / "unrelated-data").write_text("preserve")
-        self.assert_blocked("重新出现")
-        self.assertEqual((admin / "unrelated-data").read_text(), "preserve")
+        for contents in (None, "preserve"):
+            with self.subTest(contents=contents):
+                unrelated = admin / "unrelated-data"
+                if contents is not None:
+                    unrelated.write_text(contents)
+                self.assert_blocked("已清理工作树或注册重新出现")
+                self.assertTrue(admin.is_dir())
+                self.assertFalse((admin / "gitdir").exists())
+                self.assertFalse(self.checkout.exists())
+                self.assertEqual(self.receipt.read_bytes(), receipt)
+                if contents is not None:
+                    self.assertEqual(unrelated.read_text(), contents)
 
     def test_abandoned_terminal_is_eligible(self):
         self.run["status"] = "abandoned"

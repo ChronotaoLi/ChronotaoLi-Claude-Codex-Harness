@@ -13,10 +13,11 @@ from pathlib import Path
 from unittest.mock import patch
 
 import harness.finalization as finalization
+from harness import git
 from harness.finalization import FinalAcceptance
 from harness.task_lifecycle import TaskLifecycle
 from harness.util import HarnessError, read_json, write_json
-from test_harness import RepoCase, after_save
+from test_harness import RepoCase, after_save, crash_point
 import test_review_batches as batches   # by module: a TestCase imported by name is collected again here
 from test_runtime_changes import ScriptedBackend, finding, revised, trigger_kind
 
@@ -32,7 +33,8 @@ def transition_span(function, marker=None):
              for parent in ast.walk(ast.parse(source)) for field in ("body", "orelse")
              for node in (getattr(parent, field, None) if isinstance(getattr(parent, field, None), list) else [])
              if isinstance(node, ast.With) and any(
-                 isinstance(item.context_expr, ast.Call) and getattr(item.context_expr.func, "attr", None) == "transition"
+                 isinstance(item.context_expr, ast.Call) and (getattr(item.context_expr.func, "attr", None) == "transition"
+                 or getattr(item.context_expr.func, "id", None) == "defer_cleanup_signals")
                  for item in node.items)
              and (marker is None or marker in ast.get_source_segment(source, node)
                   or isinstance(parent, ast.If) and marker in ast.get_source_segment(source, parent.test))]
@@ -655,10 +657,42 @@ class ExistingTransitionTests(LedgerSweepCase):
         self.sweep_ledger(ScriptedBackend, TaskLifecycle.accept_pending, None, run)
 
     def test_recorded_acceptance(self):
-        """The commit precedes the transition: from the old ledger a resume stops at the moved HEAD, as it always has."""
-        self.sweep_ledger(ScriptedBackend, TaskLifecycle._record_accepted, None,
-                          lambda engine, backend: engine.start("Implement greet", batches.plan()),
-                          old_stop=("workspace_mismatch", "head_changed"))
+        """The completion block defers SIGINT through both ledger saves and the Git writes."""
+        self.sweep_ledger(ScriptedBackend, TaskLifecycle._complete_acceptance, None,
+                          lambda engine, backend: engine.start("Implement greet", batches.plan()))
+
+    def test_recorded_ref_move_resumes_to_one_acceptance(self):
+        backend = ScriptedBackend()
+        engine = self.engine(backend)
+        move = git.move_branch
+        crash, die = crash_point(engine)
+
+        def move_then_die(*args, **kwargs):
+            moved = move(*args, **kwargs)
+            self.assertEqual(moved.returncode, 0)
+            die()
+
+        with crash, patch.object(git, "move_branch", side_effect=move_then_die), self.assertRaises(KeyboardInterrupt):
+            engine.start("Implement greet", batches.plan())
+        saved = batches.state(engine)
+        self.assertEqual(saved["accepted"], {})
+        intent = saved["pending_acceptance"]["intent"]
+        self.assertEqual(git.head(engine.worktree), intent["commit"])
+        self.assertEqual(saved["expected_head"], intent["parent"])
+        with patch.object(git, "build_commit", wraps=git.build_commit) as build, \
+                patch.object(git, "move_branch", wraps=git.move_branch) as move_again:
+            result = self.engine(backend).resume(saved["id"])
+        build.assert_not_called()
+        move_again.assert_not_called()
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["expected_head"], intent["commit"])
+        self.assertEqual(result["accepted"]["greet"]["tree"], intent["tree"])
+        self.assertNotIn("pending_acceptance", result)
+        self.assertNotIn("pending_post_accept", result)
+        self.assertEqual([call["kind"] for call in backend.calls],
+                         ["implement", "review", "final_review"])
+        self.assertEqual(git.git(self.repo, "rev-list", "--count",
+                                 intent["parent"] + ".." + intent["commit"]).strip(), "1")
 
     def test_final_verification(self):
         self.sweep_ledger(ScriptedBackend, FinalAcceptance.final_review, "verifying",

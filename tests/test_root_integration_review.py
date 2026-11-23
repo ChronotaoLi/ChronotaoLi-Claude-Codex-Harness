@@ -3,6 +3,7 @@ import copy
 import unittest
 
 from harness.diagnostics import budget_explanation
+from harness.versions import RUN_SCHEMA_VERSION
 
 
 class RootIntegrationReviewTests(unittest.TestCase):
@@ -16,7 +17,7 @@ class RootIntegrationReviewTests(unittest.TestCase):
                    review_history={'task': [dict(artifact=f'review{i}', worker_source={
                      'dispatch_id': f'w{i}', 'artifact': f'/dispatches/w{i}/returned-result.json',
                      'artifact_digest': 'a' * 64}) for i in range(3)] + [dict(artifact='legacy-review')]},
-                   schema_version=19, agent_dispatches=9,
+                   schema_version=RUN_SCHEMA_VERSION, agent_dispatches=9,
                    config_snapshot={'runtime': {'max_attempts': 5, 'max_agent_dispatches': 12}})
         before = copy.deepcopy(run)
         report = budget_explanation(run, {'task': 5})

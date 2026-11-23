@@ -137,7 +137,7 @@ def _gate(run, directory, *, terminal=False):
     validate_dispatch_indexes(directory, run['dispatches'])
     validate_input_dispatch_indexes(directory, run['dispatches'])
     validate_worker_receipt_links(run, directory)
-    ensure_dispatches_exited(run['dispatches'], state=repo / '.harness', observe=group_alive)
+    ensure_dispatches_exited(run['dispatches'], state=repo / '.harness', directory=directory, observe=group_alive)
     git.check_worktree_binding(checkout, run['worktree_binding'])
     if git.head(checkout, binding=run['worktree_binding']) != run['expected_head']:
         _fail('HEAD changed', stops.make('workspace_mismatch', 'head_changed', data={'expected_head': run['expected_head']}))

@@ -193,7 +193,8 @@ class Scheduler(RuntimeService):
                     elif action.kind == "decide":
                         self.services.planning.decide(action.data)
                     elif action.kind == "final_review":
-                        if self.services.finalization.final_review(reverify=self.context.reverify_requested):
+                        result = self.services.finalization.final_review(reverify=self.context.reverify_requested)
+                        if result:
                             break
                     else:
                         raise HarnessError(f"调度推导出未知步骤：{action.kind}", stop=stops.make("runtime_failure", "invariant"))
@@ -204,7 +205,7 @@ class Scheduler(RuntimeService):
                         continue
                     raise
             self.services.planning.verify_plan_authority()
-            self.context.run["status"] = "completed"
+            self.context.run.update(status="completed", result=result)
             self.context.save(terminal=True)
         except BaseException as error:
             # A quota failure takes its account snapshot before the stop is settled and saved;

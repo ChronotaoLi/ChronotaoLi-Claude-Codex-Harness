@@ -50,9 +50,9 @@ def open_root(held, root, binding):
 class VerificationOutcomeTests(unittest.TestCase):
     def fixture(self, root):
         context = SimpleNamespace(
-            run={"dispatches": []}, config=SimpleNamespace(data={"runtime": {"verify_timeout_seconds": 1}}),
+            directory=root, run={"dispatches": []}, config=SimpleNamespace(data={"runtime": {"verify_timeout_seconds": 1}}),
             ensure_exited=lambda: None, save=lambda: None, save_fact=lambda *keys: True)
-        return Verification(context), root / "checks"
+        return Verification(context), root / "verification" / "checks"
 
     def run_fake(self, verification, folder, outcome, error=None, then=lambda: None):
         def process(argv, cwd, log, **kwargs):
@@ -64,7 +64,7 @@ class VerificationOutcomeTests(unittest.TestCase):
             return outcome.exit_code
         with patch("harness.verification.git.open_bound_root", side_effect=open_root), \
                 patch("harness.verification.run_process", process):
-            return verification.run_verification_commands("task", [{"cwd": ".", "argv": ["check"]}], folder.parent, folder, {})
+            return verification.run_verification_commands("task", [{"cwd": ".", "argv": ["check"]}], verification.context.directory, folder, {})
 
     def test_zero_exit_with_unknown_group_cannot_pass_and_leaves_receipt(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -786,7 +786,7 @@ class VerificationFeedbackCommitTests(unittest.TestCase):
         context, workflow = self.context_and_workflow(root)
         root = context.state
         verification = Verification(context)
-        folder = root / "checks"
+        folder = context.directory / "verification" / "checks"
         if process_type in CHECK_FAILURES:
             process_error = check_failure(process_type, folder)
         elif process_type is not None:

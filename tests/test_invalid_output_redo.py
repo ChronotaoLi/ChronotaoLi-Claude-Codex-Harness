@@ -14,7 +14,7 @@ from harness.dispatch import Dispatcher
 from harness.memory import Memory
 from harness.util import HarnessError, read_json, write_json
 from test_engine_repairs import RecordingBackend
-from test_harness import RepoCase, ROOT, after_save, continues_without_stop, stopped, walk_exit
+from test_harness import RepoCase, ROOT, after_save, continues_without_stop, walk_exit
 from test_runtime_changes import ScriptedBackend, decided, finding, finding_key, trigger_kind
 from test_runtime_changes import revised as revised_
 from test_worker_return_recovery import stub_provider_clis
@@ -618,16 +618,18 @@ class UndecodableOutputTests(RepoCase):
             "Implement greet", plan())
         path = Path(run["worktree"]).parent.parent / "runs" / run["id"] / "state.json"
         saved = read_json(path)
-        for name, change in (("provider failure", {"worker_receipt_consumed": "provider_failure"}),
-                             ("not invalid", {"status": "failed"})):
+        cases = (
+            ("provider failure", {"worker_receipt_consumed": "provider_failure"},
+             "worker provider failure lacks retry evidence"),
+            ("not invalid", {"status": "failed"}, "worker invalid-output evidence lacks its rejection"),
+        )
+        for name, change, reason in cases:
             with self.subTest(case=name):
                 state = copy.deepcopy(saved)
                 state["dispatches"][0].update(change)
-                stopped(state)
                 write_json(path, state)
                 original = path.read_bytes()
-                with self.assertRaisesRegex(HarnessError, "provider failure lacks retry evidence|"
-                                                          "invalid-output evidence lacks its rejection"):
+                with self.assertRaisesRegex(HarnessError, reason):
                     self.engine(DemoBackend()).resume(run["id"])
                 self.assertEqual(path.read_bytes(), original)
 
@@ -772,7 +774,7 @@ class OptionalProductTests(RepoCase):
 class AcceptancePreflightTests(RepoCase):
     def test_task_memory_record_failure_stops_before_commit(self):
         engine = self.engine(ScriptedBackend())
-        with patch("harness.git.accept", wraps=git.accept) as accept, \
+        with patch("harness.git.build_commit", wraps=git.build_commit) as accept, \
                 patch.object(Memory, "validate_record", side_effect=HarnessError("too large")):
             with self.assertRaisesRegex(HarnessError, "任务记忆记录不合格；未提交"):
                 engine.start("Implement greet", plan())
@@ -812,7 +814,6 @@ class LedgerLinkTests(RepoCase):
                 a = next(d for d in state["dispatches"] if d["id"] == first["id"])
                 b = next(d for d in state["dispatches"] if d["id"] == second["id"])
                 mutate(state, a, b)
-                stopped(state)
                 write_json(path, state)
                 original = path.read_bytes()
                 with self.assertRaisesRegex(HarnessError, "运行台账恢复状态无效"):

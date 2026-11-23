@@ -27,7 +27,7 @@ class TaskPhaseHandoffTests(RepoCase):
         # combination must be rejected before it can consume the approval.
         saved["pending_task"] = {"task_id": "greet", "stage": "reviewing"}
         write_json(path, saved)
-        with patch("harness.task_lifecycle.git.accept", wraps=git.accept) as accept:
+        with patch("harness.task_lifecycle.git.build_commit", wraps=git.build_commit) as accept:
             with self.assertRaises(HarnessError):
                 self.engine(backend).resume(saved["id"])
         accept.assert_not_called()

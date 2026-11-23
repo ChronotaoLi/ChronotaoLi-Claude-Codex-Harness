@@ -200,7 +200,7 @@ class CommitMessageTests(RepoCase):
     def resume_refused(self, engine, backend, saved, pattern):
         write_json(engine.directory / "state.json", saved)
         head = git.head(engine.worktree)
-        with patch("harness.git.accept", wraps=git.accept) as accept, self.assertRaisesRegex(HarnessError, pattern):
+        with patch("harness.git.build_commit", wraps=git.build_commit) as accept, self.assertRaisesRegex(HarnessError, pattern):
             self.engine(backend).resume(saved["id"])
         accept.assert_not_called()
         self.assertEqual(git.head(engine.worktree), head)
@@ -261,7 +261,7 @@ class CommitMessageTests(RepoCase):
             value = read_json(artifact)
             value["commit_message"]["subject"] = "Changed while acceptance was pending"
             write_json(artifact, value)
-        with patch("harness.git.accept", wraps=git.accept) as accept, \
+        with patch("harness.git.build_commit", wraps=git.build_commit) as accept, \
                 self.assertRaisesRegex(HarnessError, "原始结果已改变|non-symlink file"):
             self.engine(backend).resume(saved["id"])
         accept.assert_not_called()
@@ -283,34 +283,35 @@ class CommitMessageTests(RepoCase):
         backend = ScriptedBackend(write)
         engine = self.engine(backend)
         base = git.head(self.repo)
-        accept = git.accept
+        move = git.move_branch
         crash, die = crash_point(engine)
 
-        def commit_then_die(*args, **kwargs):
-            accept(*args, **kwargs)
+        def move_then_die(*args, **kwargs):
+            moved = move(*args, **kwargs)
+            self.assertEqual(moved.returncode, 0, moved)
             die()
-        with crash, patch("harness.git.accept", side_effect=commit_then_die), self.assertRaises(KeyboardInterrupt):
+        with crash, patch("harness.git.move_branch", side_effect=move_then_die), self.assertRaises(KeyboardInterrupt):
             engine.start("Implement greet", self.plan())
         saved = read_json(engine.directory / "state.json")
         self.assertIn("pending_acceptance", saved)
         head = git.head(engine.worktree)
         self.assertNotEqual(head, saved["expected_head"])
-        error = None
-        with patch("harness.git.accept", wraps=git.accept) as again:
-            try:
-                self.engine(backend).resume(saved["id"])
-            except HarnessError as caught:
-                error = caught
-        # The commit step itself never runs again, whatever stops the resume.
+        with patch("harness.git.build_commit", wraps=git.build_commit) as again, \
+                patch("harness.git.move_branch", wraps=git.move_branch) as move_again:
+            result = self.engine(backend).resume(saved["id"])
         again.assert_not_called()
-        self.assertRegex(str(error), "HEAD 与检查点不同")
+        move_again.assert_not_called()
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["expected_head"], head)
+        self.assertEqual(result["accepted"]["greet"]["commit"], head)
+        self.assertEqual(self.workers(backend), 1)
         self.assertEqual(git.head(engine.worktree), head)
         self.assertEqual(git.git(self.repo, "rev-list", "--count", f"{base}..{head}").strip(), "1")
         original = read_json(Path(saved["pending_acceptance"]["worker_source"]["artifact"]))["commit_message"]
         self.assertEqual(commit_object(self.repo, head)[1],
                          commit_message_text(original, saved["id"], "greet").encode())
 
-    def test_interruption_after_staging_voids_the_approval_and_commits_the_new_message(self):
+    def test_interruption_after_private_staging_keeps_the_approval_and_first_message(self):
         def write(backend, kwargs, packet, result):
             if kwargs["role"] == "worker":
                 acceptance = "acceptance" in (packet.get("feedback") or {})
@@ -321,17 +322,17 @@ class CommitMessageTests(RepoCase):
         run_git = git.git
 
         def die_before_commit(repo, *args, **kwargs):
-            if "--cleanup=verbatim" in args:
+            if args[0] == "commit-tree":
                 raise KeyboardInterrupt
             return run_git(repo, *args, **kwargs)
         with patch("harness.git.git", side_effect=die_before_commit), self.assertRaises(KeyboardInterrupt):
             engine.start("Implement greet", self.plan())
         result = self.engine(backend).resume(engine.run["id"])
         self.assertEqual(result["status"], "completed")
-        self.assertEqual(self.workers(backend), 2)
+        self.assertEqual(self.workers(backend), 1)
         head = result["accepted"]["greet"]["commit"]
         self.assertEqual(git.git(self.repo, "rev-list", "--count", f"{base}..{head}").strip(), "1")
-        self.assertTrue(commit_object(self.repo, head)[1].startswith(b"Second message\n\n"))
+        self.assertTrue(commit_object(self.repo, head)[1].startswith(b"First message\n\n"))
 
 
 class BlockedMessageTests(RepoCase):

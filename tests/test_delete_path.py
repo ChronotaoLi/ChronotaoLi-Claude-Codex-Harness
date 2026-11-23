@@ -471,7 +471,7 @@ class DeletePathInterruptionTests(BrokerFixture):
                     # Recovery sees an exited child, never an unknown exit.
                     parent = self.parent_entry()
                     validate_command_directories([parent], self.run_dir)
-                    self.assertEqual(ensure_dispatches_exited([parent], state=self.run_dir), [])
+                    self.assertEqual(ensure_dispatches_exited([parent], state=self.run_dir, directory=self.run_dir), [])
                     # Later calls are admitted and nothing repeats the deletion.
                     self.assertEqual(broker.run_command({'command_id': command_id(ECHO)})['exit_code'], 0)
                     self.assertEqual((self.repo / 'legacy' / 'old.txt').exists(), when == 'before')
@@ -492,7 +492,7 @@ class DeletePathInterruptionTests(BrokerFixture):
         folder = Path(result['intent_path']).parent
         self.assertEqual(sorted(p.name for p in folder.iterdir()), ['delete-intent.json', 'process.json'])
         # Exit is already confirmed: resume and cleanup need no operator assertion.
-        self.assertEqual(ensure_dispatches_exited([self.parent_entry()], state=self.run_dir), [])
+        self.assertEqual(ensure_dispatches_exited([self.parent_entry()], state=self.run_dir, directory=self.run_dir), [])
         # The same dispatch refuses further calls instead of guessing; nothing is repeated.
         for attempt in (lambda: broker.delete_path({'path': 'legacy/tool.sh'}),
                         lambda: broker.run_command({'command_id': command_id(ECHO)})):

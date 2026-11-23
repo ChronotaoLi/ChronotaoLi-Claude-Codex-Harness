@@ -856,6 +856,19 @@ class LockedDirectory:
         self._locked()
         return self._identity
 
+    @property
+    def descriptor(self) -> int:
+        """The lock file descriptor, usable only while this lock is held."""
+        fd = self.held_descriptor
+        if fd is None:
+            raise RuntimeError("the lock is not held")
+        return fd
+
+    @property
+    def held_descriptor(self) -> int | None:
+        """The lock file descriptor, or None outside the holder's usable lifetime."""
+        return None if self._directory is None else self._held[-1][0]
+
     def _below(self, name):
         walk = self._walk
         return _Walk(walk.given, walk.components[:-1] + _components((name,)), Outcome, below=self._locked(),

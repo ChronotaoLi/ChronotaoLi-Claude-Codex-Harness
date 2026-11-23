@@ -1944,9 +1944,7 @@ MIGRATED = {
     ],
     "cleanup.py": [
         ("_canonical", "is_symlink"), ("_canonical", "resolve"), ("common_dir", "resolve"),
-        ("_root_missing", "os.lstat"), ("_check_missing_binding", "resolve"),
-        ("clean_checkout", "exists"), ("clean_checkout", "exists"), ("clean_checkout", "exists"),
-        ("clean_checkout", "is_symlink"),
+        ("_check_missing_binding", "resolve"),
         ("_clean_worktree", "exists"), ("_clean_worktree", "exists"), ("_clean_worktree", "exists"),
         ("_clean_worktree", "exists"), ("_clean_worktree", "exists"), ("_clean_worktree", "is_symlink"),
     ],

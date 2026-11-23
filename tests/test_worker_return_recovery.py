@@ -11,11 +11,11 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from harness import stops
+from harness import stops, worker_returns
 from harness.adapters import CLIBackend, DemoBackend
 from harness.process_runtime import ProcessOutcome
 from harness.recovery import worker_recovery_context
-from harness.util import HarnessError, ProcessTimeout, read_json, write_json
+from harness.util import HarnessError, ProcessTimeout, json_bytes, read_json, write_json
 from harness.worker_returns import SOURCES, inspect_return, validate_return_evidence
 from test_harness import RepoCase, ROOT, walk_exit
 import test_worker_receipts as receipt_tests
@@ -45,6 +45,9 @@ class WorkerReturnClassificationTests(unittest.TestCase):
          'unknown', 'provider result conflicts with original output'),
         # A provider result beside empty output is a conflict, never an absent return.
         ('2b provider result without output', {'process.stdout': '', 'provider-result.json': OK},
+         'unknown', 'provider result conflicts with original output'),
+        ('2c equivalent provider result with different bytes',
+         {'process.stdout': OK, 'provider-result.json': json.dumps(OK)},
          'unknown', 'provider result conflicts with original output'),
         ('3a stdout absent', {}, 'retryable', 'direct JSON output is absent or empty after exit'),
         ('3b stdout blank', {'process.stdout': ' \n'}, 'retryable', 'direct JSON output is absent or empty after exit'),
@@ -90,12 +93,19 @@ class WorkerReturnClassificationTests(unittest.TestCase):
             with self.subTest(row=name), tempfile.TemporaryDirectory() as temporary:
                 job = Path(temporary).resolve()
                 for filename, value in files.items():
-                    data = value if isinstance(value, (str, bytes)) else json.dumps(value)
-                    (job / filename).write_bytes(data if isinstance(data, bytes) else data.encode())
+                    path = job / filename
+                    if isinstance(value, bytes):
+                        path.write_bytes(value)
+                    elif isinstance(value, str):
+                        path.write_text(value, encoding='utf-8')
+                    elif filename == 'provider-result.json':
+                        write_json(path, value)
+                    else:
+                        path.write_bytes(json.dumps(value).encode())
                 record = inspect_return(job)
                 self.assertEqual((record['state'], record['reason']), (state, reason))
                 self.assertEqual(set(record), {'version', 'state', 'reason', 'sources', 'provider'})
-                self.assertEqual(record['version'], 2)
+                self.assertEqual(record['version'], 3)
                 # No process record in these rows: a retryable one is never provider-classified.
                 self.assertEqual(record['provider'],
                                  {'code': 'unknown', 'http_status': None} if state == 'retryable' else None)
@@ -105,6 +115,43 @@ class WorkerReturnClassificationTests(unittest.TestCase):
                 validate_return_evidence(job, record)
                 with self.assertRaisesRegex(HarnessError, 'invalid worker return evidence record'):
                     validate_return_evidence(job, {**record, 'capture': {'provider': 'claude', 'mode': 'legacy_json'}})
+
+
+    def test_json_bytes_match_published_bytes(self):
+        value = {'z': 'é\udcff', 'a': [True, 1.5]}
+        expected = b'{\n  "z": "\xc3\xa9\\udcff",\n  "a": [\n    true,\n    1.5\n  ]\n}\n'
+        with tempfile.TemporaryDirectory() as temporary:
+            target = Path(temporary) / 'published.json'
+            write_json(target, value)
+            self.assertEqual(target.read_bytes(), expected)
+            self.assertEqual(json_bytes(value), expected)
+
+    def test_originals_still_have_a_content_limit_and_derived_files_only_bind_digests(self):
+        limit = 256
+        compact = json.dumps(ERROR).encode()
+        for source, contents in (('process.stdout', compact), ('process.outcome.json', b'{}')):
+            with self.subTest(source=source), tempfile.TemporaryDirectory() as temporary:
+                job = Path(temporary).resolve()
+                (job / 'process.stdout').write_bytes(compact)
+                (job / 'process.outcome.json').write_bytes(b'{}')
+                derived = job / 'provider-result.json'
+                write_json(derived, ERROR)
+                leaf = job / source
+                with patch.object(worker_returns, 'LIMIT', limit):
+                    at_limit = contents.ljust(limit, b' ')
+                    leaf.write_bytes(at_limit)
+                    record = inspect_return(job)
+                    self.assertEqual((record['version'], record['state']), (3, 'retryable'))
+                    self.assertEqual(record['sources']['provider-result.json'],
+                                     hashlib.sha256(derived.read_bytes()).hexdigest())
+                    validate_return_evidence(job, record)
+
+                    leaf.write_bytes(at_limit + b' ')
+                    record = inspect_return(job)
+                    self.assertEqual((record['state'], record['reason']),
+                                     ('unknown', 'unreadable worker return evidence: ValueError'))
+                    self.assertEqual(record['sources'][source], hashlib.sha256(at_limit + b' ').hexdigest())
+                    validate_return_evidence(job, record)
 
 
 class WorkerReturnRecoveryTests(RepoCase):

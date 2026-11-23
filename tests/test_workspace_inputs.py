@@ -40,6 +40,7 @@ class WorkspaceInputsTests(unittest.TestCase):
         self.run = dict(schema_version=RUN_SCHEMA_VERSION, workspace_inputs=None, id=self.ident,
                         repo=str(self.repo), worktree=str(self.checkout), status='paused',
                         expected_head=git.head(self.checkout), dispatches=[], worker_receipts={},
+                        verification_checkouts=[],
                         worktree_binding=git.capture_worktree_binding(self.checkout, 'harness/' + self.ident))
         self.save()
         (self.repo / 'deps').mkdir()

@@ -19,6 +19,7 @@ from harness.util import HarnessError, write_json
 from harness.workflow import Workflow
 from test_operations import OperationCase
 from test_quota_sampling import two_tasks
+from test_runtime_changes import ScriptedBackend
 from test_stop_exits import final_answer, final_failure_scenario
 
 
@@ -157,10 +158,20 @@ class CommitAmbiguityTests(OperationCase):
         self.assert_same_lock_for_recovery_read(fault)
         saved = self.ledger(fault.candidate["id"])
         stop = saved.pop("stop")
-        self.assertEqual(saved, {**fault.candidate, "status": "blocked"})
+        candidate = deepcopy(fault.candidate)
+        identity = candidate.pop("result")
+        self.assertEqual(saved, {**candidate, "status": "blocked"})
         self.assertEqual(saved["store_revision"], json.loads(fault.before)["store_revision"] + 1)
         self.assertEqual((stop["kind"], stop["reason"]), ("runtime_failure", "io"))
         self.assertEqual(fault.stops, [Workflow.WRITTEN])
+        backend = ScriptedBackend()
+        engine = self.engine(backend)
+        engine.load_run(saved["id"])
+        result = engine.resume(saved["id"])
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["result"], identity)
+        self.assertEqual(result["final_history"], saved["final_history"])
+        self.assertEqual(backend.calls, [])
 
     def test_failed_write_reread_is_resolved_by_stop_before_saving(self):
         fault = TerminalWriteFault("completed", failed_reads={"write failure read"})
@@ -169,6 +180,8 @@ class CommitAmbiguityTests(OperationCase):
         self.assert_saved_candidate(fault)
         self.assertEqual(fault.phases, ["write failure read", "boundary resolve read"])
         self.assertEqual(fault.stops, [Workflow.KEPT])
+        self.assertEqual(fault.live["result"], fault.candidate["result"])
+        self.assertIsNot(fault.live["result"], fault.candidate["result"])
         self.assertIn("终态已保存", errors)
 
     def test_sigint_between_replace_and_adoption_keeps_completed(self):
@@ -217,6 +230,9 @@ class CommitAmbiguityTests(OperationCase):
                 self.assert_saved_candidate(fault)
                 self.assertEqual(fault.phases, ["write failure read", "boundary resolve read", "stop commit read"])
                 self.assertEqual(fault.stops, [Workflow.KEPT])
+                if status == "completed":
+                    self.assertEqual(fault.live["result"], fault.candidate["result"])
+                    self.assertIsNot(fault.live["result"], fault.candidate["result"])
                 ident = fault.candidate["id"]
                 self.assertEqual(self.events(ident, "run_stopped"), [])
                 self.assertEqual(len(self.events(ident, event)), 1)

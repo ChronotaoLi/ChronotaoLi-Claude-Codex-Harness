@@ -56,7 +56,7 @@ class BrokerPublicationWindowTests(BrokerFixture):
         self.assertEqual(command_processes(self.job, state=self.run_dir), [])
         parent = self.parent_entry()
         validate_command_directories([parent], self.run_dir)
-        self.assertEqual(ensure_dispatches_exited([parent], state=self.run_dir), [])
+        self.assertEqual(ensure_dispatches_exited([parent], state=self.run_dir, directory=self.run_dir), [])
         audits = []
         confirm_dispatches_exited([parent], [parent['id']], state=self.run_dir, audit=lambda *a, **k: audits.append(a), save=lambda: None)
         self.assertEqual(audits, [])

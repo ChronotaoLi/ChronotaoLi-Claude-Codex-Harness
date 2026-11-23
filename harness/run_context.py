@@ -28,6 +28,7 @@ class RunContext:
         self.store = RunStore(self.state)
         self.saved_stop = None  # (outgoing error, exit code) for a confirmed stop in this call
         self.reverify_requested = False
+        self._run_lock = None
         # Optional post-commit observer; failures propagate after durable state.
         self.on_save = None
 
@@ -47,10 +48,17 @@ class RunContext:
     def worktree(self):
         return Path(self.run["worktree"])
 
-    def snapshot(self):
+    def _check_snapshot_workspace(self):
         self.store.check_current()
         git.check_worktree_state(self.worktree)
+
+    def snapshot(self):
+        self._check_snapshot_workspace()
         return git.snapshot(self.worktree, binding=self.run["worktree_binding"])
+
+    def read_worktree(self):
+        self._check_snapshot_workspace()
+        return git.read_worktree(self.worktree, binding=self.run["worktree_binding"])
 
     def ignored_inventory(self):
         """The run worktree's current ignored set for one packet: bounded, never saved.
@@ -62,6 +70,13 @@ class RunContext:
         except (HarnessError, OSError) as error:
             return {"coverage": "paths_only_not_contents", "entries": None, "entry_count": None,
                     "omitted_count": None, "error": str(error)[:500]}
+
+    @property
+    def run_lock_descriptor(self) -> int | None:
+        """The lock file descriptor while the lifecycle callback owns it."""
+        # An interrupt can skip clearing the reference, but holding still closes the lock.
+        lock = self._run_lock
+        return None if lock is None else lock.held_descriptor
 
     def run_lock(self, stop, use):
         """``use()`` with run.lock held, the run directory it lies in bound to the store first.
@@ -79,7 +94,11 @@ class RunContext:
             nonlocal entered
             entered = True
             self.store.bind_directory(locked.identity)
-            return use()
+            try:
+                self._run_lock = locked
+                return use()
+            finally:
+                self._run_lock = None
         try:
             return holding(StateFiles(self.state).lock(("runs", self.run["id"], "run.lock"), create=True,
                                                        identity=self.store.directory_identity), held)
@@ -156,13 +175,16 @@ class RunContext:
                    "operator_decisions": deepcopy(self.run.get("operator_decisions", [])),
                    "task_checkpoints": deepcopy(self.run.get("task_checkpoints", [])),
                    "next": "Resume the harness run; every dispatch creates a fresh agent process."}
+        if "result" in self.run:
+            handoff["result"] = self.run["result"]
         # handoff.json is the only handoff artifact.
         write_json(self.directory / "handoff.json", handoff)
 
     def ensure_exited(self, *, commit=True):
         validate_command_directories(self.run["dispatches"], self.directory)
         try:
-            exited = ensure_dispatches_exited(self.run["dispatches"], state=self.state, observe=group_alive)
+            exited = ensure_dispatches_exited(self.run["dispatches"], state=self.state, directory=self.directory,
+                                             observe=group_alive)
         except HarnessError as error:
             stop = error.stop
             if isinstance(stop, dict) and stop.get("kind") == "process_unconfirmed":

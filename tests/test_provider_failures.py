@@ -22,7 +22,7 @@ import uuid
 from pathlib import Path
 from unittest.mock import patch
 
-from harness import git, stops
+from harness import git, stops, worker_returns
 from harness.adapters import CLIBackend, DemoBackend
 from harness.budgets import work_attempts
 from harness.cli import status_summary
@@ -33,10 +33,10 @@ from harness.provider_failures import classify, stop_facts
 from harness.run_store import RunStore
 from harness.runtime import Runtime
 from harness.task_lifecycle import TaskLifecycle
-from harness.util import HarnessError, ProcessTimeout, read_json, tail_text, write_json
+from harness.util import HarnessError, ProcessTimeout, json_bytes, read_json, tail_text, write_json
 from harness.worker_receipts import WorkerReceipts
 from harness.worker_returns import inspect_return, validate_return_evidence
-from test_harness import ROOT, RepoCase, after_save, crash_after_save, crash_point, run_cli, walk_exit
+from test_harness import ROOT, RepoCase, after_save, crash_after_save, crash_point, refused_by_cli, run_cli, walk_exit
 from test_operations import OperationCase
 from test_runtime_changes import ScriptedBackend
 from test_worker_return_recovery import stub_provider_clis
@@ -252,15 +252,15 @@ class ClassifierTests(unittest.TestCase):
         self.assertEqual(code(429, api_error="rate_limit_error", api_error_type="rate_limit_error"), "rate_limit")
         self.assertEqual(code(429, api_error_type=None), "rate_limit")
 
-    def test_worker_return_evidence_v2_shape_is_strict(self):
+    def test_worker_return_evidence_v3_shape_is_strict(self):
         with tempfile.TemporaryDirectory() as folder:
             job = Path(folder).resolve()
             (job / "process.outcome.json").write_text(json.dumps(NORMAL))
             (job / "process.stdout").write_text(json.dumps(QUOTA))
             record = inspect_return(job)
-            self.assertEqual((record["version"], record["provider"]), (2, {"code": "usage_limit", "http_status": 429}))
+            self.assertEqual((record["version"], record["provider"]), (3, {"code": "usage_limit", "http_status": 429}))
             validate_return_evidence(job, record)
-            for change in ({"version": 1}, {"provider": None}, {"provider": {"code": "nope", "http_status": None}},
+            for change in ({"version": 1}, {"version": 2}, {"provider": None}, {"provider": {"code": "nope", "http_status": None}},
                            {"provider": {"code": "usage_limit", "http_status": "429"}}):
                 with self.subTest(change=change), self.assertRaisesRegex(HarnessError, "invalid worker return evidence"):
                     validate_return_evidence(job, {**record, **change})
@@ -446,7 +446,7 @@ class ImmediateJudgmentTests(RepoCase):
         stdout_digest = hashlib.sha256((job / "process.stdout").read_bytes()).hexdigest()
         self.assertEqual(state["worker_receipts"], {})
         self.assertEqual(entry["worker_receipt_consumed"], "provider_failure")
-        self.assertEqual(entry["worker_return_evidence"]["version"], 2)
+        self.assertEqual(entry["worker_return_evidence"]["version"], 3)
         self.assertEqual(entry["worker_return_evidence"]["provider"], {"code": "usage_limit", "http_status": 429})
         self.assertEqual(entry["attempt_exemption"], {"basis": "provider_error", "code": "usage_limit",
                                                       "artifact": str(job / "process.stdout"),
@@ -460,6 +460,141 @@ class ImmediateJudgmentTests(RepoCase):
         after = walk_exit(self, engine.directory, ("provider_quota", "usage_limit"), backend=backend,
                           expect_status="completed")
         self.assertEqual((after["attempts"], work_attempts(after)), ({"greet": 2}, {"greet": 1}))
+
+    def test_large_provider_copy_is_exempt_and_resume_dispatches_fresh_worker(self):
+        terminal = {**QUOTA, "detail": [{"text": "世"}] * 100}
+        compact = json.dumps(terminal, ensure_ascii=False, separators=(",", ":"))
+        command = f"import sys; sys.stdout.write({compact!r})"
+        self.config.data["runtime"]["max_agent_dispatches"] = 3
+        with patch.object(worker_returns, "LIMIT", 2560):
+            engine, backend, error = self.failed(program=command, exit_code=0)
+            state = saved(engine)
+            entry = worker(state)
+            job = engine.directory / "dispatches" / entry["id"]
+            original = (job / "process.stdout").read_bytes()
+            self.assertEqual(read_json(job / "process.outcome.json")["exit_code"], 0)
+            copy_bytes = (job / "provider-result.json").read_bytes()
+            self.assertLess(len(original), 2560)
+            self.assertGreater(len(copy_bytes), 2560)
+            self.assertEqual(copy_bytes, json_bytes(terminal))
+            self.assertEqual(copy_bytes, (json.dumps(terminal, ensure_ascii=False, indent=2) + "\n").encode())
+            self.assertEqual((stops.of(error)["kind"], stops.of(error)["reason"]),
+                             ("provider_quota", "usage_limit"))
+            self.assertEqual(entry["worker_return_evidence"], {
+                "version": 3, "state": "retryable", "reason": "provider returned a complete explicit error",
+                "provider": {"code": "usage_limit", "http_status": 429},
+                "sources": {name: hashlib.sha256((job / name).read_bytes()).hexdigest()
+                            if (job / name).is_file() else None for name in worker_returns.SOURCES},
+            })
+            self.assertEqual(entry["worker_receipt_consumed"], "provider_failure")
+            self.assertFalse(state["worker_receipts"])
+            self.assertEqual((state["attempts"], work_attempts(state), state["agent_dispatches"]),
+                             ({"greet": 1}, {"greet": 0}, 1))
+
+            fresh = self.engine(backend)
+            fresh.load_run(state["id"])
+            fresh.services.budgets.validate_provider_exemption(entry, entry["attempt_exemption"], {"greet"})
+            refused_by_cli(self, backend, ["resume", state["id"]], ("budget", "agent_dispatches"), 3)
+            result = saved(engine)
+        self.assertEqual(backend.calls, ["worker", "commander", "worker"])
+        workers = [item for item in result["dispatches"] if item["role"] == "worker"]
+        self.assertEqual(len(workers), 2)
+        self.assertNotEqual(workers[0]["id"], workers[1]["id"])
+        self.assertEqual((result["attempts"], work_attempts(result), result["agent_dispatches"]),
+                         ({"greet": 2}, {"greet": 1}, 3))
+
+    def test_provider_copy_conflicts_keep_the_receipt_and_block_resume(self):
+        class ConflictingCopy(FailingWorker):
+            def invoke(self, **kwargs):
+                try:
+                    return super().invoke(**kwargs)
+                except HarnessError:
+                    job = Path(kwargs["job"])
+                    copy_path = job / "provider-result.json"
+                    if mode == "different result":
+                        write_json(copy_path, RATE)
+                    elif mode == "empty original":
+                        (job / "process.stdout").write_bytes(b"")
+                    else:
+                        copy_path.write_text(json.dumps(QUOTA), encoding="utf-8")
+                    raise
+
+        for mode in ("different result", "empty original", "different formatting"):
+            with self.subTest(mode=mode):
+                backend = ConflictingCopy(self.config, self.repo, QUOTA, exit_code=0)
+                engine = self.engine(backend)
+                with self.assertRaises(HarnessError) as caught:
+                    engine.start("Implement greet", plan())
+                notice = stops.of(caught.exception)
+                self.assertEqual((notice["kind"], notice["reason"]), ("evidence", "unsealed_unknown"))
+                state = saved(engine)
+                entry = worker(state)
+                verdict = entry["worker_return_evidence"]
+                self.assertEqual((verdict["version"], verdict["state"], verdict["reason"], verdict["provider"]),
+                                 (3, "unknown", "provider result conflicts with original output", None))
+                self.assertNotIn("attempt_exemption", entry)
+                self.assertIn("worker:implement:greet", state["worker_receipts"])
+                self.assertEqual((state["attempts"], work_attempts(state), state["agent_dispatches"]),
+                                 ({"greet": 1}, {"greet": 1}, 1))
+                refused_by_cli(self, backend, ["resume", state["id"]], ("evidence", "unsealed_unknown"), 1)
+                self.assertEqual(backend.calls, ["worker"])
+                self.assertEqual(saved(engine)["agent_dispatches"], 1)
+
+    def test_adapter_copy_read_failure_keeps_the_unjudged_receipt(self):
+        offsets = []
+
+        class UnreadableCopy(ReadsOf):
+            def pread(self, fd, size, offset):
+                if self.names[fd] == "provider-result.json":
+                    offsets.append(offset)
+                    raise OSError(errno.EIO, "injected provider copy read failure")
+                return super().pread(fd, size, offset)
+
+        with patch.object(state_files, "os", UnreadableCopy()):
+            engine, backend, error = self.failed(exit_code=0)
+        self.assertEqual(offsets, [0])
+        notice = stops.of(error)
+        self.assertEqual((notice["kind"], notice["reason"], notice["data"]["error_type"]),
+                         ("runtime_failure", "io", "OSError"))
+        state = saved(engine)
+        entry = worker(state)
+        self.assertIn("worker:implement:greet", state["worker_receipts"])
+        for field in ("worker_return_evidence", "worker_receipt_consumed", "attempt_exemption"):
+            self.assertNotIn(field, entry)
+        self.assertEqual((state["attempts"], work_attempts(state), state["agent_dispatches"]),
+                         ({"greet": 1}, {"greet": 1}, 1))
+        self.assertEqual(backend.calls, ["worker"])
+
+        result = self.engine(backend).resume(state["id"])
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(worker(result)["attempt_exemption"]["code"], "usage_limit")
+        self.assertEqual((result["attempts"], work_attempts(result), backend.workers),
+                         ({"greet": 2}, {"greet": 1}, 2))
+
+    def test_provider_copy_changes_fail_loading_and_exemption_validation(self):
+        engine, backend, error = self.failed(exit_code=0)
+        self.assertEqual(stops.of(error)["reason"], "usage_limit")
+        state = saved(engine)
+        entry = worker(state)
+        fresh = self.engine(backend)
+        fresh.load_run(state["id"])
+        exemption = entry["attempt_exemption"]
+        fresh.services.budgets.validate_provider_exemption(entry, exemption, {"greet"})
+        copy_path = engine.directory / "dispatches" / entry["id"] / "provider-result.json"
+        original = copy_path.read_bytes()
+        self.assertEqual(original[-1:], b"\n")
+        for change in ("one byte", "deleted"):
+            with self.subTest(change=change):
+                if change == "one byte":
+                    copy_path.write_bytes(original[:-1] + b" ")
+                else:
+                    copy_path.unlink()
+                with self.assertRaisesRegex(HarnessError, "worker return evidence changed"):
+                    fresh.services.budgets.validate_provider_exemption(entry, exemption, {"greet"})
+                refused_by_cli(self, backend, ["resume", state["id"]], ("evidence", "load_integrity"), 1)
+                self.assertEqual(backend.calls, ["worker"])
+                copy_path.write_bytes(original)
+        self.engine(backend).load_run(state["id"])
 
     def exempted(self, terminal, code):
         engine, backend, _ = self.failed(terminal)

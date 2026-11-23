@@ -143,7 +143,7 @@ harness resume RUN --step
 
 所有更改在 `<目标项目>/.harness/worktrees/<run_id>` 的 `harness/<run_id>` 分支完成。每个通过检查和审阅的任务生成本地提交。成功输出分支和路径，便于查看 diff、merge 或 cherry-pick；最终集成由你操作。
 
-每个有改动的已接受任务恰好生成一个提交。提交消息由该任务的 worker 按目标仓库的提交规范撰写（`commit_message` 的主题与正文），经独立审阅审查；除非仓库规范要求，消息里不加 `Co-Authored-By` 之类的署名行，多出的署名行由审阅者按阻断问题退回；运行时按原样提交（`--cleanup=verbatim`），只在末尾追加 `Harness-Run`、`Harness-Task` 两行 trailer。作者与提交者固定为 `Personal Harness <harness@localhost>`，不签名，不运行仓库 hooks，提交编码固定为 UTF-8；运行时不推送、不合并、不改写历史。目标或仓库规则要求更多（签名、`Signed-off-by` trailer、指定作者、压缩提交、推送）时，指挥会向操作者提问，不会写成运行时做不到的验收项。
+每个接受后的树与父提交不同的任务恰好生成一个提交。提交消息由该任务的 worker 按目标仓库的提交规范撰写（`commit_message` 的主题与正文），经独立审阅审查；除非仓库规范要求，消息里不加 `Co-Authored-By` 之类的署名行，多出的署名行由审阅者按阻断问题退回；运行时用 `git commit-tree` 原样写入主题与正文，并在末尾追加 `Harness-Run`、`Harness-Task` 两行 trailer。作者与提交者固定为 `Personal Harness <harness@localhost>`，不签名，不运行仓库 hooks，提交编码固定为 UTF-8；运行时不推送、不合并、不改写历史。目标或仓库规则要求更多（签名、`Signed-off-by` trailer、指定作者、压缩提交、推送）时，指挥会向操作者提问，不会写成运行时做不到的验收项。
 
 外层脚本按 trailer 识别 Harness 提交，不要匹配主题。读取时固定 trailer 分隔符，并让 `interpret-trailers` 不把正文里的 `---` 行当作补丁分隔线：
 
@@ -233,9 +233,9 @@ harness cleanup-run RUN --remove --remove-ignored
 
 `cleanup-run RUN` 是唯一的显式清理入口（验证通过的检出另由运行时在整体审阅前尝试回收）：默认预览，逐项列出保留的全新验证检出和分支工作树能否清理、被什么挡住，`--remove` 才逐项删除。分支工作树只在 `completed` 或 `abandoned` 时清理，其他状态报告 `retained`；工作树里被 Git 忽略的文件只在本次命令带 `--remove-ignored` 时随工作树删除（不带时报 `blocked`，`--remove-ignored` 单独使用是预览忽略清单）；验证检出里的忽略文件随检出删除。某项受阻不影响其余各项，只有出现 `blocked` 时退出码为 1。派发或命令子进程退出未确认时整条命令拒绝，核实后可加 `--confirm-exited DISPATCH_ID`。命令不改 run 状态，不删除分支、台账或运行证据；中断后重跑同一命令续做。各状态的含义、门禁与记录文件见[放弃与清理](docs/recovery.md#放弃与清理)。
 
-台账版本为 19。台账只存摘要与引用，完整内容在 run 目录的不可变文件里；这些文件被删除、修改或换成符号链接时 `resume` 停止并保留现场（见[证据损坏](docs/recovery.md#证据损坏)）。已完成 run 的普通恢复返回保存结果。
+台账版本为 20。台账只存摘要与引用，完整内容在 run 目录的不可变文件里；这些文件被删除、修改或换成符号链接时 `resume` 停止并保留现场（见[证据损坏](docs/recovery.md#证据损坏)）。已完成 run 的普通恢复返回保存结果。
 
-只支持当前台账版本：其他版本的台账在各入口一律被拒绝（`台账版本 N 不支持（当前版本 19）`），运行列表只列出它的路径、版本和“不支持”。见[终态与其他版本的台账](docs/recovery.md#终态与其他版本的台账)。
+只支持当前台账版本：其他版本的台账在各入口一律被拒绝（`台账版本 N 不支持（当前版本 20）`），运行列表只列出它的路径、版本和“不支持”。见[终态与其他版本的台账](docs/recovery.md#终态与其他版本的台账)。
 
 ## 共用 skills / MCP
 
@@ -327,7 +327,7 @@ claude_max_turns_by_role = { worker = 200 }
 
 首次私有写入前，运行时保留 Git 公共目录 `info/exclude` 原字节并补充 `/.harness/`，同时建立私有根 `.harness/.gitignore` 的 `*` 保护；不改项目已跟踪 `.gitignore`。已有冲突控制文件、符号链接或被跟踪的私有状态会拒绝，不覆盖现场。`.harness/` 属于被忽略的私有运行目录，不要提交运行现场、凭据或生成 MCP 配置；日志可能包含代码与业务内容。
 
-`status RUN --full` 的 `provider_usage` 及 `dispatch_finished` 事件记录供应商实际返回的用量，缺失用量不当作零，不汇总（见[用量与名义费用](docs/operations.md#额度)）。长进程每 60 秒在 stderr 提示仍在运行，实际超时独立生效。错误、中断、Git 提交与检查点之间的窗口见[不能自动恢复的窗口](docs/recovery.md#不能自动恢复的窗口)；派发事件的含义见[观察网页用法与限制](docs/operations.md#观察网页用法与限制)，调用计数以台账 `invoked` 为准。
+`status RUN --full` 的 `provider_usage` 及 `dispatch_finished` 事件记录供应商实际返回的用量，缺失用量不当作零，不汇总（见[用量与名义费用](docs/operations.md#额度)）。长进程每 60 秒在 stderr 提示仍在运行，实际超时独立生效。Git 接受步骤中断见[接受过程中断](docs/recovery.md#接受过程中断)，其他中断见[不能自动恢复的窗口](docs/recovery.md#不能自动恢复的窗口)；派发事件的含义见[观察网页用法与限制](docs/operations.md#观察网页用法与限制)，调用计数以台账 `invoked` 为准。
 
 ## 参考与边界
 

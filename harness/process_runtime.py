@@ -96,18 +96,25 @@ def failure(step, error):
 
 
 class ProcessSupervisor:
-    def __init__(self, log, *, on_outcome=None, cleanup_deadline=None):
-        from .util import write_json
+    def __init__(self, log, *, on_outcome=None, cleanup_deadline=None, owner=None):
         self.log = log
         self.path = log.with_suffix(".outcome.json")
         self.on_outcome = on_outcome
+        self.owner = owner
         self.cleanup_deadline = cleanup_deadline
         self.fatal = None
         self.process = None
         self.launch_pending = False
         self.outcome = ProcessOutcome()
         # Before Popen: inability to save intent must prevent startup.
-        write_json(self.path, self.outcome.to_dict())
+        self._persist()
+
+    def _persist(self):
+        from .util import write_json
+        record = self.outcome.to_dict()
+        if self.owner is not None:
+            record["owner"] = self.owner
+        write_json(self.path, record)
 
     def begin_launch(self):
         # If Popen itself raises after creating a child, its identity may never
@@ -115,13 +122,12 @@ class ProcessSupervisor:
         self.launch_pending = True
 
     def started(self, process):
-        from .util import write_json
         self.process = process  # Ownership is assigned before persistence/callbacks.
         self.launch_pending = False
         self.outcome.started = True
         self.outcome.startup_state = "started"
         self.outcome.pid = self.outcome.pgid = process.pid
-        write_json(self.path, self.outcome.to_dict())
+        self._persist()
 
     def _attempt(self, step, action):
         try:
@@ -175,14 +181,13 @@ class ProcessSupervisor:
 
     def record_cancellation(self, error):
         """Persist a late cancellation without repeating process cleanup."""
-        from .util import write_json
         out = self.outcome
         out.termination_reason = "cancelled"
         out.errors.append(failure("execution", error))
         error.outcome = out
         with defer_cleanup_signals(primary=error):
             try:
-                write_json(self.path, out.to_dict())
+                self._persist()
                 if self.on_outcome:
                     self.on_outcome(out)
             except BaseException as persistence_error:
@@ -203,7 +208,7 @@ class ProcessSupervisor:
                 raise
 
     def _finish(self, primary=None):
-        from .util import HarnessError, ProcessStartError, ProcessTimeout, write_json
+        from .util import HarnessError, ProcessStartError, ProcessTimeout
         out = self.outcome
         if primary is not None:
             out.termination_reason = ("timeout" if isinstance(primary, ProcessTimeout) else
@@ -257,7 +262,7 @@ class ProcessSupervisor:
             out.evidence_complete = False
         secondary = None
         try:
-            write_json(self.path, out.to_dict())
+            self._persist()
         except (Exception, KeyboardInterrupt, SystemExit) as error:
             out.evidence_complete = False
             out.errors.append(failure("persist_outcome", error))
@@ -270,7 +275,7 @@ class ProcessSupervisor:
                 out.errors.append(failure("on_outcome", error))
                 secondary = secondary or error
                 try:
-                    write_json(self.path, out.to_dict())
+                    self._persist()
                 except (Exception, KeyboardInterrupt, SystemExit) as persistence_error:
                     out.errors.append(failure("persist_callback_failure", persistence_error))
         if primary is not None:

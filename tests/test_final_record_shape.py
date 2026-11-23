@@ -69,13 +69,14 @@ class FinalRecordShapeTests(RepoCase):
             ("no phase", ".status/phase", pop("phase")),
             ("running/reviewing without its mapping", ".required_findings", put(status="running", phase="reviewing")),
             *((f"no {key}", f".{key}", pop(key)) for key in (
-                "attempt", "head", "snapshot_digest", "snapshot_artifact", "artifact", "accepted_tasks",
+                "attempt", "head", "tree", "snapshot_digest", "snapshot_artifact", "artifact", "accepted_tasks",
                 "verification_rounds", "verification", "diff_artifact", "failure_kind", "verification_failures")),
             # Table K5-2: wherever a key appears, its value.
             ("attempt 0", ".attempt", put(attempt=0)),
             ("attempt true", ".attempt", put(attempt=True)),
             ("attempt as text", ".attempt", put(attempt="1")),
             ("head null", ".head", put(head=None)),
+            ("tree null", ".tree", put(tree=None)),
             ("snapshot_digest a number", ".snapshot_digest", put(snapshot_digest=7)),
             ("artifact null", ".artifact", put(artifact=None)),
             ("snapshot_artifact a list", ".snapshot_artifact", put(snapshot_artifact=["x"])),

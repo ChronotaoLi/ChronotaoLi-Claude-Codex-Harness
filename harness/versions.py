@@ -11,7 +11,7 @@ from . import stops
 from .state_files import StateFiles
 from .util import EvidenceError, HarnessError
 
-RUN_SCHEMA_VERSION = 19
+RUN_SCHEMA_VERSION = 20
 
 
 def unsupported_ledger(run):

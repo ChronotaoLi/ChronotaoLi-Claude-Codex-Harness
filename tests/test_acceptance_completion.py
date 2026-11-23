@@ -7,7 +7,7 @@ from harness.adapters import DemoBackend
 from harness.util import HarnessError, dump, read_json
 from unittest.mock import patch
 
-from test_harness import ROOT, RepoCase, crash_point
+from test_harness import ROOT, RepoCase, after_save, crash_point
 from test_memory_pipeline import ProposedKnowledge
 
 
@@ -27,6 +27,58 @@ class AcceptanceCompletionTests(RepoCase):
         self.assertEqual(len(engine.memory.export()), memory_count)
         self.assertEqual(len(self.events(engine, "task_accepted")), 1)
         self.assertNotIn("pending_post_accept", result)
+
+    def test_acceptance_tree_stays_out_of_saved_post_accept_payload(self):
+        engine = self.engine(DemoBackend())
+        published = []
+
+        def capture_publication():
+            published.append((
+                read_json(engine.directory / "state.json"),
+                git.git(engine.worktree, "rev-parse", "HEAD").strip(),
+                git.git(engine.worktree, "rev-parse", "HEAD^{tree}").strip(),
+            ))
+
+        observer, _ = after_save(engine, lambda run: "pending_post_accept" in run, capture_publication)
+        with observer:
+            engine.start("Implement greet", step=True)
+
+        (saved, commit, tree), = published
+        self.assert_completed_once(engine, commit, 1)
+        self.assertEqual(saved["expected_head"], commit)
+        self.assertNotIn("pending_acceptance", saved)
+        accepted = saved["accepted"]["greet"]
+        self.assertEqual(accepted["commit"], commit)
+        self.assertEqual(accepted["tree"], tree)
+        self.assertEqual(engine.run["accepted"]["greet"], accepted)
+
+        # Signed A1 publishes these acceptance facts in both places. Ordinary
+        # acceptance binds the worker source and retains the empty request list.
+        old_keys = {"commit", "summary", "summary_source", "files", "verification",
+                    "review", "review_artifact", "review_source", "worker_source", "decision_requests"}
+        self.assertEqual(set(accepted), old_keys | {"tree"})
+        self.assertEqual(accepted["worker_source"], saved["review_history"]["greet"][-1]["worker_source"])
+        self.assertEqual(accepted["decision_requests"], [])
+        post_accept = saved["pending_post_accept"]
+        self.assertEqual(set(post_accept), {"payload", "completion"})
+
+        record, = engine.memory.export()
+        self.assertEqual(record["kind"], "accepted_task")
+        self.assertEqual(json.loads(record["detail"])["commit"], commit)
+        self.assertEqual(record["source"], f"git:{commit};run:{saved['id']}")
+        self.assertEqual(record["provenance"], {
+            "commit": commit, "run_id": saved["id"], "task_id": "greet",
+            "scope": "run", "reference_only": True,
+        })
+        event, = self.events(engine, "task_accepted")
+        self.assertEqual(event["task_id"], "greet")
+        self.assertEqual(event["commit"], commit)
+        self.assertEqual(event["event_id"], post_accept["completion"]["id"])
+
+        self.assertEqual(set(post_accept["payload"]), old_keys | {"task_id"})
+        self.assertEqual(post_accept["payload"], {
+            "task_id": "greet", **{key: accepted[key] for key in old_keys},
+        })
 
     def test_approved_review_at_contract_maximum_still_records_task_memory(self):
         class MaximumReview(DemoBackend):

@@ -272,6 +272,51 @@ class FinalCompletionGateTests(RepoCase):
         self.assertEqual(len(finals), 3)
         self.assertEqual([row["label"] for row in finals[-1]["packet"]["required_findings"]], ["only-on-b"])
 
+        identity = result["result"]
+        self.assertEqual(identity, {
+            "commit": result["expected_head"], "tree": history[0]["tree"],
+            "snapshot_digest": history[0]["snapshot_digest"], "attempts": [1, 3],
+            "verification_mode": "run_worktree",
+        })
+        self.assertEqual(self.engine(backend).resume(result["id"])["result"], identity)
+
+        def reject(label, edited):
+            with self.subTest(damage=label):
+                ledger = engine.directory / "state.json"
+                write_json(ledger, edited)
+                before = ledger.read_bytes()
+                with self.assertRaises(HarnessError) as error:
+                    self.engine(backend).resume(result["id"])
+                self.assertEqual((error.exception.stop["kind"], error.exception.stop["reason"]),
+                                 ("evidence", "load_integrity"))
+                self.assertEqual(ledger.read_bytes(), before)
+
+        for key, values in {
+            "commit": (None, "other commit"),
+            "tree": (None, "other tree"),
+            "snapshot_digest": (None, "other snapshot", history[1]["snapshot_digest"]),
+            "attempts": (None, [], [True, 3], [1.0, 3], [1, "3"], [1], [3], [3, 1],
+                         [1, 1, 3], [1, 2, 3], [0, 3], [1, 4]),
+            "verification_mode": (None, "fresh_checkout"),
+            "extra_key": (True,),
+        }.items():
+            for value in values:
+                reject((key, value), {**result, "result": {**identity, key: value}})
+        for key in identity:
+            reject(("missing field", key),
+                   {**result, "result": {k: v for k, v in identity.items() if k != key}})
+        for value in (None, [], "identity"):
+            reject(("result shape", value), {**result, "result": value})
+            reject(("result on blocked run", value), {**result, "status": "blocked", "result": value})
+        reject("completed without result", {key: value for key, value in result.items() if key != "result"})
+        reject("result on running run", {**result, "status": "running"})
+        for field, value in (("attempt", 2), ("head", "other commit"), ("tree", "other tree"),
+                             ("snapshot_digest", "other snapshot")):
+            edited = copy.deepcopy(result)
+            edited["final_history"][2][field] = value
+            reject(("approval mismatch", field), edited)
+        self.assertEqual(calls(backend, kind="final_review"), finals)
+
     def test_every_completion_passes_the_approval_contract_prefix_and_source_checks(self):
         """Rules 7 and 8: a reuse passes the same gate; each damaged part stops with its own type."""
         engine = self.engine(self.rejected_once_backend())

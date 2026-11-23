@@ -50,7 +50,7 @@ ROOT_DIRECTORIES = frozenset(("plans", "dispatches", "verification", "recovery",
                               "continuation-rejections", "execution-guidance", "proposal-rejections",
                               "input-indexes", "finding-progress"))
 # The generated MCP configuration and empty lock files; *.tmp and memory.sqlite3* by pattern.
-EXCLUDED_NAMES = frozenset(("mcp.json", "run.lock", "store.lock", "command-admission.lock"))
+EXCLUDED_NAMES = frozenset(("mcp.json", "run.lock", "store.lock", "command-admission.lock", "remove.lock"))
 DEFAULT_TAIL = 64 * 1024
 MAX_TAIL = 1024 * 1024
 STATE_MAX_BYTES = 64 * 1024 * 1024
@@ -799,6 +799,9 @@ class Observer:
             detail["summary_error"] = f"{type(error).__name__}: {_first_line(str(error))}"
         detail["schema_version"] = run["schema_version"]
         unavailable = detail["unavailable"]
+        if (detail["summary"] is not None and "result" not in detail["summary"]
+                and (run.get("status") == "completed" or "result" in run)):
+            unavailable.append("result")
         detail["run"] = {key: _string(run.get(key)) for key in
                          ("id", "status", "goal", "branch", "worktree", "repo", "commander", "current_task",
                           "created_by_operation", "config_path", "expected_head", "base_commit")}

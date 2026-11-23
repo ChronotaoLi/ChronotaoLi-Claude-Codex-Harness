@@ -34,7 +34,7 @@ class WorkerEvidenceEntryTests(RepoCase):
         self.assertEqual(stop_pair(raised.exception), ("provider_quota", "usage_limit"))
         state = read_json(engine.directory / "state.json")
         entry = worker(state)
-        self.assertEqual(entry["worker_return_evidence"]["version"], 2)
+        self.assertEqual(entry["worker_return_evidence"]["version"], 3)
         return backend, engine.directory, state["id"], engine.directory / "dispatches" / entry["id"]
 
     def check_entries(self, backend, directory, run_id, failure, hits):
@@ -100,7 +100,7 @@ class WorkerReturnReadTests(unittest.TestCase):
         self.job = self.parent / "dispatch"
         self.job.mkdir()
 
-    def test_only_the_three_inspected_files_retain_bytes_and_the_digest_covers_the_whole_file(self):
+    def test_only_the_two_original_files_retain_bytes_and_the_digest_covers_the_whole_file(self):
         for name in SOURCES:
             (self.job / name).write_bytes(b" " * LIMIT + name.encode())
         calls = []
@@ -113,17 +113,18 @@ class WorkerReturnReadTests(unittest.TestCase):
 
         with patch.object(state_files.StateFiles, "digest", recorded):
             result = inspect_return(self.job)
-        self.assertEqual(result["version"], 2)
+        self.assertEqual(result["version"], 3)
         self.assertEqual(result["state"], "returned")
-        inspected = {"process.stdout", "process.outcome.json", "provider-result.json"}
+        inspected = {"process.stdout", "process.outcome.json"}
         self.assertEqual(calls, [(name, LIMIT, LIMIT + 1) if name in inspected else (name, 0, None)
                                  for name in SOURCES] + [(name, 0, None) for name in SOURCES])
         for name in SOURCES:
             self.assertEqual(result["sources"][name], hashlib.sha256((self.job / name).read_bytes()).hexdigest())
 
-    def test_inspected_sources_at_the_limit_and_one_byte_over_keep_version_two_verdicts(self):
+    def test_original_sources_at_the_limit_and_one_byte_over_keep_version_three_verdicts(self):
         terminal = b'{"type":"result","is_error":true}'
-        contents = {"process.stdout": terminal, "process.outcome.json": b"{}", "provider-result.json": terminal}
+        contents = {"process.stdout": terminal, "process.outcome.json": b"{}"}
+        write_json(self.job / "provider-result.json", {"type": "result", "is_error": True})
         for name, data in contents.items():
             with self.subTest(source=name):
                 for source, raw in contents.items():
@@ -132,18 +133,19 @@ class WorkerReturnReadTests(unittest.TestCase):
                 raw = data.ljust(LIMIT, b" ")
                 leaf.write_bytes(raw)
                 at_limit = inspect_return(self.job)
-                self.assertEqual((at_limit["version"], at_limit["state"]), (2, "retryable"))
+                self.assertEqual((at_limit["version"], at_limit["state"]), (3, "retryable"))
+                validate_return_evidence(self.job, at_limit)
                 leaf.write_bytes(raw + b" ")
                 over = inspect_return(self.job)
                 self.assertEqual((over["version"], over["state"], over["reason"]),
-                                 (2, "unknown", "unreadable worker return evidence: ValueError"))
+                                 (3, "unknown", "unreadable worker return evidence: ValueError"))
                 self.assertEqual(over["sources"][name], hashlib.sha256(raw + b" ").hexdigest())
                 validate_return_evidence(self.job, over)
 
     def test_absent_leaf_is_allowed_but_missing_dispatch_linked_ancestor_and_fifo_are_refused(self):
-        version_two = inspect_return(self.job)
-        self.assertEqual((version_two["version"], version_two["state"]), (2, "retryable"))
-        self.assertEqual(version_two["sources"], dict.fromkeys(SOURCES))
+        verdict = inspect_return(self.job)
+        self.assertEqual((verdict["version"], verdict["state"]), (3, "retryable"))
+        self.assertEqual(verdict["sources"], dict.fromkeys(SOURCES))
 
         leaf = self.job / "process.stdout"
         os.mkfifo(leaf)

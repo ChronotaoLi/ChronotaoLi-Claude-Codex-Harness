@@ -9,7 +9,7 @@ saved intent. The branch, ledger and run evidence are never removed.
 
 The checkout step (``clean_checkout``) is also the runtime's reclamation of a
 verified checkout after the whole-run verdict is saved: same ownership,
-identity and removability gates, no run lock and no ledger file access.
+identity and removability gates under the caller’s ledger authority.
 """
 from __future__ import annotations
 
@@ -17,11 +17,12 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 import time
 from pathlib import Path
 
 from .versions import parse_current_ledger, precheck_run
-from . import git, stops
+from . import checkout_identity, git, stops
 from .commands import valid_command
 from .context import compact_checks
 from .input_projection import validate_dispatch_indexes as validate_input_dispatch_indexes
@@ -72,13 +73,14 @@ def read_run_state(files, locked):
 
 
 def _registered(repo):
-    return {field.removeprefix("worktree ") for field in
-            git.git(repo, "worktree", "list", "--porcelain", "-z", effect=git.READ).split("\0")
-            if field.startswith("worktree ")}
+    registry = git.worktree_registry(repo)
+    if registry is None:
+        raise HarnessError("无法核实完整的 Git 工作树登记；保留现场")
+    return {admin: os.fsdecode(path) for admin, path in registry.items()}
 
 
-def _ensure_exited(run, state):
-    ensure_dispatches_exited(run["dispatches"], state=state, observe=group_alive)
+def _ensure_exited(run, directory, *, state):
+    ensure_dispatches_exited(run["dispatches"], state=state, directory=directory, observe=group_alive)
 
 
 def common_dir(repo):
@@ -165,16 +167,20 @@ def _cleanup_run(repo, ident, *, remove, confirm_exited, remove_input_copies, re
             store.bind_directory(locked.identity)
         run, original, common, checkout_rounds = _gate(repo, ident, directory, files, read_state, store, confirm_exited)
         checkouts = []
-        for artifact, final, index, verified_worktree in checkout_rounds:
-            try:
-                outcome = files.probe(artifact.relative_to(directory).parts).or_local_io()
-                if outcome.state == "absent" and "checkout_digest" not in final["verification_rounds"][index - 1]:
-                    continue
-                checkouts.append(clean_checkout(repo, run, directory, final, index, common, remove,
-                                                state=state, verified_worktree=verified_worktree))
-            except (HarnessError, OSError, ValueError) as error:
-                # The recorded directory is unverified: a diagnostic, never an authority to remove.
+        def authority():
+            if read_state() != original:
+                raise HarnessError("运行台账在清理前改变；保留现场")
+
+        for artifact, final, index, entry, verified_worktree in checkout_rounds:
+            if entry is None:
                 checkouts.append({"artifact": str(artifact), "recorded_worktree": recorded_worktree(artifact, state=state),
+                                  "status": "blocked", "error": "该轮没有创建登记；只报告，不删除"})
+                continue
+            try:
+                checkouts.append(clean_checkout(repo, run, directory, final, index, common, remove,
+                                                state=state, authority=authority, verified_worktree=verified_worktree))
+            except (HarnessError, OSError, ValueError) as error:
+                checkouts.append({"artifact": str(artifact), "recorded_worktree": entry["worktree"],
                                   "status": "blocked", "error": str(error)})
         try:
             worktree = _clean_worktree(repo, run, directory, original, remove, remove_input_copies,
@@ -219,7 +225,7 @@ def _gate(repo, ident, directory, files, read_state, store, confirm_exited):
         original = read_state()
     elif read_state() != original:
         raise HarnessError("运行台账在清理前改变；保留现场", stop=stops.make("runtime_failure", "invariant"))
-    _ensure_exited(run, files.path)
+    _ensure_exited(run, directory, state=files.path)
     return run, original, common, rounds
 
 
@@ -354,6 +360,7 @@ def _validate_cleanup_ledger(repo, ident, directory, state_root, run, common):
             final["status"] == "approved" and final["head"] == run["expected_head"] for final in history):
         raise HarnessError("已完成的 run 缺少对应 HEAD 的整体批准记录；保留现场")
     if not history:
+        checkout_identity.validate_checkout_entries(run)
         return []
     config = run.get("config_snapshot")
     verification = config.get("verification") if isinstance(config, dict) else None
@@ -408,46 +415,17 @@ def _validate_cleanup_ledger(repo, ident, directory, state_root, run, common):
                     files, folder, final, commands, dispatches, seen_checks,
                     worktree=run["worktree"], fresh_checkout=fresh_checkout)
             checkouts.append((folder / "checkout.json", final, index, verified_worktree))
-    return checkouts
-
-
-def _checkout_identity(repo, run, environment, expected_head, common):
-    if (not isinstance(environment, dict) or environment.get("mode") != "fresh_checkout"
-            or not isinstance(environment.get("worktree"), str)
-            or environment.get("head") != expected_head):
-        raise HarnessError("全新验证检出的记录或提交与运行台账不符")
-    checkout = Path(environment["worktree"])
-    _canonical(checkout)
-    if (checkout.name != "checkout" or checkout.parent.name != ".harness"
-            or not checkout.parents[1].name.startswith("harness-verify-")
-            or checkout.is_relative_to(repo) or checkout == Path(run["worktree"])):
-        raise HarnessError("只能清理该 run 记录的外部全新验证检出")
-    binding = environment.get("binding")
-    fields = ("worktree", "git_dir", "common_dir", "gitfile_sha256", "backlink_sha256", "commondir_sha256")
-    if (not isinstance(binding, dict) or any(not isinstance(binding.get(key), str) for key in fields)
-            or binding.get("branch", "missing") is not None
-            or binding.get("detached_head") != expected_head
-            or binding["worktree"] != str(checkout) or binding["common_dir"] != str(common)):
-        raise HarnessError("验证 worktree Git 绑定缺失或不属于该运行；不能重新推断绑定")
-    admin = Path(binding["git_dir"])
-    _canonical(admin)
-    if admin.parent != common / "worktrees":
-        raise HarnessError("验证 worktree Git 管理目录不属于该仓库")
-    return checkout, binding
-
-
-def _root_missing(checkout):
-    try:
-        os.lstat(checkout.parents[1])
-    except FileNotFoundError:
-        return True
-    return False
+    checkout_identity.validate_checkout_entries(run)
+    rounds = []
+    for artifact, final, index, verified_worktree in checkouts:
+        entry = checkout_identity.entry_for(run, final["attempt"], index)
+        if entry is not None or files.probe(artifact.relative_to(state_root).parts).state != "absent":
+            rounds.append((artifact, final, index, entry, verified_worktree))
+    return rounds
 
 
 def _check_missing_binding(checkout, binding):
     """A missing checkout can still have an exact, inspectable registration."""
-    if _root_missing(checkout):
-        raise HarnessError("检出根目录已不在；保留 Git 登记")
     admin = Path(binding["git_dir"])
     for name, digest_key, target in (
         ("gitdir", "backlink_sha256", checkout / ".git"),
@@ -472,92 +450,156 @@ def _read_receipt(files, components):
         return value
 
 
-def clean_checkout(repo, run, directory, final, index, common, remove, *, state, by="cleanup-run", verified_worktree=None):
-    """One fresh verification checkout; its receipt is cleanup.json beside the evidence.
+class CheckoutRemovalIncomplete(HarnessError):
+    """A checkout was preserved, or its removal did not complete."""
 
-    Round ``index`` of the whole-run record ``final`` names the evidence
-    directory. The record there must belong to this run, attempt and round,
-    and a round whose verdict was saved also binds the record's bytes; only
-    then do the identity, binding and removability gates run. Ignored files
-    inside this runtime-owned checkout are removed with it. ``by`` names the
-    writer of the receipt (the runtime or cleanup-run). The caller supplies
-    the state directory for the command exit check.
-    """
+
+def _checkout_status(repo, root, checkout, admin, entry, previous):
+    """Classify the current checkout and its exact Git registration."""
+    root_now = checkout_identity.directory_identity(root)
+    worktree_now = checkout_identity.directory_identity(checkout)
+    admin_now = checkout_identity.directory_identity(admin)
+    registrations = _registered(repo)
+    path = str(checkout)
+    registered = path in registrations.values()
+    identity = entry["identity"]
+    binding = entry["binding"]
+    if previous and previous["status"] == "removed":
+        if worktree_now is not None or registered:
+            raise CheckoutRemovalIncomplete("已清理路径或 Git 注册重新出现；保留现场")
+        return "removed"
+    if root_now is not None and root_now != identity["root"]:
+        raise CheckoutRemovalIncomplete("检出根目录不是创建时那一个；保留现场")
+    if registered:
+        match = path.lower()
+        count = sum(candidate.lower() == match or candidate.lower().endswith("/" + match)
+                    for candidate in registrations.values())
+        if count != 1:
+            raise CheckoutRemovalIncomplete(f"该路径在 Git 里有 {count} 条登记；保留现场")
+        if registrations.get(admin) != path:
+            raise CheckoutRemovalIncomplete("Git 路径登记不属于创建时的管理目录；保留现场")
+    if worktree_now is not None:
+        if admin_now is None:
+            raise CheckoutRemovalIncomplete("检出目录仍在而创建时的 Git 管理目录已不在；检出可能只删除了一部分。"
+                                            "核对后手工删除该目录，再重跑 cleanup-run --remove")
+        if worktree_now != identity["worktree"] or admin_now != identity["git_dir"] or not registered:
+            raise CheckoutRemovalIncomplete("验证检出或 Git 管理目录与创建登记不符；保留现场")
+        git.check_worktree_binding(checkout, binding)
+        git.assert_removable_worktree(checkout, binding=binding)
+        return "eligible"
+    if registered:
+        if admin_now != identity["git_dir"]:
+            raise CheckoutRemovalIncomplete("缺失检出的 Git 管理目录与创建登记不符；保留注册")
+        _check_missing_binding(checkout, binding)
+        return "stale_registration"
+    if admin_now == identity["git_dir"]:
+        raise CheckoutRemovalIncomplete("检出路径和注册已不在，原 Git 管理目录仍在；保留现场")
+    return "absent"
+
+
+def clean_checkout(repo, run, directory, final, index, common, remove, *, state, authority, by="cleanup-run",
+                   verified_worktree=None):
+    """Clean one registered checkout, reconciling its receipt under the removal lock."""
     folder = checkout_folder(directory, final, index)
-    round_record = final["verification_rounds"][index - 1]
-    if not isinstance(round_record, dict) or round_record.get("artifact_dir") != str(folder):
-        raise HarnessError("整体验证证据目录与运行台账不符")
     artifact = folder / "checkout.json"
     files = StateFiles(state).under(*folder.relative_to(state).parts)
-    source = {"artifact": str(artifact)}
-    expected_head = final["head"]
-    original = files.read(("checkout.json",), limit=None).evidence(source)
-    with stops.evidence_reads(source=source):
-        if round_record["status"] == "completed" and "checkout_digest" not in round_record:
-            raise HarnessError("已完成的验证检出缺少结论摘要；保留现场")
-        environment = json.loads(original)
-    if not isinstance(environment, dict) or environment.get("owner") != {
-            "run_id": run["id"], "attempt": final["attempt"], "round": index}:
-        raise HarnessError("验证检出记录不属于该 run 的这一轮验证；保留现场")
-    digest = hashlib.sha256(original).hexdigest()
-    if "checkout_digest" in round_record and digest != round_record["checkout_digest"]:
-        raise HarnessError("验证检出记录与整体验证结论保存的摘要不符；保留现场")
-    checkout, binding = _checkout_identity(repo, run, environment, expected_head, common)
-    if verified_worktree is not None and str(checkout) != verified_worktree:
-        raise HarnessError("验证检出与该轮检查派发记录不符；保留现场")
-    receipt_path = artifact.with_name("cleanup.json")
-    receipt = {"run_id": run["id"], "artifact": str(artifact), "artifact_digest": digest,
-               "worktree": str(checkout), "head": expected_head}
-    previous = _read_receipt(files, ("cleanup.json",))
-    if previous is not None and (any(previous.get(key) != value for key, value in receipt.items())
-                                 or previous.get("status") not in ("pending", "removed")):
-        raise HarnessError("清理记录与原验证证据不符；保留现场")
-    exists = checkout.exists()
-    registered = str(checkout) in _registered(repo)
-    if previous and previous["status"] == "removed":
-        if exists or registered:
-            raise HarnessError("已清理路径或 Git 注册重新出现；保留现场")
-        # Git may reuse the old administrative directory name for another
-        # checkout. A completed receipt never authorizes touching that directory.
-        return {"artifact": str(artifact), "worktree": str(checkout),
-                "status": "removed" if remove else "absent", "removed_by": previous.get("by")}
-    if exists:
-        git.check_worktree_binding(checkout, binding)
-        git.assert_removable_worktree(checkout, binding=binding)
-        status = "eligible"
-    elif registered:
-        _check_missing_binding(checkout, binding)
-        status = "stale_registration"
-    else:
-        if Path(binding["git_dir"]).exists():
-            raise HarnessError("检出及注册缺失但 Git 管理目录仍存在；保留现场")
-        status = "absent"
-    result = {"artifact": str(artifact), "worktree": str(checkout), "status": status}
-    if not remove:
-        return result
-    # Persist intent before Git changes anything, without altering raw evidence.
-    write_json(receipt_path, {**receipt, "status": "pending", "by": by, "time": time.time()})
-    _ensure_exited(run, state)
-    if files.read(("checkout.json",), limit=None).evidence(source) != original:
-        raise HarnessError("验证检出证据在清理前改变；保留现场")
-    if exists:
-        git.check_worktree_binding(checkout, binding)
-        git.assert_removable_worktree(checkout, binding=binding)
-    elif registered:
-        _check_missing_binding(checkout, binding)
-    if exists or registered:
-        # Exact removal also unregisters an absent checkout; never prune other runs.
-        git.git(repo, "worktree", "remove", str(checkout), effect=git.CHECKOUT)
-    if checkout.exists() or checkout.is_symlink() or str(checkout) in _registered(repo):
-        raise HarnessError("验证工作树尚未完全移除；保留待清理记录")
-    # Empty wrappers belong to this checkout; unexpected siblings are preserved.
-    for parent in (checkout.parent, checkout.parents[1]):
+    entry = checkout_identity.entry_for(run, final["attempt"], index)
+    root, checkout = Path(entry["root"]), Path(entry["worktree"])
+    binding = entry["binding"]
+    admin = Path(binding["git_dir"])
+    receipt_path = folder / "cleanup.json"
+    receipt = {"run_id": run["id"], "attempt": entry["attempt"], "round": entry["round"],
+               "worktree": str(checkout), "identity": entry["identity"]}
+    result = {"artifact": str(artifact), "worktree": str(checkout)}
+    try:
+        if final["verification_rounds"][index - 1].get("artifact_dir") != str(folder):
+            raise CheckoutRemovalIncomplete("整体验证证据目录与运行台账不符")
+        if binding["common_dir"] != str(common) or admin.parent != common / "worktrees":
+            raise CheckoutRemovalIncomplete("验证 worktree Git 管理目录不属于该仓库")
+        if verified_worktree is not None and str(checkout) != verified_worktree:
+            raise CheckoutRemovalIncomplete("验证检出与该轮检查派发记录不符；保留现场")
+        previous = _read_receipt(files, ("cleanup.json",))
+        if previous is not None and (any(json.dumps(previous.get(key), sort_keys=True) !=
+                                         json.dumps(value, sort_keys=True) for key, value in receipt.items())
+                                     or previous.get("status") not in ("pending", "removed")):
+            raise CheckoutRemovalIncomplete("清理记录与创建登记不符；保留现场")
+    except (HarnessError, OSError, ValueError, RecursionError) as error:
+        if isinstance(error, CheckoutRemovalIncomplete):
+            raise
+        raise CheckoutRemovalIncomplete(str(error)) from error
+
+    def classify():
         try:
-            parent.rmdir()
-        except OSError:
-            pass
-    write_json(receipt_path, {**receipt, "status": "removed", "by": by, "time": time.time()})
-    return {**result, "status": "removed"}
+            for path in (root, checkout, admin):
+                _canonical(path)
+            return _checkout_status(repo, root, checkout, admin, entry, previous)
+        except (HarnessError, OSError, ValueError, RuntimeError) as error:
+            if isinstance(error, CheckoutRemovalIncomplete):
+                raise
+            raise CheckoutRemovalIncomplete(str(error)) from error
+
+    def remove_locked(locked, status):
+        _ensure_exited(run, directory, state=state)
+        authority()
+        if classify() != status:
+            raise CheckoutRemovalIncomplete("清理前现场改变；保留待清理记录")
+        try:
+            if status in ("eligible", "stale_registration"):
+                process = git.git_process(repo, "worktree", "remove", str(checkout),
+                                          effect=git.CHECKOUT, pass_fds=(locked.descriptor,))
+                if process.returncode:
+                    detail = process.stderr.decode("utf-8", errors="replace").strip()
+                    raise CheckoutRemovalIncomplete(f"git worktree remove {checkout} failed: {detail}")
+            if (checkout_identity.directory_identity(checkout) is not None or str(checkout) in _registered(repo).values()
+                    or checkout_identity.directory_identity(admin) == entry["identity"]["git_dir"]):
+                raise CheckoutRemovalIncomplete("验证工作树尚未完全移除；保留待清理记录")
+            if checkout_identity.directory_identity(root) == entry["identity"]["root"]:
+                for wrapper in (checkout.parent, root):
+                    try:
+                        wrapper.rmdir()
+                    except OSError:
+                        pass
+        except (HarnessError, OSError, ValueError, subprocess.TimeoutExpired) as error:
+            if isinstance(error, CheckoutRemovalIncomplete):
+                raise
+            raise CheckoutRemovalIncomplete(str(error)) from error
+        write_json(receipt_path, {**receipt, "status": "removed", "by": by, "time": time.time()})
+        return {**result, "status": "removed"}
+
+    def with_remove_lock(use):
+        entered = False
+
+        def held(locked):
+            nonlocal entered
+            entered = True
+            return use(locked)
+
+        try:
+            return holding(files.lock(("remove.lock",), mode="exclusive" if remove else "shared",
+                                      create=remove), held)
+        except LockUnavailable as error:
+            if entered:
+                raise
+            if error.outcome.state == "busy":
+                raise CheckoutRemovalIncomplete("上一次删除仍在进行；保留待清理记录") from error
+            if not remove and error.outcome.state == "absent" and error.outcome.step.leaf:
+                return use(None)
+            raise CheckoutRemovalIncomplete(str(error)) from error
+
+    def reconcile(locked=None):
+        status = classify()
+        if status == "removed":
+            return {**result, "status": "removed" if remove else "absent", "removed_by": previous.get("by")}
+        if not remove:
+            return {**result, "status": status}
+        if locked is not None:
+            return remove_locked(locked, status)
+        write_json(receipt_path, {**receipt, "status": "pending", "by": by, "time": time.time()})
+        return with_remove_lock(lambda holder: remove_locked(holder, status))
+
+    if previous and previous["status"] == "pending":
+        return with_remove_lock(reconcile)
+    return reconcile()
 
 
 def _branch_matches(repo, branch, expected):
@@ -600,12 +642,12 @@ def _clean_worktree(repo, run, directory, original, remove, remove_input_copies,
         raise HarnessError("清理记录与运行证据不符；保留现场")
     exists = checkout.exists()
     input_summary = {"status": "none", "files": []}
-    registered = str(checkout) in _registered(repo)
     if previous and previous["status"] == "removed":
-        # Finished stays finished, even after the operator deletes or moves the branch.
-        if exists or registered or admin.exists():
+        # Either path is enough to refuse. A recreated admin may lack its backlink.
+        if exists or admin.exists() or str(checkout) in _registered(repo).values():
             raise HarnessError("已清理工作树或注册重新出现；保留现场")
         return {**result, "status": "removed" if remove else "absent", "input_copies": input_summary}
+    registered = str(checkout) in _registered(repo).values()
     listing = None
     if not exists:
         if registered or admin.exists() or not previous:
@@ -645,7 +687,7 @@ def _clean_worktree(repo, run, directory, original, remove, remove_input_copies,
         # Completing a removal an earlier command performed keeps what that command recorded.
         record.update({key: previous[key] for key in ("remove_ignored", "ignored_paths") if key in previous})
     write_json(receipt_path, {**record, "status": "pending", "time": time.time()})
-    _ensure_exited(run, files.path)
+    _ensure_exited(run, directory, state=files.path)
     if read_state() != original:
         raise HarnessError("运行台账在清理前改变；保留现场")
     if exists:
@@ -658,7 +700,7 @@ def _clean_worktree(repo, run, directory, original, remove, remove_input_copies,
         git.assert_removable_worktree(checkout, binding=binding)
         _ignored_gate(checkout, binding, remove_ignored)
         git.git(repo, "worktree", "remove", str(checkout), effect=git.CHECKOUT)
-    if checkout.exists() or checkout.is_symlink() or admin.exists() or str(checkout) in _registered(repo):
+    if checkout.exists() or checkout.is_symlink() or admin.exists() or str(checkout) in _registered(repo).values():
         raise HarnessError("工作树尚未完全移除；保留待清理记录")
     write_json(receipt_path, {**record, "status": "removed", "time": time.time()})
     return {**result, "status": "removed"}

@@ -5,6 +5,7 @@ import errno
 import json
 import math
 import os
+import re
 import signal
 import stat
 import subprocess
@@ -106,11 +107,15 @@ def dump(value) -> str:
     return text.encode("utf-8", errors="backslashreplace").decode("utf-8")
 
 
+def json_bytes(value) -> bytes:
+    return (dump(value) + "\n").encode("utf-8")
+
+
 def write_json(path: Path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
     temp = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
-    with temp.open("w", encoding="utf-8") as f:
-        f.write(dump(value) + "\n")
+    with temp.open("wb") as f:
+        f.write(json_bytes(value))
         f.flush()
         os.fsync(f.fileno())
     temp.replace(path)
@@ -186,6 +191,22 @@ def _dispatch_pgid(entry):
 
 
 @stops.reads_evidence
+def _verification_record_parts(entry):
+    if entry.get("role") != "verification":
+        if "process_record" in entry:
+            raise HarnessError("非验证 dispatch 不得登记进程记录")
+        return None
+    record = entry.get("process_record")
+    if type(record) is not str or len(record) > 4096 or "\\" in record or "\0" in record:
+        raise HarnessError("验证进程记录路径无效")
+    parts = tuple(record.split("/"))
+    if (parts[0] != "verification" or any(part in ("", ".", "..") for part in parts)
+            or re.fullmatch(r"check-(0|[1-9][0-9]*)\.outcome\.json", parts[-1]) is None):
+        raise HarnessError("验证进程记录路径无效")
+    return parts
+
+
+@stops.reads_evidence
 def validate_command_directories(dispatches, run_dir):
     """Reject ledger paths that could redirect child-process supervision."""
     from .state_files import StateFiles  # state_files imports this module
@@ -196,6 +217,7 @@ def validate_command_directories(dispatches, run_dir):
     for entry in dispatches:
         if not isinstance(entry, dict):
             raise HarnessError("运行台账 dispatch 无效")
+        _verification_record_parts(entry)
         directory = entry.get("command_directory")
         if directory is None:
             if "command_directory" in entry:
@@ -215,9 +237,11 @@ def validate_command_directories(dispatches, run_dir):
             raise HarnessError("命令退出确认无效")
         for key, value in confirmations.items():
             if (not isinstance(key, str) or not key.startswith(ident + ":command:")
-                    or not isinstance(value, dict) or not isinstance(value.get("journal_digest"), str)
-                    or len(value["journal_digest"]) != 64
-                    or any(c not in "0123456789abcdef" for c in value["journal_digest"])):
+                    or not isinstance(value, dict) or "journal_digest" not in value):
+                raise HarnessError("命令退出确认身份或摘要无效")
+            digest = value["journal_digest"]
+            if digest is not None and (not isinstance(digest, str) or len(digest) != 64
+                                       or any(c not in "0123456789abcdef" for c in digest)):
                 raise HarnessError("命令退出确认身份或摘要无效")
 
 
@@ -233,52 +257,108 @@ def _exit_unconfirmed(entry):
                       source={"dispatch_id": ident} if isinstance(ident, str) else {})
 
 
-def _check_dispatch_journals(dispatches, state, directory_for, check):
-    """Check in dispatch order, holding a shared root from the first journal check onward."""
+def read_process_exit(files, components, *, owner=None):
+    """Return (not started, pgid) from a usable supervisor record, or (False, None)."""
+    outcome = files.read(components, limit=16 * 1024 * 1024).or_local_io()
+    if outcome.state != "read":
+        return False, None
+    try:
+        record = strict_json_loads(outcome.data)
+    except (ValueError, RecursionError):
+        return False, None
+    if not isinstance(record, dict) or (owner is not None and record.get("owner") != owner):
+        return False, None
+    pgid, pid = record.get("pgid"), record.get("pid")
+    if (record.get("started") is False and record.get("startup_state") == "not_started"
+            and "pid" in record and pid is None and "pgid" in record and pgid is None
+            and record.get("exit_confirmed") is True):
+        return True, None
+    if (record.get("started") is True and record.get("startup_state") == "started"
+            and type(pgid) is int and 0 < pgid <= PGID_MAX and type(pid) is int and pid == pgid):
+        return False, pgid
+    return False, None
+
+
+@stops.reads_evidence
+def _dispatch_process_exit(entry, directory, files, verification_record):
+    ident = entry.get("id")
+    if (not isinstance(ident, str) or ident in ("", ".", "..")
+            or any(char in ident for char in ("/", "\\", "\0"))):
+        raise HarnessError("运行台账 dispatch 无效")
+    if not files.opened:
+        root = files.entries()
+        if root.step.stage == "resolve":
+            root.or_local_io()
+    parts = files.recorded(os.fspath(directory))
+    if parts is None or len(parts) != 2 or parts[0] != "runs" or "\\" in parts[1]:
+        raise HarnessError("运行目录不属于状态目录")
+    if verification_record is not None:
+        return read_process_exit(files, (*parts, *verification_record), owner=ident)
+    return read_process_exit(files, (*parts, "dispatches", ident, "process.outcome.json"))
+
+
+def _check_dispatch_records(dispatches, state, needs_files, check):
+    """Check in dispatch order, holding a shared root from the first evidence read onward."""
     from .state_files import StateFiles, holding
 
-    pending = ((entry, _dispatch_pgid(entry), directory_for(entry)) for entry in dispatches)
-    for entry, pgid, directory in pending:
-        if directory is None:
-            check(entry, pgid, directory, None)
+    pending = ((entry, _dispatch_pgid(entry)) for entry in dispatches)
+    for entry, pgid in pending:
+        if not needs_files(entry, pgid):
+            check(entry, pgid, None)
             continue
 
         def check_remaining(files):
-            check(entry, pgid, directory, files)
-            for next_entry, next_pgid, next_directory in pending:
-                check(next_entry, next_pgid, next_directory, files)
+            check(entry, pgid, files)
+            for next_entry, next_pgid in pending:
+                check(next_entry, next_pgid, files)
 
         holding(StateFiles.held(state), check_remaining)
         return
 
 
-def ensure_dispatches_exited(dispatches, *, state, observe=group_alive):
-    """Use the same conservative exit gate for execution and cleanup.
-
-    Only a saved preparation state proves that startup has not been attempted.
-    An absent pgid after startup may mean the controller died between Popen and
-    its callback, including for older ledgers without process_state. Command
-    journals are read from ``state``, the state directory of the run.
-    """
+def ensure_dispatches_exited(dispatches, *, state, directory, observe=group_alive):
+    """Check exits without changing ledger or journal, using one held state root for evidence."""
     from .command_server import ensure_command_processes_exited
 
     exited = []
 
-    def check(entry, pgid, directory, files):
-        if directory is not None:
-            ensure_command_processes_exited(directory, entry, state=files, observe=observe)
+    def needs_record(entry, pgid):
+        return (entry.get("exit_confirmed") is not True and pgid is None
+                and entry.get("process_state") != "prepared")
+
+    def check(entry, pgid, files):
+        commands = entry.get("command_directory")
+        if commands is not None:
+            ensure_command_processes_exited(commands, entry, state=files, observe=observe)
+        verification_record = _verification_record_parts(entry)
         if entry.get("exit_confirmed") is True:
             return
+        from_record = needs_record(entry, pgid)
+        if from_record:
+            not_started, pgid = _dispatch_process_exit(entry, directory, files, verification_record)
+            if not_started:
+                exited.append(entry)
+                return
         hint = ("核实旧进程已退出后，可用 --confirm-exited <dispatch_id> 留痕确认；"
                 "已完成或已放弃的 run 使用 cleanup-run 的同名选项")
         if pgid is not None:
-            if observe(pgid):
-                raise HarnessError(f"旧 dispatch {entry.get('id', '<unknown>')} 的进程组仍存在；{hint}", stop=_exit_unconfirmed(entry))
+            if from_record:
+                remaining = observed_alive(observe, pgid)
+                if remaining is not False:
+                    raise HarnessError(
+                        f"无法确认旧 dispatch {entry['id']} 的进程组 {pgid} 已退出；{hint}",
+                        stop=_exit_unconfirmed(entry))
+            elif observe(pgid):
+                raise HarnessError(f"旧 dispatch {entry.get('id', '<unknown>')} 的进程组仍存在；{hint}",
+                                   stop=_exit_unconfirmed(entry))
             exited.append(entry)
         elif entry.get("process_state") != "prepared":
-            raise HarnessError(f"无法确认旧 dispatch {entry.get('id', '<unknown>')} 已退出；{hint}", stop=_exit_unconfirmed(entry))
+            raise HarnessError(f"无法确认旧 dispatch {entry.get('id', '<unknown>')} 已退出；{hint}",
+                               stop=_exit_unconfirmed(entry))
 
-    _check_dispatch_journals(dispatches, state, lambda entry: entry.get("command_directory"), check)
+    _check_dispatch_records(dispatches, state,
+                            lambda entry, pgid: entry.get("command_directory") is not None or needs_record(entry, pgid),
+                            check)
     return exited
 
 
@@ -301,28 +381,20 @@ def confirm_dispatches_exited(dispatches, identifiers, *, state, audit, save, ob
     from .command_server import command_exit_settled, command_processes
     children = {}
 
-    def read_journals(entry, _pgid, directory, files):
+    def read_journals(entry, _pgid, files):
+        directory = entry.get("command_directory") or None
         children[entry["id"]] = command_processes(directory, state=files) if directory is not None else []
         confirmations = entry.get("command_exit_confirmations", {})
         if (not isinstance(confirmations, dict)
                 or any(not isinstance(value, dict) for value in confirmations.values())):
             raise HarnessError("命令退出确认无效")
 
-    _check_dispatch_journals((entries[ident] for ident in identifiers), state,
-                             lambda entry: entry.get("command_directory") or None, read_journals)
+    _check_dispatch_records((entries[ident] for ident in identifiers), state,
+                            lambda entry, _pgid: bool(entry.get("command_directory")), read_journals)
     # The whole batch to write, decided before the first audit; the gate's own rules say what is settled.
     pending = {ident: [child for child in children[ident]
                        if not command_exit_settled(child, entries[ident].get("command_exit_confirmations", {}))]
                for ident in identifiers}
-    for ident in identifiers:
-        for child in pending[ident]:
-            if child["journal_digest"] is None:
-                # Ledger 19 has no confirmation shape without a journal digest: nothing of the batch is written.
-                raise HarnessError(
-                    f"命令调用目录缺少可读的 process.json；当前台账版本不能记录这种确认：{child['id']}",
-                    stop=stops.make("process_unconfirmed", "command_exit",
-                                    data={"command_id": child["id"], "returned_unsealed": False},
-                                    source={"dispatch_id": ident}))
 
     def observation(pgid):
         observed = {"pgid": pgid, "group_alive": observed_alive(observe, pgid) if pgid is not None else None}
@@ -341,14 +413,17 @@ def confirm_dispatches_exited(dispatches, identifiers, *, state, audit, save, ob
     writes = []
     for ident in identifiers:
         for child in pending[ident]:
-            writes.append((ident, child["id"], {"time": time.time(), "journal_digest": child["journal_digest"],
-                                                "observed": observation(child["pgid"])}))
+            confirmation = {"time": time.time(), "journal_digest": child["journal_digest"],
+                            "observed": observation(child["pgid"])}
+            writes.append((ident, child["id"], child["journal_state"], confirmation))
         if entries[ident].get("exit_confirmed") is not True:
-            writes.append((ident, None, {"time": time.time(), "observed": observation(entries[ident].get("pgid"))}))
-    for ident, call, confirmation in writes:
+            confirmation = {"time": time.time(), "observed": observation(entries[ident].get("pgid"))}
+            writes.append((ident, None, None, confirmation))
+    for ident, call, journal_state, confirmation in writes:
         entry = entries[ident]
         if call is not None:
-            audit("command_exit_confirmed_by_operator", dispatch_id=ident, command_id=call, **confirmation)
+            audit("command_exit_confirmed_by_operator", dispatch_id=ident, command_id=call,
+                  journal_state=journal_state, **confirmation)
             entry.setdefault("command_exit_confirmations", {})[call] = confirmation
         else:
             audit("dispatch_exit_confirmed_by_operator", dispatch_id=ident, **confirmation)
@@ -480,7 +555,8 @@ def open_command_directory(held: Descriptors, root_fd: int, relative: str) -> in
 
 def run_process(argv: list[str], cwd: Path, log: Path, *, stdin: str = "",
                 timeout: int | float = 900, env=None, on_start=None, on_outcome=None,
-                execution_deadline=None, cleanup_deadline=None, relative_cwd=None, root_fd=None) -> int:
+                execution_deadline=None, cleanup_deadline=None, relative_cwd=None, root_fd=None,
+                record_owner=None) -> int:
     """No shell interpolation; terminate the owned process group on all exits.
 
     With relative_cwd the child starts in that directory, opened from root_fd (the
@@ -491,7 +567,8 @@ def run_process(argv: list[str], cwd: Path, log: Path, *, stdin: str = "",
         raise ValueError("relative_cwd and root_fd go together")
     execution_deadline = min(time.monotonic() + timeout, execution_deadline if execution_deadline is not None else float("inf"))
     log.parent.mkdir(parents=True, exist_ok=True)
-    supervision = ProcessSupervisor(log, on_outcome=on_outcome, cleanup_deadline=cleanup_deadline)
+    supervision = ProcessSupervisor(log, on_outcome=on_outcome, cleanup_deadline=cleanup_deadline,
+                                    owner=record_owner)
     # Its exit is handed the exception leaving this block, never one the caller is handling.
     with supervision:
         with log.with_suffix(".stdout").open("w", encoding="utf-8") as out, \

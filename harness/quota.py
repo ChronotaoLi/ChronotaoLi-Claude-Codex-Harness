@@ -855,7 +855,7 @@ class QuotaSampler(RuntimeService):
         try:
             util.validate_command_directories(self.context.run["dispatches"], self.context.directory)
             util.ensure_dispatches_exited(self.context.run["dispatches"], state=self.context.state,
-                                          observe=util.group_alive)
+                                          directory=self.context.directory, observe=util.group_alive)
             return True
         except Exception:
             return False

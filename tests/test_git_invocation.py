@@ -9,6 +9,7 @@ import ast
 import collections
 import contextlib
 import functools
+import fcntl
 import hashlib
 import http.client
 import io
@@ -32,7 +33,8 @@ from unittest.mock import patch
 import git_isolation
 import run_shards
 import stop_tripwire
-from harness import (cleanup, cli, command_server, dashboard, git, git_query, memory, operations,
+from acceptance_support import accept_now, acceptance_checkout
+from harness import (cleanup, cli, command_server, dashboard, finalization, git, git_query, memory, operations,
                      permission_smoke, private_state, stops, tool_smoke, workspace_inputs)
 from harness.config import Config
 from harness.util import HarnessError, read_json
@@ -247,7 +249,7 @@ class PreviewAndObservationTests(IsolatedRepoCase):
         def runtime_reclaim_fails_once(*args, **kwargs):
             if kwargs.get("by") == "runtime" and not refused:
                 refused.append(True)
-                raise HarnessError("simulated reclamation failure")
+                raise cleanup.CheckoutRemovalIncomplete("simulated reclamation failure")
             return real_clean_checkout(*args, **kwargs)
         engine = self.engine()
         markers.reset()
@@ -265,7 +267,7 @@ class PreviewAndObservationTests(IsolatedRepoCase):
         self.addCleanup(shutil.rmtree, checkout.parents[1], ignore_errors=True)
         self.assertTrue(checkout.is_dir())
         self.assertIn(f"worktree {checkout}\n", plain_git(self.repo, "worktree", "list", "--porcelain").stdout.decode())
-        for tree, binding in ((worktree, result["worktree_binding"]), (checkout, read_json(artifact)["binding"])):
+        for tree, binding in ((worktree, result["worktree_binding"]), (checkout, result["verification_checkouts"][0]["binding"])):
             plain_git(tree, "update-index", "--split-index")
             self.assertTrue(list(Path(binding["git_dir"]).glob("sharedindex.*")))
             expire_stats(tree)
@@ -835,6 +837,7 @@ class ColourTests(IsolatedRepoCase):
         final, = [path for path in evidence if "final" in path.relative_to(engine.directory).parts]
         self.uncolour()
         self.assertEqual(final.read_bytes(), git.range_diff_bytes(Path(result["worktree"]), result["base_commit"],
+                                                                  result["expected_head"],
                                                                   binding=result["worktree_binding"]))
 
     def test_working_tree_and_range_diffs_are_the_bytes_of_an_uncoloured_repository(self):
@@ -845,9 +848,10 @@ class ColourTests(IsolatedRepoCase):
         (self.repo / "new.txt").write_text("new\n")
         self.colour()
         self.assertIn(b"\x1b[", plain_git(self.repo, "diff", "HEAD").stdout)  # the configuration is in effect
-        coloured = git.diff_bytes(self.repo), git.range_diff_bytes(self.repo, base)
+        tip = git.head(self.repo)
+        coloured = git.diff_bytes(self.repo), git.range_diff_bytes(self.repo, base, tip)
         self.uncolour()
-        self.assertEqual(coloured, (git.diff_bytes(self.repo), git.range_diff_bytes(self.repo, base)))
+        self.assertEqual(coloured, (git.diff_bytes(self.repo), git.range_diff_bytes(self.repo, base, tip)))
         self.assertTrue(all(b"\x1b" not in value and b"test_hello.py" in value for value in coloured))
 
 
@@ -903,10 +907,9 @@ class TreeDiffTests(IsolatedRepoCase):
                             b"\\ No newline at end of file", b"\r\n", b"deleted file mode 100644\nindex"),
                  (c2, c3): (b"Subproject commit", b'"a/name_\\377.txt"'), (c0, c3): (b"renamed.py",), (c3, c3): ()}
         for (base, head), expected in kinds.items():
-            plain_git(repo, "update-ref", "--no-deref", "HEAD", head)  # the runtime compares base with HEAD
             porcelain = plain_git(repo, "diff", *self.PATCH, base, head, "--").stdout
             with self.subTest(base=base, head=head):
-                self.assertEqual(git.range_diff_bytes(repo, base), porcelain)
+                self.assertEqual(git.range_diff_bytes(repo, base, head), porcelain)
                 self.assertTrue(all(kind in porcelain for kind in expected), expected)
                 self.assertEqual(porcelain == b"", base == head)
 
@@ -954,6 +957,7 @@ class TreeDiffTests(IsolatedRepoCase):
         (self.repo / "story.txt").write_text("head\n")
         self.commit("story")
         worktree, binding = self.run_worktree()
+        tip = git.head(worktree, binding=binding)
         patch_bytes = plain_git(worktree, "diff", *self.PATCH, base, "HEAD", "--").stdout  # the form before diff-tree
         names = plain_git(worktree, "diff", "--name-only", "--no-renames", "-z", base, "HEAD").stdout
         self.assertIn(b"+head\n", patch_bytes)
@@ -964,11 +968,11 @@ class TreeDiffTests(IsolatedRepoCase):
         story.write_text("live\n")  # same size, same inode; the old mtime back: the index entry still matches
         os.utime(story, ns=(kept.st_atime_ns, kept.st_mtime_ns))
         self.assertTrue(git.clean(worktree, binding=binding))  # Git's own stat check does not see the edit
-        self.assertEqual(git.range_diff_bytes(worktree, base, binding=binding), patch_bytes)
+        self.assertEqual(git.range_diff_bytes(worktree, base, tip, binding=binding), patch_bytes)
         # A real index Git cannot read: porcelain diff between two commits never read it, nor do these.
         (Path(binding["git_dir"]) / "index").write_bytes(b"not an index")
-        self.assertEqual(git.range_diff_bytes(worktree, base, binding=binding), patch_bytes)
-        self.assertEqual(os.fsencode(git.range_paths(worktree, base, binding=binding)), names)
+        self.assertEqual(git.range_diff_bytes(worktree, base, tip, binding=binding), patch_bytes)
+        self.assertEqual(os.fsencode(git.range_paths(worktree, base, tip, binding=binding)), names)
 
     def test_no_configuration_diff_tree_reads_reshapes_the_whole_run_comparison(self):
         # Edits on which other algorithms choose other hunks than Git's default: patience on driven.txt, histogram
@@ -992,14 +996,15 @@ class TreeDiffTests(IsolatedRepoCase):
         plain_git(self.repo, "update-index", "--add", "--cacheinfo", f"160000,{base},vendor/sub")
         self.commit("edits", add=False)
         worktree, binding = self.run_worktree()
+        tip = git.head(worktree, binding=binding)
 
         def porcelain():
             return (plain_git(worktree, "diff", *self.PATCH, base, "HEAD", "--").stdout,
                     plain_git(worktree, "diff", "--name-only", "--no-renames", "-z", base, "HEAD").stdout)
 
         def whole_run():
-            return (git.range_diff_bytes(worktree, base, binding=binding),
-                    os.fsencode(git.range_paths(worktree, base, binding=binding)))
+            return (git.range_diff_bytes(worktree, base, tip, binding=binding),
+                    os.fsencode(git.range_paths(worktree, base, tip, binding=binding)))
         default = porcelain()
         self.assertEqual(whole_run(), default)
         for key, value in (("diff.suppressBlankEmpty", "true"), ("diff.indentHeuristic", "false"),
@@ -1027,8 +1032,9 @@ class TreeDiffTests(IsolatedRepoCase):
         (self.repo / "story.txt").write_text("head\n")
         self.commit("story")
         worktree, binding = self.run_worktree()
-        return base, worktree, binding, lambda: (git.range_diff_bytes(worktree, base, binding=binding),
-                                                 git.range_paths(worktree, base, binding=binding))
+        tip = git.head(worktree, binding=binding)
+        return base, worktree, binding, lambda: (git.range_diff_bytes(worktree, base, tip, binding=binding),
+                                                 git.range_paths(worktree, base, tip, binding=binding))
 
     def test_the_comparison_names_a_new_absent_index_and_makes_nothing_whatever_tmpdir_says(self):
         base, worktree, binding, whole_run = self.story()
@@ -1069,6 +1075,7 @@ class TreeDiffTests(IsolatedRepoCase):
 
     def test_an_index_name_that_exists_after_the_call_stops_the_comparison(self):
         base, worktree, binding, whole_run = self.story()
+        tip = git.head(worktree, binding=binding)
         folder = self.scratch / "absent"  # in place of the null device's folder, where no test may write
         folder.mkdir()
         launch = git._launch
@@ -1084,7 +1091,7 @@ class TreeDiffTests(IsolatedRepoCase):
             with patch.object(git, "_launch", side_effect=created_by_git):
                 for compare in (git.range_diff_bytes, git.range_paths):
                     with self.subTest(compare.__name__), self.assertRaises(HarnessError) as raised:
-                        compare(worktree, base, binding=binding)
+                        compare(worktree, base, tip, binding=binding)
                     stop = stops.of(raised.exception)
                     self.assertEqual((stop["kind"], stop["reason"]), ("runtime_failure", "invariant"))
         self.assertEqual(len(list(folder.iterdir())), 2)
@@ -1316,6 +1323,9 @@ class GitIsolationTests(unittest.TestCase):
             (repo / "a.txt").write_text("a\n")
             git.git(repo, "add", ".")
             git.git(repo, *IDENTITY, "commit", "-m", "fixture")
+            worktree = self.root / "acceptance"
+            binding = acceptance_checkout(repo, worktree)
+            repo = worktree
             (repo / "a.txt").write_text("changed\n")
             (repo / "build").mkdir()
             (repo / "build" / "out.txt").write_text("built\n")
@@ -1331,7 +1341,7 @@ class GitIsolationTests(unittest.TestCase):
                     self.assertEqual(git.git(repo, "config", "--show-origin", "--get-regexp", r"^core\.excludesfile$",
                                              effect=git.READ), f"file:{config}\tcore.excludesfile {ignore}\n")
             before = git.head(repo)
-            self.assertNotEqual(git.accept(repo, ["a.txt"], "run_isolation", "task", {"subject": "Accept", "body": ""}),
+            self.assertNotEqual(accept_now(repo, ["a.txt"], "run_isolation", "task", {"subject": "Accept", "body": ""}, binding=binding),
                                 before)
             self.assertEqual(git.changed(repo), [])
             (repo / "a.txt").write_text("plain\n")
@@ -1415,6 +1425,9 @@ class GlobalConfiguredHookTests(unittest.TestCase):
         (repo / "a.txt").write_text("a\n")
         plain_git(repo, "add", "a.txt")
         plain_git(repo, *IDENTITY, "commit", "-qm", "fixture")
+        worktree = root / "acceptance"
+        binding = acceptance_checkout(repo, worktree)
+        repo = worktree
         markers = Markers(root)
         refuse = markers.script("refuse.sh", f"printf '%s %s\\n' \"$1\" \"$(pwd -P)\" >> '{markers.log}'\nexit 1\n")
         hook = f"[hook \"refuse\"]\n\tcommand = '{refuse}' refuse\n" + "".join(
@@ -1431,7 +1444,7 @@ class GlobalConfiguredHookTests(unittest.TestCase):
             self.assertEqual(markers.kinds(), {"refuse"})
             markers.reset()
             before = git.head(repo)
-            accepted = git.accept(repo, ["a.txt"], "run_hook", "task", {"subject": "Accept", "body": ""})
+            accepted = accept_now(repo, ["a.txt"], "run_hook", "task", {"subject": "Accept", "body": ""}, binding=binding)
             (repo / "b.txt").write_text("b\n")
             git.git(repo, "add", "b.txt", effect=git.INDEX)
             git.git(repo, *IDENTITY, "commit", "-qm", "declared", effect=git.INDEX_REFS)
@@ -2277,7 +2290,7 @@ class NewCheckoutHookTests(IsolatedRepoCase):
         self.config.data["verification"]["fresh_checkout"] = True
         engine = self.engine()
         with patch.object(tempfile, "tempdir", str(self.scratch)), patch.object(git, "HOOK_EVENTS", ()), \
-                patch.object(cleanup, "clean_checkout", side_effect=HarnessError("retain fixture for inspection")):
+                patch.object(cleanup, "clean_checkout", side_effect=cleanup.CheckoutRemovalIncomplete("retain fixture for inspection")):
             result = engine.start("Implement greet", self.plan)
         self.assertEqual(result["status"], "completed")
         self.assertEqual(self.markers.read(), [])
@@ -2287,8 +2300,8 @@ class NewCheckoutHookTests(IsolatedRepoCase):
         head = result["expected_head"]
         self.assertNotEqual(head, result["base_commit"])
         self.assertEqual((environment["status"], environment["head"]), ("verified", head))
-        self.assertEqual(environment["binding"]["detached_head"], head)
-        self.assertEqual(git.head(checkout, binding=environment["binding"]), head)
+        self.assertEqual(engine.run["verification_checkouts"][0]["binding"]["detached_head"], head)
+        self.assertEqual(git.head(checkout, binding=engine.run["verification_checkouts"][0]["binding"]), head)
         self.assertEqual(plain_git(checkout, "symbolic-ref", "-q", "HEAD", check=False).returncode, 1)
         # Only this Git directory sees the include; it was absent in the source run worktree.
         key = "hook.gitdir-post-index-change.command"
@@ -2349,8 +2362,7 @@ class Trace2Tests(IsolatedRepoCase):
 READ_SITES = {
     ("git", "_configured_hooks"): (1, lambda c: git.invocation(
         c.repo, ("status",), effect=git.COMPARE, deadline=time.monotonic() + 60)),
-    ("git", "_worktree_registration"): (2, lambda c: git._worktree_registration(
-        c.repo, os.fsencode(c.linked), binding=None, isolated_config=False)),
+    ("git", "worktree_registry"): (2, lambda c: c.registered_worktrees()),
     ("git", "capture_worktree_binding"): (3, lambda c: git.capture_worktree_binding(c.detached, None)),
     ("git", "_check_binding"): (1, lambda c: git.check_worktree_binding(c.linked, c.binding)),
     ("git", "repository"): (1, lambda c: git.repository(c.linked)),
@@ -2359,13 +2371,20 @@ READ_SITES = {
     ("git", "reject_submodules"): (1, lambda c: git.reject_submodules(c.linked, binding=c.binding)),
     ("git", "assert_removable_worktree"): (5, lambda c: git.assert_removable_worktree(c.linked, binding=c.binding)),
     ("git", "ignored_paths"): (1, lambda c: git.ignored_paths(c.linked, binding=c.binding)),
-    ("git", "snapshot"): (2, lambda c: git.snapshot(c.linked, binding=c.binding)),
+    ("git", "read_worktree"): (2, lambda c: git.read_worktree(c.linked, binding=c.binding)),
+    ("finalization", "FinalAcceptance.final_review"): (2, lambda c: c.final_entry()),
+    ("git", "prove_image"): (1, lambda c: c.prove_candidate_image()),
     ("git", "changed"): (1, lambda c: git.changed(c.linked, binding=c.binding)),
     ("git", "diff_bytes"): (1, lambda c: git.diff_bytes(c.linked, binding=c.binding)),
     ("git", "_range_diff"): (1, lambda c: c.range_comparison()),
     ("git", "archive_and_reset"): (1, lambda c: c.archive_candidate()),
-    ("git", "accept"): (1, lambda c: c.accept_candidate()),
-    ("cleanup", "_registered"): (1, lambda c: c.registered_worktrees()),
+    ("git", "build_commit"): (3, lambda c: c.build_candidate()),
+    ("git", "_check_candidate_tree"): (1, lambda c: c.build_candidate()),
+    ("git", "branch_state"): (2, lambda c: git.branch_state(c.linked, c.binding["branch"], binding=c.binding)),
+    ("git", "object_kinds"): (1, lambda c: git.object_kinds(c.linked, [c.tip], binding=c.binding)),
+    ("git", "commit_header"): (1, lambda c: git.commit_header(c.linked, c.tip, binding=c.binding)),
+    ("git", "tree_readable"): (1, lambda c: git.tree_readable(c.linked, c.tip_tree, binding=c.binding)),
+    ("git", "index_digest"): (1, lambda c: git.index_digest(c.linked, binding=c.binding)),
     ("cleanup", "common_dir"): (1, lambda c: cleanup.common_dir(c.repo)),
     ("cleanup", "_branch_matches"): (1, lambda c: cleanup._branch_matches(c.repo, "main", c.tip)),
     ("private_state", "private_state_lock"): (1, lambda c: c.lock_private_state()),
@@ -2382,7 +2401,9 @@ READ_SITES = {
     ("git_query", "run_git_query"): (1, lambda c: c.query("show", "HEAD:test_hello.py")),
 }
 MIXED_READ_SITES = {("git", name) for name in ("check_starting_checkout", "changed", "diff_bytes",
-                                              "archive_and_reset", "accept")} | {("operations", "harness_identity")}
+                                              "archive_and_reset", "build_commit",
+                                              "_check_candidate_tree", "prove_image")} | {("operations", "harness_identity"),
+                                                                       ("finalization", "FinalAcceptance.final_review")}
 
 
 class ReadSiteTests(IsolatedRepoCase):
@@ -2398,14 +2419,14 @@ class ReadSiteTests(IsolatedRepoCase):
         plain_git(self.repo, "add", ".")
         plain_git(self.repo, *IDENTITY, "commit", "-qm", "READ fixture")
         self.tip = git.head(self.repo)
+        self.tip_tree = plain_git(self.repo, "rev-parse", "HEAD^{tree}").stdout.decode().strip()
         self.linked = (self.scratch / "linked").resolve()
         self.detached = (self.scratch / "detached").resolve()
         self.binding = git.add_worktree(self.repo, self.linked, self.tip, branch="linked")
         detached_binding = git.add_worktree(self.repo, self.detached, self.tip)
         listing = plain_git(self.repo, "worktree", "list", "--porcelain", "-z",
                             env=dict(os.environ, LC_ALL="C"), check=False)
-        self.worktree_list_has_z = listing.returncode == 0
-        if not self.worktree_list_has_z:
+        if listing.returncode:
             self.assertEqual((listing.returncode, listing.stdout), (129, b""), listing.stderr)
             self.assertTrue(listing.stderr.startswith(b"error: unknown switch `z'\nusage: git worktree "), listing.stderr)
         private_state.ensure_private_state(self.repo)
@@ -2450,12 +2471,10 @@ class ReadSiteTests(IsolatedRepoCase):
         self.assertTrue(all(path.stat().st_size for path in trace.iterdir()))
 
     def registered_worktrees(self):
-        if self.worktree_list_has_z:
-            self.assertEqual(cleanup._registered(self.repo), {str(self.repo.resolve()), str(self.linked), str(self.detached)})
-        else:
-            with patch.dict(os.environ, LC_ALL="C"), self.assertRaisesRegex(
-                    HarnessError, r"^git worktree list --porcelain failed: error: unknown switch `z'"):
-                cleanup._registered(self.repo)
+        self.assertEqual(git._worktree_registration(
+            self.repo, os.fsencode(self.linked), binding=None, isolated_config=False), "present")
+        self.assertEqual(set(cleanup._registered(self.repo).values()),
+                         {str(self.repo.resolve()), str(self.linked), str(self.detached)})
 
     def lock_private_state(self):
         with private_state.private_state_lock(self.repo):
@@ -2466,9 +2485,33 @@ class ReadSiteTests(IsolatedRepoCase):
         result = git_query.run_git_query(query, self.linked, self.binding)
         self.assertEqual(result["exit_code"], 0, result)
 
+    def prove_candidate_image(self):
+        name = "image-proof-untracked"
+        probe = self.linked / name
+        probe.write_bytes(b"private index proof\n")
+        try:
+            result = git.prove_image(self.linked, self.tip, self.tip_tree, binding=self.binding)
+            self.assertIn(name, result.paths)
+            self.assertIsNone(result.detail)
+        finally:
+            probe.unlink()
+
+    def final_entry(self):
+        changed = self.linked / "dirty-final-entry"
+        changed.write_text("untracked\n")
+        context = SimpleNamespace(
+            worktree=self.linked, run={"expected_head": self.tip, "worktree_binding": self.binding, "final_history": []},
+            read_worktree=lambda: git.read_worktree(self.linked, binding=self.binding))
+        try:
+            with self.assertRaises(HarnessError) as caught:
+                finalization.FinalAcceptance(context).final_review()
+            self.assertEqual(stops.of(caught.exception)["reason"], "dirty_final_workspace")
+        finally:
+            changed.unlink()
+
     def range_comparison(self):
-        self.assertIn(b"committed fixture change", git.range_diff_bytes(self.linked, self.base, binding=self.binding))
-        self.assertIn("added.txt\0", git.range_paths(self.linked, self.base, binding=self.binding))
+        self.assertIn(b"committed fixture change", git.range_diff_bytes(self.linked, self.base, self.tip, binding=self.binding))
+        self.assertIn("added.txt\0", git.range_paths(self.linked, self.base, self.tip, binding=self.binding))
 
     def installation_identity(self):
         with patch.object(operations, "PACKAGE", self.repo.resolve() / "harness"):
@@ -2481,10 +2524,11 @@ class ReadSiteTests(IsolatedRepoCase):
         self.assertEqual((archive / "files" / "draft.txt").read_text(), "discarded draft\n")
         self.assertFalse((self.linked / "draft.txt").exists())
 
-    def accept_candidate(self):
-        (self.linked / "accepted.txt").write_text("accepted content\n")
-        self.assertNotEqual(git.accept(self.linked, ["accepted.txt"], "fixture", "task",
-                                       {"subject": "Accept", "body": ""}, binding=self.binding), self.tip)
+    def build_candidate(self):
+        path = "new-candidate.txt"
+        (self.linked / path).write_text("candidate-only content")
+        result = git.build_commit(self.linked, self.tip, [path], [path], "task", "Candidate\n", binding=self.binding)
+        self.assertNotEqual(result.tree, self.tip_tree)
 
     def fingerprint(self):
         return self.files(self.repo, self.global_config) | self.files(self.scratch, skip=("memories",))
@@ -2790,34 +2834,52 @@ class LifecycleEffectTests(IsolatedRepoCase):
         reset = next(i for i, (cmd, effect, path, _) in enumerate(calls)
                      if cmd[:2] == ("reset", "--hard") and effect is git.CHECKOUT and path == worktree)
         accepted = next(i for i, (cmd, effect, path, _) in enumerate(calls)
-                        if cmd[0] == "commit" and effect is git.INDEX_REFS and path == worktree)
+                        if cmd[0] == "update-ref" and effect is git.REFS and path == worktree)
         phases = [registered[0][0], populated[0][0], reset, accepted, registered[1][0], populated[1][0]]
         self.assertEqual(sorted(set(phases)), phases)
 
     def test_acceptance_disables_automatic_maintenance_with_a_traced_positive_control(self):
         launch = git._launch
-        path = self.repo / "accepted.txt"
+        repo = self.scratch / "maintenance-acceptance"
+        binding = acceptance_checkout(self.repo, repo)
+        path = repo / "accepted.txt"
+        path.write_text("candidate content\n")
+        trace = self.scratch / "maintenance-accept.log"
+
+        def trace_acceptance(argv, env, *, effect, **kwargs):
+            if "commit-tree" in argv or "update-ref" in argv or "--reset" in argv:
+                for setting in ("maintenance.auto=false", "gc.auto=0"):
+                    self.assertEqual(argv[argv.index(setting) - 1], "-c")
+                env = dict(env, GIT_TRACE=str(trace))
+            return launch(argv, env, effect=effect, **kwargs)
+
+        before = git.head(repo)
+        with patch.object(git, "_launch", trace_acceptance):
+            commit = accept_now(repo, [path.name], "fixture", "task", {"subject": "Accept", "body": ""}, binding=binding)
+        self.assertNotEqual(commit, before)
+        lines = trace.read_text().splitlines()
+        for command in ("commit-tree", "update-ref", "read-tree"):
+            self.assertTrue(any(f"built-in: git {command}" in line for line in lines), lines)
+        self.assertFalse(any("run_command:" in line and "maintenance run --auto" in line for line in lines), lines)
+
+        # git commit invokes automatic maintenance and provides a positive control
+        # even on versions whose plumbing never attempts to launch maintenance.
         for enabled in (False, True):
             with self.subTest(automatic_maintenance=enabled):
-                trace = self.scratch / f"maintenance-{enabled}.log"
-                path.write_text(f"fixture content {enabled}\n")
-
-                def trace_commit(argv, env, *, effect, **kwargs):
-                    if effect is git.INDEX_REFS and "--cleanup=verbatim" in argv:
-                        argv = list(argv)
-                        for setting in ("maintenance.auto=false", "gc.auto=0"):
-                            index = argv.index(setting)
-                            self.assertEqual(argv[index - 1], "-c")
-                            if enabled:
-                                del argv[index - 1:index + 1]
-                        env = dict(env, GIT_TRACE=str(trace))
-                    return launch(argv, env, effect=effect, **kwargs)
-
-                before = git.head(self.repo)
-                with patch.object(git, "_launch", trace_commit):
-                    commit = git.accept(self.repo, [path.name], "fixture", "task", {"subject": "Accept", "body": ""})
-                self.assertNotEqual(commit, before)
-                lines = trace.read_text().splitlines()
+                control = self.scratch / f"maintenance-control-{enabled}.log"
+                path.write_text(f"control content {enabled}\n")
+                plain_git(repo, "add", path.name)
+                deadline = time.monotonic() + 60
+                argv, env = git.invocation(repo, ("commit", "-m", "Maintenance control"),
+                                           effect=git.INDEX_REFS, deadline=deadline)
+                if enabled:
+                    for setting in ("maintenance.auto=false", "gc.auto=0"):
+                        index = argv.index(setting)
+                        del argv[index - 1:index + 1]
+                result = launch(argv, dict(env, GIT_TRACE=str(control)), effect=git.INDEX_REFS,
+                                input=None, deadline=deadline)
+                self.assertEqual(result.returncode, 0, result)
+                lines = control.read_text().splitlines()
                 self.assertTrue(any("built-in: git commit" in line for line in lines), lines)
                 self.assertEqual(any("run_command:" in line and "maintenance run --auto" in line for line in lines),
                                  enabled, lines)
@@ -2902,17 +2964,27 @@ class AcceptanceGitFormsTests(IsolatedRepoCase):
 
             def observe(argv, env, *, effect, **kwargs):
                 result = launch(argv, env, effect=effect, **kwargs)
-                seen.append((effect, argv, env, result))
+                seen.append((effect, argv, env, result, kwargs.get("pass_fds", ())))
                 return result
 
             with patch.object(git, "_launch", observe):
                 if row == "G10":  # The binding check itself uses _run_git to avoid recursion.
                     git.check_worktree_binding(worktree, binding)
                     result, = (record[3] for record in seen)
+                elif row in ("G16", "G17"):
+                    with (self.scratch / "matrix-run.lock").open("a+b") as lock:
+                        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        fd = lock.fileno()
+                        if row == "G16":
+                            ref, commit, parent = args[-3:]
+                            result = git.move_branch(worktree, ref, commit, parent, "task", binding=binding, lock_fd=fd)
+                        else:
+                            result = git.sync_index(worktree, args[-1], binding=binding, lock_fd=fd)
+                    self.assertEqual([record[4] for record in seen if record[4]], [(fd,)])
                 else:
                     result = git.git_process(worktree, *args, effect=effect, binding=binding,
                                              index_file=private_index, input=input, literal_pathspecs=literal)
-            (launched_effect, argv, env, _), = (record for record in seen if record[3] is result)
+            (launched_effect, argv, env, _, passed), = (record for record in seen if record[3] is result)
             self.assertEqual(tuple(argv[-len(args):]), args)
             self.assertIn("--git-dir=" + binding["git_dir"], argv)
             self.assertIn("--work-tree=" + binding["worktree"], argv)
@@ -2920,7 +2992,7 @@ class AcceptanceGitFormsTests(IsolatedRepoCase):
             self.assertEqual(env.get("GIT_INDEX_FILE"), str(private_index) if private else None)
             self.assertEqual("--literal-pathspecs" in argv[:-len(args)], literal)
             self.assertIs(launched_effect, effect)
-            # G16/G17 cover Git effects here. Inheritance of run.lock is verified by D1-A1.
+            self.assertEqual(passed, (fd,) if row in ("G16", "G17") else ())
             self.assertEqual(launched_effect.interruptible, row not in ("G16", "G17"))
             if code is None:
                 self.assertNotEqual(result.returncode, 0, result.stderr)

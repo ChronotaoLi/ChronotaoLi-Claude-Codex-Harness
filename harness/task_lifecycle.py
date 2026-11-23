@@ -6,7 +6,7 @@ import json
 from copy import deepcopy
 from pathlib import Path
 
-from . import git, stops
+from . import acceptance, git, stops
 from .config import PROJECT_FILE
 from .context import compact_checks, compact_feedback, compact_reviews, instruction_file_changes
 from .contracts import envelope, judge_review, review_approved, review_schema, WORK
@@ -15,6 +15,7 @@ from .planning import attempt_limit_error
 from .input_projection import validate_dispatch_indexes as validate_input_dispatch_indexes
 from .path_evidence import validate_dispatch_indexes
 from .progress import CheckpointDeclarationError
+from .process_runtime import defer_cleanup_signals
 from .recovery import read_evidence_json, acceptance_review_records, snapshot_digest, worker_recovery_context
 from .services import RuntimeService
 from .continuation import record_continuation
@@ -604,22 +605,6 @@ class TaskLifecycle(RuntimeService):
                 self.context.run["pending_acceptance" if approved else "feedback"] = successor
         return outcome
 
-    def _record_accepted(self, pending, accepted, completion):
-        """Publish the commit and its remaining work at the same durable barrier."""
-        runtime = self.context
-        self._require_handoff("pending_acceptance", pending, "pending_task", "pending_post_accept")
-        tid = pending["task_id"]
-        successor = {"payload": {"task_id": tid, **accepted}, "completion": completion}
-        # The commit already exists: a stop saves it wholly recorded with its successor, or not recorded at all.
-        with self.context.transition():
-            self.context.run["expected_head"] = accepted["commit"]
-            self.context.run["accepted"][tid] = accepted
-            self.context.run["feedback"] = None
-            self.context.run["current_task"] = None
-            self.context.run.get("worker_recovery", {}).pop(tid, None)
-            self.context.run.pop("pending_acceptance")
-            self.context.run["pending_post_accept"] = successor
-
     def task_memory_record(self, task, pending, commit, paths):
         """The accepted task's memory record fields; the preflight uses a same-length placeholder commit."""
         run_id, tid = self.context.run["id"], task["id"]
@@ -634,15 +619,8 @@ class TaskLifecycle(RuntimeService):
         provenance = {"commit": commit, "run_id": run_id, "task_id": tid, "scope": "run", "reference_only": True}
         return record, provenance
 
-    def accept_pending(self):
-        runtime = self.context
-        pending = self.context.run["pending_acceptance"]
-        self._require_handoff("pending_acceptance", pending, "pending_task", "pending_post_accept")
-        tid, attempt = pending["task_id"], pending["attempt"]
-        task = next(task for task in self.context.run["tasks"] if task["id"] == tid)
-        self.context.ensure_exited()
-        # Reads that never touch the worktree come first: a predictable record
-        # error stops before the commit, and the message is read by its digest.
+    def _preflight_accept_memory(self, task, pending):
+        tid = pending["task_id"]
         placeholder = "0" * len(self.context.run["expected_head"])
         knowledge_ttl_days = self.context.config.data["memory"]["knowledge_ttl_days"] or None
         try:
@@ -653,11 +631,35 @@ class TaskLifecycle(RuntimeService):
                 Memory.validate_record(**record)
         except HarnessError as error:
             raise HarnessError(f"任务记忆记录不合格；未提交：{error}", stop=stops.make("runtime_failure", "invariant")) from error
+        return knowledge_ttl_days
+
+    def _check_accept_review(self, pending):
+        tid = pending["task_id"]
+        validate_review_source(self.context.run, tid, pending, candidate_digest=pending["snapshot_digest"])
+        # The coverage gate, on the whole history: every historical blocking
+        # finding has a usable resolution on this very snapshot.
+        if required_findings(self.context.run, tid, pending["snapshot_digest"]):
+            raise HarnessError("批准没有覆盖该任务全部历史阻断问题的独立解决处置；未提交", stop=stops.make("runtime_failure", "invariant"))
+
+    def accept_pending(self):
+        runtime = self.context
+        pending = runtime.run["pending_acceptance"]
+        self._require_handoff("pending_acceptance", pending, "pending_task", "pending_post_accept")
+        tid, attempt = pending["task_id"], pending["attempt"]
+        task = next(task for task in runtime.run["tasks"] if task["id"] == tid)
+        if "intent" in pending:
+            runtime.ensure_exited()
+            knowledge_ttl_days = self._preflight_accept_memory(task, pending)
+            self._check_accept_review(pending)
+            if self._complete_acceptance(task, pending, pending["intent"], knowledge_ttl_days, publish_intent=False):
+                return True
+            # A missing unreferenced object returns to the first-acceptance gates.
+
+        runtime.ensure_exited()
+        knowledge_ttl_days = self._preflight_accept_memory(task, pending)
         message = self.approved_worker_message(pending)
-        # The one candidate check: after those reads, before the checks of run
-        # evidence and scope that lead to the commit. A changed candidate voids
-        # the approval; every other failure keeps pending_acceptance.
-        if snapshot_digest(self.context.snapshot()) != pending["snapshot_digest"]:
+        snapshot = runtime.snapshot()
+        if snapshot_digest(snapshot) != pending["snapshot_digest"]:
             feedback = {"task_id": tid, "acceptance": {
                 "error": "待接受文件已变化，旧审阅失效；需要重新验证和独立审阅",
                 "review_artifact": pending["review_artifact"]}}
@@ -674,29 +676,57 @@ class TaskLifecycle(RuntimeService):
         validate_input_dispatch_indexes(self.context.directory, self.context.run["dispatches"])
         paths = git.check_scope(self.context.worktree, task["allowed_paths"], binding=self.context.run["worktree_binding"],
                                 task_id=tid)
-        validate_review_source(self.context.run, tid, pending, candidate_digest=pending["snapshot_digest"])
-        # The coverage gate, on the whole history: every historical blocking
-        # finding has a usable resolution on this very snapshot.
-        if required_findings(self.context.run, tid, pending["snapshot_digest"]):
-            raise HarnessError("批准没有覆盖该任务全部历史阻断问题的独立解决处置；未提交", stop=stops.make("runtime_failure", "invariant"))
-        commit = git.accept(self.context.worktree, paths, self.context.run["id"], tid, message,
-                            binding=self.context.run["worktree_binding"])
-        accepted = {"commit": commit, "summary": pending["review"]["summary"], "summary_source": "reviewer",
-                    "files": paths, "verification": pending["verification"], "review": pending["review"],
-                    "review_artifact": pending["review_artifact"] ,
-                    "review_source": deepcopy(pending["review_source"])}
-        if pending.get("worker_source"):
-            accepted.update(worker_source=deepcopy(pending["worker_source"]),
-                            decision_requests=deepcopy(pending.get("decision_requests", [])))
-        task_memory, provenance = self.task_memory_record(task, pending, commit, paths)
-        completion = {
-            "id": f"acceptance:{self.context.run['id']}:{tid}",
-            "task_memory": {**task_memory, "kind": "accepted_task", "provenance": provenance},
-            "proposals": pending["proposals"], "approved_keys": pending["approved_keys"],
-            "knowledge_ttl_days": knowledge_ttl_days,
-            "knowledge": {"status": "pending"},
+        self._check_accept_review(pending)
+        parent = runtime.run["expected_head"]
+        binding = runtime.run["worktree_binding"]
+        built = git.build_commit(runtime.worktree, parent, paths, task["allowed_paths"], tid,
+                                 git.commit_message_text(message, runtime.run["id"], tid), binding=binding)
+        intent: acceptance.Intent = {
+            "ref": binding["branch"], "parent": parent, "tree": built.tree, "commit": built.commit,
+            "files": paths, "index_before": snapshot["index"], "index_synced": built.index_synced,
         }
-        self._record_accepted(pending, accepted, completion)
+        return self._complete_acceptance(task, pending, intent, knowledge_ttl_days, publish_intent=True)
+
+    def _complete_acceptance(self, task, pending, intent: acceptance.Intent, knowledge_ttl_days, *, publish_intent):
+        runtime = self.context
+        tid, commit, paths = pending["task_id"], intent["commit"], intent["files"]
+        with defer_cleanup_signals(inherit=False):
+            if publish_intent:
+                pending["intent"] = intent
+                runtime.save()
+            current = acceptance.state(runtime, intent)
+            if isinstance(current, acceptance.Rebuild):
+                if publish_intent:
+                    raise acceptance.integrity(tid)
+                return False
+            if current.branch != commit:
+                acceptance.move_branch(runtime, intent, tid)
+            if current.index != intent["index_synced"]:
+                acceptance.sync_index(runtime, intent)
+            acceptance.confirm(runtime, intent, tid)
+            accepted = {"commit": commit, "summary": pending["review"]["summary"], "summary_source": "reviewer",
+                        "files": paths, "verification": pending["verification"], "review": pending["review"],
+                        "review_artifact": pending["review_artifact"], "review_source": deepcopy(pending["review_source"])}
+            if pending.get("worker_source"):
+                accepted.update(worker_source=deepcopy(pending["worker_source"]),
+                                decision_requests=deepcopy(pending.get("decision_requests", [])))
+            task_memory, provenance = self.task_memory_record(task, pending, commit, paths)
+            completion = {
+                "id": f"acceptance:{self.context.run['id']}:{tid}",
+                "task_memory": {**task_memory, "kind": "accepted_task", "provenance": provenance},
+                "proposals": pending["proposals"], "approved_keys": pending["approved_keys"],
+                "knowledge_ttl_days": knowledge_ttl_days,
+                "knowledge": {"status": "pending"},
+            }
+            successor = {"payload": {"task_id": tid, **accepted}, "completion": completion}
+            runtime.run["expected_head"] = commit
+            runtime.run["accepted"][tid] = {**accepted, "tree": intent["tree"]}
+            runtime.run["feedback"] = None
+            runtime.run["current_task"] = None
+            runtime.run.get("worker_recovery", {}).pop(tid, None)
+            runtime.run.pop("pending_acceptance")
+            runtime.run["pending_post_accept"] = successor
+            runtime.save()
         self.finish_post_accept()
-        self.context.checkpoint()
+        runtime.checkpoint()
         return True

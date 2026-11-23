@@ -3,8 +3,8 @@
 A record's facts and digest come from one read. A journal that is missing, a link, a FIFO or a directory,
 or that is not one whole valid journal (over 64 KiB, not strict JSON, a field outside its domain), leaves
 the call's exit unconfirmed: never a pass and never an untyped error. An invalid journal is confirmed bound
-to the whole file's digest; under ledger 19 a call without a readable journal cannot be confirmed, so a
-batch that would need such a confirmation writes nothing. A read that fails is local I/O; an entry of
+to the whole file's digest; a call without a readable journal needs an explicit null digest. A batch
+containing a failed read writes nothing. A read that fails is local I/O; an entry of
 commands/ that is not a call folder is damaged evidence, and so is a link at any level down to it from the state
 directory the caller gives, or a dispatch path not written below it as a ledger records one; nothing above that
 directory is opened. A group ID
@@ -20,6 +20,7 @@ import io
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -30,6 +31,7 @@ from unittest.mock import patch
 from harness import command_server, state_files, stops
 from harness.cleanup import cleanup_run
 from harness.command_server import Broker, command_id, command_processes, create_manifest, handle
+from harness.run_store import RunStore
 from harness.state_files import StateReadError
 from harness.util import (EvidenceError, HarnessError, confirm_dispatches_exited, ensure_dispatches_exited,
                           read_json, validate_command_directories, write_json)
@@ -217,11 +219,12 @@ class JournalFixture(unittest.TestCase):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         self.root = Path(temp.name).resolve()
+        self.directory = self.root / "runs" / "fixture"
 
     def dispatch(self, ident=None, *, exit_confirmed=True):
         """A ledger entry of an exited dispatch with an empty commands/ of its own."""
         ident = ident or "d" + uuid.uuid4().hex[:12]
-        commands = self.root / "dispatches" / ident / "commands"
+        commands = self.directory / "dispatches" / ident / "commands"
         commands.mkdir(parents=True)
         return {"id": ident, "pgid": None, "process_state": "exited", "exit_confirmed": exit_confirmed,
                 "command_directory": str(commands)}
@@ -265,7 +268,7 @@ class JournalRecordTests(JournalFixture):
     def test_root_open_failure_preserves_path_validation_and_permission_error(self):
         entry = self.dispatch(exit_confirmed=False)
         valid = entry["command_directory"]
-        invalid = str(self.root / "dispatches" / ".." / "dispatches" / entry["id"] / "commands")
+        invalid = str(self.directory / "dispatches" / ".." / "dispatches" / entry["id"] / "commands")
 
         def open_(real, name, *args, **kwargs):
             if kwargs.get("dir_fd") is None and os.fspath(name) == str(self.root):
@@ -277,7 +280,7 @@ class JournalRecordTests(JournalFixture):
             before, audits, saves = copy.deepcopy(spelled), [], []
             gates = {
                 "records": lambda: command_processes(path, state=self.root),
-                "exit gate": lambda: ensure_dispatches_exited([spelled], state=self.root),
+                "exit gate": lambda: ensure_dispatches_exited([spelled], state=self.root, directory=self.directory),
                 "confirmation": lambda: self.confirm([spelled], [entry["id"]], audits, saves),
             }
             for name, gate in gates.items():
@@ -335,7 +338,7 @@ class JournalRecordTests(JournalFixture):
         entry = self.dispatch()
         folder, call = self.call(entry)
         (folder / "process.json").write_bytes(encoded(exited(call, pgid=77)))
-        ensure_dispatches_exited([entry], state=self.root)
+        ensure_dispatches_exited([entry], state=self.root, directory=self.directory)
         [record] = command_processes(entry["command_directory"], state=self.root)
         self.assertEqual(record, {**exited(call, pgid=77), "journal": str(folder / "process.json"),
                                   "journal_digest": sha((folder / "process.json").read_bytes()), "journal_state": "valid"})
@@ -347,7 +350,7 @@ class JournalRecordTests(JournalFixture):
                 with unblocked(folder / "process.json", layout):
                     [record] = command_processes(entry["command_directory"], state=self.root)
                     with self.assertRaises(HarnessError) as raised:
-                        ensure_dispatches_exited([entry], state=self.root)
+                        ensure_dispatches_exited([entry], state=self.root, directory=self.directory)
                 self.assertEqual(record, {"id": call, "command_id": None, "pgid": None, "process_state": None,
                                           "exit_confirmed": False, "journal": str(folder / "process.json"),
                                           "journal_digest": None if raw is None else sha(raw), "journal_state": state})
@@ -374,7 +377,7 @@ class JournalRecordTests(JournalFixture):
         before = copy.deepcopy(entry)
         audits, saves = [], []
         for name, gate in (("records", lambda: command_processes(entry["command_directory"], state=self.root)),
-                           ("exit gate", lambda: ensure_dispatches_exited([entry], state=self.root)),
+                           ("exit gate", lambda: ensure_dispatches_exited([entry], state=self.root, directory=self.directory)),
                            ("confirmation", lambda: self.confirm([entry], [entry["id"]], audits, saves))):
             with self.subTest(gate=name):
                 with self.assertRaises(StateReadError) as raised:
@@ -396,7 +399,7 @@ class JournalRecordTests(JournalFixture):
                     entry = self.dispatch(exit_confirmed=gate != "confirmation")
                     folder, call = self.call(entry)
                     (folder / "process.json").write_bytes(encoded(exited(call)))
-                    linked = folder.parent.parent if level == "dispatch" else self.root / "dispatches"
+                    linked = folder.parent.parent if level == "dispatch" else self.directory / "dispatches"
                     # The link leads to the very same journal: only the link itself may refuse it.
                     moved = linked.with_name("moved-" + linked.name)
                     linked.rename(moved)
@@ -406,7 +409,7 @@ class JournalRecordTests(JournalFixture):
                         if gate == "records":
                             command_processes(entry["command_directory"], state=self.root)
                         elif gate == "exit gate":
-                            ensure_dispatches_exited([entry], state=self.root)
+                            ensure_dispatches_exited([entry], state=self.root, directory=self.directory)
                         else:
                             self.confirm([entry], [entry["id"]], audits, saves)
                     self.assertEqual((stop_of(raised.exception)["kind"], stop_of(raised.exception)["reason"]),
@@ -420,7 +423,7 @@ class JournalRecordTests(JournalFixture):
         (folder / "process.json").write_bytes(encoded(exited(call)))
         with failing_lookups(folder.parent.parent, errno.EIO, opens=False):
             [record] = command_processes(entry["command_directory"], state=self.root)
-            ensure_dispatches_exited([entry], state=self.root)
+            ensure_dispatches_exited([entry], state=self.root, directory=self.directory)
         self.assertEqual(record["journal_state"], "valid")
 
     def test_a_dispatch_path_not_recorded_below_the_state_directory_is_damaged_evidence(self):
@@ -438,11 +441,11 @@ class JournalRecordTests(JournalFixture):
         (elsewhere / "dispatches" / job.name / "commands" / folder.name).mkdir(parents=True)
         (elsewhere / "dispatches" / job.name / "commands" / folder.name / "process.json").write_bytes(encoded(exited(call)))
         spellings = {
-            "a .. segment": str(self.root / "dispatches" / ".." / "dispatches" / job.name),
+            "a .. segment": str(self.directory / "dispatches" / ".." / "dispatches" / job.name),
             "a .. below commands/": str(job / "commands" / ".." / "commands"),
             "an empty segment": str(job).replace("/dispatches/", "/dispatches//"),
             "a . segment": str(job).replace("/dispatches/", "/dispatches/./"),
-            "through a link to the state directory": str(alias / "dispatches" / job.name / "commands"),
+            "through a link to the state directory": str(alias / "runs" / "fixture" / "dispatches" / job.name / "commands"),
             "another directory": str(elsewhere / "dispatches" / job.name),
             "relative": os.path.relpath(job),
             "the state directory": str(self.root),
@@ -457,7 +460,7 @@ class JournalRecordTests(JournalFixture):
                         if gate == "records":
                             command_processes(path, state=self.root)
                         elif gate == "exit gate":
-                            ensure_dispatches_exited([spelled], state=self.root)
+                            ensure_dispatches_exited([spelled], state=self.root, directory=self.directory)
                         else:
                             self.confirm([spelled], [spelled["id"]], audits, saves)
                     # The stop names the path as given; make() drops a relative one, as any unfit source.
@@ -470,7 +473,7 @@ class JournalRecordTests(JournalFixture):
             with self.subTest(path=str(path), state=str(state)):
                 [record] = command_processes(path, state=state)
                 self.assertEqual(record["journal_state"], "valid")
-        ensure_dispatches_exited([entry], state=alias)
+        ensure_dispatches_exited([entry], state=alias, directory=self.directory)
 
     def test_journal_reads_open_nothing_above_the_state_directory(self):
         # Confirm review D4-T3b, suggestion: each read walked from / and opened every directory above the state tree.
@@ -478,10 +481,11 @@ class JournalRecordTests(JournalFixture):
         folder, call = self.call(entry)
         (folder / "process.json").write_bytes(encoded(exited(call)))
         job = folder.parent.parent
-        walked = {identity(path) for path in (self.root, job.parent, job, folder.parent, folder, folder / "process.json")}
+        walked = {identity(path) for path in (self.root, self.directory.parent, self.directory,
+                                             job.parent, job, folder.parent, folder, folder / "process.json")}
         above = {identity(path) for path in self.root.parents}
         for name, gate in (("records", lambda: command_server.command_processes(entry["command_directory"], state=self.root)),
-                           ("exit gate", lambda: ensure_dispatches_exited([dict(entry, exit_confirmed=True)], state=self.root)),
+                           ("exit gate", lambda: ensure_dispatches_exited([dict(entry, exit_confirmed=True)], state=self.root, directory=self.directory)),
                            ("confirmation", lambda: self.confirm([copy.deepcopy(entry)], [entry["id"]]))):
             with self.subTest(gate=name):
                 with journal_opens() as opened:
@@ -562,7 +566,7 @@ class JournalRecordTests(JournalFixture):
                         if gate == "records":
                             command_processes(entry["command_directory"], state=self.root)
                         elif gate == "exit gate":
-                            ensure_dispatches_exited([entry], state=self.root)
+                            ensure_dispatches_exited([entry], state=self.root, directory=self.directory)
                         else:
                             self.confirm([entry], [entry["id"]], audits, saves)
                     self.assertEqual((stop_of(raised.exception)["kind"], stop_of(raised.exception)["reason"]),
@@ -589,19 +593,29 @@ class JournalRecordTests(JournalFixture):
                 parent = dict(entry) if confirmations is None else dict(entry, command_exit_confirmations=confirmations)
                 with self.subTest(confirmations=confirmations):
                     with self.assertRaises(HarnessError) as raised:
-                        ensure_dispatches_exited([parent], state=self.root)
+                        ensure_dispatches_exited([parent], state=self.root, directory=self.directory)
                     self.assertEqual(stop_of(raised.exception), unconfirmed(call, entry["id"]))
             # Only a stored None, the shape ledger 20 adds, matches a call that has no readable journal.
-            ensure_dispatches_exited([dict(entry, command_exit_confirmations={call: {"journal_digest": None}})], state=self.root)
+            ensure_dispatches_exited([dict(entry, command_exit_confirmations={call: {"journal_digest": None}})], state=self.root, directory=self.directory)
+
+    def test_confirmation_shape_requires_explicit_null_or_lowercase_hex_digest(self):
+        entry = self.dispatch("d")
+        _, call = self.call(entry)
+        for value in ({"journal_digest": None}, {"journal_digest": "a" * 64}):
+            validate_command_directories([dict(entry, command_exit_confirmations={call: value})], self.directory)
+        bad_digests = (False, 0, [], {}, "a" * 63, "A" * 64, "g" * 64, "a" * 65)
+        for value in ({}, None, *({"journal_digest": bad} for bad in bad_digests)):
+            with self.subTest(value=value), self.assertRaises(EvidenceError):
+                validate_command_directories([dict(entry, command_exit_confirmations={call: value})], self.directory)
 
     def test_command_directory_checks_go_through_the_primitive(self):
         entry = self.dispatch("d")
-        validate_command_directories([entry], self.root)
+        validate_command_directories([entry], self.directory)
         for name, fake, error_type in (("EIO", FakeOs(stat=failing(errno.EIO, "commands")), "OSError"),
                                        ("EACCES", FakeOs(stat=failing(errno.EACCES, "commands")), "PermissionError")):
             with self.subTest(lookup=name):
                 with patch.object(state_files, "os", fake), self.assertRaises(StateReadError) as raised:
-                    validate_command_directories([entry], self.root)
+                    validate_command_directories([entry], self.directory)
                 self.assertEqual(stop_of(raised.exception), local_io(error_type))
         commands = Path(entry["command_directory"])
         elsewhere = self.root / "elsewhere"
@@ -614,7 +628,7 @@ class JournalRecordTests(JournalFixture):
             with self.subTest(commands=name):
                 damage()
                 with self.assertRaises(EvidenceError):
-                    validate_command_directories([entry], self.root)
+                    validate_command_directories([entry], self.directory)
 
 
 class JournalConfirmationTests(JournalFixture):
@@ -647,7 +661,7 @@ class JournalConfirmationTests(JournalFixture):
                 resolutions, root_opens, journal_reads = [], [], []
                 with patch.object(Path, "resolve", resolve), patch.object(state_files, "os", FakeOs(open=open_)):
                     if gate == "exit gate":
-                        self.assertEqual(ensure_dispatches_exited(iter(dispatches), state=self.root), [])
+                        self.assertEqual(ensure_dispatches_exited(iter(dispatches), state=self.root, directory=self.directory), [])
                     else:
                         selected = [dict(entry, exit_confirmed=False) for entry in dispatches]
                         audits, saves = self.confirm(selected, ["d1", "d2"])
@@ -665,54 +679,60 @@ class JournalConfirmationTests(JournalFixture):
                 folder, call = self.call(entry)
                 _, raw = lay_out(folder, call, layout)
                 with self.assertRaises(HarnessError):
-                    ensure_dispatches_exited([entry], state=self.root)
+                    ensure_dispatches_exited([entry], state=self.root, directory=self.directory)
                 audits, saves = self.confirm([entry], [entry["id"]])
-                self.assertEqual([(event, fields["command_id"], fields["journal_digest"], fields["observed"])
+                self.assertEqual([(event, fields["command_id"], fields["journal_digest"], fields["journal_state"], fields["observed"])
                                   for event, fields in audits],
-                                 [("command_exit_confirmed_by_operator", call, sha(raw), {"pgid": None, "group_alive": None})])
+                                 [("command_exit_confirmed_by_operator", call, sha(raw), "invalid",
+                                   {"pgid": None, "group_alive": None})])
                 self.assertEqual(len(saves), 1)
                 self.assertEqual(entry["command_exit_confirmations"][call]["journal_digest"], sha(raw))
-                ensure_dispatches_exited([entry], state=self.root)
+                ensure_dispatches_exited([entry], state=self.root, directory=self.directory)
                 # Already bound to these bytes: nothing to confirm again.
                 self.assertEqual(self.confirm([entry], [entry["id"]]), ([], []))
                 # Other invalid bytes are another journal: the confirmation no longer covers it.
                 (folder / "process.json").write_bytes(raw + b" ")
                 with self.assertRaises(HarnessError) as raised:
-                    ensure_dispatches_exited([entry], state=self.root)
+                    ensure_dispatches_exited([entry], state=self.root, directory=self.directory)
                 self.assertEqual(stop_of(raised.exception), unconfirmed(call, entry["id"]))
                 audits, _ = self.confirm([entry], [entry["id"]])
                 self.assertEqual([fields["journal_digest"] for _, fields in audits], [sha(raw + b" ")])
-                ensure_dispatches_exited([entry], state=self.root)
+                ensure_dispatches_exited([entry], state=self.root, directory=self.directory)
 
-    def test_a_batch_that_needs_a_confirmation_without_a_digest_writes_nothing(self):
+    def test_a_mixed_batch_confirms_in_requested_command_then_dispatch_order(self):
         for order, layout in ((("d1", "d2"), "absent"), (("d2", "d1"), "fifo"), (("d1", "d2"), "link")):
             with self.subTest(order=order, layout=layout):
-                shutil.rmtree(self.root / "dispatches", ignore_errors=True)
+                shutil.rmtree(self.directory / "dispatches", ignore_errors=True)
                 first, second = self.dispatch("d1", exit_confirmed=False), self.dispatch("d2", exit_confirmed=False)
                 folder, call = self.call(first)
                 _, raw = lay_out(folder, call, "shape")
                 missing, unbound = self.call(second)
-                lay_out(missing, unbound, layout)
-                before, audits, saves = copy.deepcopy([first, second]), [], []
-                with unblocked(missing / "process.json", layout), self.assertRaises(HarnessError) as raised:
-                    self.confirm([first, second], list(order), audits, saves)
-                self.assertEqual(stop_of(raised.exception), unconfirmed(unbound, "d2"))
-                self.assertEqual((audits, saves, [first, second]), ([], [], before))
-        # d1 alone is confirmed as before: its call bound to the whole invalid file, then the dispatch.
-        audits, saves = self.confirm([first, second], ["d1"])
-        self.assertEqual([(event, fields.get("command_id"), fields.get("journal_digest")) for event, fields in audits],
-                         [("command_exit_confirmed_by_operator", call, sha(raw)),
-                          ("dispatch_exit_confirmed_by_operator", None, None)])
-        self.assertEqual(len(saves), 2)
-        self.assertNotIn("command_exit_confirmations", second)
+                state, _ = lay_out(missing, unbound, layout)
+                with unblocked(missing / "process.json", layout):
+                    audits, saves = self.confirm([first, second], list(order))
+                    ensure_dispatches_exited([first, second], state=self.root, directory=self.directory)
+                    self.assertEqual(self.confirm([first, second], list(order)), ([], []))
+                commands = {"d1": (call, sha(raw), "invalid"), "d2": (unbound, None, state)}
+                expected = []
+                for ident in order:
+                    expected.extend([("command_exit_confirmed_by_operator", ident, *commands[ident]),
+                                     ("dispatch_exit_confirmed_by_operator", ident, None, None, None)])
+                self.assertEqual([(event, fields["dispatch_id"], fields.get("command_id"),
+                                   fields.get("journal_digest"), fields.get("journal_state"))
+                                  for event, fields in audits], expected)
+                self.assertEqual(len(saves), 4)
+                confirmation = second["command_exit_confirmations"][unbound]
+                self.assertEqual(set(confirmation), {"time", "journal_digest", "observed"})
+                self.assertIsNone(confirmation["journal_digest"])
+                self.assertEqual(confirmation["observed"], {"pgid": None, "group_alive": None})
 
     def test_a_journal_read_failing_for_the_second_selected_dispatch_writes_nothing(self):
         for order in (("d1", "d2"), ("d2", "d1")):
             with self.subTest(order=order):
-                shutil.rmtree(self.root / "dispatches", ignore_errors=True)
+                shutil.rmtree(self.directory / "dispatches", ignore_errors=True)
                 dispatches = {ident: self.dispatch(ident, exit_confirmed=False) for ident in ("d1", "d2")}
                 confirmable, call = self.call(dispatches[order[0]])
-                lay_out(confirmable, call, "shape")
+                lay_out(confirmable, call, "absent")
                 failing, call = self.call(dispatches[order[1]])
                 (failing / "process.json").write_bytes(encoded(exited(call)))
                 inode = failing.stat().st_ino
@@ -740,7 +760,7 @@ class JournalConfirmationTests(JournalFixture):
         [record] = command_processes(second["command_directory"], state=self.root)
         self.assertEqual((record["journal_state"], record["pgid"], record["journal_digest"]), ("invalid", None, sha(wide)))
         with self.assertRaises(HarnessError) as raised:
-            ensure_dispatches_exited([second], state=self.root)
+            ensure_dispatches_exited([second], state=self.root, directory=self.directory)
         self.assertEqual(stop_of(raised.exception), unconfirmed(second_call, "d2"))
         audits, saves = self.confirm([first, second], ["d1", "d2"])
         self.assertEqual([(event, fields["dispatch_id"], fields.get("journal_digest")) for event, fields in audits],
@@ -749,7 +769,7 @@ class JournalConfirmationTests(JournalFixture):
                           ("command_exit_confirmed_by_operator", "d2", sha(wide)),
                           ("dispatch_exit_confirmed_by_operator", "d2", None)])
         self.assertEqual(len(saves), 4)
-        ensure_dispatches_exited([first, second], state=self.root)
+        ensure_dispatches_exited([first, second], state=self.root, directory=self.directory)
         # The largest group ID pid_t holds is a journal's own fact, looked at like any other.
         entry = self.dispatch()
         folder, call = self.call(entry)
@@ -757,7 +777,7 @@ class JournalConfirmationTests(JournalFixture):
         [record] = command_processes(entry["command_directory"], state=self.root)
         self.assertEqual((record["journal_state"], record["pgid"]), ("valid", 2**31 - 1))
         looked = []
-        ensure_dispatches_exited([entry], state=self.root, observe=lambda pgid: looked.append(pgid) or False)
+        ensure_dispatches_exited([entry], state=self.root, directory=self.directory, observe=lambda pgid: looked.append(pgid) or False)
         self.assertEqual(looked, [2**31 - 1])
 
     def test_a_group_that_cannot_be_looked_at_is_unconfirmed_and_its_confirmation_says_so(self):
@@ -773,7 +793,7 @@ class JournalConfirmationTests(JournalFixture):
             with self.subTest(error=type(error).__name__):
                 before = copy.deepcopy(entry)
                 with self.assertRaises(HarnessError) as raised:
-                    ensure_dispatches_exited([dict(entry, exit_confirmed=True)], state=self.root, observe=failing(error))
+                    ensure_dispatches_exited([dict(entry, exit_confirmed=True)], state=self.root, directory=self.directory, observe=failing(error))
                 self.assertEqual(stop_of(raised.exception), unconfirmed(call, entry["id"]))
                 self.assertEqual(entry, before)
         # The confirmation that stop asks for is still written: the observation records that nothing was seen.
@@ -782,7 +802,7 @@ class JournalConfirmationTests(JournalFixture):
         self.assertEqual([(event, fields["observed"]["pgid"], fields["observed"]["group_alive"]) for event, fields in audits],
                          [("command_exit_confirmed_by_operator", 4242, None), ("dispatch_exit_confirmed_by_operator", None, None)])
         self.assertEqual(len(saves), 2)
-        ensure_dispatches_exited([entry], state=self.root, observe=observe)
+        ensure_dispatches_exited([entry], state=self.root, directory=self.directory, observe=observe)
 
     def test_an_observation_that_fails_leaves_before_the_first_audit(self):
         # Every confirmation of the batch is observed before any is written: an interrupt while the second
@@ -1067,58 +1087,121 @@ class JournalLifecycleTests(RepoCase):
         self.assertEqual([(e["command_id"], e["journal_digest"]) for e in events
                           if e["event"] == "command_exit_confirmed_by_operator"], [(call, digest) for digest in digests])
 
-    def test_a_call_without_a_readable_journal_cannot_be_confirmed_under_ledger_19(self):
-        backend, engine = self.stopped_run()
+    def test_unreadable_journal_confirmations_survive_load_at_each_entry(self):
+        for layout, operation in (("absent", "resume"), ("fifo", "abandon"),
+                                  ("link", "cleanup"), ("directory", "cleanup")):
+            with self.subTest(layout=layout, operation=operation):
+                backend, engine = self.stopped_run()
+                [worker] = self.workers(engine)
+                folder, call = self.the_call(worker)
+                self.restored_at_cleanup(folder, call)
+                run_id = engine.run["id"]
+                journal_state, _ = lay_out(folder, call, layout)
+                with unblocked(folder / "process.json", layout):
+                    if operation == "cleanup":
+                        result = cleanup_run(self.repo, run_id, remove=True, confirm_exited=[worker["id"]])
+                        status = result["run_status"]
+                        self.assertEqual(result["worktree"]["status"], "retained")
+                    else:
+                        code, errors = run_cli(self, backend, [operation, run_id, "--confirm-exited", worker["id"]])
+                        self.assertEqual(code, 0, errors)
+                        status = "completed" if operation == "resume" else "abandoned"
+                    self.assert_confirmed(engine, worker, call, [None], status=status)
+                    events = [json.loads(line) for line in (engine.directory / "events.jsonl").read_text().splitlines()]
+                    [audit] = [e for e in events if e["event"] == "command_exit_confirmed_by_operator"]
+                    self.assertEqual((audit["journal_state"], audit["observed"]),
+                                     (journal_state, {"pgid": None, "group_alive": None}))
+                    cleanup_run(self.repo, run_id)
+                if operation == "cleanup":
+                    code, errors = run_cli(self, backend, ["abandon", run_id])
+                    self.assertEqual(code, 0, errors)
+                    self.assertEqual(cleanup_run(self.repo, run_id, remove=True)["worktree"]["status"], "removed")
+
+    def test_null_confirmation_survives_fifo_but_reappearing_live_journal_blocks_cleanup(self):
+        _, engine = self.stopped_run()
         [worker] = self.workers(engine)
         folder, call = self.the_call(worker)
-        self.restored_at_cleanup(folder, call)
-        run_id, unchanged = engine.run["id"], self.unchanged(engine)
-        for layout in ("absent", "fifo", "link", "directory"):
-            with self.subTest(layout=layout):
-                lay_out(folder, call, layout)
-                with unblocked(folder / "process.json", layout):
-                    for operation in ("resume", "abandon"):
-                        notice = refused_by_cli(self, backend, [operation, run_id, "--confirm-exited", worker["id"]],
-                                                ("process_unconfirmed", "command_exit"), 3)
-                        self.assertEqual(notice["data"]["command_id"], call)
-                    with self.assertRaises(HarnessError) as raised:
-                        cleanup_run(self.repo, run_id, confirm_exited=[worker["id"]])
+        run_id = engine.run["id"]
+        lay_out(folder, call, "absent")
+        cleanup_run(self.repo, run_id, confirm_exited=[worker["id"]])
+        lay_out(folder, call, "fifo")
+        path = folder / "process.json"
+        with unblocked(path, "fifo"):
+            cleanup_run(self.repo, run_id, confirm_exited=[worker["id"]])
+        self.assert_confirmed(engine, worker, call, [None], status="blocked")
+        clear(path)
+        with subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()"],
+                              stdin=subprocess.PIPE, start_new_session=True) as child:
+            try:
+                write_json(path, journal(call, pgid=child.pid, process_state="running"))
+                with self.assertRaises(HarnessError) as raised:
+                    cleanup_run(self.repo, run_id, remove=True)
                 self.assertEqual(stop_of(raised.exception), unconfirmed(call, worker["id"]))
-                unchanged()
+            finally:
+                child.stdin.close()
+                try:
+                    child.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    child.kill()
+                    child.wait(timeout=5)
+        cleanup_run(self.repo, run_id)
+        self.assert_confirmed(engine, worker, call, [None], status="blocked")
 
-    def test_a_confirmation_batch_that_needs_a_journal_digest_writes_nothing(self):
+    def test_null_confirmation_audited_again_if_the_first_save_is_interrupted(self):
+        _, engine = self.stopped_run()
+        [worker] = self.workers(engine)
+        folder, call = self.the_call(worker)
+        run_id = engine.run["id"]
+        self.restored_at_cleanup(folder, call)
+        lay_out(folder, call, "absent")
+        ledger = engine.directory / "state.json"
+        before = ledger.read_bytes()
+        with patch.object(RunStore, "commit", side_effect=KeyboardInterrupt), self.assertRaises(KeyboardInterrupt):
+            cleanup_run(self.repo, run_id, confirm_exited=[worker["id"]])
+        self.assertEqual(ledger.read_bytes(), before)
+        with self.assertRaises(HarnessError) as raised:
+            cleanup_run(self.repo, run_id)
+        self.assertEqual(stop_of(raised.exception), unconfirmed(call, worker["id"]))
+        for _ in range(2):
+            cleanup_run(self.repo, run_id, confirm_exited=[worker["id"]])
+        self.assert_confirmed(engine, worker, call, [None, None], status="blocked")
+
+    def test_cli_mixed_confirmation_batch_refuses_eio_then_records_both_when_repaired(self):
         backend, engine = self.stopped_run(failures=2)
         run_id = engine.run["id"]
         [first] = self.workers(engine)
-        first_folder, first_call = self.the_call(first)
-        # Confirming the first failed worker lets the run go on to a second, which fails the same way.
         code, errors = run_cli(self, backend, ["resume", run_id, "--confirm-exited", first["id"]])
         self.assertEqual(code, 3, errors)
         first, second = self.workers(engine)
+        first_folder, first_call = self.the_call(first)
         folder, call = self.the_call(second)
+        _, raw = lay_out(first_folder, first_call, "not_json")
         self.restored_at_cleanup(folder, call)
-        # The first call's journal is now other, invalid bytes (confirmable); the second call has none to bind.
-        _, raw = lay_out(first_folder, first_call, "shape")
-        unchanged = self.unchanged(engine)
-        for order, layout in (((first, second), "absent"), ((second, first), "fifo")):
-            with self.subTest(order=[d["id"] for d in order], layout=layout):
-                lay_out(folder, call, layout)
-                argv = ["resume", run_id]
-                for dispatch in order:
-                    argv += ["--confirm-exited", dispatch["id"]]
-                with unblocked(folder / "process.json", layout):
-                    notice = refused_by_cli(self, backend, argv, ("process_unconfirmed", "command_exit"), 3)
-                self.assertEqual((notice["data"]["command_id"], notice["source"]), (call, {"dispatch_id": second["id"]}))
-                unchanged()
-        # The first alone is confirmed as before; the gate then stops at the second call.
         lay_out(folder, call, "absent")
-        notice = refused_by_cli(self, backend, ["resume", run_id, "--confirm-exited", first["id"]],
-                                ("process_unconfirmed", "command_exit"), 3)
-        self.assertEqual(notice["data"]["command_id"], call)
+        argv = ["resume", run_id, "--confirm-exited", second["id"], "--confirm-exited", first["id"]]
+        unchanged = self.unchanged(engine)
+        calls_before = len(backend.calls)
+        inode = first_folder.stat().st_ino
+
+        def open_(real, name, *args, **kwargs):
+            fd = kwargs.get("dir_fd")
+            if name == "process.json" and fd is not None and os.fstat(fd).st_ino == inode:
+                raise OSError(errno.EIO, os.strerror(errno.EIO))
+            return real(name, *args, **kwargs)
+
+        with patch.object(state_files, "os", FakeOs(open=open_)):
+            refused_by_cli(self, backend, argv, ("runtime_failure", "io"), 1)
+        unchanged()
+        self.assertEqual(len(backend.calls), calls_before)
+        code, errors = run_cli(self, backend, argv)
+        self.assertEqual(code, 0, errors)
         state = read_json(engine.directory / "state.json")
-        entry = next(d for d in state["dispatches"] if d["id"] == first["id"])
-        self.assertEqual(entry["command_exit_confirmations"][first_call]["journal_digest"], sha(raw))
-        self.assertNotIn("command_exit_confirmations", next(d for d in state["dispatches"] if d["id"] == second["id"]))
+        self.assertEqual(state["status"], "completed")
+        events = [json.loads(line) for line in (engine.directory / "events.jsonl").read_text().splitlines()]
+        self.assertEqual([(e["command_id"], e["journal_digest"], e["journal_state"]) for e in events
+                          if e["event"] == "command_exit_confirmed_by_operator"][-2:],
+                         [(call, None, "absent"), (first_call, sha(raw), "invalid")])
+        cleanup_run(self.repo, run_id)
 
     def test_a_group_id_past_pid_t_or_one_not_looked_at_stops_each_entry_typed(self):
         # Code review D4-T3, blocker 2: resume, abandon and cleanup-run each let os.killpg's OverflowError out.

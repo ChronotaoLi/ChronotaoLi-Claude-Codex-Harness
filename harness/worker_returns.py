@@ -1,14 +1,15 @@
 """Classify an exited worker's durable output without inventing a return.
 
 There is one transport: Claude's JSON output in process.stdout. A retryable
-record also carries the provider classification of the failure (version 2,
+record also carries the provider classification of the failure (version 3,
 ``provider``), derived from the same bytes. These records never bind a candidate.
 """
+import hashlib
 from pathlib import Path
 
 from . import stops
 from .state_files import StateFiles
-from .util import HarnessError, strict_json_loads
+from .util import HarnessError, json_bytes, strict_json_loads
 
 
 # Every file the runtime can write into a worker dispatch directory that bears on
@@ -20,7 +21,7 @@ SOURCES = (
 STATES = ('retryable', 'invalid', 'returned', 'unknown')
 LIMIT = 16 * 1024 * 1024
 _DECODE_ERRORS = (ValueError, UnicodeError, RecursionError)
-_INSPECTED = frozenset(('process.stdout', 'process.outcome.json', 'provider-result.json'))
+_INSPECTED = frozenset(('process.stdout', 'process.outcome.json'))
 
 
 def worker_evidence_files(job):
@@ -115,7 +116,7 @@ def inspect_return(job):
         # A writer or external edit must not race the classification.
         if fingerprint(job, SOURCES) != sources:
             raise HarnessError('worker return evidence changed during inspection')
-        return {'version': 2, 'state': state, 'reason': reason, 'sources': sources,
+        return {'version': 3, 'state': state, 'reason': reason, 'sources': sources,
                 'provider': provider if state == 'retryable' else None}
 
     if sources['returned-result.json'] is not None or sources['response.json'] is not None:
@@ -126,9 +127,9 @@ def inspect_return(job):
         outcome = inspected('process.outcome.json')
         # Worker calls are Claude only (the configuration refuses a Codex worker).
         provider = classify(outcome, raw, 'claude')
-        if sources['provider-result.json'] is not None:
-            published = strict_json_loads(inspected('provider-result.json'))
-            if envelope is None or published != envelope:
+        published = sources['provider-result.json']
+        if published is not None:
+            if envelope is None or hashlib.sha256(json_bytes(envelope)).hexdigest() != published:
                 return result('unknown', 'provider result conflicts with original output')
     except _DECODE_ERRORS as error:
         # Over the limit or not strictly decodable: a property of the bytes. An
@@ -156,7 +157,7 @@ def _provider_shape(record):
 @stops.reads_evidence
 def validate_return_evidence(job, record):
     if (not isinstance(record, dict) or set(record) != {'version', 'state', 'reason', 'sources', 'provider'}
-            or record['version'] != 2 or record['state'] not in STATES or not _provider_shape(record)
+            or record['version'] != 3 or record['state'] not in STATES or not _provider_shape(record)
             or not isinstance(record['reason'], str)
             or not isinstance(record['sources'], dict) or set(record['sources']) != set(SOURCES)):
         raise HarnessError('invalid worker return evidence record')

@@ -11,6 +11,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+from harness.versions import RUN_SCHEMA_VERSION
 from harness.adapters import DemoBackend
 from harness.cli import main
 from harness.config import Config, normalized
@@ -265,7 +266,7 @@ class CLIBoundaryTests(RepoCase):
                 self.assertEqual(code, 2)
                 self.assertEqual(output, "")
                 # A non-object is not a current-version ledger: the shared refusal, no field read.
-                self.assertIn("台账版本缺失或无效，不支持（当前版本 19）", errors)
+                self.assertIn(f"台账版本缺失或无效，不支持（当前版本 {RUN_SCHEMA_VERSION}）", errors)
                 self.assertNotIn("Traceback", errors)
                 self.assertEqual(read_json(path), value)
 
@@ -277,7 +278,7 @@ class CLIBoundaryTests(RepoCase):
             with self.subTest(value=value):
                 self.assertEqual(code, 2)
                 self.assertEqual(output, "")
-                self.assertIn("不支持（当前版本 19）", errors)
+                self.assertIn(f"不支持（当前版本 {RUN_SCHEMA_VERSION}）", errors)
                 self.assertNotIn("Traceback", errors)
                 self.assertEqual(read_json(path), value)
 

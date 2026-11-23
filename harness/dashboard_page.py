@@ -1724,6 +1724,7 @@ APP_JS = r""""use strict";
   function metaPanel(data, run, summary) {
     var panel = el("div");
     var unavailable = data.unavailable || [];
+    var result = summary.result;
     panel.appendChild(kv([
       ["run", mono(data.id)], ["台账状态（原始值）", run.status], ["分支", mono(run.branch)], ["工作树（仅显示）", mono(run.worktree)], ["工作树已删除", run.worktree_removed],
       ["仓库（仅显示）", mono(run.repo)], ["配置（仅显示）", mono(run.config_path)], ["指挥", run.commander],
@@ -1731,6 +1732,12 @@ APP_JS = r""""use strict";
       ["范围边界", Array.isArray(run.scope) ? (run.scope.length ? run.scope.join("、") : "未声明") : UNAVAILABLE],
       ["已接受任务", summary.accepted_tasks ? summary.accepted_tasks.join("、") || "无" : UNAVAILABLE],
       ["基线提交", mono(run.base_commit)], ["期望 HEAD", mono(run.expected_head)],
+      ...(result ? [
+        ["结果提交", mono(result.commit)],
+        ["结果树", mono(result.tree)],
+        ["批准它的整体尝试", Array.isArray(result.attempts) ? result.attempts.join("、") : UNAVAILABLE],
+        ["验证模式", result.verification_mode]
+      ] : []),
       ["台账版本", data.schema_version],
       ["创建该 run 的操作记录", run.created_by_operation],
       ["首个事件时间", fmtTime(data.timing && data.timing.first_event_time)],
@@ -1740,6 +1747,9 @@ APP_JS = r""""use strict";
       ["停止详情", summary.stop ? summary.stop.detail : null],
       ["不可用区块", unavailable.length ? unavailable.join("、") : "无"]
     ]));
+    if (result) {
+      panel.appendChild(notice("结果来自台账记录，分支之后可能已移动。"));
+    }
     if (summary.worker_outcomes) {
       panel.appendChild(el("h3", null, "worker 结果计数（观测值，不等于接受）"));
       panel.appendChild(kv(Object.keys(summary.worker_outcomes).map(function (key) {

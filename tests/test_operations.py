@@ -101,7 +101,7 @@ class OperationRecordTests(OperationCase):
         code, output, errors = self.invoke(["run", "Implement greet", "--operation-id", "op-a"], backend)
         self.assertEqual(code, 0, errors)
         result = json.loads(output)  # a single JSON document; trailing data would fail to parse
-        self.assertEqual(set(result), {"id", "status", "branch", "worktree", "accepted", "operation_id"})
+        self.assertEqual(set(result), {"id", "status", "branch", "worktree", "accepted", "operation_id", "result"})
         self.assertEqual(result["operation_id"], "op-a")
         self.assertEqual(result["status"], "completed")
         run_id = result["id"]
@@ -129,6 +129,7 @@ class OperationRecordTests(OperationCase):
         self.assertLessEqual(record["run_linked_at"], record["finished_at"])
         self.assertRegex(record["finished_at_utc"], r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
         ledger = self.ledger(run_id)
+        self.assertEqual(result["result"], ledger["result"])
         self.assertEqual((ledger["schema_version"], ledger["created_by_operation"]), (RUN_SCHEMA_VERSION, "op-a"))
         created = self.events(run_id, "run_created")
         self.assertEqual([(event["run_id"], event["operation_id"]) for event in created], [(run_id, "op-a")])
@@ -218,12 +219,14 @@ class OperationRecordTests(OperationCase):
     def test_resume_creates_its_own_record_with_event_and_notice(self):
         code, output, errors = self.invoke(["run", "Implement greet", "--pause-after-plan", "--operation-id", "op-start"])
         self.assertEqual(code, 0, errors)
-        run_id = json.loads(output)["id"]
+        paused = json.loads(output)
+        self.assertNotIn("result", paused)
+        run_id = paused["id"]
         start = self.record("op-start")
         code, output, errors = self.invoke(["resume", run_id, "--approve-plan", "--operation-id", "op-resume"])
         self.assertEqual(code, 0, errors)
         result = json.loads(output)
-        self.assertEqual(set(result), {"id", "status", "branch", "worktree", "operation_id"})
+        self.assertEqual(set(result), {"id", "status", "branch", "worktree", "operation_id", "result"})
         self.assertEqual((result["id"], result["status"], result["operation_id"]), (run_id, "completed", "op-resume"))
         record = self.record("op-resume")
         self.assertEqual((record["kind"], record["status"], record["run_id"], record["exit_status"],
@@ -236,7 +239,9 @@ class OperationRecordTests(OperationCase):
         self.assertEqual([event["operation_id"] for event in self.events(run_id, "run_resumed")], ["op-resume"])
         self.assertIn(notice("run_resumed", run_id, "op-resume"), errors.splitlines())
         self.assertEqual(self.record("op-start"), start)
-        self.assertEqual(self.ledger(run_id)["created_by_operation"], "op-start")
+        ledger = self.ledger(run_id)
+        self.assertEqual(result["result"], ledger["result"])
+        self.assertEqual(ledger["created_by_operation"], "op-start")
 
     def test_early_rejected_resume_links_record_without_touching_run_evidence(self):
         code, output, errors = self.invoke(["run", "Implement greet", "--pause-after-plan", "--operation-id", "op-paused"])

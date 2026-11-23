@@ -764,14 +764,46 @@ class RuntimeTests(RepoCase):
         self.assertNotEqual(workers[0]["id"], workers[1]["id"])
 
     def test_resume_refuses_live_old_process(self):
-        engine = self.engine()
-        engine.start("Implement greet")
-        stopped(engine.run, "interrupted")
-        engine.run["dispatches"][-1]["pgid"] = os.getpgrp()
-        engine.run["dispatches"][-1]["exit_confirmed"] = False
-        engine.context.save()
-        with self.assertRaisesRegex(HarnessError, "进程组仍存在"):
-            self.engine().resume(engine.run["id"])
+        class LiveWorker(DemoBackend):
+            def invoke(self, **kwargs):
+                if kwargs["role"] == "worker":
+                    kwargs["on_start"](process.pid)
+                return super().invoke(**kwargs)
+
+        with subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
+                              start_new_session=True) as process:
+            try:
+                engine = self.engine(LiveWorker())
+                crash, state = crash_after_save(engine, lambda run: run["dispatches"]
+                                                and run["dispatches"][-1].get("pgid") == process.pid)
+                with crash, self.assertRaises(KeyboardInterrupt):
+                    engine.start("Implement greet")
+                self.assertTrue(state["fired"])
+                ledger = engine.directory / "state.json"
+                before = ledger.read_bytes()
+                run = json.loads(before)
+                dispatch = run["dispatches"][-1]
+                self.assertNotIn("result", run)
+                self.assertEqual(dispatch["process_state"], "running")
+                self.assertEqual(dispatch["pgid"], process.pid)
+                self.assertFalse(dispatch.get("exit_confirmed", False))
+                with self.assertRaisesRegex(HarnessError, "进程组仍存在") as raised:
+                    self.engine().resume(run["id"])
+                stop = raised.exception.stop
+                self.assertEqual((stop["kind"], stop["reason"]), ("process_unconfirmed", "dispatch_exit"))
+                self.assertEqual(stop["source"]["dispatch_id"], dispatch["id"])
+                self.assertEqual(ledger.read_bytes(), before)
+                self.assertIsNone(process.poll())
+            finally:
+                process.kill()
+
+        resumed = self.engine().resume(run["id"])
+        self.assertEqual(resumed["status"], "completed")
+        workers = [entry for entry in resumed["dispatches"] if entry["role"] == "worker"]
+        self.assertEqual(len(workers), 2)
+        self.assertEqual(workers[0]["id"], dispatch["id"])
+        self.assertTrue(workers[0]["exit_confirmed"])
+        self.assertNotEqual(workers[0]["id"], workers[1]["id"])
 
     def test_verification_must_not_rewrite_review_candidate(self):
         self.config.data["verification"]["commands"] = [{"cwd": ".", "argv": [sys.executable, "-c", "from pathlib import Path; Path('hello.py').write_text('bad')"]}]

@@ -239,13 +239,13 @@ class CurrentLedgerTests(RepoCase):
         self.assertEqual(self.path.read_bytes(), self.before)
 
     def test_new_ledger_has_no_removed_fields_and_status_sums_attempts(self):
-        self.assertEqual(self.run['schema_version'], 19)
+        self.assertEqual(self.run['schema_version'], 20)
         self.assertFalse(REMOVED_KEYS & set(self.run))
         self.assertFalse({'max_total_attempts', 'claude_output_mode'} & set(self.run['config_snapshot']['runtime']))
         self.assertFalse(any('capture' in entry['worker_receipt'] for entry in self.workers(self.run)))
         evidence = self.workers(self.run)[0]['worker_return_evidence']
         self.assertEqual(set(evidence), {'version', 'state', 'reason', 'sources', 'provider'})
-        self.assertEqual(evidence['version'], 2)
+        self.assertEqual(evidence['version'], 3)
         self.assertEqual(set(evidence['sources']), set(SOURCES))
         self.assertEqual(self.run['attempts'], {'greet': 3})
         handoff = read_json(self.directory / 'handoff.json')
@@ -286,7 +286,7 @@ def ledger_bytes(current, version, **fields):
 
 class UnsupportedLedgerTests(DashboardCase):
     # Object ledgers of other versions (including a string and a boolean), then non-objects.
-    VERSIONS = (18, 20, 1, '19', True, MISSING, ARRAY, NULL)
+    VERSIONS = (19, 18, RUN_SCHEMA_VERSION + 1, 1, str(RUN_SCHEMA_VERSION), True, MISSING, ARRAY, NULL)
 
     def setUp(self):
         super().setUp()

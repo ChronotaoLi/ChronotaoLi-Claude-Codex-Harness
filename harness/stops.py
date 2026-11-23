@@ -209,7 +209,7 @@ _row("invalid_output", "redo_exhausted", 3, "输出连续两次无效", ("resume
      ("dispatch_id", "task_id", "artifact", "artifact_digest"), role=ROLE)
 _row("workspace_mismatch", "head_changed", 1, "工作树 HEAD 与检查点不同",
      ("resume {run}", "abandon {run}", ("resume {run} --operator-decision FILE", "question_registered")),
-     ("task_id", "request_id"), expected_head=_id, question_registered=_bool)
+     ("task_id", "request_id"), expected_head=_id, accept_commit=_id, question_registered=_bool)
 _row("workspace_mismatch", "candidate_changed", 1, "候选代码或暂存区与绑定快照不同", ("resume {run}", "abandon {run}"),
      ("task_id", "dispatch_id"))
 _row("workspace_mismatch", "directive_mismatch", 1, "待派发指令与已发布计划或候选不符", ("resume {run}", "abandon {run}"),

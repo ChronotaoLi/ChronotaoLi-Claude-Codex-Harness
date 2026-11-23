@@ -6,11 +6,13 @@ import json
 import os
 from pathlib import Path
 import shutil
+import subprocess
 import sys
 import tempfile
 from unittest.mock import patch
 
-from harness import git, state_files, stops
+from git_isolation import fixture_git
+from harness import checkout_identity, cleanup, git, state_files, stops
 from harness.cleanup import cleanup_run
 from harness.cli import main
 from harness.path_evidence import project_paths
@@ -39,7 +41,8 @@ class VerificationCleanupTests(RepoCase):
         self.directory = self.engine_instance.directory
         self.artifact = next(self.directory.glob("verification/final/*/verification-*/checkout.json"))
         self.environment = read_json(self.artifact)
-        self.checkout = Path(self.environment["worktree"])
+        self.entry, = self.run["verification_checkouts"]
+        self.checkout = Path(self.entry["worktree"])
         self.roots = [self.checkout.parents[1]]
         self.addCleanup(self.cleanup_roots)
 
@@ -52,7 +55,7 @@ class VerificationCleanupTests(RepoCase):
 
     def git_calls(self, interrupt_after_remove=None):
         """Record exact worktree removals; optionally interrupt after the Nth one."""
-        removed, original = [], git.git
+        removed, original = [], git.git_process
 
         def recording(repo, *args, **kwargs):
             result = original(repo, *args, **kwargs)
@@ -61,31 +64,116 @@ class VerificationCleanupTests(RepoCase):
                 if len(removed) == interrupt_after_remove:
                     raise KeyboardInterrupt()
             return result
-        return removed, patch("harness.cleanup.git.git", side_effect=recording)
+        return removed, patch("harness.cleanup.git.git_process", side_effect=recording)
 
-    def additional_checkout(self):
-        root = Path(tempfile.mkdtemp(prefix="harness-verify-")).resolve()
+    def additional_checkout(self, *, prefix="harness-verify-"):
+        root = Path(tempfile.mkdtemp(prefix=prefix)).resolve()
         self.roots.append(root)
         checkout = root / ".harness" / "checkout"
-        git.git(self.repo, "worktree", "add", "--detach", str(checkout), self.environment["head"])
+        fixture_git(self.repo, "worktree", "add", "--detach", str(checkout), self.environment["head"])
+        binding = git.capture_worktree_binding(checkout, None)
+        identity = {key: checkout_identity.directory_identity(path) for key, path in (
+            ("root", root), ("worktree", checkout), ("git_dir", Path(binding["git_dir"])))}
         history = self.run["final_history"]
         attempt = len(history) + 1
         # A later attempt has a retained round whose verdict was never published.
-        environment = {**self.environment, "worktree": str(checkout),
-                       "owner": {"run_id": self.run["id"], "attempt": attempt, "round": 1},
-                       "binding": git.capture_worktree_binding(checkout, None)}
+        environment = {**self.environment, "worktree": str(checkout)}
+        self.run["verification_checkouts"].append(checkout_identity.build_entry(
+            {"attempt": attempt, "round": 1}, root, checkout, identity, binding))
         attempt_dir = self.directory / "verification" / "final" / str(attempt)
         folder = attempt_dir / "verification-1"
         artifact = folder / "checkout.json"
         write_json(artifact, environment)
-        history.append({"attempt": attempt, "head": environment["head"],
-                        "snapshot_digest": self.environment["snapshot_digest"],
+        history.append({"attempt": attempt, "head": environment["head"], "tree": history[0]["tree"],
+                        "snapshot_digest": history[0]["snapshot_digest"],
                         "snapshot_artifact": str(attempt_dir / "snapshot.json"),
                         "artifact": str(attempt_dir / "final.json"), "accepted_tasks": sorted(self.run["accepted"]),
                         "status": "running", "phase": "verifying", "approved_batches": [],
                         "verification_rounds": [{"artifact_dir": str(folder), "status": "running"}]})
         write_json(self.directory / "state.json", self.run)
         return checkout, artifact
+
+    def test_checkout_registration_requires_complete_unique_observation(self):
+        root = Path(tempfile.mkdtemp(prefix="harness-verify-")).resolve()
+        self.roots.append(root)
+        other = root / ".harness" / "checkout"
+        fixture_git(self.repo, "worktree", "add", "--detach", str(other), self.environment["head"])
+        other_admin = Path(git.capture_worktree_binding(other, None)["git_dir"])
+        target_admin = Path(self.entry["binding"]["git_dir"])
+        target = os.fsencode(self.checkout)
+        other_bytes = os.fsencode(other)
+        main_record = b"worktree " + os.fsencode(self.repo.resolve()) + b"\0bare\0\0"
+
+        def linked(path):
+            return b"worktree " + path + b"\0HEAD " + self.environment["head"].encode() + b"\0detached\0\0"
+
+        main_record += linked(os.fsencode(self.run["worktree"]))
+        real_process, real_binding_file = git.git_process, git._binding_file_at
+        cases = (
+            ("duplicate", target, linked(target), "2 条登记"),
+            ("case variant", target.upper(), linked(target.upper()), "2 条登记"),
+            ("noncanonical suffix", b"/elsewhere/" + target, linked(b"/elsewhere/" + target), "无法核实"),
+            ("wrong owner", target, linked(other_bytes), "不属于创建时的管理目录"),
+            ("omitted", other_bytes, b"", "无法核实"),
+            ("malformed", other_bytes, linked(other_bytes)[:-1], "无法核实"),
+            ("malformed field", other_bytes, linked(other_bytes).replace(b"detached", b"unknown"), "无法核实"),
+            ("malformed admin", None, linked(other_bytes), "无法核实"),
+        )
+        receipt = self.artifact.with_name("cleanup.json")
+        identity = checkout_identity.directory_identity
+        for label, other_path, other_record, message in cases:
+            for legacy in (False, True) if label in ("duplicate", "wrong owner", "malformed admin") else (False,):
+                removals, writes = [], []
+
+                def process(repo, *args, **kwargs):
+                    if args[:2] == ("worktree", "remove"):
+                        removals.append(args)
+                        raise AssertionError("The fixture never invokes Git removal")
+                    if args == ("worktree", "list", "--porcelain", "-z"):
+                        if legacy:
+                            return subprocess.CompletedProcess(
+                                args, 129, b"", b"error: unknown switch `z'\nusage: git worktree add ...\n")
+                        return subprocess.CompletedProcess(args, 0, main_record + linked(target) + other_record, b"")
+                    return real_process(repo, *args, **kwargs)
+
+                def binding_file(held, fd, path):
+                    if label == "wrong owner" and path == target_admin / "gitdir":
+                        return other_bytes + b"/.git\n"
+                    if path == other_admin / "gitdir":
+                        return b"malformed" if other_path is None else other_path + b"/.git\n"
+                    return real_binding_file(held, fd, path)
+
+                def directory_identity(path):
+                    return None if stale and path == self.checkout else identity(path)
+
+                with self.subTest(label=label, legacy=legacy):
+                    with patch.object(git, "git_process", side_effect=process), \
+                            patch.object(git, "_binding_file_at", side_effect=binding_file), \
+                            patch.object(cleanup, "_clean_worktree", return_value={"status": "retained"}), \
+                            patch.object(cleanup, "write_json", side_effect=lambda path, record: writes.append(path)):
+                        for remove in (False, True):
+                            for stale in (False, True):
+                                with self.subTest(remove=remove, stale=stale), \
+                                        patch.object(checkout_identity, "directory_identity", side_effect=directory_identity):
+                                    item = self.cleanup(remove=remove)["checkouts"][0]
+                                    self.assertEqual(item["status"], "blocked")
+                                    self.assertIn(message, item["error"])
+                        if label == "duplicate":
+                            self.assertEqual(git._worktree_registration(
+                                self.repo, target, binding=None, isolated_config=False), "unknown")
+                    self.assertEqual(removals, [])
+                    self.assertEqual(writes, [])
+                    self.assertTrue(self.checkout.is_dir())
+                    self.assertTrue(other.is_dir())
+                    self.assertFalse(receipt.exists())
+
+    def test_checkout_registration_preserves_distinct_native_same_basename_paths(self):
+        other, _ = self.additional_checkout(prefix="harness-verify-line\nbreak\t ")
+        self.assertEqual(other.name, self.checkout.name)
+        self.assertNotEqual(other, self.checkout)
+        items = self.cleanup()["checkouts"]
+        self.assertEqual([(item.get("worktree"), item["status"]) for item in items],
+                         [(str(self.checkout), "eligible"), (str(other), "eligible")])
 
     def statuses(self, result):
         return [item["status"] for item in result["checkouts"]], result["worktree"]["status"]
@@ -118,7 +206,6 @@ class VerificationCleanupTests(RepoCase):
         files = {
             journal: ("process_unconfirmed", "command_exit"),
             self.directory / "run.lock": ("evidence", "runtime_integrity"),
-            self.artifact: ("resource", "checkouts"),
             self.artifact.with_name("cleanup.json"): ("resource", "checkouts"),
             self.directory / "worktree-cleanup.json": ("resource", "worktree"),
             packet: ("evidence", "runtime_integrity"),
@@ -193,6 +280,18 @@ class VerificationCleanupTests(RepoCase):
                 self.assertTrue(checkout.is_dir() and engine.worktree.is_dir())
                 self.assertEqual(tree_bytes(checkout), checkout_before)
                 self.assertEqual(git.git(self.repo, "worktree", "list", "--porcelain"), registered)
+
+    def test_invalid_registry_refuses_audited_removal_even_with_a_confirmable_dispatch(self):
+        dispatch = self.add_unknown_dispatch()
+        write_json(self.directory / "state.json", {**self.run, "verification_checkouts": [None]})
+        before = tree_bytes(self.engine_instance.context.state)
+        code, output, error = self.cleanup_cli("--remove", "--confirm-exited", dispatch["id"])
+        self.assertEqual((code, output), (1, ""), error)
+        stop = cli_notice(error)
+        self.assertEqual((stop["kind"], stop["reason"]), ("evidence", "runtime_integrity"))
+        self.assertIn("verification_checkouts", error)
+        self.assertEqual(tree_bytes(self.engine_instance.context.state), before)
+        self.assertTrue(self.checkout.is_dir() and self.engine_instance.worktree.is_dir())
 
     def test_malformed_verification_checks_refuse_cleanup_of_a_failed_attempt(self):
         self.config.data["verification"]["commands"].append(
@@ -549,6 +648,7 @@ class VerificationCleanupTests(RepoCase):
         with held_lock(self.directory / "run.lock"), self.assertRaisesRegex(HarnessError, "运行锁"):
             self.cleanup(remove=True)
         self.run["dispatches"].append({"id": "old", "role": "verification", "pgid": 12345,
+                                       "process_record": "verification/fixture/old/check-0.outcome.json",
                                        "status": "running", "exit_confirmed": False})
         write_json(self.directory / "state.json", self.run)
         with patch("harness.cleanup.group_alive", return_value=True), self.assertRaisesRegex(HarnessError, "进程组仍存在"):
@@ -570,13 +670,16 @@ class VerificationCleanupTests(RepoCase):
         gitfile.write_bytes(original + b"\n")
         self.assertEqual(self.cleanup(remove=True)["checkouts"][0]["status"], "blocked")
         gitfile.write_bytes(original)
-        write_json(self.artifact, {**self.environment, "worktree": str(self.engine_instance.worktree)})
-        self.assertEqual(self.cleanup(remove=True)["checkouts"][0]["status"], "blocked")
-        self.assertTrue(self.engine_instance.worktree.exists())
-        self.assertTrue(self.checkout.exists())
-        write_json(self.artifact, {**self.environment, "head": "0" * 40})
-        self.assertEqual(self.cleanup(remove=True)["checkouts"][0]["status"], "blocked")
-        write_json(self.artifact, self.environment)
+        write_json(self.artifact, {**self.environment, "worktree": str(self.engine_instance.worktree),
+                                   "head": "0" * 40, "owner": {"run_id": "foreign"}})
+        item, = self.cleanup()["checkouts"]
+        self.assertEqual((item["status"], item["worktree"]), ("eligible", str(self.checkout)))
+        self.assertTrue(self.engine_instance.worktree.exists() and self.checkout.exists())
+        write_json(self.directory / "state.json", {**self.run, "verification_checkouts": [
+            {**self.entry, "worktree": str(self.engine_instance.worktree)}]})
+        with self.assertRaisesRegex(HarnessError, "verification_checkouts"):
+            self.cleanup(remove=True)
+        write_json(self.directory / "state.json", self.run)
         git.git(self.checkout, "checkout", "--detach", self.run["base_commit"])
         self.assertEqual(self.cleanup(remove=True)["checkouts"][0]["status"], "blocked")
         self.assertTrue(self.checkout.exists())
@@ -587,6 +690,7 @@ class VerificationCleanupTests(RepoCase):
         shutil.rmtree(other)
         # The unreferenced stale checkout must never be touched by a broad prune.
         self.run["final_history"].pop()
+        self.run["verification_checkouts"].pop()
         write_json(self.directory / "state.json", self.run)
         other_artifact.unlink()
         self.assertEqual(self.cleanup()["checkouts"][0]["status"], "stale_registration")
@@ -599,7 +703,7 @@ class VerificationCleanupTests(RepoCase):
         self.run["status"] = "stopped"
         write_json(self.directory / "state.json", self.run)
         shutil.rmtree(self.checkout)
-        backlink = Path(self.environment["binding"]["git_dir"]) / "gitdir"
+        backlink = Path(self.entry["binding"]["git_dir"]) / "gitdir"
         backlink.write_text(str(self.engine_instance.worktree / ".git") + "\n")
         self.assertEqual(self.cleanup(remove=True)["checkouts"][0]["status"], "blocked")
         self.assertTrue(backlink.parent.exists())
@@ -608,13 +712,34 @@ class VerificationCleanupTests(RepoCase):
     def test_completed_cleanup_ignores_reused_git_administrative_name(self):
         self.cleanup(remove=True)
         other, artifact = self.additional_checkout()
-        self.assertEqual(read_json(artifact)["binding"]["git_dir"], self.environment["binding"]["git_dir"])
+        self.assertEqual(self.run["verification_checkouts"][-1]["binding"]["git_dir"], self.entry["binding"]["git_dir"])
         result = self.cleanup()
         self.assertEqual([item["status"] for item in result["checkouts"]], ["absent", "eligible"])
         self.assertTrue(other.is_dir())
 
+    def test_missing_pruned_checkout_accepts_reused_admin_name_without_a_second_removal(self):
+        self.run["status"] = "stopped"
+        shutil.rmtree(self.checkout.parents[1])
+        fixture_git(self.repo, "worktree", "prune", "--expire", "now")
+        other, _ = self.additional_checkout()
+        replacement = self.run["verification_checkouts"].pop()
+        self.run["final_history"].pop()
+        write_json(self.directory / "state.json", self.run)
+        self.assertEqual(replacement["binding"]["git_dir"], self.entry["binding"]["git_dir"])
+        self.assertNotEqual(replacement["identity"]["git_dir"], self.entry["identity"]["git_dir"])
+        cache = other / "__pycache__"
+        cache.mkdir(exist_ok=True)
+        (cache / "neighbor").write_text("keep")
+        self.assertEqual(self.cleanup()["checkouts"][0]["status"], "absent")
+        removed, recording = self.git_calls()
+        with recording:
+            self.assertEqual(self.cleanup(remove=True)["checkouts"][0]["status"], "removed")
+        self.assertEqual(removed, [])
+        self.assertEqual((cache / "neighbor").read_text(), "keep")
+        self.assertIn(str(other), fixture_git(self.repo, "worktree", "list", "--porcelain"))
+
     def test_interruption_after_git_removal_recovers_pending_receipt(self):
-        original_git = git.git
+        original_git = git.git_process
 
         def interrupted(repo, *args, **kwargs):
             result = original_git(repo, *args, **kwargs)
@@ -622,7 +747,7 @@ class VerificationCleanupTests(RepoCase):
                 raise KeyboardInterrupt()
             return result
 
-        with patch("harness.cleanup.git.git", side_effect=interrupted), self.assertRaises(KeyboardInterrupt):
+        with patch("harness.cleanup.git.git_process", side_effect=interrupted), self.assertRaises(KeyboardInterrupt):
             self.cleanup(remove=True)
         receipt = read_json(self.artifact.with_name("cleanup.json"))
         self.assertEqual(receipt["status"], "pending")
@@ -656,24 +781,24 @@ class VerificationCleanupTests(RepoCase):
         self.assertFalse(self.artifact.with_name("cleanup.json").exists())
         self.assertFalse(self.engine_instance.worktree.exists())
 
-    def test_checkout_probe_io_failure_blocks_only_that_checkout(self):
+    def test_checkout_receipt_io_failure_blocks_only_that_checkout(self):
         other, _ = self.additional_checkout()
         ledger = (self.directory / "state.json").read_bytes()
         checkout_before = tree_bytes(self.checkout)
 
-        def fail_first_checkout_probe(stat, name, *args, **kwargs):
-            if name == "checkout.json" and not injected:
+        def fail_first_receipt_probe(open_file, name, *args, **kwargs):
+            if name == "cleanup.json" and not injected:
                 injected.append(name)
-                raise OSError(errno.EIO, "checkout probe")
-            return stat(name, *args, **kwargs)
+                raise OSError(errno.EIO, "receipt probe")
+            return open_file(name, *args, **kwargs)
 
         for options, expected in (((), "eligible"), (("--remove",), "removed")):
             with self.subTest(options=options):
                 injected = []
-                with patch.object(state_files, "os", FakeOs(stat=fail_first_checkout_probe)):
+                with patch.object(state_files, "os", FakeOs(open=fail_first_receipt_probe)):
                     code, output, error = self.cleanup_cli(*options)
                 self.assertEqual((code, error), (1, ""), output)
-                self.assertEqual(injected, ["checkout.json"])
+                self.assertEqual(injected, ["cleanup.json"])
                 result = json.loads(output)
                 self.assertEqual(self.statuses(result), (["blocked", expected], expected))
                 blocked = result["checkouts"][0]
@@ -691,6 +816,7 @@ class VerificationCleanupTests(RepoCase):
 
     def add_unknown_dispatch(self, ident="unknown"):
         entry = {"id": ident, "role": "verification", "status": "running",
+                 "process_record": f"verification/fixture/{ident}/check-0.outcome.json",
                  "pgid": None, "exit_confirmed": False}
         self.run["dispatches"].append(entry)
         write_json(self.directory / "state.json", self.run)

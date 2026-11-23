@@ -26,7 +26,7 @@ from . import git, stops
 from .commands import command_id, valid_command, validate_command
 from .state_files import SIGNALS, HeldFiles, LockUnavailable, StateFiles, holding
 from .util import (DIRECTORY_FLAGS, PGID_MAX, EvidenceError, HarnessError, ProcessStartError, ProcessTimeout,
-                   fold_name, group_alive, observed_alive, run_process, strict_json_loads,
+                   fold_name, group_alive, observed_alive, read_process_exit, run_process, strict_json_loads,
                    with_descriptors, write_json)
 from .versions import missing_ledger, parse_current_ledger
 
@@ -281,19 +281,39 @@ def command_exit_settled(record, confirmations):
 
 
 def ensure_command_processes_exited(directory, parent_entry=None, *, state, observe=group_alive):
-    records = command_processes(directory, state=state)
+    if isinstance(state, HeldFiles):
+        return _ensure_command_processes_exited(directory, parent_entry, state, observe)
+    return holding(StateFiles.held(state),
+                   lambda files: _ensure_command_processes_exited(directory, parent_entry, files, observe))
+
+
+def _ensure_command_processes_exited(directory, parent_entry, files, observe):
+    records = command_processes(directory, state=files)
     parent = parent_entry or {}
     for entry in records:
         if command_exit_settled(entry, parent.get("command_exit_confirmations", {})):
             continue
-        pgid = entry["pgid"]
-        # A group that could not be looked at (None) is as unconfirmed as one seen alive.
-        if entry["journal_state"] == "valid" and (
-                (pgid is not None and observed_alive(observe, pgid) is False)
-                or (pgid is None and entry["process_state"] == "prepared")):
-            continue
-        state = "" if entry["journal_state"] == "valid" else f" (process.json {entry['journal_state']})"
-        raise HarnessError(f"Cannot confirm command process exited: {entry['id']}{state}", stop=stops.make("process_unconfirmed", "command_exit", data={"command_id": entry["id"], "returned_unsealed": False}, source={"dispatch_id": parent.get("id")} if parent.get("id") else {}))
+        if entry["journal_state"] == "valid":
+            detail = ""
+            pgid = entry["pgid"]
+            if pgid is None:
+                if entry["process_state"] == "prepared":
+                    continue
+                # The path comes from this observation's journal enumeration, never from the ledger.
+                parts = files.recorded(entry["journal"])
+                not_started, pgid = read_process_exit(files, (*parts[:-1], "output.outcome.json"))
+                if not_started:
+                    continue
+                if pgid is not None:
+                    detail = f" (pgid {pgid})"
+            if pgid is not None and observed_alive(observe, pgid) is False:
+                continue
+        else:
+            detail = f" (process.json {entry['journal_state']})"
+        raise HarnessError(f"Cannot confirm command process exited: {entry['id']}{detail}",
+                           stop=stops.make("process_unconfirmed", "command_exit",
+                                           data={"command_id": entry["id"], "returned_unsealed": False},
+                                           source={"dispatch_id": parent["id"]} if parent.get("id") else {}))
     return records
 
 

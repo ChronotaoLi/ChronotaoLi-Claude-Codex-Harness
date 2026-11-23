@@ -10,8 +10,9 @@ from .versions import RUN_SCHEMA_VERSION, missing_ledger, parse_current_ledger, 
 from .commands import validate_commands
 from .config import normalized, require_run_commands
 from .contracts import validate_required_commands
-from . import git, quota_wait, scope as boundary, stops
+from . import acceptance, checkout_identity, git, quota_wait, scope as boundary, stops
 from .operations import observe_terminal, warn
+from .finalization import validate_result
 from .input_projection import validate_dispatch_indexes as validate_input_dispatch_indexes
 from .path_evidence import validate_dispatch_indexes
 from .review_progress import entries
@@ -59,7 +60,7 @@ class RunLifecycle(RuntimeService):
                     "config_path": str(self.context.config.path), "config_snapshot": deepcopy(self.context.config.data),
                     "asset_digest": asset_digest(self.context.config), "base_commit": git.head(self.context.repo),
                     "original_tasks": deepcopy(supplied_tasks),
-                    "review_history": {}, "final_history": [], "plan_history": [],
+                    "review_history": {}, "final_history": [], "verification_checkouts": [], "plan_history": [],
                     "worker_receipts": {}, "review_receipts": {}, "commander_receipts": {},
                     "scope": scope,
                     "environment_updates": [], "environment_checks": [],
@@ -175,6 +176,8 @@ class RunLifecycle(RuntimeService):
             raise HarnessError("运行输入绑定字段缺失或无效；保留现场")
         validate_command_directories(self.context.run["dispatches"], self.context.directory)
         self.validate_recovery_links()
+        validate_result(self.context.run)
+        checkout_identity.validate_checkout_entries(self.context.run)
         self.validate_command_shapes()
         self.services.worker_receipts.validate_links()
         self.services.budgets.validate_attempt_accounting()
@@ -269,8 +272,11 @@ class RunLifecycle(RuntimeService):
         validate_input_dispatch_indexes(self.context.directory, self.context.run["dispatches"])
 
     def verify_head_and_inputs(self):
-        """The worktree HEAD is the checkpoint (through the binding), prepared inputs and receipt links are intact."""
-        if git.head(self.context.worktree, binding=self.context.run["worktree_binding"]) != self.context.run["expected_head"]:
+        """Check the worktree against the saved intent or checkpoint, then validate inputs and receipt links."""
+        pending = self.context.run.get("pending_acceptance", {})
+        if "intent" in pending:
+            acceptance.state(self.context, pending["intent"])
+        elif git.head(self.context.worktree, binding=self.context.run["worktree_binding"]) != self.context.run["expected_head"]:
             raise HarnessError("worktree HEAD 与检查点不同；请先核对提交，不自动重放", stop=stops.make("workspace_mismatch", "head_changed", data={"expected_head": self.context.run["expected_head"]}))
         from .workspace_inputs import validate_inputs
         validate_inputs(self.context.run, self.context.directory)
@@ -379,7 +385,6 @@ class RunLifecycle(RuntimeService):
             if not isinstance(records, list):
                 fail(f"review_history.{tid} 必须是列表")
             entries(records)
-        entries(self.context.run["final_history"], whole_run=True)
         from .finalization import validate_final_records
         validate_final_records(self.context.run["final_history"])
 
@@ -390,6 +395,34 @@ class RunLifecycle(RuntimeService):
         for field in ("pending_task", "pending_acceptance"):
             if field in self.context.run:
                 task_reference(self.context.run[field].get("task_id"), field + ".task_id")
+        pending = self.context.run.get("pending_acceptance", {})
+        if "intent" in pending:
+            field = "pending_acceptance.intent"
+            intent = mapping(pending["intent"], field)
+            expected_head = self.context.run["expected_head"]
+
+            def hex_string(value, length):
+                return (isinstance(value, str) and len(value) == length
+                        and all(c in "0123456789abcdef" for c in value))
+
+            if set(intent) != {"ref", "parent", "tree", "commit", "files", "index_before", "index_synced"}:
+                fail(field + " 键不符")
+            if not isinstance(intent["ref"], str) or intent["ref"] != self.context.run["worktree_binding"].get("branch"):
+                fail(field + ".ref 必须等于 worktree 绑定分支")
+            if intent["parent"] != expected_head:
+                fail(field + ".parent 必须等于 expected_head")
+            for key in ("tree", "commit"):
+                if not expected_head or not hex_string(intent[key], len(expected_head)):
+                    fail(field + "." + key + " 必须是与 expected_head 同长度的小写十六进制字符串")
+            if not isinstance(intent["files"], list) or any(not isinstance(path, str) for path in intent["files"]):
+                fail(field + ".files 必须是字符串列表")
+            for key in ("index_before", "index_synced"):
+                if not hex_string(intent[key], 64):
+                    fail(field + "." + key + " 必须是 64 位小写十六进制字符串")
+        for tid, entry in self.context.run["accepted"].items():
+            field = f"accepted.{tid}"
+            if not isinstance(mapping(entry, field).get("tree"), str):
+                fail(field + ".tree 必须是字符串")
         if "pending_post_accept" in self.context.run:
             field = "pending_post_accept.payload"
             payload = mapping(self.context.run["pending_post_accept"].get("payload"), field)
