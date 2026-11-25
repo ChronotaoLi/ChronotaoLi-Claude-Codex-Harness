@@ -138,8 +138,10 @@ class Listing(Outcome):
     """A directory's entries, ``state`` listed: (name, kind) sorted by name.
 
     ``kind`` is file, dir, symlink or other (not followed), or absent: the name was listed and gone when its type was read.
+    Requested ``file_stats`` are (name, stat_result) pairs from the same directory walk.
     """
     entries: tuple = ()
+    file_stats: tuple = ()
 
 
 class StateReadError(HarnessError):
@@ -514,7 +516,7 @@ class _Walk:
         found = _found(mode, expect)
         return self.outcome("present", step) if found is None else self.outcome("refused", step, found=found)
 
-    def entries(self):
+    def entries(self, *, include_file_stats):
         if self.components:
             parent = self.parent()
             level, name = self.last()
@@ -526,16 +528,19 @@ class _Walk:
                 names = sorted(entry.name for entry in iterator)
         except OSError as error:
             self.fail(self.step(level, "read"), error.errno)
-        entries = []
+        entries, file_stats = [], []
         for entry in names:
             try:
-                kind = _kind(os.stat(entry, dir_fd=fd, follow_symlinks=False).st_mode)
+                info = os.stat(entry, dir_fd=fd, follow_symlinks=False)
+                kind = _kind(info.st_mode)
             except OSError as error:
                 if error.errno != errno.ENOENT:
                     self.fail(self.step(level, "read"), error.errno)
                 kind = "absent"  # gone since it was listed: kept, so a caller requiring every entry sees it
             entries.append((entry, kind))
-        return self.outcome("listed", self.step(level, "read"), entries=tuple(entries))
+            if include_file_stats and kind == "file":
+                file_stats.append((entry, info))
+        return self.outcome("listed", self.step(level, "read"), entries=tuple(entries), file_stats=tuple(file_stats))
 
     def lock(self, mode, create, wait, identity):
         """The lock file opened in its directory, then flocked; ``locked`` is the directory's identity and descriptor.
@@ -692,9 +697,10 @@ class _Files:
             raise ValueError(f"unknown expectation: {expect!r}")
         return self._call(components, lambda walk: walk.probe(expect))
 
-    def entries(self, components=()):
-        """The Listing of a directory (the root itself for no components); needs read permission on it."""
-        return self._call(components, lambda walk: walk.entries(), Listing, named=False)
+    def entries(self, components=(), *, include_file_stats=False):
+        """List by name with optional regular-file metadata; requires directory read permission."""
+        return self._call(components, lambda walk: walk.entries(include_file_stats=include_file_stats),
+                          Listing, named=False)
 
     def recorded(self, path):
         """The components of a recorded absolute path below this root and prefix, or None; the path is never opened.
@@ -900,13 +906,15 @@ class _Holder:
     set up before the descriptors were taken closes them then (``holding``, or the owner's own two nested cleanups).
     """
 
-    def close(self):
-        """Close what is held; the errno of a failing close or mask call, or None. Safe to call again."""
+    def close(self, *, checked=False):
+        """Close what is held; return the failure's errno, or raise StateReadError when checked."""
         try:
             closed = self._shut()
         except BaseException:
             _settle(self._shut)
             raise
+        if checked and closed is not None:
+            raise self._failure(closed)
         return closed and closed[1]
 
     def __exit__(self, *exc):
@@ -992,6 +1000,16 @@ class HeldFiles(_Files, _Holder):
     @property
     def opened(self):
         return self._anchor.state == "entered" and bool(self._anchor.held)
+
+    @property
+    def resolved_path(self):
+        """The fixed root path, or None if resolution failed."""
+        return self._bound()
+
+    @property
+    def opening_failure(self):
+        """The outcome explaining why the root could not be opened, if any."""
+        return self._anchor.failure
 
     def _bound(self):
         if self._anchor.state == "new":

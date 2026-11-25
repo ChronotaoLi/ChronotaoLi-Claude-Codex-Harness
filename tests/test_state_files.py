@@ -1938,6 +1938,23 @@ MIGRATED = {
     "run_store.py": [], "worker_returns.py": [], "path_evidence.py": [], "input_projection.py": [],
     "diagnostics.py": [], "provider_failures.py": [],
     "receipts.py": [], "runtime_evidence.py": [],
+    "versions.py": [], "mcp_server.py": [],
+    "scope.py": [], "recovery.py": [], "observe.py": [], "watch_cli.py": [],
+    "cli.py": [("_main", "resolve"), ("operate", "util.read_json"), ("print_saved_result", "os.open")],
+    "supervisor.py": [
+        ("_linked_run", "resolve"),  # Only a trusted Darwin system alias above private state.
+        # Pre-launch collision checks, receipt/claim creation and the child repository argument.
+        ("supervise", "exists"), ("supervise", "is_symlink"), ("supervise", "os.open"),
+        ("supervise", "os.open"), ("supervise", "resolve"),
+    ],
+    "memory.py": [
+        # Repository identity, provenance files outside state and the SQLite connection.
+        ("__init__", "resolve"), ("_check_proposals", "resolve"), ("_source_hash", "read_bytes"),
+        ("_source_ledger", "resolve"), ("_source_ledger", "resolve"), ("_source_path", "is_file"),
+        ("_source_path", "resolve"), ("_source_path", "stat"), ("_staleness", "resolve"),
+        ("bind_source_files", "is_symlink"), ("bind_source_files", "read_bytes"),
+        ("bind_source_files", "resolve"), ("connect", "resolve"), ("validate_proposals", "resolve"),
+    ],
     # Explicit operator inputs, write preparation and worker-declared candidate inputs.
     "continuation.py": [("_read_input", "open")],
     "decisions.py": [("read_decision", "open")],

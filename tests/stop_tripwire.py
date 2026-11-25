@@ -18,10 +18,12 @@ A publication is counted where a reader can see it, and only when this call made
 
 A write is observed on the call that made it: the calls in progress (``Workflow.stop``, ``commit``, ``finish``) are kept
 per thread, and the writes stay wrapped for the whole process, so a commit of another thread never marks this
-one. Publications of one test that share an exception, an operation ID or a commit identity
-``(ledger path, store_revision)`` are one finding. A finding is exempt when every exception in it was raised by test
-code (``injected``), when the test's ``allow_unclassified`` is a non-empty string, or when the test took it with
-``consume``. With ``ENFORCE`` a finding that is not exempt fails its test; without it findings are only reported.
+one. Publications of one test that share an observed exception cause, an operation ID or a commit identity
+``(ledger path, store_revision)`` are one finding. Each publication must be covered by an exemption. An exception's
+own throw frame determines injection for that event. Value-only publications inherit injection from an injected
+exception publication of the same operation. A non-empty ``allow_unclassified`` reason applies while set on the test,
+and ``consume`` covers the remaining publications taken by that call. With ``ENFORCE`` an uncovered publication
+makes its finding fail the test; without it findings are only reported.
 ``HARNESS_STOP_TRIPWIRE_REPORT`` names a file that gets one JSON line per finding, exempt ones included; a write of it
 that fails leaves the test's result alone, appends to ``<report>.incomplete`` where it can (not beside a report that is
 no regular file), and the process ends with one ``INCOMPLETE`` line on stderr, its details one JSON object in printable
@@ -32,12 +34,19 @@ The work has two parts of different kinds.
 Registration (``_guard``) runs right after a watched call returned or raised, with the asynchronous signals held back on
 the main thread (``Held``), and only appends values that are plain already: fields of the published stop value; of an
 exception its type and identity, the stop hung on it (looked up in its and its classes' namespaces), the ``str`` items of
-its ``args`` and the file names and lines of its traceback. It runs no code a test can override (no ``str`` or ``repr``
+its ``args`` and the file names and lines of its traceback, along with the test's current plain allowance attribute.
+It runs no code a test can override (no ``str`` or ``repr``
 of the exception, no ``case.id()``, no ``stops.of``), opens, stats and resolves no path, and waits for nothing, so it
 cannot hang while signals are held, and an ``Exception`` it raises is the tripwire's own failure: that fails the test
 and never reaches the watched call, whose return value or exception (identity and ``__context__``) stays. A
-``KeyboardInterrupt`` or ``SystemExit`` goes on at once, as it is. It keeps no exception, so no traceback lives longer:
-a weak reference, where the class takes one, tells whether an ``id`` is still the same exception's (``_key``).
+``KeyboardInterrupt`` or ``SystemExit`` goes on at once, as it is. Publications keep no exception or traceback.
+A weak reference tracks identity where the exception supports it. For other exceptions, a token follows the actual
+exception through the active Workflow, Runtime and CLI calls, with at most one live exception per call and an identity
+comparison at each observation. An exception leaving an entry hands its token to the innermost enclosing watched CLI
+call on the same thread and in the same test, including through intervening helpers. Each call clears its slot on
+exit. Fixtures that carry an exception between calls can declare that lifetime with ``correlate``. Outside these
+boundaries, separate observations of a non-weak-referenceable exception have separate tokens. The operation and
+commit keys still apply.
 
 Reporting (working out each exception's stop, merging, exempting, formatting, writing) runs with the signals as they
 are, in three places, and calls nothing that catches every ``Exception`` (a signal handler's error would vanish there):
@@ -69,9 +78,8 @@ attributes. Nothing guards against an exception class or a watched class that ov
 registration reads with a descriptor of its own; a dict holding a key that hashes like a string key a registration looks
 up and has an ``__eq__`` of its own; a ``str`` subclass as a keyword name or as a code object's ``co_filename``; a
 CPython audit hook (``id()`` and a traceback's ``tb_frame`` raise audit events), trace function or profile function
-installed in the test process. A built-in exception handed to ``report_stop`` before it was ever raised, and raised from
-a watched entry afterwards, makes two findings, not one: its first registration saw no raising line (``_key``). That the
-attributes of ``harness/`` a registration reads stay plain ones (none becomes, say, a property written in Python) is
+installed in the test process. That the attributes of ``harness/`` a registration reads stay plain
+ones (none becomes, say, a property written in Python) is
 what the structural self-test watches (``test_stop_tripwire.Registration``).
 """
 from __future__ import annotations
@@ -80,7 +88,6 @@ import atexit
 import errno
 import functools
 import inspect
-import itertools
 import json
 import os
 import signal
@@ -90,6 +97,7 @@ import sys
 import threading
 import unittest
 import weakref
+from contextlib import nullcontext
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -103,7 +111,7 @@ from harness.runtime import Runtime
 from harness.util import HarnessError
 from harness.workflow import Workflow
 
-ENFORCE = False
+ENFORCE = True
 REPORT = "HARNESS_STOP_TRIPWIRE_REPORT"
 # run_shards collects this stderr line, "<INCOMPLETE>: <one JSON object>", from the collection and every shard
 INCOMPLETE = "stop tripwire: report incomplete"
@@ -118,9 +126,11 @@ HELD = frozenset(signal.valid_signals()) - SYNCHRONOUS - {signal.SIGKILL, signal
 # Registration reads an exception through BaseException's and type's own descriptors, so no code of its class runs.
 _ARGS = BaseException.__dict__["args"].__get__
 _TRACEBACK = BaseException.__dict__["__traceback__"].__get__
+_REDUCE = BaseException.__dict__["__reduce__"]
 _MRO = type.__dict__["__mro__"].__get__
 _NAMESPACE = type.__dict__["__dict__"].__get__
 _OPAQUE = object()   # a part of a carried stop that is no JSON value: no stop with it validates
+_EXEMPTION_ORDER = {None: 0, "consume": 1, "allow_unclassified": 2, "injected": 3}
 
 
 def injected(error):
@@ -154,6 +164,7 @@ class Publication:
     seen: Seen | None
     operation: str | None
     commit: tuple | None  # (ledger path, store_revision) the commit wrote
+    allowance: str | bool | None = None
 
 
 @dataclass(eq=False)
@@ -165,6 +176,7 @@ class Finding:
     injected: bool
     facts: dict
     exempt: str | None = None
+    allowance: str | bool | None = None
 
 
 @dataclass(eq=False)
@@ -184,13 +196,41 @@ class Call:
     value: object = None
 
 
+@dataclass(eq=False)
+class CauseScope:
+    """One live cause in a watched call, or one explicitly held by a fixture."""
+    kind: str
+    owner: object = None
+    error: BaseException | None = None
+    key: tuple | None = None
+    test_frame: Frame | None = field(init=False, default=None)
+
+    def __enter__(self):
+        scopes = _calls("causes")
+        try:
+            self.test_frame = _frame()
+            scopes.append(self)
+            return self
+        except BaseException:
+            self.__exit__()
+            raise
+
+    def __exit__(self, *exc_info):
+        # A wrapper frame can itself be in the outgoing traceback.
+        self.error = None
+        self.owner = None
+        self.test_frame = None
+        scopes = _calls("causes")
+        if scopes and scopes[-1] is self:
+            scopes.pop()
+
+
 _tests = []        # frames of the running tests, innermost last (a test's threads publish on it too)
 _outside = Frame(None)   # setUpClass, setUpModule and the like: reported, never failed
 _local = threading.local()   # this thread's calls in progress; another thread's calls are never on its stacks
 _lost = []         # the report writes that failed: the report misses these findings
 _depth = 0         # the main thread's registrations in progress (Held)
 _alive = {}        # id() of a registered exception still alive -> (weak reference to it, its key)
-_serial = itertools.count()
 
 
 class Held:
@@ -242,6 +282,20 @@ def _frame():
     return _tests[-1] if _tests else _outside
 
 
+def _active_causes():
+    frame = _frame()
+    return (scope for scope in reversed(_calls("causes")) if scope.test_frame is frame)
+
+
+def _cli_boundary(leaving=None):
+    return next((scope for scope in _active_causes() if scope.kind == "cli" and scope is not leaving), None)
+
+
+def correlate(error):
+    """Correlate observations while a fixture already holds this exact exception."""
+    return CauseScope("fixture", error=error)
+
+
 # ---- registration: plain values only, with the signals held ---------------------------------------------------------
 
 def _guard(function):
@@ -274,11 +328,8 @@ def _frames(error):
     return tuple(frames)
 
 
-def _key(error, frames):
-    """A merge key that is ``error``'s alone. Its ``id`` may be a later exception's once it is gone, so a weak
-    reference, which keeps neither it nor its traceback alive, follows it; an exception of a class that takes none (a
-    built-in one) is keyed by its ``id``, type and raising line, so it can be taken only for a later one of its type
-    raised at the same line at the same address, never for one raised elsewhere (which could change the exemption)."""
+def _key(error, boundary):
+    """Get or issue a token by live object identity, and optionally hand it to an enclosing call."""
     ident = id(error)
     known = _alive.get(ident)
     if known is not None and known[0]() is error:
@@ -286,18 +337,24 @@ def _key(error, frames):
     try:
         reference = weakref.ref(error, lambda _, ident=ident, alive=_alive: alive.pop(ident, None))
     except TypeError:
-        return ("error", ident, type(error), frames[-1] if frames else None)
-    key = ("error", next(_serial))
-    _alive[ident] = (reference, key)
-    return key
+        matches = [scope for scope in _active_causes() if scope.error is error]
+        key = next((scope.key for scope in matches if scope.key is not None), None)
+        if key is None:
+            key = ("error", object())
+        for scope in matches:
+            scope.key = key
+        if boundary is not None:
+            boundary.error, boundary.key = error, key
+        return key
+    key = ("error", object())
+    return _alive.setdefault(ident, (reference, key))[1]
 
 
-def _carried(error):
+def _carried(error, namespace):
     """``error.stop`` read where ``getattr`` finds a plain value, its own ``__dict__`` then its classes' namespaces: no
     property or ``__getattr__`` of its class runs."""
-    own = object.__getattribute__(error, "__dict__")
-    if type(own) is dict and "stop" in own:
-        return own["stop"]
+    if type(namespace) is dict and "stop" in namespace:
+        return namespace["stop"]
     for klass in _MRO(type(error)):
         namespace = _NAMESPACE(klass)
         if "stop" in namespace:
@@ -318,9 +375,13 @@ def _plain(value):
     return _OPAQUE
 
 
-def _seen(error):
+def _seen(error, boundary=None):
     frames = _frames(error)
-    return Seen(type(error), id(error), _key(error, frames), _texts(error), frames, _plain(_carried(error)))
+    # BaseException's own reduction exposes existing instance state. Reading __dict__ would create empty state
+    # on some exceptions, changing their reduction and pickle even if nothing were written into the dict.
+    state = _REDUCE(error)
+    namespace = state[2] if len(state) == 3 else None
+    return Seen(type(error), id(error), _key(error, boundary), _texts(error), frames, _plain(_carried(error, namespace)))
 
 
 def _published(value):
@@ -340,17 +401,38 @@ def _published(value):
     return "unclassified", reason if type(reason) is str else None, detail if type(detail) is str else ""
 
 
-def _publish(channel, value, *, error=None, operation=None, commit=None):
+def _allowance(case):
+    """Snapshot an instance or class reason without invoking case-defined code while registering."""
+    if case is None:
+        return None
+    own = object.__getattribute__(case, "__dict__")
+    if dict.__contains__(own, "allow_unclassified"):
+        value = dict.__getitem__(own, "allow_unclassified")
+    else:
+        namespaces = map(_NAMESPACE, _MRO(type(case)))
+        value = next((namespace["allow_unclassified"] for namespace in namespaces
+                      if "allow_unclassified" in namespace), None)
+    if issubclass(type(value), str):
+        return str.__str__(value)
+    return value if type(value) is bool else None
+
+
+def _publish(channel, value, *, error=None, operation=None, commit=None, boundary=None):
     stop = _published(value)
     if stop is not None:
-        _frame().publications.append(Publication(
-            channel, stop, _seen(error) if issubclass(type(error), BaseException) else None,
-            operation if type(operation) is str else None, commit))
+        frame = _frame()
+        if error is not None and channel in ("cli", "record") and sys.exception() is error:
+            boundary = _cli_boundary()
+        seen = _seen(error, boundary) if issubclass(type(error), BaseException) else None
+        frame.publications.append(Publication(
+            channel, stop, seen,
+            operation if type(operation) is str else None, commit, _allowance(frame.case)))
 
 
-def _left(channel, error):
+def _left(channel, error, boundary=None):
     """``error`` left a watched entry; whether its stop is an unclassified one is worked out when reported."""
-    _frame().publications.append(Publication(channel, None, _seen(error), None, None))
+    frame = _frame()
+    frame.publications.append(Publication(channel, None, _seen(error, boundary), None, None, _allowance(frame.case)))
 
 
 # ---- reporting: signals as they are ---------------------------------------------------------------------------------
@@ -449,22 +531,51 @@ def _facts(seen, text):
             "site": _where(*site) if site else None, "text": text, "injected": _injected(frames)}
 
 
-def _merge(publications):
+def _cause_details(event, stop, members):
+    """Find diagnostics for the selected event's cause from the observations in its finding."""
+    seen = event.seen
+    if seen is None:
+        matches = {other.seen.key: other.seen for other, projection, _, _ in members
+                   if other.seen is not None and other.operation == event.operation and projection == stop}
+        if len(matches) != 1:
+            return None
+        seen = next(iter(matches.values()))
+    if seen.frames:
+        return seen
+    return next((other.seen for other, _, _, _ in members
+                 if other.seen is not None and other.seen.key == seen.key and other.seen.frames), seen)
+
+
+def _merge(publications, *, consuming=False):
     """One finding per stop: the unclassified publications that share a key, an exception, an operation ID or a commit
     identity."""
-    items = []   # (publication, its stop, its keys)
+    qualified = []
+    injected_operations = set()
     for publication in publications:
         stop = _stop(publication)
         if stop is None:
             continue
+        injected = publication.seen is not None and _injected(publication.seen.frames)
+        qualified.append((publication, stop, injected))
+        if injected and publication.operation is not None:
+            injected_operations.add(publication.operation)
+
+    items = []   # (publication, its stop, its keys, its exemption)
+    for publication, stop, injected in qualified:
+        if injected or (publication.seen is None and publication.operation in injected_operations):
+            exemption = "injected"
+        elif type(publication.allowance) is str and publication.allowance:
+            exemption = "allow_unclassified"
+        else:
+            exemption = "consume" if consuming else None
         keys = {publication.seen.key} if publication.seen is not None else set()
         if publication.operation is not None:
             keys.add(("operation", publication.operation))
         if publication.commit is not None:
             keys.add(("commit", str(publication.commit[0]), publication.commit[1]))
-        items.append((publication, stop, keys))
+        items.append((publication, stop, keys, exemption))
     groups = []   # [keys, members]; an item joins every group it shares a key with
-    for index, (_, _, keys) in enumerate(items):
+    for index, (_, _, keys, _) in enumerate(items):
         joined = [group for group in groups if group[0] & keys]
         merged, members = set(keys), [index]
         for group in joined:
@@ -474,26 +585,14 @@ def _merge(publications):
     findings = []
     for _, members in sorted(groups, key=lambda group: min(group[1])):
         members = [items[index] for index in sorted(members)]
-        firsts = []   # the first publication of each distinct exception
-        for publication, stop, _ in members:
-            if publication.seen is not None and all(publication.seen.key != other.seen.key for other, _ in firsts):
-                firsts.append((publication, stop))
-        facts = [_facts(publication.seen, stop[2]) for publication, stop in firsts]
-        first, stop, _ = members[0]
-        findings.append(Finding(frozenset(publication.channel for publication, _, _ in members), stop[0], stop[1],
-                                tuple(publication.seen.id for publication, _ in firsts),
-                                bool(facts) and all(item["injected"] for item in facts),
-                                facts[0] if facts else _facts(None, stop[2])))
-    return findings
-
-
-def _exempted(case, findings):
-    for finding in findings:
-        if finding.injected:
-            finding.exempt = "injected"
-        else:
-            reason = getattr(case, "allow_unclassified", None) if case is not None else None
-            finding.exempt = "allow_unclassified" if isinstance(reason, str) and reason else None
+        errors = {publication.seen.key: publication.seen.id for publication, _, _, _ in members
+                  if publication.seen is not None}
+        # Eligibility belongs to the event. A value-only event can still describe an observed exception.
+        event, stop, _, exempt = min(members, key=lambda item: (_EXEMPTION_ORDER[item[3]], item[0].seen is None))
+        seen = _cause_details(event, stop, members)
+        findings.append(Finding(frozenset(publication.channel for publication, _, _, _ in members), stop[0], stop[1],
+                                tuple(errors.values()), exempt == "injected", _facts(seen, stop[2]),
+                                exempt, event.allowance))
     return findings
 
 
@@ -504,10 +603,8 @@ def consume(case):
     if frame is None:
         return []
     taken = len(frame.publications)
-    findings = _exempted(case, _merge(frame.publications[:taken]))
+    findings = _merge(frame.publications[:taken], consuming=True)
     del frame.publications[:taken]
-    for finding in findings:
-        finding.exempt = finding.exempt or "consume"
     frame.consumed.extend(findings)
     return findings
 
@@ -522,13 +619,12 @@ def _test_name(case):
     return f"{type(case).__module__}.{type(case).__qualname__}.{case._testMethodName}"
 
 
-def _line(test, case, finding):
-    allowed = getattr(case, "allow_unclassified", None) if case is not None else None
+def _line(test, finding):
     facts = finding.facts
     return {"test": test, "channels": sorted(finding.channels),
             "kind": finding.kind, "reason": finding.reason, "error_type": facts["error_type"],
             "where": facts["where"], "site": facts["site"], "text": facts["text"][:TEXT_LIMIT],
-            "exempt": finding.exempt, "allow_unclassified": allowed if isinstance(allowed, (str, bool)) else None}
+            "exempt": finding.exempt, "allow_unclassified": finding.allowance}
 
 
 def _describe(failure):
@@ -543,7 +639,7 @@ def _report(frame):
     """Work out ``frame``'s findings and failures and write their lines (``_write``); only then are they taken from
     the frame, so what raises before leaves them to be reported later."""
     taken, failed = len(frame.publications), len(frame.failures)
-    findings = frame.consumed + _exempted(frame.case, _merge(frame.publications[:taken]))
+    findings = frame.consumed + _merge(frame.publications[:taken])
     failures = [_failure_text(*failure) for failure in frame.failures[:failed]]
     path = os.environ.get(REPORT)
     if path and (findings or failures):
@@ -555,7 +651,7 @@ def _report(frame):
 
 def _write(path, case, findings, failures):
     test = _test_name(case)
-    lines = [_line(test, case, finding) for finding in findings]
+    lines = [_line(test, finding) for finding in findings]
     lines += [{"test": test, "channels": ["tripwire_error"], "kind": None,
                "reason": None, "error_type": None, "where": None, "site": None, "text": text[:TEXT_LIMIT],
                "exempt": None, "allow_unclassified": None} for text in failures]
@@ -672,10 +768,14 @@ def _at_exit():
         _announce()
 
 
-def _check(frame):
+def _check(frame, prior_skips):
     """The test's last cleanup: report its findings, and those no test took, then fail it for what fails it. What is
     raised here, but for the report file's ``OSError`` or ``ValueError`` (``_write``), is this test's error, a signal
     handler's included, and what was not written is left for the end of the run (``_unchecked``)."""
+    result = frame.case._outcome.result
+    skipped = getattr(result, "skipped", ())
+    if any(test is frame.case for test, _ in skipped[prior_skips:]):
+        return  # a whole-test skip is report-only; _test_run reports it without changing the result
     findings, failures = _report(frame)
     _report(_outside)
     failing = [finding for finding in findings if finding.exempt is None] if ENFORCE else []
@@ -802,12 +902,21 @@ def _workflow_stop(original):
     def stop(workflow, error, *args, **kwargs):
         operation = _step(lambda: _operation(workflow))
         stopping = _calls("stopping")
-        stopping.append((error, operation))
-        try:
-            return original(workflow, error, *args, **kwargs)
-        finally:
-            stopping.pop()
+        with CauseScope("workflow", error=error) as cause:
+            stopping.append((workflow, error, operation, cause))
+            try:
+                return original(workflow, error, *args, **kwargs)
+            finally:
+                stopping.pop()
     return stop
+
+
+def _ledger_stop(call, workflow, error, operation, cause):
+    # The terminal stop belongs to this Runtime invocation only if it owns the workflow's context.
+    boundary = next((scope for scope in _active_causes()
+                     if scope.kind == "runtime" and getattr(scope.owner, "context", None) is workflow.context), cause)
+    _publish("ledger", call.value.get("stop"), error=error, operation=operation,
+             commit=(call.path, call.value.get("store_revision")), boundary=boundary)
 
 
 def _commit(original):
@@ -816,24 +925,32 @@ def _commit(original):
         stopping = _calls("stopping")
         if not stopping:
             return original(store, *args, **kwargs)
-        error, operation = stopping[-1]
+        workflow, error, operation, cause = stopping[-1]
         # The candidate is what this commit's own write wrote (``_ledger_written``), not rebuilt here.
         return _observing("commit", _step(lambda: getattr(store, "_path", None)),
                           lambda: original(store, *args, **kwargs),
-                          lambda call: _publish("ledger", call.value.get("stop"), error=error, operation=operation,
-                                                commit=(call.path, call.value.get("store_revision"))))
+                          lambda call: _ledger_stop(call, workflow, error, operation, cause))
     return commit
 
 
-def _leaving(channel):
+def _leaving(channel, *, scope=None):
     def wrap(original):
         @functools.wraps(original)
         def wrapped(*args, **kwargs):
-            try:
-                return original(*args, **kwargs)
-            except BaseException as error:
-                _guard(lambda: _left(channel, error))
-                raise   # the very exception the call raised, its context untouched
+            owner = (args[0] if args else kwargs.get("self")) if scope == "runtime" else None
+            with (CauseScope(scope, owner) if scope else nullcontext()) as active:
+                try:
+                    return original(*args, **kwargs)
+                except BaseException as error:
+                    # The active CLI caller can receive this exception through ordinary helper calls.
+                    def note():
+                        boundary = _cli_boundary(leaving=active)
+                        if channel is not None:
+                            _left(channel, error, boundary)
+                        elif boundary is not None:
+                            _key(error, boundary)
+                    _guard(note)
+                    raise   # the very exception the call raised, its context untouched
         return wrapped
     return wrap
 
@@ -843,7 +960,7 @@ def _test_run(original):
     def run(case, result=None):
         frame = Frame(case)
         # Registered before setUp: cleanups run last-in first-out, so the check follows every cleanup of the test.
-        case.addCleanup(_check, frame)
+        case.addCleanup(_check, frame, len(getattr(result, "skipped", ())))
         case.addCleanup(_check_dirty_waits, case, frame.dirty_waits)
         _tests.append(frame)
         try:
@@ -876,9 +993,10 @@ def install():
     _wrap(Workflow, "stop", _workflow_stop)
     _wrap(RunStore, "commit", _commit)
     _wrap(RunStore, "_publish_candidate", _publishing(_ledger_written))
-    _wrap(cli, "_main", _leaving("escape"))
+    _wrap(cli, "_main", _leaving("escape", scope="cli"))
+    _wrap(cli, "operate", _leaving(None, scope="cli"))
     for name in ("start", "resume", "abandon"):
-        _wrap(Runtime, name, _leaving("entry"))
+        _wrap(Runtime, name, _leaving("entry", scope="runtime"))
     _wrap(workspace_inputs, "prepare_run", _leaving("entry"))
     wrapped = _wrap(cleanup, "cleanup_run", _leaving("entry"))
     if not getattr(cli.cleanup_run, MARK, False):

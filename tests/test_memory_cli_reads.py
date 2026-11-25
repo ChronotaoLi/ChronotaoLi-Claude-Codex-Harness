@@ -1,6 +1,8 @@
 import contextlib
+import errno
 import io
 import json
+import os
 import sqlite3
 import tempfile
 import unittest
@@ -8,7 +10,7 @@ from argparse import Namespace
 from pathlib import Path
 from unittest.mock import patch
 
-from harness import git, stops
+from harness import git, state_files, stops
 from harness.cli import main, manage_memory
 from harness.mcp_server import handle
 from harness.memory import Memory
@@ -56,6 +58,32 @@ class MemoryCLIReadTests(unittest.TestCase):
         self.assertEqual(self.invoke("export")[0], 0)
         self.assertFalse(self.exclude.exists())
         self.assertFalse(self.state.exists())
+
+    def test_database_probe_io_failure_is_not_an_empty_result(self):
+        self.state.mkdir()
+        original_exclude = self.exclude.read_bytes()
+        memory = Memory(self.path, read_only=True)
+        request = {"method": "tools/call", "params": {"name": "memory_search", "arguments": {"query": "storage"}}}
+        self.assertEqual(json.loads(handle(request, memory, None, None)["content"][0]["text"]), [])
+        self.assertEqual(memory.history("storage"), [])
+        real_stat = os.stat
+
+        def denied(path, *args, **kwargs):
+            if path == self.path.name and kwargs.get("dir_fd") is not None:
+                raise PermissionError(errno.EACCES, "memory probe denied")
+            return real_stat(path, *args, **kwargs)
+
+        with patch.object(state_files.os, "stat", denied):
+            code, output, errors = self.invoke("export")
+            stop = cli_notice(errors)
+            self.assertNotEqual(code, 0)
+            self.assertEqual((output, stop["kind"], stop["reason"], stop["data"]["error_type"]),
+                             ("", "runtime_failure", "io", "PermissionError"))
+            self.assertTrue(handle(request, memory, None, None)["isError"])
+            with self.assertRaises(state_files.StateReadError):
+                memory.history("storage")
+        self.assertEqual(list(self.state.iterdir()), [])
+        self.assertEqual(self.exclude.read_bytes(), original_exclude)
 
     def test_existing_legacy_database_reads_do_not_migrate_or_change_git_exclusions(self):
         self.state.mkdir()

@@ -11,7 +11,6 @@ import unittest
 from pathlib import Path
 
 import stop_tripwire  # noqa: F401  importing it installs the stop tripwire in this test process
-from stop_tripwire import injected  # one exemption rule for G7 and the tripwire
 from harness import git
 from harness.adapters import CLIBackend, DemoBackend
 from harness.config import Config
@@ -319,41 +318,19 @@ def continues_without_stop(case, directory, *, events_from=0):
     return saved
 
 
-# ---- stop guards (spec 14.4, G7 and G10), installed on every RepoCase ---------------------
+# ---- G10 (spec 14.4), installed on every RepoCase --------------------------------------
 def install_stop_guards(case):
-    """G7: no runtime stop is unclassified. G10: a published stop's listed exits are not blocked by the load checks.
-
-    What they see, and no more:
-
-    - G7 wraps ``Workflow.stop``, ``Runtime.start``/``resume``/``abandon`` and the module function
-      ``workspace_inputs.prepare_run`` (the CLI looks it up at call time; a test that imported the
-      function by name calls it unwrapped). An ``unclassified`` stop whose innermost frame is in the
-      runtime or the standard library fails the test, unless the class sets ``allow_unclassified``;
-      one raised by test code (a frame under ``tests/``, or a patched ``side_effect`` in
-      ``unittest.mock``) is exempt (``injected()``, self-tested in test_stop_guards.InjectionRule).
-    - G10 checks every stop saved through ``Workflow.stop`` and every plan awaiting approval that
-      ``start``/``resume`` return (saved, or reported again): a fresh ``Runtime`` loads the run, and
-      listed ``resume``/``abandon`` exits imply the load passes, ``load_integrity`` that it is
-      refused. In ``addCleanup`` (after the body and tearDown, before the temporary directory is
-      removed), if the run still holds that saved stop and still loads, the first listed ``abandon``
-      exit is executed on the original fixture. It does not see operation refusals (G1 and the row
-      tests check those), CLI projections (G11), or a stop whose evidence the test changed later.
+    """G10 checks the recovery exits of stops saved by ``Workflow.stop`` and approvals returned by
+    ``start`` or ``resume``. A fresh Runtime must load a run with a listed resume or abandon exit
+    and refuse a run stopped for load_integrity. In cleanup, exercise the first listed abandon
+    exit if the run still holds that stop and its evidence still loads.
     """
     import shlex
     from unittest.mock import patch
     from harness import interrupts, stops
     from harness.workflow import Workflow
-    unclassified, mismatches, seen = [], [], {}
+    mismatches, seen = [], {}
     original_stop = Workflow.stop
-
-    def note(error):
-        value = stops.of(error)
-        if value["kind"] == "unclassified" and not injected(error):
-            tb, where = error.__traceback__, None
-            while tb is not None:
-                where = f"{tb.tb_frame.f_code.co_filename}:{tb.tb_lineno}"
-                tb = tb.tb_next
-            unclassified.append((value["reason"], type(error).__name__, str(error)[:160], where))
 
     def published(run, directory):
         value = run.get("stop") or {}
@@ -382,7 +359,6 @@ def install_stop_guards(case):
 
     def stop(workflow, error):
         result = original_stop(workflow, error)
-        note(error)
         published(workflow.context.run, workflow.context.directory)
         return result
 
@@ -390,23 +366,10 @@ def install_stop_guards(case):
         original = getattr(Runtime, name)
 
         def wrapped(runtime, *args, **kwargs):
-            try:
-                result = original(runtime, *args, **kwargs)
-            except BaseException as error:
-                note(error)
-                raise
+            result = original(runtime, *args, **kwargs)
             if isinstance(result, dict) and result.get("status") == "awaiting_approval":
                 published(result, runtime.directory)  # the approval stop: saved, or reported again
             return result
-        return wrapped
-
-    def guarded(function):
-        def wrapped(*args, **kwargs):
-            try:
-                return function(*args, **kwargs)
-            except BaseException as error:
-                note(error)
-                raise
         return wrapped
 
     def walk_abandon(only_repo=None):
@@ -440,15 +403,11 @@ def install_stop_guards(case):
             if status != "abandoned":
                 mismatches.append(("listed abandon failed", value["kind"], value["reason"], " ".join(words), status))
 
-    case.stop_guard_findings = {"unclassified": unclassified, "mismatches": mismatches}  # for the guards' self-tests
-    from harness import workspace_inputs
-    patches = [patch.object(Workflow, "stop", stop),
-               patch.object(workspace_inputs, "prepare_run", guarded(workspace_inputs.prepare_run))] + [
-        patch.object(Runtime, name, operation(name)) for name in ("start", "resume", "abandon")]
+    case.stop_guard_findings = {"mismatches": mismatches}  # for G10's self-test
+    patches = [patch.object(Workflow, "stop", stop)] + [
+        patch.object(Runtime, name, operation(name)) for name in ("start", "resume")]
     for item in patches:
         item.start()
-    case.addCleanup(lambda: case.assertEqual(
-        [] if getattr(case, "allow_unclassified", False) else unclassified, [], "G7: unclassified stops"))
     case.addCleanup(lambda: case.assertEqual(mismatches, [], "G10: exits blocked by the load checks"))
     case.addCleanup(walk_abandon)
     for item in patches:

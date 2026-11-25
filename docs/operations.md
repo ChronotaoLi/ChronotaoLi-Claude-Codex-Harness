@@ -45,14 +45,15 @@ python3 -m harness --repo /abs/project run "目标描述" --scope 'src/**'
 | `demo`、`smoke`、`sync`，以及 `python3 -m harness.permission_smoke`、`python3 -m harness.tool_smoke` | 读 | 不读 |
 | `status`、`watch`、`dashboard`、`memory`、`prepare-run`、`cleanup-run`、`supervise` | 不读 | 不读 |
 
-- 项目配置不存在时，`run`、`resume`、`permission-diagnostics` 拒绝：退出码 2，停止类型 `invalid_input/cli_arguments`，`data.option` 为 `--repo`，错误信息给出期望的绝对路径并指向 `examples/project.toml`。这个拒绝在任何写入之前：没有操作记录，不安装 `.harness/` 的忽略保护，不创建 run、分支或工作树，不调用模型。项目配置存在但读不出、不是合法 TOML 或内容不合格时，与操作者配置无效时一样报错（退出码 1），同样在任何写入之前。
-- `abandon` 不读项目配置，项目配置缺失或损坏时照常可用。`demo`、`smoke` 与两个独立联调入口自己设置验证命令和 worker 命令，目标仓库里即使有项目配置也不读取、不执行其中的命令。`supervise` 把 `--config` 原样传给它启动的子进程。
+- 项目配置不存在时，`run`、`resume`、`permission-diagnostics` 拒绝：退出码 2，停止类型 `invalid_input/cli_arguments`，`data.option` 为 `--repo`，错误信息给出期望的绝对路径并指向 `examples/project.toml`。这个拒绝在任何写入之前：没有操作记录，不安装 `.harness/` 的忽略保护，不创建 run、分支或工作树，不调用模型。找不到操作者配置时同样退出 2，`data.option` 为 `--config`。两份配置的内容不合格（编码、TOML、嵌套、节、键、取值或命令形状）与 `run` 的验证命令为空都报 `invalid_input/config_file`（退出码 2）；逐文件校验的 `data.file` 指明是哪份，合并后的校验应核对两份。文件读不出（权限、设备）报 `runtime_failure/io`（退出码 1）。这些拒绝都在写入之前。
+- `abandon` 只读操作者配置，先只读核对 run ID、台账存在性和版本，再初始化运行时；锁内重新加载并核对恢复链接。项目配置缺失或损坏时仍可使用。`demo`、`smoke` 与两个独立联调入口自己设置验证命令和 worker 命令，目标仓库里即使有项目配置也不读取、不执行其中的命令。`supervise` 把 `--config` 原样传给它启动的子进程。
 - `run` 启动时在 stderr 依次回显三条：`[harness] config=<操作者配置路径>`、`[harness] project=<项目配置路径>`、`[harness] verification=<验证命令>`。`verification` 这一条的值是缩进排版的 JSON，可以跨多行（续行没有 `[harness]` 前缀）。项目配置显示的总是固定位置：它是符号链接时也不显示链接目标。
 - 共享资源（rules、skills、mcp）相对操作者配置所在目录解析；复制操作者配置到其他位置时同步修正这些路径。`doctor` 的 `shared` 字段显示解析后的绝对路径。
 - 启动前用 `doctor` 核对实际加载的包与配置：`harness.package`（包目录）、`harness.revision`（包目录上级是 Git 检出根时的 HEAD，否则 null）、`harness.runtime_modified`（`harness/` 下有已修改或未跟踪文件时为 true）、`config`、`project`（见下）、`asset_digest`（共享资产摘要；失败为 null 并另给 `asset_error`）。同名模块、site-packages 中的另一份安装或改过的工作副本都会在这里显现。`doctor` 的退出码仍只取决于配置引用的 CLI 是否已登录，项目配置缺失或无效不会让它失败。
   - `config` 是 `{path, sha256, project}`，字段含义与[操作记录](#自动记录的字段)相同；`doctor` 不把项目配置当作有效配置，所以这里的 `config.project` 总是 null。
   - `project` 报告 `--repo`（默认当前目录）对应的项目配置：`{path, exists, sha256, error}`，`path` 总是期望的绝对路径；`--repo` 不在 Git 仓库里时整个字段为 null。文件不存在：`exists=false`，`sha256` 与 `error` 为 null。存在且能与当前操作者配置一起加载：`exists=true`，有摘要，`error=null`。存在但读不出：`exists=true`，`sha256=null`，`error` 是错误首行。读得出但不是合法 TOML 或内容不合格：`exists=true`，有摘要，`error` 是错误首行。摘要与错误来自同一次读取，描述的是同一份字节。
 - 启动前核对目标仓库：已有提交，已跟踪文件与暂存区没有未提交修改，`verification.commands` 与依赖在工作树中可用，每条验证命令的 `cwd` 在 HEAD 中存在、每条准备命令的 `cwd` 在 HEAD 中存在或由前面的准备命令创建（命令带目录 `{cwd, argv}`，目录不存在不是配置错误，执行时这条命令不启动），生成产物已忽略。这些要求见 [README](../README.md#执行)。
+- `memory add` 先核对静态字段，再打开或创建记忆库；库内冲突在事务里判断。`sync` 先验证共享 MCP 配置并预先序列化 Codex 的 TOML，再初始化私有状态和写生成配置。
 - 每次 `run`／`resume` 自动写一份操作记录，可用 `--operation-id ID` 指定记录 ID；见[操作记录与记录模板](#操作记录与记录模板)。
 
 ## 外层 agent 操作说明
@@ -67,6 +68,8 @@ python3 -m harness --repo /abs/project run "目标描述" --scope 'src/**'
 - 用 `status`、`status RUN`、`status RUN --full`、`watch RUN` 和 `dashboard` 观察，读取目标项目 `.harness/` 下的台账、事件、dispatch 产物与操作记录；`status` 的三种形式把检出与状态目录写在 stderr 第一行（条件与格式见[页面](#页面)），这一行不进 stdout，需要知道一份结果来自哪个检出时保留这份 stderr；
 - 使用[阻塞状态与操作者出口](recovery.md#阻塞状态与操作者出口)中明确适用于当前状态的恢复出口，例如 `--approve-plan`、加入精确命令授权后的普通 `resume`、`--environment-update`、带着所有者答复的 `--operator-decision`；
 - `provider_failure/transport`（与供应商的连接失败）之后不问所有者执行 `stop.exits` 里的普通 `resume`，同一 run 连续至多 3 次：只依据本会话自己运行的调用返回的停止（stderr 里 `event` 为 `stop` 的那一行，或它的操作记录），不依据 `status RUN` 显示的台账停止；每次用新的、唯一的 `--operation-id`，按下面“长任务与受限沙箱”的规则启动，交给所有者在终端运行的那次 `resume` 不算外层自己的；第一次这样恢复的传输停止算第 1 次，本会话运行的调用返回同一 run 的其他停止、或所有者作出决定时清零，`busy/run_lock` 不清零，也从不作为再次恢复的理由（另一个进程可能仍持有该 run）；计数只在本会话里，新会话从零开始；第 4 次连续的传输停止不再恢复，报告所有者检查网络或代理。
+
+完成时把 stdout 中的 `result.commit`、`branch` 与 `worktree` 交给所有者；验证模式见 `result.verification_mode`，交接与台账不一致时以台账为准。
 
 **长任务与受限沙箱。** `run` 和需要继续执行的 `resume` 可能运行很久：用外层工具自己的后台任务启动，再用 `status RUN`、`watch RUN` 观察。`&`、`nohup` 不保证进程存活，不要依赖它们。外层工具没有可靠的后台任务，或者它的沙箱不允许联网、写 `.git`、启动 `claude`／`codex` 子进程时，这两类命令都交给所有者在普通终端里运行：外层会话给出完整命令，自己负责观察、准备输入文件（操作者决定、环境更新、请求拒绝）和提出下一条命令。普通 `resume RUN` 在退出证据齐全时会直接继续执行，所以中断（130）之后的它也按这条规则启动。`dashboard` 在启动时打开一个状态目录，直到停止都不换，并在打印地址之前把它与检出写在 stderr，页眉显示同样的检出与状态目录：启动时用 `--repo` 指向 run 所在的检出，把地址交给所有者时说明它显示的是哪个检出；默认端口可能已被另一个 `dashboard` 占用时用 `--port 0`，端口被占用是启动错误，不会改用别的端口。
 
@@ -129,11 +132,13 @@ ln -s <Harness 源码目录>/operator/harness-operator ~/.codex/skills/harness-o
 
 run 身份的关联：`run` 的首次台账保存随同写入可选字段 `created_by_operation`（不是额外一次保存），保存成功后追加 `run_created` 事件（带 `operation_id`）、在 stderr 输出一行 `[harness-json] {"event":"run_created","run_id":"...","operation_id":"..."}`，并立即把 `run_id` 写进记录，长时间运行或被强制终止时也能关联。`resume` 在自身预检门禁（含计划批准）通过后、进入 `execute()` 前同样追加 `run_resumed` 事件与通知。
 
-`run_resumed` 不表示已经派发模型：缺少命令授权、等待操作者决定等执行阶段门禁仍可使它紧接一条 `run_stopped`（携带停止投影 `stop`）。命令失败时，stderr 里 `harness: ` 加错误全文之后紧跟一行 `[harness-json] {"event":"stop","run_id":…,"operation_id":…,"stop":…}`（与 `status RUN` 的 `stop` 同一投影，不含 `detail`）；写这一行失败不改变退出码与操作记录。这两部分之前有 `[harness] config=…`、`[harness] project=…`、`[harness] operation_id=…`、运行事件与 `run_created` 通知等行，之后还可能有输出（例如 `supervise` 的监督回执），所以外层脚本应找以 `[harness-json] ` 开头、`event` 为 `stop` 的那一行，不按行号读。恢复未进入执行时不发布 `run_resumed`。已保存的退出确认审计仍保留；前置门禁失败不会采纳本次配置放宽。前置门禁通过后若仍等待计划批准，已采纳的配置放宽和命令授权检查记录也保留。已完成 run 的普通 resume 不写运行事件，台账与事件文件保持不变。操作记录缺失、损坏或与台账不一致都不影响 resume、abandon 或清理。
+`run_resumed` 不表示已经派发模型：缺少命令授权、等待操作者决定等执行阶段门禁仍可使它紧接一条 `run_stopped`（携带停止投影 `stop`）。CLI 报告有类型的停止时，stderr 通常先写 `harness: ` 加错误全文，然后写原因链，最后尽力写一行 `[harness-json] {"event":"stop","run_id":…,"operation_id":…,"stop":…}`（与 `status RUN` 的 `stop` 同一投影，省略 `detail` 与人读原因链）；写这一行失败不改变退出码与操作记录。没有通知时按退出码处理，例如参数解析错误只给用法和退出 2，`cleanup-run` 的单项阻断可通过 stdout 的逐资源结果退出 1。这两部分之前有 `[harness] config=…`、`[harness] project=…`、`[harness] operation_id=…`、运行事件与 `run_created` 通知等行，之后还可能有输出（例如 `supervise` 的监督回执），所以外层脚本应找以 `[harness-json] ` 开头、`event` 为 `stop` 的那一行，不按行号读。恢复未进入执行时不发布 `run_resumed`。已保存的退出确认审计仍保留；前置门禁失败不会采纳本次配置放宽。前置门禁通过后若仍等待计划批准，已采纳的配置放宽和命令授权检查记录也保留。已完成 run 的普通 resume 不写运行事件，台账与事件文件保持不变。旧版台账拒绝同样保留 run 证据，但 `resume` 在加载版本之前仍可写本次操作记录和查询 CLI 的 `--version`，不派发模型。操作记录缺失、损坏或与台账不一致都不影响 resume、abandon 或清理。
 
-上述拒绝或已完成返回只要对应台账文件存在，操作记录结束时仍关联参数中的 run ID。加载配置失败（含项目配置缺失或无效）时没有记录（记录在 `Config.load` 之后才创建）；创建 run 之前失败（仓库基线不满足、计划非法等）时记录保留但没有 `run_id`；resume 在预检阶段被强制终止时记录也可能没有 `run_id`。
+上述拒绝或已完成返回只要对应台账文件存在，操作记录结束时仍关联参数中的 run ID。加载配置失败时没有记录，包括项目配置缺失或无效、`run` 的 `verification.commands` 为空。记录在配置加载与这些检查通过之后才创建；创建 run 之前失败（仓库基线不满足、计划非法等）时记录保留但没有 `run_id`；resume 在预检阶段被强制终止时记录也可能没有 `run_id`。
 
 限制：非 Git 检出或包目录上级不是检出根时 `revision`／`runtime_modified` 为 null；`runtime_modified` 也会因 `harness/` 下的未跟踪文件为 true；`cli.version` 是启动时 PATH 中的 CLI，不证明派发实际使用了同一个二进制。
+
+多行错误的续行与原因行均以两个空格开头。单个外来值（如路径、ID 与参数）的控制字符用 `\n`、`\x1b` 等形式转义。原因最多显示 3 行，每行转义并截取到至多 500 字符；遇到显示深度上限时另写「（更深的原因未显示）」。程序错误的 Python 回溯有自己的格式。用换行符分行并从行首识别 `[harness-json] `，不要依赖与人读行相邻。原因行写入或刷新失败时，CLI 会先尽力补一个换行，再尝试写通知。首条 `harness:` 诊断只写出一部分就失败时，通知可能接在残留文本之后。找不到从行首开始的通知时（例如 stderr 持续不可写），按退出码处理。
 
 ### 人工补充（人工核实）
 
@@ -236,6 +241,8 @@ python3 -m harness.dashboard --state /abs/project/.harness --port 8765
 
 ### 页面
 
+`run`、普通 `resume`、`demo` 和 `smoke` 的 stdout 在有保存的 `result` 时返回它。`status RUN` 摘要、网页详情与 `handoff.json` 也显示获批身份。结果对象 `result` 含 `commit`、`tree`、`snapshot_digest`、`attempts` 和 `verification_mode`（`run_worktree` 或 `fresh_checkout`）。`status RUN --full` 可查看台账中的原对象；详情页的运行信息显示提交、树、批准它的整体尝试及验证模式。已加载的运行时或观察器直接投影台账结果，无需查看获批对象、分支或工作树。分支移动或对象已被回收时，仍显示当时获批的提交。CLI 入口仍先按常规发现仓库，`resume` 还执行私有状态检查和操作审计。
+
 run 列表 → run 详情 → 文件查看。列表按最近事件排序，以卡片显示台账状态、目标摘要、分支与最近事件时间，并汇总需要关注／进行中／已结束的数量。详情首屏只放判断所需的信息：目标摘要、状态标记与台账阶段（见下文 `ledger_stage`），额度等待期间另有额度等待记录；“需要处理”区（摘要或台账读取失败；停止的类型、诊断摘录、调用失败的结构化事实（停止的 `data` 里有这些事实时才显示）与出口命令，台账为 blocked 而没有停止投影时的阻断提示；运行中断或暂停；计划等待批准；等待操作者决定；当前环境阻断；缺失命令授权；续作请求；并附常用出口），没有这些项时不显示该区；有返工提示时，其后是单独的返工提示区（见下文）；台账状态、已接受／总任务进度、当前任务、最近观测与待处理数量（只数“需要处理”区的项）；任务列表与最近活动。当前任务最近一次调用（不含验证命令）的记录带错误时，任务列表里这个任务的“最近调用”之下显示错误的首行与 dispatch ID；不论 run 状态，它都不单列为“需要处理”的项。长目标、决定问题和事件字段默认只显示有界摘要，“查看完整原文”展开后显示未截断的原文。
 
 预算与额度、调用记录（逐行展开查看进程、用量与产物文件链接）、事件日志、操作记录、运行信息（工作树、台账版本、操作记录、worker 结果计数、历史环境阻断等）和文件索引（可按路径筛选）收在标签页中，可用方向键、Home、End 切换；“如何理解这些状态”展开后给出台账与进程、完成与接受的区别。文件查看显示文本尾部，默认 64 KiB，最大 1 MiB，可调整。
@@ -250,7 +257,7 @@ run 列表 → run 详情 → 文件查看。列表按最近事件排序，以�
 
 有效工作尝试（`work_attempts`）达到 3 次，或最近两个结论都是否决、两条记录的 `findings` 有共同的 blocking 标签时提示。任务提示的字段：`work_attempts`；`review_rejections`（结论为否决的尝试数）；`repeated_labels`（最近两个结论都是否决时两条记录 blocking 标签的交集，排序后至多 20 个，`repeated_labels_truncated` 标出截断）；`reasons`（成立的触发条件，依次是 `work_attempts`、`repeated_labels`）；`compared_reviews`（`repeated_labels` 非空时是这两个结论，先早后晚，否则为空列表）；`latest_review`（最近一个结论，没有时为 null）；`latest_attempt`（台账 `attempts` 里这个任务的值，即最新的尝试编号，不是整数时为 null）；`attempts_since_latest_review`（尝试编号之差：`latest_attempt` 减去最近结论的尝试号；没有结论时等于 `latest_attempt`；任一方不是整数或差为负时为 null）。被豁免的 worker 调用也占一个尝试编号而不计入 `work_attempts`，所以这个差可以大于其间新增的工作尝试。结论写成 `{round, attempt, review_dispatch_id, snapshot_digest, verdict, outcome}`：前五个与 `review_rounds` 的行同取法（`verdict` 是审阅原写的值），`outcome` 是 `rejected`、`approved` 或 `invalidated`。只因工作尝试次数触发时 `compared_reviews` 为空，`latest_review` 不受影响。标签是审阅者写的文字，不是问题的身份；以原键 `open` 指出的旧问题写在 `finding_dispositions` 里，不参与比较，审阅只以 `open` 指出旧问题、不再新报时，它不进入 `repeated_labels`。提示不说明进程是否在执行；台账最后记录的步骤见下文 `ledger_stage`。整体验收在 `final_history` 里 `status` 为 `rejected` 或 `invalid_rejected` 的记录至少 2 条、最后一条记录不是 `approved` 时提示：`review_rejections` 是这些记录的条数，`latest_rejection` 是其中最后一条的 `{attempt, review_dispatch_id, snapshot_digest}`（dispatch 取 `review_source.dispatch_id`），`latest_final_attempt` 是 `final_history` 最后一条的 `{attempt, status, phase}`；这两项照录台账的值，`attempt` 不是整数、其余不是字符串时记为 null。
 
-`status RUN`、`watch RUN` 与详情中的 `convergence` 都是建议，不自动改变预算、范围、派发或接受条件；completed／abandoned 不显示返工警告。详情页把提示放在“需要处理”区（没有该区时是首屏卡片）之后、概览之前的单独区域，不计入待处理数量：每个任务一项，写工作尝试与否决次数、比较依据（两轮各自的轮次、尝试号、审阅 dispatch 的短 ID 与共同的标签；只因次数触发时写明没有可比较的标签）、最近一个结论属于第几次尝试与第几轮、是什么结论，以及最新尝试编号与非零的编号差（没有结论或编号不可用时只写这一点）；整体验收一项写拒绝次数、最近一次拒绝的整体尝试号与审阅 dispatch、最近一次整体尝试的尝试号与台账记录的 `status`、`phase`。
+`status RUN`、`watch RUN` 与详情中的 `convergence` 都是建议，不自动改变预算、范围、派发或接受条件；completed／abandoned 不显示返工警告。详情页把提示放在“需要处理”区（没有该区时是首屏卡片）之后、概览之前的单独区域，不计入待处理数量：每个任务一项，写工作尝试与否决次数、比较依据（两轮各自的轮次、尝试号、审阅 dispatch 的短 ID 与共同的标签；只因次数触发时写明没有可比较的标签）、最近一个结论属于第几次尝试与第几轮、是什么结论，以及时间行中的最新尝试编号与非零的编号差（写作「编号增加 K」；没有结论或编号不可用时只写这一点）；整体验收一项写拒绝次数、最近一次拒绝的整体尝试号与审阅 dispatch、最近一次整体尝试的尝试号与台账记录的 `status`、`phase`。
 
 审阅轮次投影 `review_rounds` 按任务列出 `review_history` 的每一轮（按记录顺序从 1 编号，含失效或结构非法的记录）：`attempt`、来源审阅 `review_dispatch_id`、候选 `snapshot_digest`、`verdict`，以及本轮首次出现的 blocking finding 标签 `new_blocking`（按审阅者写的 id 字符串判断；标签不是身份，同名不一定是同一个问题）。它只读、不调用模型，`cause` 固定为 `unknown`，不推断问题为何在后续轮次才出现。每一批审阅是一轮：同一验证轮次的各批是相邻的几轮，`snapshot_digest` 相同，除最后一轮外 `verdict` 都是 approve。详情页在“运行信息”标签显示该表。
 
@@ -267,7 +274,7 @@ run 列表 → run 详情 → 文件查看。列表按最近事件排序，以�
 
 脚本可直接读 JSON 接口：`/api/runs`、`/api/runs/<run_id>`、`/api/runs/<run_id>/events?tail=`、`/api/runs/<run_id>/files`、`/api/runs/<run_id>/files/<相对路径>?tail=&format=json`。无效 ID 或参数 400，拒绝的路径与 Host 不匹配 403，不存在的 run 或文件 404，GET／HEAD 以外的方法 405；台账可读但摘要失败的 run 仍返回 200 并带 `summary_error`。这五个接口的 JSON 响应（文件内容在 `format=json` 时）与 JSON 格式的错误体 `{error, status, observed}`（400／403／404／409）都带同一份 `observed`，它在服务启动时算出，之后不变：`state` 是状态目录（解析后的路径），`checkout` 是检出（未知时为 null），`checkout_basis` 是 `git`（`--repo` 的 Git 根）、`path`（按状态目录路径推定，未核实）或 null，`name` 是检出（未知时取状态目录）去掉根之后的最后两段（一段也没有时是完整路径）。不是 JSON 的响应没有它：文件正文（不带 `format=json`）、页面与脚本，以及 Host 不匹配的 403、405、414、500、503 等纯文本错误；SSE 帧也没有。
 
-`GET /api/runs/<run_id>/stream` 提供 SSE，HEAD 返回 405。`ready` 与 `change` 只发送 run ID、原生后端和采样时间，页面随后读取当前投影；`unavailable` 表示订阅不可用并关闭连接。每 15 秒的注释心跳仅用于连接维护，不读取台账，也不证明模型进程存活。默认最多 2 个订阅，占用总计 8 个连接额度；断连、写入超时和服务关闭都会释放订阅。
+`GET /api/runs/<run_id>/stream` 提供 SSE，HEAD 返回 405。`ready` 与 `change` 只发送 run ID、原生后端和采样时间，页面随后读取当前投影；`unavailable` 表示订阅不可用并关闭连接。每 15 秒的注释心跳仅用于连接维护，不读取台账，也不证明模型进程存活。默认最多 2 个订阅，占用总计 8 个连接额度；订阅使用服务持有的状态根，断连、写入超时和服务关闭都会释放订阅。
 
 命令行 `watch RUN` 先订阅，再输出简短 JSONL 状态；之后每次读取台账，快照与上一次读到的不同时输出一行，两次读取之间的几次变化可能合并成一行，也可能不留下输出。快照带 `quota_wait`（额度等待记录的 `window`、`until`、`recorded_at`，没有时为 null）；快照的 `convergence` 与 `status RUN` 的是同一投影（字段见上面的返工提示），快照不带 `observed` 与 `ledger_stage`；等待期间状态仍是 `running`，`watch` 不退出。读到 completed、abandoned、blocked、interrupted、paused 或 awaiting_approval 时退出；`--follow` 可跨越这些状态继续等待，Ctrl-C 结束。`watch RUN --state /abs/archive/.harness` 可观察归档状态，不要求 Git 仓库或配置。macOS 使用 kqueue，Linux 使用 inotify 与 `/proc/self/fd`；平台不支持或订阅失败时明确报错，不回退到轮询。输出的 `process_observation=ledger_only` 表示进程信息取自台账而非探测。
 
@@ -310,17 +317,17 @@ run 列表 → run 详情 → 文件查看。列表按最近事件排序，以�
 
 ### 文件访问
 
-只能通过固定根读取 run 目录内的普通文件：顶层 `state.json`、`events.jsonl`、`handoff.json`、`worktree-cleanup.json`、`workspace-inputs.json`、`workspace-inputs-manifest.json`；目录 `plans/`、`dispatches/<uuid>/`（含 `commands/<32 位十六进制>/`）、`verification/`、`preflight/`、`recovery/`、`decisions/`、`environment/`、`checkpoints/`、`proposal-rejections/`、`continuations/`、`continuation-rejections/`、`execution-guidance/`、`path-indexes/`、`input-indexes/`、`finding-progress/`、`observations/`（额度样本），即[文件布局](#文件布局)里 run 目录下的全部证据。生成的 MCP 配置 `mcp.json`、两个空锁文件 `run.lock` 与 `store.lock`、`*.tmp` 与 `memory.sqlite3*` 按名排除；顶层其他条目在文件索引里计为“不可寻址”。离线套件在每个仓库用例结束时核对它留下的 run 目录：顶层的每个条目要么在上面的固定根里、要么按名排除，运行时新增顶层文件或目录而忘了登记会让用例失败。符号链接与非普通文件一律拒绝，中间目录在检查后被替换为符号链接也无法逃出根目录；路径深度不超过 8。文件接口不打开台账中的绝对路径；详情摘要与 `watch` 可能按台账记录的绝对路径读取指挥原件（`scope.held_view`），观察复制的 `.harness` 时也读原位置那一份。文件内容永远以 `text/plain`（或 `format=json`）返回，日志不会作为 HTML 执行。
+只能通过固定根读取 run 目录内的普通文件：顶层 `state.json`、`events.jsonl`、`handoff.json`、`worktree-cleanup.json`、`workspace-inputs.json`、`workspace-inputs-manifest.json`；目录 `plans/`、`dispatches/<uuid>/`（含 `commands/<32 位十六进制>/`）、`verification/`、`preflight/`、`recovery/`、`decisions/`、`environment/`、`checkpoints/`、`proposal-rejections/`、`continuations/`、`continuation-rejections/`、`execution-guidance/`、`path-indexes/`、`input-indexes/`、`finding-progress/`、`observations/`（额度样本），即[文件布局](#文件布局)里 run 目录下的全部证据。生成的 MCP 配置 `mcp.json`、两个空锁文件 `run.lock` 与 `store.lock`、`*.tmp` 与 `memory.sqlite3*` 按名排除；顶层其他条目在文件索引里计为“不可寻址”。离线套件在每个仓库用例结束时核对它留下的 run 目录：顶层的每个条目要么在上面的固定根里、要么按名排除，运行时新增顶层文件或目录而忘了登记会让用例失败。符号链接与非普通文件一律拒绝，中间目录在检查后被替换为符号链接也无法逃出根目录；路径深度不超过 8。文件接口与摘要以成功解析并持有的状态根为起点，拒绝根下的符号链接。只有 `status RUN` 摘要和网页详情按 run ID、dispatch ID 与固定文件名读取被持有提案的指挥原件（至多 16 MiB），记录的路径只核对末尾五级，并核对摘要。观察复制的 `.harness` 时读的是复制里的原件。缺失、拒读、超限或摘要不符时只在 `scope.held.error` 给出诊断；已判定的提问不显示为提案。`watch` 与 `abandon` 的摘要不读原件，也不显示 `scope.held`。文件内容永远以 `text/plain`（或 `format=json`）返回，日志不会作为 HTML 执行。
 
 ### 限制
 
 - 只绑定 127.0.0.1，不开放远端访问；只接受 GET／HEAD（事件流仅 GET）；同时连接最多 8 个，超出返回 503；写入阻塞的慢客户端约 10 秒后断开。
-- 服务在启动时固定持有 `.harness` 目录的描述符；目录被删除重建后需重启服务。目标项目还没有 `.harness` 目录、`.harness` 是指向自身的符号链接或只有搜索权限时，`dashboard` 报错退出 1，而 `status` 列表输出 `[]`、退出 0（前两种情况位置行末尾带 `（无法打开）`）。`.harness/runs` 本身是符号链接或不可读时，`status` 列表输出包含目录路径的诊断并退出 1。`status RUN` 的台账不用列表的符号链接拒绝规则：它从位置行所报、已经打开的状态目录出发按相对路径读取，跟随符号链接，状态目录只有搜索权限也能读；额度样本也从这个目录读取。`state.json` 是 FIFO、设备这类非普通文件时不读，以 `runtime_failure/io` 停止。
+- 服务在启动时固定持有状态目录的描述符；目录被删后重建时须重启服务才能观察新目录。状态根缺失或自身是无法解析的循环链接时，`status` 列表返回 `[]`，`dashboard` 启动失败。`status RUN` 的台账及额度样本、列表与文件接口都从各自持有的根逐级读取，拒绝链接与非普通文件。状态根与 `runs` 只有搜索权限时也可按名读取。`status` 列表枚举 `runs` 需要读与搜索权限；权限不足、`runs` 是链接或枚举遇 I/O 故障时报告 `runtime_failure/io`。`runs/<id>` 或 `state.json` 是链接，或 `state.json` 是 FIFO、设备等非普通文件时，`status RUN` 也按此类型停止。无法打开状态根（例如只有读权限，没有搜索权限）时，位置行带「（无法打开）」。
 - `python3 -m harness.dashboard --state` 指向复制或归档的 `.harness` 时，检出只是按路径推定的上级目录，那里未必是 Git 检出；解析后的目录名不是 `.harness` 时检出未知。
 - 端口被占用时启动失败、退出 1、不写位置行；不自动换端口，也不探测其他端口或检出。同一仓库的几个检出各开一个 `dashboard` 时用 `--port 0`。
 - 首／末事件时间只在 `events.jsonl` 头／尾 64 KiB 内查找；dispatch 结束时间只取尾部 64 KiB 中的事件，较早调用可能显示不可用；`state.json` 超过 64 MiB 不解析；操作记录最多扫描 1000 个文件、每个 256 KiB；文件索引最多 2000 项。
-- 无法解析的台账在列表中跳过并给诊断，详情仍尽量显示并标出 `ledger_error`；摘要失败标出 `summary_error`。解析成功但不是当前版本对象的台账（其他版本、缺版本、数组、`null`）只列路径、版本和“不支持”，详情返回 409。
-- 不汇总多个项目，不按公开单价估算账单，观察结果不改变任何预算。自动验证覆盖 HTTP、macOS 原生通知和页面脚本行为；Linux 原生通知与浏览器人工验收没有执行（见[验证记录](validation.md)）。
+- 无法解析的台账在列表中跳过并给诊断，详情仍尽量显示并标出 `ledger_error`；摘要失败标出 `summary_error`。解析成功但不是当前版本对象的台账（其他版本、缺版本、数组、`null`）只在网页列表和命令行列表的 stderr 诊断给出路径、版本和“不支持”；CLI 的 stdout 列表省略该项，网页详情返回 409。
+- 不汇总多个项目，不按公开单价估算账单，观察结果不改变任何预算。平台、浏览器及通知的已完成验证见[验证记录](validation.md)。
 
 ## worker 结果与审阅问题
 
@@ -351,7 +358,7 @@ WORK 结果可以带可选的 `checkpoints`，每项为 `{id, summary, inputs, e
 
 ## 依赖副本清单
 
-`prepare-run RUN --manifest FILE` 在 run 锁内预检主检出源文件、当前 HEAD、worktree Git 绑定、所有已登记派发和命令进程。仅接受当前台账版本（20）的 `paused` / `awaiting_approval` run，没有待消费候选、审阅、待发布的修订等阶段；其他版本的台账被拒绝。已接受任务和预算不改变。
+`prepare-run RUN --manifest FILE` 先只读预检 run ID、台账和清单的静态形状，再初始化私有状态并取 run 锁。锁内核对主检出源文件、当前 HEAD、worktree Git 绑定、所有已登记派发和命令进程。仅接受当前台账版本（20）的 `paused` / `awaiting_approval` run，没有待消费候选、审阅、待发布的修订等阶段；其他版本的台账被拒绝。已接受任务和预算不改变。
 
 清单示例（HEAD 和 SHA256 必须替换为实际值，mode 是十进制 POSIX 权限）：
 
@@ -359,7 +366,9 @@ WORK 结果可以带可选的 `checkpoints`，每项为 `{id, summary, inputs, e
 {"schema_version":1,"run_id":"run_0123456789abcdef","head":"<current expected HEAD>","source_root":".","max_files":1,"max_bytes":1048576,"files":[{"source":"deps/input.dat","destination":"vendor/input.dat","sha256":"<64 lowercase hex>","mode":420,"type":"file","ownership":"input_copy"}]}
 ```
 
-源为主检出中的普通独立文件；目标必须在隔离 worktree 中、被 Git 忽略且未跟踪。拒绝符号链接、硬链接、保留路径、隐式凭据路径、源目标重叠和未知已有目标。复制前冻结清单摘要与台账绑定，再记录意图、独占临时文件身份、发布及回执；源和副本不共享 inode。中断后仅用登记的文件身份恢复，不能凭内容相同接管文件。resume 与派发前均核验登记副本；前置核验失败不新增 worker 次数。
+源为主检出中的普通独立文件；目标必须在隔离 worktree 中、被 Git 忽略且未跟踪。拒绝符号链接、硬链接、保留路径、隐式凭据路径、源目标重叠和未知已有目标。首次准备在锁内先探查实际目标布局，核对已存在目标、名称冲突及可观察的卷规则；从实际目标父目录查询规则；需要时在同设备且命名规则匹配的私有目录试探名称。规则未知而有潜在等价冲突时拒绝；规则未知但无冲突时按现有正式发布路径处理。目标工作树只在正式复制时创建副本。能在这一步确认的冲突可修正清单后重试。没有旧登记时，通过这些检查才把清单摘要写入台账，再写冻结清单与初始回执，然后开始正式复制；只有实际创建才暴露的拒绝仍可能在冻结后出现。已有发布回执时，只按已冻结的同一清单恢复，不重新冻结或换清单。
+
+正式复制先记录意图与临时文件，再登记发布身份、发布目标并完成回执；源和副本不共享 inode。恢复和清理用登记的设备号、inode、大小、模式与 SHA-256 核对身份，不能只凭相同内容接管文件。文件系统复用 inode 且其余登记字段全等时，这些字段无法区分先后两代文件。resume 与派发前均核验登记副本；前置核验失败不新增 worker 次数。
 
 清理默认只读预览。`cleanup-run RUN --remove --remove-input-copies` 在终态与进程退出、HEAD/Git 绑定门禁通过后，整批预检源和副本未改变，再逐项记录删除意图和结果。未知或改动的文件保留；未被忽略的遗留文件仍会阻止整个 worktree 删除，其他被 Git 忽略的文件只在同时加 `--remove-ignored` 时随工作树删除（`--remove-ignored` 不能代替 `--remove-input-copies`：登记的副本还在时照样阻止）。中断可能留下已删/未删回执，重复执行仅恢复同一意图。此机制不认领构建产物、不运行任意 setup，也不将忽略的可编辑源码导入任务。
 
@@ -398,7 +407,7 @@ WORK 结果可以带可选的 `checkpoints`，每项为 `{id, summary, inputs, e
 - `<rev>` 整串匹配 7–64 位十六进制、`HEAD`、`HEAD~N` 或 `HEAD^N`（N 为 1–4 位十进制）；分支名、`@{…}`、`..`／`...` 范围、`HEAD~1junk` 都拒绝。
 - 路径按字面解释（Git 字面 pathspec，`*`、`?`、`[`、`]` 不作通配，`:(…)` 魔法拒绝），必须是仓库相对路径，最多 128 个；拒绝空路径、空段、`.`／`..` 段、绝对路径、以 `-` 或 `:` 开头的路径、NUL 和看起来像 shell 运算符或重定向的参数。
 - 含 `--` 的形式（`ls-files`、`ls-tree`、`log`、`hash-object`）中，`--` 必须恰好出现一次，且在规定位置，之后不能再有选项；`rev-parse`、`show`、`cat-file` 不接受 `--`。argv 最多 134 项，每项最多 4,096 字节。
-- 执行时显式指定 git-dir／work-tree，剔除 `GIT_*` 环境变量，固定 `--no-pager --literal-pathspecs`，关闭 fsmonitor、签名显示、颜色和协议传输。
+- 执行时显式指定 git-dir／work-tree，固定 `--no-pager --literal-pathspecs`。表内是严格只读查询，使用 Harness 的 Git 固定设置（见[不变量 16](design.md#不变量)），关闭 fsmonitor、hook、签名显示与 Git 自身的网络传输，不运行内容过滤器。
 
 输出有两个上限。**保留上限 1 MiB**：`stdout` 最多返回前 1 MiB（截断时按完整 UTF-8 字符，无法解码时用 base64 并设 `stdout_encoding`），超出时 `stdout_truncated=true`。**观测上限 64 MiB**：超过保留上限后继续读取并计入 `stdout_bytes` 与 `stdout_sha256`，直到输出结束、任一管道读满 64 MiB 或 30 秒超时。输出正常结束时 `observed_complete=true`，`stdout_bytes` 与 `stdout_sha256` 覆盖完整输出；读满观测上限（恰好 64 MiB 也算）或超时时终止整个进程组，`terminated` 为 `output_limit` 或 `timeout`，`exit_code=null`，`observed_complete=false`，字节数与摘要只覆盖已观测的前缀。其他字段：`form`、`implementation`（`git` 或 `python_blob_hash`）、`git_args`、`stdout_returned_bytes`、`retain_limit_bytes`、`observe_limit_bytes`、`stderr`（保留前 64 KiB）与 `stderr_truncated`；`hash-object` 另有 `object_format`、`file_bytes`、`file_sha256`。
 
@@ -414,7 +423,9 @@ WORK 结果可以带可选的 `checkpoints`，每项为 `{id, summary, inputs, e
 
 删除立即生效，审阅和接受门禁只决定候选能否被接受，不能撤销删除。保证见[设计的不变量 26](design.md#不变量)，不保证（并发改名）见[仍需明确的限制](design.md#隔离与进程)。
 
-每次调用（命令或删除）都先在 dispatch 的 `command-staging/` 中准备目录并写好完整的 `process.json`，再一次原子改名进 `commands/<32 位十六进制>/`；发布之前不启动子进程、不删除任何文件。发布失败或在发布前被杀时，`commands/` 里不会出现残缺目录，恢复不受影响；残留的准备目录不参与枚举，也不自动回收。命令记录包括 `output.stdout`、`output.stderr` 与 `receipt.json`；删除记录的 journal 命令 ID 为 `delete_path`，在最后一次核对前写入 `delete-intent.json`（路径、HEAD、原文件 SHA256 与字节数、时间），结束后写入 `receipt.json`，其 `outcome` 为 `deleted`、`refused`、`failed` 或 `concurrent_change`，并带 `deleted`、`sha256`、`bytes`、`concurrent_change`。只有 `deleted` 不是工具错误。每个派发的命令清单 `commands.json` 是 manifest 版本 3，含工作树根 `worktree`、建清单时根目录的身份 `root_identity`（`[st_dev, st_ino]`，`run_command` 与 `delete_path` 共用）、命令条目 `{command_id, command}` 与任务删除范围 `delete_scope`；broker 拒绝其他版本与不合格的命令条目。所有恢复和清理都核对这些子进程记录，父 dispatch 退出不能证明命令已退出。
+每次调用（命令或删除）都先在 dispatch 的 `command-staging/` 中准备目录并写好完整的 `process.json`，再一次原子改名进 `commands/<32 位十六进制>/`；发布之前不启动子进程、不删除任何文件。发布失败或在发布前被杀时，`commands/` 里不会出现残缺目录，恢复不受影响；残留的准备目录不参与枚举，也不自动回收。命令记录包括 `output.stdout`、`output.stderr` 与 `receipt.json`。取消在回执发布前结算，回执只发布一次。broker 在回执写完后才送达仍挂起的信号，此时结束连接而不向调用方返回本次响应，磁盘回执仍用于准入与封存。写入报告错误时读回核对，字节相同则认作已发布，确认没有写入则返回证据不完整；无法确认则结束连接并在 stderr 诊断。
+
+删除记录的 journal 命令 ID 为 `delete_path`，在最后一次核对前写入 `delete-intent.json`（路径、HEAD、原文件 SHA256 与字节数、时间），结束后写入 `receipt.json`，其 `outcome` 为 `deleted`、`refused`、`failed` 或 `concurrent_change`，并带 `deleted`、`sha256`、`bytes`、`concurrent_change`。只有 `deleted` 不是工具错误。每个派发的命令清单 `commands.json` 是 manifest 版本 3，含工作树根 `worktree`、建清单时根目录的身份 `root_identity`（`[st_dev, st_ino]`，`run_command` 与 `delete_path` 共用）、命令条目 `{command_id, command}` 与任务删除范围 `delete_scope`；broker 拒绝其他版本与不合格的命令条目。准入锁随清单创建，broker 只打开已有锁；发布 journal 前的准入拒绝不留证据文件。所有恢复和清理都核对这些子进程记录，父 dispatch 退出不能证明命令已退出。
 
 ## 真实账号联调
 

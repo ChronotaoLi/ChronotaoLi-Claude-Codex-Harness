@@ -7,11 +7,13 @@ import gc
 import io
 import json
 import os
+import pickle
 import queue
 import signal
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -23,7 +25,7 @@ from unittest.mock import patch
 
 import run_shards
 import stop_tripwire
-from harness import cli, operations, run_store, stops
+from harness import cli, operations, run_store, stops, workspace_inputs
 from harness.adapters import DemoBackend
 from harness.operations import OperationRecord
 from harness.receipts import SuppliedPlanHold
@@ -76,7 +78,7 @@ def test_error():
 
 
 def from_the_library(*args, **kwargs):
-    """A patched step that fails inside the standard library (json), the way G7's self-test does: not injected."""
+    """A patched step that fails inside the standard library (json), outside the injection rule."""
     return json.loads("{not json")
 
 
@@ -88,11 +90,6 @@ def publish(error):
 
 def summary(findings):
     return [(sorted(finding.channels), finding.kind, finding.reason) for finding in findings]
-
-
-def forget_g7(case):
-    """G7 (test_harness.install_stop_guards) sees the same stops; these tests assert the tripwire's view instead."""
-    getattr(case, "stop_guard_findings", {}).get("unclassified", []).clear()
 
 
 class NestedRuns(unittest.TestCase):
@@ -160,6 +157,27 @@ class NestedRuns(unittest.TestCase):
                 outcomes[case_class.__name__] = result.wasSuccessful()
                 self.assertEqual([line["exempt"] for line in lines], [exempt])
         self.assertEqual(outcomes, {"Injected": True, "Reasoned": True, "Consumed": True, "TrueOnly": False})
+
+    def test_a_whole_test_skip_reports_its_publication_and_a_subtest_skip_leaves_enforcement_active(self):
+        class Skipped(unittest.TestCase):
+            def test(inner):
+                publish(runtime_error())
+                inner.skipTest("fixture is unavailable")
+
+        class SubtestSkipped(unittest.TestCase):
+            def test(inner):
+                with inner.subTest(fixture="unavailable"):
+                    inner.skipTest("fixture is unavailable")
+                publish(runtime_error())
+
+        for case_class, failures in ((Skipped, 0), (SubtestSkipped, 1)):
+            with self.subTest(case=case_class.__name__):
+                result, _, lines = self.run_inner(case_class)
+                self.assertEqual((result.testsRun, len(result.skipped), len(result.failures), len(result.errors)),
+                                 (1, 1, failures, 0))
+                (line,) = lines
+                self.assertTrue(line["test"].endswith(f"{case_class.__name__}.test"), line)
+                self.assertEqual((line["channels"], line["exempt"]), (["cli"], None))
 
     def test_a_failure_of_the_tripwire_itself_leaves_the_call_unchanged_and_fails_the_test(self):
         class Publishes(unittest.TestCase):
@@ -536,6 +554,98 @@ class NestedRuns(unittest.TestCase):
         self.assertEqual(sorted((line["exempt"] or "-", line["where"].split(":")[0]) for line in lines),
                          [("-", "harness/stops.py"), ("injected", "tests/test_stop_tripwire.py")])
 
+    def test_the_same_exception_can_have_injected_and_unexempt_publications(self):
+        class Publishes(unittest.TestCase):
+            def test(inner):
+                error = ValueError("the same cause")
+
+                def throw():
+                    raise error
+
+                # assertRaises clears the traceback after the entry already saw the injected throw.
+                with stop_tripwire.correlate(error):
+                    with inner.assertRaises(ValueError) as caught:
+                        stop_tripwire._leaving("entry")(throw)()
+                    inner.assertIs(caught.exception, error)
+                    inner.assertIsNone(error.__traceback__)
+                    publish(error)
+                inner.assertEqual(len(stop_tripwire._frame().publications), 2)
+
+        result, results, lines = self.run_inner(Publishes)
+        self.assertEqual((len(result.failures), len(result.errors), len(results)), (1, 0, 1))
+        (line,) = lines
+        self.assertEqual((line["channels"], line["error_type"], line["exempt"]),
+                         (["cli", "entry"], "ValueError", None))
+        self.assertRegex(line["where"], r"^tests/test_stop_tripwire\.py:\d+$")
+
+    def test_an_allowance_covers_only_publications_made_while_it_applies(self):
+        class Publishes(unittest.TestCase):
+            allow_unclassified = "first publication is the subject of the test"
+
+            def test(inner):
+                error = runtime_error()
+                publish(error)
+                inner.allow_unclassified = True
+                publish(error)
+                inner.allow_unclassified = "a final allowance cannot cover the second publication"
+
+        result, results, lines = self.run_inner(Publishes)
+        self.assertEqual((len(result.failures), len(result.errors), len(results)), (1, 0, 1))
+        (line,) = lines
+        self.assertEqual((line["channels"], line["exempt"], line["allow_unclassified"]), (["cli"], None, True))
+
+    def test_uncovered_value_only_publications_keep_their_causes_diagnostic(self):
+        class Publishes(unittest.TestCase):
+            allow_unclassified = "capture the runtime exception before publishing the same projection again"
+
+            def test(inner):
+                operation = "op_value_details"
+                _, record = LedgerAndRecordChannels.record(
+                    inner, {"operation_id": operation, "run_id": None, "status": "running", "stop": None})
+                error = runtime_error()
+                with contextlib.redirect_stderr(io.StringIO()):
+                    cli.report_stop(ValueError("different diagnostic"), operation_id=operation)
+                    value = cli.report_stop(error, operation_id=operation)
+                    inner.allow_unclassified = ""
+                    cli.stop_notice(value, None, operation)
+                    record.finish(exit_status=1, stop=value)
+
+        result, results, lines = self.run_inner(Publishes)
+        self.assertEqual((len(result.failures), len(result.errors), len(results)), (1, 0, 1))
+        (line,) = lines
+        self.assertEqual((line["channels"], line["error_type"], line["exempt"], line["allow_unclassified"]),
+                         (["cli", "cli_notice", "record"], "HarnessError", None, ""))
+        self.assertRegex(line["where"], r"^harness/stops\.py:\d+$")
+        self.assertEqual(line["where"], line["site"])
+        self.assertIn(f"HarnessError at {line['where']}: {line['text']}", result.failures[0][1])
+
+    def test_value_only_publications_inherit_injection_within_their_operation(self):
+        class Publishes(unittest.TestCase):
+            def test(inner):
+                error = test_error()
+                operation = "op_fixture"
+                value = stops.project(stops.of(error), None)
+                _, record = LedgerAndRecordChannels.record(
+                    inner, {"operation_id": operation, "run_id": None, "status": "running", "stop": None})
+                with contextlib.redirect_stderr(io.StringIO()):
+                    cli.stop_notice(value, None, operation)
+                    record.finish(exit_status=1, stop=value)
+                    cli.report_stop(error, operation_id=operation)
+                    if inner.include_runtime:
+                        cli.report_stop(runtime_error(), operation_id=operation)
+
+        for include_runtime in (False, True):
+            with self.subTest(include_runtime=include_runtime):
+                Publishes.include_runtime = include_runtime
+                result, results, lines = self.run_inner(Publishes)
+                self.assertEqual((len(result.failures), len(result.errors), len(results)),
+                                 (int(include_runtime), 0, 1))
+                (line,) = lines
+                self.assertEqual((line["channels"], line["exempt"]),
+                                 (["cli", "cli_notice", "record"], None if include_runtime else "injected"))
+                if include_runtime:
+                    self.assertRegex(line["where"], r"^harness/stops\.py:\d+$")
+
 
 class HeldSignals(unittest.TestCase):
     """Real signals sent to this test's own thread, the main thread, while a step of the tripwire runs there."""
@@ -611,7 +721,8 @@ class HeldSignals(unittest.TestCase):
                                      ["AssertionError: a watchdog fired"])
                     self.assertEqual((order, len(lines), lost), (["handler", "report.jsonl"], 1, []))
                 else:
-                    self.assertEqual(result.failures, [])
+                    (_, text), = result.failures
+                    self.assertIn("AssertionError: stop tripwire: ['cli'] unclassified/untyped_harness_error", text)
                     self.assertEqual((order, lines), (["handler", "report.jsonl.incomplete"], []))
                     self.assertEqual([(entry["lines"], entry["error"]) for entry in lost],
                                      [(1, f"InterruptedError: [Errno {errno.EINTR}] the test's own SIGINT handler")])
@@ -984,11 +1095,11 @@ class LedgerAndRecordChannels(unittest.TestCase):
             finally:
                 release.set()   # on every way out: the other finish goes on, and leaving the pool joins it
             pending.result(10)
-        self.assertEqual(late, [], "the interleaving did not happen: the other finish gave up waiting for its turn")
         self.assertEqual(read_json(path), writer.record)
         found = stop_tripwire.consume(self)
         self.assertEqual(summary(found), [(["record"], "unclassified", "untyped_harness_error")])
         self.assertEqual(found[0].errors, (id(error),))
+        self.assertEqual(late, [], "the interleaving did not happen: the other finish gave up waiting for its turn")
 
     def test_an_interleaving_that_did_not_happen_in_time_fails_its_test_and_leaves_no_thread(self):
         # The designated writer is held back until the other call ended, so the other one can only give up waiting.
@@ -1048,6 +1159,10 @@ class Registration(unittest.TestCase):
                 note("repr")
                 return "Observed()"
 
+            def __reduce__(self):
+                note("reduce")
+                return super().__reduce__()
+
             @property
             def stop(self):   # stops.of reads it with getattr; a registration looks it up without running it
                 note("stop")
@@ -1100,8 +1215,9 @@ class Registration(unittest.TestCase):
                 sys.setprofile(previous)
         self.assertIsNone(escaped)
         self.assertEqual(result.errors, [])
-        self.assertEqual([text.splitlines()[-1] for _, text in result.failures],
-                         ["AssertionError: stop tripwire: tripwire error: Observed: a fault of the tripwire"])
+        (_, text), = result.failures
+        self.assertIn("['cli_notice'] unclassified/untyped_harness_error", text)
+        self.assertIn("tripwire error: Observed: a fault of the tripwire", text)
         self.assertEqual(held, [])
         self.assertTrue({"_seen", "_published", "_wrote"} <= set(steps), steps)   # registrations did run meanwhile
         # Reporting, where signals come as they come, did what a registration may not: the watch saw it.
@@ -1140,6 +1256,117 @@ class Registration(unittest.TestCase):
         self.assertEqual([reference() for reference in references], [None] * 4)
         self.assertEqual(summary(stop_tripwire.consume(self)), [(["cli"], "unclassified", "untyped_harness_error"),
                                                                 (["entry"], "unclassified", "untyped_harness_error")])
+
+    def test_same_site_repeated_errors_keep_each_entry_and_cli_pair_distinct(self):
+        for error_type in (ValueError, KeyError, TypeError, RecursionError, HarnessError, json.JSONDecodeError):
+            with self.subTest(error_type=error_type):
+                def one_publication_pair():
+                    error = (error_type("process failure", "", 0) if error_type is json.JSONDecodeError
+                             else error_type("process failure"))
+
+                    def fail():
+                        raise error
+
+                    with stop_tripwire.correlate(error):
+                        try:
+                            stop_tripwire._leaving("entry")(fail)()
+                        except error_type as caught:
+                            publish(caught)
+
+                for _ in range(16):
+                    one_publication_pair()
+                self.assertEqual(len(stop_tripwire._frame().publications), 32)
+                findings = stop_tripwire.consume(self)
+                self.assertEqual(len(findings), 16)
+                self.assertEqual({item.channels for item in findings}, {frozenset(("entry", "cli"))})
+                self.assertEqual({item.exempt for item in findings}, {"injected"})
+                self.assertTrue(all("process failure" in item.facts["text"] for item in findings))
+
+    def test_watching_builtins_preserves_json_copy_and_pickle_state(self):
+        for error_type in (ValueError, KeyError, TypeError, RuntimeError, RecursionError, AssertionError):
+            for with_state in (False, True):
+                with self.subTest(error_type=error_type, with_state=with_state):
+                    error = error_type("diagnostic")
+                    expected = {"origin": "fixture"} if with_state else {}
+                    if with_state:
+                        error.origin = expected["origin"]
+                    serialized = pickle.dumps(error)
+                    reduction = BaseException.__reduce__(error)
+                    publish(error)
+                    self.assertEqual(BaseException.__reduce__(error), reduction)
+                    self.assertEqual(pickle.dumps(error), serialized)
+                    for copied in (copy.copy(error), copy.deepcopy(error), pickle.loads(serialized)):
+                        self.assertIsNot(copied, error)
+                        self.assertEqual((copied.args, vars(copied)), (error.args, expected))
+                    self.assertEqual(json.dumps(vars(error)), json.dumps(expected))
+        stop_tripwire.consume(self)
+
+    def test_watching_classified_entries_keeps_exception_state_and_identity(self):
+        for error in (OSError(errno.EIO, "failed"), KeyboardInterrupt("interrupt"), SystemExit(3)):
+            with self.subTest(error_type=type(error)):
+                def fail():
+                    raise error
+
+                serialized = pickle.dumps(error)
+                self.assertIs(raised(stop_tripwire._leaving("entry")(fail)), error)
+                self.assertEqual(pickle.dumps(error), serialized)
+                self.assertEqual(vars(error), {})
+        self.assertEqual(stop_tripwire.consume(self), [])
+
+    def test_a_fixture_can_correlate_the_same_builtin_through_state_cleanup_and_distinguish_copies(self):
+        error = ValueError("process failure")
+        error.origin = "fixture"
+        with stop_tripwire.correlate(error) as lifetime:
+            publish(error)
+            for copied in (copy.copy(error), copy.deepcopy(error), pickle.loads(pickle.dumps(error))):
+                self.assertIsNot(copied, error)
+                self.assertEqual((copied.args, vars(copied)), (error.args, {"origin": "fixture"}))
+                publish(copied)
+            vars(error).clear()
+            publish(error)
+            self.assertEqual(vars(error), {})
+        self.assertIsNone(lifetime.error)
+        self.assertEqual(len(stop_tripwire._frame().publications), 5)
+        findings = stop_tripwire.consume(self)
+        self.assertEqual([(item.channels, item.exempt) for item in findings], [(frozenset({"cli"}), "consume")] * 4)
+
+    def test_a_builtin_republished_without_a_shared_lifetime_has_independent_observations(self):
+        error = ValueError("independently published")
+        publish(error)
+        publish(error)
+        self.assertEqual(len(stop_tripwire.consume(self)), 2)
+
+    def test_a_builtin_publication_releases_its_traceback_and_descriptor_before_reporting(self):
+        class OwnedDescriptor:
+            def __init__(self):
+                self.fd = os.open(os.devnull, os.O_RDONLY)
+
+            def __del__(self):
+                os.close(self.fd)
+
+        descriptors = []
+
+        def fail():
+            owned = OwnedDescriptor()
+            descriptors.append((owned.fd, weakref.ref(owned)))
+            raise ValueError("process failure")
+
+        def through_entry():
+            try:
+                stop_tripwire._leaving("entry")(fail)()
+            except ValueError:
+                pass
+
+        through_entry()
+        gc.collect()
+        (fd, reference), = descriptors
+        self.assertIsNone(reference())
+        with self.assertRaises(OSError) as closed:
+            os.fstat(fd)
+        self.assertEqual(closed.exception.errno, errno.EBADF)
+        self.assertEqual(len(stop_tripwire._frame().publications), 1)
+        (finding,) = stop_tripwire.consume(self)
+        self.assertEqual((finding.channels, finding.exempt), (frozenset({"entry"}), "injected"))
 
     def test_an_exception_that_is_gone_is_never_taken_for_a_later_one_at_its_address(self):
         # Registration keeps an exception's id, not the exception: once it is gone, a later one may get its address.
@@ -1536,6 +1763,7 @@ class Steps(unittest.TestCase):
             raise unittest.SkipTest("every test of the class is skipped")
 
     def test_one(self):
+        self.allow_unclassified = "Use a runtime refusal as the signal rendezvous and measure the handler's result."
         if mode == "body_pending":
             leave()
         elif mode != "tear_down_class":
@@ -1749,6 +1977,22 @@ class Flows(RepoCase):
         engine.start("Implement greet", read_json(ROOT / "examples" / "plan.json"), pause_after_plan=True)
         return engine
 
+    def test_demo_builtin_stop_is_one_finding_across_the_nested_cli_call(self):
+        def fail_step(*args, **kwargs):
+            Path("left").relative_to("right")
+
+        stderr = io.StringIO()
+        with patch.object(tempfile, "tempdir", str(self.outside)), patch.object(Scheduler, "next_step", fail_step), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(stderr):
+            code = cli.main(["--repo", str(self.repo), "demo"])
+        self.assertEqual(code, 1, stderr.getvalue())
+        ledger, = self.outside.glob("personal-harness-demo-*/.harness/runs/*/state.json")
+        self.assertEqual(read_json(ledger)["status"], "blocked")
+        findings = stop_tripwire.consume(self)
+        self.assertEqual(summary(findings), [(["cli", "entry", "ledger"], "unclassified", "unexpected_exception")])
+        self.assertEqual(findings[0].facts["error_type"], "ValueError")
+        self.assertEqual(len(findings[0].errors), 1)
+
     def test_one_cli_operation_is_one_finding_and_two_operations_are_two(self):
         engine = self.paused()
         with patch.object(Scheduler, "next_step", from_the_library):
@@ -1762,7 +2006,6 @@ class Flows(RepoCase):
         self.assertEqual(summary(found), [(["cli", "entry", "ledger", "record"], "unclassified",
                                            "unexpected_exception")] * 2)
         self.assertEqual([finding.facts["error_type"] for finding in found], ["JSONDecodeError"] * 2)
-        forget_g7(self)
 
     def test_two_direct_resumes_are_two_findings(self):
         engine = self.paused()
@@ -1772,7 +2015,48 @@ class Flows(RepoCase):
                     self.engine().resume(engine.run["id"], approve_plan=approve)
         self.assertEqual(summary(stop_tripwire.consume(self)),
                          [(["entry", "ledger"], "unclassified", "unexpected_exception")] * 2)
-        forget_g7(self)
+
+    def test_native_builtin_stops_keep_the_same_cause_through_cli_and_direct_calls(self):
+        engine = self.paused()
+
+        def from_pathlib(*args, **kwargs):
+            Path("left").relative_to("right")
+
+        def from_stops(*args, **kwargs):
+            stops.make("no such kind", "no such reason")
+
+        ident = engine.run["id"]
+        with patch.object(Scheduler, "next_step", from_pathlib):
+            with self.assertRaises(ValueError):
+                self.engine().resume(ident, approve_plan=True)
+            for _ in range(2):
+                code, errors = run_cli(self, DemoBackend(), ["resume", ident])
+                self.assertEqual(code, 1, errors)
+        with patch.object(Scheduler, "next_step", from_stops), self.assertRaises(KeyError):
+            run_cli(self, DemoBackend(), ["resume", ident])
+
+        found = stop_tripwire.consume(self)
+        self.assertEqual([sorted(item.channels) for item in found],
+                         [["entry", "ledger"], ["cli", "entry", "ledger", "record"],
+                          ["cli", "entry", "ledger", "record"], ["entry", "escape", "ledger", "record"]])
+        self.assertEqual([len(item.errors) for item in found], [1] * 4)
+        self.assertEqual([item.facts["error_type"] for item in found], ["ValueError"] * 3 + ["KeyError"])
+        self.assertEqual(stop_tripwire._calls("causes"), [])
+
+    def test_builtin_prepare_run_entry_reaches_the_cli_without_an_operation_id(self):
+        engine = self.paused()
+
+        def fail_precheck(*args, **kwargs):
+            Path("left").relative_to("right")
+
+        argv = ["prepare-run", engine.run["id"], "--manifest", str(engine.directory / "manifest.json")]
+        with patch.object(workspace_inputs, "precheck_run", fail_precheck):
+            for _ in range(2):
+                code, errors = run_cli(self, DemoBackend(), argv)
+                self.assertEqual(code, 1, errors)
+        findings = stop_tripwire.consume(self)
+        self.assertEqual(summary(findings), [(["cli", "entry"], "unclassified", "unexpected_exception")] * 2)
+        self.assertEqual([len(item.errors) for item in findings], [1, 1])
 
     def test_one_exception_through_the_entry_and_the_cli_is_one_finding(self):
         engine = self.paused()
@@ -1781,7 +2065,6 @@ class Flows(RepoCase):
         self.assertEqual(code, 1, errors)
         self.assertEqual(summary(stop_tripwire.consume(self)),
                          [(["cli", "entry"], "unclassified", "unexpected_exception")])
-        forget_g7(self)
 
     def test_an_unclassified_exception_escaping_the_cli_is_a_finding(self):
         deep = []
@@ -1801,7 +2084,6 @@ class Flows(RepoCase):
         with patch.object(Scheduler, "next_step", from_the_library), self.assertRaises(ValueError):
             self.engine().resume(engine.run["id"], approve_plan=True)
         stop_tripwire.consume(self)
-        forget_g7(self)
         saved = read_json(engine.directory / "state.json")
         self.assertEqual(saved["stop"]["kind"], "unclassified")
         # resume returns that saved ledger: operate's success branch prints its stop line and records it.

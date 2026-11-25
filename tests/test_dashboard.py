@@ -1,5 +1,6 @@
 """Local read-only dashboard over real HTTP: routes, file boundaries, limits, read-only proofs."""
 import contextlib
+import errno
 import fcntl
 import hashlib
 import http.client
@@ -21,7 +22,7 @@ import uuid
 from pathlib import Path
 from unittest.mock import patch
 
-from harness import cli, dashboard, observe, stops
+from harness import cli, dashboard, observe, state_files, stops
 from harness.cli import status_summary
 from harness.dashboard_page import APP_JS
 from harness.util import HarnessError, read_json, write_json
@@ -156,6 +157,80 @@ class DashboardCase(RepoCase):
 
 
 class RouteTests(DashboardCase):
+    def test_server_close_waits_for_a_request_reading_the_held_root(self):
+        state = self.repo / ".harness"
+        state.mkdir()
+        server = self.start_server(state)
+        reading, release_read, close_attempt, closed = (threading.Event() for _ in range(4))
+        results, failures = [], []
+        read_runs, gate = server.observer.list_runs, server._read_gate
+
+        class RecordingGate:
+            def __enter__(self):
+                if threading.current_thread() is closer:
+                    close_attempt.set()
+                return gate.__enter__()
+
+            def __exit__(self, *exc):
+                gate.__exit__(*exc)
+
+        def read():
+            reading.set()
+            if not release_read.wait(5):
+                raise AssertionError("timed out waiting for test to release HTTP read")
+            return read_runs()
+
+        def request():
+            try:
+                results.append(self.request(server, "/api/runs"))
+            except Exception as error:
+                failures.append(error)
+
+        def close():
+            server.server_close()
+            closed.set()
+
+        reader = threading.Thread(target=request)
+        closer = threading.Thread(target=close)
+        server._read_gate = RecordingGate()
+        with patch.object(server.observer, "list_runs", read):
+            reader.start()
+            try:
+                self.assertTrue(reading.wait(5))
+                closer.start()
+                self.assertTrue(close_attempt.wait(5))
+                self.assertFalse(closed.is_set())
+                self.assertTrue(server.observer.reader.opened)
+            finally:
+                release_read.set()
+                reader.join(5)
+                if closer.ident is not None:
+                    closer.join(5)
+        self.assertFalse(reader.is_alive())
+        self.assertTrue(closed.is_set())
+        self.assertFalse(server.observer.reader.opened)
+        self.assertEqual(failures, [])
+        (status, _, body), = results
+        self.assertEqual((status, json.loads(body)["runs"]), (200, []))
+
+
+    def test_ledger_read_failure_retains_http_refusal(self):
+        state = self.repo / ".harness"
+        ledger = state / "runs" / "run_read" / "state.json"
+        write_json(ledger, {"schema_version": RUN_SCHEMA_VERSION, "id": "run_read"})
+        server = self.start_server(state)
+        real_open = os.open
+
+        def fail_ledger(name, flags, mode=0o777, *, dir_fd=None):
+            if dir_fd is not None and name == "state.json":
+                raise OSError(errno.EIO, "ledger open fixture")
+            return real_open(name, flags, mode, dir_fd=dir_fd)
+
+        with patch.object(state_files.os, "open", fail_ledger):
+            status, _, body = self.request(server, "/api/runs/run_read")
+        self.assertEqual((status, json.loads(body)["status"]), (403, 403))
+        self.assertIn(os.strerror(errno.EIO), json.loads(body)["error"])
+
     def test_routes_status_codes_origin_checks_and_security_headers(self):
         run_id, _ = self.demo_run()
         server = self.start_server()
@@ -549,13 +624,13 @@ class ServeEntryTests(RepoCase):
                 self.assertNotIn("Traceback", errors.getvalue())
         self.assertFalse((base / "absent").exists())
 
-    def test_shared_server_errors_keep_original_type_and_cause(self):
+    def test_shared_server_errors_keep_the_opening_outcome(self):
         state = self.repo / "missing" / ".harness"
         output, errors = io.StringIO(), io.StringIO()
         for start in (dashboard.create_server, lambda state, port: dashboard.serve(
                 state, port, stdout=output, stderr=errors)):
-            for given, port, failure in ((state, 70000, None), (state, 0, FileNotFoundError),
-                                         (str(state) + "\x00", 0, ValueError)):
+            for given, port, failure in ((state, 70000, None), (state, 0, observe.NotFound),
+                                         (str(state) + "\x00", 0, observe.ReadFailed)):
                 with self.subTest(given=given, port=port, start=start):
                     with self.assertRaises(HarnessError) as caught:
                         start(given, port)
@@ -566,9 +641,10 @@ class ServeEntryTests(RepoCase):
                     if failure is None:
                         self.assertIsNone(cause)
                     else:
-                        self.assertIs(type(cause), observe.NotFound)
-                        self.assertIs(type(cause.__cause__), failure)
-                        self.assertIsNone(cause.__cause__.__cause__)
+                        self.assertIs(type(cause), failure)
+                        self.assertEqual(cause.step.level, "root")
+                        if isinstance(cause, observe.ReadFailed):
+                            self.assertEqual((cause.errno, cause.error_type), (errno.EINVAL, "OSError"))
         self.assertEqual((output.getvalue(), errors.getvalue()), ("", ""))
         self.assertFalse(state.parent.exists())
 
@@ -738,9 +814,9 @@ class CLIWiringTests(RepoCase):
         self.assertNotIn("Traceback", errors)
         stop = cli_notice(errors)
         self.assertEqual((stop["kind"], stop["reason"]), ("runtime_failure", "io"))
-        with self.assertRaises(observe.NotFound) as cause:
+        with self.assertRaises(observe.PathRefused) as cause:
             observe.StateReader(self.repo / ".harness", required=True)
-        self.assertEqual(stop["data"]["error_type"], type(cause.exception.__cause__).__name__)
+        self.assertEqual(stop["data"]["error_type"], observe.error_type(cause.exception))
         self.assertTrue((self.repo / ".harness").is_symlink())
 
 

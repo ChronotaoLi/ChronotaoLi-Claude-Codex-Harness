@@ -1,5 +1,4 @@
 import contextlib
-import errno
 import io
 import json
 import tempfile
@@ -30,8 +29,7 @@ class WatchCliTests(unittest.TestCase):
         class Watcher:
             backend = "fixture"
             def __init__(self, *args): self.calls = 0
-            def __enter__(self): return self
-            def __exit__(self, *args): pass
+            def close(self): pass
             def wait(self, seconds):
                 self.calls += 1
                 if self.calls == 1:
@@ -69,8 +67,7 @@ class WatchCliTests(unittest.TestCase):
         class Watcher:
             backend = "fixture"
             def __init__(self, *args): pass
-            def __enter__(self): return self
-            def __exit__(self, *args): pass
+            def close(self): pass
             def wait(self, seconds):
                 write_json(path, ledgers.pop(0))
                 return True
@@ -105,8 +102,9 @@ class WatchCliTests(unittest.TestCase):
         class Watcher:
             backend = "fixture"
             def __init__(self, *args): pass
-            def __enter__(self): return self
-            def __exit__(self, *args): closed.append(True)
+            def close(self):
+                if not closed:
+                    closed.append(True)
             def wait(self, seconds): raise KeyboardInterrupt()
         with patch("harness.watch_cli.RunWatcher", Watcher), self.assertRaises(KeyboardInterrupt):
             watch_run(self.state, "run_test", follow=True, stdout=io.StringIO())
@@ -132,8 +130,7 @@ class WatchCliTests(unittest.TestCase):
                 self.assertIsNone(caught.exception.stop)
                 cause = caught.exception.__cause__
                 self.assertIs(type(cause), observe.NotFound)
-                self.assertEqual(cause.__cause__.errno, errno.ENOENT)
-                self.assertEqual(Path(cause.__cause__.filename).name, missing)
+                self.assertEqual(Path(cause.step.name).name, missing)
                 self.assertEqual(output.getvalue(), "")
 
     def test_watch_keeps_shared_ledger_refusals_untyped(self):

@@ -4,13 +4,15 @@
 
 Test IDs are collected with standard discovery, exactly as by
 ``python3 -m unittest discover -s tests``; a test ID collected more than once
-fails the run before any shard starts.  Modules are split into groups by
-test count, and each group runs as ``python3 -m unittest -v <modules>`` (led by
-``stop_tripwire`` when ``tests/stop_tripwire.py`` exists) in its
-own process with the repository root as cwd and ``tests/`` on PYTHONPATH, so
+fails the run before any shard starts.  Modules stay together unless their
+sole test class opts into method sharding and discovery finds no shared
+fixture or custom loading.  Each group uses unittest's CLI loader and text
+runner (loading ``stop_tripwire`` first when ``tests/stop_tripwire.py`` exists)
+in its own process with the repository root as cwd and ``tests/`` on PYTHONPATH, so
 test modules keep importing each other by top-level name (``test_x``, never
-``tests.test_x``).  Afterwards every log's per-test result lines are parsed and
-the executed IDs are compared with the collected IDs as multisets.
+``tests.test_x``).  The runner's own writes are copied separately from test
+stderr for outcome accounting.  The executed IDs are compared with the
+collected IDs as multisets.
 
 The exit status is non-zero when collection repeats a test ID, a shard exits
 non-zero, a module fails to import, a log cannot be fully accounted for, or a
@@ -30,6 +32,7 @@ import sys
 import tempfile
 import threading
 import time
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -43,6 +46,9 @@ FIXTURES = frozenset({"setUpModule", "tearDownModule", "setUpClass", "tearDownCl
 STOP_GRACE = 10.0
 LIST_LIMIT = 50
 TRIPWIRE = "stop_tripwire"   # tests/stop_tripwire.py: no test of its own; it watches the tests of its process
+# Rough load per unmeasured test, estimated from P9 shard runtimes.
+ORDINARY_TEST_SECONDS = 4.34
+
 # The stderr line the tripwire of the collection or of a shard writes at exit when its report file could not be
 # written (test results stand): this prefix, ": ", then one JSON object in printable ASCII, so no path or error text
 # in it can end the line.
@@ -52,6 +58,7 @@ INCOMPLETE_TITLE = "stop tripwire report incomplete (test results unaffected)"
 # Runs in a child process (cwd = root) so test imports never touch this process.
 _COLLECT = r'''
 import json, sys, unittest
+from types import FunctionType, MethodType
 
 def flatten(suite):
     for item in suite:
@@ -60,19 +67,100 @@ def flatten(suite):
         else:
             yield item
 
-modules = []
+def lifecycle_function(cls, name):
+    method = getattr(cls, name, None)
+    return getattr(method, "__func__", method)
+
+def independent_methods(module, suite, tests, ids):
+    if not tests:
+        return {}
+    cls = type(tests[0])
+    if cls.__dict__.get("shard_methods") is not True:
+        return {}
+    # Package hooks can own the discovery and lifecycle of their descendants.
+    package = module.__package__
+    while package:
+        if getattr(sys.modules.get(package), "load_tests", None) is not None:
+            return {}
+        package = package.rpartition(".")[0]
+    if (type(suite) is not unittest.TestSuite
+            or any(type(child) is not unittest.TestSuite for child in suite)
+            or hasattr(module, "__path__")
+            or any(getattr(module, hook, None) is not None
+                   for hook in ("setUpModule", "tearDownModule"))
+            or cls.__module__ != module.__name__
+            or getattr(module, cls.__name__, None) is not cls
+            or any(type(test) is not cls for test in tests)
+            or getattr(cls, "_class_cleanups", None)):
+        return {}
+    if any(lifecycle_function(cls, name) is not lifecycle_function(unittest.TestCase, name)
+           for name in ("setUpClass", "tearDownClass", "doClassCleanups", "__init__", "__call__", "run", "id")):
+        return {}
+    prefix = module.__name__ + "." + cls.__name__ + "."
+    hints = cls.__dict__.get("shard_seconds")
+    hints = hints if type(hints) is dict else {}
+    weights = {}
+    for test, test_id in zip(tests, ids):
+        method = test._testMethodName
+        # Named loads treat static methods, class methods and other callables as factories.
+        if (test_id != prefix + method or not isinstance(getattr(cls, method, None), FunctionType)
+                or not isinstance(getattr(test, method, None), MethodType)):
+            return {}
+        seconds = hints.get(method)
+        weights[test_id] = seconds if type(seconds) in (int, float) and 0 < seconds <= sys.float_info.max else None
+    return weights
+
+module_suites = []
+custom_loads = set()
+
+class ModuleLoad:
+    # Forward unittest's own lookups without probing the hook separately. Its
+    # final load_tests lookup decides whether it calls the hook.
+    def __init__(self, module):
+        self.module = module
+        self.used_hook = False
+
+    def __dir__(self):
+        return dir(object.__getattribute__(self, "module"))
+
+    def __getattribute__(self, name):
+        module = object.__getattribute__(self, "module")
+        if name != "load_tests":
+            return getattr(module, name)
+        self.used_hook = False
+        hook = getattr(module, name)
+        self.used_hook = hook is not None
+        return hook
 
 class Loader(unittest.TestLoader):
     def loadTestsFromModule(self, module, *args, **kwargs):
-        suite = super().loadTestsFromModule(module, *args, **kwargs)
-        modules.append([module.__name__, [test.id() for test in flatten(suite)]])
+        observed = ModuleLoad(module)
+        suite = super().loadTestsFromModule(observed, *args, **kwargs)
+        if object.__getattribute__(observed, "used_hook"):
+            custom_loads.add(module.__name__)
+        tests = list(flatten(suite))
+        module_suites.append((module, suite, tests, [test.id() for test in tests]))
         return suite
 
 loader = Loader()
 suite = loader.discover(sys.argv[1], pattern=sys.argv[2])
 failed = [test.id() for test in flatten(suite) if test.id().startswith("unittest.loader._FailedTest.")]
+modules = [[module.__name__, ids] for module, _, _, ids in module_suites]
+methods = {}
+# Import-time module cleanups live in one unittest-wide stack with no owner metadata.
+# Inspect it after all imports, including imports by other tests or package hooks.
+if not getattr(unittest.case, "_module_cleanups", None):
+    for module, suite, tests, ids in module_suites:
+        if module.__name__ in custom_loads:
+            continue
+        weights = independent_methods(module, suite, tests, ids)
+        if weights:
+            methods[module.__name__] = weights
 with open(sys.argv[3], "w", encoding="utf-8") as handle:
-    json.dump({"modules": modules, "failed": failed, "errors": loader.errors}, handle)
+    data = {"modules": modules, "failed": failed, "errors": loader.errors}
+    if methods:
+        data["independent_methods"] = methods
+    json.dump(data, handle)
 '''
 
 
@@ -88,6 +176,7 @@ class Collection:
     failed_modules: list
     errors: list
     report_incomplete: list = field(default_factory=list)  # the collecting process's REPORT_INCOMPLETE lines
+    independent_methods: dict = field(default_factory=dict)  # module -> test ID -> optional seconds
 
     @property
     def ids(self):
@@ -124,7 +213,7 @@ def collect(root, pattern, out_dir, python=sys.executable):
     for name, ids in data["modules"]:
         modules.setdefault(name, []).extend(ids)
     failed = sorted({test_id[len(FAILED_IMPORT):] for test_id in data["failed"]})
-    return Collection(modules, failed, data["errors"], incomplete)
+    return Collection(modules, failed, data["errors"], incomplete, data.get("independent_methods", {}))
 
 
 def split(counts, shards):
@@ -144,14 +233,32 @@ def split(counts, shards):
     return [sorted(group) for group in groups if group]
 
 
+def plan_groups(collection, shards, root=None, pattern=DEFAULT_PATTERN):
+    """Balance whole modules and discovered independent methods in the same units.
+
+    The discovery result already reflects the caller's root and pattern.
+    """
+    counts = {name: len(ids) for name, ids in collection.modules.items() if ids}
+    if shards == 1 or not collection.independent_methods:
+        return split(counts, shards)
+    weights = {name: count * ORDINARY_TEST_SECONDS for name, count in counts.items()
+               if name not in collection.independent_methods}
+    for methods in collection.independent_methods.values():
+        weights.update((test_id, seconds or ORDINARY_TEST_SECONDS) for test_id, seconds in methods.items())
+    return split(weights, shards)
+
+
 # --- log parsing -------------------------------------------------------------
 
 _ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
-# "name (module.Class.name) ... " as written by TextTestResult.startTest, with an
-# optional docstring line between the description and the dots.
-_START = re.compile(r"^(?P<name>[^\s()]+) \((?P<target>[^\s()]+)\)(?:\n[^\n]*?)? \.\.\. ", re.M)
-_SUBTEST = re.compile(r"^  (?P<name>[^\s()]+) \((?P<target>[^\s()]+)\) .* \.\.\. (?P<status>FAIL|ERROR)$", re.M)
-_STATUS = r"ok|FAIL|ERROR|expected failure|unexpected success|skipped (?:'.*'|\".*\")"
+# TextTestResult.startTest writes its description at the current stderr position. A cleanup can
+# leave text on that line; the method repeated inside the parentheses identifies the actual start.
+_START = re.compile(r"(?<![^\s()])(?P<name>[^\s()]+) \((?P<target>[^\s()]+)\)")
+_DELIMITER = re.compile(r"(?:\n[^\n]*?)? \.\.\. ")
+_SKIP = r"skipped (?:'.*'|\".*\")"
+_STATUS = rf"ok|FAIL|ERROR|expected failure|unexpected success|{_SKIP}"
+_SUBTEST = re.compile(rf"^  [^\s()]+ \([^\s()]+\) .+(?:\n[^\n]*?)? \.\.\. (?P<status>FAIL|ERROR|{_SKIP})$", re.M)
+_SKIP_LINE = re.compile(_SKIP)
 _STATUS_LINE = re.compile(_STATUS)
 _STATUS_HEAD = re.compile(rf"(?:{_STATUS})(?=\n|\Z)")
 _STATUS_TAIL = re.compile(rf"(?:{_STATUS})$")
@@ -190,14 +297,17 @@ class ParsedLog:
     report_incomplete: list = field(default_factory=list)  # REPORT_INCOMPLETE lines, decoded
 
 
-_INCOMPLETE = re.compile(rf"^{re.escape(REPORT_INCOMPLETE)}: (.*)$", re.M)
+_INCOMPLETE_PREFIX = re.escape(REPORT_INCOMPLETE + ": ")
+# The tripwire can write immediately after an unterminated diagnostic. A joined
+# warning starts its JSON object there. Keep the unreadable fallback for cut lines.
+_INCOMPLETE = re.compile(rf"(?:^{_INCOMPLETE_PREFIX}|{_INCOMPLETE_PREFIX}(?=\{{))(.*)$", re.M)
 
 
 def report_incomplete(text):
     """The REPORT_INCOMPLETE lines of a process's stderr, each decoded from its JSON (``{"unreadable": line}`` when
     that fails, e.g. a line cut short)."""
     entries = []
-    for match in _INCOMPLETE.finditer(text):
+    for match in _INCOMPLETE.finditer(_ANSI.sub("", text)):
         try:
             entry = json.loads(match[1])
         except ValueError:
@@ -211,7 +321,31 @@ def _test_id(name, target):
     return target if target.endswith("." + name) else f"{target}.{name}"
 
 
-def _statuses(segment):
+def _fixture(name, target):
+    return name in FIXTURES and not target.endswith("." + name)
+
+
+def _result_starts(region):
+    result_start = 0
+    for match in _START.finditer(region):
+        if match.start() < result_start:
+            continue
+        name, target = match["name"], match["target"]
+        line_start = region.rfind("\n", 0, match.start()) + 1
+        _, dot, method = target.rpartition(".")
+        if dot and name.endswith(method):
+            actual = method
+        elif dot and match.start() == line_start:
+            actual = name
+        else:
+            actual = next((fixture for fixture in FIXTURES if name.endswith(fixture)), None)
+        delimiter = _DELIMITER.match(region, match.end()) if actual else None
+        if delimiter:
+            result_start = delimiter.end()
+            yield match.start() + len(name) - len(actual), result_start, actual, target
+
+
+def _statuses(segment, failure_statuses=()):
     """Statuses of one test, and fixture statuses printed after it without a description."""
     found = [match["status"] for match in _SUBTEST.finditer(segment)]
     lines = [line.rstrip() for line in segment.split("\n") if line.strip() and not _SUBTEST.match(line)]
@@ -228,7 +362,12 @@ def _statuses(segment):
         tail = _STATUS_TAIL.search(lines[-1])
         if tail:
             found.append(tail.group())
-    return found, []
+    # Cleanup diagnostics can follow a standalone status. Confirm earlier FAIL/ERROR lines against
+    # the traceback headers so plain diagnostic text from a passing test cannot supply a failure.
+    for line in lines:
+        if line not in found and (line in failure_statuses or _SKIP_LINE.fullmatch(line)):
+            found.append(line)
+    return [status for status in found if status not in ("FAIL", "ERROR") or status in failure_statuses], []
 
 
 def _error_line(body):
@@ -247,16 +386,25 @@ def parse_log(text):
     text = _ANSI.sub("", text).replace("\r\n", "\n")
     end = _END.search(text)
     region = text[:end.start()] if end else text
-    starts = list(_START.finditer(region))
+    failures = []
+    failure_statuses = collections.defaultdict(set)
+    if end:
+        for kind, description, body in _BLOCK.findall(text[end.start():]):
+            failures.append((kind, description, _error_line(body)))
+            match = _DESCRIPTION.match(description)
+            if match and not _fixture(match[1], match[2]):
+                failure_statuses[_test_id(match[1], match[2])].add(kind)
+    starts = list(_result_starts(region))
     executions, fixtures = [], []
-    for index, match in enumerate(starts):
-        stop = starts[index + 1].start() if index + 1 < len(starts) else len(region)
-        statuses, bare = _statuses(region[match.end():stop])
-        name, target = match["name"], match["target"]
-        if name in FIXTURES and not target.endswith("." + name):
+    for index, (_, result_start, name, target) in enumerate(starts):
+        stop = starts[index + 1][0] if index + 1 < len(starts) else len(region)
+        segment = region[result_start:stop]
+        if _fixture(name, target):
+            statuses, _ = _statuses(segment, ("ERROR",))
             fixtures.append((name, target, statuses[-1] if statuses else "unknown"))
             continue
         test_id = _test_id(name, target)
+        statuses, bare = _statuses(segment, failure_statuses.get(test_id, ()))
         fixtures.extend((f"unnamed fixture after {test_id}", None, status) for status in bare)
         previous = executions[-1] if executions else None
         # A second status for the same test (a failure after failed subtests, or a
@@ -266,17 +414,60 @@ def parse_log(text):
             previous.statuses.extend(statuses)
         else:
             executions.append(Execution(test_id, statuses))
+    counts = collections.Counter(execution.test_id for execution in executions)
+    for execution in executions:
+        # A traceback header names the method exactly, even when stderr split or obscured its
+        # result. Avoid assigning one traceback to multiple executions of a duplicated ID.
+        failures_for_test = failure_statuses.get(execution.test_id)
+        if failures_for_test and counts[execution.test_id] == 1:
+            execution.statuses.extend(sorted(failures_for_test.difference(execution.statuses)))
     ran = verdict = None
     for summary in _RAN.finditer(text):
         ran, verdict = int(summary[1]), summary[0].rsplit("\n", 1)[-1]
-    failures = []
-    if end:
-        for kind, description, body in _BLOCK.findall(text[end.start():]):
-            failures.append((kind, description, _error_line(body)))
     return ParsedLog(executions, fixtures, ran, verdict, failures, report_incomplete(text))
 
 
 # --- running -----------------------------------------------------------------
+
+# Give the standard text runner a private stream that also forwards its writes
+# to stderr. Test and cleanup writes still go directly to the raw stderr log.
+_RUN_SHARD = r'''
+import os, sys, unittest
+
+__unittest = True
+if sys.path and sys.path[0] == "":
+    sys.path[0] = os.getcwd()
+sys.argv[0] = os.path.basename(sys.executable) + " -m unittest"
+
+class ResultStream:
+    def __init__(self, stderr, evidence):
+        self.stderr = stderr
+        self.evidence = evidence
+
+    def write(self, text):
+        self.evidence.write(text)
+        return self.stderr.write(text)
+
+    def flush(self):
+        self.evidence.flush()
+        self.stderr.flush()
+
+    def __getattr__(self, name):
+        return getattr(self.stderr, name)
+
+class Runner(unittest.TextTestRunner):
+    def __init__(self, **kwargs):
+        super().__init__(stream=ResultStream(sys.stderr, evidence), **kwargs)
+
+fd = os.environ.pop("HARNESS_SHARD_RESULT_FD", None)
+if fd is None:
+    unittest.main(module=None)  # allow running the recorded command on its own
+fd = int(fd)
+os.set_inheritable(fd, False)
+with os.fdopen(fd, "w", encoding="utf-8", errors="backslashreplace") as evidence:
+    unittest.main(module=None, testRunner=Runner)
+'''
+
 
 @dataclass
 class Shard:
@@ -289,6 +480,7 @@ class Shard:
     returncode: int | None = None
     seconds: float | None = None
     parsed: ParsedLog | None = None
+    test_ids: list | None = field(default=None, kw_only=True)
 
 
 def _signal_group(pgid, signum):
@@ -345,23 +537,51 @@ def make_shards(groups, collection, out_dir, root, python=sys.executable):
     out_dir = Path(out_dir)
     # Imported first, the tripwire is installed before any test module imports a function it wraps by name.
     first = [TRIPWIRE] if (Path(root) / START_DIR / f"{TRIPWIRE}.py").is_file() else []
-    return [Shard(index, list(modules), sum(len(collection.modules.get(name, ())) for name in modules),
-                  out_dir / f"shard-{index}.log", out_dir / f"shard-{index}.stdout.log",
-                  [python, "-m", "unittest", "-v", *first, *modules])
-            for index, modules in enumerate(groups, 1)]
+    method_modules = {test_id: module for module, methods in collection.independent_methods.items()
+                      for test_id in methods}
+    shards = []
+    for index, targets in enumerate(groups, 1):
+        modules, test_ids = [], []
+        for target in targets:
+            if target in method_modules:
+                module = method_modules[target]
+                if module not in modules:
+                    modules.append(module)
+                test_ids.append(target)
+            else:
+                modules.append(target)
+                test_ids.extend(collection.modules.get(target, ()))
+        shards.append(Shard(index, modules, len(test_ids),
+                            out_dir / f"shard-{index}.log", out_dir / f"shard-{index}.stdout.log",
+                            [python, "-c", _RUN_SHARD, "-v", *first, *targets], test_ids=test_ids))
+    return shards
 
 
 def run_groups(groups, collection, out_dir, root=ROOT, python=sys.executable, echo=print):
-    """Run each module group in its own unittest process and verify the results against ``collection``."""
+    """Run each group in its own unittest process and verify the results against ``collection``."""
     shards = make_shards(groups, collection, out_dir, root, python)
+    with ExitStack() as stack:
+        results = [stack.enter_context(tempfile.TemporaryFile(mode="w+", encoding="utf-8")) for _ in shards]
+        wall = _run_shards(shards, results, root, echo)
+        for shard, stream in zip(shards, results, strict=True):
+            stream.seek(0)
+            shard.parsed = parse_log(stream.read())
+            stderr = shard.log.read_text(encoding="utf-8", errors="replace")
+            shard.parsed.report_incomplete = report_incomplete(stderr)
+    return verify(collection, shards, wall)
+
+
+def _run_shards(shards, results, root, echo):
     env = child_env(root)
     procs = []  # shards whose process group may still have members
     started = time.monotonic()
     try:
-        for shard in shards:
+        for shard, stream in zip(shards, results, strict=True):
+            fd = stream.fileno()
+            shard_env = dict(env, HARNESS_SHARD_RESULT_FD=str(fd))
             with open(shard.log, "wb") as err, open(shard.stdout_log, "wb") as out:
-                procs.append(subprocess.Popen(shard.command, cwd=root, env=env, stdin=subprocess.DEVNULL,
-                                              stdout=out, stderr=err, start_new_session=True))
+                procs.append(subprocess.Popen(shard.command, cwd=root, env=shard_env, stdin=subprocess.DEVNULL,
+                                              stdout=out, stderr=err, pass_fds=(fd,), start_new_session=True))
         pending = dict(zip(procs, shards))
         while pending:
             for proc, shard in list(pending.items()):
@@ -378,10 +598,7 @@ def run_groups(groups, collection, out_dir, root=ROOT, python=sys.executable, ec
     except BaseException:
         _stop(procs)
         raise
-    wall = time.monotonic() - started
-    for shard in shards:
-        shard.parsed = parse_log(shard.log.read_text(encoding="utf-8", errors="replace"))
-    return verify(collection, shards, wall)
+    return time.monotonic() - started
 
 
 def verify(collection, shards, wall):
@@ -400,15 +617,19 @@ def verify(collection, shards, wall):
                 continue
             seen[execution.test_id] += 1
             outcomes[execution.outcome] += 1
+            if execution.outcome == "unknown":
+                problems.append(f"shard {shard.index}: no unittest outcome for {execution.test_id}")
         # Tests behind a skipped setUpClass/setUpModule never start; they are skipped, not missing.
         skipped_scopes = [scope + "." for name, scope, status in parsed.fixtures
                           if scope and name.startswith("setUp") and status.startswith("skipped")]
         if skipped_scopes:
-            for name in shard.modules:
-                for test_id in collection.modules.get(name, ()):
-                    if not seen[test_id] and test_id.startswith(tuple(skipped_scopes)):
-                        seen[test_id] += 1
-                        outcomes["skipped"] += 1
+            ids = shard.test_ids
+            if ids is None:  # call sites that construct Shard directly still specify whole modules
+                ids = [test_id for name in shard.modules for test_id in collection.modules.get(name, ())]
+            for test_id in ids:
+                if not seen[test_id] and test_id.startswith(tuple(skipped_scopes)):
+                    seen[test_id] += 1
+                    outcomes["skipped"] += 1
         for name, scope, status in parsed.fixtures:
             label = f"{name} ({scope})" if scope else name
             if not status.startswith("skipped"):
@@ -423,7 +644,7 @@ def verify(collection, shards, wall):
                             f"but unittest ran {parsed.ran}")
         for kind, description, line in parsed.failures:
             match = _DESCRIPTION.match(description)
-            is_test = match and not (match[1] in FIXTURES and not match[2].endswith("." + match[1]))
+            is_test = match and not _fixture(match[1], match[2])
             test = _test_id(match[1], match[2]) + match[3] if is_test else description
             failures.append({"shard": shard.index, "kind": kind, "test": test, "line": line})
         incomplete.extend(dict(entry, source=f"shard {shard.index}") for entry in parsed.report_incomplete)
@@ -567,7 +788,7 @@ def _main(args, root, out, echo):
                                           "report_incomplete": collection.report_incomplete})
         echo("FAILED")
         return 1
-    groups = split({name: len(tests) for name, tests in collection.modules.items() if tests}, args.shards)
+    groups = plan_groups(collection, args.shards)
     shards = make_shards(groups, collection, out, root)
     _write_json(out / "manifest.json", {
         "root": str(root), "python": sys.executable, "pattern": args.pattern,

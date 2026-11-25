@@ -11,22 +11,32 @@ import threading
 import time
 
 from .operations import OPERATION_ID
-from .private_state import ensure_private_state, _path
+from .private_state import DARWIN_SYSTEM_ALIASES, ensure_private_state, _path
+from .state_files import StateFiles
 from .util import HarnessError, display_text, uid, write_json
 
 
 def _linked_run(state, operation_id):
     """An optional relationship, not proof that ledger progress matches exit."""
-    path = state / 'operations' / (operation_id + '.json')
+    # Walk from the filesystem root. Only the Darwin system aliases allowed at
+    # private-state initialization may be resolved before the no-follow walk.
+    if sys.platform == 'darwin':
+        for alias in DARWIN_SYSTEM_ALIASES:
+            if alias in state.parents:
+                try:
+                    state = alias.resolve() / state.relative_to(alias)
+                except (OSError, RuntimeError):
+                    return None
+                break
+    outcome = StateFiles.nofollow_directory(state).read(('operations', operation_id + '.json'), limit=1024 * 1024)
+    if outcome.state != 'read':
+        return None
     try:
-        _path(path)
-        if path.stat().st_size > 1024 * 1024:
-            return None
-        value = json.loads(path.read_bytes())
+        value = json.loads(outcome.data)
         run_id = value.get('run_id') if value.get('operation_id') == operation_id else None
         if isinstance(run_id, str) and run_id.startswith('run_') and run_id[4:].isalnum():
             return run_id
-    except (OSError, ValueError, AttributeError, HarnessError):
+    except (ValueError, AttributeError, RecursionError):
         pass
     return None
 

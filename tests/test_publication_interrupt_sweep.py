@@ -429,6 +429,55 @@ class Invocation:
 
 
 class PublicationInterruptSweepTests(RepoCase):
+    # RepoCase and fresh_trial give each method private repositories, configuration and
+    # cleanup. Each method owns its mutable state and can run in any order.
+    shard_methods = True
+
+    # Placement estimates from P9 shard times, sweep point counts and spot measurements.
+    shard_seconds = {
+        "test_abandon": 144,
+        "test_accounting_binds_continuation_rejection": 901,
+        "test_compare_git_wait_cancels_acceptance_scope_check": 28,
+        "test_continue_blocked_worker": 654,
+        "test_dispatch": 3746,
+        "test_dispatch_budget_guard_stops_without_charging": 530,
+        "test_failed_preflight_and_verification_publish_feedback_before_rework": 418,
+        "test_final_review_receipt_git_wait": 43,
+        "test_git_wait_in_loop_and_cli_preflight": 63,
+        "test_handoff_rejects_a_decision_for_its_own_task": 552,
+        "test_initial_planning_and_scheduler_terminal": 461,
+        "test_invalid_blocker_and_revision": 1631,
+        "test_private_git_wait_cleans_acceptance_index": 29,
+        "test_quota_probe": 26,
+        "test_quota_wait": 15,
+        "test_real_commander_wait": 32,
+        "test_real_verification_wait": 46,
+        "test_real_worker_wait": 30,
+        "test_reject_invalid_worker": 477,
+        "test_resume_preflight_preserves_audited_exit_confirmation": 10,
+        "test_resume_preflight_preserves_published_approval": 10,
+        "test_resume_rebuilds_operator_request_after_handoff_save": 257,
+        "test_revision_archives_dirty_candidate_before_publishing_new_selection": 219,
+        "test_scheduler_awaiting_approval": 235,
+        "test_scheduler_paused": 332,
+        "test_scheduler_publishes_legacy_acceptance_invalidation": 402,
+        "test_sealed_worker_replay": 922,
+        "test_settlement_acceptance": 235,
+        "test_settlement_fresh_verification_checkout": 316,
+        "test_settlement_worktree_binding": 15,
+        "test_signal_during_failed_accounting_publication_keeps_rollback": 4,
+        "test_stop_after_environment_blocker": 1046,
+        "test_stop_after_operator_blocker": 863,
+        "test_stop_after_vetoed_environment_blocker": 509,
+        "test_stop_after_vetoed_operator_blocker": 761,
+        "test_task_blocker_is_consumed_without_exemption": 552,
+        "test_task_handoff_and_review": 1717,
+        "test_terminal_worktree_drift_is_detected": 4,
+        "test_unrelated_commit_does_not_prove_a_worker_seal": 4,
+        "test_verification_retry_publishes_the_new_round_and_reads_its_evidence": 740,
+        "test_window_verification_detects_missing_branch_and_repeated_event": 4,
+    }
+
     @contextmanager
     def fresh_trial(self):
         """Give setup, action and recovery one project and one out-of-repo scratch directory."""

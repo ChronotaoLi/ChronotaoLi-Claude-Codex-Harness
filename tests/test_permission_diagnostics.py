@@ -217,8 +217,8 @@ class PermissionDiagnosticsCliTests(RepoCase):
         code, output, errors = self.diagnose()
         stop = cli_notice(errors)
         self.assertEqual((code, output, stop['kind'], stop['reason'], stop['data']),
-                         (1, '', 'runtime_failure', 'io', {'error_type': 'NotFound'}))
-        self.assertIn('NotADirectoryError', errors)
+                         (1, '', 'runtime_failure', 'io', {'error_type': 'PathRefused'}))
+        self.assertIn('不是目录', errors)
 
     def test_dispatch_reads_stdout_even_beside_a_stream_manifest(self):
         path = self.ledger({'process.stdout': terminal('json_tool'),

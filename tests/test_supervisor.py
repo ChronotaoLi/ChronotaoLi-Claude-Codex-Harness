@@ -68,6 +68,49 @@ class SupervisorTests(unittest.TestCase):
         self.assertEqual((saved['process_observation'], saved['broker_processes']), ('exited', 'unknown'))
         self.assert_receipt_only(saved)
 
+    def test_operation_link_ignores_relocated_private_state_reached_through_a_symlink(self):
+        for replace_ancestor in (False, True):
+            with self.subTest(replace_ancestor=replace_ancestor):
+                repo = self.repo / ('ancestor' if replace_ancestor else 'state')
+                repo.mkdir()
+                git.git(repo, 'init', '-q')
+                state = repo / '.harness'
+                original = repo if replace_ancestor else state
+                moved = original.with_name(original.name + '-moved')
+
+                def launch(argv, **kwargs):
+                    operation = argv[argv.index('--operation-id') + 1]
+                    original.rename(moved)
+                    original.symlink_to(moved, target_is_directory=True)
+                    records = state / 'operations'
+                    records.mkdir()
+                    (records / (operation + '.json')).write_text(
+                        json.dumps(dict(operation_id=operation, run_id='run_untrusted')))
+                    return subprocess.Popen([sys.executable, '-c', 'raise SystemExit(7)'], **kwargs)
+
+                receipt = supervise(repo, ['resume', 'run_untrusted'], popen=launch)
+                self.assertEqual(receipt['exit_code'], 7)
+                self.assertEqual(receipt['process_observation'], 'exited')
+                self.assertIsNone(receipt['run_id'])
+                saved = state / 'supervision' / (receipt['supervision_id'] + '.json')
+                self.assertEqual(json.loads(saved.read_text()), receipt)
+
+    @unittest.skipUnless(sys.platform == 'darwin', 'Darwin system alias')
+    def test_operation_link_accepts_a_private_state_under_darwin_tmp(self):
+        with tempfile.TemporaryDirectory(dir='/tmp') as directory:
+            repo = Path(directory)
+            git.git(repo, 'init', '-q')
+
+            def launch(argv, **kwargs):
+                records = repo / '.harness/operations'
+                records.mkdir()
+                (records / 'op_tmp.json').write_text(json.dumps(dict(operation_id='op_tmp', run_id='run_abc')))
+                return subprocess.Popen([sys.executable, '-c', 'raise SystemExit(7)'], **kwargs)
+
+            receipt = supervise(repo, ['resume', 'run_abc'], operation_id='op_tmp', popen=launch)
+            self.assertEqual(receipt['exit_code'], 7)
+            self.assertEqual(receipt['run_id'], 'run_abc')
+
     def test_actual_harness_early_failure_is_not_lost(self):
         # Invalid run ID fails before a run/model invocation; real Harness CLI only. Its operation
         # record reads both CLIs' --version, which must reach the recording stubs.

@@ -21,7 +21,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from . import observe
 from .process_runtime import defer_cleanup_signals
-from .watch import RunWatcher, WatchError
+from .watch import RunWatcher, WatchError, watching
 from .dashboard_page import APP_CSS, APP_JS, INDEX_HTML
 from .util import HarnessError, display_text, one_line
 
@@ -69,6 +69,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def setup(self):
         self.timeout = self.server.socket_timeout
+        self._response_started = False
         super().setup()
 
     def __getattr__(self, name):
@@ -97,6 +98,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
         except KeyError:
             phrase = "error"
         self._send(code, f"{code} {phrase}\n".encode("utf-8"), TEXT)
+
+    def end_headers(self):
+        # A failed socket write can still have sent part of the headers.
+        self._response_started = True
+        super().end_headers()
 
     def _send(self, status, body, content_type, extra=()):
         self.send_response(status)
@@ -128,13 +134,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if result is None:
                 return
             status, body, content_type, extra = result
-        except observe.ObserveError as error:
-            status = next((code for kind, code in _STATUS_CODES.items() if isinstance(error, kind)), 400)
-            body = _json_bytes({"error": str(error), "status": status, "observed": self.server.observer.observed})
-            content_type, extra = JSON, ()
         except Exception as error:  # Never leak a traceback to the client.
-            self.log_error("internal error: %s: %s", type(error).__name__, error)
-            status, body, content_type, extra = 500, b"500 internal error\n", TEXT, ()
+            if isinstance(error, observe.ObserveError) and not self._response_started:
+                status = next((code for kind, code in _STATUS_CODES.items() if isinstance(error, kind)), 400)
+                body = _json_bytes({"error": str(error), "status": status, "observed": self.server.observer.observed})
+                content_type, extra = JSON, ()
+            else:
+                self.log_error("internal error: %s: %s", type(error).__name__, error)
+                if self._response_started:
+                    self.close_connection = True
+                    return
+                status, body, content_type, extra = 500, b"500 internal error\n", TEXT, ()
         self._send(status, body, content_type, extra)
 
     def _stream_frame(self, event, data):
@@ -148,54 +158,57 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._send(405, b"405 stream requires GET\n", TEXT, (("Allow", "GET"),))
             return
         server = self.server
-        if not server.acquire_stream(self.connection):
-            self._send(503, b"503 stream capacity reached\n", TEXT, (("Retry-After", "1"),))
-            return
-        started = False
-        try:
+
+        def open_watcher():
             # Hold the server read gate while registering against its shared root.
             # server_close marks stopping before waiting for this gate.
             with server._read_gate:
                 if server._stopping.is_set():
                     return
-                watcher = RunWatcher(server.observer.reader, run_id)
-            with watcher:
-                self.send_response(200)
-                self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-                for name, value in SECURITY_HEADERS:
-                    self.send_header(name, value)
-                self.send_header("Connection", "close")
-                self.end_headers()
-                started = True
-                def metadata():
-                    return {"id": run_id, "backend": watcher.backend,
-                            "sampled_at_utc": observe.utc(time.time())}
-                self._stream_frame("ready", metadata())
-                heartbeat = time.monotonic() + server.stream_heartbeat
-                while not server._stopping.is_set():
-                    # EOF detection releases idle disconnected subscribers promptly.
-                    readable, _, _ = select.select([self.connection], [], [], 0)
-                    if readable and not self.connection.recv(1, socket.MSG_PEEK):
-                        break
-                    with server._read_gate:
-                        if server._stopping.is_set():
-                            break
-                        changed = watcher.wait(min(server.stream_wait,
-                                                   max(0, heartbeat - time.monotonic())))
+                return RunWatcher(server.observer.reader, run_id)
+
+        def stream(watcher):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            for name, value in SECURITY_HEADERS:
+                self.send_header(name, value)
+            self.send_header("Connection", "close")
+            self.end_headers()
+            def metadata():
+                return {"id": run_id, "backend": watcher.backend,
+                        "sampled_at_utc": observe.utc(time.time())}
+            self._stream_frame("ready", metadata())
+            heartbeat = time.monotonic() + server.stream_heartbeat
+            while not server._stopping.is_set():
+                # EOF detection releases idle disconnected subscribers promptly.
+                readable, _, _ = select.select([self.connection], [], [], 0)
+                if readable and not self.connection.recv(1, socket.MSG_PEEK):
+                    break
+                with server._read_gate:
                     if server._stopping.is_set():
                         break
-                    if changed:
-                        self._stream_frame("change", metadata())
-                    if time.monotonic() >= heartbeat:
-                        self.wfile.write(b": heartbeat\n\n")
-                        self.wfile.flush()
-                        heartbeat = time.monotonic() + server.stream_heartbeat
+                    changed = watcher.wait(min(server.stream_wait,
+                                               max(0, heartbeat - time.monotonic())))
+                if server._stopping.is_set():
+                    break
+                if changed:
+                    self._stream_frame("change", metadata())
+                if time.monotonic() >= heartbeat:
+                    self.wfile.write(b": heartbeat\n\n")
+                    self.wfile.flush()
+                    heartbeat = time.monotonic() + server.stream_heartbeat
+
+        if not server.acquire_stream(self.connection):
+            self._send(503, b"503 stream capacity reached\n", TEXT, (("Retry-After", "1"),))
+            return
+        try:
+            watching(open_watcher, stream)
         except (BrokenPipeError, ConnectionError, TimeoutError):
             pass
         except observe.ObserveError as error:
-            if not started and not isinstance(error, WatchError):
+            if not self._response_started and not isinstance(error, WatchError):
                 raise
-            if not started:
+            if not self._response_started:
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream; charset=utf-8")
                 for name, value in SECURITY_HEADERS:
@@ -234,13 +247,24 @@ class DashboardHandler(BaseHTTPRequestHandler):
         parts = urllib.parse.urlsplit(self.path)
         path = urllib.parse.unquote(parts.path)
         query = urllib.parse.parse_qs(parts.query, keep_blank_values=True)
-        observer = self.server.observer
         if path == "/":
             return 200, INDEX_HTML.encode("utf-8"), "text/html; charset=utf-8", ()
         if path == "/app.js":
             return 200, APP_JS.encode("utf-8"), "application/javascript; charset=utf-8", ()
         if path == "/app.css":
             return 200, APP_CSS.encode("utf-8"), "text/css; charset=utf-8", ()
+        if path.startswith("/api/runs/"):
+            run_id, _, remainder = path[len("/api/runs/"):].partition("/")
+            if run_id and remainder == "stream":
+                self._stream(run_id)
+                return None
+        with self.server._read_gate:
+            if self.server._stopping.is_set():
+                return 503, b"503 service stopping\n", TEXT, ()
+            return self._read_route(path, query)
+
+    def _read_route(self, path, query):
+        observer = self.server.observer
         if path == "/api/runs":
             return 200, _json_bytes(observer.list_runs()), JSON, ()
         if not path.startswith("/api/runs/"):
@@ -250,9 +274,6 @@ class DashboardHandler(BaseHTTPRequestHandler):
             raise observe.NotFound("未知路由")
         if remainder == "":
             return 200, _json_bytes(observer.run_detail(run_id)), JSON, ()
-        if remainder == "stream":
-            self._stream(run_id)
-            return None
         if remainder == "events":
             return 200, _json_bytes(observer.events(run_id, self._tail(query))), JSON, ()
         if remainder == "files":
@@ -396,7 +417,7 @@ def create_server(state, port=DEFAULT_PORT, **options):
         raise error
     try:
         return DashboardServer(state, port, **options)
-    except observe.NotFound as error:
+    except (observe.NotFound, observe.PathRefused) as error:
         raise HarnessError(f"{error}；没有可观察的 run 目录时请先执行 run 或 status") from error
 
 

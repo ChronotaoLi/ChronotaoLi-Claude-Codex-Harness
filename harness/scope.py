@@ -9,7 +9,7 @@ import hashlib
 import json
 
 from . import git
-from .util import HarnessError, dump
+from .util import HarnessError, dump, strict_json_loads
 
 WILDCARDS = frozenset("*?[")
 
@@ -141,24 +141,41 @@ def proposal_gaps(run, result):
     return missing
 
 
-def held_view(run):
-    """Read-only, recomputed view of a returned, judged, unlanded revise original (status).
+def held_view(run, reader, *, run_id):
+    """Project the judged proposal from the original in this observer's held root."""
+    from . import observe, provider_failures
 
-    The original is read by its bound digest and nothing is written; a failure is reported
-    as ``error`` instead of failing the status view.
-    """
-    from .recovery import read_bound_result
+    if not isinstance(run.get("scope"), list):
+        return None
     receipts = run.get("commander_receipts")
     receipt = receipts.get("commander:decide:run") if isinstance(receipts, dict) else None
     if not isinstance(receipt, dict) or "artifact_digest" not in receipt:
         return None
-    entry = next((d for d in run.get("dispatches", []) if isinstance(d, dict) and d.get("id") == receipt.get("dispatch_id")), None)
+    dispatch_id = receipt.get("dispatch_id")
+    entry = next((d for d in run.get("dispatches", []) if isinstance(d, dict) and d.get("id") == dispatch_id), None)
     if (not entry or (entry.get("role"), entry.get("kind"), entry.get("status")) != ("commander", "decide", "completed")
             or "proposal_rejection" in entry):
         return None
     try:
-        result, _ = read_bound_result(receipt, "指挥")
-        if not isinstance(result, dict) or result.get("action") != "revise":
+        if not observe.canonical_uuid(dispatch_id):
+            raise HarnessError("台账记录的指挥派发 ID 无效")
+        observe.validate_run_id(run_id)
+        if run.get("id") != run_id:
+            raise HarnessError("运行台账 ID 与观察目录不符")
+        components = ("runs", run_id, "dispatches", dispatch_id, "returned-result.json")
+        artifact = receipt.get("artifact")
+        if not isinstance(artifact, str) or tuple(artifact.rsplit("/", 5)[-5:]) != components:
+            raise HarnessError("台账记录的原件路径不在该 run 的派发目录")
+        original = reader.read(components, limit=provider_failures.LIMIT)
+        if original["too_large"]:
+            raise HarnessError("指挥原始结果超过 16 MiB")
+        raw = original["data"]
+        if hashlib.sha256(raw).hexdigest() != receipt["artifact_digest"]:
+            raise HarnessError("指挥原始结果摘要与台账不符")
+        result = strict_json_loads(raw)
+        if not isinstance(result, dict):
+            raise HarnessError("指挥原始结果不是 JSON 对象")
+        if result.get("action") != "revise":
             return None
         missing = proposal_gaps(run, result)
         entries, widened = suggestions(missing)

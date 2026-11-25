@@ -24,7 +24,6 @@ import sys
 import tempfile
 import threading
 import time
-import traceback
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -1197,7 +1196,7 @@ class PartialCloneTests(IsolatedRepoCase):
         blob = plain_git(clone, "rev-parse", "HEAD:test_hello.py").stdout.decode().strip()
         self.assertTrue(self.missing(clone, blob))
         engine = self.engine()
-        try:  # Keep the traceback for the stop guard's entry observation.
+        try:
             engine.start("Implement greet")
         except HarnessError as caught:
             error = caught
@@ -1209,7 +1208,6 @@ class PartialCloneTests(IsolatedRepoCase):
         self.assertEqual((stop["kind"], stop["reason"]), ("runtime_failure", "io"))
         saved = read_json(engine.directory / "state.json")
         self.assertEqual((saved["status"], saved["stop"], saved["dispatches"]), ("blocked", stop, []))
-        self.assertEqual(self.stop_guard_findings["unclassified"], [])
         self.assertFalse(Path(saved["worktree"]).exists())
         self.assertNotIn(f"worktree {saved['worktree']}\n", git.git(clone, "worktree", "list", "--porcelain"))
         self.assertEqual(git.git(clone, "branch", "--list", saved["branch"]).strip(), saved["branch"])
@@ -1738,15 +1736,13 @@ class WorktreeCreationTests(IsolatedRepoCase):
             value = stops.of(error)
             self.assertEqual((value["kind"], value["reason"]), ("runtime_failure", "io"))
             self.assertEqual(state["stop"], value)
-            self.assertEqual(self.stop_guard_findings["unclassified"], [])
         else:
             self.assertEqual(results, [])
-            innermost = traceback.extract_tb(error.__traceback__)[-1]
-            finding = ("untyped_harness_error", "HarnessError", message[:160],
-                       f"{innermost.filename}:{innermost.lineno}")
-            self.assertEqual(self.stop_guard_findings["unclassified"], [finding, finding])
-            self.stop_guard_findings["unclassified"].clear()
-            self.assertEqual(len(stop_tripwire.consume(self)), 1)
+            finding, = stop_tripwire.consume(self)
+            self.assertEqual((finding.channels, finding.kind, finding.reason, finding.facts["error_type"],
+                              finding.facts["text"], finding.exempt),
+                             ({"entry", "ledger"}, "unclassified", "untyped_harness_error", "HarnessError",
+                              message[:stop_tripwire.TEXT_LIMIT], "consume"))
         self.assertEqual(state["status"], "blocked")
         self.assertEqual(state["worktree_binding"], {})
         self.assertEqual(state["dispatches"], [])

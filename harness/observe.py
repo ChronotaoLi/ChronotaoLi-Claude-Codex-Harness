@@ -1,12 +1,11 @@
 """Read-only observation of `.harness` run evidence for the dashboard and `status`.
 
-Every byte this module reads comes through one descriptor walk below the resolved
-`.harness` directory: each intermediate directory opens with O_DIRECTORY|O_NOFOLLOW
-from its parent descriptor, the final component opens with O_NOFOLLOW|O_NONBLOCK and
-must fstat as a regular file. The one exception is `status RUN`'s ledger
-(`StateReader.read_following`): below the same root, it follows links as the path read
-it replaced did. Nothing here constructs a Runtime, loads a run for
-recovery, takes run.lock, writes files, runs git or probes processes.
+Every state file read by this module goes through `harness.state_files` below the
+resolved `.harness` directory. Directories on the walk open with search permission
+and O_NOFOLLOW; the final file opens with O_NOFOLLOW|O_NONBLOCK and must fstat as
+a regular file. This includes the ledger for `status RUN`. Nothing here constructs
+a Runtime, loads a run for recovery, takes run.lock, writes files, runs git or
+probes processes.
 
 Ledger interpretation stays in `harness.cli.status_summary`; this module only adds
 bounded projections (invocation classes, account quota observed during the run, event
@@ -18,19 +17,18 @@ with its path and version alone, and the detail refuses it.
 """
 from __future__ import annotations
 
-import contextlib
+from contextlib import suppress
 import errno
 import json
 import math
 import os
 import re
-import stat
 import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path, PurePath
 
-from . import quota
+from . import quota, scope, state_files
 from .process_runtime import defer_cleanup_signals
 from .util import one_line, strict_json_loads
 from .versions import unsupported_ledger
@@ -67,14 +65,6 @@ _PARSE_ERRORS = (ValueError, RecursionError)  # json.loads on damaged or absurdl
 MODEL_ROLES = ("commander", "worker", "reviewer")
 PROVIDERS = ("claude", "codex", "unknown")
 
-_DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
-_FILE_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
-# A directory with search permission only (macOS O_SEARCH, Linux O_PATH): enough to open names below it.
-_SEARCH_FLAGS = (getattr(os, "O_SEARCH", 0) or getattr(os, "O_PATH", 0)) | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
-_FOLLOWED_FLAGS = _FILE_FLAGS & ~os.O_NOFOLLOW
-_CHUNK = 1024 * 1024
-
-
 class ObserveError(Exception):
     """Base class for refusals the HTTP layer maps to status codes."""
 
@@ -86,9 +76,27 @@ class InvalidPath(ObserveError):
 class PathRefused(ObserveError):
     """Well-formed path refused by policy: excluded name, symlink, non-regular file (HTTP 403)."""
 
+    def __init__(self, message, *, found=None, step=None):
+        super().__init__(message)
+        self.found, self.step = found, step
+
+
+class ReadFailed(PathRefused):
+    """A state read failed at the OS boundary (HTTP 403)."""
+
+    def __init__(self, outcome, *, prefix=""):
+        self.errno = outcome.errno
+        self.error_type = outcome.error_type
+        detail = os.strerror(self.errno) if self.errno is not None else self.error_type
+        super().__init__(f"{prefix}无法读取（{outcome.step.stage}：{detail}）", step=outcome.step)
+
 
 class NotFound(ObserveError):
     """The addressed run or file does not exist (HTTP 404)."""
+
+    def __init__(self, message, *, step=None):
+        super().__init__(message)
+        self.step = step
 
 
 class Unsupported(ObserveError):
@@ -144,50 +152,26 @@ def validate_path(path):
     return components
 
 
-def _translate(error, dir_fd, name):
-    """Classify a refused open; O_NOFOLLOW already guaranteed no link was followed."""
-    if error.errno == errno.ELOOP:
-        return PathRefused("拒绝符号链接")
-    if error.errno in (errno.ENOENT, errno.ENOTDIR):
-        try:  # macOS reports ENOTDIR for a directory symlink under O_DIRECTORY|O_NOFOLLOW.
-            if stat.S_ISLNK(os.stat(name, dir_fd=dir_fd, follow_symlinks=False).st_mode):
-                return PathRefused("拒绝符号链接")
-        except OSError:
-            pass
-        return NotFound("文件不存在")
-    return PathRefused(f"无法打开：{error.strerror}")
+def _check(outcome, *, prefix=""):
+    if outcome.state == "absent":
+        raise NotFound(f"{prefix}文件不存在", step=outcome.step)
+    if outcome.state == "failed":
+        raise ReadFailed(outcome, prefix=prefix)
+    if outcome.state == "refused":
+        reason = {"symlink": "拒绝符号链接", "not_directory": "不是目录",
+                  "changed": "读取时文件被改写"}.get(outcome.found, "拒绝非普通文件")
+        raise PathRefused(f"{prefix}{reason}", found=outcome.found, step=outcome.step)
 
 
-def _pread_exact(fd, length, offset):
-    chunks = []
-    while length > 0:
-        chunk = os.pread(fd, min(length, _CHUNK), offset)
-        if not chunk:
-            break
-        chunks.append(chunk)
-        offset += len(chunk)
-        length -= len(chunk)
-    return b"".join(chunks)
-
-
-def _scan(fd):
-    entries = []
-    with os.scandir(fd) as iterator:
-        for entry in iterator:
-            try:
-                if entry.is_symlink():
-                    kind, info = "symlink", None
-                elif entry.is_dir(follow_symlinks=False):
-                    kind, info = "dir", None
-                elif entry.is_file(follow_symlinks=False):
-                    kind, info = "file", entry.stat(follow_symlinks=False)
-                else:
-                    kind, info = "other", None
-            except OSError:
-                kind, info = "other", None
-            entries.append((entry.name, kind, info))
-    entries.sort(key=lambda item: item[0])
-    return entries
+def error_type(error, *, ledger=False):
+    if isinstance(error, ReadFailed):
+        return error.error_type
+    if isinstance(error, NotFound):
+        return "FileNotFoundError"
+    if ledger and isinstance(error, PathRefused):
+        return {"directory": "IsADirectoryError", "not_directory": "NotADirectoryError"}.get(
+            error.found, "PathRefused")
+    return type(error).__name__
 
 
 def location(given, resolved, *, checkout=None):
@@ -222,212 +206,78 @@ def location_text(observed, *, opened=True):
 
 
 class StateReader:
-    """Descriptor-anchored reads below one resolved `.harness` directory."""
+    """Adapt one held state root to observations and their public errors."""
 
     def __init__(self, state, *, required=False):
-        """Fix the root descriptor now; it is never reopened or replaced later.
-
-        With required=False a missing `.harness` yields empty listings and NotFound
-        reads (the `status` list stays usable); required=True raises NotFound so a
-        long-lived service refuses to start against a directory it could not fix.
-        A path that cannot be resolved (a symbolic link loop on 3.11, a NUL byte)
-        is one that cannot be opened: ``state`` is None.
-
-        The root is also what ``read_following`` reads below. A root that may not be
-        read is bound with search permission alone, all a path read needs: ``opened``
-        is true and ``read_following`` works, while listings and walks find no root
-        there, as before. Bound means a lookup below the descriptor works, not just that
-        one was returned. When nothing is bound, ``_failure`` keeps why.
-        """
-        # Every slot is empty before anything is opened and the cleanup is entered first: each descriptor is
-        # opened and stored inside one deferral, whose re-raise of a signal it kept still lands in this try.
-        self.state = self._root = self._bound = self._search = self._failure = None
+        self._held = state_files.StateFiles.held(state)
         try:
-            try:
-                self.state = Path(state).resolve()
-            except (OSError, RuntimeError, ValueError) as error:
-                self._failure = error
-                if required:
-                    unavailable = NotFound(f"观察目录不可用：{state}")
-                    if isinstance(error, (OSError, RuntimeError)):
-                        unavailable._root_initialization_failed = True
-                    raise unavailable from error
-                return
             with defer_cleanup_signals(inherit=False):
-                try:
-                    self._root = self._bound = os.open(str(self.state), _DIR_FLAGS)
-                except OSError as error:
-                    self._failure = error  # kept, not raised here: an error leaving the deferral would drop its signal
-            if self._root is not None:
-                return
-            if required:
-                unavailable = NotFound(f"观察目录不可用：{self.state}")
-                unavailable._root_initialization_failed = True
-                raise unavailable from self._failure
-            if not isinstance(self._failure, PermissionError):
-                return
-            with defer_cleanup_signals(inherit=False), contextlib.suppress(OSError):
-                self._search = os.open(str(self.state), _SEARCH_FLAGS)
-            if self._search is None:
-                return
-            try:
-                # O_PATH needs no permission on the directory itself: bound only if a lookup below it works.
-                # "." always exists, so a refusal here is missing search permission, never a missing name.
-                os.stat(".", dir_fd=self._search)
-            except OSError:
-                with defer_cleanup_signals(inherit=False):
-                    search, self._search = self._search, None
-                    os.close(search)
-            else:
-                self._bound, self._search = self._search, None
+                self._held.__enter__()
+            resolved = self._held.resolved_path
+            self.state = Path(resolved) if resolved is not None else None
+            if required and not self.opened:
+                _check(self._held.opening_failure, prefix=f"观察目录不可用：{state}；")
         except BaseException:
-            self.close()
+            with suppress(state_files.StateReadError):
+                self.close()
             raise
 
     @property
     def opened(self):
-        return self._bound is not None
+        return self._held.opened
 
     def close(self):
-        # Emptied before closing: closing again never reaches a number reused since.
-        held = {self._root, self._bound, self._search} - {None}
-        self._root = self._bound = self._search = None
-        for fd in held:
-            os.close(fd)
+        self._held.close(checked=True)
 
-    def read_following(self, components):
-        """The whole regular file below the bound root, read as a path read is: links followed, search permission enough.
+    def open_directory(self, components, *, into):
+        outcome, fd = self._held.open(components, "directory", into=into)
+        _check(outcome)
+        return fd
 
-        Only `status RUN` reads this way, for its ledger. Failures are the OSErrors a path read
-        raises (FileNotFoundError when the root or the file is absent, IsADirectoryError for a
-        directory); any other non-regular file is PathRefused, opened without blocking and never read.
-        """
-        if self._bound is None:
-            if isinstance(self._failure, RuntimeError):  # 3.11 resolves a link loop with this; a path read gets ELOOP
-                raise OSError(errno.ELOOP, os.strerror(errno.ELOOP)) from self._failure
-            raise self._failure
-        name = os.path.join(str(self.state), *components)
-        try:
-            fd = os.open("/".join(components), _FOLLOWED_FLAGS, dir_fd=self._bound)
-        except OSError as error:
-            error.filename = name  # the file it names, not the relative path
-            raise
-        try:
-            mode = os.fstat(fd).st_mode
-            if stat.S_ISDIR(mode):
-                raise IsADirectoryError(errno.EISDIR, os.strerror(errno.EISDIR), name)
-            if not stat.S_ISREG(mode):
-                raise PathRefused("拒绝非普通文件")
-            chunks = []
-            while chunk := os.read(fd, _CHUNK):
-                chunks.append(chunk)
-            return b"".join(chunks)
-        finally:
-            os.close(fd)
+    def open_file(self, components, *, into):
+        outcome, fd = self._held.open(components, "file", into=into)
+        _check(outcome)
+        return fd
 
-    def _root_fd(self):
-        if self._root is None:
-            raise NotFound("观察目录不可用")
-        return self._root
-
-    def open_directory(self, components):
-        """Open each component with O_DIRECTORY|O_NOFOLLOW from its parent; caller closes."""
-        fd = os.dup(self._root_fd())
-        os.set_inheritable(fd, False)
-        try:
-            for name in components:
-                try:
-                    child = os.open(name, _DIR_FLAGS, dir_fd=fd)
-                except OSError as error:
-                    raise _translate(error, fd, name) from error
-                os.close(fd)
-                fd = child
-            return fd
-        except BaseException:
-            os.close(fd)
-            raise
-
-    def open_file(self, components):
-        *parents, name = components
-        parent = self.open_directory(parents)
-        try:
-            try:
-                fd = os.open(name, _FILE_FLAGS, dir_fd=parent)
-            except OSError as error:
-                raise _translate(error, parent, name) from error
-        finally:
-            os.close(parent)
-        try:
-            info = os.fstat(fd)
-            if not stat.S_ISREG(info.st_mode):
-                raise PathRefused("拒绝非普通文件")
-        except BaseException:
-            os.close(fd)
-            raise
-        return fd, info
+    def probe(self, components, *, expect):
+        _check(self._held.probe(components, expect=expect))
 
     def read(self, components, *, limit, mode="whole"):
-        """Read a regular file: whole (refused above limit), head or tail of at most limit bytes."""
-        fd, info = self.open_file(components)
-        try:
-            size = info.st_size
-            result = {"source": "/".join(components), "size": size, "truncated": False,
-                      "too_large": False, "data": b""}
-            if mode == "tail":
-                offset = max(0, size - limit)
-                result["truncated"] = offset > 0
-                result["data"] = _pread_exact(fd, size - offset, offset)
-            elif mode == "head":
-                result["truncated"] = size > limit
-                result["data"] = _pread_exact(fd, min(size, limit), 0)
-            elif size > limit:
-                result.update(truncated=True, too_large=True)
-            else:
-                result["data"] = _pread_exact(fd, size, 0)
-            after = os.fstat(fd)
-            result["changed_while_reading"] = ((after.st_size, after.st_mtime_ns, after.st_ino)
-                                               != (info.st_size, info.st_mtime_ns, info.st_ino))
-        finally:
-            os.close(fd)
-        return result
+        outcome = self._held.read(components, limit=limit, part=mode)
+        _check(outcome)
+        too_large = outcome.state == "too_large"
+        return {"source": "/".join(components), "size": outcome.size, "too_large": too_large,
+                "truncated": too_large or (mode != "whole" and outcome.size > limit),
+                "data": outcome.data if not too_large else b"", "changed_while_reading": outcome.changed}
 
     def scandir(self, components):
-        fd = self.open_directory(components)
-        try:
-            return _scan(fd)
-        finally:
-            os.close(fd)
+        listing = self._held.entries(components, include_file_stats=True)
+        _check(listing)
+        file_stats = dict(listing.file_stats)
+        return [(name, "other" if kind == "absent" else kind, file_stats.get(name))
+                for name, kind in listing.entries]
 
-    def check_run_listing_root(self):
-        """Keep the CLI's inaccessible state directory distinct from an absent one."""
-        failure = self._failure
-        if self._root is None and isinstance(failure, OSError):
-            # A loop can survive non-strict resolution. A no-follow directory open
-            # may report ENOTDIR for that remaining link, just as for a plain file.
-            unresolved_link = (failure.errno == errno.ENOTDIR and self.state is not None
-                               and os.path.islink(self.state))
-            if failure.errno not in (errno.ENOENT, errno.ELOOP) and not unresolved_link:
-                raise PathRefused(f"无法打开观察目录：{failure}") from failure
+    def empty_run_listing(self, error):
+        # Preserve the list's empty result for a regular file in place of runs/
+        # and for an unresolvable state-root link.
+        if isinstance(error, ReadFailed):
+            return error.errno == errno.ELOOP and error.step.level == "root" and error.step.stage == "resolve"
+        step, found = error.step, error.found
+        return step is not None and ((step.level == 0 and found == "not_directory")
+                                     or (step.level == "root" and found == "symlink"))
 
     def walk(self, components, *, limit, max_depth):
         """List addressable regular files below a directory, depth-first and bounded."""
-        files, skipped, truncated = [], {"symlink": 0, "other": 0, "excluded": 0, "unaddressable": 0}, False
-        fd = self.open_directory(components)
-        try:
-            truncated = self._walk(fd, list(components), files, skipped, limit, max_depth)
-        finally:
-            os.close(fd)
+        files, skipped = [], {"symlink": 0, "other": 0, "excluded": 0, "unaddressable": 0}
+        truncated = self._walk(self.scandir(components), list(components), files, skipped, limit, max_depth)
         return files, skipped, truncated
 
-    def _walk(self, fd, components, files, skipped, limit, max_depth):
-        for name, kind, info in _scan(fd):
+    def _walk(self, entries, components, files, skipped, limit, max_depth):
+        for name, kind, info in entries:
             if len(files) >= limit:
                 return True
-            if kind == "symlink":
-                skipped["symlink"] += 1
-                continue
-            if kind == "other":
-                skipped["other"] += 1
+            if kind in ("symlink", "other"):
+                skipped[kind] += 1
                 continue
             path = components + [name]
             if kind == "file":
@@ -442,15 +292,12 @@ class StateReader:
                 skipped["unaddressable"] += 1
                 continue
             try:
-                child = os.open(name, _DIR_FLAGS, dir_fd=fd)
-            except OSError:
+                children = self.scandir(path)
+            except ObserveError:
                 skipped["other"] += 1
                 continue
-            try:
-                if self._walk(child, path, files, skipped, limit, max_depth):
-                    return True
-            finally:
-                os.close(child)
+            if self._walk(children, path, files, skipped, limit, max_depth):
+                return True
         return False
 
 
@@ -486,11 +333,6 @@ def _tail_limit(tail):
     if type(tail) is not int or not 1 <= tail <= MAX_TAIL:
         raise InvalidPath(f"tail 必须是 1 到 {MAX_TAIL} 之间的整数")
     return tail
-
-
-def _status_summary(run):
-    from .cli import status_summary  # resolved at call time; cli may import dashboard later
-    return status_summary(run)
 
 
 def classify_invocation(entry):
@@ -687,7 +529,8 @@ class Observer:
             self.observed = location(state, self.reader.state, checkout=checkout)
         except BaseException:
             if owned is not None:
-                owned.close()
+                with suppress(state_files.StateReadError):
+                    owned.close()
             raise
 
     def close(self):
@@ -696,8 +539,8 @@ class Observer:
     def __enter__(self):
         return self
 
-    def __exit__(self, *exc):
-        self.close()
+    def __exit__(self, kind, value, traceback):
+        _closing(self.close, suppress_io=kind is not None)
 
     # ----- ledger -----
 
@@ -725,6 +568,10 @@ class Observer:
             entries = self.reader.scandir(["runs"])
         except NotFound:
             return result
+        except PathRefused as error:
+            if self.reader.empty_run_listing(error):
+                return result
+            raise
         for name, kind, _ in entries:
             if kind == "symlink":
                 result["skipped"].append({"path": f"runs/{name}", "reason": "符号链接"})
@@ -766,6 +613,16 @@ class Observer:
             result["runs"].append(item)
         return result
 
+    def run_summary(self, run, run_id, *, integrity_stop=None):
+        from .cli import status_summary  # resolved at call time to avoid importing CLI through dashboard
+
+        summary = status_summary(run, integrity_stop=integrity_stop)
+        if "scope" in summary:
+            held = scope.held_view(run, self.reader, run_id=run_id)
+            if held is not None:
+                summary["scope"]["held"] = held
+        return summary
+
     def run_detail(self, run_id):
         validate_run_id(run_id)
         sampled = time.time()
@@ -794,7 +651,7 @@ class Observer:
         if ledger_error is not None:
             return detail
         try:
-            detail["summary"] = _status_summary(run)
+            detail["summary"] = self.run_summary(run, run_id)
         except Exception as error:  # Any ledger damage: HarnessError, TypeError, KeyError, ...
             detail["summary_error"] = f"{type(error).__name__}: {_first_line(str(error))}"
         detail["schema_version"] = run["schema_version"]
@@ -961,7 +818,7 @@ class Observer:
     def events(self, run_id, tail=None):
         validate_run_id(run_id)
         sampled = time.time()
-        os.close(self.reader.open_directory(["runs", run_id]))  # Missing run: 404 even without events.jsonl
+        self.reader.probe(["runs", run_id], expect="directory")  # Missing run: 404 even without events.jsonl
         return {"id": run_id, "sampled_at": sampled, "sampled_at_utc": utc(sampled), **self._events(run_id, tail),
                 "observed": self.observed}
 
@@ -1067,24 +924,28 @@ def holding(use, close, *, keep=False):
     ``close`` closes what is still open, once, and is safe to call again or before anything is open. With ``keep``,
     what ``use`` opened is its caller's once it returns.
     """
-    kept = False
+    kept = completed = False
     try:
         try:
             result = use()
-            kept = keep
+            kept, completed = keep, True
             return result
         finally:
             if not kept:
-                _closing(close)
+                _closing(close, suppress_io=not completed)
     finally:
         if not kept:
-            _closing(close)
+            _closing(close, suppress_io=not completed)
 
 
-def _closing(close):
+def _closing(close, *, suppress_io):
     # Kept while closing, a signal is raised only once everything is closed.
     with defer_cleanup_signals(inherit=False):
-        close()
+        try:
+            close()
+        except (state_files.StateReadError, OSError):
+            if not suppress_io:
+                raise
 
 
 def observing(state, use, **options):

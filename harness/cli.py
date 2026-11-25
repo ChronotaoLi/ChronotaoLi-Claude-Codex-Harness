@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import copy
-import errno
 import json
 import os
 import re
@@ -26,6 +25,7 @@ from .operations import (RUN_ID, OperationRecord, config_identity, digest_assets
                          shared_paths, warn)
 from .runtime import Runtime
 from .shared import mcp_configs, toml_value
+from .state_files import StateFiles
 from .util import HarnessError, display_text, dump, escape_json_controls, one_line, read_json, write_json
 from .versions import missing_ledger, parse_current_ledger, precheck_run, require_current_ledger, unsupported_ledger
 
@@ -266,9 +266,6 @@ def status_summary(run, *, integrity_stop=None):
         result["scope"] = {"entries": list(declared), "declared": bool(declared)}
         if not declared:
             result["scope"]["note"] = "未声明：首版计划不受边界约束，修订只能复用已发布计划的模式"
-        held = boundary.held_view(run)
-        if held is not None:
-            result["scope"]["held"] = held
         if run.get("status") == "awaiting_approval":
             result["scope_summary"] = boundary.summary(run)
     responses = run.get("operator_decisions", [])
@@ -301,14 +298,12 @@ def show_status(args, repo):
         if args.run_id:
             path = state / "runs" / args.run_id / "state.json"
             try:
-                # Below the bound root, but as the path read it replaces: links followed, uncapped, OSErrors as raised.
-                raw = observer.reader.read_following(["runs", args.run_id, "state.json"])
-            except FileNotFoundError as error:
+                raw = observer.reader.read(["runs", args.run_id, "state.json"], limit=None)["data"]
+            except observe.NotFound as error:
                 raise missing_ledger(path) from error
             except observe.PathRefused as error:
-                # A FIFO or device, never read: local I/O, as a directory in its place is.
                 raise HarnessError(f"无法读取运行台账 {path}：{error}", stop=stops.make(
-                    "runtime_failure", "io", data={"error_type": type(error).__name__})) from error
+                    "runtime_failure", "io", data={"error_type": observe.error_type(error, ledger=True)})) from error
             try:
                 ledger = parse_current_ledger(raw)
             except json.JSONDecodeError as error:
@@ -316,23 +311,20 @@ def show_status(args, repo):
             if args.full:
                 print(dump(ledger))
                 return
-            summary = status_summary(ledger, integrity_stop=stops.make("evidence", "load_integrity"))
+            summary = observer.run_summary(ledger, args.run_id, integrity_stop=stops.make("evidence", "load_integrity"))
             # Read after the ledger's version gate; saved samples only, never a CLI.
             summary["quota"] = observer.quota_block(args.run_id)
             print(dump(summary))
             return
         # The read-only observation layer owns the list; stdout fields are unchanged.
         try:
-            observer.reader.check_run_listing_root()
             return observer.list_runs()
-        except (observe.ObserveError, OSError) as error:
-            cause = error.__cause__
-            failure = (cause if isinstance(cause, OSError) and
-                       cause.errno not in (errno.ELOOP, errno.ENOTDIR, errno.ENOENT) else error)
+        except observe.ObserveError as error:
+            failure = observe.error_type(error)
             hint = ("；列表需要运行目录的读权限；按 ID 查看（status RUN）对此目录只需搜索权限"
-                    if isinstance(failure, PermissionError) else "")
+                    if failure == "PermissionError" else "")
             raise HarnessError(f"无法读取运行目录 {state / 'runs'}：{error}{hint}", stop=stops.make(
-                "runtime_failure", "io", data={"error_type": type(failure).__name__})) from error
+                "runtime_failure", "io", data={"error_type": failure})) from error
     listing = observe.observing(state, show, checkout=repo)
     if args.run_id:
         return
@@ -380,13 +372,13 @@ def _manage_memory(args, repo, state):
                 raise HarnessError("记忆来源运行缺失、无效、不属于当前项目或台账版本不支持",
                                    stop=stops.make("invalid_input", "cli_arguments", data={"option": "--run"}))
         git.ignore_state(repo)
-    elif not path.exists():
+    memory = Memory(path, repo=repo, read_only=not adding)
+    if not adding and not memory.database_exists():
         if args.memory_command == "read":
             raise HarnessError(f"没有此记忆：{args.id}",
                                stop=stops.make("invalid_input", "cli_arguments", data={"option": "id"}))
         print(dump([]))
         return
-    memory = Memory(path, repo=repo, read_only=not adding)
     if adding:
         print(memory.remember(key=args.key, abstract=args.title, overview=args.text, detail=args.text,
                               source=args.source, ttl_days=args.ttl_days,
@@ -558,11 +550,9 @@ def persisted_run_id(args, engine, state):
         ident = run.get("id") if isinstance(run, dict) else None
     else:
         ident = args.run_id
-    try:
-        if isinstance(ident, str) and RUN_ID.fullmatch(ident) and (state / "runs" / ident / "state.json").is_file():
+    if isinstance(ident, str) and RUN_ID.fullmatch(ident):
+        if StateFiles(state).probe(("runs", ident, "state.json")).state == "present":
             return ident
-    except OSError:
-        pass
     return None
 
 
@@ -848,9 +838,9 @@ def _main(argv=None):
                         cause = error.__cause__
                         if getattr(error, "_dashboard_invalid_port", False):
                             error.stop = stops.make("invalid_input", "cli_arguments", data={"option": "--port"})
-                        elif isinstance(cause, observe.NotFound) and getattr(cause, "_root_initialization_failed", False):
+                        elif isinstance(cause, observe.ObserveError):
                             error.stop = stops.make("runtime_failure", "io",
-                                                    data={"error_type": type(cause.__cause__).__name__})
+                                                    data={"error_type": observe.error_type(cause)})
                         raise
                 elif args.command == "cleanup-run":
                     result = cleanup_run(repo, args.run_id, remove=args.remove,
@@ -892,9 +882,6 @@ def _main(argv=None):
                     try:
                         run, error = observer._read_ledger(args.run_id)
                     except observe.NotFound as failure:
-                        cause = failure.__cause__
-                        if cause is not None and not (isinstance(cause, OSError) and cause.errno == errno.ENOENT):
-                            raise
                         raise HarnessError(str(failure), stop=stops.make(
                             "invalid_input", "cli_arguments", data={"option": "run_id"})) from failure
                     if error is None and unsupported_ledger(run) is not None:
@@ -937,11 +924,8 @@ def _main(argv=None):
                 try:
                     return observe.observing(state, diagnose, required=True)
                 except observe.ObserveError as error:
-                    cause = error.__cause__
-                    failure = (cause if isinstance(cause, OSError) and
-                               cause.errno not in (errno.ELOOP, errno.ENOTDIR, errno.ENOENT) else error)
                     raise HarnessError(str(error), stop=stops.make(
-                        "runtime_failure", "io", data={"error_type": type(failure).__name__})) from error
+                        "runtime_failure", "io", data={"error_type": observe.error_type(error)})) from error
             if args.command in ("demo", "smoke"):
                 demo(config, live=args.command == "smoke", commander=getattr(args, "commander", "astra"))
                 return 0

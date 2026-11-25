@@ -67,12 +67,3 @@ def parse_current_ledger(raw):
     run = json.loads(raw.decode("utf-8"))
     require_current_ledger(run)
     return run
-
-
-def read_current_ledger(path):
-    """Read a run ledger file; refuse any other version before a field is interpreted."""
-    try:
-        raw = path.read_bytes()
-    except FileNotFoundError as error:
-        raise missing_ledger(path) from error
-    return parse_current_ledger(raw)

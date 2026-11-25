@@ -144,7 +144,15 @@ class StatusStderrTests(RepoCase):
         self.assert_io(self.status(), "PathRefused")
 
     def test_list_enumeration_io_error_does_not_look_like_empty_list(self):
-        with patch.object(observe, "_scan", side_effect=OSError(errno.EIO, "fixture I/O failure")):
+        runs_info = self.runs.stat()
+        scandir = os.scandir
+
+        def scandir_with_eio(path_or_fd):
+            if isinstance(path_or_fd, int) and os.path.samestat(os.fstat(path_or_fd), runs_info):
+                raise OSError(errno.EIO, "fixture I/O failure")
+            return scandir(path_or_fd)
+
+        with patch("harness.state_files.os.scandir", new=scandir_with_eio):
             self.assert_io(self.status(), "OSError")
 
     def test_genuinely_missing_listing_directories_are_empty(self):

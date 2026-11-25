@@ -230,7 +230,7 @@ class EventObservationTests(StateCase):
         self.assertIn("dispatch_prepared", detail["notes"]["events"])
         output = io.StringIO()
         with patch("harness.watch_cli.RunWatcher") as watcher:
-            watcher.return_value.__enter__.return_value.backend = "fixture"
+            watcher.return_value.backend = "fixture"
             self.assertEqual(watch_run(self.state, run_id, stdout=output), 0)
         snapshot, = [json.loads(line) for line in output.getvalue().splitlines()]
         self.assertEqual(snapshot["status"], "blocked")

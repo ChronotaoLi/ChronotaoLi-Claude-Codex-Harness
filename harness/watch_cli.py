@@ -7,7 +7,7 @@ import sys
 from . import observe, stops
 from .util import HarnessError
 from .versions import require_current_ledger
-from .watch import RunWatcher
+from .watch import RunWatcher, watching
 
 STOPPED = frozenset(("completed", "abandoned", "blocked", "interrupted", "paused", "awaiting_approval"))
 
@@ -17,9 +17,8 @@ def watch_run(state, run_id, *, follow=False, stdout=None):
 
     stdout = sys.stdout if stdout is None else stdout
 
-    def watching(observer):
-        # Register first: writes racing the initial read remain queued.
-        with RunWatcher(observer.reader, run_id) as watcher:
+    def watch_observer(observer):
+        def snapshot_loop(watcher):
             previous = None
             while True:
                 run, error = observer._read_ledger(run_id)
@@ -54,8 +53,11 @@ def watch_run(state, run_id, *, follow=False, stdout=None):
                 while not watcher.wait(30):
                     pass  # timeout is only an interrupt boundary; no state read
 
+        # Register first: writes racing the initial read remain queued.
+        return watching(lambda: RunWatcher(observer.reader, run_id), snapshot_loop)
+
     try:
-        return observe.observing(state, watching, required=True)
+        return observe.observing(state, watch_observer, required=True)
     except observe.ObserveError as error:
         stop = None
         if getattr(error, "_initial_run_missing", False):

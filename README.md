@@ -41,7 +41,9 @@ python3 tests/run_shards.py
 
 `doctor` 只检查配置中使用的 CLI 安装和登录，不请求模型；`demo` 用模拟 agent 跑真实 Git、测试、提交、记忆和交接流程，在临时目录留下可检查的结果。它不证明真实模型调用成功。
 
-单进程 `unittest discover` 是参考跑法。`python3 tests/run_shards.py [--shards 4] [--out DIR] [--pattern 'test*.py']` 用同样的标准 discovery 收集测试 ID，按模块分组在独立的 unittest 进程中并行运行，再从各组日志核对执行集合：收集到的每个测试恰好执行一次时才以 0 退出；收集到重复 ID、某组失败、模块导入失败、日志无法完整对账，或有测试缺失、重复、多出时都以非零退出并列出 ID。
+单进程 `unittest discover` 是参考跑法。`python3 tests/run_shards.py [--shards 4] [--out DIR] [--pattern 'test*.py']` 用同样的标准 discovery 收集测试 ID，在独立的 unittest 进程中并行运行。多片运行时，模块里唯一有测试的类可声明 `shard_methods = True`，表示方法各自拥有夹具，且不依赖执行顺序或共享状态。discovery 发现模块或类共享夹具、`load_tests` 或定制生命周期时，保留整组。中断扫测类已启用方法级调度。`shard_seconds` 中的可选耗时估计只用于平衡负载，未填写的方法使用固定默认值。分片保留人读日志，同时用独立于测试 stderr 的 unittest 结果流按 ID 核对每个方法。类或模块夹具导致的跳过也要能归到收集的 ID。收集出现重复 ID、分片失败、导入失败、结果无法对账，或有测试缺失、重复、多出时都以非零退出。
+
+`result.json` 的 `outcomes` 按方法计数，原生 unittest 的跳过事件数还可包含同一方法中的多个子测试。绊线报告写不完整的诊断收在 `report_incomplete`（含来源），该字段用于核对证据完整性，退出码仍按测试结果与执行对账决定。
 
 真实模型的最小联调会消耗你现有账号的额度：
 
@@ -93,10 +95,10 @@ editable 安装不复制源码：包、默认操作者配置（源码目录的 `
   ```
 
   项目配置的位置固定：不向上级目录搜索，没有回退，也没有命令行参数能改它；`--repo` 指向仓库子目录时用的也是 Git 根目录下的这一份（在 `git worktree` 建的链接工作树里，Git 根目录是那个工作树自己的根）。
-- `verification.commands` 是确定性验证命令，`run` 要求至少一条。每条命令是只含 `cwd` 与 `argv` 两个键的表，两键都必填，例如 `{ cwd = ".", argv = ["uv", "run", "pytest"] }` 或 `{ cwd = "web", argv = ["npm", "test", "--", "--run"] }`。`argv` 不经 shell 解释。`cwd` 是命令执行的目录，相对工作树根，`"."` 表示根；工程在子目录时（它的 `pubspec.yaml`、`package.json` 或 `pyproject.toml` 所在的目录）把那个目录写成 `cwd`，不要写 `cd` 的 shell 脚本。同一 argv 在两个目录是两条命令。`cwd` 不能是绝对路径，不能以 `/` 结尾，不能有空段、`.` 或 `..` 段，每段要含非空白字符，不含反斜杠与 NUL，不含代理码点（JSON 输入可以用单独的 `\ud800` 这类转义写出它，TOML 本身不接受这种转义），最多 4,096 个字符；首段不能是 `.git`、`.harness`、`.codex`、`.claude`，任一段不能是 `.git`（按折叠后的名称判定，`.GIT` 这类写法同样拒绝）。不合格时加载配置即报错，错误写明字段路径（例如 `permissions.worker_commands[2].cwd`）与所在文件。命令形状的错误在逐个文件解析时报出：两份配置里还有预算、`fresh_checkout` 类型、准备命令需要 `fresh_checkout` 这类合并之后才检查的错误时，先报出的是命令形状的错误。目录是否存在在加载时不检查。执行时从工作树根逐级以 no-follow 打开目录（下面的结果都以单一故障为前提，见[设计：隔离与进程](docs/design.md#隔离与进程)）：某一段不存在、不是目录、是符号链接、没有权限或名称过长，或者子进程进入目录的 `fchdir` 失败（例如没有搜索权限）时，这条命令不启动，不是缺少授权：正式验证里它记为一条失败的检查（`termination_reason` 为 `start_failed`）。逐级打开时遇到其他本地 I/O 错误（例如 `EIO`）时它不是检查结果，正式验证以 `runtime_failure/io` 停止；验证自己的写入或监督器出故障时的结果见[设计：不变量](docs/design.md#不变量)第 23 条。依赖需要在 worktree 中可用；生成产物应已忽略或位于工作树外，验证期间出现未忽略的新文件也会触发快照门禁。验证命令与 `permissions.worker_commands` 就是授予 worker 的执行能力（见[worker 命令与删除](docs/operations.md#worker-命令与删除)）。
+- `verification.commands` 是确定性验证命令，`run` 要求至少一条。每条命令是只含 `cwd` 与 `argv` 两个键的表，两键都必填，例如 `{ cwd = ".", argv = ["uv", "run", "pytest"] }` 或 `{ cwd = "web", argv = ["npm", "test", "--", "--run"] }`。`argv` 不经 shell 解释。`cwd` 是命令执行的目录，相对工作树根，`"."` 表示根；工程在子目录时（它的 `pubspec.yaml`、`package.json` 或 `pyproject.toml` 所在的目录）把那个目录写成 `cwd`，不要写 `cd` 的 shell 脚本。同一 argv 在两个目录是两条命令。`cwd` 不能是绝对路径，不能以 `/` 结尾，不能有空段、`.` 或 `..` 段，每段要含非空白字符，不含反斜杠与 NUL，不含代理码点（JSON 输入可以用单独的 `\ud800` 这类转义写出它，TOML 本身不接受这种转义），最多 4,096 个字符；首段不能是 `.git`、`.harness`、`.codex`、`.claude`，任一段不能是 `.git`（按折叠后的名称判定，`.GIT` 这类写法同样拒绝）。不合格时加载配置即报错，错误写明字段路径（例如 `permissions.worker_commands[2].cwd`）与所在文件。命令形状的错误在逐个文件解析时报出：两份配置里还有预算、`fresh_checkout` 类型、准备命令需要 `fresh_checkout` 这类合并之后才检查的错误时，先报出的是命令形状的错误。目录是否存在在加载时不检查。执行时从工作树根逐级以 no-follow 打开目录（下面的结果都以单一故障为前提，见[设计：隔离与进程](docs/design.md#隔离与进程)）：某一段不存在、不是目录、是符号链接、没有权限或名称过长，或者子进程进入目录的 `fchdir` 失败（例如没有搜索权限）时，这条命令不启动，不是缺少授权：正式验证里它记为一条失败的检查（`termination_reason` 为 `start_failed`），argv[0] 本身无法执行时也按同一检查结果处理。逐级打开时遇到其他本地 I/O 错误（例如 `EIO`）时它不是检查结果，正式验证以 `runtime_failure/io` 停止；验证自己的写入或监督器出故障时的结果见[设计：不变量](docs/design.md#不变量)第 23 条。依赖需要在 worktree 中可用；生成产物应已忽略或位于工作树外，验证期间出现未忽略的新文件也会触发快照门禁。验证命令与 `permissions.worker_commands` 就是授予 worker 的执行能力（见[worker 命令与删除](docs/operations.md#worker-命令与删除)）。
 - 有效配置是“内置默认值 ← 操作者配置 ← 项目配置”，后者覆盖前者。项目配置里的 `runtime` 逐键覆盖操作者配置，每个键的值整体替换（`claude_max_turns_by_role` 这样的表和所有数组都不合并）；`verification`、`permissions` 只来自项目配置，没写的键取内置默认值。合并后的有效配置再按全部规则校验。
 - 节写错了文件会被拒绝，错误指出它应写在哪份文件里（例如操作者配置里出现 `verification`）；未知节和键同样被拒绝，错误给出完整键路径和所在文件。模型 ID 原样使用；`shared` 的相对路径相对操作者配置所在的目录解析。
-- `run`、`resume`、`permission-diagnostics` 读两份配置，项目配置不存在时在任何写入之前拒绝（退出码 2）；其他命令读哪份配置见[统一入口](docs/operations.md#统一入口)。
+- `run`、`resume`、`permission-diagnostics` 读两份配置，项目配置不存在、任一配置内容不合格或 `run` 的 `verification.commands` 为空，都在任何写入之前拒绝（退出码 2）。配置文件读不出时为本地 I/O 故障（退出码 1）；其他命令读哪份配置见[统一入口](docs/operations.md#统一入口)。
 - `.harness/` 的 Git 忽略保护由第一次 `run`（或 `sync`、`memory add`）安装（见[数据与排查](#数据与排查)）。在那之前项目配置只是未跟踪文件，不要 `git add` 它：`.harness` 下有被跟踪或暂存的文件时，运行时拒绝初始化私有状态。Harness 仓库自己的 `.harness/project.toml` 也是本地文件，不入库。
 
 ### 执行
@@ -141,7 +143,7 @@ harness resume RUN --step
 
 指挥的修订若只细化当前未接受任务的说明、追加它的范围或前置命令且仍选它，会核验并保留该任务的候选代码，交给同一任务的新 worker；新增任务或依赖仍先归档未接受修改。提案有模式无法证明在范围边界内时被持有（回执保留、不调用模型）：核对后执行停止信息给出的 `resume RUN --scope=…` 落地同一提案，或用 `resume RUN --reject-request FILE` 拒绝它。指挥提问后 run 停止，须通过 `resume RUN --operator-decision FILE` 明确回答；回答进入下一次指挥决定。详见[指挥提问、修订与范围](docs/recovery.md#指挥提问修订与范围)。
 
-所有更改在 `<目标项目>/.harness/worktrees/<run_id>` 的 `harness/<run_id>` 分支完成。每个通过检查和审阅的任务生成本地提交。成功输出分支和路径，便于查看 diff、merge 或 cherry-pick；最终集成由你操作。
+所有更改在 `<目标项目>/.harness/worktrees/<run_id>` 的 `harness/<run_id>` 分支完成。任务通过检查和审阅后，只有树与父提交不同才创建新的本地提交。完成时输出分支、工作树路径与获批的结果提交 `result.commit`，可据此查看 diff 或集成。分支之后移动也不会改写获批的提交；最终集成由你操作。
 
 每个接受后的树与父提交不同的任务恰好生成一个提交。提交消息由该任务的 worker 按目标仓库的提交规范撰写（`commit_message` 的主题与正文），经独立审阅审查；除非仓库规范要求，消息里不加 `Co-Authored-By` 之类的署名行，多出的署名行由审阅者按阻断问题退回；运行时用 `git commit-tree` 原样写入主题与正文，并在末尾追加 `Harness-Run`、`Harness-Task` 两行 trailer。作者与提交者固定为 `Personal Harness <harness@localhost>`，不签名，不运行仓库 hooks，提交编码固定为 UTF-8；运行时不推送、不合并、不改写历史。目标或仓库规则要求更多（签名、`Signed-off-by` trailer、指定作者、压缩提交、推送）时，指挥会向操作者提问，不会写成运行时做不到的验收项。
 
@@ -173,7 +175,7 @@ setup_commands = [{ cwd = ".", argv = ["npm", "ci"] }]
 
 默认 `fresh_checkout = false`、`setup_commands = []`。开启后，仅整体验证改用目标仓库外的全新 detached worktree，顺序执行准备与验证；准备不得改变已跟踪文件或留下未忽略文件，也不授予 worker 权限。任务级验证仍在原工作树，依赖仍须可用。同一 run 不可改变这两项设置。准备与验证命令的 `cwd` 相对新检出的根，新检出只含 HEAD 的已提交内容：准备命令的目录必须在 HEAD 中存在或由前面的准备命令创建，否则依赖准备失败（`verification/setup_failed`），每次 `resume` 都在同一 HEAD 上同样失败；`verification.*` 恢复时不能改，只能 `abandon` 后用改正的配置开新 run。
 
-验证通过的检出由运行时在整体审阅派发前尝试回收；准备失败、验证失败或中断的检出保留供检查，用 `cleanup-run` 清理（见[整体验证与重验](docs/recovery.md#整体验证与重验)）。该模式仍使用当前环境、Git 配置及声明的准备命令，不承诺容器级可复现性。审阅包里的忽略清单只列路径（目录折叠、有界），不校验内容，不能替代全新检出。
+验证通过的检出由运行时在整体审阅派发前尝试回收；准备失败、验证失败或中断的检出保留供检查，用 `cleanup-run` 清理（见[整体验证与重验](docs/recovery.md#整体验证与重验)）。该模式仍使用当前环境、Git 配置（含内容过滤器与换行转换）及声明的准备命令。Harness 的 Git 调用关闭已配置的 hook（并发改写配置的窗口见[隔离与进程](docs/design.md#隔离与进程)）；可复现性仍取决于这些输入。审阅包里的忽略清单只列路径（目录折叠、有界），不校验内容，不能替代全新检出。
 
 ## 状态、恢复与清理
 
@@ -191,7 +193,7 @@ harness cleanup-run RUN --remove-ignored
 harness cleanup-run RUN --remove --remove-ignored
 ```
 
-`status RUN` 显示任务、预算、待答决定、续作、范围边界、审阅轮次、停止投影 `stop`（类型、标题、出口命令与诊断摘录）和运行期间账号额度的观测变化 `quota`（字段见[通用规则](docs/recovery.md#通用规则)与[额度](docs/operations.md#额度)），`--full` 查看完整台账。失败的命令在 stderr 输出一行 `[harness-json] {"event":"stop",…}`，与 `status RUN` 的 `stop` 同一投影；它紧跟在 `harness: ` 开头的错误全文之后，前后还有别的行，外层脚本按前缀 `[harness-json] ` 与 `event` 为 `stop` 找这一行，不按行号（见[自动记录的字段](docs/operations.md#自动记录的字段)）。`resume` 使用保存的现场和全新 agent，不恢复供应商会话，也不清零累计预算；恢复时只能放宽的配置与可以任意调整的额度等待上限见[通用规则](docs/recovery.md#通用规则)，其余配置及共享资产必须一致。
+`status RUN` 显示任务、预算、待答决定、续作、范围边界、审阅轮次、停止投影 `stop`（类型、标题、出口命令与诊断摘录）和运行期间账号额度的观测变化 `quota`（字段见[通用规则](docs/recovery.md#通用规则)与[额度](docs/operations.md#额度)），`--full` 查看完整台账。CLI 报告有类型的停止时，通常先写 `harness: ` 开头的错误全文，再尽力在 stderr 写一行 `[harness-json] {"event":"stop",…}`。错误续行与原因行都以两个空格开头。通知采用与 `status RUN` 相同的投影规则，省略 `detail` 和人读原因链。外层脚本按行首前缀与 `event` 为 `stop` 找本次调用的通知。没有通知时按退出码处理（见[自动记录的字段](docs/operations.md#自动记录的字段)）。`resume` 使用保存的现场和全新 agent，不恢复供应商会话，也不清零累计预算；恢复时只能放宽的配置与可以任意调整的额度等待上限见[通用规则](docs/recovery.md#通用规则)，其余配置及共享资产必须一致。
 
 **额度用尽时的进程内等待。** Claude 担任的角色（worker、`--commander fable` 的指挥、配置成 Claude 的审阅者）遇到额度用尽（`provider_quota/usage_limit`）时，默认在同一进程里等到额度快照给出的重置时刻再继续，单次最多 `runtime.quota_wait_max_seconds` 秒（默认 21,600，即 6 小时；0 关闭）。等待期间 run 仍是 `running`、持有运行锁（另一个 `resume`／`abandon` 得到 `busy/run_lock`），`status RUN` 的 `quota_wait` 显示等到何时；按 Ctrl-C 或 SIGTERM 取消（记为中断），之后普通 `resume`。没有等待时停止值的 `data.wait_reason` 写明原因。它不是恢复：进程被杀就不会自动继续。条件、醒来后的核对与取消方法见[额度等待](docs/recovery.md#额度等待)。
 
@@ -235,7 +237,7 @@ harness cleanup-run RUN --remove --remove-ignored
 
 台账版本为 20。台账只存摘要与引用，完整内容在 run 目录的不可变文件里；这些文件被删除、修改或换成符号链接时 `resume` 停止并保留现场（见[证据损坏](docs/recovery.md#证据损坏)）。已完成 run 的普通恢复返回保存结果。
 
-只支持当前台账版本：其他版本的台账在各入口一律被拒绝（`台账版本 N 不支持（当前版本 20）`），运行列表只列出它的路径、版本和“不支持”。见[终态与其他版本的台账](docs/recovery.md#终态与其他版本的台账)。
+只支持当前台账版本：其他版本的台账在各入口一律被拒绝（`台账版本 N 不支持（当前版本 20）`），网页列表只列出它的路径、版本和“不支持”。命令行列表把这条诊断写到 stderr，stdout 的列表省略该项。见[终态与其他版本的台账](docs/recovery.md#终态与其他版本的台账)。
 
 ## 共用 skills / MCP
 
@@ -327,13 +329,13 @@ claude_max_turns_by_role = { worker = 200 }
 
 首次私有写入前，运行时保留 Git 公共目录 `info/exclude` 原字节并补充 `/.harness/`，同时建立私有根 `.harness/.gitignore` 的 `*` 保护；不改项目已跟踪 `.gitignore`。已有冲突控制文件、符号链接或被跟踪的私有状态会拒绝，不覆盖现场。`.harness/` 属于被忽略的私有运行目录，不要提交运行现场、凭据或生成 MCP 配置；日志可能包含代码与业务内容。
 
-`status RUN --full` 的 `provider_usage` 及 `dispatch_finished` 事件记录供应商实际返回的用量，缺失用量不当作零，不汇总（见[用量与名义费用](docs/operations.md#额度)）。长进程每 60 秒在 stderr 提示仍在运行，实际超时独立生效。Git 接受步骤中断见[接受过程中断](docs/recovery.md#接受过程中断)，其他中断见[不能自动恢复的窗口](docs/recovery.md#不能自动恢复的窗口)；派发事件的含义见[观察网页用法与限制](docs/operations.md#观察网页用法与限制)，调用计数以台账 `invoked` 为准。
+`status RUN --full` 的 `provider_usage` 及 `dispatch_finished` 事件记录供应商实际返回的用量，缺失用量不当作零，不汇总（见[用量与名义费用](docs/operations.md#额度)）。长进程每 60 秒在 stderr 提示仍在运行，实际超时独立生效。Git 接受步骤中断见[接受过程中断](docs/recovery.md#接受过程中断)，信号送达与强杀后的恢复分别见[中断与重新启动](docs/recovery.md#中断与重新启动)和[不能自动恢复的窗口](docs/recovery.md#不能自动恢复的窗口)；派发事件的含义见[观察网页用法与限制](docs/operations.md#观察网页用法与限制)，调用计数以台账 `invoked` 为准。
 
 ## 参考与边界
 
 [设计取舍与参考来源](docs/design.md)记录 Orca、ECC、OpenWiki 的借鉴及厂商接口依据；实现是独立的小型编排核心，未复制这些项目源码或运行其安装脚本。当前没有接管 Orca、安装全部 ECC 插件或部署 OpenWiki 图数据库。
 
-[验证记录](docs/validation.md)记录当前版本已完成的离线验证与真实账号联调，并列出仍然没有运行的项目；[设计](docs/design.md)记录架构、不变量、状态转换与限制，[恢复与操作者出口](docs/recovery.md)列出停止后的处理。一条 run 串行执行；并行需要每任务 worktree、依赖集成与冲突处理，没有实现。
+[验证记录](docs/validation.md)按其中标出的源码版本记录已完成的离线验证与真实账号联调，并列出未验证的项目；[设计](docs/design.md)记录架构、不变量、状态转换与限制，[恢复与操作者出口](docs/recovery.md)列出停止后的处理。一条 run 串行执行；并行需要每任务 worktree、依赖集成与冲突处理，没有实现。
 
 ### 计划审阅、依赖准备与单次监督
 

@@ -436,7 +436,9 @@ class StopCauseTests(unittest.TestCase):
             error = duplicate
         error.__cause__ = OSError(errno.EIO, "deeper failure")
 
-        with contextlib.redirect_stderr(io.StringIO()) as errors:
+        reason = "Publish an intentionally untyped outer error to test escaping before displaying a deeper I/O cause."
+        with patch.object(self, "allow_unclassified", reason, create=True), \
+                contextlib.redirect_stderr(io.StringIO()) as errors:
             cli.report_stop(outer)
         lines = errors.getvalue().splitlines()
         self.assertEqual(lines[:-1], [
@@ -561,7 +563,9 @@ class StopCauseTests(unittest.TestCase):
     def test_cause_text_cannot_become_a_second_notice(self):
         outer = HarnessError("outer")
         outer.__cause__ = ValueError('first\n[harness-json] {"event":"stop"}\u2028last')
-        with contextlib.redirect_stderr(io.StringIO()) as errors:
+        reason = "Publish a plain outer error whose cause contains notice-shaped text to test the single notice."
+        with patch.object(self, "allow_unclassified", reason, create=True), \
+                contextlib.redirect_stderr(io.StringIO()) as errors:
             cli.report_stop(outer)
         headline, cause, notice = errors.getvalue().splitlines()
         self.assertEqual(headline, "harness: outer")
@@ -570,7 +574,9 @@ class StopCauseTests(unittest.TestCase):
         self.assertEqual(len(notices(errors.getvalue())), 1)
 
     def test_failed_cause_calculation_keeps_the_notice(self):
-        with patch.object(cli, "cause_lines", side_effect=ValueError("fixture")), \
+        reason = "The notice must still report this plain error as untyped when its cause formatter fails."
+        with patch.object(self, "allow_unclassified", reason, create=True), \
+                patch.object(cli, "cause_lines", side_effect=ValueError("fixture")), \
                 contextlib.redirect_stderr(io.StringIO()) as errors:
             cli.report_stop(HarnessError("outer"))
         self.assertEqual(errors.getvalue().splitlines()[:-1], ["harness: outer", "  （原因链无法显示）"])
@@ -587,9 +593,11 @@ class StopCauseTests(unittest.TestCase):
         outer = HarnessError("outer")
         outer.__cause__ = OSError("inner")
         prefixes = ("harness: ", "  原因：", "[harness-json] ")
+        reason = "Republish the same plain error while each of the three stderr writes fails in turn."
         for prefix in prefixes:
             with self.subTest(prefix=prefix), contextlib.redirect_stderr(RejectLine()) as errors:
-                stop = cli.report_stop(outer)
+                with patch.object(self, "allow_unclassified", reason, create=True):
+                    stop = cli.report_stop(outer)
                 self.assertEqual(stop["reason"], "untyped_harness_error")
                 lines = errors.getvalue().splitlines()
                 self.assertEqual(lines.count(""), int(prefix == "  原因："))

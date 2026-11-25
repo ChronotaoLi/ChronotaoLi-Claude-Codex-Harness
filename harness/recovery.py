@@ -198,31 +198,6 @@ def decode_evidence_json(raw, source, *, message=None):
         return strict_json_loads(raw.decode("utf-8"))
 
 
-def read_bound_bytes(receipt, label, *, bind=None):
-    """Read and bind original bytes before parsing or any later lifecycle gate.
-
-    Path loss and changed bytes are EvidenceError; other local I/O stays itself.
-    The ``bind`` callback (a save) runs outside the evidence read.
-    """
-    try:
-        raw = Path(receipt["artifact"]).read_bytes()
-    except OSError as error:
-        stops.keep_local_io(error)
-        raise _evidence(f"{label}原始结果缺失或无法读取；保留证据，禁止重新抽取结论", receipt) from error
-    digest = hashlib.sha256(raw).hexdigest()
-    if receipt.get("artifact_digest", digest) != digest:
-        raise _evidence(f"{label}原始结果已改变；保留证据，禁止重新抽取结论", receipt)
-    if "artifact_digest" not in receipt and bind is not None:
-        receipt["artifact_digest"] = digest
-        bind()
-    return raw, digest
-
-
-def read_bound_result(receipt, label, *, bind=None):
-    raw, digest = read_bound_bytes(receipt, label, bind=bind)
-    return _decode_result(raw, digest, receipt, label)
-
-
 def _decode_result(raw, digest, receipt, label):
     try:
         # The runtime wrote this file; anything not strictly decodable was altered.

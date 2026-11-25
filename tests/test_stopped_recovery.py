@@ -234,13 +234,13 @@ class StoppedRecoveryTests(RepoCase):
         self.assertEqual(cleanup_run(self.repo, engine.run["id"], remove=True)["worktree"]["status"], "removed")
 
     def test_abandon_refuses_live_process_or_ignored_unsaved_file(self):
-        # The hand-made dispatch below has no ID, so the refusal cannot name one: its stop degrades to unclassified.
-        self.allow_unclassified = True
         engine = self.engine()
         engine.start("Implement greet", self.plan(), pause_after_plan=True)
         engine.run["dispatches"].append({"pgid": 123456, "exit_confirmed": False})
         engine.context.save()
-        with patch("harness.run_context.group_alive", return_value=True), self.assertRaises(HarnessError):
+        reason = "The hand-made live dispatch has no ID to put in the dispatch-exit refusal."
+        with patch.object(self, "allow_unclassified", reason, create=True), \
+                patch("harness.run_context.group_alive", return_value=True), self.assertRaises(HarnessError):
             self.engine().abandon(engine.run["id"])
         engine.run["dispatches"].clear()
         engine.context.save()

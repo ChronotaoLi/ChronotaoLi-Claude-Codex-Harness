@@ -7,6 +7,7 @@ whose windows each test sets. ``harness.quota_wait.time`` normally uses a fake c
 Every quota number and time is synthetic; the one real envelope is the de-identified
 connection failure ``test_provider_failures.REAL_CONNECTION_REFUSED``.
 """
+import ast
 import copy
 import errno
 import json
@@ -1225,10 +1226,7 @@ class ObservationTests(WaitCase):
                 self.calls = 0
                 write_json(path, sequence[0])
 
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *args):
+            def close(self):
                 pass
 
             def wait(self, seconds):
@@ -1375,14 +1373,24 @@ class ContractTests(WaitCase):
         self.assertEqual(saved["stop"]["data"]["window"], label)
         self.assertFalse(any("quota_wait" in state for state in states))
 
+    def assert_watch_quota_wait_literals(self, tree):
+        from test_stop_guards import watch_snapshot_literals
+
+        projected = watch_snapshot_literals(tree, "quota_wait")
+        self.assertEqual(len(projected), 3)
+        unexpected = [node.lineno for node in ast.walk(tree)
+                      if isinstance(node, ast.Constant) and node.value == "quota_wait" and node not in projected]
+        self.assertEqual(unexpected, [], "unexpected quota_wait literals in watch_cli.py")
+
     def test_quota_wait_literal_guard(self):  # T8-26 (GQ)
-        import ast
         allowed = {("quota_wait.py", "validate_ledger"), ("quota_wait.py", "clear"), ("quota_wait.py", "project"),
-                   ("quota_wait.py", "_wait"), ("cli.py", "status_summary"), ("watch_cli.py", "watch_run"),
-                   ("watch_cli.py", "watching"), ("diagnostics.py", "ledger_stage")}
+                   ("quota_wait.py", "_wait"), ("cli.py", "status_summary"), ("diagnostics.py", "ledger_stage")}
         found = set()
         for path in sorted((ROOT / "harness").glob("*.py")):
             tree = ast.parse(path.read_text(encoding="utf-8"))
+            if path.name == "watch_cli.py":
+                self.assert_watch_quota_wait_literals(tree)
+                continue
             for function in ast.walk(tree):
                 if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     continue
@@ -1394,6 +1402,14 @@ class ContractTests(WaitCase):
         source = (ROOT / "harness" / "quota_wait.py").read_text(encoding="utf-8")
         writes = re.findall(r'run\["quota_wait"\]\s*=', source)
         self.assertEqual(len(writes), 1)
+
+        watch_source = (ROOT / "harness" / "watch_cli.py").read_text(encoding="utf-8")
+        for marker, new_line in (("                encoded = ", "                run['quota_wait'] = None"),
+                                 ("        def snapshot_loop", "        observer.get('quota_wait')"),
+                                 ("def watch_run", "field = 'quota_wait'")):
+            with self.subTest(new_line=new_line), self.assertRaises(AssertionError):
+                changed = watch_source.replace(marker, f"{new_line}\n{marker}", 1)
+                self.assert_watch_quota_wait_literals(ast.parse(changed))
 
     def test_not_waiting_matches_the_settled_result_without_the_waiter(self):  # T8-25
         """Every reason not to wait ends as the waiter-less code path would, through the real CLI.

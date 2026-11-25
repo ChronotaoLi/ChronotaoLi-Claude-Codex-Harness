@@ -9,11 +9,13 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import stop_tripwire
+
 from harness import state_files, stops
 from harness.adapters import DemoBackend
 from harness.dispatch import invocation_stop, process_stop
 from harness.process_runtime import ProcessOutcome, failure
-from harness.recovery import bound_bytes, read_bound_bytes
+from harness.recovery import bound_bytes
 from harness.run_context import RunContext
 from harness.run_lifecycle import RunLifecycle
 from harness.runtime import Runtime
@@ -68,12 +70,48 @@ class RegistryGuard(unittest.TestCase):
 # ---- G6: no runtime code reads the ledger's stop ------------------------------------------
 WRITERS = {("workflow.py", "stop"), ("scheduler.py", "_execute_until_terminal"), ("cli.py", "status_summary")}
 DELETERS = {("scheduler.py", "_execute_until_terminal"), ("run_lifecycle.py", "abandon_locked")}
-OUTPUT_KEYS = {("cli.py", "stop_notice"), ("operations.py", "create"), ("watch_cli.py", "watching")}
-READERS = {("observe.py", "_operation_summary"), ("watch_cli.py", "watching")}  # projections and records only
+OUTPUT_KEYS = {("cli.py", "stop_notice"), ("operations.py", "create")}
+READERS = {("observe.py", "_operation_summary")}  # projections and records only
 WRITTEN_LEAVE_ERROR_ASSIGNMENT = ast.dump(ast.parse("""
 leave_error = {"stop": f"{value['kind']}/{value['reason']}",
                "error": value["data"].get("detail") or type(error).__name__}
 """).body[0])
+
+
+WATCH_SNAPSHOT_PROJECTIONS = {
+    "stop": "{key: summary['stop'][key] for key in ('kind', 'reason', 'title', 'exit_code')}"
+            " if summary.get('stop') else None",
+    "quota_wait": "{key: summary['quota_wait'][key] for key in ('window', 'until', 'recorded_at')}"
+                  " if summary.get('quota_wait') else None",
+}
+
+
+def watch_snapshot_literals(tree, field):
+    """Return the three literals of one projected field in watch_cli's snapshot loop."""
+    scope = tree
+    for name in ("watch_run", "watch_observer", "snapshot_loop"):
+        definitions = [node for node in scope.body if isinstance(node, ast.FunctionDef) and node.name == name]
+        if len(definitions) != 1:
+            return set()
+        scope = definitions[0]
+    fields = []
+    for loop in scope.body:
+        if not isinstance(loop, ast.While):
+            continue
+        for assignment in loop.body:
+            if not (isinstance(assignment, ast.Assign) and len(assignment.targets) == 1
+                    and isinstance(assignment.targets[0], ast.Name) and assignment.targets[0].id == "snapshot"
+                    and isinstance(assignment.value, ast.Dict)):
+                continue
+            fields.extend((key, value) for key, value in zip(assignment.value.keys, assignment.value.values)
+                          if isinstance(key, ast.Constant) and key.value == field)
+    if len(fields) != 1:
+        return set()
+    key, value = fields[0]
+    expected = ast.parse(WATCH_SNAPSHOT_PROJECTIONS[field], mode="eval").body
+    if ast.dump(value) != ast.dump(expected):
+        return set()
+    return {key, *(node for node in ast.walk(value) if isinstance(node, ast.Constant) and node.value == field)}
 
 
 def stop_literals(name, text):
@@ -88,8 +126,11 @@ def stop_literals(name, text):
                 return node.name
         return "<module>"
     found = []
+    watch_projection = watch_snapshot_literals(tree, "stop") if name == "watch_cli.py" else set()
     for node in ast.walk(tree):
         if not (isinstance(node, ast.Constant) and node.value == "stop"):
+            continue
+        if node in watch_projection:
             continue
         parent, role = parents.get(node), "read"
         grand = parents.get(parent)
@@ -147,8 +188,18 @@ class StopLiteralGuard(unittest.TestCase):
                 module = "cli.py" if name == "operate branches" else "scheduler.py"
                 self.assertTrue(stop_violations(stop_literals(module, text)), name)
 
+        source = (ROOT / "harness" / "watch_cli.py").read_text(encoding="utf-8")
+        marker = "                encoded = "
+        for statement, role in (("run.get('stop')", "read"), ("run['stop'] = None", "write"),
+                                ("del run['stop']", "delete"), ("other = {'stop': None}", "output")):
+            with self.subTest(statement=statement):
+                changed = source.replace(marker, f"                {statement}\n{marker}", 1)
+                self.assertEqual([(module, function, use) for module, function, use, _ in
+                                  stop_violations(stop_literals("watch_cli.py", changed))],
+                                 [("watch_cli.py", "snapshot_loop", role)])
 
-# ---- G7's exemption rule: only exceptions raised by test code count as injected ---------------------
+
+# ---- Tripwire injection: only exceptions raised by test code count as injected ---------------------
 class InjectionRule(unittest.TestCase):
     @staticmethod
     def caught(function):
@@ -160,7 +211,6 @@ class InjectionRule(unittest.TestCase):
 
     def test_test_frames_and_mock_side_effects_are_injected_runtime_and_library_frames_are_not(self):
         from unittest.mock import Mock
-        from test_harness import injected
 
         def raised_by_a_test():
             raise HarnessError("raised by the test itself")
@@ -172,7 +222,7 @@ class InjectionRule(unittest.TestCase):
         }
         for name, (function, expected) in cases.items():
             with self.subTest(case=name):
-                self.assertIs(injected(self.caught(function)), expected)
+                self.assertIs(stop_tripwire.injected(self.caught(function)), expected)
 
 
 # ---- G12: construction never fails on values and never lists an exit it cannot fill ----
@@ -357,16 +407,6 @@ class ReadFailureClasses(RepoCase):
                 self.assertIn(os.strerror(code), str(error))
                 self.assertIn(str(artifact), str(error))
 
-    def test_legacy_path_read_for_held_view(self):
-        with self.assertRaises(EvidenceError):
-            read_bound_bytes({"artifact": str(self.repo / "gone.json"), "artifact_digest": "a" * 64}, "测试")
-        locked = self.repo / "locked.json"
-        locked.write_text("{}")
-        with patch.object(Path, "read_bytes", side_effect=PermissionError(errno.EACCES, "denied")):
-            with self.assertRaises(PermissionError) as caught:
-                read_bound_bytes({"artifact": str(locked)}, "测试")
-        self.assertEqual(stops.of(caught.exception)["kind"], "runtime_failure")
-
 
 class LoadFailureClasses(RepoCase):
     def blocked_run(self):
@@ -507,7 +547,6 @@ class LoadFailureClasses(RepoCase):
 
 # ---- G17: settling (spec 2.2, 4.4) ----------------------------------------------------------
 class SettledStops(RepoCase):
-    allow_unclassified = True  # one case refuses with an injected untyped error, then settles
     blocked_run = LoadFailureClasses.blocked_run
     def test_preflight_sees_a_packet_replaced_after_the_locked_load(self):
         backend, engine = self.blocked_run()
@@ -964,7 +1003,7 @@ class PreflightRefusals(RepoCase):
         self.check(backend, engine, ["--reverify"], ("invalid_input", "run_state"), 2)
 
 
-# ---- G10 and G7 see the approval publication and prepare-run (code-4b suggestion 2) ------------------
+# ---- G10 and the stop tripwire see the approval publication and prepare-run -------------------------
 class GuardCoverage(DecideCase):
     def test_g10_sees_a_plan_awaiting_approval_published_over_a_load_failure(self):
         from harness.packets import PacketBuilder
@@ -992,11 +1031,13 @@ class GuardCoverage(DecideCase):
         write_json(manifest, {"files": []})
         # A failure raised by library code inside the operation (innermost frame json), not by the test.
         with patch.object(workspace_inputs, "manifest_shape", lambda ident, value: json.loads("{not json")):
-            code, _ = run_cli(self, ScriptedBackend(), ["prepare-run", engine.run["id"], "--manifest", str(manifest)])
-        self.assertEqual(code, 1)
-        findings = self.stop_guard_findings["unclassified"]
-        self.assertEqual([item[:2] for item in findings], [("unexpected_exception", "JSONDecodeError")])
-        findings.clear()
+            code, errors = run_cli(self, ScriptedBackend(), ["prepare-run", engine.run["id"], "--manifest", str(manifest)])
+        self.assertEqual(code, 1, errors)
+        notice = cli_notice(errors)
+        self.assertEqual((notice["kind"], notice["reason"]), ("unclassified", "unexpected_exception"))
+        finding, = stop_tripwire.consume(self)
+        self.assertEqual((finding.channels, finding.kind, finding.reason, finding.facts["error_type"], finding.exempt),
+                         ({"entry", "cli"}, "unclassified", "unexpected_exception", "JSONDecodeError", "consume"))
 
 
 # ---- A verification timeout whose cleanup failed is process evidence, not a timeout (code-4b 3) ------

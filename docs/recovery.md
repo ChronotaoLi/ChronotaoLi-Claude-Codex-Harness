@@ -44,7 +44,7 @@
 
 ## 阻塞状态与操作者出口
 
-“停止信息”是 `status RUN` 的 `stop.detail` 或 stderr 里 `harness: ` 开头的错误全文（节选；不含 `status` 写在第一行的位置行 `harness: 检出 …`）；紧跟其后的 `[harness-json]` 行是同一停止的投影。每个停止都有类型 `stop.kind/stop.reason`；外层按类型选择下表的行，`stop.exits` 给出可直接执行的出口命令，`data`、`source` 给出出口所需的身份（请求号、任务、派发、原件路径与摘要）。行标识是稳定的名字，`tests/test_stop_exits.py` 用它把行与走完出口的用例绑在一起；同一类型因情形不同（例如环境阻断的两条路由）分成几行。调用失败的停止（`provider_quota/*`、`provider_failure/*`、`budget/agent_timeout`、`budget/agent_turns`）在 `data` 里另给出只用于显示的事实，每项有自己的出现条件。取自原件的事实只在两份原件（`process.outcome.json`、`process.stdout`）都重新读到、且都与分类时的摘要相符时给出：`exit_confirmed` 在进程记录里是布尔值时给出，进程记录不完整时也给出；`api_error`、`terminal_reason`（符合标识符形状才给出）、`api_error_type`（CLI 的标准类型才给出）、存在而不能给出的标签字段名 `unrecognized_labels` 与 `http_status_state`（`missing`、`null`、`valid`、`invalid`）只在原件满足读信封的前提（见下一段）时给出；超时与启动失败只有 `exit_confirmed`。数值的 `http_status`（分类得到有效的 HTTP 状态时）与 worker 的 `attempt_charged`（这次调用是否计了工作尝试，取自台账）不取自重新读取，原件读不到或不符时仍保留。
+“停止信息”是 `status RUN` 的 `stop.detail` 或 stderr 里 `harness: ` 开头的错误全文（节选；不含 `status` 写在第一行的位置行 `harness: 检出 …`）；CLI 报告有类型的停止时，通常先写错误全文和缩进的续行、原因行，再尽力写 `[harness-json]` 通知。按行首识别通知，其中省略 `detail` 与人读原因链。原因行也不进入操作记录。每个停止都有类型 `stop.kind/stop.reason`；外层按类型选择下表的行，`stop.exits` 给出可直接执行的出口命令，`data`、`source` 给出出口所需的身份（请求号、任务、派发、原件路径与摘要）。行标识是稳定的名字，`tests/test_stop_exits.py` 用它把行与走完出口的用例绑在一起；同一类型因情形不同（例如环境阻断的两条路由）分成几行。调用失败的停止（`provider_quota/*`、`provider_failure/*`、`budget/agent_timeout`、`budget/agent_turns`）在 `data` 里另给出只用于显示的事实，每项有自己的出现条件。取自原件的事实只在两份原件（`process.outcome.json`、`process.stdout`）都重新读到、且都与分类时的摘要相符时给出：`exit_confirmed` 在进程记录里是布尔值时给出，进程记录不完整时也给出；`api_error`、`terminal_reason`（符合标识符形状才给出）、`api_error_type`（CLI 的标准类型才给出）、存在而不能给出的标签字段名 `unrecognized_labels` 与 `http_status_state`（`missing`、`null`、`valid`、`invalid`）只在原件满足读信封的前提（见下一段）时给出；超时与启动失败只有 `exit_confirmed`。数值的 `http_status`（分类得到有效的 HTTP 状态时）与 worker 的 `attempt_charged`（这次调用是否计了工作尝试，取自台账）不取自重新读取，原件读不到或不符时仍保留。
 
 `agent-turns` 与 `provider-quota` 到 `provider-failed` 这几行按 Claude 的错误信封分类，共同前提是：Claude 的调用正常结束，进程记录完整（退出已确认、有整数退出码、`evidence_complete` 为真、`cleanup_errors` 与 `errors` 为空），`process.stdout` 是显式的错误信封（能严格解码的 `type=result` 对象，`is_error=true` 或 `subtype` 以 `error_` 开头）。不满足这个前提时，这几行都不适用。满足前提时轮数用尽优先于标签分类：`subtype=error_max_turns` 是 `agent-turns`，不看标签字段（带 `api_error=connection_failed` 也一样）；其余信封才按各行的标签条件分类。
 
@@ -56,7 +56,7 @@
 
 ### 退出码
 
-`run`、`resume`、`abandon`、`status`、`watch`、`prepare-run`、`permission-diagnostics` 的退出码由停止类型查登记表得出，不解析文字：0 完成或操作者要求的暂停（`completed`、`paused`、计划待批准——包括未带 `--approve-plan` 的普通 `resume`，它返回 0 并重报同一停止）；3 run 自洽，有文档化的操作者动作或外部条件可解开；2 本次调用的输入不被接受（`invalid_input/*`、`config_mismatch/*`、`unsupported_ledger`，以及参数解析错误）；1 证据或现场与台账不符、Harness 自身失败、未分类；130 中断。`cleanup-run` 仍按逐资源结果返回 0／1。0 不代表 `completed`，外层仍要读结果 JSON 的 `status`。
+`run`、`resume`、`abandon`、`status`、`watch`、`prepare-run`、`permission-diagnostics` 的退出码由停止类型查登记表得出，不解析文字：0 完成或操作者要求的暂停（`completed`、`paused`、计划待批准——包括未带 `--approve-plan` 的普通 `resume`，它返回 0 并重报同一停止）；3 run 自洽，有文档化的操作者动作或外部条件可解开；2 本次调用的输入不被接受（`invalid_input/*`、`config_mismatch/*`、`unsupported_ledger`，以及参数解析错误）；1 证据或现场与台账不符、Harness 自身失败、未分类；130 中断。`cleanup-run` 仍按逐资源结果返回 0／1。0 不代表 `completed`，外层仍要读结果 JSON 的 `status`。缺少结构化通知时按退出码处理，例如参数解析错误给用法和退出 2，`cleanup-run` 一项受阻时可从 stdout 读逐资源结果。
 
 | 行标识 | 类型（`kind/reason`） | 退出码 | 停止信息或状态 | 操作者该做什么 | 出口命令（`stop.exits`） |
 | --- | --- | --- | --- | --- | --- |
@@ -87,7 +87,7 @@
 | `agent-turns` | `budget/agent_turns` | 3 | Claude 轮数用尽（信封 `subtype=error_max_turns`，worker 计一次工作尝试） | 核对候选进展，再决定是否提高 `claude_max_turns_by_role` | `resume RUN` |
 | `final-timeout` | `verification/final_timeout` | 3 | `整体验证超时` | 修复环境或提高 `verify_timeout_seconds`；普通 `resume` 在同一快照重验 | `resume RUN` |
 | `dispatch-exit` | `process_unconfirmed/dispatch_exit` | 3 | `旧 dispatch … 的进程组仍存在` 或 `无法确认旧 dispatch … 已退出` | 核实该进程及其命令子进程已退出，不终止无关进程；终态 run 用 `cleanup-run` 的同名选项。`data.returned_unsealed` 为真时，这是一个已返回对象结果、尚未封存的 worker：未封存的结果事后不补认，确认之后只能放弃，所以不列 `resume`；为假时，确认之后 worker 的这次调用按原件判定（可重试、无效输出或未封存结果都可能） | 〔`!returned_unsealed`〕`resume RUN --confirm-exited {dispatch_id}`；`abandon RUN --confirm-exited {dispatch_id}` |
-| `command-exit` | `process_unconfirmed/command_exit`（操作） | 3 | `Cannot confirm command process exited: …`。本行是恢复预检的拒绝；运行中发现时（例如 worker 返回、封存之前）同一类型作为 run 停止写入台账 | 同上；用父 dispatch ID（`source.dispatch_id`）确认 | 〔`!returned_unsealed`〕`resume RUN --confirm-exited {dispatch_id}`；`abandon RUN --confirm-exited {dispatch_id}` |
+| `command-exit` | `process_unconfirmed/command_exit`（操作） | 3 | `Cannot confirm command process exited: …`。本行是恢复预检的拒绝；运行中发现时（例如 worker 返回、封存之前）同一类型作为 run 停止写入台账 | 用父 dispatch ID（`source.dispatch_id`）确认；已发布的调用没有可读的 journal 也停在这里，审计记录为 `journal_digest: null`，journal 重新可读即失效 | 〔`!returned_unsealed`〕`resume RUN --confirm-exited {dispatch_id}`；`abandon RUN --confirm-exited {dispatch_id}` |
 | `provider-quota` | `provider_quota/usage_limit` | 3 | 供应商额度用尽（Claude 信封 `api_error=usage_limit_reached`，`api_error_type` 缺失、为 null，或为 `rate_limit_error` 而 HTTP 状态是 429、缺失或 null；`source.artifact` 是失败原件 `process.stdout` 与摘要），而且没有在进程内等过去（见[额度等待](#额度等待)）：`data.wait_reason` 写明为什么没等，`data.waits` 是本进程已完成的等待次数，判断走到哪一步就带到哪一步（`window` 选中的窗口、`resets_at` 它的重置时刻、`wait_seconds` 需要的秒数、`wait_limit_seconds` 配置的上限、`uncertain_windows` 对应不明的满窗口）。真实 CLI 的 run 另带额度样本：`data.quota_snapshot`（`available`、`unavailable`、`not_published`）、样本文件名 `quota_sample`、不可用原因 `quota_reason`，以及快照里已满（≥100%）的窗口与重置时刻 `full_windows`——账号观察，不是失败原因 | 等额度恢复后普通 `resume`；worker 的这次调用已当场判定，不计工作尝试，仍计入 `max_agent_dispatches`；额度未恢复时会再失败一次（那次失败照常先判断能否等待）。`exceeds_limit`：可调高 `quota_wait_max_seconds` 后普通 `resume`，不会“补等”这一次；`dispatch_budget`：先提高 `max_agent_dispatches`；`window_uncertain`、`reset_unknown`、`no_blocking_window`：快照证明不了该等到何时，自行判断时刻后 `resume`；`record_invalid`：快照里的时刻超出等待记录的范围；`not_running`：进入执行循环之前的失败不等（首版规划，以及恢复时重放已封存而未交接的 worker 结果所做的验证与任务审阅） | `resume RUN` |
 | `provider-rate-limit` | `provider_quota/rate_limit` | 3 | 供应商限速（`api_error` 与 `api_error_type` 中一个是 `rate_limit_error`、另一个缺失、为 null 或也是它，或两个都缺失或为 null 而 `api_error_status=429`；`api_error=usage_limit_reached` 与 `api_error_type=rate_limit_error` 并存时不在这一行：HTTP 状态是 429、缺失或 null 时是 `provider-quota`，否则是 `provider-failed`）；额度样本字段同上 | 稍后普通 `resume`；worker 不计工作尝试 | `resume RUN` |
 | `provider-overloaded` | `provider_failure/overloaded` | 3 | 供应商过载（`api_error` 或 `api_error_type` 为 `overloaded_error`，另一个缺失、为 null 或也是它） | 稍后普通 `resume`；worker 不计工作尝试 | `resume RUN` |
@@ -97,7 +97,7 @@
 | `provider-unknown` | `provider_failure/unknown` | 3 | 模型调用失败，原因未识别：没有进程记录或记录不完整、没有错误信封，或 Codex 角色的调用失败（Codex 不读信封；超时与启动失败仍按进程事实分别是 `agent-timeout`、`provider-start`）；worker 计一次工作尝试 | 修复原因 | `resume RUN` |
 | `provider-start` | `provider_failure/local_start` | 3 | 模型 CLI 未能启动 | 恢复 CLI 后普通 `resume`（新的计费尝试） | `resume RUN` |
 | `unsealed-return` | `evidence/unsealed_return` | 1 | `worker return interrupted before immutable seal; …; automatic retry forbidden`：输出能解码成对象结果，但没有封存——封存之前中断、CLI 非零退出、或封存前的本地检查失败（例如 worker 写了受保护的 `.harness`、改了工作树的 Git 绑定、或移动了 HEAD；原因在派发条目的 `error`，恢复预检另行报告绑定或 HEAD 的变化）；当场判定与恢复时都停在这里 | `--confirm-exited` 解不开；保留证据后放弃 | `abandon RUN` |
-| `unsealed-unknown` | `evidence/unsealed_unknown` | 1 | 同上：返回证据互相冲突、超过读取上限或字节无法严格解码（判为 unknown）；解不出对象结果的输出不会停在这里，读文件时的系统错误也不会（见 `runtime-io`） | 同上 | `abandon RUN` |
+| `unsealed-unknown` | `evidence/unsealed_unknown` | 1 | 同上：派生的 `provider-result.json` 摘要与原件不符，或原件（`process.stdout`、`process.outcome.json`）超限或字节无法严格解码（判为 unknown）；解不出对象结果的输出不会停在这里，读文件时的系统错误也不会（见 `runtime-io`） | 同上 | `abandon RUN` |
 | `invalid-worker-output` | 非停止 | — | worker 输出无效（结构、语义、界限、交接目标非法，或解不出对象结果） | 不停止：计一次工作尝试、回执结局 `result_rejected`，下一次尝试经指挥选择；只在同一任务达到 `max_attempts` 时以 `task-attempts` 停止 | — |
 | `invalid-blocker-environment` | `environment/worker_blocked`（`invalid_output=true`） | 3 | worker 的 environment 阻断只有界限检查失败（条目 `invalid_blocked`，反馈带 `output_error`） | 原结果进入反馈的 `worker`，按 `environment-blocked` 处理；不给尝试豁免 | `resume RUN`；`resume RUN --environment-update FILE` |
 | `invalid-blocker-operator` | `operator_decision/answer_required` | 3 | worker 的 operator 阻断只有界限检查失败 | 按 `operator-answer` 答复；不给尝试豁免 | `resume RUN --operator-decision FILE`；〔`reverify_available`〕`resume RUN --operator-decision FILE --reverify` |
@@ -107,10 +107,10 @@
 | `special-file` | `scope_violation/special_file` | 1 | `候选含 Git 不能记录的特殊文件：…`（管道、套接字或设备；`data.path`、`source.task_id`） | 删除它或换回普通文件，不自动删除 | `resume RUN` |
 | `redo-exhausted` | `invalid_output/redo_exhausted` | 3 | `<role> 输出连续两次无效：…；原件 PATH；普通 resume 重新请求，或 abandon` | 读原件与错误（派发条目的 `error`、`invalid_output`）；首次判定时计划超出整体审阅的必要上下文同样是无效输出；普通 `resume` 是新请求，最多再两次调用 | `resume RUN`；`abandon RUN` |
 | `invalid-original-changed` | `evidence/runtime_integrity` | 1 | `无效输出原始结果缺失或无法读取`、`无效输出原始结果已改变` | 上一次无效输出的原件被删改，调用计费前的核对停止（这次核对在本地准备之后，留下一个 `invoked=false` 的失败准备条目）；恢复原字节后普通 `resume`，或放弃 | `resume RUN`；`abandon RUN` |
-| `head-changed` | `workspace_mismatch/head_changed`（操作） | 1 | `worktree HEAD 与检查点不同` 或 `接受分支与意图不符` | 核对检查点和 `pending_acceptance.intent`（如有），恢复可信现场后 `resume`，或放弃 | `resume RUN`；`abandon RUN`；〔`question_registered`〕`resume RUN --operator-decision FILE` |
+| `head-changed` | `workspace_mismatch/head_changed`（操作） | 1 | `worktree HEAD 与检查点不同` 或 `接受分支与意图不符` | 核对检查点和 `pending_acceptance.intent`（如有），有 `data.accept_commit` 时可按[接受过程中断](#接受过程中断)恢复分支到父提交或意图提交后 `resume`，也可放弃 | `resume RUN`；`abandon RUN`；〔`question_registered`〕`resume RUN --operator-decision FILE` |
 | `load-integrity` | `evidence/load_integrity`（操作） | 1 | 加载时核验的证据被删改（`worker packet artifact changed`、`worker schema artifact changed`、`evidence artifact disagrees with ledger` 等，见[证据损坏](#证据损坏)），或台账里保存的命令形状不合格（`运行台账 tasks[i] 的命令无效` 等）；运行中定稿得出时写入台账，`data.superseded` 记原停止 | 恢复原字节；不改台账摘要。`abandon` 同样被拒绝；无法恢复时保留 run 目录原样，另开新 run | 无命令出口 |
 | `index-damaged` | `evidence/runtime_integrity` | 1 | 路径索引、输入索引或环境更新产物损坏（`path-indexes/`、`input-indexes/`、`environment/`） | 恢复原字节后普通 `resume`；无法恢复时可放弃 | `resume RUN`；`abandon RUN` |
-| `candidate-changed` | `workspace_mismatch/candidate_changed` | 1 | `待派发指令的代码快照已变化`、`修订保留候选的代码或暂存区已变化`、`真实暂存区与接受意图不符` | 恢复原快照或意图允许的暂存区状态后普通 `resume`，或保留证据后放弃 | `resume RUN`；`abandon RUN` |
+| `candidate-changed` | `workspace_mismatch/candidate_changed` | 1 | `待派发指令的代码快照已变化`、`修订保留候选的代码或暂存区已变化`、`真实暂存区与接受意图不符` | 恢复原快照；若是真实暂存区遇到第三种状态，按[接受过程中断](#接受过程中断)核对并恢复暂存区。随后普通 `resume`，也可保留证据后放弃 | `resume RUN`；`abandon RUN` |
 | `directive-mismatch` | `workspace_mismatch/directive_mismatch` | 1 | `待派发指令与已发布计划或候选不符` | 恢复台账与计划文件的原值后普通 `resume`，或放弃 | `resume RUN`；`abandon RUN` |
 | `continuation-candidate` | `workspace_mismatch/candidate_changed` | 1 | `pending continuation candidate or task changed` | 恢复续作等待的候选后普通 `resume`（新 worker 继续原候选） | `resume RUN`；`abandon RUN` |
 | `context-final` | `budget/context_capacity` | 3 | `计划的整体审阅必要上下文 N 字符超过预算 M`（供给计划） | 提高 `context_chars`；模型给出的过大计划首次判定时按无效输出重做，不停在这里 | `resume RUN`；`abandon RUN` |
@@ -120,22 +120,22 @@
 | `shared-assets` | `config_mismatch/shared_assets`（操作） | 2 | `共享规则、skills 或 MCP 已改变` | 恢复原版本的共享资产 | `resume RUN` |
 | `wake-shared-assets` | `config_mismatch/shared_assets` | 2 | 同上，额度等待醒来后的前提核对发现的（等待期间改了共享资产）；之后没有调用任何模型 | 恢复原版本的共享资产后普通 `resume`；醒来后的核对与手工 `resume` 是同一组函数，HEAD、Git 绑定、计划文件、索引、加载核验的不符也按各自的行处理 | `resume RUN` |
 | `config-changed` | `config_mismatch/immutable_config`（操作） | 2 | `配置已改变：…` | 把操作者配置或项目配置改回[通用规则](#通用规则)允许的范围：不可放宽的值恢复原样，可放宽的值不低于台账当前 `config_snapshot` 里的值 | `resume RUN` |
-| `binding-missing` | `workspace_mismatch/binding_missing`（操作） | 1 | `缺少已保存的 worktree Git 绑定` | 启动在绑定保存前中断；放弃后重新 `run`，核对后手工 `git worktree remove` 并删除 `harness/<run>` 分支 | `abandon RUN` |
+| `binding-missing` | `workspace_mismatch/binding_missing`（操作） | 1 | `缺少已保存的 worktree Git 绑定` | 启动在绑定保存前被强杀或失败；放弃后重新 `run`，核对后手工 `git worktree remove` 并删除 `harness/<run>` 分支 | `abandon RUN` |
 | `unsupported` | `unsupported_ledger/ledger_version`（操作） | 2 | `台账版本 N 不支持（当前版本 20）` | 当前版本不恢复、不放弃、不准备、不清理、不解释这份台账（见[终态与其他版本的台账](#终态与其他版本的台账)）；运行列表仍显示路径与版本；开始新 run，原始 JSON 用文件工具查看 | 无命令出口 |
 | `busy` | `busy/run_lock`（操作） | 3 | `已有进程持有运行锁`。额度等待期间 `resume`／`abandon` 也会遇到：锁外读到的台账有 `quota_wait` 时，停止值带 `quota_wait_until`、`quota_wait_recorded_at` 与固定说明 `quota_wait_note`（记录不证明持锁的进程仍在等待），并列出 `status RUN` | 等另一个 `run`／`resume`／`abandon` 结束后重试原命令；看 `status RUN` 的 `quota_wait` 判断是否在等额度；要取消等待就中断那个进程（Ctrl-C 或 SIGTERM），再按 `interrupted` 处理。`cleanup-run` 遇到锁被占按逐资源结果返回 1 | 〔`quota_wait_recorded`〕`status RUN` |
 | `setup-failed` | `verification/setup_failed` | 3 | `整体验证依赖准备失败` | 修复环境；普通 `resume` 用另一全新检出，同一尝试。准备命令的 `cwd` 不在 HEAD 中、也不由前面的准备命令创建时，每次 `resume` 都在同一 HEAD 的新检出里同样失败：`verification.*` 恢复时不能改，只能 `abandon` 后用改正的配置开新 run | `resume RUN` |
 | `checks-modified` | `verification/checks_modified_files` | 3 | 验证或依赖准备修改了受检文件 | 让验证只读；验证生成的文件在 `info/exclude` 加精确模式 | `resume RUN` |
-| `dirty-final` | `workspace_mismatch/dirty_final_workspace` | 1 | 真实暂存区条目或 Git 从工作树构建的树与已接受提交不符，或构建失败；消息给出差异路径或 Git 错误（例如过滤器失败） | 恢复已接受提交对应的暂存区和工作树，或修好 Git 构建错误后普通 `resume`；也可放弃 | `resume RUN`；`abandon RUN` |
+| `dirty-final` | `workspace_mismatch/dirty_final_workspace` | 1 | 工作树不是已接受提交的可提交映像：真实暂存区或按 Git 规则构建的工作树树不符，或建树失败；消息给出差异路径或 Git 错误（例如过滤器失败） | 恢复已接受提交对应的暂存区和工作树，或修好 Git 构建错误后普通 `resume`；也可放弃 | `resume RUN`；`abandon RUN` |
 | `binding-changed` | `workspace_mismatch/binding_changed` | 1 | worktree 的 Git 绑定核对不通过，例如 `.git` 的指向被改、执行命令时工作树根不是绑定的目录；核对用的 Git 调用失败（例如超时）也报这一类，这时绑定未必改变 | 保留现场核对 | `abandon RUN` |
 | `process-incomplete` | `evidence/process_incomplete` | 1 | 指挥、审阅或验证进程结束了，但退出观察留下清理或持久化故障 | 核实进程已退出。列出的只有放弃：确认退出修不好已记下的故障。按实际情形，`resume`（退出未确认时带 `--confirm-exited ID`）的结果不同：指挥或审阅进程正常结束、结果已返回而 outcome 未完整落盘时，`resume` 仍被拒；指挥或审阅调用没有返回结果（例如超时且清理出错）时，`resume` 丢弃无返回的意图并重新派发；验证命令进程（例如超时且清理出错）时，`resume` 重新执行验证 | 〔`!exit_unconfirmed`〕`abandon RUN`；〔`exit_unconfirmed`〕`abandon RUN --confirm-exited {dispatch_id}` |
-| `runtime-io` | `runtime_failure/io` | 1 | 本地 I/O 失败（权限、句柄、设备、磁盘满）；逐级打开命令 `cwd` 遇权限拒绝时记 `start_failed`，不在此列 | 排查本地环境；证据未必损坏，不要“恢复原字节”；修好后重试原命令。worker 调用失败的判定读不出原件（持续的 `EIO`、权限）时也停在这里：系统读取错误不形成判定，回执保留，每次 `resume` 都重新判定，故障不消失就每次停在这里；故障只涉及这次尚未判定的原件、加载核验通过时，`abandon` 仍可用（它不判定），加载本身也读失败时 `resume` 与 `abandon` 都要先修复读取条件 | 无命令出口 |
+| `runtime-io` | `runtime_failure/io` | 1 | 本地 I/O 失败（权限、句柄、设备、磁盘满）；逐级打开命令 `cwd` 遇权限拒绝时记 `start_failed`，不在此列。`status` 不能读取或枚举状态目录（例如权限、链接或 EIO）也报告此类型，`data.error_type` 给出错误类型 | 排查本地环境；证据未必损坏，不要“恢复原字节”；修好后重试原命令。worker 调用失败的判定读不出原件（持续的 `EIO`、权限）时也停在这里：系统读取错误不形成判定，回执保留，每次 `resume` 都重新判定，故障不消失就每次停在这里；故障只涉及这次尚未判定的原件、加载核验通过时，`abandon` 仍可用（它不判定），加载本身也读失败时 `resume` 与 `abandon` 都要先修复读取条件。结算未登记返回的指挥或审阅时，读取结果、终端捕获标记或补做终端取证遇本地 I/O 错误，也保留回执、停止写入或重新派发 | 无命令出口 |
 | `runtime-database` | `runtime_failure/database`（操作） | 1 | 记忆数据库错误 | 排查数据库；修好后重试原命令 | 无命令出口 |
 | `runtime-invariant` | `runtime_failure/invariant`（操作） | 1 | 运行时一致性检查失败（例如另一写入者改了台账） | 保留现场报告 | 无命令出口 |
 | `unclassified-harness-error` | `unclassified/untyped_harness_error` | 1 | 未分类的停止 | 不推测恢复动作，保留现场报告 | 无命令出口 |
 | `unclassified-exception` | `unclassified/unexpected_exception` | 1 | 未预期的异常 | 同上 | 无命令出口 |
-| `interrupted` | `interrupted/signal` | 130 | Ctrl-C、SIGTERM、SIGHUP | 确认中断原因；普通 `resume` 报出需要确认退出的确切派发 | `resume RUN`；〔`exits_confirmed`〕`abandon RUN` |
-| `input-arguments` | `invalid_input/cli_arguments`（操作） | 2 | 命令参数无效（例如 run ID 形式无效、run 不存在、目标为空、`--operation-id` 形式不合格或同名操作记录已存在）；或 `run`、`resume`、`permission-diagnostics` 找不到项目配置（`data.option` 为 `--repo`，错误给出期望的路径；拒绝在任何写入之前） | 修正参数后重试；缺项目配置时以 `examples/project.toml` 为起点在给出的路径创建它（见[两份配置](../README.md#两份配置)），再重试原命令 | 无命令出口 |
-| `input-file` | `invalid_input/input_schema`（操作） | 2 | 输入文件不合格（`--operator-decision`、`--environment-update`、`--execution-guidance`、`--reject-request`、`prepare-run --manifest`），含文件不存在、读不出、不是 UTF-8 或不是 JSON | 修正文件后重试。`--operator-decision`、`--execution-guidance`、`--reject-request` 与 `prepare-run --manifest` 的读取与解析在任何写入之前，这些拒绝不改写台账；`--environment-update` 的文件在退出确认之后才读取，同一条命令里先前保存的 `--confirm-exited` 确认与审计会保留，其他恢复输入都不写入（内容合法而之后的状态检查拒绝的，见各选项） | 无命令出口 |
+| `interrupted` | `interrupted/signal` | 130 | 执行中的 run 因 Ctrl-C、SIGTERM 或 SIGHUP 停下并保存中断。早期初始化、只读预检或放弃的操作边界也可能仅报告本次调用的 `interrupted/signal`（退出 130），此时台账保持原状或尚未创建。 | 普通 `resume` 报出未确认退出的派发；证据齐全时会直接继续。再次发信号只缩短收尾宽限，SIGKILL 按[强杀后恢复](#中断与重新启动)处理。终态保存后按已保存的结果退出 | `resume RUN`；〔`exits_confirmed`〕`abandon RUN` |
+| `input-arguments` | `invalid_input/cli_arguments`（操作） | 2 | 命令参数无效（例如 run ID 形式无效、run 不存在、目标为空、`--operation-id` 形式不合格或同名操作记录已存在）；或 `run`、`resume`、`permission-diagnostics` 找不到项目配置（`data.option` 为 `--repo`，错误给出期望的路径；拒绝在任何写入之前）；找不到操作者配置也在写入前拒绝（`data.option` 为 `--config`） | 修正参数后重试；缺项目配置时以 `examples/project.toml` 为起点在给出的路径创建它（见[两份配置](../README.md#两份配置)），再重试原命令 | 无命令出口 |
+| `input-file` | `invalid_input/input_schema`（操作） | 2 | 输入文件不合格（`--operator-decision`、`--environment-update`、`--execution-guidance`、`--reject-request`、`prepare-run --manifest`），含文件不存在、读不出、在接受的编码下无法解析为 JSON，或结构不合格 | 修正文件后重试（例如清单解析保留 JSON 解析器支持的 UTF-16）。`--operator-decision`、`--execution-guidance`、`--reject-request` 与 `prepare-run --manifest` 的读取、解析与静态形状检查先于台账写入；`run`／`resume` 的操作记录仍保留本次拒绝，`prepare-run` 的静态清单拒绝先于私有状态写入；`--environment-update` 的文件在退出确认之后才读取，同一条命令里先前保存的 `--confirm-exited` 确认与审计会保留，其他恢复输入都不写入（内容合法而之后的状态检查拒绝的，见各选项） | 无命令出口 |
 | `options` | `invalid_input/incompatible_options`（操作） | 2 | 选项不能同用（见[恢复选项与互斥](#恢复选项与互斥)） | 拆成合法的组合后重试 | 无命令出口 |
 | `stale-request` | `invalid_input/stale_request`（操作） | 2 | 输入针对的请求或来源已失效（未知请求、之后已有模型调用、已被新答复取代；`--reject-request` 的 `request_id` 不是已判定合格而未落地的提案或当前续作） | 用 `status RUN` 读当前请求后重答 | `status RUN` |
 | `run-state` | `invalid_input/run_state`（操作） | 2 | 该命令或选项不适用于 run 的当前状态（已放弃、已完成、有待处理阶段） | 用 `status RUN` 核对状态 | `status RUN` |
@@ -226,7 +226,7 @@ harness resume RUN --operator-decision /absolute/path/decision.json --step
 
 **判定与持有。** 一份已返回的指挥原件（implement 或 revise）按四类检查判定：证据（失败即按证据或现场类型停止，回执保留，不重做）；原件契约（只依赖原件与修订基线，首次判定不合格是无效输出）；范围包含（只缺范围即持有）；运行条件（整体审阅的必要上下文：首次判定超出是无效输出；已判定合格的原件在重放时超出则停止并保留原件，`budget/proposal_capacity`）。派发条目记 `completed` 且回执仍在，表示原件已判定合格而未落地；之后重放失败只记 `error`，不降级。持有与容量保留都不消费回执、不记无效、不写计划文件，普通 `resume` 重放同一原件得到同一停止（同一 `request_id`），不调用模型。持有期间环境更新、操作者决定与执行指导被拒绝（回执仍在）；首版持有时 `--approve-plan` 被拒。
 
-**扩大。** 停止信息与 `status RUN` 给出两组字段：`gaps` 是提案里证明不了的原模式（按任务），`suggested_scope` 是由它们推导的合法条目——缺口本身是具体路径或字面子树时原样，否则取第一个通配段之前的字面前缀加 `/**`（`tests/*.py` → `tests/**`，`**/*.py` → `**`），`widened` 标出比缺口宽的条目。核对后执行停止给出的命令（`resume RUN --scope=…`，每条都写成 `--scope=VALUE`，以 `-` 开头或含空格的值也不会被误读）；建议可能比缺口宽，也可以改写成更窄的具体路径。边界是持续、跨任务的授权：扩大后当前与之后的提案都可复用这些条目，旧终端里的同一条命令也会放行之后尚未读过的提案。只覆盖一部分缺口时继续持有，停止里只剩其余缺口。停止值里的列表有上限，截断时 `data.*_omitted` 记被截去的条数；完整缺口在 `status RUN` 的 `scope.held`，每次读取时按当前台账与原件即时重算，不写任何文件。`--scope` 与答复、本次采用的配置放宽（例如为新任务加入 `permissions.worker_commands`）在一次保存里生效，然后重放同一原件：全部在边界内且容量通过时照常落地（首版：先按当前边界复核，计划文件先写，`original_tasks`、`tasks`、`plan_history` 与回执消费同次；修订：计划文件先写，`pending_revision` 与回执消费同次，发布前按当前边界复核）。追加的命令授权可能加长整体审阅的必要输入，此时重放停在 `budget/proposal_capacity`，原件仍保留：提高 `runtime.context_chars` 后普通 `resume` 落地同一原件，或拒绝它。
+**扩大。** 停止信息与 `status RUN` 给出两组字段：`gaps` 是提案里证明不了的原模式（按任务），`suggested_scope` 是由它们推导的合法条目——缺口本身是具体路径或字面子树时原样，否则取第一个通配段之前的字面前缀加 `/**`（`tests/*.py` → `tests/**`，`**/*.py` → `**`），`widened` 标出比缺口宽的条目。核对后执行停止给出的命令（`resume RUN --scope=…`，每条都写成 `--scope=VALUE`，以 `-` 开头或含空格的值也不会被误读）；建议可能比缺口宽，也可以改写成更窄的具体路径。边界是持续、跨任务的授权：扩大后当前与之后的提案都可复用这些条目，旧终端里的同一条命令也会放行之后尚未读过的提案。只覆盖一部分缺口时继续持有，停止里只剩其余缺口。停止值里的列表有上限，截断时 `data.*_omitted` 记被截去的条数；完整缺口在 `status RUN` 的 `scope.held`，每次读取时按当前台账与原件即时重算，不写任何文件。`--scope` 与答复、本次采用的配置放宽（例如为新任务加入 `permissions.worker_commands`）在一次保存里生效，然后重放同一原件：全部在边界内且容量通过时照常落地（首版：先按当前边界复核，计划文件先写，`original_tasks`、`tasks`、`plan_history` 与回执消费同次；修订：计划文件先写，`pending_revision` 与回执消费同次，发布前按当前边界复核）。新增的命令授权可能加长整体审阅的必要输入，此时重放停在 `budget/proposal_capacity`，原件仍保留：提高 `runtime.context_chars` 后普通 `resume` 落地同一原件，或拒绝它。
 
 **拒绝。** `resume RUN --reject-request FILE` 拒绝一份已判定合格而未落地的提案（持有、容量保留，或边界已扩大而尚未重放的都可以）：文件是 `{"request_id": "proposal_<sha256>", "reason": "…"}`，`request_id` 取停止的 `source.request_id` 或 `status RUN` 的 `scope.held.request_id`，`reason` 非空、最多 4,000 字符。从未判定过的原件（返回后在判定之前中断）不能拒绝，先普通 `resume`；请求 ID 不符是 `stale_request`；提案绑定的候选或 HEAD 已变时拒绝被挡住（`candidate_changed`）。拒绝先写内容寻址的 `proposal-rejections/<sha256>.json`，再把这份提案在中断前预写过、尚未登记的计划文件（只有与由原件和当前基线重算出的字节完全相同的文件才算）改名归档到 `plans/rejected/`，最后一次保存消费回执并在来源派发条目记 `proposal_rejection`。被拒原件此后不会在任何恢复里落地；之后的指挥决定带 `rejected_revision`（请求 ID、原件引用与操作者理由），直到有一次指挥决定真正落地。保存之前中断时可以重交（换了理由也可以）。
 
@@ -248,11 +248,13 @@ harness resume RUN --operator-decision /absolute/path/decision.json --step
 - **可选产物**：worker 的 `checkpoints`、`proposed_memories` 与审阅的 `approved_memory_keys` 不合格只丢弃自身，记 `checkpoints_discarded`、`memory_proposals_discarded`，结果照常处理；之后的上下文只带它们经过校验的投影（登记后的检查点、整批合法时的提案 key，不带记忆批准），原件保留原值。worker 的 `decision_requests` 不合格则整份结果无效。
 - **只缺范围的合格提案不是无效输出**：持有（回执保留，见上节）；已判定合格的原件在重放时容量不够也不是无效输出（`budget/proposal_capacity`，原件保留）；另有契约缺陷时首次判定照常记无效并重做。
 
+正常完成的指挥或审阅调用若尚未登记返回，普通 `resume` 先核对独立进程记录，再用实际适配器从 Claude 的 `process.stdout` 或 Codex 的 `response.json` 结算。解出对象时写回派生的 `returned-result.json` 并判定；能确认返回了无效输出时走有界重做。确实未返回时才丢弃意图并允许后续新派发。已绑定摘要的返回不能被替换；终端捕获、缺失且应存在的原件、证据冲突或本地读取故障按各自门禁处理。
+
 ### 整体验证与重验
 
-全部任务接受后，整体验证失败时：全部失败项都是超时则停在当前尝试，修复环境或提高 `verify_timeout_seconds` 后普通 `resume` 在同一快照重验；普通非零退出交给指挥决定，同一快照重验须显式 `--reverify`；若指挥已就此提问，修复环境后用 `resume RUN --operator-decision FILE --reverify` 一次完成答复与同一快照重验（答复先整批登记，再进入整体验收；停止信息里 `reverify_available=true` 时投影给出这条组合命令）。`--reverify` 只在本次恢复首次进入整体验收时生效，开始新的整体尝试，保留原失败记录；已返回而未落地的指挥决定存在时拒绝（先普通 `resume`），从未返回的决定意图在核实退出后丢弃，已扣的预算不退回。整体拒绝或非超时验证失败之后，整体阶段的下一步按当前快照上最近的整体记录推导（设计的不变量 15）：它仍是这次拒绝时，无论是否带 `--reverify`、是否同时答复，都是派生的指挥决定；仍是这次非超时验证失败时，没有 `--reverify` 就是指挥决定；这两种情况（例如已接受的修正任务没有改变快照）都不重抽整体审阅、不重跑相同代码。只改已跟踪普通文件的读写执行权限位（HEAD 与 Git 清洁状态都不变）也得到另一个快照；没有记录的快照进入整体审阅。
+全部任务接受后，整体验证失败时：全部失败项都是超时则停在当前尝试，修复环境或提高 `verify_timeout_seconds` 后普通 `resume` 在同一快照重验；普通非零退出交给指挥决定，同一快照重验须显式 `--reverify`；若指挥已就此提问，修复环境后用 `resume RUN --operator-decision FILE --reverify` 一次完成答复与同一快照重验（答复先整批登记，再进入整体验收；停止信息里 `reverify_available=true` 时投影给出这条组合命令）。`--reverify` 只在本次恢复首次进入整体验收时生效，开始新的整体尝试，保留原失败记录；读写前先以只读结算核对待处理的指挥决定：已返回（含无效输出）、可能需要补做终端取证或退出未确认时拒绝重验（本次显式确认的派发仍须通过结算核对），读取故障按其类型停止。已返回的决定先用普通 `resume` 处理。只有能判定尚未返回的意图才会在退出核验后丢弃，已扣的预算不退回。整体拒绝或非超时验证失败之后，整体阶段的下一步按当前快照上最近的整体记录推导（设计的不变量 15）：它仍是这次拒绝时，无论是否带 `--reverify`、是否同时答复，都是派生的指挥决定；仍是这次非超时验证失败时，没有 `--reverify` 就是指挥决定；这两种情况（例如已接受的修正任务没有改变快照）都不重抽整体审阅、不重跑相同代码。只改已跟踪普通文件的读写执行权限位（HEAD 与 Git 清洁状态都不变）也得到另一个快照；没有记录的快照进入整体审阅。
 
-开启 `verification.fresh_checkout` 时，整体验证在系统临时目录的全新 detached worktree 中执行；准备失败或中断后，普通 `resume` 在另一个新检出重试当前最终尝试。准备命令与验证命令的 `cwd` 相对新检出的根；新检出只含 HEAD 的已提交内容，所以目录必须在 HEAD 中存在，或由排在前面、已经成功的准备命令创建。准备命令的目录不存在时依赖准备失败（`verification/setup_failed`，见出口表的 `setup-failed`）；验证命令的目录不存在时它是一条失败的检查（`termination_reason` 为 `start_failed`），按普通非零退出处理。验证通过、结论已保存且有创建登记的检出，由运行时在整体审阅派发之前尝试回收（首次进入与恢复同一处）；删除失败只记事件 `verification_checkout_reclaim_failed`，不改变结论、不重跑验证或审阅，检出留给 `cleanup-run`。准备失败、验证失败或中断的检出保留供诊断；清理依据见[放弃与清理](#放弃与清理)。验证中产生未忽略的新文件时，核对后可在 `git rev-parse --git-common-dir` 指向的公共目录的 `info/exclude` 中加入精确模式，再恢复；不要用宽泛模式掩盖待交付代码。
+开启 `verification.fresh_checkout` 时，整体验证在系统临时目录的全新 detached worktree 中执行；准备失败或中断后，普通 `resume` 在另一个新检出重试当前最终尝试。准备命令与验证命令的 `cwd` 相对新检出的根；新检出只含 HEAD 的已提交内容，所以目录必须在 HEAD 中存在，或由排在前面、已经成功的准备命令创建。准备命令的目录不存在时依赖准备失败（`verification/setup_failed`，见出口表的 `setup-failed`）；验证命令因目录原因无法进入或因 argv[0] 本身无法执行而未启动时，记失败检查（`termination_reason` 为 `start_failed`），按普通非零退出处理。创建进程失败等本地故障按本地错误停止，见[不变量 23](design.md#不变量)。验证通过、结论已保存且有创建登记的检出，由运行时在整体审阅派发之前尝试回收（首次进入与恢复同一处）；删除失败只记事件 `verification_checkout_reclaim_failed`，不改变结论、不重跑验证或审阅，检出留给 `cleanup-run`。准备失败、验证失败或中断的检出保留供诊断；清理依据见[放弃与清理](#放弃与清理)。验证中产生未忽略的新文件时，核对后可在 `git rev-parse --git-common-dir` 指向的公共目录的 `info/exclude` 中加入精确模式，再恢复；不要用宽泛模式掩盖待交付代码。
 
 ### 额度等待
 
@@ -260,7 +262,7 @@ Claude 担任的角色（worker、`--commander fable` 的指挥、配置成 Clau
 
 - **等待期间**：状态保持 `running`，台账另有只供观察的 `quota_wait`（来源调用、窗口、重置时刻、等到何时、记录时刻、上限、失败样本），`status RUN` 的 `quota_wait` 与观察网页详情首屏的额度等待记录显示它（不在“需要处理”区），`watch` 的快照带 `quota_wait`，退出条件不变。进程持有 `run.lock`：另一个 `resume`／`abandon` 得到 `busy/run_lock`（提示里有等待记录的时刻，记录不证明持锁的进程仍在等待）。事件 `quota_wait_started`、`quota_wait_finished`；失败时与醒来时各取一份额度样本（触发 `quota_failure`、`wake`）。
 - **醒来之后**：先删除 `quota_wait`（单独一次保存），再重跑 `resume` 预检里只读的前提核对，与手工 `resume` 调用同一组函数：盘上台账仍是本进程刚提交的那份、加载核验、共享资产摘要、环境产物、计划文件、Git 绑定、路径与输入索引、HEAD、依赖副本、回执链接。任何一项不符就停止，类型与 `resume` 遇到同样情况时相同（例如 `head-changed` 的 `workspace_mismatch/head_changed`、`wake-shared-assets`、`load-integrity`），之后不调用任何模型。不重跑带写入的预检步骤（退出确认、登记已返回的提问、补终端摘要、恢复输入），也不重读任何一份配置文件：等待期间改了操作者配置或项目配置，本进程照旧用启动时加载的有效配置，改动由下一次 `resume` 按通用规则接受或拒绝。核对通过后回到调度循环开头，重跑全部调度门禁，下一步照常推导：worker 失败之后是一次新的指挥决定，指挥或审阅失败之后是同一种调用的新请求（新进程、新 dispatch，不带 `retry_of`），不是重试同一个调用。
-- **取消**：中断这个进程（Ctrl-C 或 SIGTERM），台账记 `interrupted/signal`（退出码 130），`quota_wait` 与中断同次删除；之后普通 `resume` 或 `abandon`。等待中改小或关闭上限只能这样：中断后带新配置 `resume`，新值只影响之后的额度失败。
+- **取消**：中断这个进程（Ctrl-C、SIGTERM 或 SIGHUP），台账记 `interrupted/signal`（退出码 130），`quota_wait` 与中断同次删除；之后普通 `resume` 或 `abandon`。等待中改小或关闭上限只能这样：中断后带新配置 `resume`，新值只影响之后的额度失败。
 - **主进程被强杀**：台账留着 `running` 与 `quota_wait`，读法与被强杀的 `running` 相同——记录不证明进程存活，不会自动继续。普通 `resume` 进入执行时删除它、照常推导下一步，不续等；`abandon` 同样删除它。
 - **有界**：每次等待之前都有一次计入 `max_agent_dispatches` 的失败调用，并且要求 `agent_dispatches` 仍小于上限；所以等待次数受派发预算约束，但累计等待时长不受单次上限约束（默认 200 次 × 6 小时）。
 
@@ -272,19 +274,19 @@ Claude 担任的角色（worker、`--commander fable` 的指挥、配置成 Clau
 
 ### 放弃与清理
 
-- `abandon RUN` 把未完成的 run 标为 `abandoned`，保留分支、工作树和证据，之后不能 resume。它先经过 `load_run`：台账恢复链接损坏或加载时核验的证据被删改时拒绝放弃，保留现场供核对；路径索引与输入索引不在加载时核验，它们损坏时仍可放弃。放弃不删除文件；要移除工作树，之后执行 `cleanup-run RUN --remove`。
+- `abandon RUN` 把未完成的 run 标为 `abandoned`，保留分支、工作树和证据，之后不能 resume。它先经过 `load_run`：台账恢复链接损坏或加载时核验的证据被删改时拒绝放弃，保留现场供核对；路径索引与输入索引不在加载时核验，它们损坏时仍可放弃。退出门禁通过后，`abandon` 尽力只读核对已经写出但尚未入账的整体审阅离开记录；符合条件时与 `abandoned` 同次保存并消费回执。无法核对时仍可放弃，原尝试与回执保留，`run_abandoned.written_leave_error` 给出诊断（见[不变量 15](design.md#不变量)）。移除工作树用 `cleanup-run RUN --remove`。
 - `cleanup-run RUN` 是唯一的显式清理入口（验证通过的检出另由运行时在整体审阅前尝试回收，见[整体验证与重验](#整体验证与重验)），默认只读预览，加 `--remove` 才逐项删除。它不加载配置、不调用模型，只支持当前台账版本，不改 run 状态，不删除分支、台账或运行证据。
   - 共同门禁：在运行锁内核对台账版本与归属（run ID、仓库、工作树路径、分支名、Git 公共目录与管理目录绑定）、命令目录、路径索引与输入索引、worker 回执链接，以及全部派发与命令子进程的退出证据。任一项不通过时整条命令报错，不处理任何资源。
-  - 全新验证检出：run 处于任何状态都可清理。删除以台账 `verification_checkouts` 中对应尝试和轮次的创建登记为准，核对路径、三处目录身份、Git 绑定及已有清理记录，已发布的验证还核对派发记录里的检出路径。`checkout.json` 供报告和诊断；只有该文件而没有创建登记时报告 `blocked`，被引用的路径不动。已跟踪修改、未被忽略的未跟踪文件、`assume-unchanged`／`skip-worktree` 标记阻止清理，错误列出前 10 个阻塞路径；被 Git 忽略的文件（含被忽略目录里的嵌套仓库）随检出删除，不需要选项——需要保留诊断产物时先另存。目录已缺失而 Git 注册仍在时，只注销该精确路径，不做全仓库 prune。记录写在检出证据旁的 `cleanup.json`，`by` 是这份记录的写入者（`runtime` 或 `cleanup-run`）。
+  - 全新验证检出：run 处于任何状态都可清理。删除以台账 `verification_checkouts` 中对应尝试和轮次的创建登记为准，核对路径、三处目录身份、Git 绑定及已有清理记录，已发布的验证还核对派发记录里的检出路径。`checkout.json` 供报告和诊断；只有该文件而没有创建登记时报告 `blocked`，被引用的路径不动。已跟踪修改、未被忽略的未跟踪文件、`assume-unchanged`／`skip-worktree` 标记阻止清理，错误列出前 10 个阻塞路径；被 Git 忽略的文件（含被忽略目录里的嵌套仓库）随检出删除，不需要选项——需要保留诊断产物时先另存。检出目录缺失而 Git 注册仍在时，仅在原管理目录身份、反向链接、公共目录摘要和 detached HEAD 都匹配时注销该路径；验证根缺失也使用同一门禁。删除或注销都要求路径在 Git 列表中归属唯一（按不分大小写比对），否则报 `blocked`。Git 已注销但目录仍有残余时回执保持 `pending`，核对并手工处理残余后可重跑命令补记完成。记录写在检出证据旁的 `cleanup.json`，`by` 是这份记录的写入者（`runtime` 或 `cleanup-run`）。
   - 分支工作树：只在 `completed` 或 `abandoned` 时清理，其他状态下按规则保留（`retained`）。要求原分支仍指向检查点，HEAD 与 Git 绑定未变，没有未被忽略的未跟踪文件、`.harness` 目录或隐藏索引标记，已跟踪文件的字节与 HEAD 一致。记录写在 `worktree-cleanup.json`。`--remove --remove-input-copies` 另删除登记且未修改的依赖副本；登记的副本仍在时，`--remove` 报 `blocked`，`--remove-ignored` 不能代替 `--remove-input-copies`。
   - 工作树里的忽略文件：不带 `--remove-ignored` 时，有任何被 Git 忽略的条目即 `blocked`，`error` 列出目录折叠后的前 10 条并提示选项。`cleanup-run RUN --remove-ignored` 预览：工作树条目带 `ignored_paths`（`{coverage, entries, entry_count, omitted_count}`，目录折叠、不计空目录，最多 100 条与 8 KiB，其余只计数；被忽略目录里的内容包括嵌套仓库不显示）。`--remove --remove-ignored` 在写意图之前重新列出清单，意图与完成记录写明 `remove_ignored` 与这份清单，然后由 `git worktree remove` 连同忽略文件删除。只有本次命令的选项能授权：意图里存的允许不延续到之后不带选项的命令（工作树还在时照样 `blocked`）；工作树已被删、只差完成记录时，补写的记录保留原意图的 `remove_ignored` 与清单。预览与删除之间清单可能变化。
-  - “忽略”按 Harness 调用的 Git 判定：工作树里的 `.gitignore`、公共 Git 目录的 `info/exclude`（含运行时加入的 `/.harness/`）以及 `core.excludesFile`（未设置时为 `$XDG_CONFIG_HOME/git/ignore` 或 `~/.config/git/ignore`）。Harness 调用 Git 时去掉全部 `GIT_*` 环境变量（含 `GIT_CONFIG_GLOBAL`），以 `--remove-ignored` 预览列出的清单为准，不以自己 shell 里的 `git status` 为准。
+  - “忽略”按 Harness 调用的 Git 判定：工作树里的 `.gitignore`、公共 Git 目录的 `info/exclude`（含运行时加入的 `/.harness/`）以及 `core.excludesFile`（未设置时为 `$XDG_CONFIG_HOME/git/ignore` 或 `~/.config/git/ignore`）。Harness 调用 Git 时仅保留三个配置选择变量 `GIT_CONFIG_GLOBAL`、`GIT_CONFIG_SYSTEM`、`GIT_CONFIG_NOSYSTEM`，以 `--remove-ignored` 预览列出的清单为准，不以自己 shell 里的 `git status` 为准。
   - 每个资源先保存删除意图，再执行 Git 删除，完成后记为 `removed`。删除后记账前中断时，重跑同一命令按已存意图续做，已经删掉的资源不再执行删除。工作树的记录绑定 run、工作树路径、分支名、检查点和 Git 绑定，不绑定整份台账，所以中断后用 `--confirm-exited` 补的退出确认不妨碍续做。
   - 工作树记为 `removed` 之后，操作者删除或移动分支、或之后的 `--confirm-exited` 改写台账，都不会改变结果：再次运行仍报告 `removed`（预览为 `absent`），只有路径、Git 注册或管理目录重新出现才报 `blocked`。分支核对只在工作树仍存在、即将删除时进行。
   - 输出逐项列出每个资源的 `status`：
     - `eligible`：预览时可以删除。
     - `removed`：已删除，完成记录已写入。
-    - `absent`：预览时资源已不存在（有删除记录，或检出的目录、注册和管理目录都已消失）；加 `--remove` 时补写完成记录，报告 `removed`。此前已删除的检出带 `removed_by`（完成记录的写入者，`runtime` 表示运行时回收）。
+    - `absent`：预览时已有删除记录，或原检出目录、注册和创建时的 Git 管理目录都已消失。检出目录与注册均已消失时，身份不同的同名 Git 管理目录不算原目录。加 `--remove` 时补写完成记录，报告 `removed`。此前已删除的检出带 `removed_by`（完成记录的写入者，`runtime` 表示运行时回收）。
     - `stale_registration`：仅验证检出，目录已缺失而 Git 注册仍在；`--remove` 只注销该精确路径。
     - `input_copies_present`：仅工作树的预览，有登记的依赖副本，需 `--remove --remove-input-copies`。
     - `retained`：仅工作树，run 还没有 `completed` 或 `abandoned`，按规则保留，`reason` 写明当前状态。`reason_kind` 为 `finish_or_abandon_first`：先完成或 `abandon` 该 run 再清理。
@@ -296,6 +298,8 @@ Claude 担任的角色（worker、`--commander fable` 的指挥、配置成 Clau
 
 `load_run` 在 `resume` 和 `abandon` 做任何事之前核验以下证据的路径、类型与 SHA256：worker 派发的 `packet.json` 与 `schema.json`（`packet.json` 同时是该 worker 必需问题的键对照）；`attempt_exemption` 引用的原始 worker 结果或失败原件（供应商豁免引用 `process.stdout`）；worker 判定记录 `worker_return_evidence`（版本 3）绑定的五个来源（存在时记录整份 SHA256，缺失时为 null；重新推导判定与供应商分类）；`decisions/` 下的请求与答复；检查点 manifest 与批次文件；`continuations/`、`continuation-rejections/`、`execution-guidance/` 下的完整产物。其中任一缺失、被改或换成符号链接时，`resume` 与 `abandon` 都在写入前拒绝。`load_run` 另按命令的形状重新校验台账里保存的命令（`config_snapshot` 的 `verification.commands`、`verification.setup_commands`、`permissions.worker_commands`，`tasks` 与 `original_tasks` 各任务的 `required_commands`、`self_checks`），不合格时同样拒绝（`evidence/load_integrity`）。出口只有两个：把原字节恢复回去后照常 `resume` 或 `abandon`；或者保留 run 目录与工作树原样，另开新 run。`status`、`watch`、`dashboard` 不经过这些核验，仍可查看。
 
+整体尝试、验证轮次及审阅记录的形状也在加载时核对。例如缺少该尝试的 HEAD 或验证失败种类会按 `evidence/load_integrity` 拒绝；用手工编辑补字段并不会恢复原证据。
+
 路径索引（`path-indexes/`）、输入索引（`input-indexes/`）和环境更新产物（`environment/`）在 `resume` 预检、派发或接受前核验，不在加载时核验：它们损坏会阻止继续，但不阻止 `abandon`。
 
 提交消息的来源在用到时核验：构造任务审阅包前，`pending_task.worker_result` 与 worker 原件不同即停止“worker 结果台账与原件不同”，不派发审阅。首次构建或重建接受意图时，`pending_acceptance.worker_source` 必须与批准审阅绑定的来源、工作尝试和快照一致；按摘要读取原件的 `commit_message` 之前或途中发现来源错误即停止，保留 `pending_acceptance`。修复原始证据后普通 `resume`，或在加载门禁通过时 `abandon`。续做有效的已保存意图使用绑定的提交对象。
@@ -304,29 +308,43 @@ Claude 担任的角色（worker、`--commander fable` 的指挥、配置成 Clau
 
 ### 终态与其他版本的台账
 
-`completed` run 的普通 `resume` 返回保存结果，不派发；修改选项被拒绝。
+`completed` run 的普通 `resume` 返回保存的 `result`，不派发；修改选项被拒绝。以台账为准，`handoff.json` 仅是交接副本。记录认证的是保存的提交与验证模式。分支之后移动或对象被回收时，结果的身份仍相同。CLI 入口仍做仓库发现、私有状态核对和操作审计，见[结果的显示](operations.md#页面)。
 
-只支持台账版本 20。其他版本（含缺失或非整数的版本）的台账不迁移、不补默认值、不解释字段：`resume`、`abandon`、`prepare-run`、`cleanup-run`、`status RUN`（含 `--full`）、`watch`、`permission-diagnostics` 与观察网页的 run 详情都拒绝，worker 的命令 broker 与只读 MCP 读到这样的台账也拒绝，错误写明该 run 的台账版本与当前版本（`台账版本 N 不支持（当前版本 20）`；不是对象或版本缺失、无效时为“台账版本缺失或无效，不支持（当前版本 20）”），退出码 2（`cleanup-run` 仍为 1），台账、工作树与检出都不改动。运行列表（不带 run 的 `status`、观察网页的列表）对这些目录只给出路径、版本和“不支持”；损坏或旧版本的目录不影响其他 run 的列出。原始 JSON 用文件工具查看。
+只支持台账版本 20。其他版本（含缺失或非整数的版本）的台账不迁移、不补默认值、不解释字段：`resume`、`abandon`、`prepare-run`、`cleanup-run`、`status RUN`（含 `--full`）、`watch`、`permission-diagnostics` 与观察网页的 run 详情都拒绝，worker 的命令 broker 与只读 MCP 读到这样的台账也拒绝，错误写明该 run 的台账版本与当前版本（`台账版本 N 不支持（当前版本 20）`；不是对象或版本缺失、无效时为“台账版本缺失或无效，不支持（当前版本 20）”），CLI 的版本拒绝退出 2，`cleanup-run` 退出 1，网页详情返回 HTTP 409，台账、工作树与检出都不改动。网页列表对这些目录只显示路径、版本和“不支持”。不带 run 的 `status` 把该诊断写到 stderr，stdout 的列表省略该项。旧版 run 的台账、证据、工作树和检出保持原状，`resume` 的外层操作记录与 CLI `--version` 查询仍可能发生；不派发模型。原始 JSON 用文件工具查看。
 
-旧版本 run 的工作树与验证检出不由当前版本清理：用对应版本的 Harness 清理，或人工核对后执行 `git worktree remove`。升级前应完成或放弃进行中的旧 run。
+19 与更早版本均按上述规则处理。旧版本 run 的工作树与验证检出不由当前版本清理：用对应版本的 Harness 清理，或人工核对后执行 `git worktree remove`。升级前应完成或放弃进行中的旧 run。
 
 ## 接受过程中断
 
-`pending_acceptance.intent` 保存后，分支仍在原父提交、已移动到意图提交但真实暂存区尚未同步、或两者都已更新，均可普通 `resume`。通过预检后，运行时只补缺少的分支更新、暂存区同步和台账登记，这几个步骤沿用原批准。分支仍在父提交、未发布的树或提交对象缺失时，重新核对原件、候选和批准，通过后重建意图。构建或重建时发现候选快照变化，旧批准失效，任务需重新执行、验证和审阅。
+接受意图保存在 `pending_acceptance.intent`。它绑定原父提交 P、候选树 T、意图提交 C 和真实暂存区同步前后的摘要。`resume`、进程内额度醒来和执行接受时共用只读判定。额度醒来只做预检，之后由正常调度决定是否执行接受。
 
-分支偏离意图的两个提交、真实暂存区不符同步前后任一摘要、或 Git 对象与意图不符时，恢复保留现场并停止。可以用 `git -c trailer.separators=: log --format='%H %(trailers:key=Harness-Task,valueonly)'` 核对提交，并用 `git show --no-patch <commit>` 查阅 trailer。原生 Git 若留下引用或暂存区的锁文件，运行时不会移除它们。
+| 只读核对看到的状态 | 普通 `resume` |
+| --- | --- |
+| 分支在 P，对象有效，暂存区处于登记的任一状态 | 以 P 为预期旧值比较并交换到 C，按需要同步暂存区，核对后登记接受。C 等于 P 时只处理暂存区与登记。 |
+| 分支已在 C，对象有效，暂存区尚未同步或已同步 | 按需要同步暂存区，核对后登记接受。 |
+| 分支仍在 P，未发布的 C 或 T 已确认缺失 | 回到首次接受，从核对原件、候选快照与批准开始重建意图。发现候选变化时旧批准失效，重新执行、验证与审阅。 |
+| 分支是第三个值、暂存区是第三种状态、绑定或对象矛盾、读取故障 | 保留现场，按停止类型处理。 |
+
+`head-changed` 带 `data.accept_commit` 时，先核对 run 分支和意图，可恢复到 `data.expected_head` 或 `data.accept_commit` 后普通 `resume`，也可放弃。`candidate-changed` 若来自已保存意图的暂存区核对，可在确认没有需保留的暂存内容后，于 run 工作树执行 `git read-tree --reset <intent.commit>` 再普通 `resume`，或放弃。同步只写暂存区。不要手工登记接受。
+
+分支更新与暂存区同步的 Git 子进程继承运行锁，Harness 被强杀后也要等进程释放描述符才能继续。若原生 Git 异常退出留下引用或索引锁文件，Harness 会保留现场。可用 `git show --no-patch <commit>` 查阅提交与 trailer。
+
+## 中断与重新启动
+
+`run`、`resume`、`abandon` 的中断控制器先记下 Ctrl-C、SIGTERM 或 SIGHUP，在可安全停止的检查点送达。执行中的 run 停下时保存 `interrupted/signal` 并退出 130。早期初始化、只读预检或放弃的操作边界也可只以退出 130 报告本次中断。此时 run 可能尚未创建，已有台账也不因这种调用拒绝而改写状态。额度等待会被唤醒；结算区或进行中的 Git 写入要等边界结束。后续信号只缩短收尾宽限。到终态仍未送达的信号由这次调用消化，退出按已保存的结果。
+
+若进程被 SIGKILL 或由外部终止而来不及保存停止，先看 `status RUN` 和进程退出证据。台账可能仍是 `running`，也可能已经保存终态；它不证明进程存活。等持锁的旧进程退出，再按停止或以下窗口处理。普通 `resume` 在门禁通过时会直接继续。不能确认退出时，人工核实后按[进程退出确认](#进程退出确认)操作。遇到 Git 锁或证据冲突时先核对现场。
 
 ## 不能自动恢复的窗口
 
-以下中断窗口需要操作者判断；运行时停止并保留现场，不提供改写台账的捷径。
-
-1. **worker 已有能解码成对象的原始输出、封存之前中断**：不能把恢复时的工作树补绑为原候选，也不自动重派；返回证据互相冲突、超过读取上限或字节无法严格解码（判为 unknown）同样阻塞，`--confirm-exited` 不能解开（读文件时的系统错误不形成判定，见出口表的 `runtime-io`）。保留证据后 `abandon`。对象不合契约时也停在这里，而不中断时它会作为无效输出进入下一次尝试。输出解不出对象（截断、非 JSON、重复键、不是对象）不在此列：无论是否中断，都作为无效输出进入下一次尝试。
-2. **调用前台账保存失败**：可能留下已扣预算、`invoked=true` 的条目；恢复按原件判定（没有输出时可重试），多计一次尝试。
-3. **worker 调用失败、判定保存之前原件被改**：判定之前没有可比对的记录，恢复按改后的字节判定（包括额度类豁免）；判定保存之后再改，加载核验拒绝 `resume` 与 `abandon`。能写运行目录的人也能直接提高 `max_attempts`。
-4. **派发 `starting` 后、pgid 落盘前中断**：缺 pgid 的记录不能证明未启动，需核实后 `--confirm-exited`。
-5. **启动时 `worktree_binding` 保存前中断**：没有可信绑定，只能 `abandon` 后重新运行，并手工清理已创建的工作树和分支。
-6. **`delete_path` 删除之后**：删除立即生效，接受门禁只决定候选是否被接受；需要恢复文件时从 Git 历史中取回。
-7. **`prepare-run` 在保存临时文件身份之前中断**：不能凭相同字节接管文件，需人工核对。
-8. **`command-staging/` 中的准备目录**：发布前失败或被杀时留下；运行时不枚举它们，也不回收，反复失败会累积磁盘占用。
-9. **指挥或审阅的供应商输出不可解码、判定保存之前中断**：回执里没有原件，恢复按无返回处理，发起没有 `retry_of` 的调用；与不中断相比最多多一次调用。
-10. **额度等待中主进程被杀**：不会自动继续；台账留着 `running` 与 `quota_wait`（不证明进程存活），普通 `resume` 进入执行时删除记录并照常推导下一步，不续等。
+1. **worker 已有能解码成对象的原始输出、封存之前被强杀**：恢复无法把当前工作树认作当时的候选，不自动重派。派生信封与原件冲突、原件超限或无法严格解码而判为 unknown 时同样阻塞；`--confirm-exited` 只确认退出。保留证据后 `abandon`。普通中断信号不会在正常返回到封存的结算区内送达。完整但解不出对象的结果按无效输出处理。
+2. **调用前台账保存失败**：可能留下已扣预算、`invoked=true` 的条目；恢复按原件判定（没有返回时可重试），可能多计一次尝试。
+3. **worker 调用失败、判定保存前原件被改**：恢复只能按当时读到的原件判定。判定保存之后再改，加载核验拒绝 `resume` 与 `abandon`。
+4. **派发条目写成 `starting`、尚未登记 pgid 时被强杀**：若独立进程记录已写出，退出门禁按该记录的身份与进程组判断。证据不足时核实后加 `--confirm-exited`。
+5. **启动时创建工作树之后、保存 `worktree_binding` 之前被强杀**：没有可信绑定，`resume` 以 `workspace_mismatch/binding_missing` 拒绝，`cleanup-run` 整条拒绝。可 `abandon` 后开新 run，并核对后手工处理残留工作树和分支。普通中断信号在结算区结束后才送达。
+6. **`delete_path` 删除之后**：删除立即生效；需要恢复文件时从 Git 历史取回。
+7. **`prepare-run` 只登记清单或尚未保存临时文件的身份就中断**：缺失的已绑定清单证据会挡住运行，未知文件也不能凭相同内容接管。人工核对现场，见[依赖副本清单](operations.md#依赖副本清单)。
+8. **`command-staging/` 中的准备目录**：发布前失败或被强杀可留下目录；运行时不枚举或回收。
+9. **额度等待中主进程被强杀**：台账可能留着 `running` 和 `quota_wait`。普通 `resume` 进入执行时删除这条记录，照常重新推导下一步。
+10. **接受已移动分支、尚未登记接受时被强杀，随后放弃**：未入账提交留在该分支，`cleanup-run` 因分支与检查点不符保留工作树，需要人工核对。
+11. **全新验证检出创建前后失败，或创建后、登记前被强杀**：没有可信创建登记但留有检出记录的轮次，`cleanup-run` 只报告 `blocked` 与 `recorded_worktree`。普通 `resume` 新开一轮。核对归属与需保留的产物后，用 Git 手工移除遗留检出，并清理已空的临时根。

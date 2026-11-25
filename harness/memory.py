@@ -463,6 +463,14 @@ class Memory:
                 reasons.append(commit_cache[commit])
         return {"possibly_stale": bool(reasons), "stale_reasons": reasons}
 
+    def database_exists(self):
+        """Check the database name before opening SQLite in read-only mode."""
+        outcome = StateFiles(self.path.parent).probe((self.path.name,)).or_local_io()
+        if outcome.state == "refused":
+            raise HarnessError(f"记忆库路径被拒绝（{outcome.found}）：{outcome.path}",
+                               stop=stops.make("runtime_failure", "io"))
+        return outcome.state == "present"
+
     def _source_ledger(self, source_run):
         """(status, ledger) of a memory's source run.
 
@@ -470,14 +478,10 @@ class Memory:
         ledger when it is not a current-version object, whose fields are never read.
         """
         try:
-            ledger_path = self.path.parent / "runs" / source_run / "state.json"
-            if not ledger_path.resolve().is_relative_to((self.path.parent / "runs").resolve()):
-                raise ValueError("source ledger outside state")
-            with ledger_path.open("rb") as stream:
-                data = stream.read(16 * 1024 * 1024 + 1)
-            if len(data) > 16 * 1024 * 1024:
-                raise ValueError("oversized source ledger")
-            ledger = json.loads(data)
+            outcome = StateFiles(self.path.parent).read(("runs", source_run, "state.json"), limit=16 * 1024 * 1024)
+            if outcome.state != "read":
+                return "missing", {}
+            ledger = json.loads(outcome.data)
             if unsupported_ledger(ledger) is not None:
                 return "unsupported", {}
             status = ledger.get("status") if ledger.get("id") == source_run else "invalid"
@@ -657,7 +661,7 @@ class Memory:
     def history(self, key):
         if not isinstance(key, str) or not key:
             raise HarnessError("key 必须为非空字符串")
-        if not self.path.exists():
+        if not self.database_exists():
             return []
         with self.connect() as db:
             rows = db.execute("SELECT * FROM memories WHERE key=? ORDER BY created, rowid", (key,)).fetchall()

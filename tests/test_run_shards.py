@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -60,6 +61,29 @@ ALPHA = [f"test_fake_alpha.Alpha.{name}" for name in ("test_doc", "test_stderr",
 BETA = [f"test_fake_beta.Beta.{name}" for name in ("test_pass", "test_skip", "test_skip_inside")]
 GAMMA = ["test_fake_gamma.Gamma.test_one", "test_fake_gamma.Gamma.test_two"]
 
+INDEPENDENT = """\
+import os
+import sys
+import unittest
+from pathlib import Path
+from fake_support import VALUE
+
+class Probe(unittest.TestCase):
+    shard_methods = True
+    shard_seconds = {"test_first": 40, "test_second": "stale", "test_removed": 90}
+
+    def setUp(self):
+        self.assertEqual(VALUE, 3)
+        self.assertIn("stop_tripwire", sys.modules)
+        print(os.getpid())
+
+    def test_first(self):
+        pass
+
+    def test_second(self):
+        pass
+"""
+
 # A test that publishes an unclassified stop the runtime raised, through a function imported by name.
 PUBLISHES = '''
     import contextlib
@@ -69,6 +93,7 @@ PUBLISHES = '''
     from harness.cli import report_stop   # by name: only a tripwire imported first wraps it
 
     class {name}(unittest.TestCase):
+        {allowance}
         def test_publishes(self):
             try:
                 stops.validate({{}})   # an untyped refusal raised by the runtime, not by this test
@@ -182,6 +207,185 @@ class ShardRunnerTests(unittest.TestCase):
         for shard in result["shards"]:
             self.assertTrue(Path(shard["log"]).is_file())
 
+    def test_cli_shards_independent_methods_after_unrelated_edits_and_new_test(self):
+        name = "test_fake_probe"
+        self.write_suite({**BASE_SUITE, name + ".py": INDEPENDENT, "stop_tripwire.py": "# tripwire\n"})
+        # Run as a script so its default checkout root, argument parsing and child commands are all exercised.
+        self.copy_runner()
+        methods = [name + ".Probe.test_first", name + ".Probe.test_second"]
+        for args in ([], ["--shards", "3", "--pattern", "test_fake_*.py"]):
+            if args:
+                self.out = self.base / "after-edit"
+                methods.append(name + ".Probe.test_new")
+                self.write_suite({"fake_support.py": BASE_SUITE["fake_support.py"] + "# unrelated comment\n",
+                                  "stop_tripwire.py": "# edited tripwire\n",
+                                  name + ".py": INDEPENDENT + "\n    def test_new(self):\n        pass\n"})
+            with self.subTest(args=args):
+                result = self.run_probe_cli(args)
+                self.assertEqual(len(result["shards"]), 3 if args else 4)
+                self.assertEqual((result["collected"], result["executed"]), (9 + len(methods),) * 2)
+                executions, pids = [], set()
+                for shard in result["shards"]:
+                    parsed = run_shards.parse_log(Path(shard["log"]).read_text())
+                    executions.extend(item.test_id for item in parsed.executions)
+                    self.assertEqual((shard["tests"], shard["executed"], shard["ran"]), (parsed.ran,) * 3)
+                    if name in shard["modules"]:
+                        self.assertNotIn(name, shard["command"])
+                        pids.update(line for line in Path(shard["stdout_log"]).read_text().splitlines()
+                                    if line.isdecimal())
+                self.assertGreaterEqual(len(pids), 2)
+                self.assertCountEqual(executions, ALPHA + BETA + GAMMA + methods)
+                collect = json.loads((self.out / "collection.json").read_text())
+                self.assertEqual(collect["independent_methods"], {
+                    name: {method: 40 if method.endswith(".test_first") else None for method in methods}})
+
+    def copy_runner(self):
+        for name in ("run_shards.py", "git_isolation.py"):
+            shutil.copyfile(run_shards.ROOT / "tests" / name, self.root / "tests" / name)
+
+    def run_probe_cli(self, args):
+        proc = subprocess.run([sys.executable, "tests/run_shards.py", "--out", str(self.out), *args],
+                              cwd=self.root, capture_output=True, text=True, timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        return json.loads((self.out / "result.json").read_text())
+
+    def test_default_cli_accounts_for_a_skip_between_stderr_and_cleanup_output(self):
+        self.write_suite({**BASE_SUITE, "test_fake_skips.py": '''
+            import sys
+            import unittest
+
+            class Skips(unittest.TestCase):
+                def test_whole(self):
+                    self.addCleanup(sys.stderr.write, "cleanup completed\\n")
+                    sys.stderr.write("checking fixture: ")
+                    self.skipTest("whole fixture skipped")
+
+                def test_subtests(self):
+                    for index in range(2):
+                        with self.subTest(index=index):
+                            self.skipTest("data point skipped")
+        '''})
+        self.copy_runner()
+        reference = subprocess.run([sys.executable, "-m", "unittest", "discover", "-s", "tests", "-v"],
+                                   cwd=self.root, capture_output=True, text=True, timeout=30)
+        self.assertEqual(reference.returncode, 0, reference.stderr)
+        self.assertIn("OK (skipped=5)", reference.stderr)
+        joined = "checking fixture: skipped 'whole fixture skipped'\ncleanup completed\n"
+        self.assertIn(joined, reference.stderr)
+
+        result = self.run_probe_cli([])
+        self.assertEqual([shard["exit"] for shard in result["shards"]], [0] * 4)
+        self.assertEqual((result["collected"], result["executed"]), (11, 11))
+        for name in ("missing", "duplicated", "unexpected", "log_problems"):
+            self.assertEqual(result[name], [])
+        self.assertEqual({kind: count for kind, count in result["outcomes"].items() if count},
+                         {"passed": 7, "skipped": 4})
+        (skip_shard,) = [shard for shard in result["shards"] if "test_fake_skips" in shard["modules"]]
+        self.assertEqual(skip_shard["verdict"], "OK (skipped=3)")
+        self.assertIn(joined, Path(skip_shard["log"]).read_text(encoding="utf-8"))
+
+    def test_a_started_test_with_no_unittest_outcome_fails_accounting(self):
+        self.write_suite({"test_fake_incomplete.py": '''
+            import sys
+            import unittest
+
+            class Incomplete(unittest.TestCase):
+                def run(self, result):
+                    result.startTest(self)
+                    self.test_one()
+                    result.stopTest(self)
+
+                def test_one(self):
+                    sys.stderr.write("fixture looked ok\\n")
+        '''})
+        code, result, _ = self.run_main()
+        self.assertEqual((code, result["collected"], result["executed"]), (1, 1, 1))
+        (shard,) = result["shards"]
+        self.assertEqual((shard["exit"], shard["verdict"]), (0, "OK"))
+        self.assertEqual((result["outcomes"]["passed"], result["outcomes"]["unknown"]), (0, 1))
+        self.assertEqual(result["log_problems"],
+                         ["shard 1: no unittest outcome for test_fake_incomplete.Incomplete.test_one"])
+
+    def test_shared_lifecycles_keep_opted_in_modules_whole(self):
+        inherited_setup = '''
+            class Fixture(unittest.TestCase):
+                @classmethod
+                def setUpClass(cls):
+                    raise unittest.SkipTest("inherited fixture")
+
+            class Probe(Fixture):
+        '''
+        cases = {
+            "module_setup": '\ndef setUpModule():\n    raise unittest.SkipTest("module fixture")\n',
+            "module_teardown": '\ndef tearDownModule():\n    pass\n',
+            "class_teardown": '\n    @classmethod\n    def tearDownClass(cls):\n        pass\n',
+            "class_cleanup": '\nProbe.addClassCleanup(Path("class-cleaned").touch)\n',
+            "custom_run": '\n    def run(self, result=None):\n        return super().run(result)\n',
+            "load_tests": '\ndef load_tests(loader, tests, pattern):\n    return tests\n',
+            "custom_suite": """
+class Suite(unittest.TestSuite):
+    def run(self, result, debug=False):
+        Path("suite-ran").touch()
+        return super().run(result, debug)
+
+def load_tests(loader, tests, pattern):
+    return Suite(tests)
+""",
+        }
+        files = {"test_" + name + ".py": INDEPENDENT + extra for name, extra in cases.items()}
+        files["test_class_setup.py"] = INDEPENDENT.replace("class Probe(unittest.TestCase):",
+                                                          textwrap.dedent(inherited_setup).rstrip())
+        files["test_weight_only.py"] = INDEPENDENT.replace("    shard_methods = True\n", "")
+        files["test_named_load_factory.py"] = INDEPENDENT.replace("    def test_first(self):",
+                                                                 "    @classmethod\n    def test_first(cls):")
+        files["test_independent.py"] = INDEPENDENT
+        self.write_suite({**files, "fake_support.py": BASE_SUITE["fake_support.py"], "stop_tripwire.py": "# tripwire\n"})
+        code, result, _ = self.run_main("--shards", "16")
+        self.assertEqual(code, 0, result)
+        self.assertEqual((result["collected"], result["executed"]), (2 * len(files),) * 2)
+        self.assertEqual(result["outcomes"]["skipped"], 4)
+        targets = [target for shard in result["shards"] for target in shard["command"][5:]]
+        self.assertCountEqual(targets, [Path(name).stem for name in files if name != "test_independent.py"]
+                              + ["test_independent.Probe.test_first", "test_independent.Probe.test_second"])
+        self.assertTrue((self.root / "class-cleaned").is_file())
+        self.assertTrue((self.root / "suite-ran").is_file())
+
+        self.out = self.base / "module-cleanup"
+        # unittest's registered module cleanups run even without named fixture functions.
+        self.write_suite({"test_independent.py": INDEPENDENT +
+                          '\nunittest.addModuleCleanup(Path("module-cleaned").touch)\n'})
+        code, result, _ = self.run_main("--shards", "4", "--pattern", "test_independent.py")
+        self.assertEqual((code, result["collected"], result["executed"]), (0, 2, 2), result)
+        self.assertEqual([shard["command"][5:] for shard in result["shards"]], [["test_independent"]])
+        self.assertTrue((self.root / "module-cleaned").is_file())
+
+    def test_one_shot_load_tests_preserves_instance_data_and_skips(self):
+        self.write_suite({"test_one_shot.py": '''
+            import unittest
+
+            class Probe(unittest.TestCase):
+                shard_methods = True
+
+                def test_data(self):
+                    self.assertEqual(self.label, "test_data")
+
+                def test_skip(self):
+                    if getattr(self, "label", None) == "test_skip":
+                        self.skipTest("set by load_tests")
+
+            def load_tests(loader, suite, pattern):
+                del globals()["load_tests"]
+                for group in suite:
+                    for instance in group:
+                        instance.label = instance._testMethodName
+                return suite
+        '''})
+        code, result, _ = self.run_main()
+        self.assertEqual(code, 0, result)
+        self.assertEqual((result["collected"], result["executed"]), (2, 2))
+        self.assertEqual((result["outcomes"]["passed"], result["outcomes"]["skipped"]), (1, 1))
+        self.assertEqual([shard["command"][4:] for shard in result["shards"]], [["test_one_shot"]])
+
     def test_module_left_out_of_a_shard_is_reported_missing(self):
         self.write_suite(BASE_SUITE)
         original = run_shards.split
@@ -216,29 +420,57 @@ class ShardRunnerTests(unittest.TestCase):
 
     def test_failing_test_in_any_shard_fails_the_run(self):
         self.write_suite({**BASE_SUITE, "test_fake_broken.py": '''
+            import sys
             import unittest
 
             class Broken(unittest.TestCase):
+                def setUp(self):
+                    self.addCleanup(sys.stderr.write, "cleanup ran (local)\\ncleanup diagnostic")
+
+                def test_a_pass_with_noise(self):
+                    print("FAIL", file=sys.stderr)
+
                 def test_error(self):
+                    print("starting error", file=sys.stderr)
                     raise RuntimeError("boom")
+
                 def test_fail(self):
+                    """First line of a documented failure."""
+                    print("starting assertion", file=sys.stderr)
                     self.assertEqual(1, 2)
+
+                def test_skip_with_noise(self):
+                    print("starting skip", file=sys.stderr)
+                    self.skipTest("method cannot run")
+
                 def test_subtest_fail(self):
                     for i in range(2):
                         with self.subTest(i=i):
                             self.assertEqual(i, 0)
+
+                def test_subtest_skip(self):
+                    """First line of a documented subtest skip."""
+                    for i in range(2):
+                        with self.subTest(i=i):
+                            self.skipTest("case cannot run")
         '''})
         code, result, _ = self.run_main("--shards", "3")
-        self.assertNotEqual(code, 0)
+        self.assertEqual(code, 1)
         self.assertEqual((result["missing"], result["duplicated"], result["unexpected"]), ([], [], []))
         self.assertEqual(result["executed"], result["collected"])
-        self.assertEqual((result["outcomes"]["failed"], result["outcomes"]["error"]), (2, 1))
+        self.assertEqual(result["outcomes"], {"passed": 8, "failed": 2, "error": 1, "skipped": 4,
+                                             "unexpected success": 0, "expected failure": 0, "unknown": 0})
         for shard in result["shards"]:
-            self.assertEqual(shard["exit"] != 0, "test_fake_broken" in shard["modules"], shard)
-        lines = {(item["test"], item["line"]) for item in result["failures"]}
-        self.assertIn(("test_fake_broken.Broken.test_error", "RuntimeError: boom"), lines)
-        self.assertIn(("test_fake_broken.Broken.test_fail", "AssertionError: 1 != 2"), lines)
-        self.assertTrue(any(test.startswith("test_fake_broken.Broken.test_subtest_fail (i=1)") for test, _ in lines))
+            broken = "test_fake_broken" in shard["modules"]
+            self.assertEqual(shard["exit"], int(broken), shard)
+            if broken:
+                self.assertEqual(shard["verdict"], "FAILED (failures=2, errors=1, skipped=3)")
+        self.assertEqual(result["log_problems"], [])
+        self.assertCountEqual([(item["kind"], item["test"], item["line"]) for item in result["failures"]], [
+            ("ERROR", "test_fake_broken.Broken.test_error", "RuntimeError: boom"),
+            ("FAIL", "test_fake_broken.Broken.test_fail", "AssertionError: 1 != 2"),
+            ("FAIL", "test_fake_broken.Broken.test_subtest_fail (i=1)", "AssertionError: 1 != 0"),
+        ])
 
     def test_log_accounting_survives_noise_repeated_statuses_and_class_fixtures(self):
         self.write_suite({"test_fake_edges.py": '''
@@ -341,8 +573,10 @@ class ShardRunnerTests(unittest.TestCase):
         self.assertEqual(shard.command[3:], ["-v", "test_fake_gamma"])
 
     def write_publishing_suite(self, last="pass"):
-        self.write_suite({"test_fake_one.py": PUBLISHES.format(name="One", last="pass"),
-                          "test_fake_two.py": PUBLISHES.format(name="Two", last=last)})
+        first = PUBLISHES.format(name="One", last="pass",
+                                 allowance='allow_unclassified = "Publish the refusal to check the shared report."')
+        self.write_suite({"test_publish_one.py": first,
+                          "test_publish_two.py": PUBLISHES.format(name="Two", last=last, allowance="")})
         self.copy_tripwire()
 
     def copy_tripwire(self):
@@ -353,13 +587,56 @@ class ShardRunnerTests(unittest.TestCase):
         report = self.base / "report.jsonl"
         with mock.patch.dict(os.environ, {"PYTHONPATH": str(run_shards.ROOT), "HARNESS_STOP_TRIPWIRE_REPORT": str(report)}):
             code, result, _ = self.run_main("--shards", "2")
-        self.assertEqual(code, 0, result)   # report mode: the findings change no result
+        self.assertEqual(code, 1, result)
         self.assertEqual(len(result["shards"]), 2)
         lines = [json.loads(line) for line in report.read_text(encoding="utf-8").splitlines()]
         self.assertEqual(sorted((line["test"], line["channels"], line["kind"], line["exempt"]) for line in lines),
-                         [(f"test_fake_{module}.{name}.test_publishes", ["cli"], "unclassified", None)
-                          for module, name in (("one", "One"), ("two", "Two"))])
+                         [("test_publish_one.One.test_publishes", ["cli"], "unclassified", "allow_unclassified"),
+                          ("test_publish_two.Two.test_publishes", ["cli"], "unclassified", None)])
+        self.assertEqual([shard["exit"] for shard in result["shards"]], [0, 1])
+        self.assertEqual(result["outcomes"]["failed"], 1)
+        self.assertEqual(result["log_problems"], [])
         self.assertEqual(result["report_incomplete"], [])
+
+    def test_default_discovery_and_four_shard_cli_enforce_the_same_publication(self):
+        self.write_publishing_suite()
+        self.write_suite({
+            # The real discovery hook lives in test_harness. Its shard equivalent is the first module argument.
+            "test_harness.py": "import stop_tripwire\n",
+            "test_fixture_collected.py": PUBLISHES_WHILE_COLLECTED,
+            "test_fixture_pass.py": BASE_SUITE["test_fake_gamma.py"],
+        })
+        self.copy_runner()
+        commands = {
+            "discover": ["-m", "unittest", "discover", "-s", "tests", "-v"],
+            "shards": ["tests/run_shards.py", "--out", str(self.out)],
+        }
+        for label, command in commands.items():
+            with self.subTest(entry=label):
+                report = self.base / f"{label}.jsonl"
+                env = dict(os.environ, PYTHONPATH=str(run_shards.ROOT), HARNESS_STOP_TRIPWIRE_REPORT=str(report))
+                process = subprocess.run([sys.executable, *command], cwd=self.root, env=env,
+                                         capture_output=True, text=True, timeout=30)
+                self.assertEqual(process.returncode, 1, process.stdout + process.stderr)
+                self.assertCountEqual([(row["test"], row["exempt"]) for row in
+                                       map(json.loads, report.read_text(encoding="utf-8").splitlines())], [
+                    (None, None),
+                    ("test_publish_one.One.test_publishes", "allow_unclassified"),
+                    ("test_publish_two.Two.test_publishes", None),
+                ])
+                if label == "discover":
+                    logs = [process.stderr]
+                else:
+                    result = json.loads((self.out / "result.json").read_text(encoding="utf-8"))
+                    self.assertEqual(len(result["shards"]), 4)
+                    self.assertEqual(sorted(shard["exit"] for shard in result["shards"]), [0, 0, 0, 1])
+                    self.assertEqual((result["collected"], result["executed"]), (5, 5))
+                    self.assertEqual(result["report_incomplete"], [])
+                    self.assertEqual(result["log_problems"], [])
+                    logs = [Path(shard["log"]).read_text(encoding="utf-8") for shard in result["shards"]]
+                parsed = [run_shards.parse_log(log) for log in logs]
+                self.assertCountEqual([execution.test_id for log in parsed for execution in log.executions
+                                       if execution.outcome == "failed"], ["test_publish_two.Two.test_publishes"])
 
     def test_a_stop_tripwire_report_that_cannot_be_written_changes_no_result_and_is_marked_incomplete(self):
         self.write_publishing_suite(last='self.skipTest("skipped after publishing")')
@@ -404,6 +681,36 @@ class ShardRunnerTests(unittest.TestCase):
         self.assertEqual([(entry["source"], entry["report"]) for entry in result["report_incomplete"]],
                          [("collection", str(report))])
         self.assertIn(f"{run_shards.INCOMPLETE_TITLE} (1):", lines)
+
+    def test_default_cli_preserves_an_incomplete_report_joined_to_stderr(self):
+        atexit_progress = '''
+            import atexit
+            import sys
+            import stop_tripwire
+
+            atexit.register(sys.stderr.write, "cleanup finished: ")
+        '''
+        publishes = PUBLISHES.format(name="Covered", last="pass",
+                                     allowance='allow_unclassified = "Publish the refusal to check report loss."')
+        self.write_suite({**BASE_SUITE,
+                          "test_a_publishes.py": textwrap.dedent(atexit_progress) + textwrap.dedent(publishes)})
+        self.copy_runner()
+        self.copy_tripwire()
+        obstruction = self.base / "obstruction"
+        obstruction.write_text("ordinary data\n", encoding="utf-8")
+        report = obstruction / "tripwire.jsonl"
+        with mock.patch.dict(os.environ, {"PYTHONPATH": str(run_shards.ROOT), "HARNESS_STOP_TRIPWIRE_REPORT": str(report)}):
+            result = self.run_probe_cli([])
+        self.assertEqual([shard["exit"] for shard in result["shards"]], [0] * 4)
+        self.assertEqual((result["collected"], result["executed"], result["log_problems"]), (10, 10, []))
+        (shard,) = [shard for shard in result["shards"] if "test_a_publishes" in shard["modules"]]
+        stderr = Path(shard["log"]).read_text(encoding="utf-8")
+        prefix = "cleanup finished: " + run_shards.REPORT_INCOMPLETE + ": "
+        (payload,) = [line.removeprefix(prefix) for line in stderr.splitlines() if line.startswith(prefix)]
+        warning = json.loads(payload)
+        self.assertEqual((warning["report"], warning["writes"], warning["lines"], warning["marker"]),
+                         (str(report), 1, 1, None))
+        self.assertEqual(result["report_incomplete"], [dict(warning, source=f"shard {shard['index']}")])
 
     def test_a_collecting_process_that_exits_non_zero_still_carries_its_report_incomplete_line(self):
         self.write_suite({"test_fake_aborts.py": ABORTS_WHILE_COLLECTED})

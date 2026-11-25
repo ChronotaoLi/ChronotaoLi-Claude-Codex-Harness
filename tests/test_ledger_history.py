@@ -8,9 +8,11 @@ schema_version: every entry refuses it before anything is changed, and the run
 list names it by path and version alone.
 """
 import contextlib
+import errno
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
 import re
 import shutil
@@ -21,7 +23,7 @@ import unittest
 from unittest.mock import patch
 import uuid
 
-from harness import cli, git, observe
+from harness import cli, git, observe, state_files
 from harness.cleanup import cleanup_run
 from harness.cli import status_summary
 from harness.command_server import Broker, create_manifest
@@ -591,6 +593,38 @@ class UnsupportedLedgerMcpTests(unittest.TestCase):
                               'worktree': str(self.root)})
         request = {'method': 'tools/call', 'params': {'name': 'run_status', 'arguments': {}}}
         self.assertFalse(handle(request, self.memory, None, self.run)['isError'])
+
+    def test_bound_read_distinguishes_absent_refused_and_local_io(self):
+        request = {"method": "tools/call", "params": {"name": "run_status"}}
+        self.assertFalse(handle(request, self.memory, None, None)["isError"])
+        absent = handle(request, self.memory, None, self.run)
+        self.assertTrue(absent["isError"])
+        self.assertIn("run 不存在", absent["content"][0]["text"])
+        ledger = {"schema_version": RUN_SCHEMA_VERSION, "id": "run_old"}
+        target = self.root / "other.json"
+        write_json(target, ledger)
+        self.run.parent.mkdir(parents=True)
+        self.run.symlink_to(target)
+        refused = handle(request, self.memory, None, self.run)
+        self.assertTrue(refused["isError"])
+        self.assertIn("symlink", refused["content"][0]["text"])
+        self.run.unlink()
+        write_json(self.run, ledger)
+        original = self.run.read_bytes()
+        real_open = os.open
+
+        def denied(path, *args, **kwargs):
+            if path == self.run.name and kwargs.get("dir_fd") is not None:
+                raise PermissionError(errno.EACCES, "run ledger read denied")
+            return real_open(path, *args, **kwargs)
+
+        with patch.object(state_files.os, "open", denied):
+            unreadable = handle(request, self.memory, None, self.run)
+        self.assertTrue(unreadable["isError"])
+        self.assertIn(os.strerror(errno.EACCES), unreadable["content"][0]["text"])
+        result = handle(request, self.memory, None, self.run)
+        self.assertEqual(json.loads(result["content"][0]["text"])["id"], "run_old")
+        self.assertEqual(self.run.read_bytes(), original)
 
     def test_server_does_not_start_on_another_version(self):
         write_json(self.run, {'schema_version': 18, 'id': 'run_old', 'worktree': str(self.root)})

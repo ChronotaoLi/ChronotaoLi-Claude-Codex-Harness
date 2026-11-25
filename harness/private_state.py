@@ -14,12 +14,13 @@ from .util import HarnessError
 
 
 CONTROL_LIMIT = 64 * 1024
+DARWIN_SYSTEM_ALIASES = (Path("/var"), Path("/tmp"), Path("/etc"))
 
 
 def _path(path, *, directory=False):
     path = Path(os.path.abspath(path))
     for parent in reversed(path.parents):
-        system_alias = sys.platform == "darwin" and parent in (Path("/var"), Path("/tmp"), Path("/etc"))
+        system_alias = sys.platform == "darwin" and parent in DARWIN_SYSTEM_ALIASES
         if parent.is_symlink() and not system_alias:
             raise HarnessError(f"私有状态路径不能包含符号链接：{parent}")
         if parent.exists() and not parent.is_dir():

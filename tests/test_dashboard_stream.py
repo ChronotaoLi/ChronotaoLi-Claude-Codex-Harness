@@ -1,4 +1,5 @@
 """Real HTTP subscribers and native file notifications; no model calls."""
+import errno
 import http.client
 import io
 import json
@@ -12,7 +13,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from harness import dashboard
-from harness.watch import WatchError
+from harness.watch import RunWatcher, WatchError
 
 
 class StreamTests(unittest.TestCase):
@@ -106,6 +107,56 @@ class StreamTests(unittest.TestCase):
         self.eventually(lambda: self.server.active_streams() == 0)
         self.eventually(lambda: self.server.active_connections() == 0)
 
+    def assert_single_ready_response(self, after_ready):
+        port = self.server.server_port
+        with socket.create_connection(('127.0.0.1', port), timeout=2) as conn:
+            conn.sendall((f'GET /api/runs/run_stream/stream HTTP/1.0\r\n'
+                          f'Host: 127.0.0.1:{port}\r\n\r\n').encode())
+            with conn.makefile('rb') as wire:
+                prefix = b''
+                while not prefix.endswith(b'\n\n') or b'event: ready\n' not in prefix:
+                    line = wire.readline()
+                    self.assertTrue(line, prefix)
+                    prefix += line
+                after_ready(conn)
+                response = prefix + wire.read()
+        self.assertEqual([line for line in response.splitlines() if line.startswith(b'HTTP/')],
+                         [b'HTTP/1.0 200 OK'])
+        self.assertNotIn(b'500 internal error', response)
+        self.assertEqual(self.server.active_streams(), 0)
+
+    def test_owned_close_failure_after_ready_sends_one_http_response(self):
+        watched_fds = []
+        failures = []
+        real_close = os.close
+
+        def create(reader, run_id):
+            watcher = RunWatcher(reader, run_id)
+            watched_fds.append(watcher._entries[('runs', run_id, 'state.json')][1])
+            return watcher
+
+        def close(fd):
+            real_close(fd)
+            if watched_fds and fd == watched_fds[0] and not failures:
+                failures.append(fd)
+                raise OSError(errno.EIO, 'injected watcher-owned close failure')
+
+        with patch.object(dashboard, 'RunWatcher', side_effect=create), patch.object(os, 'close', close):
+            self.assert_single_ready_response(lambda conn: conn.shutdown(socket.SHUT_WR))
+        self.assertEqual(failures, watched_fds)
+        self.assertIn('internal error: StateReadError', self.server.log.getvalue())
+
+    def test_ready_frame_failure_sends_one_http_response(self):
+        stream_frame = dashboard.DashboardHandler._stream_frame
+
+        def fail_after_frame(handler, event, data):
+            stream_frame(handler, event, data)
+            raise RuntimeError('injected frame failure')
+
+        with patch.object(dashboard.DashboardHandler, '_stream_frame', fail_after_frame):
+            self.assert_single_ready_response(lambda conn: None)
+        self.assertIn('internal error: RuntimeError: injected frame failure', self.server.log.getvalue())
+
     def test_security_head_and_native_unavailable(self):
         for method, path, headers, expected in (
             ('HEAD', '/api/runs/run_stream/stream', {}, 405),
@@ -126,6 +177,10 @@ class StreamTests(unittest.TestCase):
         _, response = self.connect(path='/api/runs/run_link/stream')
         self.assertEqual(response.status, 403)
         response.read()
+        with patch.object(dashboard, 'RunWatcher', side_effect=RuntimeError('injected setup failure')):
+            _, response = self.connect()
+            self.assertEqual(response.status, 500)
+            self.assertEqual(response.read(), b'500 internal error\n')
         with patch('harness.dashboard.RunWatcher', side_effect=WatchError('native unsupported')):
             _, response = self.connect()
             self.assertEqual(response.status, 200)
@@ -148,7 +203,6 @@ class StreamTests(unittest.TestCase):
         normal.read()
 
     def test_shutdown_closes_watch_descriptors_and_stops_reader_access(self):
-        from harness.watch import RunWatcher
         watchers = []
         def create(reader, run_id):
             watcher = RunWatcher(reader, run_id)
@@ -165,7 +219,6 @@ class StreamTests(unittest.TestCase):
             self.assertEqual(response.read(), b'')
 
     def test_watcher_failure_closes_and_releases_subscription(self):
-        from harness.watch import RunWatcher
         original = RunWatcher.wait
         real_close = RunWatcher.close
         failed = threading.Event()

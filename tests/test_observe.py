@@ -20,8 +20,7 @@ import uuid
 from pathlib import Path
 from unittest.mock import patch
 
-from harness import stops
-from harness import cli, dashboard, git, observe, process_runtime, watch_cli
+from harness import cli, dashboard, git, observe, process_runtime, state_files, stops, watch_cli
 from harness.cli import status_summary
 from harness.util import read_json, write_json
 from harness.versions import RUN_SCHEMA_VERSION
@@ -255,6 +254,16 @@ class ProviderModelTests(StateCase):
 
 
 class EventsAndDamageTests(StateCase):
+    def test_events_checks_run_existence_without_descriptor_handoff(self):
+        run_id = self.save(ledger("run_exists"))
+        with observe.Observer(self.state) as observer, patch.object(
+                state_files.HeldFiles, "open", side_effect=AssertionError("unexpected descriptor handoff")):
+            with self.assertRaises(observe.NotFound):
+                observer.events("run_absent")
+            events = observer.events(run_id)
+            self.assertEqual((events["exists"], events["records"]), (False, []))
+
+
     def write_events(self, run_id, lines, trailing=b""):
         path = self.state / "runs" / run_id / "events.jsonl"
         path.write_bytes(b"".join(json.dumps(line).encode() + b"\n" for line in lines) + trailing)
@@ -522,6 +531,34 @@ class FirstEventTimeTests(StateCase):
 
 
 class RootDescriptorTests(StateCase):
+    def test_root_close_io_is_reported_only_when_the_observation_succeeds(self):
+        self.save(ledger("run_close"))
+        real_close = os.close
+
+        def close_then_fail(fd):
+            real_close(fd)
+            raise OSError(errno.EIO, "close fixture")
+
+        with patch.object(state_files.os, "close", close_then_fail), self.assertRaises(
+                state_files.StateReadError) as failure:
+            observe.observing(self.state, lambda observer: observer.reader.opened)
+        self.assertEqual((failure.exception.outcome.step.stage, failure.exception.outcome.errno),
+                         ("close", errno.EIO))
+
+        primary = ValueError("observation fixture")
+        entered = []
+
+        def fail(observer):
+            entered.append(observer.reader)
+            raise primary
+
+        # With no other descriptor operations in use(), this is the held root's close.
+        with patch.object(state_files.os, "close", close_then_fail), self.assertRaises(ValueError) as failure:
+            observe.observing(self.state, fail)
+        self.assertIs(failure.exception, primary)
+        self.assertFalse(entered[0].opened)
+
+
     def test_missing_state_directory_lists_empty_unless_required(self):
         missing = Path(self.temp.name) / "absent" / ".harness"
         with observe.Observer(missing) as observer:
@@ -592,15 +629,22 @@ class LocationTests(unittest.TestCase):
                     self.assertEqual(observer.reader.state, Path(given).resolve())
             self.assertNotEqual(os.path.abspath(dotdot), str(b / "deep" / ".harness"))  # a lexical fold would name another
             # A symbolic link loop (resolution fails on 3.11, opening fails from 3.13) and a NUL byte: not openable.
-            for given in (str(b / "loop-a"), str(b / "bad") + "\x00x"):
+            loop = str(b / "loop-a")
+            bad_name = str(b / "bad") + "\x00x"
+            for given in (loop, bad_name):
                 with self.subTest(given=given):
                     with observe.Observer(given) as observer:
                         self.assertFalse(observer.reader.opened)
-                        self.assertEqual(observer.list_runs()["runs"], [])
-                        with self.assertRaises(observe.NotFound):
+                        if given == loop:
+                            self.assertEqual(observer.list_runs()["runs"], [])
+                        else:
+                            with self.assertRaises(observe.ReadFailed) as error:
+                                observer.list_runs()
+                            self.assertEqual(error.exception.errno, errno.EINVAL)
+                        with self.assertRaises(observe.PathRefused):
                             observer.run_detail("run_x")
                         self.assertEqual(observer.observed, observed(given, None, None, f"{top}/{Path(given).name}"))
-                    with self.assertRaises(observe.NotFound):
+                    with self.assertRaises(observe.PathRefused):
                         observe.Observer(given, required=True)
 
     def test_every_json_view_carries_the_fixed_location(self):
@@ -677,7 +721,7 @@ class StatusListDiagnosticsTests(RepoCase):
 
         output, errors = io.StringIO(), io.StringIO()
         # Inject at the OS boundary so EACCES is exercised even under root.
-        with patch("harness.observe.os.open", side_effect=unreadable_open), \
+        with patch("harness.state_files.os.open", side_effect=unreadable_open), \
                 contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
             code = cli.main(["--repo", str(self.repo), "status"])
 
@@ -775,7 +819,7 @@ def written_summary(goal):
 
 
 class StatusLayoutTests(RepoCase):
-    """`status RUN` reads below the root it names, yet as the path read it replaced did (guarantee 5.1)."""
+    """`status RUN` reads below the root it names and keeps the status stop contract."""
 
     def setUp(self):
         super().setUp()
@@ -800,38 +844,63 @@ class StatusLayoutTests(RepoCase):
             code = cli.main(["--repo", str(repo), "status", *args])
         return code, output.getvalue(), errors.getvalue()
 
-    def test_layouts_the_path_read_could_read_print_the_same_bytes(self):
+    def test_search_only_directories_allow_named_reads(self):
         if os.geteuid() == 0:
             self.skipTest("permission bits do not stop root")
-        # Written out: no samples found, or the quota walk refused (it follows no link and needs read permission).
         no_samples = {"notes": ["账号级观测：包含本 run 以外的使用（含驱动 Harness 的会话），不是本 run 的消耗",
                                 "无法识别账号是否换过；样本里没有可比较的账号标识", "单位是百分点；重叠的额度桶不相加，两家不合成总数"],
                       "damaged_count": 0, "omitted": 0,
                       "providers": {"claude": {"state": "no_samples"}, "codex": {"state": "no_samples"}}}
-        refused = {"error": "PathRefused"}
-        cases = {}
-        repo = self.repository("run-link")
-        (repo / ".harness" / "runs").mkdir(parents=True)
-        (repo / ".harness" / "runs" / "run_same").symlink_to(self.base / "elsewhere" / "run_same")
-        cases["run-link"] = (repo, self.elsewhere, refused)
-        repo = self.repository("ledger-link")
-        (repo / ".harness" / "runs" / "run_same").mkdir(parents=True)
-        (repo / ".harness" / "runs" / "run_same" / "state.json").symlink_to(
-            self.base / "elsewhere" / "run_same" / "state.json")
-        cases["ledger-link"] = (repo, self.elsewhere, no_samples)
-        for name, folder, quota_block in (("search-only-runs", "runs", refused), ("search-only-state", None, no_samples)):
+        for name, folder in (("search-only-runs", "runs"), ("search-only-state", None)):
             repo = self.repository(name)
             write_json(repo / ".harness" / "runs" / "run_same" / "state.json", self.ordinary)
             self.restrict(repo / ".harness" / folder if folder else repo / ".harness", 0o111)
-            cases[name] = (repo, self.ordinary, quota_block)
-        for name, (repo, value, quota_block) in cases.items():
             location = f"harness: 检出 {repo}；状态目录 {repo / '.harness'}"
-            for extra, expected in (((), printed({**written_summary(value["goal"]), "quota": quota_block})),
-                                    (("--full",), printed(value))):
+            for extra, expected in (((), printed({**written_summary(self.ordinary["goal"]), "quota": no_samples})),
+                                    (("--full",), printed(self.ordinary))):
                 with self.subTest(layout=name, extra=extra):
                     code, output, errors = self.status(repo, "run_same", *extra)
                     self.assertEqual((code, errors.splitlines()), (0, [location]), errors)
                     self.assertEqual(output, expected)
+            if folder:
+                code, output, errors = self.status(repo)
+                stop = cli_notice(errors)
+                self.assertEqual((code, output, stop["kind"], stop["reason"], stop["data"]["error_type"]),
+                                 (1, "", "runtime_failure", "io", "PermissionError"), errors)
+
+    def test_quota_samples_are_read_below_search_only_runs(self):
+        if os.geteuid() == 0:
+            self.skipTest("permission bits do not stop root")
+        from harness import quota
+        from test_quota_view import T, claude
+
+        repo = self.repository("search-only-quota")
+        state = repo / ".harness"
+        run = state / "runs" / "run_same"
+        write_json(run / "state.json", self.ordinary)
+        sample = claude(T, [("session", 10, T + 100)])
+        write_json(run.joinpath(*quota.QUOTA_DIR, quota.sample_name(sample)), sample)
+        self.restrict(state / "runs", 0o111)
+        with observe.Observer(state, required=True) as observer:
+            self.assertEqual(observer.quota_samples("run_same")["samples"], [sample])
+
+    def test_run_and_ledger_links_are_refused(self):
+        for name in ("run-link", "ledger-link"):
+            repo = self.repository(name)
+            runs = repo / ".harness" / "runs"
+            runs.mkdir(parents=True)
+            target = self.base / "elsewhere" / "run_same"
+            if name == "run-link":
+                (runs / "run_same").symlink_to(target, target_is_directory=True)
+            else:
+                (runs / "run_same").mkdir()
+                (runs / "run_same" / "state.json").symlink_to(target / "state.json")
+            for extra in ((), ("--full",)):
+                with self.subTest(layout=name, extra=extra):
+                    code, output, errors = self.status(repo, "run_same", *extra)
+                    stop = cli_notice(errors)
+                    self.assertEqual((code, output, stop["kind"], stop["reason"], stop["data"]["error_type"]),
+                                     (1, "", "runtime_failure", "io", "PathRefused"), errors)
 
     def test_unreadable_layouts_keep_the_path_reads_stop_and_exit(self):
         if os.geteuid() == 0:
@@ -852,6 +921,10 @@ class StatusLayoutTests(RepoCase):
         write_json(repo / ".harness" / "runs" / "run_same" / "state.json", self.ordinary)
         self.restrict(repo / ".harness", 0)
         cases["unreadable-state"] = (repo, "PermissionError", False)
+        repo = self.repository("read-only-state")
+        write_json(repo / ".harness" / "runs" / "run_same" / "state.json", self.ordinary)
+        self.restrict(repo / ".harness", 0o444)
+        cases["read-only-state"] = (repo, "PermissionError", False)
         for name, (repo, error_type, opened) in cases.items():
             location = f"harness: 检出 {repo}；状态目录 {repo / '.harness'}" + ("" if opened else "（无法打开）")
             for extra in ((), ("--full",)):
@@ -861,6 +934,8 @@ class StatusLayoutTests(RepoCase):
                     self.assertEqual((code, output, errors.splitlines()[0]), (1, "", location), errors)
                     self.assertEqual((notice["kind"], notice["reason"], notice["exit_code"], notice["data"]["error_type"]),
                                      ("runtime_failure", "io", 1, error_type), errors)
+        code, output, errors = self.status(cases["runs-file"][0])
+        self.assertEqual((code, json.loads(output), cli_notice(errors)), (0, [], None))
         # Only an absent run or ledger is "no such run".
         repo = self.repository("absent")
         (repo / ".harness" / "runs" / "run_same").mkdir(parents=True)
@@ -883,13 +958,13 @@ class StatusLayoutTests(RepoCase):
         def descriptor_for_any_mode(path, flags, mode=0o777, *, dir_fd=None):
             # Linux O_PATH on every platform: the search-only open yields a descriptor whatever the directory's mode,
             # while a lookup through it is still checked against the directory's search permission.
-            if path == str(state) and flags == observe._SEARCH_FLAGS:
+            if path == str(state) and flags == state_files.SEARCH:
                 handed.append(os.dup(held))
                 return handed[-1]
             return real_open(path, flags, mode, dir_fd=dir_fd)
 
         location = f"harness: 检出 {repo}；状态目录 {state}（无法打开）"
-        with patch("harness.observe.os.open", side_effect=descriptor_for_any_mode):
+        with patch("harness.state_files.os.open", side_effect=descriptor_for_any_mode):
             for args in ((), ("run_same",), ("run_same", "--full")):
                 with self.subTest(args=args):
                     code, output, errors = self.status(repo, *args)
@@ -1190,19 +1265,18 @@ class InterruptedConstructionTests(RepoCase):
         self.assertIn((entry, expected), runs)
 
     def entries(self, run_id, dispatch_id):
-        """Each CLI caller of the observer: its lines and its use's, every event (the watcher's with line once), and argv."""
-        watching = (watch_cli.__file__, "watch_run.<locals>.watching")
-        # The watcher's descriptors, closed by its own exit, are design 4's (D4-T12): its line counts as entered only.
-        handed = {(watching, line) for line in lines_between(watch_cli.watch_run, "with RunWatcher(", "with RunWatcher(")}
+        """Each CLI caller of the observer: its lines and its use's, and argv."""
+        watching = {(watch_cli.__file__, f"watch_run.<locals>.watch_observer{suffix}"): None
+                    for suffix in ("", ".<locals>.watching", ".<locals>.snapshot_loop", ".<locals>.close")}
         status = {(cli.__file__, "show_status"): None, (cli.__file__, "show_status.<locals>.show"): None}
         diagnostics = {(cli.__file__, "_main"): lines_between(cli._main, "from .permission_diagnostics import",
-                                                              'data={"error_type": type(failure).__name__})) from error'),
+                                                              'data={"error_type": observe.error_type(error)})) from error'),
                        (cli.__file__, "_main.<locals>.diagnose"): None}
         return {"status RUN": (status, (), ("--repo", str(self.repo), "status", run_id)),
                 "permission-diagnostics": (diagnostics, (), (
                     "--config", str(ROOT / "harness.toml"), "--repo", str(self.repo), "permission-diagnostics",
                     self.RUN, dispatch_id)),
-                "watch": ({(watch_cli.__file__, "watch_run"): None, watching: None}, handed,
+                "watch": ({(watch_cli.__file__, "watch_run"): None, **watching}, (),
                           ("watch", run_id, "--state", str(self.state)))}
 
     def test_cli_entries_exit_130_with_nothing_left_open(self):
@@ -1356,20 +1430,23 @@ class InterruptedConstructionTests(RepoCase):
 
         def search_descriptor_for_any_mode(path, flags, mode=0o777, *, dir_fd=None):
             # Linux O_PATH: a descriptor whatever the mode; a lookup through it still needs search permission.
-            if path == str(state) and flags == observe._SEARCH_FLAGS:
+            if path == str(state) and flags == state_files.SEARCH:
                 handed.append(os.dup(held))
                 return handed[-1]
             return real_open(path, flags, mode, dir_fd=dir_fd)
 
         layouts = {"search permission only": (0o111, contextlib.nullcontext(), True),
-                   "search descriptor that cannot search": (0, patch("harness.observe.os.open",
+                   "search descriptor that cannot search": (0, patch("harness.state_files.os.open",
                                                                       side_effect=search_descriptor_for_any_mode), False)}
         for name, (mode, opening, bound) in layouts.items():
             state.chmod(mode)
             self.addCleanup(state.chmod, 0o755)
             with self.subTest(layout=name), opening:
                 runs, last = self.sweep(lambda: observe.list_runs(state), lines)
-                self.assertEqual(last["runs"], [])
+                if bound:
+                    self.assertEqual([item["id"] for item in last["runs"]], [self.RUN])
+                else:
+                    self.assertEqual(last, "ReadFailed")
                 self.assertEqual({result for _, result in runs}, {"interrupt", "deferred interrupt"})
                 with observe.Observer(state) as observer:
                     self.assertIs(observer.reader.opened, bound)

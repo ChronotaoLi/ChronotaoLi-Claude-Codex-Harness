@@ -1,31 +1,39 @@
 """The run's scope boundary (spec-6): inclusion, held proposals, rejection, the combined commit and their windows.
 
-Every model call is the scripted offline backend; no test calls a real model or CLI.
+Every model call uses the scripted offline backend.
 """
+import contextlib
 import copy
+import errno
+import hashlib
+import io
 import itertools
 import json
 import os
 import random
 import shlex
+import shutil
+import subprocess
+import sys
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from harness import git, scope as boundary, stops
+from harness import cli, git, scope as boundary, state_files, stops
 from harness.command_server import Broker, create_manifest
 from harness.context import compact_plan
 from harness.contracts import apply_revision, ScopeExtensionRequired, validate_plan
 from harness.progress import ProgressRecovery
-from harness.recovery import read_bound_result
+from harness.provider_failures import LIMIT
 from harness.review_progress import claim_gaps
 from harness.run_store import RunStore
 from harness.scope import proposal_request_id
 from harness.util import HarnessError, read_json, write_json
 from harness.verification_plan import candidate_preflight
-from test_harness import (ROOT, RepoCase, commit_recorder, crash_after_save, crash_point, decide_bound, refused_by_cli,
-                          run_cli, scratch, walk_exit, walk_notice_exit)
+from test_harness import (ROOT, RepoCase, cli_notice, commit_recorder, crash_after_save, crash_point, decide_bound, refused_by_cli,
+                          run_cli, scratch, walk_exit, walk_notice_exit, write_project_config)
 from test_runtime_changes import ScriptedBackend, decided, revised, trigger_kind, update
 
 DECIDE_KEY = "commander:decide:run"
@@ -41,6 +49,15 @@ def decides(backend):
 
 def saved(engine):
     return read_json(engine.directory / "state.json")
+
+
+def cli_status(case, run_id, *, repo=None):
+    completed = subprocess.run(
+        [sys.executable, "-m", "harness", "--repo", str(repo or case.repo), "status", run_id],
+        cwd=ROOT, text=True, capture_output=True, timeout=10,
+    )
+    case.assertEqual(completed.returncode, 0, completed.stderr)
+    return json.loads(completed.stdout)
 
 
 def receipt_entry(run):
@@ -157,7 +174,7 @@ class HeldCase(RepoCase):
         """The held proposal's final-review required input in this repository."""
         probe = self.engine()
         probe.load_run(engine.run["id"])
-        result, _ = read_bound_result(probe.run["commander_receipts"][DECIDE_KEY], "held")
+        _, result, _, _ = probe.services.planning.returned_proposal()
         proposed = apply_revision(probe.run["tasks"], result, probe.run["accepted"], scope=["**"])
         return probe.services.planning.capacity_report(proposed)["required_chars"]
 
@@ -360,8 +377,7 @@ class InitialPlanHoldTests(RepoCase):
         words = shlex.split(projected["exits"][0])
         self.assertEqual([w[len("--scope="):] for w in words if w.startswith("--scope=")], suggested)
         # The complete gaps stay readable in status, recomputed from the original.
-        from harness.cli import status_summary
-        self.assertEqual(status_summary(run)["scope"]["held"]["gaps"], {"greet": paths})
+        self.assertEqual(cli_status(self, run["id"])["scope"]["held"]["gaps"], {"greet": paths})
         source, calls = run["commander_receipts"][DECIDE_KEY]["dispatch_id"], len(backend.calls)
         result, errors = run_cli(self, backend, ["resume", run["id"]])
         again = saved(engine)
@@ -372,7 +388,7 @@ class InitialPlanHoldTests(RepoCase):
                           expect_code=3, expect_status="blocked")
         self.assertEqual((after["stop"]["reason"], after["stop"]["source"]["request_id"], len(backend.calls)),
                          ("initial_plan", stop["source"]["request_id"], calls))
-        self.assertEqual(status_summary(after)["scope"]["held"]["gaps"], {"greet": paths[len(suggested):]})
+        self.assertEqual(cli_status(self, after["id"])["scope"]["held"]["gaps"], {"greet": paths[len(suggested):]})
         self.assertEqual(run_cli(self, backend, ["resume", run["id"], "--scope=docs/**"])[0], 0)
         published = saved(engine)
         self.assertEqual((published["status"], source_of(published, 0), len(backend.calls)),
@@ -1047,7 +1063,6 @@ def files(root):
 
 class ScopeSummaryTests(HeldCase):
     def test_summary_and_held_view_are_read_only_and_bounded(self):
-        from harness.cli import status_summary
         tasks = [{"id": f"t{i}", "allowed_paths": [f"d{i}/f{j}.py" for j in range(100)] + ["top.py", "lib/*.py"]}
                  for i in range(6)]
         summary = boundary.summary({"scope": ["d0/**"], "tasks": tasks})
@@ -1061,13 +1076,243 @@ class ScopeSummaryTests(HeldCase):
         self.assertIsNone(boundary.summary({"scope": [], "tasks": tasks[:1]})["tasks"][0]["groups"]["."][0]["in_scope"])
         engine, _ = self.held(lambda b, p, r: new_task(b, p, r, path="tests/*.py"))
         before = files(engine.directory)
-        held = status_summary(saved(engine))["scope"]["held"]
+        held = cli_status(self, engine.run["id"])["scope"]["held"]
         self.assertEqual((held["gaps"], held["suggested_scope"], held["widened"], held["request_id"]),
                          ({"prepare": ["tests/*.py"]}, ["tests/**"], ["tests/**"], request_of(saved(engine))))
         probe = self.engine()
         probe.load_run(engine.run["id"])
         probe.services.planning.returned_proposal()
         self.assertEqual(files(engine.directory), before)
+
+
+class HeldObservationTests(HeldCase):
+    def dashboard_detail(self, run_id, *, state=None):
+        from test_dashboard import DashboardCase, http_request
+
+        server = DashboardCase.start_server(self, state=state)
+
+        def detail(*, summary_error=None):
+            code, _, body = http_request(server.server_port, f"/api/runs/{run_id}")
+            self.assertEqual(code, 200, body)
+            value = json.loads(body)
+            self.assertEqual(value["summary_error"], summary_error)
+            return value["summary"]
+
+        return detail
+
+    def cli_output(self, *args):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = cli.main(["--config", str(ROOT / "harness.toml"), "--repo", str(self.repo), *args])
+        self.assertEqual(code, 0, stderr.getvalue())
+        return json.loads(stdout.getvalue())
+
+    def test_scope_observers_read_the_copy_after_the_origin_moves(self):
+        engine, _ = self.held()
+        run = saved(engine)
+        source = Path(run["commander_receipts"][DECIDE_KEY]["artifact"])
+        snapshot = self.outside / "snapshot"
+        shutil.copytree(self.repo / ".harness", snapshot / ".harness")
+        detail = self.dashboard_detail(run["id"], state=snapshot / ".harness")
+        expected = cli_status(self, run["id"])["scope"]["held"]
+        self.assertEqual(expected["gaps"], {"prepare": ["support.txt"]})
+        RepoCase.init_repo(snapshot)
+        source.rename(source.with_name("moved.json"))
+        self.assertEqual(cli_status(self, run["id"], repo=snapshot)["scope"]["held"], expected)
+        self.assertEqual(detail()["scope"]["held"], expected)
+        self.assertIn("error", cli_status(self, run["id"])["scope"]["held"])
+
+    def test_invalid_evidence_stays_in_the_held_view(self):
+        engine, _ = self.held()
+        run_id = engine.run["id"]
+        ledger = engine.directory / "state.json"
+        run = saved(engine)
+        bound = run["commander_receipts"][DECIDE_KEY]
+        artifact = Path(bound["artifact"])
+        raw = artifact.read_bytes()
+        detail = self.dashboard_detail(run_id)
+        self.addCleanup(write_json, ledger, run)
+
+        def restore_artifact():
+            artifact.unlink(missing_ok=True)
+            artifact.write_bytes(raw)
+
+        self.addCleanup(restore_artifact)
+
+        def assert_error(status):
+            self.assertEqual(status["stop"]["kind"], "scope_extension")
+            held = status["scope"]["held"]
+            self.assertEqual(set(held), {"error"})
+            self.assertTrue(0 < len(held["error"]) <= 500)
+
+        def both():
+            assert_error(cli_status(self, run_id))
+            assert_error(detail())
+
+        # Intact bytes at an unrelated path do not make the recorded suffix valid.
+        unrelated = self.outside / "returned-result.json"
+        unrelated.write_bytes(raw)
+        for mode in ("path", "run_id", "uuid", "digest", "encoding", "duplicate_keys", "shape",
+                     "too_large", "symlink", "fifo"):
+            with self.subTest(mode=mode):
+                candidate = copy.deepcopy(run)
+                receipt = candidate["commander_receipts"][DECIDE_KEY]
+                artifact.unlink(missing_ok=True)
+                if mode == "path":
+                    receipt["artifact"] = str(unrelated)
+                elif mode == "run_id":
+                    candidate["id"] = "run_another"
+                elif mode == "uuid":
+                    receipt_entry(candidate)["id"] = receipt["dispatch_id"] = "invalid"
+                    invalid_original = artifact.parent.with_name("invalid") / artifact.name
+                    invalid_original.parent.mkdir()
+                    invalid_original.write_bytes(raw)
+                    receipt["artifact"] = str(invalid_original)
+                elif mode == "digest":
+                    receipt["artifact_digest"] = "f" * 64
+                elif mode in ("encoding", "duplicate_keys", "shape"):
+                    bad = {"encoding": b'{"action":"\xff"}', "duplicate_keys": b'{"action":0,"action":"ask"}',
+                           "shape": b'[]'}[mode]
+                    artifact.write_bytes(bad)
+                    receipt["artifact_digest"] = hashlib.sha256(bad).hexdigest()
+                elif mode == "too_large":
+                    # Its digest matches: an unbounded reader would decode a valid revise.
+                    padding = b" " * (LIMIT + 1 - len(raw))
+                    artifact.write_bytes(raw + padding)
+                    receipt["artifact_digest"] = hashlib.sha256(raw + padding).hexdigest()
+                elif mode == "symlink":
+                    artifact.symlink_to(unrelated)
+                elif mode == "fifo":
+                    os.mkfifo(artifact)
+                if mode in ("path", "run_id", "uuid", "digest"):
+                    artifact.write_bytes(raw)
+                write_json(ledger, candidate)
+                if mode != "fifo":
+                    both()
+                    continue
+
+                # Keep this test recoverable if a future HTTP reader blocks opening the FIFO.
+                released = threading.Event()
+
+                def release():
+                    try:
+                        writer = os.open(artifact, os.O_WRONLY | os.O_NONBLOCK)
+                    except OSError:
+                        return
+                    released.set()
+                    os.close(writer)
+
+                fallback = threading.Timer(7, release)
+                fallback.start()
+                try:
+                    both()
+                    self.assertFalse(released.is_set(), "a blocking FIFO read needed a writer")
+                finally:
+                    fallback.cancel()
+                    fallback.join()
+
+        artifact.unlink()
+        artifact.write_bytes(raw)
+        write_json(ledger, run)
+        original_open = state_files.os.open
+
+        def failing_open(path, *args, **kwargs):
+            if Path(path).name == artifact.name:
+                raise OSError(errno.EIO, os.strerror(errno.EIO))
+            return original_open(path, *args, **kwargs)
+
+        with patch.object(state_files.os, "open", failing_open):
+            assert_error(self.cli_output("status", run_id))
+            assert_error(detail())
+
+    def test_receipt_preconditions_watch_full_abandon_and_projection_do_not_open_the_original(self):
+        engine, _ = self.held()
+        run = saved(engine)
+        run_id = run["id"]
+        path = engine.directory / "state.json"
+        detail = self.dashboard_detail(run_id)
+        write_project_config(self.repo)
+        original_open, original_read_bytes = state_files.os.open, Path.read_bytes
+        reads = []
+
+        def record_open(path, *args, **kwargs):
+            if Path(path).name == "returned-result.json":
+                reads.append(path)
+            return original_open(path, *args, **kwargs)
+
+        def record_read_bytes(path):
+            if path.name == "returned-result.json":
+                reads.append(path)
+            return original_read_bytes(path)
+
+        with patch.object(state_files.os, "open", record_open), patch.object(Path, "read_bytes", record_read_bytes):
+            self.assertIn("held", self.cli_output("status", run_id)["scope"])
+            self.assertIn("held", detail()["scope"])
+            self.assertEqual(reads, ["returned-result.json", "returned-result.json"])
+            reads.clear()
+            for changes, field in (
+                ({"dispatches": None}, "尝试计数字段"),
+                ({"accepted": []}, " accepted 字段"),
+                ({"dispatches": None, "accepted": []}, " accepted 字段"),
+            ):
+                with self.subTest(changes=changes):
+                    write_json(path, {**run, **changes})
+                    expected = f"运行台账{field}无效；使用 status --full 查看原始内容"
+                    code, errors = run_cli(self, None, ["status", run_id])
+                    self.assertEqual(code, 1, errors)
+                    self.assertIn(f"harness: {expected}", errors.splitlines())
+                    notice = cli_notice(errors)
+                    self.assertEqual((notice["kind"], notice["reason"]), ("evidence", "load_integrity"))
+                    self.assertEqual(reads, [])
+                    self.assertIsNone(detail(summary_error=f"HarnessError: {expected}"))
+                    self.assertEqual(reads, [])
+            for mode in ("no_digest", "no_dispatch", "wrong_role", "rejected", "first_match"):
+                with self.subTest(mode=mode):
+                    candidate = copy.deepcopy(run)
+                    receipt = candidate["commander_receipts"][DECIDE_KEY]
+                    # Even damaged path evidence is ineligible in these cases.
+                    receipt["artifact"] = "/outside/returned-result.json"
+                    if mode == "no_digest":
+                        del receipt["artifact_digest"]
+                    elif mode == "no_dispatch":
+                        receipt["dispatch_id"] = "missing"
+                    elif mode == "wrong_role":
+                        receipt_entry(candidate)["role"] = "worker"
+                    elif mode == "rejected":
+                        receipt_entry(candidate)["proposal_rejection"] = {}
+                    elif mode == "first_match":
+                        candidate["dispatches"].insert(0, dict(receipt_entry(candidate), status="invalid"))
+                    write_json(path, candidate)
+                    self.assertNotIn("held", self.cli_output("status", run_id)["scope"])
+                    self.assertNotIn("held", detail()["scope"])
+            write_json(path, run)
+            self.assertEqual(self.cli_output("status", run_id, "--full")["id"], run_id)
+            self.assertNotIn("held", cli.status_summary(run)["scope"])
+            self.assertNotIn("scope", self.cli_output("watch", run_id))
+            abandoned = self.cli_output("abandon", run_id)
+            self.assertEqual(abandoned["status"], "abandoned")
+            self.assertNotIn("held", abandoned["scope"])
+            self.assertEqual(reads, [])
+
+    def test_valid_ask_does_not_project_a_held_proposal(self):
+        recorder, states = commit_recorder()
+        with recorder:
+            engine, _, _ = self.asked(new_task)
+        run_id = engine.run["id"]
+        before_consumption = next(run for run in states if decide_bound(run) and receipt_entry(run)["status"] == "completed")
+        artifact = Path(before_consumption["commander_receipts"][DECIDE_KEY]["artifact"])
+        self.assertEqual(read_json(artifact)["action"], "ask")
+        detail = self.dashboard_detail(run_id)
+        final = saved(engine)
+        path = engine.directory / "state.json"
+        self.addCleanup(write_json, path, final)
+        write_json(path, before_consumption)
+        for summary in (cli_status(self, run_id), detail()):
+            self.assertNotIn("held", summary["scope"])
+        write_json(path, final)
+        for summary in (cli_status(self, run_id), detail()):
+            self.assertNotIn("held", summary["scope"])
+            self.assertTrue(summary["pending_decisions"])
 
 
 # ---- T6-24 .. T6-31: the four classes of judgment -----------------------------------------------------
