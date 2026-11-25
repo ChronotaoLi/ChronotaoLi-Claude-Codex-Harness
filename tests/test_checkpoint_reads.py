@@ -8,6 +8,7 @@ import unittest
 from unittest.mock import patch
 
 import harness.progress as progress
+from harness.state_files import StateFiles
 from harness.util import HarnessError, write_json
 from test_progress_checkpoints import Runtime, sha
 from test_harness import add_worker_dispatch
@@ -40,13 +41,20 @@ class CheckpointReadTests(unittest.TestCase):
 
     def test_validation_and_projection_read_hash_and_parse_bound_artifacts_once(self):
         artifacts = [self.source, self.resolution, *self.manifests, *self.evidence]
+        read = StateFiles.read
+        counts = Counter()
+
+        def counted(files, components, **kwargs):
+            counts[Path(files.path).joinpath(*files.prefix, *components)] += 1
+            return read(files, components, **kwargs)
+
         for operation in (self.runtime.validate_checkpoint_links, lambda: self.runtime.progress_packet({})):
+            counts.clear()
             with self.subTest(operation=operation), \
-                    patch('harness.progress._read', wraps=progress._read) as reads, \
+                    patch.object(StateFiles, 'read', counted), \
                     patch('harness.progress._digest', wraps=progress._digest) as digests, \
                     patch('harness.progress.json.loads', wraps=json.loads) as parses:
                 operation()
-            counts = Counter(Path(call.args[0]) for call in reads.call_args_list)
             self.assertEqual({path: counts[path] for path in artifacts}, {path: 1 for path in artifacts})
             # Evidence bytes have no parsed representation; their hashes still
             # must be checked once per distinct private copy, including history.
@@ -80,7 +88,7 @@ class CheckpointReadTests(unittest.TestCase):
         copy_path.write_bytes(evidence.read_bytes())
         evidence.unlink()
         evidence.symlink_to(copy_path)
-        with self.assertRaisesRegex(HarnessError, 'non-symlink file'):
+        with self.assertRaisesRegex(HarnessError, 'symlink'):
             self.runtime.progress_packet({})
 
     def test_reused_manifest_keeps_exact_batch_digest_and_ledger_bindings(self):

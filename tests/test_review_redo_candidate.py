@@ -60,12 +60,23 @@ def changing_before_binding(change, role, kind):
     original, seen = Dispatcher.dispatch_once, {}
 
     def dispatch_once(service, call_role, call_kind, *args, **kwargs):
-        if (call_role, call_kind) == (role, kind) and not seen:
+        if (call_role, call_kind) == (role, kind) and "dispatches" not in seen:
             seen.update(agent_dispatches=service.context.run["agent_dispatches"],
                         dispatches=len(service.context.run["dispatches"]))
             change(service.context.worktree / "hello.py")
         return original(service, call_role, call_kind, *args, **kwargs)
     return patch.object(Dispatcher, "dispatch_once", autospec=True, side_effect=dispatch_once), seen
+
+
+def observe_review_binding(seen):
+    """Observe the digest checked in preparation, before invocation accounting."""
+    original = Dispatcher.require_review_candidate
+
+    def record(service, kind, entry, digest, previous_invalid):
+        seen.update(checked_digest=digest, checked_dispatch_id=entry["id"])
+        return original(service, kind, entry, digest, previous_invalid)
+
+    return patch.object(Dispatcher, "require_review_candidate", autospec=True, side_effect=record)
 
 
 class WholeRunRedoCandidateTests(RepoCase):
@@ -123,18 +134,19 @@ class WholeRunRedoCandidateTests(RepoCase):
         backend = final_backend(invalid=(4,))
         engine, on_a = self.invalid_on_a_then_b(backend)
         hello = engine.worktree / "hello.py"
-        original, seen = Dispatcher.redo_basis, []
+        original, seen = Dispatcher.redo_basis, {}
 
         def derived_on_a(service, key):
-            if key != FINAL_KEY or seen:
+            if key != FINAL_KEY or "agent_dispatches" in seen:
                 return original(service, key)
-            seen.append(service.context.run["agent_dispatches"])
+            seen["agent_dispatches"] = service.context.run["agent_dispatches"]
             os.chmod(hello, 0o644)
             try:
                 return original(service, key)
             finally:
                 os.chmod(hello, 0o664)
         with patch.object(Dispatcher, "redo_basis", autospec=True, side_effect=derived_on_a), \
+                observe_review_binding(seen), \
                 self.assertRaises(HarnessError) as caught:
             self.engine(backend).resume(engine.run["id"])
         self.assertEqual((caught.exception.stop["kind"], caught.exception.stop["reason"]),
@@ -145,9 +157,12 @@ class WholeRunRedoCandidateTests(RepoCase):
         refused = final_entries(saved)[-1]
         self.assertEqual((refused["invoked"], refused["status"]), (False, "failed"))
         self.assertNotIn("retry_of", refused)
-        self.assertEqual(refused["snapshot_digest"], saved["final_history"][-1]["snapshot_digest"])
-        self.assertNotEqual(refused["snapshot_digest"], on_a["snapshot_digest"])
-        self.assertEqual(saved["agent_dispatches"], seen[0])
+        self.assertNotIn("snapshot_digest", refused)
+        self.assertEqual(refused["id"], seen["checked_dispatch_id"])
+        self.assertEqual(seen["checked_digest"], saved["final_history"][-1]["snapshot_digest"])
+        self.assertNotEqual(seen["checked_digest"], on_a["snapshot_digest"])
+        self.assertEqual(saved["agent_dispatches"], seen["agent_dispatches"])
+        self.assertEqual(final_entries(saved)[-2], on_a)
         self.assertNotIn(FINAL_KEY, saved["review_receipts"])
         # Resumed on B, the review is a new request and the run completes.
         result = self.engine(backend).resume(engine.run["id"])
@@ -168,8 +183,11 @@ class FirstDispatchCandidateTests(RepoCase):
         refused = saved["dispatches"][-1]
         self.assertEqual((refused["role"], refused["kind"], refused["invoked"], refused["status"]),
                          ("reviewer", kind, False, "failed"))
+        self.assertNotIn("snapshot_digest", refused)
+        self.assertNotIn("retry_of", refused)
+        self.assertEqual(refused["id"], seen["checked_dispatch_id"])
         self.assertEqual(saved["agent_dispatches"], seen["agent_dispatches"])
-        return saved, refused
+        return saved
 
     def test_a_task_review_bound_to_another_candidate_is_never_called(self):
         backend = ScriptedBackend()
@@ -177,13 +195,13 @@ class FirstDispatchCandidateTests(RepoCase):
         patcher, seen = changing_before_binding(
             lambda hello: hello.write_text(hello.read_text(encoding="utf-8") + "# changed\n", encoding="utf-8"),
             "reviewer", "review")
-        with patcher, self.assertRaises(HarnessError) as caught:
+        with patcher, observe_review_binding(seen), self.assertRaises(HarnessError) as caught:
             engine.start("Implement greet", plan())
         self.assertEqual((caught.exception.stop["kind"], caught.exception.stop["reason"]),
                          ("workspace_mismatch", "candidate_changed"))
-        saved, refused = self.assert_refused(engine, backend, "review", "reviewer:review:greet", seen)
+        saved = self.assert_refused(engine, backend, "review", "reviewer:review:greet", seen)
         self.assertEqual(saved["pending_task"]["stage"], "reviewing")
-        self.assertNotEqual(refused["snapshot_digest"], saved["pending_task"]["snapshot_digest"])
+        self.assertNotEqual(seen["checked_digest"], saved["pending_task"]["snapshot_digest"])
         self.assertEqual(saved["review_history"].get("greet", []), [])
         # resume finds the changed candidate, invalidates the stage and starts a fresh worker.
         result = self.engine(backend).resume(engine.run["id"])
@@ -195,14 +213,14 @@ class FirstDispatchCandidateTests(RepoCase):
         backend = ScriptedBackend()
         engine = self.engine(backend)
         patcher, seen = changing_before_binding(lambda hello: os.chmod(hello, 0o664), "reviewer", "final_review")
-        with patcher, self.assertRaises(HarnessError) as caught:
+        with patcher, observe_review_binding(seen), self.assertRaises(HarnessError) as caught:
             engine.start("Implement greet", plan())
         self.assertEqual((caught.exception.stop["kind"], caught.exception.stop["reason"]),
                          ("workspace_mismatch", "candidate_changed"))
-        saved, refused = self.assert_refused(engine, backend, "final_review", FINAL_KEY, seen)
+        saved = self.assert_refused(engine, backend, "final_review", FINAL_KEY, seen)
         attempt = saved["final_history"][-1]
         self.assertEqual((attempt["status"], attempt["phase"]), ("running", "reviewing"))
-        self.assertNotEqual(refused["snapshot_digest"], attempt["snapshot_digest"])
+        self.assertNotEqual(seen["checked_digest"], attempt["snapshot_digest"])
         # Back on the attempt's candidate, the same attempt dispatches its batch and the run completes.
         os.chmod(engine.worktree / "hello.py", 0o644)
         result = self.engine(backend).resume(engine.run["id"])
@@ -225,7 +243,7 @@ class RedoJudgedOnAnotherCandidateTests(RepoCase):
         original, seen = Dispatcher.redo_basis, {}
 
         def visit_b(service, call_key):
-            if call_key != key or seen or not calls(backend, kind=kind):
+            if call_key != key or "invalid" in seen or not calls(backend, kind=kind):
                 return original(service, call_key)
             run = service.context.run
             seen.update(agent_dispatches=run["agent_dispatches"], dispatches=len(run["dispatches"]),
@@ -238,6 +256,7 @@ class RedoJudgedOnAnotherCandidateTests(RepoCase):
             finally:
                 os.chmod(hello, mode)
         with patch.object(Dispatcher, "redo_basis", autospec=True, side_effect=visit_b), \
+                observe_review_binding(seen), \
                 self.assertRaises(HarnessError) as caught:
             engine.start("Implement greet", plan())
         self.assertEqual((caught.exception.stop["kind"], caught.exception.stop["reason"]),
@@ -252,13 +271,15 @@ class RedoJudgedOnAnotherCandidateTests(RepoCase):
         self.assertEqual((refused["role"], refused["kind"], refused["invoked"], refused["status"]),
                          ("reviewer", kind, False, "failed"))
         self.assertNotIn("retry_of", refused)
-        # Bound to A, the candidate of the invalid output it was not judged a redo of.
-        self.assertEqual(refused["snapshot_digest"], invalid["snapshot_digest"])
+        self.assertNotIn("snapshot_digest", refused)
+        self.assertEqual(refused["id"], seen["checked_dispatch_id"])
+        # The gate checked A, where the previous review actually returned invalid output.
+        self.assertEqual(seen["checked_digest"], invalid["snapshot_digest"])
+        self.assertEqual(saved["dispatches"][-2], invalid)
         self.assertEqual(saved["agent_dispatches"], seen["agent_dispatches"])
         return engine, backend, invalid
 
-    def resumed_as_the_redo(self, kind, key):
-        engine, backend, invalid = self.judged_on_b(kind, key)
+    def assert_resumes_as_the_redo(self, engine, backend, invalid, kind):
         # Still on A: the call is the one redo of A's invalid output, and a second invalid output ends it.
         with self.assertRaises(HarnessError) as caught:
             self.engine(backend).resume(engine.run["id"])
@@ -268,19 +289,27 @@ class RedoJudgedOnAnotherCandidateTests(RepoCase):
                    if (entry.get("role"), entry.get("kind")) == ("reviewer", kind) and entry["invoked"]]
         self.assertEqual([entry.get("retry_of") for entry in entries], [None, invalid["id"]])
         self.assertEqual([entry["status"] for entry in entries], ["invalid", "invalid"])
+        self.assertEqual(entries[1]["snapshot_digest"], invalid["snapshot_digest"])
         reviews = calls(backend, kind=kind)
         self.assertEqual(len(reviews), 2)
-        self.assertEqual(reviews[1]["packet"]["previous_invalid"]["dispatch_id"], invalid["id"])
+        previous = reviews[1]["packet"]["previous_invalid"]
+        self.assertEqual(previous["dispatch_id"], invalid["id"])
+        for field in ("artifact", "artifact_digest"):
+            self.assertEqual(previous[field], invalid["invalid_output"][field])
 
     def test_a_task_review_judged_on_another_candidate_is_redone_on_its_own(self):
-        self.resumed_as_the_redo("review", "reviewer:review:greet")
+        engine, backend, invalid = self.judged_on_b("review", "reviewer:review:greet")
+        self.assert_resumes_as_the_redo(engine, backend, invalid, "review")
 
     def test_a_whole_run_review_judged_on_another_candidate_is_redone_on_its_own(self):
-        self.resumed_as_the_redo("final_review", FINAL_KEY)
+        engine, backend, invalid = self.judged_on_b("final_review", FINAL_KEY)
+        self.assert_resumes_as_the_redo(engine, backend, invalid, "final_review")
 
     def test_a_damaged_invalid_original_still_stops_the_redo_before_the_call(self):
         engine, backend, invalid = self.judged_on_b("review", "reviewer:review:greet")
-        Path(invalid["invalid_output"]["artifact"]).write_text("{}", encoding="utf-8")
+        artifact = Path(invalid["invalid_output"]["artifact"])
+        original = artifact.read_bytes()
+        artifact.write_bytes(b"{}")
         before = state(engine)
         with self.assertRaises(HarnessError) as caught:
             self.engine(backend).resume(engine.run["id"])
@@ -290,7 +319,12 @@ class RedoJudgedOnAnotherCandidateTests(RepoCase):
         self.assertEqual(len(calls(backend, kind="review")), 1)
         self.assertEqual(saved["agent_dispatches"], before["agent_dispatches"])
         self.assertNotIn("reviewer:review:greet", saved["review_receipts"])
+        self.assertEqual(saved["dispatches"][:len(before["dispatches"])], before["dispatches"])
         # Refused while the redo was prepared (the original is read by its digest), not at load.
         self.assertEqual([(entry["role"], entry["kind"], entry["invoked"], entry["status"])
                           for entry in saved["dispatches"][len(before["dispatches"]):]],
                          [("reviewer", "review", False, "failed")])
+        self.assertNotIn("snapshot_digest", saved["dispatches"][-1])
+        self.assertNotIn("retry_of", saved["dispatches"][-1])
+        artifact.write_bytes(original)
+        self.assert_resumes_as_the_redo(engine, backend, invalid, "review")

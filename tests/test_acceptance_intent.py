@@ -475,7 +475,7 @@ class AcceptanceIntentTests(RepoCase):
                 (kwargs["cwd"] / "usage.txt").write_text("Use greet(name).\n")
 
         engine = self.engine(ScriptedBackend(write_document))
-        run = subprocess.run
+        spawn = subprocess.Popen
         launch = git._launch
         writes = []
         pathspec_adds = []
@@ -513,6 +513,8 @@ os.execvp(argv[0], argv)
             return launch(argv, env, effect=effect, **kwargs)
 
         def invoke(argv, **kwargs):
+            if argv[0] != "git":
+                return spawn(argv, **kwargs)
             fds = kwargs.get("pass_fds", ())
             publish = "--no-deref" in argv and "update-ref" in argv
             sync = "--reset" in argv and "read-tree" in argv
@@ -521,13 +523,13 @@ os.execvp(argv[0], argv)
                 self.assertIsNotNone(lock_fd)
                 self.assertEqual(fds, (lock_fd,))
                 writes.append("ref" if publish else "index")
-                return run([sys.executable, "-c", child_check, str(lock_fd), str(engine.directory / "run.lock"),
+                return spawn([sys.executable, "-c", child_check, str(lock_fd), str(engine.directory / "run.lock"),
                             *argv], **kwargs)
             self.assertEqual(fds, ())
-            return run(argv, **kwargs)
+            return spawn(argv, **kwargs)
 
         with patch.object(git, "build_commit", wraps=git.build_commit) as build, \
-                patch.object(git, "_launch", observe), patch.object(git.subprocess, "run", invoke):
+                patch.object(git, "_launch", observe), patch.object(git.subprocess, "Popen", invoke):
             result = engine.start("Implement and document greet", plan)
         self.assertEqual(result["status"], "completed")
         self.assertEqual(build.call_count, len(result["accepted"]))

@@ -6,7 +6,7 @@ import tempfile
 from types import SimpleNamespace
 import unittest
 
-from harness.continuation import (continuation_gate, packet, record_continuation,
+from harness.continuation import (apply_continuation, continuation_gate, packet, prepare_continuation,
                                   record_execution_guidance, resolve_continuation)
 from harness.recovery import snapshot_digest
 from harness.util import HarnessError, write_json
@@ -20,7 +20,7 @@ class ContinuationTests(unittest.TestCase):
         self.root = Path(temporary.name).resolve()
         self.candidate = {'head': 'head', 'index': 'index', 'files': {'code': 'candidate'}}
         self.saved = []
-        self.context = SimpleNamespace(directory=self.root / 'run', state=self.root / '.harness',
+        self.context = SimpleNamespace(directory=self.root / '.harness' / 'runs' / 'run', state=self.root / '.harness',
             run={'id': 'run', 'tasks': [{'id': 'task'}], 'accepted': {}, 'dispatches': [],
                  'current_task': 'task', 'status': 'blocked', 'attempts': {'task': 1}, 'rounds': 3},
             config={'runtime': {'agent_timeout_seconds': 30}, 'permissions': {'worker_commands': []},
@@ -31,14 +31,41 @@ class ContinuationTests(unittest.TestCase):
             continuation_request={'kind': 'commands', 'commands': [{'cwd': '.', 'argv': ['python3', 'focused.py']}],
                                   'minimum_timeout_seconds': 0, 'reason': 'focused regression'})
 
-    def record(self, dispatch='worker1'):
+    def bind(self, dispatch='worker1'):
         self.result['dispatch_id'] = dispatch
         path = self.context.directory / 'dispatches' / dispatch / 'returned-result.json'
         write_json(path, self.result)
         self.source = {'dispatch_id': dispatch, 'artifact': str(path),
                        'artifact_digest': hashlib.sha256(path.read_bytes()).hexdigest()}
         add_worker_dispatch(self.context.run, self.context.directory, dispatch, 'task')
-        return record_continuation(self.context, 'task', self.result, self.source, self.candidate)
+
+    def record(self, dispatch='worker1'):
+        self.bind(dispatch)
+        prepared = prepare_continuation(self.context, 'task', self.result, self.source, self.candidate)
+        row = apply_continuation(self.context, prepared)
+        self.context.save()
+        return row
+
+    def test_prepared_artifact_is_reused_when_handoff_replays_before_registration(self):
+        self.bind()
+        args = self.context, 'task', self.result, self.source, self.candidate
+        before = deepcopy(self.context.run)
+        prepare_continuation(*args)
+        self.assertEqual(self.context.run, before)
+        self.assertEqual(self.saved, [])
+        artifact, = (self.context.directory / 'continuations').glob('*.json')
+        identity = artifact.stat().st_ino
+        original = artifact.read_bytes()
+
+        row = apply_continuation(self.context, prepare_continuation(*args))
+        self.assertEqual((artifact.stat().st_ino, artifact.read_bytes()), (identity, original))
+        self.assertEqual(self.context.run['continuation_history'], [row])
+        self.assertEqual(self.context.run['pending_continuation'], row['id'])
+        self.assertEqual(self.saved, [])
+        replay = prepare_continuation(*args)
+        self.assertEqual(replay[0], {})
+        self.assertEqual(apply_continuation(self.context, replay), row)
+        self.assertEqual(self.saved, [])
 
     def test_exact_grant_gate_preserves_candidate_and_cumulative_budgets(self):
         self.record()
@@ -153,7 +180,7 @@ class ContinuationTests(unittest.TestCase):
         other.write_bytes(source.read_bytes())
         source.unlink()
         source.symlink_to(other)
-        with self.assertRaisesRegex(HarnessError, 'non-symlink'):
+        with self.assertRaisesRegex(HarnessError, 'symlink'):
             continuation_gate(self.context)
 
     def test_guidance_does_not_trust_unbound_original_bytes(self):

@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from harness import progress
 from harness.util import HarnessError, write_json
 from test_progress_checkpoints import Runtime, sha
 from test_harness import add_worker_dispatch
@@ -66,6 +67,29 @@ class CheckpointBatchTests(unittest.TestCase):
         self.rt.context.run['task_checkpoints'] = []
         with self.assertRaisesRegex(HarnessError, 'incomplete'):
             self.rt.progress_packet({})
+
+    def test_resolution_digest_failure_leaves_no_registration_and_is_replayable(self):
+        result, source = self.bind([self.item])
+        digest = progress._digest
+
+        def fail_on_resolution(raw):
+            if b'"discarded":' in raw:
+                raise RuntimeError('resolution digest failed')
+            return digest(raw)
+
+        with patch.object(progress, '_digest', fail_on_resolution):
+            with self.assertRaisesRegex(RuntimeError, 'resolution digest failed'):
+                self.record(result, source)
+        self.assertEqual(self.rt.context.run['task_checkpoints'], [])
+        self.assertEqual(self.rt.context.run['checkpoint_batches'], [])
+        self.assertEqual(self.rt.events, [])
+        self.assertEqual(self.rt.saved, 0)
+
+        (self.rt.context.worktree / 'out').unlink()
+        self.assertEqual(self.record(result, source), [])
+        self.assertEqual(len(self.rt.context.run['task_checkpoints']), 1)
+        self.assertEqual(len(self.rt.context.run['checkpoint_batches']), 1)
+        self.assertEqual(self.rt.saved, 1)
 
     def test_resolution_tampering_and_duplicate_batch_fail_closed(self):
         result, source = self.bind([self.item])

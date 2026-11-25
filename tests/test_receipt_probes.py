@@ -2,6 +2,7 @@
 from contextlib import nullcontext
 from copy import deepcopy
 import errno
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -94,7 +95,7 @@ class ReceiptProbeTests(unittest.TestCase):
                         self.run["review_receipts"]["reviewer:final_review:final"] = self.receipt
                         self.run["review_receipts"]["reviewer:review:greet"] = self.receipt
                         before = deepcopy(self.run)
-                        for gate in (dispatch, discard, self.services.planning.decide_returned,
+                        for gate in (dispatch, discard, self.services.planning.land_returned_ask,
                                      self.services.finalization.leave_attempt, review):
                             with self.subTest(gate=gate):
                                 self.assert_stop(gate, "runtime_failure" if case == "io" else "evidence",
@@ -109,17 +110,63 @@ class ReceiptProbeTests(unittest.TestCase):
 
     def test_missing_leaf_is_read_only_for_decide_and_allows_discard_after_exit_check(self):
         before = deepcopy(self.run)
-        self.assertFalse(self.services.planning.decide_returned())
+        self.assertEqual(self.services.receipts.settlement("commander:decide:run").kind, "unreturned")
         self.assertEqual(self.run, before)
         self.context.save.assert_not_called()
         self.artifact.write_text("{}")
-        self.assertTrue(self.services.planning.decide_returned())
+        self.assertEqual(self.services.receipts.settlement("commander:decide:run").kind, "returned")
         self.artifact.unlink()
         self.services.receipts.discard_unreturned("commander:decide:run")
         self.context.ensure_exited.assert_called_once()
         self.context.save.assert_called_once()
         self.assertEqual(self.run["commander_receipts"], {})
         self.assertEqual(self.run["agent_dispatches"], before["agent_dispatches"])
+
+    def test_returned_ask_read_failure_is_optional_until_the_receipt_is_landed(self):
+        receipts = self.services.receipts
+        key = "commander:decide:run"
+        self.artifact.write_text(json.dumps({"action": "ask", "task_id": "run", "dispatch_id": "dispatch"}))
+        self.assertTrue(receipts.returned_ask(key))
+        failed = state_files.Outcome("failed", str(self.artifact),
+                                     state_files.Step(4, self.artifact.name, "read", True), errno=errno.EIO)
+        before = deepcopy(self.run)
+        with patch.object(state_files.StateFiles, "read", return_value=failed) as read:
+            self.assertFalse(receipts.returned_ask(key))
+        read.assert_called_once_with(("returned-result.json",), limit=None)
+        self.assertEqual(self.run, before)
+        self.context.save.assert_not_called()
+        self.send.assert_not_called()
+
+    def test_verified_terminal_process_read_failure_keeps_the_bound_receipt(self):
+        outcome = {"started": True, "termination_reason": "normal", "exit_code": 0}
+        self.entry["process_outcome"] = outcome
+        sources = {"source_digest": ("process.stdout", b"terminal source"),
+                   "outcome_digest": ("process.outcome.json", json.dumps(outcome).encode()),
+                   "result_digest": ("returned-result.json", b"{}")}
+        capture = {"version": 1, "provider": "claude", "source": "process.stdout"}
+        for field, (name, raw) in sources.items():
+            (self.job / name).write_bytes(raw)
+            capture[field] = hashlib.sha256(raw).hexdigest()
+        self.marker.write_text(json.dumps(capture))
+        before = deepcopy(self.run)
+        leaf = self.job / "process.outcome.json"
+        failed = state_files.Outcome("failed", str(leaf),
+                                     state_files.Step(4, leaf.name, "read", True), errno=errno.EIO)
+        original = state_files.StateFiles.read
+
+        def fail_process(files, components, **kwargs):
+            if components == (leaf.name,):
+                return failed
+            return original(files, components, **kwargs)
+
+        receipts = self.services.receipts
+        with patch.object(state_files.StateFiles, "read", fail_process):
+            self.assert_stop(lambda: receipts.validate_terminal_capture(self.receipt), "runtime_failure", "io")
+        self.assertEqual(self.run, before)
+        self.context.save.assert_not_called()
+        receipts.validate_terminal_capture(self.receipt)
+        self.assertEqual(self.receipt["terminal_capture_digest"], hashlib.sha256(self.marker.read_bytes()).hexdigest())
+        self.context.save.assert_called_once()
 
     def test_marker_probe_order_preserves_receipt_and_avoids_capture_on_io_failure(self):
         receipts = self.services.receipts

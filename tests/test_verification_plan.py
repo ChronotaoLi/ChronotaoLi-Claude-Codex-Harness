@@ -1,16 +1,21 @@
+import errno
 import hashlib
 import json
+import os
 import tempfile
 import unittest
 from copy import deepcopy
 from types import SimpleNamespace
 from pathlib import Path
+from unittest.mock import patch
 
 from harness.command_server import create_manifest
 from harness.commands import granted
 from harness.config import Config
 from harness.input_projection import project_commands
 from harness.packets import PacketBuilder
+from harness.state_files import StateFiles, StateReadError
+from harness.util import EvidenceError
 from harness.verification_plan import build_verification_plan, candidate_preflight, finding_progress, recent_costs, verification_role_view
 
 
@@ -249,6 +254,35 @@ class VerificationPlanTests(unittest.TestCase):
                 if reason:
                     self.assertEqual([(f["code"], f["reason"]) for f in report["failures"]],
                                      [("evidence_invalid", reason)])
+
+    def test_worker_source_read_error_distinguishes_direct_and_registered_preflight(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            task, worker, args = self.fixture(root)
+            artifact = args["worker_artifact"]
+            files = StateFiles(root).under(artifact.name)
+            open_file = os.open
+            failures = []
+
+            def fail_source(name, flags, *values, **kwargs):
+                if name == artifact.name and kwargs.get("dir_fd") is not None:
+                    failures.append(name)
+                    raise OSError(errno.EIO, os.strerror(errno.EIO))
+                return open_file(name, flags, *values, **kwargs)
+
+            with patch.object(os, "open", fail_source):
+                report = candidate_preflight(task, worker, **args)
+                self.assertFalse(report["passed"])
+                self.assertEqual([item["code"] for item in report["failures"]], ["worker_source_invalid"])
+                with self.assertRaises(StateReadError) as failed:
+                    candidate_preflight(task, worker, worker_files=files, **args)
+            self.assertEqual(failures, [artifact.name, artifact.name])
+            self.assertEqual(failed.exception.stop["reason"], "io")
+            report = candidate_preflight(task, {**worker, "summary": "other"}, worker_files=files, **args)
+            self.assertEqual([item["code"] for item in report["failures"]], ["worker_source_invalid"])
+            artifact.write_text("{}")
+            with self.assertRaises(EvidenceError):
+                candidate_preflight(task, worker, worker_files=files, **args)
 
     def test_no_requirements_needs_no_evidence_declaration(self):
         with tempfile.TemporaryDirectory() as directory:

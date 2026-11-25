@@ -9,7 +9,9 @@ import unittest
 from unittest.mock import patch
 
 import harness.finalization as finalization
+import harness.packets as packets
 from harness import git
+from harness.state_files import StateFiles
 from harness.finalization import FinalAcceptance
 from harness.receipts import ResultReceipts
 from harness.review_progress import repair_findings, required_findings
@@ -457,26 +459,43 @@ class RunLevelPacketTests(RepoCase):
                         row.update(status="open", evidence=["still wrong"])
         backend = ScriptedBackend(change)
         engine = self.engine(backend)
-        original = FinalAcceptance.final_review
+        original = packets.verify_history
         before = []
 
-        def files():
-            indexes = engine.directory / "finding-progress" / "indexes"
-            return sorted(path.name for path in indexes.glob("*")) if indexes.exists() else []
+        def indexes():
+            return {path: path.read_bytes() for folder in ("finding-progress/indexes", "input-indexes")
+                    for path in (engine.directory / folder).glob("*.json")}
 
-        def tamper_then_review(service, **kwargs):
-            if not before:
-                before.append(files())
-                service.context.run["review_history"]["greet"][1]["required_findings"][0]["label"] = "rebound"
-            return original(service, **kwargs)
-        with patch.object(FinalAcceptance, "final_review", autospec=True, side_effect=tamper_then_review), \
-                self.assertRaises(HarnessError):
+        def verify_bad_copy(run, task_id, *, files, whole_run=False):
+            if (task_id == "greet" and not whole_run and run["final_history"]
+                    and run["final_history"][-1]["phase"] == "reviewing"):
+                self.assertEqual(sorted(run["accepted"]), ["greet"])
+                self.assertFalse(before)
+                history = run["review_history"]["greet"]
+                before.append((copy.deepcopy(history), indexes()))
+                # Give the real packet gate a bad saved mapping without editing the live ledger.
+                run = copy.deepcopy(run)
+                row = run["review_history"]["greet"][1]["required_findings"][0]
+                self.assertEqual(row["label"], "r1-0")
+                row["label"] = "rebound"
+            return original(run, task_id, files=files, whole_run=whole_run)
+
+        with patch.object(packets, "verify_history", side_effect=verify_bad_copy), \
+                self.assertRaises(EvidenceError) as caught:
             engine.start("Implement greet", plan())
+
         saved = state(engine)
-        self.assertEqual(sorted(saved["accepted"]), ["greet"])
+        self.assertEqual((caught.exception.stop["kind"], caught.exception.stop["reason"]),
+                         ("evidence", "runtime_integrity"))
         self.assertEqual(stop_of(saved), ("evidence", "runtime_integrity"))
+        self.assertEqual(sorted(saved["accepted"]), ["greet"])
+        self.assertEqual(len(before), 1)
+        history, saved_indexes = before[0]
+        self.assertEqual(saved["review_history"]["greet"], history)
+        self.assertEqual(engine.run["review_history"]["greet"], history)
         self.assertEqual(calls(backend, kind="final_review"), [])
-        self.assertEqual(files(), before[0])
+        self.assertFalse(any(item.get("kind") == "final_review" for item in saved["dispatches"]))
+        self.assertEqual(indexes(), saved_indexes)
 
 
 class DamagedHistoryTests(unittest.TestCase):
@@ -493,11 +512,11 @@ class DamagedHistoryTests(unittest.TestCase):
             with self.subTest(value=value), TemporaryDirectory() as tmp:
                 run, record = self.history(tmp)
                 record("R1", dict(verdict="request_changes", findings=[finding()]))
-                rows = required_findings(run, "t", "candidate")
+                rows = required_findings(run, "t", "candidate", files=StateFiles(Path(tmp).resolve()).under("runs", run["id"]))
                 record("R2", dict(verdict="request_changes", findings=[], finding_dispositions={"f1": value}),
                        required_findings=rows)
-                self.assert_evidence_stop(lambda: required_findings(run, "t", "candidate"))
-                self.assert_evidence_stop(lambda: repair_findings(run, "t"))
+                self.assert_evidence_stop(lambda: required_findings(run, "t", "candidate", files=StateFiles(Path(tmp).resolve()).under("runs", run["id"])))
+                self.assert_evidence_stop(lambda: repair_findings(run, "t", files=StateFiles(Path(tmp).resolve()).under("runs", run["id"])))
 
     def test_a_history_record_that_is_not_an_object_is_an_evidence_stop(self):
         for damaged in ([], None, "record"):
@@ -505,13 +524,13 @@ class DamagedHistoryTests(unittest.TestCase):
                 run, record = self.history(tmp)
                 record("R1", dict(verdict="request_changes", findings=[finding()]))
                 run["review_history"]["t"].insert(0, damaged)
-                self.assert_evidence_stop(lambda: required_findings(run, "t", "candidate"))
-                self.assert_evidence_stop(lambda: repair_findings(run, "t"))
+                self.assert_evidence_stop(lambda: required_findings(run, "t", "candidate", files=StateFiles(Path(tmp).resolve()).under("runs", run["id"])))
+                self.assert_evidence_stop(lambda: repair_findings(run, "t", files=StateFiles(Path(tmp).resolve()).under("runs", run["id"])))
             with self.subTest(damaged=damaged, history="final"), TemporaryDirectory() as tmp:
                 run, attempt = final_history_fixture(tmp)
                 attempt("R1", dict(verdict="request_changes", findings=[finding()], summary="s"), "S0", "rejected")
                 run["final_history"].append(damaged)
-                self.assert_evidence_stop(lambda: required_findings(run, "final", "S0", whole_run=True))
+                self.assert_evidence_stop(lambda: required_findings(run, "final", "S0", files=StateFiles(Path(tmp).resolve()).under("runs", run["id"]), whole_run=True))
 
     def test_whether_a_record_may_lack_a_review_is_decided_by_its_state(self):
         """A state whose writer leaves no review is skipped; any other record without one is damaged evidence."""
@@ -538,12 +557,12 @@ class DamagedHistoryTests(unittest.TestCase):
                     run, attempt = final_history_fixture(tmp)
                     attempt("R1", rejection, "S0", "rejected")
                     run["final_history"].append(dict(attempt=2, head="h", snapshot_digest="A", approved_batches=[], **fields))
-                    reads = [lambda: required_findings(run, "final", "A", whole_run=True)]
+                    reads = [lambda: required_findings(run, "final", "A", files=StateFiles(Path(tmp).resolve()).under("runs", run["id"]), whole_run=True)]
                 else:
                     run, record = self.history(tmp)
                     record("R1", rejection)
                     run["review_history"]["t"].append(dict(snapshot_digest="candidate", **fields))
-                    reads = [lambda: required_findings(run, "t", "candidate"), lambda: repair_findings(run, "t")]
+                    reads = [lambda: required_findings(run, "t", "candidate", files=StateFiles(Path(tmp).resolve()).under("runs", run["id"])), lambda: repair_findings(run, "t", files=StateFiles(Path(tmp).resolve()).under("runs", run["id"]))]
                 for read in reads:
                     if legal:
                         self.assertEqual([row["label"] for row in read()], ["X"])
@@ -566,12 +585,12 @@ class DamagedHistoryTests(unittest.TestCase):
                 run, attempt = final_history_fixture(tmp)
                 attempt("R1", dict(verdict="request_changes", findings=[{**finding(), "id": "X"}], summary="s"),
                         "S0", "rejected")
-                rows = required_findings(run, "final", "A", whole_run=True)
+                rows = required_findings(run, "final", "A", files=StateFiles(Path(tmp).resolve()).under("runs", run["id"]), whole_run=True)
                 attempt("R2", review, "A", "approved", rows)
                 if name == "holds":
-                    self.assertEqual(required_findings(run, "final", "A", whole_run=True), [])
+                    self.assertEqual(required_findings(run, "final", "A", files=StateFiles(Path(tmp).resolve()).under("runs", run["id"]), whole_run=True), [])
                     continue
-                error = self.assert_evidence_stop(lambda: required_findings(run, "final", "A", whole_run=True))
+                error = self.assert_evidence_stop(lambda: required_findings(run, "final", "A", files=StateFiles(Path(tmp).resolve()).under("runs", run["id"]), whole_run=True))
                 self.assertIn("批准条目不满足批准契约", str(error))
 
 

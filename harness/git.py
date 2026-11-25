@@ -7,18 +7,21 @@ import json
 import os
 import re
 import shutil
+import signal
 import stat
 import subprocess
+import sys
 import tempfile
 import threading
 import time
 from collections import Counter
+from contextlib import nullcontext, suppress
 from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import NamedTuple
 
-from . import stops
-from .util import DIRECTORY_FLAGS, HarnessError, fold_name, with_descriptors, write_json
+from . import interrupts, stops
+from .util import DIRECTORY_FLAGS, HarnessError, fold_name, one_line, with_descriptors, write_json
 
 
 PROTECTED_ROOTS = frozenset((".git", ".harness", ".codex", ".claude"))
@@ -299,25 +302,108 @@ def _configured_hooks(repo, prefix, env, args, deadline):
     return names
 
 
+def _signal_git_group(process, signum):
+    # A reaped leader can no longer establish ownership of this numeric group.
+    if process.poll() is None:
+        with suppress(ProcessLookupError):
+            os.killpg(process.pid, signum)
+
+
+def _abort_git(process, primary):
+    try:
+        if isinstance(primary, KeyboardInterrupt):
+            _signal_git_group(process, signal.SIGTERM)
+            grace = time.monotonic() + 1
+            while process.poll() is None and not interrupts.hurry():
+                remaining = grace - time.monotonic()
+                if remaining <= 0:
+                    break
+                time.sleep(min(0.01, remaining))
+        _signal_git_group(process, signal.SIGKILL)
+    except OSError as error:
+        with suppress(Exception):
+            print(f"[harness] Git 进程组清理失败，PID {process.pid}：{one_line(error)}",
+                  file=sys.stderr, flush=True)
+    try:
+        process.wait(timeout=5)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        with suppress(Exception):
+            print(f"[harness] 无法回收 Git 子进程，PID {process.pid}：{one_line(error)}",
+                  file=sys.stderr, flush=True)
+
+
 def _launch(argv, env, *, effect, input, deadline, pass_fds=()):
-    """The only place Harness starts a Git process; it gets what is left of the call's deadline."""
+    """Start and supervise Git within the shared call deadline."""
+    interrupts.require_outside_publication("git._launch")
+    interrupts.check_wait("git._launch")
+    from .process_runtime import defer_cleanup_signals
+
     remaining = deadline - time.monotonic()
     if remaining <= 0:
         raise subprocess.TimeoutExpired(argv, 0)
+    budget = remaining
     temporary_fds = []
     inherited_fds = []
+    process = input_file = None
+    # A writer outside the controller defers terminal signals until its result
+    # has been collected. Managed signals already wait for a delivery point.
+    writable = effect is None or not effect.interruptible
+    waiting = defer_cleanup_signals(inherit=False) if writable else nullcontext()
+    startup = nullcontext() if writable else defer_cleanup_signals(inherit=False)
     try:
-        for fd in pass_fds:
-            if fd in (0, 1, 2):
-                # Redirection replaces these slots in the child. Preserve the same open file description.
-                fd = fcntl.fcntl(fd, fcntl.F_DUPFD_CLOEXEC, 3)
-                temporary_fds.append(fd)
-            inherited_fds.append(fd)
-        return subprocess.run(argv, env=env, capture_output=True, timeout=remaining, input=input,
-                              stdin=subprocess.DEVNULL if input is None else None, pass_fds=tuple(inherited_fds))
+        with waiting:
+            with startup:
+                for fd in pass_fds:
+                    if fd in (0, 1, 2):
+                        # Redirection replaces these slots in the child. Preserve the same open file description.
+                        fd = fcntl.fcntl(fd, fcntl.F_DUPFD_CLOEXEC, 3)
+                        temporary_fds.append(fd)
+                    inherited_fds.append(fd)
+                if input is not None:
+                    input_file = tempfile.TemporaryFile()
+                    input_file.write(input)
+                    input_file.seek(0)
+                if deadline <= time.monotonic():
+                    raise subprocess.TimeoutExpired(argv, 0)
+                process = subprocess.Popen(
+                    argv, env=env, stdin=subprocess.DEVNULL if input_file is None else input_file,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
+                    pass_fds=tuple(inherited_fds),
+                )
+            leader_exited = False
+            while True:
+                remaining = max(0, deadline - time.monotonic())
+                try:
+                    out, err = process.communicate(timeout=min(0.1, remaining))
+                except subprocess.TimeoutExpired as partial:
+                    if time.monotonic() >= deadline:
+                        raise subprocess.TimeoutExpired(argv, budget, partial.output, partial.stderr) from None
+                    if not leader_exited and process.poll() is not None:
+                        # Give normal exit output another slice to drain before
+                        # delivering. Descendants may still hold the pipes open.
+                        leader_exited = True
+                        continue
+                    if interrupts.abortable(effect):
+                        interrupts.deliver()
+                else:
+                    return subprocess.CompletedProcess(argv, process.returncode, out, err)
+    except BaseException as primary:
+        if process is not None:
+            with defer_cleanup_signals(primary=primary, inherit=False):
+                _abort_git(process, primary)
+        raise
     finally:
-        for fd in temporary_fds:
-            os.close(fd)
+        with defer_cleanup_signals():
+            if process is not None:
+                for pipe in (process.stdout, process.stderr):
+                    with suppress(OSError):
+                        pipe.close()
+            if input_file is not None:
+                with suppress(OSError):
+                    input_file.close()
+            for fd in temporary_fds:
+                with suppress(OSError):
+                    os.close(fd)
 
 
 class GitLaunchError(HarnessError):
@@ -994,9 +1080,12 @@ def read_worktree(repo: Path, *, binding=None):
         # Bound, the binding is checked on the very descriptor the walk starts from; unbound, the root opens by path.
         root = (_open_snapshot_root(held, repo, binding) if binding is not None
                 else held.open(repo, _SEARCH | os.O_DIRECTORY | os.O_CLOEXEC))
-        for name, parent, leaf in _parents(held, root, sorted(set(names) - {""})):
+        entries = _parents(held, root, sorted(set(names) - {""}))
+        for count, (name, parent, leaf) in enumerate(entries, 1):
             mode, data = ("deleted", b"") if parent is None else _entry(held, parent, leaf, name)
             result["files"][name] = mode + ":" + hashlib.sha256(data).hexdigest()
+            if count % 64 == 0:
+                interrupts.deliver()
     with_descriptors(read)
     return result, index
 

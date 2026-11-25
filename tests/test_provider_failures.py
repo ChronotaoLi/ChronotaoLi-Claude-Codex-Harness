@@ -33,7 +33,7 @@ from harness.provider_failures import classify, stop_facts
 from harness.run_store import RunStore
 from harness.runtime import Runtime
 from harness.task_lifecycle import TaskLifecycle
-from harness.util import HarnessError, ProcessTimeout, json_bytes, read_json, tail_text, write_json
+from harness.util import HarnessError, ProcessTimeout, json_bytes, output_tail_text, read_json, write_json
 from harness.worker_receipts import WorkerReceipts
 from harness.worker_returns import inspect_return, validate_return_evidence
 from test_harness import ROOT, RepoCase, after_save, crash_after_save, crash_point, refused_by_cli, run_cli, walk_exit
@@ -174,37 +174,6 @@ class FifoWatchdog:
         self.done.set()
         self.thread.join()
         return self.hung
-
-
-class FailingClose:
-    """``os`` for ``provider_failures`` only: every descriptor it closes fails after closing; with ``streams``, every stream too."""
-
-    def __init__(self, streams=False):
-        self.streams = streams
-
-    def __getattr__(self, name):
-        return getattr(os, name)
-
-    @staticmethod
-    def close(descriptor):
-        os.close(descriptor)
-        raise OSError(errno.EIO, "synthetic close failure")
-
-    def fdopen(self, descriptor, mode):
-        stream = os.fdopen(descriptor, mode)
-        return FailingStreamClose(stream) if self.streams else stream
-
-
-class FailingStreamClose:
-    def __init__(self, stream):
-        self.stream = stream
-
-    def __enter__(self):
-        return self.stream
-
-    def __exit__(self, *exc):
-        self.stream.close()
-        raise OSError(errno.EIO, "synthetic close failure")
 
 
 class ClassifierTests(unittest.TestCase):
@@ -1031,10 +1000,13 @@ class ImmediateJudgmentTests(RepoCase):
     def test_failed_close_in_the_facts_read_keeps_the_judged_type(self):
         """The facts read a FIFO again and its close fails: unreadable like any read, never raised over the judged stop."""
         made, build, watchdogs = [], dispatch.failure_stop, []
-        closing = patch.object(provider_failures, "os", FailingClose())
+        close_failures = []
 
         def recorded(*args, **kwargs):
-            made.append(build(*args, **kwargs))
+            reads = ReadsOf([kwargs["artifacts"]["job"] / "process.stdout"], fail_close=True)
+            with patch.object(state_files, "os", reads):
+                made.append(build(*args, **kwargs))
+            close_failures.extend(reads.closed_with_error)
             return made[-1]
         engine = self.engine(FailingWorker(self.config, self.repo, QUOTA))
 
@@ -1043,16 +1015,14 @@ class ImmediateJudgmentTests(RepoCase):
             path.unlink()
             os.mkfifo(path)
             watchdogs.append(FifoWatchdog(path))
-            closing.start()
         replaced, fired = after_save(engine, lambda run: any("attempt_exemption" in d for d in run["dispatches"]), replace)
         try:
             with replaced, patch.object(dispatch, "failure_stop", recorded), self.assertRaises(HarnessError) as caught:
                 engine.start("Implement greet", plan())
         finally:
-            if fired["fired"]:
-                closing.stop()
             hung = [watchdog.stop() for watchdog in watchdogs]
         self.assertEqual(hung, [False])
+        self.assertEqual(close_failures, ["process.stdout"])
         self.assertEqual([(value["kind"], value["reason"], value["data"]) for value in made],
                          [("provider_quota", "usage_limit", {"role": "worker", "provider": "claude",
                                                              "http_status": 429, "attempt_charged": False})])
@@ -1063,13 +1033,26 @@ class ImmediateJudgmentTests(RepoCase):
 
     def test_unreadable_original_omits_only_the_original_facts(self):
         """The facts read the originals again; a failed read drops those facts only, never the type."""
-        reader = provider_failures.read_for_boundary
-        for state in ("unreadable", "absent"):
-            def read(path, state=state):
-                return (state, None) if path.name == "process.stdout" else reader(path)
-            with self.subTest(read=state):
-                with patch.object(provider_failures, "read_for_boundary", read):
+        from test_state_files import FakeOs
+
+        classify_stop = dispatch.failure_stop
+        for number in (errno.EIO, errno.ENOENT):
+            injected = []
+
+            def open_original(real, name, flags, *args, **kwargs):
+                if name == "process.stdout":
+                    injected.append(name)
+                    raise OSError(number, os.strerror(number))
+                return real(name, flags, *args, **kwargs)
+
+            def report(*args, **kwargs):
+                with patch.object(state_files, "os", FakeOs(open=open_original)):
+                    return classify_stop(*args, **kwargs)
+
+            with self.subTest(errno=number):
+                with patch.object(dispatch, "failure_stop", report):
                     engine, _, error = self.failed()
+                self.assertEqual(injected, ["process.stdout"])
                 run = saved(engine)
                 # The judgment read its own bytes, the settle found the originals intact: the type stays.
                 self.assertEqual(worker(run)["attempt_exemption"]["code"], "usage_limit")
@@ -1079,6 +1062,87 @@ class ImmediateJudgmentTests(RepoCase):
                 self.assertEqual((data["http_status"], data["attempt_charged"]), (429, False))
                 self.assertFalse({"api_error", "api_error_type", "terminal_reason", "http_status_state",
                                   "exit_confirmed", "unrecognized_labels"} & set(data))
+
+    def test_failed_command_journal_read_keeps_the_worker_failure_object(self):
+        from test_state_files import FakeOs
+
+        class WithJournal(FailingWorker):
+            error = None
+
+            def invoke(self, **kwargs):
+                try:
+                    return super().invoke(**kwargs)
+                except HarnessError as error:
+                    self.error = error
+                    job = kwargs["job"]
+                    name = "a" * 32
+                    journal = job / "commands" / name / "process.json"
+                    journal.parent.mkdir(parents=True)
+                    write_json(journal, {"id": f"{job.name}:command:{name}", "command_id": "local-check",
+                                         "pgid": None, "process_state": "exited", "exit_confirmed": True})
+                    raise
+
+        backend = WithJournal(self.config, self.repo, QUOTA)
+        engine = self.engine(backend)
+        injected = []
+
+        def open_journal(real, name, flags, *args, **kwargs):
+            if name == "process.json" and not injected:
+                self.assertIsNotNone(backend.error)
+                self.assertIn("worker CLI exit=1", str(backend.error))
+                injected.append(name)
+                raise OSError(errno.EIO, "command journal read failed")
+            return real(name, flags, *args, **kwargs)
+
+        with patch.object(state_files, "os", FakeOs(open=open_journal)), self.assertRaises(HarnessError) as caught:
+            engine.start("Implement greet", plan())
+        self.assertEqual(injected, ["process.json"])
+        self.assertIs(caught.exception, backend.error)
+        run = saved(engine)
+        self.assertEqual(run["stop"], stops.of(backend.error))
+        self.assertEqual((run["stop"]["kind"], run["stop"]["reason"], run["stop"]["data"]["error_type"]),
+                         ("runtime_failure", "io", "OSError"))
+        entry = worker(run)
+        self.assertEqual((entry["status"], entry["error"]), ("failed", str(backend.error)))
+        self.assertNotIn("worker_return_evidence", entry)
+        receipt = run["worker_receipts"]["worker:implement:greet"]
+        self.assertEqual(receipt["dispatch_id"], entry["id"])
+        resumed = self.engine(backend)
+        self.assertEqual(resumed.resume(run["id"])["status"], "completed")
+        self.assertEqual(worker(saved(resumed))["id"], entry["id"])
+        self.assertEqual(backend.workers, 2)
+
+    def test_successful_worker_output_read_failure_stays_local_io_without_redrawing(self):
+        from test_state_files import FakeOs
+
+        terminal = {"type": "result", "structured_output": {}}
+        backend = FailingWorker(self.config, self.repo, terminal, exit_code=0)
+        engine = self.engine(backend)
+        opened = []
+
+        def read_original(real, name, flags, *args, **kwargs):
+            if name == "process.stdout" and not opened:
+                opened.append(name)
+                raise OSError(errno.EIO, "successful worker original read failed")
+            return real(name, flags, *args, **kwargs)
+
+        with patch.object(state_files, "os", FakeOs(open=read_original)):
+            with self.assertRaises(state_files.StateReadError) as caught:
+                engine.start("Implement greet", plan())
+        self.assertEqual(opened, ["process.stdout"])
+        run = saved(engine)
+        entry = worker(run)
+        self.assertEqual(run["stop"], stops.of(caught.exception))
+        self.assertEqual((run["stop"]["kind"], run["stop"]["reason"]), ("runtime_failure", "io"))
+        self.assertEqual((entry["status"], entry["exit_code"]), ("failed", 0))
+        self.assertNotIn("worker_return_evidence", entry)
+        self.assertEqual(run["worker_receipts"]["worker:implement:greet"]["dispatch_id"], entry["id"])
+        resumed = self.engine(backend)
+        with self.assertRaises(HarnessError) as blocked:
+            resumed.resume(run["id"])
+        stop = stops.of(blocked.exception)
+        self.assertEqual((stop["kind"], stop["reason"]), ("evidence", "unsealed_return"))
+        self.assertEqual(backend.workers, 1)
 
     def test_labels_show_by_source_in_the_stop_and_the_diagnostic(self):
         terminal = envelope(terminal_reason="api_error", api_error="brand_new_kind",
@@ -1130,8 +1194,15 @@ class ImmediateJudgmentTests(RepoCase):
             return real(name, *args, **kwargs)
         backend = FailingWorker(self.config, self.repo, QUOTA)
         engine = self.engine(backend)
-        with patch.object(state_files, "os", FakeOs(open=denied)), self.assertRaises(state_files.StateReadError) as caught:
+        pending = WorkerReceipts.pending
+
+        def inspect(receipts):
+            with patch.object(state_files, "os", FakeOs(open=denied)):
+                return pending(receipts)
+
+        with patch.object(WorkerReceipts, "pending", inspect), self.assertRaises(state_files.StateReadError) as caught:
             engine.start("Implement greet", plan())
+        self.assertEqual(denied_reads, ["process.stdout"])
         self.assertEqual(caught.exception.outcome.errno, errno.EACCES)
         state = saved(engine)
         self.assertEqual((state["stop"]["kind"], state["stop"]["reason"]), ("runtime_failure", "io"))
@@ -1291,18 +1362,25 @@ class CommanderFailureTests(RepoCase):
 
     def test_unreadable_output_twice_shows_no_process_facts(self):
         """Unreadable at the first read and again for the facts: two missing digests never match (spec-3 rule 8)."""
-        reader, reads = provider_failures.read_for_boundary, []
+        from test_state_files import FakeOs
 
-        def read(path):
-            if path.name == "process.stdout":
-                reads.append(path)
-                return "unreadable", None
-            return reader(path)
+        read_boundary, injected = dispatch.invocation_stop, []
+
+        def open_original(real, name, flags, *args, **kwargs):
+            if name == "process.stdout":
+                injected.append(name)
+                raise OSError(errno.EIO, "boundary read failed")
+            return real(name, flags, *args, **kwargs)
+
+        def report(*args, **kwargs):
+            with patch.object(state_files, "os", FakeOs(open=open_original)):
+                return read_boundary(*args, **kwargs)
+
         engine = Runtime(self.config, self.repo, backend=self.failing_commander(REAL_CONNECTION_REFUSED, "claude"),
                          commander="fable")
-        with patch.object(provider_failures, "read_for_boundary", read), self.assertRaises(HarnessError):
+        with patch.object(dispatch, "invocation_stop", report), self.assertRaises(HarnessError):
             engine.start("Implement greet")
-        self.assertEqual(len(reads), 2)
+        self.assertEqual(injected, ["process.stdout", "process.stdout"])
         stop = saved(engine)["stop"]
         self.assertEqual((stop["kind"], stop["reason"]), ("provider_failure", "unknown"))
         self.assertEqual({key: value for key, value in stop["data"].items() if key != "detail"},
@@ -1333,33 +1411,29 @@ class CommanderFailureTests(RepoCase):
             os.mkfifo(base / "fifo")
             watchdog = FifoWatchdog(base / "fifo")
             try:
-                states = {name: provider_failures.read_for_boundary(path) for name, path in (
-                    ("regular", base / "regular"), ("missing", base / "missing"), ("fifo", base / "fifo"),
-                    ("link", base / "link"), ("directory", base), ("device", Path(os.devnull)))}
+                (base / "directory").mkdir()
+                files = state_files.StateFiles(base)
+                outcomes = {name: files.read((name,), limit=provider_failures.LIMIT)
+                            for name in ("regular", "missing", "fifo", "link", "directory")}
             finally:
                 hung = watchdog.stop()
         self.assertFalse(hung)
-        self.assertEqual(states, {"regular": ("read", b"{}"), "missing": ("absent", None),
-                                  **{name: ("unreadable", None) for name in ("fifo", "link", "directory", "device")}})
+        self.assertEqual({name: (outcome.state, outcome.bytes_or_none()) for name, outcome in outcomes.items()},
+                         {"regular": ("read", b"{}"), "missing": ("absent", None),
+                          **{name: ("refused", None) for name in ("fifo", "link", "directory")}})
 
     def test_a_failed_close_is_unreadable_and_never_raised(self):
-        """Closing a FIFO's descriptor or a regular file's stream fails: the read is unreadable, nothing escapes."""
+        """A failed close discards even data already read."""
         with tempfile.TemporaryDirectory() as folder:
             base = Path(folder)
             (base / "regular").write_bytes(b"{}")
-            os.mkfifo(base / "fifo")
-            watchdog = FifoWatchdog(base / "fifo")
-            try:
-                with patch.object(provider_failures, "os", FailingClose(streams=True)):
-                    bounded = {name: provider_failures.read_for_boundary(base / name) for name in ("fifo", "regular")}
-                    whole = {name: provider_failures.read_original(base / name, lambda stream: stream.read())
-                             for name in ("fifo", "regular")}
-            finally:
-                hung = watchdog.stop()
-        self.assertFalse(hung)
-        self.assertEqual(bounded, {"fifo": ("unreadable", None), "regular": ("unreadable", None)})
-        self.assertEqual({name: (state, error.errno) for name, (state, error) in whole.items()},
-                         {"fifo": ("unreadable", errno.EIO), "regular": ("unreadable", errno.EIO)})
+            files = state_files.StateFiles(base)
+            reads = ReadsOf([base / "regular"], fail_close=True)
+            with patch.object(state_files, "os", reads):
+                outcomes = [files.read(("regular",), limit=limit) for limit in (provider_failures.LIMIT, None)]
+        self.assertEqual(reads.closed_with_error, ["regular", "regular"])
+        self.assertEqual([(read.state, read.errno, read.bytes_or_none()) for read in outcomes],
+                         [("failed", errno.EIO, None)] * 2)
 
 
 class FifoAfterExitTests(RepoCase):
@@ -1468,14 +1542,10 @@ class FifoAfterExitTests(RepoCase):
 
 
 class ReadsOf:
-    """``os`` for ``provider_failures``: wraps every stream opened on ``targets`` (paths, filled in late) with ``wrap``.
+    """Count state-file opens and bytes, and inject faults at selected descriptor operations."""
 
-    ``reads`` collects the size of every read on any stream; ``fail_open`` names files whose
-    second open fails with EIO.
-    """
-
-    def __init__(self, targets=(), wrap=None, fail_open=(), *, fail_close=False):
-        self.targets, self.wrap, self.fail_open, self.opens, self.reads = targets, wrap, fail_open, {}, []
+    def __init__(self, targets=(), fail_open=(), *, fail_close=False):
+        self.targets, self.fail_open, self.opens = targets, fail_open, {}
         self.fail_close, self.closed_with_error = fail_close, []
         self.bytes_by_file, self.names = {}, {}
 
@@ -1505,38 +1575,12 @@ class ReadsOf:
             self.closed_with_error.append(name)
             raise OSError(errno.EIO, "synthetic close failure")
 
-    def fdopen(self, descriptor, mode):
-        stream = Counted(os.fdopen(descriptor, mode), self.reads)
-        identity = os.fstat(descriptor)
-        if self.wrap and any(path.exists() and os.path.samestat(identity, path.stat()) for path in self.targets):
-            return self.wrap(stream)
-        return stream
-
-
-class Counted:
-    def __init__(self, stream, reads):
-        self.stream, self.reads = stream, reads
-
-    def __getattr__(self, name):
-        return getattr(self.stream, name)
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        self.stream.close()
-
-    def read(self, size=-1):
-        data = self.stream.read(size)
-        self.reads.append(len(data))
-        return data
-
 
 class FailingStat(contextlib.ExitStack):
     """While entered, every stat of ``targets`` (paths, filled in late) fails with EIO: by path, link or descriptor.
 
     pathlib's checks stat by path or link (Python 3.11 to 3.13 let the EIO out, later versions
-    swallow it), ``read_original`` by descriptor: whatever asks, the file's metadata cannot be
+    swallow it), the state-file reader by descriptor: whatever asks, the file's metadata cannot be
     read, so a case means the same on every version.
     """
 
@@ -1629,7 +1673,13 @@ class FailedCallReadTests(RepoCase):
         """A Claude commander returns a whole terminal and exits 7; closing ``target`` after reading it fails."""
         targets = []
         reads = ReadsOf(targets, fail_close=True)
-        result = self.failed_read(target, targets, patch.object(state_files, "os", reads))
+        preserve = CLIBackend.preserve_terminal
+
+        def capture(backend, *args, **kwargs):
+            with patch.object(state_files, "os", reads):
+                return preserve(backend, *args, **kwargs)
+
+        result = self.failed_read(target, targets, patch.object(CLIBackend, "preserve_terminal", capture))
         self.assertEqual(reads.closed_with_error, [target] if target else [])
         return result
 
@@ -1679,6 +1729,83 @@ class FailedCallReadTests(RepoCase):
         self.assertEqual(read_json(job / "returned-result.json"), {})
         self.assertFalse(getattr(error, "__notes__", []))
 
+    def test_capture_bindings_stream_the_keyed_receipt_without_masking_the_stop(self):
+        marker, artifact = "terminal-capture.json", "returned-result.json"
+        for role in ("commander", "reviewer"):
+            cases = ("regular", marker, artifact, "absent")
+            if role == "reviewer":
+                cases += ("large",)
+            for case in cases:
+                with self.subTest(role=role, case=case):
+                    self.check_failed_capture_bindings(role, case)
+
+    def check_failed_capture_bindings(self, role, case):
+        from test_state_files import FakeOs
+
+        marker, artifact = "terminal-capture.json", "returned-result.json"
+        terminal = json.dumps(self.TERMINAL)
+
+        def program(job):
+            if case == "absent":
+                deliver = f"Path({str(job / artifact)!r}).write_text('{{}}')"
+            elif role == "commander":
+                deliver = f"print({terminal!r})"
+            else:
+                value = ('value = [0] * 300000\nfor _ in range(32):\n    value = {"nested": value}\n'
+                         if case == "large" else "value = {}\n")
+                deliver = value + f"Path({str(job / 'response.json')!r}).write_text(json.dumps(value))"
+            return f"from pathlib import Path\nimport json, sys\n{deliver}\nsys.exit(7)"
+
+        backend = self.backend(role, program)
+        invoke = backend.invoke
+        received, injected, opens = [], [], []
+
+        def call(**kwargs):
+            try:
+                return invoke(**kwargs)
+            except HarnessError as error:
+                received.append(error)
+                raise
+
+        def open_capture(real, name, flags, *args, **kwargs):
+            if received and name in (marker, artifact):
+                opens.append(name)
+                if name == case and not injected:
+                    injected.append(name)
+                    raise OSError(errno.EIO, "capture binding read failed")
+            return real(name, flags, *args, **kwargs)
+
+        engine = Runtime(self.config, self.repo, backend=backend, commander="fable")
+        with patch.object(backend, "invoke", call), patch.object(state_files, "os", FakeOs(open=open_capture)):
+            with self.assertRaises(HarnessError) as caught:
+                engine.start("Implement greet", *(() if role == "commander" else (plan(),)))
+        self.assertEqual(injected, [case] if case in (marker, artifact) else [])
+        self.assertEqual(opens, [marker] if case == "absent" else [marker, artifact])
+        error, = received
+        self.assertIs(caught.exception, error)
+        run = saved(engine)
+        self.assertEqual(run["stop"], stops.of(error))
+        self.assertEqual((run["stop"]["kind"], run["stop"]["reason"]), ("provider_failure", "unknown"))
+        entry, = [entry for entry in run["dispatches"] if entry["role"] == role]
+        self.assertEqual(entry["error"], str(error))
+        field, key = (("commander_receipts", "commander:decide:run") if role == "commander"
+                      else ("review_receipts", "reviewer:review:greet"))
+        self.assertEqual(set(run[field]), {key})
+        receipt = run[field][key]
+        self.assertEqual(receipt["dispatch_id"], entry["id"])
+        job = engine.directory / "dispatches" / entry["id"]
+        if case == "large":
+            self.assertGreater((job / artifact).stat().st_size, provider_failures.LIMIT)
+            self.assertLess((job / "response.json").stat().st_size, provider_failures.LIMIT)
+        if case == "absent":
+            self.assertFalse((job / marker).exists())
+            self.assertEqual(read_json(job / artifact), {})
+        for name, field in ((marker, "terminal_capture_digest"), (artifact, "artifact_digest")):
+            if case in ("absent", name):
+                self.assertNotIn(field, receipt)
+            else:
+                self.assertEqual(receipt[field], hashlib.sha256((job / name).read_bytes()).hexdigest())
+
     def test_a_failed_stat_of_the_outcome_on_a_nonzero_exit_never_replaces_the_cli_failure(self):
         """No check of the originals' metadata precedes the capture's reads: the same note as a failed close."""
         error, job = self.failed_stat("process.outcome.json")
@@ -1715,7 +1842,13 @@ class FailedCallReadTests(RepoCase):
                 raise OSError(errno.EIO, "synthetic terminal read failure")
             return pread(fd, length, offset)
 
-        with patch.object(adapters, "run_process", ran), patch.object(state_files.os, "pread", failing):
+        preserve = CLIBackend.preserve_terminal
+
+        def capture(backend, *args, **kwargs):
+            with patch.object(state_files.os, "pread", failing):
+                return preserve(backend, *args, **kwargs)
+
+        with patch.object(adapters, "run_process", ran), patch.object(CLIBackend, "preserve_terminal", capture):
             with self.assertRaises(ProcessTimeout) as caught:
                 engine.start("Implement greet")
 
@@ -1833,28 +1966,53 @@ class OriginalReadBoundTests(unittest.TestCase):
                 job = Path(folder)
                 (job / name).write_bytes(data)
                 reads = ReadsOf()
-                with patch.object(provider_failures, "os", reads):
+                with patch.object(state_files, "os", reads):
                     result = CLIBackend(None, None).completed_result(job, provider)
                 self.assertEqual(result, value if provider == "claude" else {**value, "summary": pad})
-                # Still the one read of read_original: never blocking, never through a link, a regular file only.
-                self.assertEqual((reads.opens, sum(reads.reads)), ({name: 1}, len(data)))
+                self.assertEqual((reads.opens[name], reads.bytes_by_file[name]), (1, len(data)))
+
+    def test_completed_result_distinguishes_absent_malformed_and_failed_reads(self):
+        for provider, name in (("claude", "process.stdout"), ("codex", "response.json")):
+            for case in ("absent", "malformed", "io"):
+                with self.subTest(provider=provider, case=case), tempfile.TemporaryDirectory() as folder:
+                    job = Path(folder) / "job"
+                    job.mkdir()
+                    path = job / name
+                    reads = ReadsOf([path], fail_close=case == "io")
+                    if case != "absent":
+                        path.write_bytes(b"invalid JSON")
+                    backend = CLIBackend(None, Path(folder))
+                    with patch.object(state_files, "os", reads), self.assertRaises(HarnessError) as caught:
+                        backend.completed_result(job, provider)
+                    self.assertEqual(reads.opens[name], 1)
+                    if case == "io":
+                        self.assertIsInstance(caught.exception, state_files.StateReadError)
+                        self.assertEqual(stops.of(caught.exception)["data"]["error_type"], "OSError")
+                        self.assertEqual(reads.closed_with_error, [name])
+                    elif case == "malformed":
+                        self.assertIsInstance(caught.exception, adapters.UndecodableOutput)
+                        self.assertEqual(caught.exception.artifact_digest, hashlib.sha256(path.read_bytes()).hexdigest())
+                    else:
+                        self.assertIs(type(caught.exception), HarnessError)
+                        self.assertFalse((job / "provider-result.json").exists())
 
     def test_the_stderr_tail_never_reads_past_its_size_when_the_file_grows(self):
-        class Growing(Counted):
-            def seek(self, offset, whence=os.SEEK_SET):
-                if whence == os.SEEK_SET:
-                    with open(path, "ab") as more:
+        class Growing(ReadsOf):
+            def pread(self, fd, size, offset):
+                if self.names[fd] == path.name:
+                    with path.open("ab") as more:
                         more.write(b"b" * (1 << 20))
-                return self.stream.seek(offset, whence)
+                return super().pread(fd, size, offset)
 
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "process.stderr"
             path.write_bytes(b"a" * 10000)
-            reads = ReadsOf([path], wrap=lambda stream: Growing(stream.stream, stream.reads))
-            with patch.object(provider_failures, "os", reads):
-                state, text = provider_failures.read_original(path, tail_text)
-        self.assertEqual((state, text), ("read", "[earlier output omitted; see log]\n" + "a" * 4000))
-        self.assertEqual(sum(reads.reads), 4000)
+            reads = Growing()
+            with patch.object(state_files, "os", reads):
+                outcome = state_files.StateFiles(path.parent).read((path.name,), limit=4000, part="tail")
+        self.assertTrue(outcome.changed)
+        self.assertEqual(output_tail_text(outcome), "[earlier output omitted; see log]\n" + "a" * 4000)
+        self.assertEqual(reads.bytes_by_file[path.name], 4000)
 
     def test_a_capture_after_exit_0_reads_the_terminal_once(self):
         """The capture binds and decodes the same bytes: a second read of the terminal would fail here."""

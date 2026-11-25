@@ -1,9 +1,12 @@
+import errno
 import hashlib
 import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import patch
 
+from harness import state_files
 from harness.context import prompt_json
 from harness.util import HarnessError
 from harness.verification_plan import finding_progress, finding_progress_packet, project_finding_sources
@@ -74,6 +77,16 @@ class FindingProgressIndexTests(unittest.TestCase):
             with self.assertRaisesRegex(HarnessError, 'index changed'):
                 finding_progress_packet(run, ['task'], Path(directory).resolve())
             self.assertEqual(path.read_bytes(), b'changed evidence')
+
+    def test_failed_index_probe_never_publishes_an_artifact(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            failed = state_files.Outcome("failed", str(root), state_files.Step(0, "finding-progress", "open", False),
+                                         errno=errno.EIO)
+            with patch.object(state_files.StateFiles, "probe", return_value=failed), self.assertRaises(HarnessError) as caught:
+                finding_progress_packet(self.history(), ["task"], root)
+            self.assertEqual((caught.exception.stop["kind"], caught.exception.stop["reason"]), ("runtime_failure", "io"))
+            self.assertEqual(list(root.iterdir()), [])
 
     def test_symlink_artifact_and_parent_are_rejected(self):
         for parent in (False, True):

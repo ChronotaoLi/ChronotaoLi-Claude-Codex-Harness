@@ -14,7 +14,7 @@ import json
 from pathlib import Path
 from typing import NamedTuple
 
-from . import stops
+from . import interrupts, stops
 from .operations import first_line, warn, warn_kept_terminal
 from .process_runtime import defer_cleanup_signals
 from .state_files import LockUnavailable, StateFiles, StateReadError, holding
@@ -55,6 +55,7 @@ class RunStore:
         self._accepted = None
         self._carried = {}
         self._terminal = None
+        self._poisoned = False
         # (st_dev, st_ino) of the run directory this process first locked; every later lock must find it again.
         self._directory = None
 
@@ -121,6 +122,7 @@ class RunStore:
             self._revision = 0
             self._pending = self._attempted = self._accepted = self._terminal = None
             self._carried.clear()
+            self._poisoned = False
             return
         ident, revision = self._identity(run)
         path = self.root / ident / LEDGER
@@ -153,6 +155,7 @@ class RunStore:
         self._pending = self._terminal = None
         self._accepted = self._attempted = deepcopy(run)
         self._carried.clear()
+        self._poisoned = False
 
     @property
     def directory_identity(self):
@@ -189,6 +192,15 @@ class RunStore:
         """Exclude a caller's rolled-back changes from the base of a later stop."""
         self._attempted = self._accepted
 
+    @property
+    def poisoned(self):
+        """Whether a failed publication body left an unusable live ledger."""
+        return self._poisoned
+
+    def poison(self):
+        """Refuse to commit any partially applied publication body."""
+        self._poisoned = True
+
     def rebase_for_stop(self):
         """Restore the last complete candidate and explicitly carried facts in place."""
         base = deepcopy(self._attempted)
@@ -196,6 +208,7 @@ class RunStore:
         base.update(deepcopy(self._carried))
         self.run.clear()
         self.run.update(base)
+        self._poisoned = False
 
     def _adopt(self, pending):
         self._accepted = pending.candidate
@@ -207,6 +220,7 @@ class RunStore:
             self.run["store_revision"] = self._revision
         if pending.terminal:
             self._terminal = pending.candidate
+            interrupts.terminal(self)
         self._pending = None
 
     def _reconcile(self, digest):
@@ -261,6 +275,11 @@ class RunStore:
             self._require_identity()
         self._locked(self._path.parent.name, self._directory, check)
 
+    @property
+    def adopted_baseline(self):
+        """Identity of the selected ledger and its last adopted revision."""
+        return self._path, self._revision
+
     def matches_commit(self):
         """Whether the live ledger is exactly what this store last committed (no staged change).
 
@@ -276,8 +295,11 @@ class RunStore:
     @stops.classifies("runtime_failure", "invariant")
     def commit(self, *, terminal=False, stop=False):
         """Return the written revision or KEPT; refused and unconfirmed writes raise."""
+        interrupts.require_outside_publication("commit")
         if self.run is None or self._path is None:
             raise HarnessError("没有已绑定的运行台账")
+        if self._poisoned:
+            raise HarnessError("发布段中途失败；拒绝提交半步")
         ident = self._path.parent.name
         if self._directory is None:
             # Only a run never locked in this process makes its directory (runs/ too); a known one is never remade.

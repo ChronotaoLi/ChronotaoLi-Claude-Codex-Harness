@@ -2,7 +2,8 @@ import copy
 from pathlib import Path
 from unittest.mock import patch
 
-from harness.util import HarnessError, read_json, write_json
+from harness import stops
+from harness.util import EvidenceError, HarnessError, read_json, write_json
 import harness.worker_receipts as worker_receipts_module
 from test_harness import ROOT, RepoCase, crash_after_save, decide_bound
 from test_runtime_changes import ScriptedBackend, decided, trigger_kind
@@ -165,16 +166,30 @@ class CommanderReceiptTests(RepoCase):
                 backend = ScriptedBackend()
                 engine = self.engine(backend)
                 saved = self.interrupt_bound(engine, pause_after_plan=True)
-                artifact = Path(saved["commander_receipts"]["commander:decide:run"]["artifact"])
+                receipt = saved["commander_receipts"]["commander:decide:run"]
+                artifact = Path(receipt["artifact"])
                 if mode == "missing":
                     artifact.unlink()
                 else:
                     value = read_json(artifact)
                     value["new_tasks"][0]["description"] = "A different plan"
                     write_json(artifact, value)
+                retained = None if mode == "missing" else artifact.read_bytes()
                 calls = copy.deepcopy(backend.calls)
-                with self.assertRaisesRegex(HarnessError, "指挥原始结果"):
+                with self.assertRaisesRegex(HarnessError, "指挥原始结果") as caught:
                     self.engine(backend).resume(saved["id"])
+                self.assertIsInstance(caught.exception, EvidenceError)
+                stop = stops.of(caught.exception)
+                self.assertEqual((stop["kind"], stop["reason"]), ("evidence", "runtime_integrity"))
+                self.assertEqual(stop["source"], {key: receipt[key] for key in
+                                                  ("artifact", "artifact_digest", "dispatch_id")})
+                if mode == "missing":
+                    self.assertIn(f"运行时证据缺失：{artifact}（{artifact.name}）", str(caught.exception))
+                    self.assertFalse(artifact.exists())
+                else:
+                    self.assertEqual(artifact.read_bytes(), retained)
+                self.assertEqual(read_json(engine.directory / "state.json")["commander_receipts"],
+                                 saved["commander_receipts"])
                 self.assertEqual(backend.calls, calls)
 
     def test_second_invalid_selection_stops_and_resume_is_a_new_request(self):

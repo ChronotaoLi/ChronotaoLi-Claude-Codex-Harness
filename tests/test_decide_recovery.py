@@ -3,6 +3,7 @@
 The kill mode writes the boundary save, then fails every later write of the
 process, as SIGKILL would: no in-memory state can repair a split save.
 """
+import errno
 import hashlib
 import json
 import os
@@ -271,6 +272,27 @@ class PlanAuthorityTests(DecideCase):
                 self.assertEqual(path.read_bytes(), before)
                 self.assertFalse(self.state(engine)["plan_approved"])
                 self.assertEqual(script.calls, [])
+
+    def test_failed_plan_read_stops_approval_without_consuming_the_pause(self):
+        script = Script()
+        engine = self.engine(script)
+        state = engine.start("approve", {"tasks": [task("a")]}, pause_after_plan=True)
+        artifact = state["plan_history"][0]["artifact"]
+        paths = [engine.directory / name for name in ("state.json", "events.jsonl")]
+        before = [path.read_bytes() for path in paths]
+        original = state_files.StateFiles.read
+
+        def fail_plan(files, components, **kwargs):
+            if str(Path(files.path).joinpath(*files.prefix, *components)) == artifact:
+                return state_files.Outcome("failed", artifact,
+                                           state_files.Step(3, "revision-0.json", "read", True), errno=errno.EIO)
+            return original(files, components, **kwargs)
+
+        with patch.object(state_files.StateFiles, "read", fail_plan), self.assertRaises(HarnessError) as caught:
+            self.engine(script).resume(state["id"], approve_plan=True)
+        self.assertEqual((caught.exception.stop["kind"], caught.exception.stop["reason"]), ("runtime_failure", "io"))
+        self.assertEqual([path.read_bytes() for path in paths], before)
+        self.assertEqual(script.calls, [])
 
     def test_damaged_plan_stops_resume_before_the_exit_confirmation_write(self):
         script = Script()

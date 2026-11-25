@@ -34,7 +34,7 @@ import git_isolation
 import run_shards
 import stop_tripwire
 from acceptance_support import accept_now, acceptance_checkout
-from harness import (cleanup, cli, command_server, dashboard, finalization, git, git_query, memory, operations,
+from harness import (cleanup, cli, command_server, dashboard, finalization, git, git_query, interrupts, memory, operations,
                      permission_smoke, private_state, stops, tool_smoke, workspace_inputs)
 from harness.config import Config
 from harness.util import HarnessError, read_json
@@ -388,7 +388,7 @@ class PreviewAndObservationTests(IsolatedRepoCase):
                      ("permission-diagnostics", "run_fixture", "dispatch_fixture"),
                      ("cleanup-run", "run_fixture", "--remove-ignored", "--remove-input-copies")):
             with self.subTest(argv=argv), patch.object(git, "repository", side_effect=compare), \
-                    patch.object(git.subprocess, "run", wraps=subprocess.run) as processes:
+                    patch.object(git.subprocess, "Popen", wraps=subprocess.Popen) as processes:
                 code, output, errors = self.cli(*argv)
                 stop = cli_notice(errors)
                 self.assertEqual((stop["kind"], stop["reason"]), ("runtime_failure", "invariant"), errors)
@@ -407,7 +407,7 @@ class PreviewAndObservationTests(IsolatedRepoCase):
             self.fail("watch with explicit state allowed a comparison")
 
         with patch("harness.watch_cli.watch_run", side_effect=compare), \
-                patch.object(git.subprocess, "run", wraps=subprocess.run) as processes:
+                patch.object(git.subprocess, "Popen", wraps=subprocess.Popen) as processes:
             code, output, errors = self.cli("watch", "run_fixture", "--state", str(self.repo / ".harness"))
         stop = cli_notice(errors)
         self.assertEqual((stop["kind"], stop["reason"]), ("runtime_failure", "invariant"), errors)
@@ -442,15 +442,15 @@ class ConstructionTests(unittest.TestCase):
     def launches(self, fail=None):
         """Record every argv harness.git starts, and in ``self.finished`` what each returned; ``fail`` (an exception)
         is raised by the hook name read."""
-        real, started, self.finished = subprocess.run, [], []
+        real, started, self.finished = git._launch, [], []
 
-        def recording(argv, **kwargs):
+        def recording(argv, env, **kwargs):
             started.append(list(argv))
             if fail is not None and "--get-regexp" in argv:
                 raise fail
-            self.finished.append(real(argv, **kwargs))
+            self.finished.append(real(argv, env, **kwargs))
             return self.finished[-1]
-        with patch("harness.git.subprocess.run", side_effect=recording):
+        with patch.object(git, "_launch", side_effect=recording):
             yield started
 
     def assert_invariant(self, call):
@@ -3156,6 +3156,182 @@ class AcceptanceGitFormsTests(IsolatedRepoCase):
         self.assertNotIn(oid.decode().strip(), self.objects())
 
 
+class GitSupervisionTests(IsolatedRepoCase):
+    """Run sleeping Git stand-ins in private groups, with real signal delivery."""
+
+    @contextlib.contextmanager
+    def interpose(self, suffix, program, *, after_spawn=None, only_linked=False):
+        spawn = subprocess.Popen
+        processes = []
+
+        def start(argv, **kwargs):
+            if argv[0] != "git" or argv[-len(suffix):] != suffix:
+                return spawn(argv, **kwargs)
+            if only_linked and not any(arg.startswith("--work-tree=") for arg in argv):
+                return spawn(argv, **kwargs)
+            proc = spawn([sys.executable, "-c", program, *argv], **kwargs)
+            processes.append(proc)
+            if after_spawn is not None:
+                after_spawn(proc)
+            return proc
+
+        with patch.object(git.subprocess, "Popen", side_effect=start):
+            yield processes
+
+    def assert_reaped(self, processes, code):
+        self.assertEqual(len(processes), 1)
+        process, = processes
+        self.assertEqual(process.returncode, code)
+        self.assertTrue(process.stdout.closed)
+        self.assertTrue(process.stderr.closed)
+        with self.assertRaises(ProcessLookupError):
+            os.killpg(process.pid, 0)
+
+    def test_interrupt_during_snapshot_preserves_run_and_reaps_reader(self):
+        engine = self.engine()
+        program = "import os, signal, time; os.kill(os.getppid(), signal.SIGINT); time.sleep(30)"
+        with patch.object(interrupts, "ENABLED", True), interrupts.installed(), self.interpose(
+                ["ls-files", "--stage", "-z"], program, only_linked=True) as processes:
+            start = time.monotonic()
+            with self.assertRaises(KeyboardInterrupt):
+                engine.start("Implement greet")
+            self.assertLess(time.monotonic() - start, 2)
+            self.assertEqual(interrupts.active().delivered_from, "_launch")
+        self.assert_reaped(processes, -signal.SIGTERM)
+        state = read_json(engine.directory / "state.json")
+        self.assertEqual(state["status"], "interrupted")
+        self.assertFalse(any(dispatch["invoked"] for dispatch in state["dispatches"]))
+        self.assertFalse(list((self.repo / ".git").rglob("index.lock")))
+
+    def test_interrupt_during_population_saves_checkout_and_binding(self):
+        engine = self.engine()
+        program = ("import os, signal, sys, time; os.kill(os.getppid(), signal.SIGINT); "
+                   "time.sleep(.35); os.execvp(sys.argv[1], sys.argv[1:])")
+        with patch.object(interrupts, "ENABLED", True), interrupts.installed(), self.interpose(
+                ["reset", "-q", "--hard", "--no-recurse-submodules"], program) as processes:
+            with self.assertRaises(KeyboardInterrupt):
+                engine.start("Implement greet")
+            self.assertNotEqual(interrupts.active().delivered_from, "_launch")
+        self.assert_reaped(processes, 0)
+        state = read_json(engine.directory / "state.json")
+        checkout = Path(state["worktree"])
+        self.assertEqual(state["status"], "interrupted")
+        self.assertEqual(state["worktree_binding"], git.capture_worktree_binding(checkout, state["branch"]))
+        self.assertTrue((checkout / "test_hello.py").is_file())
+        self.assertEqual(state["dispatches"], [])
+
+    def test_write_and_undeclared_effects_finish_before_interrupt(self):
+        program = ("import os, signal, sys, time; os.kill(os.getppid(), signal.SIGINT); "
+                   "time.sleep(.35); os.execvp(sys.argv[1], sys.argv[1:])")
+        for effect, enabled in ((git.REFS, True), (None, True), (git.REFS, False), (None, False)):
+            with self.subTest(effect=effect, controller=enabled):
+                ref = f"refs/heads/fixture-{effect is None}-{enabled}"
+                args = ["update-ref", ref, "HEAD"]
+                with patch.object(interrupts, "ENABLED", enabled), interrupts.installed(), self.interpose(
+                        args, program) as processes:
+                    with self.assertRaises(KeyboardInterrupt):
+                        result = git.git_process(self.repo, *args, effect=effect)
+                        self.assertTrue(enabled)
+                        self.assertEqual(result.returncode, 0)
+                        interrupts.deliver()
+                self.assert_reaped(processes, 0)
+                self.assertEqual(git.git(self.repo, "rev-parse", ref, effect=git.READ),
+                                 git.git(self.repo, "rev-parse", "HEAD", effect=git.READ))
+
+    def test_reaped_leader_with_inherited_output_pipe_never_signals_group(self):
+        args = ["rev-parse", "HEAD"]
+        descendant = self.scratch / "descendant.pid"
+        program = (
+            "import os, pathlib, time\n"
+            "pid = os.fork()\n"
+            "if pid == 0:\n"
+            "    time.sleep(10)\n"
+            "    os._exit(0)\n"
+            f"pathlib.Path({str(descendant)!r}).write_text(str(pid))\n"
+        )
+
+        def leader_exited(process):
+            self.assertEqual(process.wait(timeout=3), 0)
+            signal.raise_signal(signal.SIGINT)
+
+        with patch.object(interrupts, "ENABLED", True), interrupts.installed(), self.interpose(
+                args, program, after_spawn=leader_exited) as processes:
+            try:
+                with patch.object(git.os, "killpg", wraps=os.killpg) as killpg, self.assertRaises(KeyboardInterrupt):
+                    start = time.monotonic()
+                    git.git_process(self.repo, *args, effect=git.READ, timeout=3)
+                self.assertLess(time.monotonic() - start, 2)
+                killpg.assert_not_called()
+                self.assertEqual(processes[0].returncode, 0)
+                self.assertTrue(processes[0].stdout.closed)
+                self.assertTrue(processes[0].stderr.closed)
+                os.kill(int(descendant.read_text()), 0)
+            finally:
+                if descendant.exists():
+                    with contextlib.suppress(ProcessLookupError):
+                        os.kill(int(descendant.read_text()), signal.SIGTERM)
+
+    def test_fully_drained_exit_precedes_pending_interrupt(self):
+        args = ["rev-parse", "HEAD"]
+        program = "import sys; sys.stdout.buffer.write(b'complete\\x00\\xff')"
+
+        def finished_at_slice_boundary(process):
+            self.assertEqual(process.wait(timeout=3), 0)
+            communicate = process.communicate
+
+            def first_slice_times_out(**kwargs):
+                process.communicate = communicate
+                signal.raise_signal(signal.SIGINT)
+                raise subprocess.TimeoutExpired(args, kwargs["timeout"])
+
+            process.communicate = first_slice_times_out
+
+        with patch.object(interrupts, "ENABLED", True), interrupts.installed(), self.interpose(
+                args, program, after_spawn=finished_at_slice_boundary) as processes:
+            result = git.git_process(self.repo, *args, effect=git.READ)
+            self.assertEqual((result.returncode, result.stdout, result.stderr), (0, b"complete\x00\xff", b""))
+            self.assertIsNone(interrupts.active().delivered_from)
+            with self.assertRaises(KeyboardInterrupt):
+                interrupts.deliver()
+        self.assert_reaped(processes, 0)
+
+    def test_timeout_preserves_partial_bytes_and_kills_child(self):
+        args = ["rev-parse", "HEAD"]
+        program = ("import os, time; os.write(1, b'out\\x00\\xff'); os.write(2, b'err\\xff'); time.sleep(30)")
+        with self.interpose(args, program) as processes, self.assertRaises(subprocess.TimeoutExpired) as timed_out:
+            git.git_process(self.repo, *args, effect=git.READ, timeout=.5)
+        self.assert_reaped(processes, -signal.SIGKILL)
+        self.assertEqual(timed_out.exception.output, b"out\x00\xff")
+        self.assertEqual(timed_out.exception.stderr, b"err\xff")
+        self.assertGreater(timed_out.exception.timeout, .4)
+
+    def test_io_failure_preserves_original_exception_and_reaps_child(self):
+        args = ["rev-parse", "HEAD"]
+        failure = OSError("fixture pipe error")
+
+        def communication_failure(process):
+            def fail(**kwargs):
+                raise failure
+            process.communicate = fail
+
+        with self.interpose(args, "import time; time.sleep(30)", after_spawn=communication_failure) as processes:
+            with self.assertRaises(OSError) as raised:
+                git.git_process(self.repo, *args, effect=git.READ)
+        self.assertIs(raised.exception, failure)
+        self.assert_reaped(processes, -signal.SIGKILL)
+
+    def test_input_and_output_are_lossless_across_slices(self):
+        args = ["hash-object", "--stdin"]
+        payload = b"line\x00\xff" * (1024 * 1024)
+        expected = plain_git(self.repo, *args, input=payload).stdout
+        program = ("import os, sys, time; time.sleep(.22); os.write(2, b'\\xff' * (1024 * 1024)); "
+                   "os.execvp(sys.argv[1], sys.argv[1:])")
+        with self.interpose(args, program) as processes:
+            result = git.git_process(self.repo, *args, input=payload, effect=git.READ)
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, expected, b"\xff" * (1024 * 1024)))
+        self.assert_reaped(processes, 0)
+
+
 class DeadlineTests(unittest.TestCase):
     """Case 18: the hook name read and the call share one monotonic deadline."""
 
@@ -3177,12 +3353,15 @@ class DeadlineTests(unittest.TestCase):
 
         A binding check (``symbolic-ref``) runs for real and spends ``check_spend`` seconds.
         """
-        real, started = subprocess.run, []
+        real, started = git._launch, []
 
-        def fake(argv, **kwargs):
-            started.append((list(argv), kwargs.get("timeout")))
+        def fake(argv, env, *, deadline, **kwargs):
+            remaining = deadline - self.now
+            if remaining <= 0:
+                return real(argv, env, deadline=deadline, **kwargs)
+            started.append((list(argv), remaining))
             if any(word in argv for word in passthrough):
-                result = real(argv, **kwargs)
+                result = real(argv, env, deadline=deadline, **kwargs)
                 self.now += check_spend
                 return result
             if "--get-regexp" in argv:
@@ -3191,7 +3370,7 @@ class DeadlineTests(unittest.TestCase):
                 self.now += spend
                 return subprocess.CompletedProcess(argv, 1, b"", b"")
             return subprocess.CompletedProcess(argv, 0, b"", b"")
-        with patch("harness.git.subprocess.run", side_effect=fake):
+        with patch.object(git, "_launch", side_effect=fake):
             yield started
 
     def call(self, layer):
@@ -3398,7 +3577,7 @@ def call_shape_problems(sources, *, reads=None):
             starter = qualified(node.func) or ""
             if starter in STARTERS or starter.startswith(("os.exec", "os.posix_spawn")):
                 if module == "git":
-                    if (function, starter) != ("_launch", "subprocess.run"):
+                    if (function, starter) != ("_launch", "subprocess.Popen"):
                         problems.append((place, "starts a process outside _launch"))
                     continue
                 for argument in [*node.args, *(keyword.value for keyword in node.keywords if keyword.arg == "args")]:

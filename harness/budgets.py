@@ -6,7 +6,7 @@ import re
 
 from .contracts import validate_work_bounds, validate_work_core
 from .worker_receipts import delivered_work_contract
-from .recovery import read_bound_result
+from .recovery import bound_result, returned_result_files
 from .util import HarnessError
 
 
@@ -35,12 +35,13 @@ class AttemptAccounting(RuntimeService):
         return work_attempts(self.context.run).get(task_id, 0)
 
     @stops.reads_evidence
-    def validate_attempt_accounting(self):
-        attempts = self.context.run["attempts"]
+    def validate_attempt_accounting(self, run=None):
+        run = self.context.run if run is None else run
+        attempts = run["attempts"]
         if any(not isinstance(k, str) or type(v) is not int or v < 0 for k, v in attempts.items()):
             raise HarnessError("任务调用计数无效；保留台账")
-        tasks = {task["id"] for task in self.context.run["tasks"]}
-        for entry in self.context.run["dispatches"]:
+        tasks = {task["id"] for task in run["tasks"]}
+        for entry in run["dispatches"]:
             if "attempt_exemption" not in entry:
                 continue
             exemption = entry["attempt_exemption"]
@@ -58,15 +59,15 @@ class AttemptAccounting(RuntimeService):
                     or not re.fullmatch(r"[0-9a-f]{64}", exemption["artifact_digest"])
                     or exemption.get("artifact") != str(self.context.directory / "dispatches" / dispatch_id / "returned-result.json")):
                 raise HarnessError("任务尝试豁免来源无效；保留台账")
-            result, _ = read_bound_result(exemption, "任务尝试豁免")
-            contract = delivered_work_contract(self.context.run, self.context.directory, dispatch_id)
+            result, _ = bound_result(returned_result_files(self.context, dispatch_id), exemption, "任务尝试豁免")
+            contract = delivered_work_contract(run, self.context.directory, dispatch_id)
             # The whole core contract, as when the exemption was granted.
             validate_work_core(result, contract, self.context.state)
             validate_work_bounds(result, contract)
             if (result["status"] != "blocked" or result["blocker_kind"] != exemption["blocker_kind"]
                     or entry.get("worker_outcome") != exemption["blocker_kind"] + "_blocked"):
                 raise HarnessError("任务尝试豁免与原始阻断结果不符；保留台账")
-        if any(value < 0 for value in work_attempts(self.context.run).values()):
+        if any(value < 0 for value in work_attempts(run).values()):
             raise HarnessError("任务尝试豁免超过实际调用次数；保留台账")
 
     def validate_provider_exemption(self, entry, exemption, tasks):
@@ -96,7 +97,7 @@ class AttemptAccounting(RuntimeService):
                 or evidence["provider"]["code"] != exemption["code"]):
             raise HarnessError("任务尝试豁免与供应商失败判定不符；保留台账")
 
-    def record_attempt_exemption(self, entry, result, source):
+    def prepare_attempt_exemption(self, entry, result, source):
         """Only a fully validated, durably retained wait may spare the task budget.
 
         Caller saves this with the blocked feedback. Crashes before that boundary
@@ -105,7 +106,15 @@ class AttemptAccounting(RuntimeService):
         """
         if result["status"] != "blocked" or result["blocker_kind"] not in ("environment", "operator"):
             return
-        entry["attempt_exemption"] = {
+        exemption = {
             "blocker_kind": result["blocker_kind"],
             "artifact": source["worker_artifact"], "artifact_digest": source["worker_artifact_digest"]}
-        self.validate_attempt_accounting()
+        run = self.context.run
+        dispatches = [dict(dispatch, attempt_exemption=exemption) if dispatch is entry else dispatch
+                      for dispatch in run["dispatches"]]
+        self.validate_attempt_accounting(dict(run, dispatches=dispatches))
+        return exemption
+
+    def apply_attempt_exemption(self, entry, exemption):
+        if exemption is not None:
+            entry["attempt_exemption"] = exemption

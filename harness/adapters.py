@@ -10,13 +10,17 @@ import time
 from copy import deepcopy
 from pathlib import Path
 
-from . import stops
+from . import interrupts, stops
 from .command_server import create_manifest
-from .provider_failures import LIMIT, claude_http_status, display_label, read_original
+from .provider_failures import LIMIT, claude_http_status, display_label
 from .shared import mcp_configs, toml_value
-from .state_files import StateFiles
-from .util import EvidenceError, HarnessError, dump, read_json, run_process, strict_json_loads, tail_text, write_json
+from .state_files import StateFiles, StateReadError
+from .util import EvidenceError, HarnessError, dump, output_tail_text, read_json, run_process, strict_json_loads, write_json
 from .worker_returns import decode_terminal
+
+
+class _CompletedResultReadError(StateReadError):
+    """Local I/O after a CLI returned zero, before its result could be judged."""
 
 
 class UndecodableOutput(HarnessError):
@@ -31,6 +35,19 @@ class UndecodableOutput(HarnessError):
         super().__init__(message)
 
 
+def result_kind(provider, raw):
+    """Return the terminal's classification, envelope, payload and decode detail."""
+    if provider != "codex":
+        return decode_terminal(raw)
+    try:
+        value = strict_json_loads(raw)
+    except (ValueError, UnicodeError, RecursionError) as error:
+        return "undecodable", None, None, error
+    if not isinstance(value, dict):
+        return "undecodable", None, None, None
+    return "object", None, value, None
+
+
 _USAGE_MAX_BYTES = 16 * 1024 * 1024
 _USAGE_MAX_COUNT = 2**63 - 1
 _CODEX_ERROR_TAIL_BYTES = 64 * 1024
@@ -39,28 +56,18 @@ _CODEX_ERROR_TAIL_BYTES = 64 * 1024
 OPERATOR_SKILL = "harness-operator"
 
 
-def _original_bytes(path, message):
-    """Read a successful call's original whole, preserving local I/O."""
-    state, raw = read_original(path, lambda stream: stream.read())
-    if state == "read":
-        return raw
-    stops.keep_local_io(raw)
-    raise HarnessError(message) from raw
-
-
-def codex_error_summary(path):
+def codex_error_summary(path, *, files=None):
     """Read only error envelopes from a bounded JSONL tail, not agent/tool text."""
-    def read(stream):
-        start = max(0, stream.seek(0, os.SEEK_END) - _CODEX_ERROR_TAIL_BYTES)
-        stream.seek(start)
-        return start, stream.read(_CODEX_ERROR_TAIL_BYTES)
-    state, value = read_original(path, read)
-    if state != "read":
+    path = Path(path)
+    if files is None:
+        files = StateFiles(path.parent)
+    tail = files.read((path.name,), limit=_CODEX_ERROR_TAIL_BYTES, part="tail")
+    raw = tail.bytes_or_none()
+    if raw is None:
         return ""
-    start, raw = value
     # A tail can start inside a UTF-8 character or a large JSON record.
     # Never parse the partial first record, even if its suffix looks valid.
-    if start:
+    if tail.size > _CODEX_ERROR_TAIL_BYTES:
         raw = raw.partition(b"\n")[2]
     details = []
     for line in reversed(raw.split(b"\n")):
@@ -97,7 +104,7 @@ def _usage_counts(value, fields):
             if type(value.get(key)) is int and 0 <= value[key] <= _USAGE_MAX_COUNT}
 
 
-def provider_usage(job, provider):
+def provider_usage(job, provider, *, files=None):
     """Read bounded diagnostics from the CLI, never from the model's response.
 
     Missing/invalid metrics stay unknown. ``reported_cost_usd`` is the CLI's nominal
@@ -105,8 +112,10 @@ def provider_usage(job, provider):
     never summed. None of these observations affect execution budgets.
     """
     try:
-        state, raw = read_original(job / "process.stdout", lambda stream: stream.read(_USAGE_MAX_BYTES + 1))
-        if state != "read" or len(raw) > _USAGE_MAX_BYTES:
+        if files is None:
+            files = StateFiles(job.parent).under(job.name)
+        raw = files.read(("process.stdout",), limit=_USAGE_MAX_BYTES).bytes_or_none()
+        if raw is None:
             return None
         if provider == "claude":
             result = json.loads(raw)
@@ -170,14 +179,16 @@ def claude_error_summary(value):
     return "Claude reported an error" + (": " + "; ".join(details) if details else "")
 
 
-def cli_error_summary(job, provider):
-    if provider == "codex":
-        return codex_error_summary(job / "process.stdout")
-    if provider != "claude":
+def cli_error_summary(job, provider, *, files=None):
+    if provider not in ("codex", "claude"):
         return ""
+    if files is None:
+        files = StateFiles(job.parent).under(job.name)
+    if provider == "codex":
+        return codex_error_summary(job / "process.stdout", files=files)
     try:
-        state, raw = read_original(job / "process.stdout", lambda stream: stream.read(_USAGE_MAX_BYTES + 1))
-        return claude_error_summary(json.loads(raw)) if state == "read" and len(raw) <= _USAGE_MAX_BYTES else ""
+        raw = files.read(("process.stdout",), limit=_USAGE_MAX_BYTES).bytes_or_none()
+        return claude_error_summary(json.loads(raw)) if raw is not None else ""
     except (ValueError, UnicodeError, RecursionError):
         return ""
 
@@ -321,7 +332,8 @@ class CLIBackend:
         try:
             code = run_process(argv, cwd, job / "process", stdin=prompt,
                                timeout=remaining, env=env, on_start=on_start,
-                               execution_deadline=parent_deadline, on_outcome=record_outcome)
+                               execution_deadline=parent_deadline, on_outcome=record_outcome,
+                               checkpoint=interrupts.deliver if interrupts.active() else None)
         except (Exception, KeyboardInterrupt, SystemExit) as error:
             outcome = getattr(error, "outcome", None)
             if (role in ("commander", "reviewer") and outcome is not None
@@ -339,14 +351,22 @@ class CLIBackend:
                 except HarnessError as capture_error:
                     # As on the exception path: evidence that cannot be read never replaces the CLI failure.
                     note = f"Terminal evidence preservation failed: {type(capture_error).__name__}: {capture_error}"
-            diagnostic = cli_error_summary(job, model["cli"])
+            files = self._job_files(job)
+            diagnostic = cli_error_summary(job, model["cli"], files=files)
             detail = f"；{diagnostic}" if diagnostic else ""
-            state, stderr = read_original(job / "process.stderr", tail_text)
-            failure = HarnessError(f"{role} CLI exit={code}{detail}；{job}\n{stderr if state == 'read' else ''}")
+            stderr = output_tail_text(files.read(("process.stderr",), limit=4000, part="tail"))
+            failure = HarnessError(f"{role} CLI exit={code}{detail}；{job}\n{stderr}")
             if note:
                 failure.add_note(note)
             raise failure
         return self.completed_result(job, model["cli"])
+
+    def _job_files(self, job):
+        job, state = Path(job), Path(self.state)
+        if not job.is_relative_to(state):
+            # An explicitly supplied state root may have a system path alias.
+            state = state.resolve()
+        return StateFiles(state).under(*job.relative_to(state).parts)
 
     def preserve_terminal(self, job, provider, outcome, *, terminal_only=False):
         """Save designated terminal evidence separately from process success.
@@ -354,11 +374,8 @@ class CLIBackend:
         Read each original once, below the state root. A failed read propagates
         even if there is insufficient process evidence to require a capture.
         """
-        job, state = Path(job), Path(self.state)
-        if not job.is_relative_to(state):
-            # An explicitly supplied state root may have a system path alias.
-            state = state.resolve()
-        files = StateFiles(state).under(*job.relative_to(state).parts)
+        job = Path(job)
+        files = self._job_files(job)
         source = "response.json" if provider == "codex" else "process.stdout"
         read = files.read((source,), limit=LIMIT).or_local_io()
         if read.state in ("absent", "refused") and not read.step.leaf:
@@ -394,6 +411,13 @@ class CLIBackend:
             write_json(job / "returned-result.json", value)
         return True
 
+    def terminal_read(self, job, provider):
+        """Read the designated original once, without publishing any result."""
+        job = Path(job)
+        files = self._job_files(job) if self.state is not None else StateFiles(job.parent).under(job.name)
+        source = "response.json" if provider == "codex" else "process.stdout"
+        return files.read((source,), limit=None)
+
     def completed_result(self, job, provider, raw=None):
         """Parse only the provider's designated, complete terminal artifact.
 
@@ -403,23 +427,26 @@ class CLIBackend:
         no-result classifier uses, so both reach the same verdict on the same bytes.
         ``raw``: the terminal's bytes, when a failed call's capture already read them.
         """
-        if provider == "codex":
-            path = job / "response.json"
-            if raw is None:
-                if not path.exists():
-                    raise HarnessError(f"Codex 未输出结构化结果：{job}")
-                raw = _original_bytes(path, f"Codex 结构化结果无法读取；日志：{path}")
-            try:
-                value = strict_json_loads(raw)
-            except (ValueError, UnicodeError, RecursionError) as e:
-                raise UndecodableOutput(path, raw, f"Codex 结构化结果不能严格解码（{type(e).__name__}）；日志：{path}") from e
-            if not isinstance(value, dict):
-                raise UndecodableOutput(path, raw, f"Codex 结构化结果必须为 JSON 对象；日志：{path}")
-            return value
-        path = job / "process.stdout"
+        codex = provider == "codex"
+        path = job / ("response.json" if codex else "process.stdout")
         if raw is None:
-            raw = _original_bytes(path, f"Claude 未返回有效 JSON；日志：{path}")
-        kind, envelope, value, detail = decode_terminal(raw)
+            outcome = self.terminal_read(job, provider)
+            if outcome.state == "failed":
+                raise _CompletedResultReadError(outcome)
+            raw = outcome.bytes_or_none()
+            if raw is None:
+                if codex and outcome.state == "absent":
+                    raise HarnessError(f"Codex 未输出结构化结果：{job}")
+                if codex:
+                    raise HarnessError(f"Codex 结构化结果无法读取；日志：{path}")
+                raise HarnessError(f"Claude 未返回有效 JSON；日志：{path}")
+        kind, envelope, value, detail = result_kind(provider, raw)
+        if codex:
+            if kind == "object":
+                return value
+            if detail is not None:
+                raise UndecodableOutput(path, raw, f"Codex 结构化结果不能严格解码（{type(detail).__name__}）；日志：{path}") from detail
+            raise UndecodableOutput(path, raw, f"Codex 结构化结果必须为 JSON 对象；日志：{path}")
         if isinstance(envelope, dict):
             write_json(job / "provider-result.json", envelope)
         if kind == "absent":

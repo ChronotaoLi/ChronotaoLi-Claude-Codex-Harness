@@ -1936,6 +1936,18 @@ class HoldingInterruptTests(SignalCase):
 # a module's last read and deletes the old reading helpers it defines adds it here; state_files.py never.
 MIGRATED = {
     "run_store.py": [], "worker_returns.py": [], "path_evidence.py": [], "input_projection.py": [],
+    "diagnostics.py": [], "provider_failures.py": [],
+    "receipts.py": [], "runtime_evidence.py": [],
+    # Explicit operator inputs, write preparation and worker-declared candidate inputs.
+    "continuation.py": [("_read_input", "open")],
+    "decisions.py": [("read_decision", "open")],
+    "environment.py": [("read_update", "open")],
+    "planning.py": [("apply_pending_revision", "exists")],
+    "progress.py": [
+        ("_checkpoint_path", "resolve"), ("_checkpoint_path", "resolve"),
+        ("_regular_file", "is_symlink"), ("_regular_file", "is_file"),
+        ("_file_digest", "open"), ("_read", "open"), ("record_checkpoints", "open"),
+    ],
     "command_server.py": [
         # Worktree identity and traversal, path checks before writes, lock creation and directory fsync.
         ("_safe", "lstat"), ("create_manifest", "resolve"), ("create_manifest", "os.stat"),

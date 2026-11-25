@@ -272,9 +272,18 @@ class LifecycleTests(SamplingCase):
             result = engine.start("Implement greet", plan())
         self.assertEqual(result["status"], "completed")
         self.assertEqual(read_json(engine.directory / "state.json"), result)
-        self.assertIn("警告", errors.getvalue())
+        self.assertIn("status=completed", errors.getvalue())
         self.assertEqual([suffix(name) for name in self.names(engine)],
-                         ["claude-before_use.json", "codex-before_use.json"])
+                         ["claude-before_use.json", "codex-before_use.json",
+                          "claude-completed.json", "codex-completed.json"])
+        for provider in ("claude", "codex"):
+            sample = self.sample(engine, f"{provider}-completed.json")
+            self.assertFalse(sample["available"])
+            self.assertEqual(sample["detail"], {"error_type": "InterruptedProbe"})
+            self.assertEqual(sample["ledger_revision"], result["store_revision"])
+            self.assertEqual(sample["process"]["started"], provider == "claude")
+            self.assertTrue(sample["process"]["exit_confirmed"])
+        self.assertEqual(len(calls.probes("codex")), 1)
         self.assertTrue(group_gone(calls.probes("claude")[-1]["pid"]))
 
     def test_the_stop_is_saved_before_its_end_sample_starts(self):  # L9
@@ -520,8 +529,12 @@ class AdmissionTests(SamplingCase):
         self.assertEqual(saved["status"], "blocked")
         self.assertEqual(saved["stop"], stops.of(caught.exception))
         self.assertEqual((saved["stop"]["kind"], saved["stop"]["reason"]), ("budget", "agent_dispatches"))
-        self.assertIn("警告", errors.getvalue())
-        self.assertFalse(any(name.endswith("claude-stop.json") for name in self.names(engine)))
+        self.assertIn("status=blocked", errors.getvalue())
+        sample = self.sample(engine, "claude-stop.json")
+        self.assertEqual(sample["ledger_revision"], saved["store_revision"])
+        self.assertTrue(sample["available"])
+        self.assertTrue(sample["zero_call"]["verified"])
+        self.assertTrue(sample["process"]["exit_confirmed"])
         self.assertEqual(len(calls.probes("claude")), 2)
         self.assertTrue(group_gone(calls.probes("claude")[-1]["pid"]))
 

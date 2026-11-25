@@ -13,6 +13,8 @@ import re
 import time
 
 from .contracts import validate_work_core
+from .recovery import evidence_path, returned_result_files, run_files
+from .runtime_evidence import optional_bytes, read_or_write
 from .worker_receipts import delivered_work_contract
 from .util import EvidenceError, HarnessError, dump, fold_name, write_json
 
@@ -132,12 +134,15 @@ class ProgressRecovery(RuntimeService):
         key = task_id, dispatch_id, source["artifact_digest"], validate_declarations
         if _validation is not None and key in _validation.sources:
             return _validation.sources[key]
-        raw = _read(expected)
+        reference = {"artifact": str(expected), "artifact_digest": source["artifact_digest"], "dispatch_id": dispatch_id}
+        files = returned_result_files(self.context, dispatch_id)
+        evidence_path(files, reference)
+        raw = files.read((), limit=None).evidence(reference)
         if _digest(raw) != source["artifact_digest"]:
             # Changed evidence, by class: the load boundary and settling make it load_integrity.
             raise EvidenceError("checkpoint original result changed", stop=stops.make(
                 "evidence", "runtime_integrity",
-                source={"artifact": str(expected), "artifact_digest": source["artifact_digest"]}))
+                source=reference))
         try:
             result = json.loads(raw)
         except (ValueError, UnicodeError) as error:
@@ -186,9 +191,11 @@ class ProgressRecovery(RuntimeService):
             return []
         folder = self.context.directory / "checkpoints" / dispatch_id
         resolution_path = self.context.directory / "checkpoints" / "batches" / (dispatch_id + ".json")
-        for private_folder in (folder, resolution_path.parent):
-            if any(p.is_symlink() for p in (private_folder, *private_folder.parents)):
-                raise HarnessError("checkpoint private directory is a symlink")
+        files = run_files(self.context)
+        resolution_parts = ("checkpoints", "batches", resolution_path.name)
+        folder_status = files.probe(("checkpoints", dispatch_id), expect="directory").or_local_io()
+        if folder_status.state == "refused":
+            folder_status.evidence({"artifact": str(folder)})
         batches = self.context.run.get("checkpoint_batches")
         batch = next((b for b in batches if b["dispatch_id"] == dispatch_id), None)
         if batch is not None:
@@ -196,9 +203,10 @@ class ProgressRecovery(RuntimeService):
             if resolution["source"] != source:
                 raise HarnessError("checkpoint batch source conflict")
             return resolution["discarded"]
-        if resolution_path.exists() or resolution_path.is_symlink():
+        resolution_raw = optional_bytes(files, resolution_parts, {"artifact": str(resolution_path)})
+        if resolution_raw is not None:
             resolution = self._checkpoint_resolution({"task_id": task_id, "dispatch_id": dispatch_id,
-                "artifact": str(resolution_path), "artifact_digest": _digest(_read(resolution_path))})
+                "artifact": str(resolution_path), "artifact_digest": _digest(resolution_raw)}, raw=resolution_raw)
             if resolution["source"] != source:
                 raise HarnessError("checkpoint recovery resolution conflict")
             prepared, discarded = resolution["rows"], resolution["discarded"]
@@ -216,16 +224,18 @@ class ProgressRecovery(RuntimeService):
                 discarded.append({"index": item_index, "reason": str(error)[:2000]})
                 continue
             artifact = folder / (item["id"] + ".json")
-            if artifact.exists():
+            parts = ("checkpoints", dispatch_id, artifact.name)
+            reference = {"artifact": str(artifact)}
+            manifest_raw = optional_bytes(files, parts, reference)
+            if manifest_raw is not None:
                 try:
-                    record = json.loads(_read(artifact))
+                    record = json.loads(manifest_raw)
                 except (ValueError, UnicodeError) as error:
                     raise HarnessError("checkpoint recovery artifact corrupt") from error
                 if (record.get("checkpoint") != item or record.get("source") != source
                         or record.get("task_id") != task_id or record.get("dispatch_id") != dispatch_id):
                     raise HarnessError("checkpoint recovery artifact conflict")
-                self._validate_checkpoint_record(record, folder)
-                total += sum(len(_read(ref["artifact"], 1024 * 1024)) for ref in record["evidence"])
+                total += self._validate_checkpoint_record(record, folder)
                 if total > 16 * 1024 * 1024:
                     raise HarnessError("checkpoint batch exceeds 16 MiB")
             else:
@@ -248,11 +258,12 @@ class ProgressRecovery(RuntimeService):
                 evidence = []
                 for index, (ref, raw) in enumerate(zip(item["evidence"], contents)):
                     target = folder / f"{item['id']}-{index}.bin"
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    if target.exists():
-                        if _read(target) != raw:
+                    copied = optional_bytes(files, ("checkpoints", dispatch_id, target.name), {"artifact": str(target)})
+                    if copied is not None:
+                        if copied != raw:
                             raise HarnessError("checkpoint evidence recovery conflict")
                     else:
+                        target.parent.mkdir(parents=True, exist_ok=True)
                         with target.open("xb") as stream:
                             stream.write(raw)
                             stream.flush()
@@ -267,29 +278,41 @@ class ProgressRecovery(RuntimeService):
                           "source": deepcopy(source), "recorded_at": recorded_at,
                           "freshness_origin": origin, "evidence": evidence}
                 write_json(artifact, record)
+                manifest_raw = files.read(parts, limit=None).evidence(reference)
             prepared.append({"task_id": task_id, "dispatch_id": dispatch_id, "checkpoint_id": item["id"],
-                             "artifact": str(artifact), "artifact_digest": _digest(_read(artifact))})
+                             "artifact": str(artifact), "artifact_digest": _digest(manifest_raw)})
         write_json(resolution_path, {"task_id": task_id, "dispatch_id": dispatch_id,
                    "source": deepcopy(source), "rows": prepared, "discarded": discarded})
         return self._register_checkpoint_batch(task_id, dispatch_id, source, prepared, discarded, resolution_path)
 
     def _register_checkpoint_batch(self, task_id, dispatch_id, source, prepared, discarded, resolution_path):
+        files = run_files(self.context).under("checkpoints", "batches", dispatch_id + ".json")
+        reference = {"artifact": str(resolution_path)}
+        evidence_path(files, reference)
+        raw = files.read((), limit=None).evidence(reference)
+        batch = {"task_id": task_id, "dispatch_id": dispatch_id,
+                 "artifact": str(resolution_path), "artifact_digest": _digest(raw)}
+        checkpoints = [*self.context.run["task_checkpoints"], *prepared]
+        batches = [*self.context.run["checkpoint_batches"], batch]
+        result = deepcopy(discarded)
         for row in prepared:
             self.context.event("task_checkpoint_recorded", **row)
-        self.context.run["task_checkpoints"].extend(prepared)
-        self.context.run["checkpoint_batches"].append({"task_id": task_id, "dispatch_id": dispatch_id,
-            "artifact": str(resolution_path), "artifact_digest": _digest(_read(resolution_path))})
-        self.context.save()
-        return deepcopy(discarded)
+        with self.context.publish():
+            self.context.run["task_checkpoints"] = checkpoints
+            self.context.run["checkpoint_batches"] = batches
+        return result
 
     def _checkpoint_manifest(self, row, validation):
+        files = run_files(self.context).under("checkpoints", row["dispatch_id"], row["checkpoint_id"] + ".json")
+        evidence_path(files, row)
         cached = validation.manifests.get(row["artifact"])
         if cached is not None:
             digest, record = cached
             if digest != row["artifact_digest"]:
                 raise HarnessError("checkpoint manifest changed")
             return record
-        raw = _read(row["artifact"])
+        source = {key: row[key] for key in ("artifact", "artifact_digest", "dispatch_id", "task_id")}
+        raw = files.read((), limit=None).evidence(source)
         digest = _digest(raw)
         if digest != row["artifact_digest"]:
             raise HarnessError("checkpoint manifest changed")
@@ -300,7 +323,7 @@ class ProgressRecovery(RuntimeService):
         validation.manifests[row["artifact"]] = digest, record
         return record
 
-    def _checkpoint_resolution(self, batch, *, _validation=None):
+    def _checkpoint_resolution(self, batch, *, _validation=None, raw=None):
         validation = _validation if _validation is not None else _CheckpointValidation()
         if (not isinstance(batch, dict) or set(batch) != {"task_id", "dispatch_id", "artifact", "artifact_digest"}
                 or not all(isinstance(v, str) for v in batch.values())
@@ -309,7 +332,10 @@ class ProgressRecovery(RuntimeService):
         folder = self.context.directory / "checkpoints" / batch["dispatch_id"]
         if batch["artifact"] != str(self.context.directory / "checkpoints" / "batches" / (batch["dispatch_id"] + ".json")):
             raise HarnessError("invalid checkpoint batch path")
-        raw = _read(batch["artifact"])
+        files = run_files(self.context).under("checkpoints", "batches", batch["dispatch_id"] + ".json")
+        evidence_path(files, batch)
+        if raw is None:
+            raw = files.read((), limit=None).evidence(batch)
         if _digest(raw) != batch["artifact_digest"]:
             raise HarnessError("checkpoint batch resolution changed")
         try:
@@ -376,11 +402,13 @@ class ProgressRecovery(RuntimeService):
         if not isinstance(evidence, list) or len(evidence) != len(item["evidence"]):
             raise HarnessError("checkpoint evidence references invalid")
         total = 0
+        files = run_files(self.context).under("checkpoints", record["dispatch_id"])
         for index, (ref, declared) in enumerate(zip(evidence, item["evidence"])):
             expected = folder / f"{item['id']}-{index}.bin"
             if ref != {**declared, "artifact": str(expected), "artifact_digest": declared["sha256"]}:
                 raise HarnessError("checkpoint cached evidence changed")
-            raw = _read(expected, 1024 * 1024)
+            source = {"artifact": str(expected), "artifact_digest": declared["sha256"]}
+            raw = files.read((expected.name,), limit=1024 * 1024).evidence(source)
             if _digest(raw) != declared["sha256"]:
                 raise HarnessError("checkpoint cached evidence changed")
             total += len(raw)
@@ -434,12 +462,8 @@ class ProgressRecovery(RuntimeService):
         raw = (dump(value) + "\n").encode("utf-8")
         digest = _digest(raw)
         folder = self.context.directory / "checkpoints" / "indexes"
-        if any(p.is_symlink() for p in (folder, *folder.parents)):
-            raise HarnessError("checkpoint index directory is a symlink")
         artifact = folder / (digest + ".json")
-        if not artifact.exists() and not artifact.is_symlink():
-            write_json(artifact, value)
-        if _read(artifact) != raw:
+        if read_or_write(run_files(self.context), ("checkpoints", "indexes", artifact.name), artifact, value) != raw:
             raise HarnessError("checkpoint index changed")
         return {"artifact": str(artifact), "artifact_digest": digest, "count": len(rows)}
 

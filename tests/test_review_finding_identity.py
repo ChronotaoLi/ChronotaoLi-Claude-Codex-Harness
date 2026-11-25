@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock
 
+from harness.state_files import StateFiles
 from harness.review_progress import repair_findings, required_findings, claim_gaps, disposition_gaps
 from harness.run_store import RunStore
 from harness.task_lifecycle import TaskLifecycle
@@ -51,7 +52,7 @@ class FindingIdentityTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             run, record = self.history(tmp)
             original = record('first', dict(verdict='request_changes', findings=[finding(), finding()]))
-            required = required_findings(run, 't', 'candidate')
+            required = required_findings(run, 't', 'candidate', files=StateFiles(Path(tmp).resolve()).under("runs", run["id"]))
             self.assertEqual([r['key'] for r in required], ['f1', 'f2'])
             self.assertEqual([r['finding_index'] for r in required], [0, 1])
             self.assertEqual([r['label'] for r in required], ['edge-case'] * 2)
@@ -67,12 +68,12 @@ class FindingIdentityTests(unittest.TestCase):
                                                  'f2': {'status': 'open', 'evidence': []}})
             record('second', invalid, status='invalid_rejected', validation_error='invalid evidence',
                    required_findings=required)
-            self.assertEqual(len(required_findings(run, 't', 'candidate')), 2)
+            self.assertEqual(len(required_findings(run, 't', 'candidate', files=StateFiles(Path(tmp).resolve()).under("runs", run["id"]))), 2)
             # A usable review resolving only the first leaves the second, by position.
             partial = dict(verdict='request_changes', findings=[],
                            finding_dispositions=self.dispositions(f1='resolved', f2='open'))
-            record('third', partial, required_findings=required_findings(run, 't', 'candidate'))
-            remaining = required_findings(run, 't', 'candidate')
+            record('third', partial, required_findings=required_findings(run, 't', 'candidate', files=StateFiles(Path(tmp).resolve()).under("runs", run["id"])))
+            remaining = required_findings(run, 't', 'candidate', files=StateFiles(Path(tmp).resolve()).under("runs", run["id"]))
             self.assertEqual([(r['key'], r['finding_index'], r['label']) for r in remaining], [('f1', 1, 'edge-case')])
             self.assertEqual(original['review']['findings'], [finding(), finding()])
 
@@ -84,25 +85,25 @@ class FindingIdentityTests(unittest.TestCase):
                 run, record = self.history(tmp)
                 record('R1', dict(verdict='request_changes', summary='s', approved_memory_keys=[],
                                   findings=[{**finding(), 'id': 'A'}, advisory, {**finding(), 'id': 'B'}]), 'X1')
-                copy_rows = required_findings(run, 't', 'X2')
+                copy_rows = required_findings(run, 't', 'X2', files=StateFiles(Path(tmp).resolve()).under("runs", run["id"]))
                 self.assertEqual([(r['key'], r['finding_index'], r['label']) for r in copy_rows],
                                  [('f1', 0, 'A'), ('f2', 2, 'B')])
                 second = record('R2', dict(verdict='request_changes', summary='s', approved_memory_keys=[], findings=[],
                                            finding_dispositions=self.dispositions(**statuses)),
                                 'X2', required_findings=copy_rows)
-                self.assertEqual([(r['finding_index'], r['label']) for r in required_findings(run, 't', 'X2')], expected)
-                self.assertEqual([r['finding_index'] for r in required_findings(run, 't', 'X3')], [0, 2])
+                self.assertEqual([(r['finding_index'], r['label']) for r in required_findings(run, 't', 'X2', files=StateFiles(Path(tmp).resolve()).under("runs", run["id"]))], expected)
+                self.assertEqual([r['finding_index'] for r in required_findings(run, 't', 'X3', files=StateFiles(Path(tmp).resolve()).under("runs", run["id"]))], [0, 2])
                 # A copy whose rows no longer equal what the dispatch received cannot close anything.
                 second['required_findings'] = list(reversed(copy_rows))
                 with self.assertRaisesRegex(HarnessError, '对照不符'):
-                    required_findings(run, 't', 'X2')
+                    required_findings(run, 't', 'X2', files=StateFiles(Path(tmp).resolve()).under("runs", run["id"]))
                 second['required_findings'] = copy_rows[:1]
                 with self.assertRaisesRegex(HarnessError, '对照不符'):
-                    required_findings(run, 't', 'X2')
+                    required_findings(run, 't', 'X2', files=StateFiles(Path(tmp).resolve()).under("runs", run["id"]))
 
-    def disposed(self, record, run, ident, snapshot, statuses, **extra):
+    def disposed(self, record, run, tmp, ident, snapshot, statuses, **extra):
         """Record a review of snapshot that disposes the rows its dispatch received."""
-        rows = required_findings(run, 't', snapshot)
+        rows = required_findings(run, 't', snapshot, files=StateFiles(Path(tmp).resolve()).under("runs", run["id"]))
         return record(ident, dict(verdict='request_changes', findings=[],
                                   finding_dispositions=self.dispositions(**statuses)),
                       snapshot, required_findings=rows, **extra)
@@ -111,19 +112,19 @@ class FindingIdentityTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             run, record = self.history(tmp)
             record('R1', reported('A', 'B'), 'X1')
-            self.assertEqual(labels(repair_findings(run, 't')), ['A', 'B'])
+            self.assertEqual(labels(repair_findings(run, 't', files=StateFiles(Path(tmp).resolve()).under("runs", run["id"]))), ['A', 'B'])
             for ident, snapshot, statuses, repair in (
                     # not_checked neither takes B off the list nor, next, puts A back on it.
                     ('R2', 'X2', dict(f1='resolved', f2='not_checked'), ['B']),
                     ('R3', 'X3', dict(f1='not_checked', f2='resolved'), []),
                     ('R4', 'X4', dict(f1='open', f2='not_checked'), ['A'])):
-                self.disposed(record, run, ident, snapshot, statuses)
-                self.assertEqual(labels(repair_findings(run, 't')), repair)
-            self.assertEqual([(r['key'], r['finding_index']) for r in repair_findings(run, 't')], [('f1', 0)])
+                self.disposed(record, run, tmp, ident, snapshot, statuses)
+                self.assertEqual(labels(repair_findings(run, 't', files=StateFiles(Path(tmp).resolve()).under("runs", run["id"]))), repair)
+            self.assertEqual([(r['key'], r['finding_index']) for r in repair_findings(run, 't', files=StateFiles(Path(tmp).resolve()).under("runs", run["id"]))], [('f1', 0)])
             # Leaving the repair list never closes a finding beyond the candidate that was reviewed.
-            self.assertEqual(labels(required_findings(run, 't', 'X2')), ['B'])
-            self.assertEqual(labels(required_findings(run, 't', 'X3')), ['A'])
-            self.assertEqual(labels(required_findings(run, 't', 'X5')), ['A', 'B'])
+            self.assertEqual(labels(required_findings(run, 't', 'X2', files=StateFiles(Path(tmp).resolve()).under("runs", run["id"]))), ['B'])
+            self.assertEqual(labels(required_findings(run, 't', 'X3', files=StateFiles(Path(tmp).resolve()).under("runs", run["id"]))), ['A'])
+            self.assertEqual(labels(required_findings(run, 't', 'X5', files=StateFiles(Path(tmp).resolve()).under("runs", run["id"]))), ['A', 'B'])
 
     def test_unusable_reviews_keep_their_open_vetoes_but_never_resolve(self):
         for status in ('invalid_rejected', 'invalidated'):
@@ -132,16 +133,16 @@ class FindingIdentityTests(unittest.TestCase):
             with self.subTest(status=status), TemporaryDirectory() as tmp:
                 run, record = self.history(tmp)
                 record('R1', reported('A', 'B'), 'X1')
-                self.disposed(record, run, 'R2', 'X2', dict(f1='resolved', f2='resolved'))
-                self.assertEqual(repair_findings(run, 't'), [])
-                self.disposed(record, run, 'R3', 'X3', dict(f1='open', f2='resolved'), **extra)
-                self.assertEqual(labels(repair_findings(run, 't')), ['A'])
-                self.disposed(record, run, 'R4', 'X4', dict(f1='resolved', f2='not_checked'), **extra)
-                self.assertEqual(labels(repair_findings(run, 't')), ['A'])
+                self.disposed(record, run, tmp, 'R2', 'X2', dict(f1='resolved', f2='resolved'))
+                self.assertEqual(repair_findings(run, 't', files=StateFiles(Path(tmp).resolve()).under("runs", run["id"])), [])
+                self.disposed(record, run, tmp, 'R3', 'X3', dict(f1='open', f2='resolved'), **extra)
+                self.assertEqual(labels(repair_findings(run, 't', files=StateFiles(Path(tmp).resolve()).under("runs", run["id"]))), ['A'])
+                self.disposed(record, run, tmp, 'R4', 'X4', dict(f1='resolved', f2='not_checked'), **extra)
+                self.assertEqual(labels(repair_findings(run, 't', files=StateFiles(Path(tmp).resolve()).under("runs", run["id"]))), ['A'])
                 # Neither unusable review closed anything on the candidate it reviewed.
-                self.assertEqual(labels(required_findings(run, 't', 'X3')), ['A', 'B'])
-                self.assertEqual(labels(required_findings(run, 't', 'X4')), ['A', 'B'])
-                self.assertEqual(required_findings(run, 't', 'X2'), [])
+                self.assertEqual(labels(required_findings(run, 't', 'X3', files=StateFiles(Path(tmp).resolve()).under("runs", run["id"]))), ['A', 'B'])
+                self.assertEqual(labels(required_findings(run, 't', 'X4', files=StateFiles(Path(tmp).resolve()).under("runs", run["id"]))), ['A', 'B'])
+                self.assertEqual(required_findings(run, 't', 'X2', files=StateFiles(Path(tmp).resolve()).under("runs", run["id"])), [])
 
     def test_every_saved_copy_is_checked_whatever_its_candidate_or_usability(self):
         tampers = (('order', lambda rows: list(reversed(rows))), ('count', lambda rows: rows[:1]),
@@ -149,12 +150,12 @@ class FindingIdentityTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             run, record = self.history(tmp)
             record('R1', reported('A', 'B'), 'X1')
-            saved = [self.disposed(record, run, ident, snapshot, dict(f1='open', f2='open'), **extra)
+            saved = [self.disposed(record, run, tmp, ident, snapshot, dict(f1='open', f2='open'), **extra)
                      for ident, snapshot, extra in (
                          ('R2', 'X2', {}),
                          ('R3', 'X3', dict(status='invalid_rejected', validation_error='invalid evidence')),
                          ('R4', 'X4', dict(status='invalidated')))]
-            self.assertEqual(labels(required_findings(run, 't', 'X5')), ['A', 'B'])
+            self.assertEqual(labels(required_findings(run, 't', 'X5', files=StateFiles(Path(tmp).resolve()).under("runs", run["id"]))), ['A', 'B'])
             for entry in saved:
                 original = entry['required_findings']
                 for name, tamper in tampers:
@@ -162,11 +163,11 @@ class FindingIdentityTests(unittest.TestCase):
                         entry['required_findings'] = tamper(original)
                         # Neither list may be derived from a history with a copy that differs.
                         with self.assertRaisesRegex(HarnessError, '对照不符'):
-                            required_findings(run, 't', 'X5')
+                            required_findings(run, 't', 'X5', files=StateFiles(Path(tmp).resolve()).under("runs", run["id"]))
                         with self.assertRaisesRegex(HarnessError, '对照不符'):
-                            repair_findings(run, 't')
+                            repair_findings(run, 't', files=StateFiles(Path(tmp).resolve()).under("runs", run["id"]))
                 entry['required_findings'] = original
-            self.assertEqual(labels(repair_findings(run, 't')), ['A', 'B'])
+            self.assertEqual(labels(repair_findings(run, 't', files=StateFiles(Path(tmp).resolve()).under("runs", run["id"]))), ['A', 'B'])
 
     def test_an_empty_or_non_mapping_disposition_field_is_still_checked_against_its_copy(self):
         # An authenticated original registered as invalidated whose dispatch received
@@ -176,11 +177,11 @@ class FindingIdentityTests(unittest.TestCase):
             with self.subTest(name), TemporaryDirectory() as tmp:
                 run, record = self.history(tmp)
                 record('R1', reported('A'), 'X1')
-                rows = required_findings(run, 't', 'X2')
+                rows = required_findings(run, 't', 'X2', files=StateFiles(Path(tmp).resolve()).under("runs", run["id"]))
                 self.assertEqual(labels(rows), ['A'])
                 record('R2', dict(verdict='request_changes', findings=[], finding_dispositions=dispositions),
                        'X2', required_findings=rows if keep_copy else [], status='invalidated')
-                for calculate in (lambda: required_findings(run, 't', 'X3'), lambda: repair_findings(run, 't')):
+                for calculate in (lambda: required_findings(run, 't', 'X3', files=StateFiles(Path(tmp).resolve()).under("runs", run["id"])), lambda: repair_findings(run, 't', files=StateFiles(Path(tmp).resolve()).under("runs", run["id"]))):
                     with self.assertRaisesRegex(EvidenceError, '对照不符') as caught:
                         calculate()
                     self.assertEqual((caught.exception.stop['kind'], caught.exception.stop['reason']),
@@ -190,14 +191,14 @@ class FindingIdentityTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             run, record = self.history(tmp)
             record('R1', reported('X', 'Y'), 'S0')
-            self.disposed(record, run, 'R2', 'A', dict(f1='resolved', f2='open'))
-            self.disposed(record, run, 'R3', 'B', dict(f1='open', f2='resolved'),
+            self.disposed(record, run, tmp, 'R2', 'A', dict(f1='resolved', f2='open'))
+            self.disposed(record, run, tmp, 'R3', 'B', dict(f1='open', f2='resolved'),
                           status='invalid_rejected', validation_error='invalid evidence')
             # Back on A's bytes: A's usable resolution of X still holds there, while
             # B's kept veto puts X back on the repair list and B resolves nothing.
-            self.assertEqual(labels(required_findings(run, 't', 'A')), ['Y'])
-            self.assertEqual(labels(required_findings(run, 't', 'B')), ['X', 'Y'])
-            self.assertEqual(labels(repair_findings(run, 't')), ['X', 'Y'])
+            self.assertEqual(labels(required_findings(run, 't', 'A', files=StateFiles(Path(tmp).resolve()).under("runs", run["id"]))), ['Y'])
+            self.assertEqual(labels(required_findings(run, 't', 'B', files=StateFiles(Path(tmp).resolve()).under("runs", run["id"]))), ['X', 'Y'])
+            self.assertEqual(labels(repair_findings(run, 't', files=StateFiles(Path(tmp).resolve()).under("runs", run["id"]))), ['X', 'Y'])
 
     def test_stale_post_accept_cannot_write_either_memory_stage(self):
         for task_memory_saved in (False, True):

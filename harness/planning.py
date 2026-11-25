@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import os
 import sys
 from copy import deepcopy
@@ -20,12 +21,13 @@ from .config import PROJECT_FILE
 from .context import compact_feedback
 from .contracts import apply_revision, DECIDE, validate_decision, validate_plan, validate_required_commands
 from .receipts import judged_decide, ProposalCapacityHold, ScopeHold, SuppliedPlanHold
-from .recovery import read_bound_result, snapshot_digest, worker_recovery_context
+from .recovery import bound_result, evidence_path, returned_result_files, run_files, snapshot_digest, worker_recovery_context
+from .runtime_evidence import optional_bytes
 from .requirements import missing_commands
 from .scope import gaps as scope_gaps, proposal_gaps, proposal_request_id, scope_args, suggestions
 from .services import RuntimeService
 from .shared import skills_catalog
-from .util import dump, HarnessError, strict_json_loads, uid, write_json
+from .util import dump, EvidenceError, HarnessError, strict_json_loads, uid, write_json
 
 DECIDE_KEY = "commander:decide:run"
 
@@ -78,10 +80,6 @@ class Planner(RuntimeService):
                                  "计划批准不授予命令权限，本检查不消耗 worker 尝试或模型派发额度",
                                stop=stops.make("missing_commands", reason, source=source,
                                                data={"config_key": "permissions.worker_commands", "missing": unmet}))
-
-    def decide_returned(self):
-        receipt = self.context.run["commander_receipts"].get(DECIDE_KEY)
-        return receipt is not None and self.services.receipts.returned(receipt)
 
     # ---- the decide request -------------------------------------------------
     def gated_tasks(self):
@@ -176,7 +174,11 @@ class Planner(RuntimeService):
             return None
         reference = last["proposal_rejection"]
         with stops.evidence_reads(source={"artifact": reference["artifact"], "dispatch_id": last["id"]}):
-            record, _ = read_bound_result(reference, "提案拒绝")
+            digest = reference.get("artifact_digest")
+            if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+                raise HarnessError("提案拒绝文件摘要无效；保留现场")
+            files = run_files(self.context).under("proposal-rejections", f"{digest}.json")
+            record, _ = bound_result(files, reference, "提案拒绝")
             source = record.get("source") if isinstance(record, dict) else None
             if (not isinstance(source, dict) or source.get("dispatch_id") != last["id"]
                     or record.get("run_id") != self.context.run["id"]):
@@ -235,7 +237,7 @@ class Planner(RuntimeService):
         entry = next((d for d in run["dispatches"] if d.get("id") == receipt["dispatch_id"]), None)
         if entry is None or not judged_decide(entry) or "proposal_rejection" in entry:
             return None
-        result, _ = read_bound_result(receipt, "指挥")
+        result, _ = bound_result(returned_result_files(self.context, entry["id"]), receipt, "指挥")
         if not isinstance(result, dict) or result.get("action") != "revise":
             return None
         payload = {k: v for k, v in result.items() if k not in ("task_id", "dispatch_id")}
@@ -259,12 +261,14 @@ class Planner(RuntimeService):
         # A plan file written for this proposal before an interruption: the only way to tell it is
         # this proposal's own is to rebuild its bytes from the original and the frozen baseline.
         orphan = self.context.directory / "plans" / f"revision-{len(run['plan_history'])}.json"
+        parts = ("plans", orphan.name)
+        actual = optional_bytes(run_files(self.context), parts, {"artifact": str(orphan)})
         prewritten = None
-        if orphan.exists() or orphan.is_symlink():
+        if actual is not None:
             with stops.classify("runtime_failure", "invariant"):
                 expected = (dump(self.plan_content(receipt, payload)) + "\n").encode("utf-8")
             with stops.evidence_reads(source={"artifact": str(orphan)}):
-                if orphan.is_symlink() or orphan.read_bytes() != expected:
+                if actual != expected:
                     raise HarnessError("未登记的计划文件不是被拒提案的预写文件；保留现场")
             prewritten = {"artifact": str(orphan), "artifact_digest": hashlib.sha256(expected).hexdigest()}
         record = {"run_id": run["id"], "request_id": request_id, "kind": "revision" if run["tasks"] else "initial_plan",
@@ -279,17 +283,24 @@ class Planner(RuntimeService):
         raw = (dump(record) + "\n").encode("utf-8")
         digest = hashlib.sha256(raw).hexdigest()
         artifact = self.context.directory / "proposal-rejections" / f"{digest}.json"
-        if not artifact.exists() and not artifact.is_symlink():
+        files = run_files(self.context)
+        parts = ("proposal-rejections", artifact.name)
+        source = {"artifact": str(artifact)}
+        actual = optional_bytes(files, parts, source)
+        if actual is None:
             write_json(artifact, record)
-        with stops.evidence_reads(source={"artifact": str(artifact)}):
-            if artifact.is_symlink() or artifact.read_bytes() != raw:
+            actual = files.read(parts, limit=None).evidence(source)
+        with stops.evidence_reads(source=source):
+            if actual != raw:
                 raise HarnessError("提案拒绝文件内容不符；保留现场")
         prewritten = prepared["prewritten"]
         if prewritten is not None:
             # The bytes the preflight attributed to this proposal, read again right before the rename.
-            orphan = Path(prewritten["artifact"])
+            orphan_files = files.under("plans", f"revision-{len(run['plan_history'])}.json")
+            orphan = evidence_path(orphan_files, prewritten)
             with stops.evidence_reads(source={"artifact": str(orphan)}):
-                if orphan.is_symlink() or hashlib.sha256(orphan.read_bytes()).hexdigest() != prewritten["artifact_digest"]:
+                actual = orphan_files.read((), limit=None).evidence(prewritten)
+                if hashlib.sha256(actual).hexdigest() != prewritten["artifact_digest"]:
                     raise HarnessError("未登记的计划文件在拒绝预检之后改变；保留现场")
             target = self.context.directory / "plans" / "rejected" / f"{prewritten['artifact_digest']}.json"
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -371,9 +382,17 @@ class Planner(RuntimeService):
         bound HEAD or candidate; the run then stops at the question and every
         execution step keeps its own HEAD and snapshot gates.
         """
-        if not self.decide_returned() or not self.services.receipts.returned_ask(DECIDE_KEY):
+        receipt = self.context.run["commander_receipts"].get(DECIDE_KEY)
+        if receipt is None:
             return
-        self.land_ask(self.services.receipts.finish_commander_receipt(DECIDE_KEY))
+        receipts = self.services.receipts
+        settlement = receipts.settlement(DECIDE_KEY)
+        if settlement.kind == "recoverable" and receipts.is_ask(DECIDE_KEY, receipt, settlement.value):
+            receipts.settle_return(DECIDE_KEY)
+        elif settlement.kind != "returned":
+            return
+        if receipts.returned_ask(DECIDE_KEY):
+            self.land_ask(receipts.finish_commander_receipt(DECIDE_KEY))
 
     @staticmethod
     def source(receipt):
@@ -384,22 +403,28 @@ class Planner(RuntimeService):
         """Immutable plan file: identical bytes are reused, different bytes stop."""
         artifact = self.context.directory / "plans" / f"revision-{revision}.json"
         raw = (dump(content) + "\n").encode("utf-8")
-        if artifact.exists() or artifact.is_symlink():
-            if artifact.is_symlink() or artifact.read_bytes() != raw:
-                raise HarnessError(f"计划文件已存在且内容不同；保留现场：{artifact}")
-        else:
+        files = run_files(self.context)
+        parts = ("plans", artifact.name)
+        source = {"artifact": str(artifact)}
+        actual = optional_bytes(files, parts, source)
+        if actual is None:
             write_json(artifact, content)
-            if artifact.read_bytes() != raw:
+            if files.read(parts, limit=None).evidence(source) != raw:
                 raise HarnessError("计划文件写入后内容不符；保留现场")
+        elif actual != raw:
+            raise HarnessError(f"计划文件已存在且内容不同；保留现场：{artifact}")
         return {"revision": revision, "artifact": str(artifact), "artifact_digest": hashlib.sha256(raw).hexdigest()}
 
     @stops.reads_evidence
     def read_plan(self, reference, label="计划文件"):
-        try:
-            raw = Path(reference["artifact"]).read_bytes()
-        except OSError as error:
-            stops.keep_local_io(error)
-            raise HarnessError(f"{label}缺失或无法读取；保留现场") from error
+        files = run_files(self.context).under("plans", f"revision-{reference['revision']}.json")
+        evidence_path(files, reference)
+        source = {key: reference[key] for key in ("artifact", "artifact_digest")}
+        outcome = files.read((), limit=None)
+        if outcome.state == "absent":
+            raise EvidenceError(f"{label}缺失；保留现场",
+                                stop=stops.make("evidence", "runtime_integrity", source=source))
+        raw = outcome.evidence(source)
         if hashlib.sha256(raw).hexdigest() != reference["artifact_digest"]:
             raise HarnessError(f"{label}已改变；保留现场")
         try:
@@ -458,11 +483,11 @@ class Planner(RuntimeService):
                                 data={"suggested_scope": entries, "gaps": missing, "scope": list(run["scope"]),
                                       "widened": widened}))
         reference = self.write_plan(0, self.first_plan(tasks, reason, source))
-        run["original_tasks"] = deepcopy(tasks)
-        run["tasks"] = deepcopy(tasks)
-        run["plan_history"] = [reference]
-        run["commander_receipts"].pop(DECIDE_KEY, None)
-        self.context.save()
+        with self.context.publish():
+            run["original_tasks"] = deepcopy(tasks)
+            run["tasks"] = deepcopy(tasks)
+            run["plan_history"] = [reference]
+            run["commander_receipts"].pop(DECIDE_KEY, None)
         self.warn_broad([], tasks, 0)
         self.report_command_requirements()
         return False
@@ -504,9 +529,9 @@ class Planner(RuntimeService):
         receipt = run["commander_receipts"][DECIDE_KEY]
         content = self.plan_content(receipt, decision.payload)
         reference = self.write_plan(content["revision"], content)
-        run["pending_revision"] = reference
-        run["commander_receipts"].pop(DECIDE_KEY)
-        self.context.save()
+        with self.context.publish():
+            run["pending_revision"] = reference
+            run["commander_receipts"].pop(DECIDE_KEY)
         return self.apply_pending_revision()
 
     # ---- publication ---------------------------------------------------------
@@ -516,7 +541,11 @@ class Planner(RuntimeService):
         run = self.context.run
         if pending.get("revision") != len(run["plan_history"]):
             raise HarnessError("待应用修订与计划版本不符；保留现场")
-        content = self.read_plan(pending, "待应用的计划文件")
+        revision = pending["revision"]
+        files = run_files(self.context).under("plans", f"revision-{revision}.json")
+        content, _ = bound_result(files, pending, "待应用的计划文件")
+        if not isinstance(content, dict) or content.get("revision") != revision:
+            raise HarnessError("待应用的计划文件与台账引用不符；保留现场")
         source = content.get("source")
         if not isinstance(source, dict) or set(source) != {"dispatch_id", "artifact", "artifact_digest"}:
             raise HarnessError("待应用修订的来源无效；保留现场")
@@ -525,7 +554,7 @@ class Planner(RuntimeService):
                 != ("commander", "decide", "run") or entries[0].get("invoked") is not True
                 or source["artifact"] != str(self.context.directory / "dispatches" / source["dispatch_id"] / "returned-result.json")):
             raise HarnessError("待应用修订的来源派发不符；保留现场")
-        result, _ = read_bound_result(source, "待应用修订的")
+        result, _ = bound_result(returned_result_files(self.context, entries[0]["id"]), source, "待应用修订的")
         if (not isinstance(result, dict) or result.get("task_id") != "run"
                 or result.get("dispatch_id") != source["dispatch_id"] or result.get("action") != "revise"):
             raise HarnessError("待应用修订的原件不是这次修订；保留现场")
@@ -565,17 +594,17 @@ class Planner(RuntimeService):
                                                 folder, self.context.state / "worktrees", binding=run["worktree_binding"])
             bound = snapshot_digest(self.context.snapshot())
         previous = run["tasks"]
-        run["plan_history"].append({key: pending[key] for key in ("revision", "artifact", "artifact_digest")})
-        run["tasks"] = deepcopy(content["tasks"])
-        run["current_task"] = directive["selected_task"]
-        run["pending_directive"] = {"directive": deepcopy(directive), "snapshot_digest": bound,
-                                    "revision": pending["revision"]}
-        run["feedback"] = {"revision": pending["revision"], "plan_artifact": pending["artifact"],
-                           "trigger": deepcopy(content.get("trigger"))}
-        if content["candidate"] != "retain":
-            run.pop("worker_recovery", None)
-        run.pop("pending_revision")
-        self.context.save()
+        with self.context.publish():
+            run["plan_history"].append({key: pending[key] for key in ("revision", "artifact", "artifact_digest")})
+            run["tasks"] = deepcopy(content["tasks"])
+            run["current_task"] = directive["selected_task"]
+            run["pending_directive"] = {"directive": deepcopy(directive), "snapshot_digest": bound,
+                                        "revision": pending["revision"]}
+            run["feedback"] = {"revision": pending["revision"], "plan_artifact": pending["artifact"],
+                               "trigger": deepcopy(content.get("trigger"))}
+            if content["candidate"] != "retain":
+                run.pop("worker_recovery", None)
+            run.pop("pending_revision")
         if archive is not None:
             self.context.event("revision_edits_archived", task_id=directive["selected_task"], artifact=archive)
         self.warn_broad(previous, content["tasks"], pending["revision"])

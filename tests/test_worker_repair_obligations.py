@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 from unittest.mock import patch
 
+from harness.recovery import run_files
 from harness.util import HarnessError, read_json, write_json
 from harness.review_progress import claim_gaps, delivered_worker_findings, repair_findings, required_findings
 from test_engine_repairs import RecordingBackend
@@ -139,7 +140,7 @@ class WorkerRepairObligationsTests(RepoCase):
         worker = [row for row in result["dispatches"] if row["role"] == "worker" and row.get("invoked")][-1]
         packet = read_json(Path(worker["worker_receipt"]["packet_artifact"]))
         self.assertEqual(labels(packet["required_findings"]), ["second-defect"])
-        self.assertEqual(labels(required_findings(result, "greet", worker["snapshot_digest"])),
+        self.assertEqual(labels(required_findings(result, "greet", worker["snapshot_digest"], files=run_files(engine.context))),
                          labels(packet["required_findings"]))
 
     def test_worker_claim_scope_cannot_remove_reviewer_obligation(self):
@@ -234,9 +235,9 @@ class WorkerRepairObligationsTests(RepoCase):
         self.assertTrue(read_json(engine.directory / "preflight/greet/4/result.json")["passed"])
         approval = result["review_history"]["greet"][-1]
         self.assertEqual(set(approval["review"]["finding_dispositions"]), {f"f{n}" for n in range(1, 61)})
-        self.assertEqual(required_findings(result, "greet", approval["snapshot_digest"]), [])
+        self.assertEqual(required_findings(result, "greet", approval["snapshot_digest"], files=run_files(engine.context)), [])
         # r1, reopened on B, stays on the repair list: its resolution holds only on A.
-        self.assertEqual(labels(repair_findings(result, "greet")), rounds(1))
+        self.assertEqual(labels(repair_findings(result, "greet", files=run_files(engine.context))), rounds(1))
 
     def test_not_checked_keeps_repair_status_and_open_reopens(self):
         def change(backend, kwargs, packet, result):

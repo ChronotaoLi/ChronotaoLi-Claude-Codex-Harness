@@ -128,25 +128,46 @@ class SupervisorTests(unittest.TestCase):
             supervise(self.repo, ['run', 'goal'], operation_id=a['operation_id'], popen=launch)
 
     def test_signal_forwarding_reaps_group_and_records_exit(self):
-        handlers = {}
+        from types import SimpleNamespace
+        from unittest.mock import Mock, call
+
         original_handlers = {signal.SIGTERM: object(), signal.SIGINT: object()}
+        handlers = original_handlers.copy()
+        waits = []
+
         class Child:
             pid = 314159
             returncode = -signal.SIGTERM
+
             def wait(self, timeout=None):
+                waits.append(timeout)
                 if timeout is None:
                     handlers[signal.SIGTERM](signal.SIGTERM, None)
                 return self.returncode
+
         def install(signum, handler):
-            old = handlers.get(signum, original_handlers[signum])
+            old = handlers[signum]
             handlers[signum] = handler
             return old
-        with patch('harness.supervisor.signal.signal', side_effect=install), patch('harness.supervisor.os.killpg') as kill:
-            with self.assertRaises(SystemExit):
-                supervise(self.repo, ['run', 'goal'], popen=lambda *a, **k: Child())
-        self.assertEqual(kill.call_args_list[0].args, (314159, signal.SIGTERM))
-        self.assertIs(handlers[signal.SIGTERM], original_handlers[signal.SIGTERM])
+
+        child = Child()
+        launch = Mock(return_value=child)
+        kill = Mock()
+        # Git initialization also uses signal and os. Replace only the supervisor's bindings.
+        supervisor_signal = SimpleNamespace(SIGTERM=signal.SIGTERM, SIGINT=signal.SIGINT,
+                                            SIGKILL=signal.SIGKILL, signal=install)
+        supervisor_os = SimpleNamespace(**(vars(os) | {'killpg': kill}))
+        with patch('harness.supervisor.signal', supervisor_signal), patch('harness.supervisor.os', supervisor_os):
+            with self.assertRaises(SystemExit) as interrupted:
+                supervise(self.repo, ['run', 'goal'], popen=launch)
+        self.assertEqual(interrupted.exception.code, 128 + signal.SIGTERM)
+        launch.assert_called_once()
+        self.assertEqual(launch.call_args.kwargs, {'start_new_session': True})
+        self.assertEqual(kill.call_args_list, [call(child.pid, signal.SIGTERM), call(child.pid, signal.SIGTERM)])
+        self.assertEqual(waits, [None, 5])
+        self.assertEqual(handlers, original_handlers)
         saved, = self.receipts()
+        self.assertEqual(saved['pid'], child.pid)
         self.assertEqual((saved['exit_code'], saved['process_observation']), (-signal.SIGTERM, 'exited'))
         self.assertEqual(saved['forwarded_signal'], signal.SIGTERM)
         self.assert_receipt_only(saved)

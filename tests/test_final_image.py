@@ -115,7 +115,8 @@ class FinalImageTests(IsolatedRepoCase):
             nested = worktree / "nested"
             nested.mkdir()
             plain_git(nested, "init", "-q")
-            plain_git(nested, *IDENTITY, "commit", "--allow-empty", "-qm", "nested fixture")
+            plain_git(nested, *IDENTITY, "-c", "maintenance.auto=false", "-c", "gc.auto=0",
+                      "commit", "--allow-empty", "-qm", "nested fixture")
             plain_git(worktree, "config", "core.fileMode", "true")
             (worktree / "hello.py").chmod(0o755)
         self.attempt(edit, expected=["hello.py", "nested", "untracked-link"])

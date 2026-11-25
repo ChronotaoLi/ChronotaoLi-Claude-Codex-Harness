@@ -516,17 +516,28 @@ class CommandLoadCheckTests(RepoCase):
                     self.assertEqual(sum(call["kind"] == "final_review" for call in backend.calls), 2)
                     self.assertEqual(backend.calls[-1]["task_id"], "fix2")
                 self.stopped_before(engine, backend, error, seen, revision)
-        with self.subTest(step="pause"):   # --step after an acceptance with work pending
-            backend = corrective(2)
-            engine = self.engine(backend)
-            error, seen, _ = self.stepped(
-                backend, lambda run, options: bool(options.get("step") and options.get("accepted_this_call")
-                                                   and settled(run) and pending(run)),
-                0, column(0, "self_checks", TASK_BAD["env key"]), lambda: engine.start("Implement greet", plan(), step=True))
-            self.assertEqual((seen["options"], len(seen["run"]["plan_history"]), sorted(seen["run"]["accepted"])),
-                             ({"step": True, "accepted_this_call": 1}, 2, ["greet"]))
-            self.stopped_before(engine, backend, error, seen, 0)
-            self.assertNotIn('"run_paused"', (engine.directory / "events.jsonl").read_text())
+        for valid in (True, False):   # --step after an acceptance with work pending
+            with self.subTest(step="pause", valid=valid):
+                backend = corrective(2)
+                engine = self.engine(backend)
+                change = column(0, "self_checks", VALID if valid else TASK_BAD["env key"])
+                outcome, seen, steps = self.stepped(
+                    backend, lambda run, options: bool(options.get("step") and options.get("accepted_this_call")
+                                                       and settled(run) and pending(run)),
+                    0, change, lambda: engine.start("Implement greet", plan(), step=True))
+                self.assertIs(seen["options"]["step"], True)
+                self.assertEqual(seen["options"]["accepted_this_call"], 1)
+                self.assertEqual((len(seen["run"]["plan_history"]), sorted(seen["run"]["accepted"]), pending(seen["run"])),
+                                 (2, ["greet"], ["fix1"]))
+                events = (engine.directory / "events.jsonl").read_text()
+                if valid:
+                    self.assertEqual(steps[-1][:2], ("pause", None))
+                    self.assertEqual(outcome["status"], "paused")
+                    self.assertEqual(len(backend.calls), seen["calls"])
+                    self.assertIn('"run_paused"', events)
+                else:
+                    self.stopped_before(engine, backend, outcome, seen, 0)
+                    self.assertNotIn('"run_paused"', events)
         # Steps only a resumed process derives first: a revision landed but not applied, and a task between its
         # verification and its review (spec: there is no scheduling step between a review and the acceptance). The
         # facts that stopped the first process are the ones its resume meets.

@@ -3,8 +3,9 @@ from copy import deepcopy
 from pathlib import Path
 from unittest.mock import patch
 
+from harness import stops
 from harness.process_runtime import ProcessOutcome
-from harness.util import HarnessError, ProcessTimeout, read_json, run_process, write_json
+from harness.util import EvidenceError, HarnessError, ProcessTimeout, read_json, run_process, write_json
 from test_harness import RepoCase, ROOT, crash_after_save, decide_bound, review_bound, walk_exit
 from test_runtime_changes import ScriptedBackend, decided, finding, revised, trigger_kind
 
@@ -60,8 +61,11 @@ class FinalStageRecoveryTests(RepoCase):
             with self.subTest(contents=contents):
                 artifact.write_text(contents)
                 resumed = self.engine(backend)
-                with self.assertRaisesRegex(HarnessError, "整体快照证据"):
+                with self.assertRaisesRegex(EvidenceError, "整体快照证据") as caught:
                     resumed.resume(engine.run["id"])
+                stop = stops.of(caught.exception)
+                self.assertEqual((stop["kind"], stop["reason"], stop["source"]),
+                                 ("evidence", "runtime_integrity", {"artifact": str(artifact)}))
                 self.assertEqual(artifact.read_text(), contents)
                 self.assertEqual(len(resumed.run["final_history"]), 1)
                 self.assertEqual(self.final_checks(resumed.run), [])

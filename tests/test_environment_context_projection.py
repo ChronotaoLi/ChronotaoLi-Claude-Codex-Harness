@@ -22,23 +22,28 @@ class EnvironmentProjectionTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.env = Projection(SimpleNamespace())
-        self.env.context.directory = Path(self.temp.name).resolve()
-        self.env.context.run = {'id': 'run', 'schema_version': RUN_SCHEMA_VERSION, 'environment_updates': [], 'environment_checks': []}
+        self.env.context.state = Path(self.temp.name).resolve()
+        self.env.context.directory = self.env.context.state / 'runs' / 'run'
+        self.env.context.run = {'id': 'run', 'schema_version': RUN_SCHEMA_VERSION,
+                                'environment_updates': [], 'environment_checks': [],
+                                'tasks': [{'id': task} for task in ('a', 'b')],
+                                'dispatches': [{'id': task + '_dispatch', 'role': 'worker', 'task_id': task}
+                                               for task in ('a', 'b')]}
 
     def add(self, task, summary, checks=None, passed=True):
         checks = checks or []
-        update = dict(schema_version=1, task_id=task, blocker_dispatch_id='dispatch', summary=summary, checks=checks)
+        update = dict(schema_version=1, task_id=task, blocker_dispatch_id=task + '_dispatch', summary=summary, checks=checks)
         digest = snapshot_digest({'run_id': 'run', 'update': update})
         record = dict(update, id='env_' + digest, sequence=len(self.env.context.run['environment_updates']) + 1,
                       source={}, update_digest=digest)
-        artifact = self.env.context.directory / (record['id'] + '.json')
+        artifact = self.env.context.directory / 'environment' / (record['id'] + '.json')
         write_json(artifact, record)
         row = dict(record, artifact=str(artifact), artifact_digest=hashlib.sha256(artifact.read_bytes()).hexdigest())
         self.env.context.run['environment_updates'].append(row)
         if checks:
             report = dict(update_id=record['id'], task_id=task, observed_at=1, passed=passed,
                           results=[dict(check=check, passed=passed) for check in checks], limitation='read only')
-            path = self.env.context.directory / ('checks-' + str(record['sequence']) + '.json')
+            path = self.env.context.directory / 'environment' / ('checks-' + str(record['sequence']) + '.json')
             write_json(path, report)
             self.env.context.run['environment_checks'].append(dict(update_id=record['id'], task_id=task, passed=passed,
                 artifact=str(path), artifact_digest=hashlib.sha256(path.read_bytes()).hexdigest()))
@@ -101,7 +106,7 @@ class EnvironmentProjectionTests(unittest.TestCase):
         original = dict(self.env.context.run['environment_checks'][0])
         report = json.loads(Path(original['artifact']).read_bytes())
         for i in range(100):
-            path = self.env.context.directory / f'repeated-{i}.json'
+            path = self.env.context.directory / 'environment' / f'checks-{i + 3}.json'
             write_json(path, dict(report, observed_at=i + 2))
             self.env.context.run['environment_checks'].append(dict(original, artifact=str(path),
                 artifact_digest=hashlib.sha256(path.read_bytes()).hexdigest()))

@@ -108,9 +108,10 @@ class CommandAdmissionTests(unittest.TestCase):
 
     def test_frozen_parent_bounds_effective_command_timeout(self):
         deadline = self.broker.manifest['parent_deadline']
-        with patch('harness.command_server.time.monotonic', return_value=deadline - 2.1):
+        with patch('harness.command_server.time.monotonic', return_value=deadline - 2.1), \
+                command_server.CallSignals() as signals:
             _, _, timeout, _, _, root = with_descriptors(
-                lambda held: self.broker._admit({'command_id': command_id(self.command)}, held))
+                lambda held: self.broker._admit({'command_id': command_id(self.command)}, held, signals))
         # The admitted root is opened into the caller's holder, whose cleanup closes it.
         with self.assertRaises(OSError):
             os.fstat(root)
@@ -241,55 +242,75 @@ print('done')
         self.assertTrue(result['exit_confirmed'])
 
     def test_broker_late_signal_restores_handlers_and_retains_committed_lifecycle(self):
-        import os
-        import signal
-        original = signal.signal
-        previous = {sig: signal.getsignal(sig) for sig in
-                    (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
+        pending = signal.sigpending
+        exit_call = command_server.CallSignals.__exit__
+        previous = {sig: signal.getsignal(sig) for sig in command_server.SIGNALS}
+        writes = []
         injected = False
-        def handoff(sig, handler):
-            nonlocal injected
-            result = original(sig, handler)
-            # The inner supervisor restores the broker handler before receipt
-            # creation; inject only at the broker's later cleanup handoff.
-            receipts = list((self.job / 'commands').glob('*/receipt.json'))
-            if (sig == signal.SIGINT and getattr(handler, '__name__', '') == 'interrupted'
-                    and receipts and not injected):
-                injected = True
-                os.kill(os.getpid(), signal.SIGINT)
-            return result
-        with patch('harness.process_runtime.signal.signal', side_effect=handoff):
-            result = self.broker.run_command({'command_id': command_id(self.command)})
-        self.assertTrue(injected)
-        self.assertTrue(result['response_cancelled'])
-        self.assertTrue(result['error'])
-        self.assertEqual(result['exit_code'], 0)
-        self.assertEqual(result['lifecycle']['termination_reason'], 'normal')
-        for sig, handler in previous.items():
-            self.assertIs(signal.getsignal(sig), handler)
-        from harness.util import read_json
-        receipt = next((self.job / 'commands').glob('*/receipt.json'))
-        self.assertTrue(read_json(receipt)['response_cancelled'])
 
-    def test_receipt_real_interrupt_records_cancellation_and_completed_wait(self):
-        import os
-        import signal
-        argv = self.command
-        original = write_json
-        def interrupt(path, value):
-            if Path(path).name == 'receipt.json':
-                os.kill(os.getpid(), signal.SIGINT)
-            original(path, value)
-        with patch('harness.command_server.write_json', side_effect=interrupt):
-            result = self.broker.run_command({'command_id': command_id(argv)})
+        def snapshot():
+            nonlocal injected
+            self.assertFalse(injected)
+            self.assertTrue(any(path.name == 'receipt.json' for path in writes))
+            self.assertIsNot(signal.getsignal(signal.SIGINT), previous[signal.SIGINT])
+            os.kill(os.getpid(), signal.SIGINT)
+            observed = pending()
+            self.assertIn(signal.SIGINT, observed)
+            injected = True
+            return observed
+
+        def handoff(signals, *exc):
+            with patch.object(signal, 'sigpending', snapshot):
+                return exit_call(signals, *exc)
+
+        def write(path, value):
+            writes.append(path)
+            write_json(path, value)
+        arguments = {'command_id': command_id(self.command)}
+        with patch.object(command_server.CallSignals, '__exit__', handoff), \
+                patch.object(command_server, 'write_json', side_effect=write), \
+                self.assertRaisesRegex(KeyboardInterrupt, f"Command broker signal {signal.SIGINT}"):
+            self.broker.run_command(arguments)
+        self.assertTrue(injected)
+        receipts = [path for path in writes if path.name == 'receipt.json']
+        self.assertEqual(len(receipts), 1)
+        self.assertNotIn(receipts[0].with_name('output.outcome.json'), writes)
+        result = read_json(receipts[0])
+        self.assertNotIn('response_cancelled', result)
+        self.assertIsNone(result['error'])
         self.assertEqual(result['exit_code'], 0)
         self.assertTrue(result['evidence_complete'])
-        self.assertEqual(result['termination_reason'], 'cancelled')
-        self.assertTrue(result['error'])
-        from harness.util import read_json
-        receipt = next((self.job / 'commands').glob('*/receipt.json'))
-        self.assertEqual(read_json(receipt)['termination_reason'], 'cancelled')
-        self.assertEqual(read_json(receipt.parent / 'output.outcome.json')['termination_reason'], 'cancelled')
+        self.assertEqual(result['termination_reason'], 'normal')
+        self.assertEqual(read_json(receipts[0].with_name('output.outcome.json')), result['lifecycle'])
+        for sig, handler in previous.items():
+            self.assertIs(signal.getsignal(sig), handler)
+        self.assertEqual(self.broker.run_command(arguments)['exit_code'], 0)
+
+    def test_receipt_real_interrupt_retains_completed_wait(self):
+        writes = []
+        def interrupt(path, value):
+            writes.append(path)
+            if path.name == 'receipt.json':
+                os.kill(os.getpid(), signal.SIGINT)
+            write_json(path, value)
+        previous = {sig: signal.getsignal(sig) for sig in command_server.SIGNALS}
+        arguments = {'command_id': command_id(self.command)}
+        with patch.object(command_server, 'write_json', side_effect=interrupt), \
+                self.assertRaises(KeyboardInterrupt):
+            self.broker.run_command(arguments)
+        receipts = [path for path in writes if path.name == 'receipt.json']
+        self.assertEqual(len(receipts), 1)
+        receipt = receipts[0]
+        self.assertNotIn(receipt.with_name('output.outcome.json'), writes)
+        result = read_json(receipt)
+        self.assertEqual(result['exit_code'], 0)
+        self.assertTrue(result['evidence_complete'])
+        self.assertEqual(result['termination_reason'], 'normal')
+        self.assertIsNone(result['error'])
+        self.assertEqual(read_json(receipt.with_name('output.outcome.json')), result['lifecycle'])
+        for sig, handler in previous.items():
+            self.assertIs(signal.getsignal(sig), handler)
+        self.assertEqual(self.broker.run_command(arguments)['exit_code'], 0)
 
     def test_persistence_fault_keeps_execution_failure(self):
         from harness.util import ProcessTimeout

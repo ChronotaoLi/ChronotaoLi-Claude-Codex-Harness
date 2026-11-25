@@ -7,7 +7,8 @@ from pathlib import Path
 
 from . import stops
 from .contracts import review_approved
-from .util import EvidenceError, HarnessError, read_json, strict_json_loads
+from .state_files import StateFiles
+from .util import EvidenceError, HarnessError, strict_json_loads
 
 
 # Shared pending lifecycle gates; each recovery entry keeps its own extra checks.
@@ -36,19 +37,6 @@ def acceptance_review_records(run, feedback=None, *, attempt=None, candidate_dig
             and (attempt is None or record.get("attempt") == attempt)
             and (candidate_digest is None or record.get("snapshot_digest") == candidate_digest)
             and record.get("status") != "invalidated"]
-
-
-def invalidate_acceptance_review(run, feedback=None, *, attempt=None, candidate_digest=None):
-    """Persist a known acceptance invalidation without changing its evidence.
-
-    Feedback binds the exact review artifact. Call before replacing it, so a
-    later plan cannot make the invalidated approval look current again.
-    """
-    records = acceptance_review_records(run, feedback, attempt=attempt, candidate_digest=candidate_digest)
-    for record in records:
-        record["status"] = "invalidated"
-    return bool(records)
-
 
 def worker_recovery_context(run, directory, task_id, *, feedback=None):
     """Separate a retained failure from the latest evidenced task stages.
@@ -148,18 +136,66 @@ def worker_recovery_context(run, directory, task_id, *, feedback=None):
 
 
 def _evidence(message, receipt):
-    source = {"artifact": receipt["artifact"]} if isinstance(receipt.get("artifact"), str) else {}
-    if isinstance(receipt.get("artifact_digest"), str):
-        source["artifact_digest"] = receipt["artifact_digest"]
-    if isinstance(receipt.get("dispatch_id"), str):
-        source["dispatch_id"] = receipt["dispatch_id"]
-    return EvidenceError(message, stop=stops.make("evidence", "runtime_integrity", source=source))
+    return EvidenceError(message, stop=stops.make("evidence", "runtime_integrity", source=_evidence_source(receipt)))
 
 
-def read_evidence_json(path):
-    """Read runtime-written JSON evidence (verification results): changed or lost bytes are EvidenceError."""
-    with stops.evidence_reads(source={"artifact": str(path)}):
-        return read_json(path)
+def _evidence_source(receipt):
+    return {key: receipt[key] for key in ("artifact", "artifact_digest", "dispatch_id")
+            if isinstance(receipt.get(key), str)}
+
+
+def run_files(context):
+    return StateFiles(context.state).under("runs", context.run["id"])
+
+
+def returned_result_files(context, dispatch_id):
+    return run_files(context).under("dispatches", dispatch_id, "returned-result.json")
+
+
+def evidence_path(files, source):
+    """Check a ledger reference against the file selected by the caller."""
+    path = Path(files.path).joinpath(*files.prefix)
+    if source.get("artifact") != str(path):
+        raise _evidence("证据路径与登记身份不符；保留证据", source)
+    return path
+
+
+def bound_bytes(files, source, label, *, bind=None):
+    """Read the caller-selected file and authenticate its bytes before interpreting them."""
+    evidence_path(files, source)
+    outcome = files.read((), limit=None)
+    try:
+        raw = outcome.evidence(_evidence_source(source))
+    except EvidenceError as error:
+        raise EvidenceError(
+            f"{label}原始结果缺失或无法读取；保留证据，禁止重新抽取结论。{error}",
+            stop=error.stop,
+        ) from error
+    digest = hashlib.sha256(raw).hexdigest()
+    if source.get("artifact_digest", digest if bind is not None else None) != digest:
+        raise _evidence(f"{label}原始结果已改变；保留证据，禁止重新抽取结论", source)
+    if "artifact_digest" not in source and bind is not None:
+        source["artifact_digest"] = digest
+        bind()
+    return raw, digest
+
+
+def bound_result(files, source, label, *, bind=None):
+    raw, digest = bound_bytes(files, source, label, bind=bind)
+    return _decode_result(raw, digest, source, label)
+
+
+def evidence_json(files, artifact):
+    """Decode a runtime-written JSON artifact after a descriptor-relative read."""
+    source = {"artifact": artifact}
+    evidence_path(files, source)
+    raw = files.read((), limit=None).evidence(source)
+    return decode_evidence_json(raw, source)
+
+
+def decode_evidence_json(raw, source, *, message=None):
+    with stops.evidence_reads(source=source, message=message):
+        return strict_json_loads(raw.decode("utf-8"))
 
 
 def read_bound_bytes(receipt, label, *, bind=None):
@@ -184,6 +220,10 @@ def read_bound_bytes(receipt, label, *, bind=None):
 
 def read_bound_result(receipt, label, *, bind=None):
     raw, digest = read_bound_bytes(receipt, label, bind=bind)
+    return _decode_result(raw, digest, receipt, label)
+
+
+def _decode_result(raw, digest, receipt, label):
     try:
         # The runtime wrote this file; anything not strictly decodable was altered.
         result = strict_json_loads(raw)

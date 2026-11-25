@@ -10,9 +10,6 @@ stderr are never read, and nothing here depends on the clock, the account or
 the config. ``stop_facts()`` passes the same gate and only describes the
 failure for display; ``classify()`` never reads what it shows.
 """
-import os
-import stat
-
 from .stops import BODY_TYPES, LABEL, LABEL_FIELDS
 from .util import strict_json_loads
 
@@ -183,50 +180,3 @@ def stop_facts(outcome_raw, stdout_raw, provider):
         facts["unrecognized_labels"] = hidden
     facts["http_status_state"] = claude_http_status(envelope)["state"]
     return facts
-
-
-def read_original(path, read):
-    """``(state, value)``: ``read(stream)`` on ``path``, one of a call's originals, never blocking or raising OSError.
-
-    The adapter's and the call boundary's reads of the originals once the process ended all come
-    here: opened without blocking or following a symlink, read only once ``fstat`` shows a regular
-    file, so neither a FIFO without a writer nor a failed close can hold or replace the failure
-    being reported. ``("read", what read returned)``; ``("absent", error)`` when the file does not
-    exist; ``("unreadable", error)`` for any other OSError of the open, the read or the close, and
-    ``("unreadable", None)`` for anything but a regular file (a FIFO, device or directory). ``read``
-    keeps each caller's own bound, the caller its own fallback.
-    """
-    try:
-        # Never blocks: a FIFO without a writer must not hold the stop of the failure being reported.
-        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    except FileNotFoundError as error:
-        return "absent", error
-    except OSError as error:
-        return "unreadable", error
-    try:
-        try:
-            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-                return "unreadable", None
-            with os.fdopen(descriptor, "rb") as stream:
-                descriptor = None
-                return "read", read(stream)
-        finally:
-            if descriptor is not None:
-                os.close(descriptor)
-    except OSError as error:  # a failed close too: it must not replace the failure being reported
-        return "unreadable", error
-
-
-def read_for_boundary(path):
-    """``(state, raw)`` for the commander/reviewer call boundary and a failure stop's facts.
-
-    ``("read", bytes)``, ``("absent", None)`` when the file does not exist, ``("unreadable", None)``
-    for whatever else ``read_original`` cannot read or over ``LIMIT``. A failed read is never told as
-    an absence, so it cannot match a digest recorded as None. The boundary only chooses the type of a
-    stop it is already reporting; a read failure there must not replace the original failure (no
-    record is saved).
-    """
-    state, raw = read_original(path, lambda stream: stream.read(LIMIT + 1))
-    if state == "read" and len(raw) <= LIMIT:
-        return "read", raw
-    return ("absent" if state == "absent" else "unreadable"), None

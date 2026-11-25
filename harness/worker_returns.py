@@ -91,6 +91,9 @@ def decode_terminal(raw):
     return 'object', envelope, payload, ''
 
 
+NO_WORKER_OUTPUT = "direct JSON output is absent or empty after exit"
+
+
 @stops.reads_evidence
 def inspect_return(job):
     """Classify an exited, unsealed worker's evidence: retryable, invalid, returned or unknown.
@@ -136,7 +139,7 @@ def inspect_return(job):
         # I/O failure leaves without a verdict.
         return result('unknown', 'unreadable worker return evidence: ' + type(error).__name__)
     if kind == 'absent':
-        return result('retryable', 'direct JSON output is absent or empty after exit')
+        return result('retryable', NO_WORKER_OUTPUT)
     if kind == 'error':
         return result('retryable', 'provider returned a complete explicit error')
     if kind == 'object':

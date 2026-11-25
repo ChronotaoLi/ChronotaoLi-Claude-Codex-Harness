@@ -11,11 +11,11 @@ import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
-from harness import git
+from harness import git, stops
 from harness.budgets import work_attempts
 from harness.contracts import WORK, judge_work
 from harness.git import commit_message_text
-from harness.util import HarnessError, read_json, write_json
+from harness.util import EvidenceError, HarnessError, read_json, write_json
 from test_harness import RepoCase, ROOT, crash_after_save, crash_point
 from test_runtime_changes import ScriptedBackend, finding
 
@@ -254,21 +254,33 @@ class CommitMessageTests(RepoCase):
         engine = self.engine(backend)
         base = git.head(self.repo)
         saved = self.stop_at_acceptance(engine)
-        artifact = Path(saved["pending_acceptance"]["worker_source"]["artifact"])
+        pending = saved["pending_acceptance"]
+        self.assertNotIn("intent", pending)
+        source = pending["worker_source"]
+        artifact = Path(source["artifact"])
         if mode == "delete":
             artifact.unlink()
         else:
             value = read_json(artifact)
             value["commit_message"]["subject"] = "Changed while acceptance was pending"
             write_json(artifact, value)
+
+        calls = list(backend.calls)
         with patch("harness.git.build_commit", wraps=git.build_commit) as accept, \
-                self.assertRaisesRegex(HarnessError, "原始结果已改变|non-symlink file"):
+                self.assertRaises(EvidenceError) as raised:
             self.engine(backend).resume(saved["id"])
+        self.assertEqual(raised.exception.stop, stops.make("evidence", "runtime_integrity", source=source))
         accept.assert_not_called()
         self.assertEqual(git.head(engine.worktree), base)
+        if mode == "delete":
+            self.assertFalse(artifact.exists())
+        self.assertEqual(backend.calls, calls)
         after = read_json(engine.directory / "state.json")
-        self.assertIn("pending_acceptance", after)
+        self.assertEqual(after["pending_acceptance"], pending)
         self.assertEqual(after["accepted"], {})
+        for key in ("expected_head", "agent_dispatches", "dispatches", "attempts", "review_history"):
+            self.assertEqual(after[key], saved[key], key)
+        self.assertEqual(work_attempts(after), work_attempts(saved))
 
     def test_rewritten_worker_original_stops_before_commit(self):
         self.original_changed_while_pending("rewrite")

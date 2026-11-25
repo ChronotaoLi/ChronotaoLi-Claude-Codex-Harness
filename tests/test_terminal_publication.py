@@ -5,12 +5,13 @@ import errno
 import io
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
 from unittest.mock import patch
 
-from harness import quota, stops
+from harness import interrupts, quota, stops
 from harness.adapters import DemoBackend
 from harness.operations import OperationRecord
 from harness.run_context import RunContext
@@ -36,8 +37,9 @@ class TerminalPublicationTests(OperationCase):
         if status != "abandoned":
             steps += ["quota marker", "quota sample"]
         for step in steps:
-            for fault in (KeyboardInterrupt("observation interrupted"), OSError(errno.EIO, "observation I/O")):
-                with self.subTest(status=status, observation=step, fault=type(fault).__name__):
+            for fault in (None, OSError(errno.EIO, "observation I/O")):
+                with self.subTest(status=status, observation=step,
+                                  fault="SIGINT" if fault is None else type(fault).__name__):
                     published, fired = [], []
 
                     def record(store, **kwargs):
@@ -48,8 +50,13 @@ class TerminalPublicationTests(OperationCase):
                         return revision
 
                     def fail():
-                        fired.append(len(published))
-                        raise fault
+                        if not fired:
+                            fired.append(len(published))
+                            if fault is None:
+                                self.assertTrue(interrupts.active().terminal)
+                                signal.raise_signal(signal.SIGINT)
+                            else:
+                                raise fault
 
                     def write_checkpoint(context):
                         if step == "checkpoint" and context.run["status"] == status:
@@ -91,9 +98,12 @@ class TerminalPublicationTests(OperationCase):
                     self.assertEqual(path.read_bytes(), data)
                     saved = json.loads(data)
                     self.assertEqual((code, saved["status"]), (exit_code, status), errors)
-                    self.assertIn("警告", errors)
-                    self.assertIn(str(fault), errors)
-                    self.assertEqual(len(self.events(saved["id"], event_name)), int(step != "event"))
+                    if fault is None:
+                        self.assertIn(f"status={status}", errors)
+                    else:
+                        self.assertIn("警告", errors)
+                        self.assertIn(str(fault), errors)
+                    self.assertEqual(len(self.events(saved["id"], event_name)), int(step != "event" or fault is None))
                     if exit_code == 0:
                         self.assertEqual(json.loads(output)["status"], status)
                     if status != "abandoned":
@@ -122,10 +132,10 @@ class TerminalPublicationTests(OperationCase):
         self.config.data["runtime"]["max_agent_dispatches"] = 1
         self.check_observations("blocked", "run_stopped", ["run", "Implement greet"], exit_code=3)
 
-    def test_stop_interrupted_during_settling_is_registered_before_quota_cleanup(self):
+    def test_signal_during_stop_settling_preserves_the_budget_stop_through_quota_cleanup(self):
         self.config.data["runtime"]["max_agent_dispatches"] = 1
         engine = self.engine()
-        interrupt = KeyboardInterrupt("interrupted while settling the stop")
+        settle = engine.services.lifecycle.settle_stop
         sampler = engine.services.quota
         end_of_call = sampler.end_of_call
         observed = []
@@ -134,14 +144,24 @@ class TerminalPublicationTests(OperationCase):
             observed.append((primary, sampler.final))
             end_of_call(primary)
 
-        with patch.object(engine.services.lifecycle, "settle_stop", side_effect=interrupt), \
+        def signal_then_settle(error):
+            signal.raise_signal(signal.SIGINT)
+            # Stop's load checks have no delivery point. Inspect the staged
+            # terminal candidate without introducing an artificial wait.
+            self.assertFalse(interrupts.deliverable())
+            self.assertIsNone(interrupts.active().delivered_from)
+            return settle(error)
+
+        with patch.object(engine.services.lifecycle, "settle_stop", signal_then_settle), \
                 patch.object(sampler, "end_of_call", observe_cleanup), \
-                contextlib.redirect_stderr(io.StringIO()), self.assertRaises(KeyboardInterrupt) as caught:
+                contextlib.redirect_stderr(io.StringIO()) as errors, self.assertRaises(HarnessError) as caught:
             engine.start("Implement greet")
-        self.assertIs(caught.exception, interrupt)
         saved = self.ledger(engine.run["id"])
-        self.assertEqual(saved["status"], "interrupted")
-        self.assertEqual(observed, [(interrupt, ("interrupted", saved["store_revision"]))])
+        self.assertEqual((saved["status"], saved["stop"]["kind"], saved["stop"]["reason"]),
+                         ("blocked", "budget", "agent_dispatches"))
+        self.assertEqual(saved["stop"], stops.of(caught.exception))
+        self.assertEqual(observed, [(caught.exception, ("blocked", saved["store_revision"]))])
+        self.assertIn("status=blocked", errors.getvalue())
 
     def test_abandonment_survives_each_observation_failure(self):
         self.check_observations("abandoned", "run_abandoned", ["abandon"])

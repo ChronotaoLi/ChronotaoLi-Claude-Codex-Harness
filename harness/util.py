@@ -16,10 +16,11 @@ import unicodedata
 import uuid
 from pathlib import Path
 
-from . import stops
+from . import interrupts, stops
 
 
 PROCESS_HEARTBEAT_SECONDS = 60
+_PROCESS_WAIT_SLICE_SECONDS = 0.1
 DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 _STDERR_JSON_ESCAPES = {code: f"\\u{code:04x}" for code in range(0x7f, 0xa0)}
 
@@ -112,6 +113,7 @@ def json_bytes(value) -> bytes:
 
 
 def write_json(path: Path, value):
+    interrupts.require_outside_publication("write_json")
     path.parent.mkdir(parents=True, exist_ok=True)
     temp = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
     with temp.open("wb") as f:
@@ -122,6 +124,7 @@ def write_json(path: Path, value):
 
 
 def read_json(path: Path):
+    interrupts.require_outside_publication("read_json")
     return json.loads(path.read_text(encoding="utf-8"))
 
 
@@ -432,6 +435,7 @@ def confirm_dispatches_exited(dispatches, identifiers, *, state, audit, save, ob
 
 
 def append_event(path, run_id, event, **fields):
+    interrupts.require_outside_publication("append_event")
     record = {"time": time.time(), "event": event, "run_id": run_id, **fields}
     with path.open("a", encoding="utf-8") as output:
         output.write(json.dumps(record, ensure_ascii=True) + "\n")
@@ -556,12 +560,16 @@ def open_command_directory(held: Descriptors, root_fd: int, relative: str) -> in
 def run_process(argv: list[str], cwd: Path, log: Path, *, stdin: str = "",
                 timeout: int | float = 900, env=None, on_start=None, on_outcome=None,
                 execution_deadline=None, cleanup_deadline=None, relative_cwd=None, root_fd=None,
-                record_owner=None) -> int:
+                record_owner=None, checkpoint=None) -> int:
     """No shell interpolation; terminate the owned process group on all exits.
 
     With relative_cwd the child starts in that directory, opened from root_fd (the
     caller's verified root, which stays open and the caller's); cwd is then unused.
+    The optional checkpoint runs before launch and after a wait slice if the
+    deadline has not elapsed and the leader is still running.
     """
+    interrupts.require_outside_publication("run_process")
+    interrupts.check_wait("run_process")
     from .process_runtime import ProcessSupervisor, defer_cleanup_signals
     if (relative_cwd is None) != (root_fd is None):
         raise ValueError("relative_cwd and root_fd go together")
@@ -597,6 +605,8 @@ def run_process(argv: list[str], cwd: Path, log: Path, *, stdin: str = "",
                 # again; preexec_fn assumes this process is single-threaded.
                 launch = {"cwd": cwd} if directory is None else {
                     "cwd": None, "preexec_fn": lambda fd=directory: os.fchdir(fd)}
+                if checkpoint is not None:
+                    checkpoint()
                 # Retain cancellation until the supervisor owns the new process.
                 # Popen can have created its child before returning to this frame.
                 # Not inherit: an exception the caller is handling must not hide the request.
@@ -627,7 +637,7 @@ def run_process(argv: list[str], cwd: Path, log: Path, *, stdin: str = "",
 
             # A start that failed or was interrupted leaves its directory to the holder's cleanup.
             p = with_descriptors(start)
-            started = time.monotonic()
+            last_heartbeat = time.monotonic()
             if on_start:
                 on_start(p.pid)
             while True:
@@ -635,23 +645,26 @@ def run_process(argv: list[str], cwd: Path, log: Path, *, stdin: str = "",
                 if remaining <= 0:
                     raise ProcessTimeout(timeout, log)
                 try:
-                    p.wait(timeout=min(PROCESS_HEARTBEAT_SECONDS, remaining))
-                    return p.returncode
+                    return p.wait(timeout=min(_PROCESS_WAIT_SLICE_SECONDS, remaining))
                 except subprocess.TimeoutExpired:
+                    pass
+                now = time.monotonic()
+                if now >= execution_deadline:
+                    raise ProcessTimeout(timeout, log)
+                returncode = p.poll()
+                if returncode is not None:
+                    return returncode
+                if now - last_heartbeat >= PROCESS_HEARTBEAT_SECONDS:
                     print(f"[harness] {one_line(argv[0])} 仍在运行；日志 {one_line(log)}", file=sys.stderr)
+                    last_heartbeat = now
+                if checkpoint is not None:
+                    checkpoint()
 
 
-def tail(path: Path, size=4000) -> str:
-    if not path.exists():
+def output_tail_text(outcome, size=4000) -> str:
+    """Render a bounded output fragment when it is available."""
+    raw = outcome.bytes_or_none()
+    if raw is None:
         return ""
-    with path.open("rb") as f:
-        return tail_text(f, size)
-
-
-def tail_text(f, size=4000) -> str:
-    f.seek(0, 2)
-    length = f.tell()
-    f.seek(max(0, length - size))
-    # At most size bytes: the file can grow after the seek.
-    value = f.read(size).decode("utf-8", errors="replace")
-    return ("[earlier output omitted; see log]\n" if length > size else "") + value
+    prefix = "[earlier output omitted; see log]\n" if outcome.size > size else ""
+    return prefix + raw.decode("utf-8", errors="replace")

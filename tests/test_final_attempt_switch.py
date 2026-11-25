@@ -1,22 +1,33 @@
 """Leaving a whole-run attempt when the candidate changes: its returned review becomes its conclusion (spec-1 rule 15)."""
 import contextlib
 import copy
+import errno
 import hashlib
+import io
+import json
 import os
 from pathlib import Path
 import signal
+import stat
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
 
 import harness.dispatch as dispatch
 import harness.finalization as finalization
+from harness import cli, interrupts, stops
+from harness.adapters import CLIBackend
 from harness.dispatch import Dispatcher
 from harness.finalization import FinalAcceptance
 from harness.packets import PacketBuilder
 from harness.receipts import ResultReceipts
+from harness.run_context import RunContext
+from harness.run_store import RunStore
+from harness.state_files import Outcome, StateFiles, Step
 from harness.util import HarnessError, dump, read_json, write_json
 from test_harness import RepoCase, after_save
+from test_provider_failures import FifoWatchdog
 import test_review_batches as batches   # by module: a TestCase imported by name is collected again here
 from test_runtime_changes import ScriptedBackend, finding, revised, trigger_kind
 
@@ -106,6 +117,11 @@ def at_leave_write(action, *, after=True):
     return patch.object(finalization, "write_json", side_effect=writing), hit
 
 
+def interrupted_cut():
+    """Represent departure at an exact recovery seam, before another lifecycle step can run."""
+    raise KeyboardInterrupt()
+
+
 def sigint():
     os.kill(os.getpid(), signal.SIGINT)
 
@@ -135,8 +151,8 @@ def rejected_on_c(case, engine, run):
 
 def written_on_b(case, engine, backend, *, published=False):
     """C rejected and stopped before the decide: A's whole-run review returns and the run stops before judging it; on
-    B the leave of A's attempt writes its record file and a signal arrives before the ledger takes it (``published``:
-    right after its transition). Returns the candidate file and A's receipt; the candidate is B."""
+    B the leave of A's attempt writes its record file. Inject a departure before the ledger takes it
+    (``published``: right after its transition). Returns the candidate file and A's receipt; the candidate is B."""
     hello = engine.worktree / "hello.py"
     os.chmod(hello, 0o664)                              # A
     with before_judgment(backend, 2), case.assertRaises(KeyboardInterrupt):
@@ -145,7 +161,7 @@ def written_on_b(case, engine, backend, *, published=False):
     os.chmod(hello, 0o646)                              # B
     resumed = case.engine(backend)
     window, hit = ((batches.interrupt_at_event(resumed, "final_attempt_left"), [True]) if published
-                   else at_leave_write(sigint))
+                   else at_leave_write(interrupted_cut))
     with window, case.assertRaises(KeyboardInterrupt):
         resumed.resume(engine.run["id"])
     case.assertTrue(hit)
@@ -262,6 +278,32 @@ class AttemptSwitchTests(RepoCase):
         self.assert_left(result["final_history"][3], saved["review_receipts"][KEY], "invalid_rejected")
         self.assertEqual(batches.sizes(batches.calls(backend, kind="final_review")), [0, 22, 44, 60, 60, 7])
 
+    def test_signal_after_final_original_preserves_its_registered_approval(self):
+        backend = ScriptedBackend()
+        engine = self.engine(backend)
+        write = dispatch.write_json
+        returned = []
+
+        def write_then_signal(path, value):
+            write(path, value)
+            if Path(path).name == "returned-result.json" and value.get("task_id") == "final":
+                returned.append(value["dispatch_id"])
+                sigint()
+
+        with patch.object(dispatch, "write_json", side_effect=write_then_signal), self.assertRaises(KeyboardInterrupt):
+            engine.start("Implement greet", batches.plan())
+        original, = returned
+        saved = batches.state(engine)
+        self.assertEqual(batches.stop_of(saved), ("interrupted", "signal"))
+        record, = saved["final_history"]
+        self.assertEqual((record["status"], record["review_source"]["dispatch_id"]), ("approved", original))
+        self.assertNotIn(KEY, saved["review_receipts"])
+        calls = call_trace(backend.calls)
+        finished = self.engine(backend).resume(saved["id"])
+        self.assertEqual(finished["status"], "completed")
+        self.assertEqual(finished["final_history"], [record])
+        self.assertEqual(call_trace(backend.calls), calls)
+
     def test_a_failed_record_write_after_binding_the_digest_is_redone(self):
         """T4-3, the original written before its digest was bound: the leave binds it in a save of its own (evidence
         binding) before the record file. A failed write keeps the attempt and the receipt slot, the receipt now with
@@ -270,12 +312,12 @@ class AttemptSwitchTests(RepoCase):
         engine = self.engine(backend)
         original = dispatch.write_json
 
-        def signal_after_the_original(path, value):
+        def depart_after_the_original(path, value):
             result = original(path, value)
             if Path(path).name == "returned-result.json" and value.get("task_id") == "final":
-                sigint()
+                interrupted_cut()
             return result
-        with patch.object(dispatch, "write_json", side_effect=signal_after_the_original), \
+        with patch.object(dispatch, "write_json", side_effect=depart_after_the_original), \
                 self.assertRaises(KeyboardInterrupt):
             engine.start("Implement greet", batches.plan())
         old = batches.state(engine)
@@ -479,8 +521,8 @@ class AttemptSwitchTests(RepoCase):
         self.assertEqual(len(backend.calls), calls)
 
     def switched_back(self, backend, *, written):
-        """The first whole-run review returns on A and the run stops before judging it; on B a signal interrupts the
-        leave after (``written``) or before it writes the record file; then the candidate is A again."""
+        """Return the first whole-run review on A, then inject a departure on B after (``written``) or before the
+        leave writes the record file. Restore candidate A for recovery."""
         engine = self.engine(backend)
         with before_judgment(backend, 1), self.assertRaises(KeyboardInterrupt):
             engine.start("Implement greet", batches.plan())
@@ -488,7 +530,7 @@ class AttemptSwitchTests(RepoCase):
         self.assertIn("artifact_digest", receipt)
         hello = engine.worktree / "hello.py"
         os.chmod(hello, 0o664)                          # B
-        window, hit = at_leave_write(sigint, after=written)
+        window, hit = at_leave_write(interrupted_cut, after=written)
         with window, self.assertRaises(KeyboardInterrupt):
             self.engine(backend).resume(engine.run["id"])
         self.assertTrue(hit)
@@ -749,12 +791,15 @@ class AttemptSwitchTests(RepoCase):
     def test_the_regular_flow_reads_no_record_file(self):
         """The check before each derivation is decided from the ledger in memory: an uninterrupted run reads no
         record file; a review interrupted before its judgment and replayed on its snapshot reads its own once."""
-        reads, regular = [], finalization.regular_bytes
+        reads, read = [], StateFiles.read
 
-        def counted(path):
-            reads.append(Path(path).name)
-            return regular(path)
-        with patch.object(finalization, "regular_bytes", side_effect=counted):
+        def counted(files, components, *, limit, part="whole"):
+            selected = files.prefix + components
+            if selected[-1:] == ("final.json",):
+                reads.append((Path(files.path), selected, limit, part))
+            return read(files, components, limit=limit, part=part)
+
+        with patch.object(StateFiles, "read", counted):
             result = self.engine(ScriptedBackend()).start("Implement greet", batches.plan())
             self.assertEqual((result["status"], reads), ("completed", []))
             self.setUp()
@@ -764,7 +809,366 @@ class AttemptSwitchTests(RepoCase):
                 engine.start("Implement greet", batches.plan())
             self.assertEqual(reads, [])
             result = self.engine(backend).resume(engine.run["id"])
-        self.assertEqual((result["status"], statuses(result), reads), ("completed", ["approved"], ["final.json"]))
+        self.assertEqual((result["status"], statuses(result)), ("completed", ["approved"]))
+        artifact = ("runs", engine.run["id"], "verification", "final", "1", "final.json")
+        self.assertEqual(reads, [(self.repo.resolve() / ".harness", artifact, None, "whole")])
+
+
+class AbandonWrittenLeaveTests(RepoCase):
+    def written_fixture(self, verdict="request_changes"):
+        self.backend = c_then_a(verdict)
+        self.original = self.engine(self.backend)
+        rejected_on_c(self, self.original, lambda: self.original.start("Implement greet", batches.plan()))
+        self.candidate, self.receipt = written_on_b(self, self.original, self.backend)
+        self.ident = self.original.run["id"]
+        self.state_path = self.original.directory / "state.json"
+        self.saved = batches.state(self.original)
+        self.artifact = Path(self.saved["final_history"][-1]["artifact"])
+        self.returned = Path(self.receipt["artifact"])
+        self.written = self.artifact.read_bytes()
+        self.call_count = len(self.backend.calls)
+        self.addCleanup(lambda backend=self.backend, count=self.call_count: self.assertEqual(len(backend.calls), count))
+
+    def observations(self):
+        path = self.original.directory / "events.jsonl"
+        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        return [row for row in rows if row["event"] in {"run_abandoned", "final_attempt_left"}]
+
+    def assert_abandoned(self, result, *, left, stop=None):
+        self.assertEqual(result, batches.state(self.original))
+        self.assertEqual(result["status"], "abandoned")
+        self.assertNotIn("stop", result)
+        self.assertNotIn("quota_wait", result)
+        if left:
+            self.assertNotIn(KEY, result["review_receipts"])
+            self.assertEqual((dump(result["final_history"][-1]) + "\n").encode("utf-8"), self.written)
+        else:
+            self.assertEqual(result["review_receipts"][KEY], self.receipt)
+            self.assertEqual(result["final_history"], self.saved["final_history"])
+        if stop:
+            events = self.observations()
+            self.assertEqual([row["event"] for row in events], ["run_abandoned"])
+            self.assertEqual(events[0]["written_leave_error"]["stop"], stop)
+
+    def abandon(self):
+        return self.engine(self.backend).abandon(self.ident)
+
+    def test_abandon_accounts_for_the_same_leave_on_any_candidate(self):
+        for verdict in ("request_changes", "approve"):
+            with self.subTest(verdict=verdict):
+                self.written_fixture(verdict)
+                before = self.state_path.read_bytes()
+                event_path = self.original.directory / "events.jsonl"
+                events_before = event_path.read_bytes()
+                for mode in (0o664, 0o646, 0o644):
+                    with self.subTest(candidate=oct(mode)):
+                        self.state_path.write_bytes(before)
+                        event_path.write_bytes(events_before)
+                        os.chmod(self.candidate, mode)
+                        runtime = self.engine(self.backend)
+                        ensure = runtime.context.ensure_exited
+                        revisions = []
+
+                        def ensure_exited():
+                            ensure()
+                            revisions.append(batches.state(self.original)["store_revision"])
+
+                        with patch.object(runtime.context, "ensure_exited", ensure_exited):
+                            result = runtime.abandon(self.ident)
+                        self.assert_abandoned(result, left=True)
+                        self.assertEqual(revisions, [result["store_revision"] - 1])
+                        expected = "invalid_rejected" if verdict == "request_changes" else "invalidated"
+                        self.assertEqual(result["final_history"][-1]["status"], expected)
+                        left, abandoned = self.observations()
+                        self.assertEqual((left["event"], left["status"], left["dispatch_id"]),
+                                         ("final_attempt_left", expected, self.receipt["dispatch_id"]))
+                        self.assertEqual(abandoned["event"], "run_abandoned")
+                        self.assertNotIn("written_leave_error", abandoned)
+                        self.assertEqual(self.artifact.read_bytes(), self.written)
+
+    def test_abandon_does_not_account_for_a_lookalike(self):
+        for case in ("edited", "link", "fifo"):
+            with self.subTest(case=case):
+                self.written_fixture()
+                watchdog = None
+                if case == "edited":
+                    original = self.written + b" "
+                    self.artifact.write_bytes(original)
+                else:
+                    self.artifact.unlink()
+                    if case == "link":
+                        target = Path(self.outside) / "lookalike.json"
+                        target.write_bytes(self.written)
+                        self.artifact.symlink_to(target)
+                    else:
+                        os.mkfifo(self.artifact)
+                        watchdog = FifoWatchdog(self.artifact, bound=5)
+                try:
+                    self.assert_abandoned(self.abandon(), left=False)
+                finally:
+                    if watchdog is not None:
+                        self.assertFalse(watchdog.stop())
+                event, = self.observations()
+                self.assertEqual(event["event"], "run_abandoned")
+                self.assertNotIn("written_leave_error", event)
+                if case == "edited":
+                    self.assertEqual(self.artifact.read_bytes(), original)
+                elif case == "link":
+                    self.assertEqual(os.readlink(self.artifact), str(target))
+                else:
+                    self.assertTrue(stat.S_ISFIFO(os.lstat(self.artifact).st_mode))
+
+    def test_authentication_failure_is_reported_and_resume_still_refuses(self):
+        self.written_fixture()
+        before = self.state_path.read_bytes()
+        altered = self.returned.read_bytes() + b" "
+        self.returned.write_bytes(altered)
+        self.assert_abandoned(self.abandon(), left=False, stop="evidence/runtime_integrity")
+        self.assertEqual(self.artifact.read_bytes(), self.written)
+        self.assertEqual(self.returned.read_bytes(), altered)
+        # Replay the pre-abandon ledger through the normal resume entry point.
+        self.state_path.write_bytes(before)
+        resumed = self.engine(self.backend)
+        with self.assertRaises(HarnessError) as caught:
+            resumed.resume(self.ident)
+        stop = stops.of(caught.exception)
+        self.assertEqual((stop["kind"], stop["reason"]), ("evidence", "runtime_integrity"))
+
+    def test_abandon_survives_an_unprintable_authentication_error(self):
+        class BrokenFormat(Exception):
+            def __str__(self):
+                raise RuntimeError("cannot format")
+
+        self.written_fixture()
+        with patch.object(finalization, "bound_bytes", side_effect=BrokenFormat()):
+            self.assert_abandoned(self.abandon(), left=False)
+        event, = self.observations()
+        self.assertIn("BrokenFormat", event["written_leave_error"]["error"])
+
+    def test_abandon_refuses_fifos_for_the_original_and_an_earlier_original(self):
+        for case in ("receipt", "earlier"):
+            with self.subTest(case=case):
+                self.written_fixture()
+                path = self.returned if case == "receipt" else Path(
+                    self.saved["final_history"][0]["review_source"]["artifact"])
+                path.unlink()
+                os.mkfifo(path)
+                watchdog = FifoWatchdog(path, bound=5)
+                try:
+                    self.assert_abandoned(self.abandon(), left=False, stop="evidence/runtime_integrity")
+                finally:
+                    self.assertFalse(watchdog.stop())
+
+    def test_abandon_records_an_original_read_failure_as_local_io(self):
+        self.written_fixture()
+        read = StateFiles.read
+        hits = []
+
+        def failing_read(files, components, **options):
+            path = Path(files.path).joinpath(*files.prefix, *components)
+            if path == self.returned:
+                hits.append(path)
+                return Outcome("failed", str(path), Step(len(files.prefix) - 1, path.name, "read", True),
+                               errno=errno.EIO)
+            return read(files, components, **options)
+
+        with patch.object(StateFiles, "read", failing_read):
+            self.assert_abandoned(self.abandon(), left=False, stop="runtime_failure/io")
+        self.assertEqual(hits, [self.returned])
+
+    def test_abandon_does_not_capture_terminal_results(self):
+        self.written_fixture()
+        before = self.state_path.read_bytes()
+        marker = self.returned.with_name("terminal-capture.json")
+        returned = self.returned.read_bytes()
+        for case in ("marker", "pending"):
+            with self.subTest(case=case):
+                run = json.loads(before)
+                if case == "marker":
+                    marker.write_bytes(b"unvalidated terminal marker")
+                else:
+                    marker.unlink()
+                    entry = next(item for item in run["dispatches"] if item["id"] == self.receipt["dispatch_id"])
+                    entry["process_outcome"] = {"started": True, "termination_reason": "timeout", "exit_code": None}
+                write_json(self.state_path, run)
+                with patch.object(CLIBackend, "preserve_terminal") as preserve:
+                    result = self.abandon()
+                preserve.assert_not_called()
+                self.assert_abandoned(result, left=False)
+                self.assertEqual(result["store_revision"], run["store_revision"] + 1)
+                self.assertEqual(self.returned.read_bytes(), returned)
+                if case == "marker":
+                    self.assertEqual(marker.read_bytes(), b"unvalidated terminal marker")
+                else:
+                    self.assertFalse(marker.exists())
+        self.assertTrue(all("written_leave_error" not in event for event in self.observations()))
+
+    def test_each_failed_observation_keeps_cli_success_and_the_other_observations(self):
+        self.written_fixture()
+        before = self.state_path.read_bytes()
+        event_path = self.original.directory / "events.jsonl"
+        events_before = event_path.read_bytes()
+        for failure in ("checkpoint", "final_attempt_left", "run_abandoned"):
+            with self.subTest(failure=failure):
+                self.state_path.write_bytes(before)
+                event_path.write_bytes(events_before)
+                stdout, stderr, calls = io.StringIO(), io.StringIO(), []
+                checkpoint = RunContext.checkpoint
+                event = RunContext.event
+
+                def observe(name, action, *args, **kwargs):
+                    calls.append(name)
+                    if name == failure:
+                        raise OSError(errno.EIO, "observation fault")
+                    return action(*args, **kwargs)
+
+                def check(context):
+                    return observe("checkpoint", checkpoint, context)
+
+                def emit(context, name, **fields):
+                    return observe(name, event, context, name, **fields)
+
+                with (patch.object(RunContext, "checkpoint", check), patch.object(RunContext, "event", emit),
+                      patch.object(CLIBackend, "invoke") as invoke, contextlib.redirect_stdout(stdout),
+                      contextlib.redirect_stderr(stderr)):
+                    code = cli.main(["--repo", str(self.repo), "--config", str(self.config.path),
+                                     "abandon", self.ident])
+                invoke.assert_not_called()
+                self.assertEqual(code, 0, stderr.getvalue())
+                self.assertEqual(json.loads(stdout.getvalue())["status"], "abandoned")
+                self.assert_abandoned(batches.state(self.original), left=True)
+                self.assertEqual(calls, ["checkpoint", "final_attempt_left", "run_abandoned"])
+                self.assertEqual([row["event"] for row in self.observations()],
+                                 [name for name in calls[1:] if name != failure])
+                self.assertEqual(sum("observation fault" in line for line in stderr.getvalue().splitlines()), 1)
+
+    def test_scheduler_filters_a_running_record_before_terminal_capture(self):
+        self.written_fixture()
+        write_json(self.artifact, self.saved["final_history"][-1])
+        marker = self.returned.with_name("terminal-capture.json")
+        marker.write_bytes(b"broken capture")
+        before = self.state_path.read_bytes()
+        resumed = self.engine(self.backend)
+        resumed.services.lifecycle.load_run(self.ident)
+        self.assertFalse(resumed.services.finalization.publish_written_leave())
+        self.assertEqual(self.state_path.read_bytes(), before)
+        self.assertEqual(marker.read_bytes(), b"broken capture")
+        with self.assertRaises(HarnessError) as caught:
+            resumed.resume(self.ident)
+        stop = stops.of(caught.exception)
+        self.assertEqual((stop["kind"], stop["reason"]), ("evidence", "runtime_integrity"))
+        self.assertEqual(marker.read_bytes(), b"broken capture")
+
+    def test_abandon_terminal_write_failure_before_and_after_publication(self):
+        self.written_fixture()
+        publish = RunStore._publish_candidate
+        before = self.state_path.read_bytes()
+        for timing in ("before", "after", "signal"):
+            with self.subTest(timing=timing):
+                fault, errors = [], io.StringIO()
+
+                def fail(store, locked, candidate, data):
+                    if candidate["status"] != "abandoned":
+                        return publish(store, locked, candidate, data)
+                    fault.append(data)
+                    if timing != "before":
+                        publish(store, locked, candidate, data)
+                    if timing == "signal":
+                        sigint()
+                        return
+                    raise OSError(errno.EIO, "terminal write fault")
+
+                self.state_path.write_bytes(before)
+                with patch.object(RunStore, "_publish_candidate", fail), contextlib.redirect_stderr(errors):
+                    if timing == "before":
+                        with self.assertRaises(OSError) as caught:
+                            self.abandon()
+                        self.assertEqual(caught.exception.errno, errno.EIO)
+                        self.assertEqual(self.state_path.read_bytes(), before)
+                        self.assertEqual(self.observations(), [])
+                    else:
+                        self.assert_abandoned(self.abandon(), left=True)
+                        self.assertEqual(self.state_path.read_bytes(), fault[0])
+                        self.assertIn("status=abandoned" if timing == "signal" else "警告", errors.getvalue())
+                self.assertEqual(len(fault), 1)
+
+    def test_sigint_after_exit_confirmation_leaves_only_whole_ledgers(self):
+        self.written_fixture()
+        starting_ledger = self.state_path.read_bytes()
+        methods = {getattr(FinalAcceptance, name).__code__ for name in (
+            "written_leave_for_abandon", "_written_candidate", "_written_record", "_leave_original", "_left_record"
+        )}
+
+        def abandon_at(target=None):
+            runtime = self.engine(self.backend)
+            ensure = runtime.context.ensure_exited
+            baseline, lines = [], []
+
+            def confirm_exit():
+                ensure()
+                baseline.append(self.state_path.read_bytes())
+
+            def trace(frame, event, arg):
+                selected = frame.f_code in methods or frame.f_code.co_name == "abandon_locked"
+                if event == "line" and baseline and selected:
+                    lines.append((frame.f_code.co_name, frame.f_lineno, runtime.context.store.terminal_committed))
+                    if len(lines) - 1 == target:
+                        sigint()
+                return trace if selected else None
+
+            previous = sys.gettrace()
+            with interrupts.installed(), patch.object(runtime.context, "ensure_exited", confirm_exit):
+                controller = interrupts.active()
+                try:
+                    sys.settrace(trace)
+                    runtime.abandon(self.ident)
+                except KeyboardInterrupt:
+                    if target is None:
+                        raise
+                finally:
+                    sys.settrace(previous)
+            self.assertEqual(len(baseline), 1)
+            return baseline[0], lines, controller.delivered_from
+
+        with contextlib.redirect_stderr(io.StringIO()):
+            _, lines, delivery = abandon_at()
+            self.assertIsNone(delivery)
+            complete = self.state_path.read_bytes()
+            self.assert_abandoned(batches.state(self.original), left=True)
+            self.assertTrue({code.co_name for code in methods}.issubset({name for name, _, _ in lines}))
+            self.assertEqual({committed for _, _, committed in lines}, {False, True})
+            for index, line in enumerate(lines):
+                with self.subTest(index=index, line=line):
+                    self.state_path.write_bytes(starting_ledger)
+                    baseline, seen, delivery = abandon_at(index)
+                    self.assertEqual(seen[index], line)
+                    if delivery is None:
+                        self.assertEqual(self.state_path.read_bytes(), complete)
+                    else:
+                        self.assertFalse(line[2])
+                        self.assertEqual(delivery, "_launch")
+                        self.assertEqual(self.state_path.read_bytes(), baseline)
+
+    def test_already_abandoned_does_not_check_or_rewrite_the_leave(self):
+        self.written_fixture()
+        abandoned = dict(self.saved, status="abandoned")
+        abandoned.pop("stop", None)
+        write_json(self.state_path, abandoned)
+        before = self.state_path.read_bytes()
+        read = StateFiles.read
+        hits = []
+
+        def counted(files, components, **options):
+            path = Path(files.path).joinpath(*files.prefix, *components)
+            if path.name in {"final.json", "returned-result.json"}:
+                hits.append(path)
+            return read(files, components, **options)
+
+        with patch.object(StateFiles, "read", counted):
+            self.assert_abandoned(self.abandon(), left=False)
+        self.assertEqual(self.state_path.read_bytes(), before)
+        self.assertEqual(hits, [])
+        self.assertEqual(self.observations(), [])
 
 
 if __name__ == "__main__":

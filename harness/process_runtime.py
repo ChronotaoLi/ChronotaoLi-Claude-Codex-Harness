@@ -13,6 +13,8 @@ import signal
 import subprocess
 import time
 
+from . import interrupts
+
 
 class DeferredSignals(list):
     handled = False
@@ -29,6 +31,10 @@ def defer_cleanup_signals(*, primary=None, inherit=True):
     """
     import sys
     captured = DeferredSignals()
+    if interrupts.active() or interrupts.holding():
+        yield captured
+        return
+
     def remember(signum, frame):
         if not captured:
             captured.append(signum)
@@ -245,7 +251,9 @@ class ProcessSupervisor:
                 cleanup_end = min(time.monotonic() + 2, self.cleanup_deadline if self.cleanup_deadline is not None else float("inf"))
                 self._attempt("sigterm", lambda: os.killpg(p.pid, signal.SIGTERM))
                 deadline = min(time.monotonic() + 1, cleanup_end)
-                while time.monotonic() < deadline and self._attempt("poll_cleanup", p.poll) is None:
+                while (time.monotonic() < deadline
+                       and self._attempt("poll_cleanup", p.poll) is None
+                       and not interrupts.hurry()):
                     self._attempt("cleanup_pause", lambda: time.sleep(.01))
                 # Keep the unreaped leader as ownership anchor until signalling
                 # is complete. If it exited, a remaining group is ambiguous.

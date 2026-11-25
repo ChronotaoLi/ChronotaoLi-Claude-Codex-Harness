@@ -26,7 +26,9 @@ class Workflow(RuntimeService):
         try:
             self.context.ensure_exited(commit=False)
         except Exception:
-            pass  # An incomplete exit check leaves the original stop in charge.
+            exits_confirmed = False  # Preserve the original stop if the check fails.
+        else:
+            exits_confirmed = True
 
         interrupted = isinstance(error, (KeyboardInterrupt, SystemExit))
         value = stops.of(error)
@@ -34,19 +36,12 @@ class Workflow(RuntimeService):
         self.context.run.pop("result", None)
         quota_wait.clear(self.context.run)   # a wait never outlives the stop that ends it
         if interrupted:
-            value["data"]["exits_confirmed"] = self.exits_confirmed()
+            value["data"]["exits_confirmed"] = exits_confirmed
         self.context.run["stop"] = value
         if not interrupted:
-            try:
-                value = self.services.lifecycle.settle_stop(error)
-            except (KeyboardInterrupt, SystemExit) as signal:
-                value = stops.of(signal)
-                value["data"]["exits_confirmed"] = self.exits_confirmed()
-                self.context.run["status"], self.context.run["stop"] = "interrupted", value
-                if self._save_stop(signal, value) is self.KEPT:
-                    return self.KEPT
-                raise
+            value = self.services.lifecycle.settle_stop(error)
             self.context.run["stop"] = value
+
         def stopped_event():
             self.context.event("run_stopped", stop=stops.project(value, self.context.run["id"]))
 
@@ -63,11 +58,6 @@ class Workflow(RuntimeService):
             return self.KEPT
         self.context.saved_stop = (error, code)
         return self.WRITTEN
-
-    def exits_confirmed(self):
-        """Whether every dispatch that may have started has a confirmed exit (abandon needs no confirmation)."""
-        return all(entry.get("exit_confirmed") is True or entry.get("process_state") == "prepared"
-                   for entry in self.context.run.get("dispatches", []))
 
     def handoff_targets(self, task_id):
         """Project only unaccepted transitive descendants, in plan order."""

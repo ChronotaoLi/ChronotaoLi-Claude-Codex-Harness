@@ -11,7 +11,8 @@ from pathlib import Path
 from . import git, stops
 from .worker_receipts import read_worker_source
 from .commands import available_through
-from .recovery import RECOVERY_BUSY_KEYS, read_bound_result, snapshot_digest
+from .recovery import RECOVERY_BUSY_KEYS, bound_result, evidence_path, returned_result_files, run_files, snapshot_digest
+from .runtime_evidence import optional_bytes
 from .util import EvidenceError, HarnessError, dump, write_json
 
 def _snapshot(context):
@@ -43,12 +44,15 @@ def _write(context, category, record):
     ident = _identity(category, record)
     value = {**deepcopy(record), 'id': ident}
     path = Path(context.directory) / category / (ident + '.json')
-    if any(p.is_symlink() for p in (path, *path.parents)):
-        raise HarnessError('immutable evidence path is a symlink')
     raw = (dump(value) + '\n').encode()
-    if not path.exists():
+    files = run_files(context)
+    parts = (category, path.name)
+    source = {"artifact": str(path)}
+    actual = optional_bytes(files, parts, source)
+    if actual is None:
         write_json(path, value)
-    if path.read_bytes() != raw:
+        actual = files.read(parts, limit=None).evidence(source)
+    if actual != raw:
         raise HarnessError('immutable evidence artifact conflict')
     return {**_projection(value), 'artifact': str(path), 'artifact_digest': hashlib.sha256(raw).hexdigest()}
 
@@ -62,9 +66,9 @@ def _complete(context, category, row):
     if row['id'] != category + '_' + suffix or len(suffix) != 64 or any(c not in '0123456789abcdef' for c in suffix):
         raise HarnessError('invalid evidence identity')
     path = Path(context.directory) / category / (row['id'] + '.json')
-    if row.get('artifact') != str(path) or not row.get('artifact_digest') or any(p.is_symlink() for p in (path, *path.parents)):
+    if row.get('artifact') != str(path) or not row.get('artifact_digest'):
         raise HarnessError('invalid evidence reference')
-    record, _ = read_bound_result(row, category)
+    record, _ = bound_result(run_files(context).under(category, row['id'] + '.json'), row, category)
     projection = {k: v for k, v in row.items() if k not in ('artifact', 'artifact_digest')}
     if (not isinstance(record, dict) or 'snapshot' in projection or 'snapshot' not in record
             or _projection(record) != projection
@@ -106,7 +110,8 @@ def _records(context, category, key):
     return deepcopy(records)
 
 
-def record_continuation(context, task_id, result, worker_source, snapshot, *, save=True):
+def prepare_continuation(context, task_id, result, worker_source, snapshot):
+    """Retain immutable evidence and return the ledger updates and independent row."""
     history = _records(context, 'continuations', 'continuation_history')
     rejections, _ = _rejections(context, history)
     stored = read_worker_source(context, task_id, worker_source)
@@ -121,7 +126,7 @@ def record_continuation(context, task_id, result, worker_source, snapshot, *, sa
                 raise HarnessError('rejected continuation source cannot be replayed', stop=stops.make("runtime_failure", "invariant"))
             if old['snapshot_digest'] != snapshot_digest(snapshot):
                 raise HarnessError('continuation candidate changed', stop=stops.make("workspace_mismatch", "candidate_changed"))
-            return old
+            return {}, old
     if context.run.get('pending_continuation'):
         raise HarnessError('another continuation remains pending', stop=stops.make("runtime_failure", "invariant"))
     record = dict(run_id=context.run['id'], sequence=len(history) + 1, task_id=task_id,
@@ -134,12 +139,13 @@ def record_continuation(context, task_id, result, worker_source, snapshot, *, sa
         if error.stop is not None:
             raise
         raise EvidenceError(str(error), stop=stops.make('evidence', 'runtime_integrity')) from error
-    context.run['continuation_history'] = [*history, row]
-    context.run['pending_continuation'] = row['id']
-    if save:
-        context.save()
-    return deepcopy(row)
+    return {'continuation_history': [*history, row], 'pending_continuation': row['id']}, deepcopy(row)
 
+
+def apply_continuation(context, prepared):
+    updates, row = prepared
+    context.run.update(updates)
+    return row
 
 def continuation_gate(context, current_snapshot=None):
     history = _records(context, 'continuations', 'continuation_history')
@@ -376,12 +382,11 @@ def record_execution_guidance(context, path, current_snapshot=None, *, value=Non
             or any(context.run.get(k) for k in RECOVERY_BUSY_KEYS)):
         raise HarnessError('execution guidance requires a safe pending task boundary', stop=stops.make('invalid_input', 'run_state', data={'status': context.run.get('status')}))
     source = {'dispatch_id': value['source_dispatch_id'], 'artifact': str(Path(context.directory) / 'dispatches' / value['source_dispatch_id'] / 'returned-result.json')}
-    try:
-        source['artifact_digest'] = hashlib.sha256(Path(source['artifact']).read_bytes()).hexdigest()
-    except OSError as error:
-        stops.keep_local_io(error)
-        raise EvidenceError('execution guidance worker source missing',
-                            stop=stops.make('evidence', 'runtime_integrity', source={'artifact': source['artifact']})) from error
+    files = returned_result_files(context, source['dispatch_id'])
+    evidence_path(files, source)
+    outcome = files.digest(())
+    outcome.evidence(source)
+    source['artifact_digest'] = outcome.digest
     # Require an existing authoritative digest; never bless edited source bytes.
     continuation_records = _records(context, 'continuations', 'continuation_history')
     links = [r['source'] for r in continuation_records]

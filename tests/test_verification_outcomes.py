@@ -20,7 +20,7 @@ from harness.process_runtime import ProcessOutcome
 from harness.run_context import RunContext
 from harness.run_store import RunStore
 from harness.util import (CommandDirectoryError, HarnessError, ProcessStartError, ProcessTimeout, ProgramStartError,
-                          read_json, run_process, tail, write_json)
+                          read_json, run_process, write_json)
 from harness.verification import Verification, checks_passed
 from harness.workflow import Workflow
 from test_harness import ROOT, RepoCase, cli_notice, run_cli, walk_exit, write_project_config
@@ -49,10 +49,11 @@ def open_root(held, root, binding):
 
 class VerificationOutcomeTests(unittest.TestCase):
     def fixture(self, root):
+        directory = root / "runs" / "run_checks"
         context = SimpleNamespace(
-            directory=root, run={"dispatches": []}, config=SimpleNamespace(data={"runtime": {"verify_timeout_seconds": 1}}),
+            state=root, directory=directory, run={"id": "run_checks", "dispatches": []}, config=SimpleNamespace(data={"runtime": {"verify_timeout_seconds": 1}}),
             ensure_exited=lambda: None, save=lambda: None, save_fact=lambda *keys: True)
-        return Verification(context), root / "verification" / "checks"
+        return Verification(context), directory / "verification" / "checks"
 
     def run_fake(self, verification, folder, outcome, error=None, then=lambda: None):
         def process(argv, cwd, log, **kwargs):
@@ -180,55 +181,50 @@ class VerificationOutcomeTests(unittest.TestCase):
                 self.assertEqual(entry["process_state"] == "exited", fact != "unconfirmed")
 
     def test_the_first_of_two_failed_writes_is_the_error_raised(self):
-        # Rule 11's W is the first of the three writes (excerpt, results.json, ledger) to fail, not a later one.
+        # Rule 11's W is the first of the two writes (results.json, ledger) to fail, not a later one.
         for error_type in CHECK_FAILURES:
             timeout = error_type is ProcessTimeout
-            for steps in (("excerpt", "results"), ("results", "ledger"), ("excerpt", "ledger")):
-                with self.subTest(process=error_type.__name__, failing=steps), \
-                        tempfile.TemporaryDirectory() as directory:
-                    verification, folder = self.fixture(Path(directory))
-                    errors = {"excerpt": OSError("excerpt read"), "results": HarnessError("results serialization"),
-                              "ledger": OSError("ledger fsync")}
-                    pending, saves = set(steps), []
+            steps = ("results", "ledger")
+            with self.subTest(process=error_type.__name__, failing=steps), \
+                    tempfile.TemporaryDirectory() as directory:
+                verification, folder = self.fixture(Path(directory))
+                errors = {"results": HarnessError("results serialization"),
+                          "ledger": OSError("ledger fsync")}
+                pending, saves = set(steps), []
 
-                    def fail(step):   # each failing write fails once; its retry succeeds
-                        if step in pending:
-                            pending.remove(step)
-                            raise errors[step]
+                def fail(step):   # each failing write fails once; its retry succeeds
+                    if step in pending:
+                        pending.remove(step)
+                        raise errors[step]
 
-                    def excerpt(path):
-                        fail("excerpt")
-                        return tail(path)
+                def persist(path, value):
+                    if value:
+                        fail("results")
+                    write_json(path, value)
 
-                    def persist(path, value):
-                        if value:
-                            fail("results")
-                        write_json(path, value)
-
-                    def save():
-                        saves.append(len(saves))
-                        if len(saves) > 1:   # every save after the entry's registration
-                            fail("ledger")
-                    verification.context.save = save
-                    outcome = ProcessOutcome(started=timeout, exit_confirmed=True,
-                                             termination_reason="timeout" if timeout else "start_failed")
-                    process = check_failure(error_type, folder)
-                    with patch("harness.verification.tail", side_effect=excerpt), \
-                            patch("harness.verification.write_json", side_effect=persist), \
-                            self.assertRaises((HarnessError, OSError)) as caught:
-                        self.run_fake(verification, folder, outcome, process)
-                    first = errors[steps[0]]
-                    self.assertEqual(pending, set())   # both writes did fail
-                    self.assertIs(caught.exception, first)
-                    self.assertIs(first.__cause__, process)
-                    self.assertEqual(stop_of(first), ("runtime_failure", "io") if isinstance(first, OSError)
-                                     else ("unclassified", "untyped_harness_error"))
-                    self.assertEqual(verification.context.run["feedback"]["verification_error"]["error"], str(first))
-                    (row,) = read_json(folder / "results.json")
-                    (entry,) = verification.context.run["dispatches"]
-                    for value in (row, entry):
-                        self.assertEqual((value["status"], value["evidence_complete"], value["persistence_error"]),
-                                         ("failed", False, str(first)))
+                def save():
+                    saves.append(len(saves))
+                    if len(saves) > 1:   # every save after the entry's registration
+                        fail("ledger")
+                verification.context.save = save
+                outcome = ProcessOutcome(started=timeout, exit_confirmed=True,
+                                         termination_reason="timeout" if timeout else "start_failed")
+                process = check_failure(error_type, folder)
+                with patch("harness.verification.write_json", side_effect=persist), \
+                        self.assertRaises((HarnessError, OSError)) as caught:
+                    self.run_fake(verification, folder, outcome, process)
+                first = errors[steps[0]]
+                self.assertEqual(pending, set())   # both writes did fail
+                self.assertIs(caught.exception, first)
+                self.assertIs(first.__cause__, process)
+                self.assertEqual(stop_of(first), ("runtime_failure", "io") if isinstance(first, OSError)
+                                 else ("unclassified", "untyped_harness_error"))
+                self.assertEqual(verification.context.run["feedback"]["verification_error"]["error"], str(first))
+                (row,) = read_json(folder / "results.json")
+                (entry,) = verification.context.run["dispatches"]
+                for value in (row, entry):
+                    self.assertEqual((value["status"], value["evidence_complete"], value["persistence_error"]),
+                                     ("failed", False, str(first)))
 
     def test_a_directory_that_cannot_open_is_a_failed_check_with_its_own_reason(self):
         # Through the real launch: rule 10's record when cleanup and every write were clean (rule 11, first row).
@@ -422,6 +418,36 @@ class VerificationOutcomeTests(unittest.TestCase):
             self.assertIn("second gate ran", results[1]["stdout"])
             self.assertFalse(checks_passed(results))
 
+    def test_unreadable_output_tail_keeps_the_command_result_and_other_tail(self):
+        for code in (0, 7):
+            with self.subTest(exit_code=code), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                verification, folder = self.fixture(root)
+                injected = []
+
+                def open_log(real, name, flags, *args, **kwargs):
+                    if name == "check-0.stdout" and kwargs.get("dir_fd") is not None:
+                        injected.append(name)
+                        raise OSError(errno.EIO, "verification output read failed")
+                    return real(name, flags, *args, **kwargs)
+
+                script = "import sys; print('full output'); sys.stderr.buffer.write(b'x' * 4100 + bytes([255])); "
+                command = {"cwd": ".", "argv": [sys.executable, "-c", script + f"sys.exit({code})"]}
+                with patch("harness.verification.git.open_bound_root", side_effect=open_root), \
+                        patch.object(state_files, "os", FakeOs(open=open_log)):
+                    (row,) = verification.run_verification_commands("task", [command], root, folder, {})
+                self.assertEqual(injected, ["check-0.stdout"])
+                self.assertEqual((folder / "check-0.stdout").read_bytes(), b"full output\n")
+                self.assertEqual((row["stdout"], row["stderr"]),
+                                 ("", "[earlier output omitted; see log]\n" + "x" * 3999 + "\ufffd"))
+                self.assertEqual((row["exit_code"], row["termination_reason"], row["evidence_complete"]),
+                                 (code, "normal", True))
+                self.assertEqual(checks_passed([row]), code == 0)
+                self.assertEqual(read_json(folder / "results.json"), [row])
+                entry, = verification.context.run["dispatches"]
+                self.assertEqual(entry["status"], "failed" if code else "completed")
+                self.assertNotIn("persistence_error", entry)
+
     def test_passed_status_requires_consistent_complete_lifecycle(self):
         for result in ({"exit_code": 0}, {"exit_code": None}, {"exit_code": 0, "status": "unknown"}):
             self.assertFalse(checks_passed([result]))
@@ -495,7 +521,7 @@ class VerificationStopExitTests(RepoCase):
         plan = read_json(ROOT / "examples" / "plan.json")
         publish = RunStore._publish_candidate
         for interrupt_type, reason in ((KeyboardInterrupt, "cancelled"), (SystemExit, "interrupted")):
-            for step in ("excerpt", "results", "ledger"):
+            for step in ("results", "ledger"):
                 with self.subTest(interrupt=interrupt_type.__name__, step=step):
                     engine = self.engine()
                     interrupt = interrupt_type("verification interrupted")
@@ -516,10 +542,6 @@ class VerificationStopExitTests(RepoCase):
                             failed = True
                             raise fault
 
-                    def excerpt(path):
-                        fail_once("excerpt")
-                        return tail(path)
-
                     def results_write(path, value):
                         fail_once("results")
                         write_json(path, value)
@@ -529,7 +551,6 @@ class VerificationStopExitTests(RepoCase):
                         publish(store, locked, candidate, data)
 
                     with patch("harness.verification.run_process", process), \
-                            patch("harness.verification.tail", excerpt), \
                             patch("harness.verification.write_json", results_write), \
                             patch.object(RunStore, "_publish_candidate", ledger_write), \
                             self.assertRaises(interrupt_type) as caught:
@@ -830,10 +851,6 @@ class VerificationFeedbackCommitTests(unittest.TestCase):
                 write_faults.append(write_error)
                 raise write_error
 
-        def excerpt(path):
-            fail_write("excerpt")
-            return tail(path)
-
         def write_results(path, value):
             if value:
                 fail_write("results")
@@ -865,7 +882,6 @@ class VerificationFeedbackCommitTests(unittest.TestCase):
         with contextlib.redirect_stderr(stderr), \
                 patch("harness.verification.git.open_bound_root", side_effect=open_root), \
                 patch("harness.verification.run_process", process), \
-                patch("harness.verification.tail", excerpt), \
                 patch("harness.verification.write_json", write_results), \
                 patch.object(state_files.LockedDirectory, "replace", write_ledger), \
                 patch.object(state_files, "os", FakeOs(pread=read_ledger, write=write_temp)):
@@ -948,7 +964,7 @@ class VerificationFeedbackCommitTests(unittest.TestCase):
 
     def test_feedback_failure_at_read_or_before_replace_preserves_the_k6_matrix(self):
         writes = (None, ("results", OSError), ("results", HarnessError), ("results", lambda _: OSError()),
-                  ("excerpt", OSError), ("ledger", HarnessError))
+                  ("ledger", HarnessError))
         process_facts = [(None, None)]
         process_facts += [(process, fact) for process in CHECK_FAILURES for fact in (None, "evidence")]
         process_facts.append((ProcessTimeout, "unconfirmed"))

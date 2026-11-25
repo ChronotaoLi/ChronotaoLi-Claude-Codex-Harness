@@ -146,29 +146,41 @@ class TerminalCaptureRecoveryTests(RepoCase):
         self.assertEqual(result["agent_dispatches"], 1)
         self.assertEqual(len(backend.calls), 1)
 
-    def test_cancellation_during_descendant_drain_never_rerolls_or_accepts(self):
-        backend = self.backend()
+    def test_signal_during_descendant_drain_preserves_the_returned_review(self):
+        backend = self.backend(duration=.4)
         original = time.sleep
-        cancelled = False
-        def interrupt(seconds):
-            nonlocal cancelled
-            if backend.jobs and (backend.jobs[0] / "descendant.pid").exists() and not cancelled:
-                cancelled = True
+        signalled = False
+
+        def signal_in_drain(seconds):
+            nonlocal signalled
+            if backend.jobs and (backend.jobs[0] / "descendant.pid").exists() and not signalled:
+                signalled = True
                 os.kill(os.getpid(), signal.SIGINT)
             original(seconds)
+
         engine = self.engine(backend)
-        with patch("harness.process_runtime.time.sleep", side_effect=interrupt), self.assertRaises(KeyboardInterrupt):
+        with patch("harness.process_runtime.time.sleep", side_effect=signal_in_drain), self.assertRaises(KeyboardInterrupt):
             engine.start("Implement greet", read_json(ROOT / "examples/plan.json"))
-        backend.release()
-        calls = len(backend.calls)
-        self.assertTrue(cancelled)
-        entry = engine.run["dispatches"][-1]
-        self.assertEqual(entry["exit_code"], 0)
-        self.assertEqual(entry["termination_reason"], "cancelled")
-        with self.assertRaisesRegex(HarnessError, "终端结果"):
-            self.engine(backend).resume(engine.run["id"])
-        self.assertEqual(len(backend.calls), calls)
-        self.assertFalse(engine.run["accepted"])
+        self.assertTrue(signalled)
+        saved = read_json(engine.directory / "state.json")
+        self.assertEqual((saved["status"], saved["stop"]["kind"], saved["stop"]["reason"]),
+                         ("interrupted", "interrupted", "signal"))
+        dispatch_id = backend.jobs[0].name
+        entry = next(row for row in saved["dispatches"] if row["id"] == dispatch_id)
+        self.assertEqual((entry["exit_code"], entry["termination_reason"]), (0, "normal"))
+        self.assertTrue(entry["exit_confirmed"])
+        self.assertTrue(entry["evidence_complete"])
+        self.assertIn("drain_descendants", entry["process_outcome"]["cleanup_actions"])
+        self.assertNotIn("sigterm", entry["process_outcome"]["cleanup_actions"])
+        record, = saved["review_history"]["greet"]
+        self.assertEqual(record["review_source"]["dispatch_id"], dispatch_id)
+        self.assertNotIn("reviewer:review:greet", saved["review_receipts"])
+        self.assertEqual([call["kind"] for call in backend.calls], ["implement", "review"])
+
+        resumed = self.engine(backend).resume(saved["id"])
+        self.assertEqual(resumed["status"], "completed")
+        self.assertEqual(resumed["review_history"]["greet"], [record])
+        self.assertEqual([call["kind"] for call in backend.calls], ["implement", "review", "final_review"])
 
     def test_commander_question_remains_on_repeated_resume(self):
         def blocked(backend, kwargs, packet, result):

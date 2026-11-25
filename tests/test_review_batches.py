@@ -9,6 +9,8 @@ from unittest.mock import patch
 
 import harness.finalization as finalization
 import harness.review_progress as review_progress
+from harness.state_files import StateFiles
+from harness.recovery import run_files
 from harness.review_progress import BATCH_LIMIT, repair_findings, required_findings
 from harness.task_lifecycle import TaskLifecycle
 from harness.util import EvidenceError, HarnessError, read_json
@@ -115,7 +117,7 @@ class TaskBatchTests(RepoCase):
         # The last batch is the approval that was accepted.
         self.assertEqual(result["accepted"]["greet"]["review_artifact"], records[-1]["artifact"])
         self.assertEqual(result["accepted"]["greet"]["review_source"], records[-1]["review_source"])
-        self.assertEqual(required_findings(result, "greet", records[-1]["snapshot_digest"]), [])
+        self.assertEqual(required_findings(result, "greet", records[-1]["snapshot_digest"], files=run_files(engine.context)), [])
         self.assertEqual([(row["dispatch_id"], row["next_batch"]) for row in events(engine, "review_batch_approved")],
                          [(records[-2]["dispatch_id"], 1)])
 
@@ -290,12 +292,12 @@ class TaskBatchSelectionTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             run, record = self.history(tmp)
             self.reported(record, "R1", 61)
-            on_a = required_findings(run, "t", "A")
+            on_a = required_findings(run, "t", "A", files=StateFiles(Path(tmp).resolve()).under("runs", run["id"]))
             self.assertEqual(labels(on_a), rounds(("R1", 60)))
             self.resolve(record, "R2", on_a, "A")
-            self.assertEqual(labels(repair_findings(run, "t")), ["R1-60"])
+            self.assertEqual(labels(repair_findings(run, "t", files=StateFiles(Path(tmp).resolve()).under("runs", run["id"]))), ["R1-60"])
             # 61 lack a resolution on C; one is open: it joins the batch, R1-59 waits, keys follow source order.
-            batch = required_findings(run, "t", "C")
+            batch = required_findings(run, "t", "C", files=StateFiles(Path(tmp).resolve()).under("runs", run["id"]))
             self.assertEqual(labels(batch), rounds(("R1", 59)) + ["R1-60"])
             self.assertEqual([row["key"] for row in batch], [f"f{n}" for n in range(1, BATCH_LIMIT + 1)])
             self.assertEqual([row["finding_index"] for row in batch], [*range(59), 60])
@@ -304,14 +306,14 @@ class TaskBatchSelectionTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             run, record = self.history(tmp)
             original = self.reported(record, "R1", 60)
-            on_a = required_findings(run, "t", "A")
+            on_a = required_findings(run, "t", "A", files=StateFiles(Path(tmp).resolve()).under("runs", run["id"]))
             # Half resolved, half open on A: the statuses differ, the order on C does not.
             self.resolve(record, "R2", on_a, "A", verdict="request_changes",
                          **{f"f{n}": "open" for n in range(31, 61)})
             source = original["review_source"]
             whole = [{"key": f"f{index + 1}", "review_dispatch_id": "R1", "finding_index": index,
                       "label": f"R1-{index}", "artifact": source["artifact"]} for index in range(60)]
-            self.assertEqual(required_findings(run, "t", "C"), whole)
+            self.assertEqual(required_findings(run, "t", "C", files=StateFiles(Path(tmp).resolve()).under("runs", run["id"])), whole)
             self.assertEqual(on_a, whole)
 
     def test_each_approved_batch_closes_exactly_its_rows_on_a_fixed_candidate(self):
@@ -319,14 +321,14 @@ class TaskBatchSelectionTests(unittest.TestCase):
             with self.subTest(findings=count), TemporaryDirectory() as tmp:
                 run, record = self.history(tmp)
                 self.reported(record, "R1", count)
-                reviews, batch = 0, required_findings(run, "t", "C")
+                reviews, batch = 0, required_findings(run, "t", "C", files=StateFiles(Path(tmp).resolve()).under("runs", run["id"]))
                 while True:
                     reviews += 1
                     if batch:
                         self.resolve(record, f"B{reviews}", batch, "C")
                     else:
                         record(f"B{reviews}", dict(verdict="approve", findings=[]), "C")
-                    following = required_findings(run, "t", "C")
+                    following = required_findings(run, "t", "C", files=StateFiles(Path(tmp).resolve()).under("runs", run["id"]))
                     self.assertFalse({(r["review_dispatch_id"], r["finding_index"]) for r in following}
                                      & {(r["review_dispatch_id"], r["finding_index"]) for r in batch})
                     if not following:
@@ -338,12 +340,12 @@ class TaskBatchSelectionTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             run, record = self.history(tmp)
             self.reported(record, "R1", 120)
-            first = required_findings(run, "t", "C")
+            first = required_findings(run, "t", "C", files=StateFiles(Path(tmp).resolve()).under("runs", run["id"]))
             self.resolve(record, "B1", first, "C")
-            self.assertEqual(labels(required_findings(run, "t", "C")), rounds(("R1", 120))[60:])
+            self.assertEqual(labels(required_findings(run, "t", "C", files=StateFiles(Path(tmp).resolve()).under("runs", run["id"]))), rounds(("R1", 120))[60:])
             # Sixty rows that the candidate already closed are not the batch recomputed after B1.
             self.resolve(record, "B2", first, "C")
-            for read in (lambda: required_findings(run, "t", "C"), lambda: repair_findings(run, "t")):
+            for read in (lambda: required_findings(run, "t", "C", files=StateFiles(Path(tmp).resolve()).under("runs", run["id"])), lambda: repair_findings(run, "t", files=StateFiles(Path(tmp).resolve()).under("runs", run["id"]))):
                 with self.assertRaises(EvidenceError) as caught:
                     read()
                 self.assertEqual((caught.exception.stop["kind"], caught.exception.stop["reason"]),
@@ -380,7 +382,7 @@ class ApprovedBatchContractTests(unittest.TestCase):
         for status in ("running", "rejected", "invalidated"):
             with self.subTest(status=status), TemporaryDirectory() as tmp:
                 run, original = self.rejected_then(tmp)
-                rows = required_findings(run, "final", "A", whole_run=True)
+                rows = required_findings(run, "final", "A", files=StateFiles(Path(tmp).resolve()).under("runs", run["id"]), whole_run=True)
                 self.assertEqual(labels(rows), ["X"])
                 bad = dict(verdict="request_changes", findings=[], summary="s",
                            finding_dispositions={"f1": {"status": "resolved", "evidence": ["x"]}})
@@ -396,7 +398,7 @@ class ApprovedBatchContractTests(unittest.TestCase):
                                                  required_findings=[], review=ok, approved_batches=[],
                                                  review_source=original("R3", ok, "A")))
                 with self.assertRaises(EvidenceError) as caught:
-                    required_findings(run, "final", "A", whole_run=True)
+                    required_findings(run, "final", "A", files=StateFiles(Path(tmp).resolve()).under("runs", run["id"]), whole_run=True)
                 self.assertEqual((caught.exception.stop["kind"], caught.exception.stop["reason"]),
                                  ("evidence", "runtime_integrity"))
                 self.assertIn("批准条目不满足批准契约", str(caught.exception))
@@ -409,15 +411,15 @@ class ApprovedBatchContractTests(unittest.TestCase):
         for name, damage in cases.items():
             with self.subTest(case=name), TemporaryDirectory() as tmp:
                 run, original = self.rejected_then(tmp)
-                rows = required_findings(run, "final", "A", whole_run=True)
+                rows = required_findings(run, "final", "A", files=StateFiles(Path(tmp).resolve()).under("runs", run["id"]), whole_run=True)
                 batch = dict(dispatch_id="R2", required_findings=rows, review=approval,
                              review_source=original("R2", approval, "A"))
                 attempt = dict(attempt=2, head="h", snapshot_digest="A", status="running", phase="reviewing",
                                required_findings=[], approved_batches=[batch])
                 run["final_history"].append(attempt)
                 # Intact, the batch closes X on A and on A only.
-                self.assertEqual(required_findings(run, "final", "A", whole_run=True), [])
-                self.assertEqual(labels(required_findings(run, "final", "B", whole_run=True)), ["X"])
+                self.assertEqual(required_findings(run, "final", "A", files=StateFiles(Path(tmp).resolve()).under("runs", run["id"]), whole_run=True), [])
+                self.assertEqual(labels(required_findings(run, "final", "B", files=StateFiles(Path(tmp).resolve()).under("runs", run["id"]), whole_run=True)), ["X"])
                 if damage is None:
                     attempt.pop("approved_batches")
                 elif damage == "drop":
@@ -425,7 +427,7 @@ class ApprovedBatchContractTests(unittest.TestCase):
                 else:
                     attempt["approved_batches"] = damage
                 with self.assertRaises(EvidenceError) as caught:
-                    required_findings(run, "final", "A", whole_run=True)
+                    required_findings(run, "final", "A", files=StateFiles(Path(tmp).resolve()).under("runs", run["id"]), whole_run=True)
                 self.assertEqual((caught.exception.stop["kind"], caught.exception.stop["reason"]),
                                  ("evidence", "runtime_integrity"))
 

@@ -6,7 +6,7 @@ import json
 from copy import deepcopy
 from pathlib import Path
 
-from . import acceptance, git, stops
+from . import acceptance, git, interrupts, stops
 from .config import PROJECT_FILE
 from .context import compact_checks, compact_feedback, compact_reviews, instruction_file_changes
 from .contracts import envelope, judge_review, review_approved, review_schema, WORK
@@ -15,10 +15,12 @@ from .planning import attempt_limit_error
 from .input_projection import validate_dispatch_indexes as validate_input_dispatch_indexes
 from .path_evidence import validate_dispatch_indexes
 from .progress import CheckpointDeclarationError
-from .process_runtime import defer_cleanup_signals
-from .recovery import read_evidence_json, acceptance_review_records, snapshot_digest, worker_recovery_context
+from .recovery import (
+    acceptance_review_records, bound_bytes, evidence_json, returned_result_files, run_files,
+    snapshot_digest, worker_recovery_context,
+)
 from .services import RuntimeService
-from .continuation import record_continuation
+from .continuation import apply_continuation, prepare_continuation
 from .review_progress import (
     batch_after, bind_review_source, validate_review_source, claim_gaps, claims_for_review, disposition_gaps,
     required_findings, delivered_worker_findings, require_saved_batch,
@@ -56,6 +58,7 @@ def environment_blocker_excerpt(result):
 
 class TaskLifecycle(RuntimeService):
     def finish_post_accept(self):
+        interrupts.deliver()
         runtime = self.context
         pending = self.context.run.get("pending_post_accept")
         if not pending:
@@ -99,9 +102,13 @@ class TaskLifecycle(RuntimeService):
 
     def acceptance_event_once(self, event, event_id, **fields):
         """Recover the event-append/state-save boundary using the stable acceptance ID."""
-        runtime = self.context
         path = self.context.directory / "events.jsonl"
-        content = path.read_text(encoding="utf-8") if path.exists() else ""
+        source = {"artifact": str(path)}
+        outcome = run_files(self.context).read((path.name,), limit=None)
+        with stops.evidence_reads(source=source):
+            content = ("" if outcome.state == "absent" and outcome.step.leaf
+                       else outcome.evidence(source).decode("utf-8"))
+        content = content.replace("\r\n", "\n").replace("\r", "\n")
         for line in content.splitlines():
             try:
                 record = json.loads(line)
@@ -161,14 +168,15 @@ class TaskLifecycle(RuntimeService):
         candidate_digest = self.services.worker_receipts.sealed_candidate(key)
         if snapshot_digest(self.context.snapshot()) != candidate_digest:
             raise HarnessError("worker candidate changed before handoff publication", stop=stops.make("workspace_mismatch", "candidate_changed", source={"task_id": tid}))
-        attempt = self.context.run["worker_receipts"][key]["attempt"]
+        attempt = receipt["attempt"]
         paths = git.check_scope(self.context.worktree, task["allowed_paths"], binding=self.context.run["worktree_binding"],
                                 task_id=tid)
-        worker_dispatch = self.services.worker_receipts.entry(self.context.run["worker_receipts"][key])
-        worker_artifact = self.context.directory / "dispatches" / worker_dispatch["id"] / "returned-result.json"
+        worker_dispatch = self.services.worker_receipts.entry(receipt)
+        worker_artifact = receipt["artifact"]
+        raw_worker, worker_digest = bound_bytes(returned_result_files(self.context, worker_dispatch["id"]),
+                                                receipt, "worker")
         with stops.evidence_reads(source={"artifact": str(worker_artifact), "dispatch_id": worker_dispatch["id"],
                                           "task_id": tid}):
-            raw_worker = worker_artifact.read_bytes()
             stored_worker = json.loads(raw_worker)
             if (not isinstance(stored_worker, dict) or worker_dispatch["role"] != "worker"
                     or worker_dispatch["task_id"] != tid
@@ -177,8 +185,7 @@ class TaskLifecycle(RuntimeService):
                     or {key: value for key, value in stored_worker.items()
                         if key not in ("task_id", "dispatch_id")} != result):
                 raise HarnessError("worker 返回产物与当前任务结果不一致；保留现场")
-        worker_source = {"worker_artifact": str(worker_artifact),
-                         "worker_artifact_digest": hashlib.sha256(raw_worker).hexdigest()}
+        worker_source = {"worker_artifact": worker_artifact, "worker_artifact_digest": worker_digest}
         if result["status"] == "blocked" and result.get("decision_requests"):
             self.context.event("decision_requests_discarded", task_id=tid, dispatch_id=worker_dispatch["id"],
                           reason="handoff requests do not apply to blocked worker results",
@@ -211,20 +218,28 @@ class TaskLifecycle(RuntimeService):
             snapshot = self.context.snapshot()
             if snapshot_digest(snapshot) != candidate_digest:
                 raise HarnessError("worker candidate changed before blocker publication", stop=stops.make("workspace_mismatch", "candidate_changed", source={"task_id": tid}))
-            self.context.run["feedback"] = {"task_id": tid, "worker": result, "attempt": attempt,
-                                       "snapshot_digest": snapshot_digest(snapshot), **worker_source}
+            worker_receipts = self.services.worker_receipts
+            feedback = {"task_id": tid, "worker": result, "attempt": attempt,
+                        "snapshot_digest": candidate_digest, **worker_source}
             if result["blocker_kind"] == "continuation":
-                record_continuation(runtime, tid, result,
+                continuation = prepare_continuation(runtime, tid, result,
                     {"dispatch_id": worker_dispatch["id"], "artifact": str(worker_artifact),
-                     "artifact_digest": worker_source["worker_artifact_digest"]}, snapshot, save=False)
-                self.services.worker_receipts.consume(key, "continuation")
-                self.context.save()
+                     "artifact_digest": worker_source["worker_artifact_digest"]}, snapshot)
+                consumption = worker_receipts.prepare_consume(key, "continuation")
+                with runtime.publish():
+                    runtime.run["feedback"] = feedback
+                    apply_continuation(runtime, continuation)
+                    worker_receipts.apply_consume(consumption)
                 return False
-            self.services.budgets.record_attempt_exemption(worker_dispatch, result, worker_source)
+            budgets = self.services.budgets
+            exemption = budgets.prepare_attempt_exemption(worker_dispatch, result, worker_source)
             if checkpoints_discarded is not None:
-                self.context.run["feedback"]["checkpoints_discarded"] = checkpoints_discarded
-            self.services.worker_receipts.consume(key, result["blocker_kind"] + "_blocked")
-            self.context.save()
+                feedback["checkpoints_discarded"] = checkpoints_discarded
+            consumption = worker_receipts.prepare_consume(key, result["blocker_kind"] + "_blocked")
+            with runtime.publish():
+                runtime.run["feedback"] = feedback
+                budgets.apply_attempt_exemption(worker_dispatch, exemption)
+                worker_receipts.apply_consume(consumption)
             if result["blocker_kind"] == "operator":
                 self.services.workflow.synchronize_decision_requests()
                 raise self.services.workflow.decision_required(self.services.workflow.task_decision_gate(tid))
@@ -232,11 +247,14 @@ class TaskLifecycle(RuntimeService):
                 raise environment_blocked(result, tid, worker_dispatch["id"], worker_artifact,
                                           worker_source["worker_artifact_digest"], invalid_output=False)
             return False
-        self.context.run["pending_task"] = {"task_id": tid, "attempt": attempt, "stage": "verifying",
+        pending = {"task_id": tid, "attempt": attempt, "stage": "verifying",
             "snapshot_digest": candidate_digest,
             "worker_result": result, **worker_source, "prior_reviews": prior_reviews, "verification_rounds": 0}
-        self.services.worker_receipts.consume(key, "pending_task")
-        self.context.save()
+        worker_receipts = self.services.worker_receipts
+        consumption = worker_receipts.prepare_consume(key, "pending_task")
+        with runtime.publish():
+            runtime.run["pending_task"] = pending
+            worker_receipts.apply_consume(consumption)
         return self.continue_task()
 
     def publish_invalid_blocker(self, task, key, result, judgment):
@@ -261,11 +279,15 @@ class TaskLifecycle(RuntimeService):
         # Inspect Git before any handoff field changes: an interruption inside it
         # must not leave new feedback beside the unconsumed receipt.
         recovery = self.services.workflow.worker_recovery(tid, entry["id"], artifact.parent)
-        self.context.run["feedback"] = feedback
-        entry.update(status="invalid_blocked", error=str(error), worker_outcome=route + "_blocked")
-        self.context.run.setdefault("worker_recovery", {})[tid] = recovery
-        self.services.worker_receipts.consume(key, "invalid_blocker")
-        self.context.save()
+        changes = {"status": "invalid_blocked", "error": feedback["output_error"],
+                   "worker_outcome": route + "_blocked"}
+        worker_receipts = self.services.worker_receipts
+        consumption = worker_receipts.prepare_consume(key, "invalid_blocker")
+        with self.context.publish():
+            self.context.run["feedback"] = feedback
+            entry.update(changes)
+            self.context.run.setdefault("worker_recovery", {})[tid] = recovery
+            worker_receipts.apply_consume(consumption)
         self.services.receipts.observe_invalid(entry)
         if route == "operator":
             self.services.workflow.synchronize_decision_requests()
@@ -300,7 +322,7 @@ class TaskLifecycle(RuntimeService):
         if "required_findings" not in pending:
             raise HarnessError("审阅阶段缺少必需问题对照；保留证据", stop=stops.make("runtime_failure", "invariant"))
         require_saved_batch(self.context.run, pending["task_id"], pending["snapshot_digest"],
-                            pending["required_findings"])
+                            pending["required_findings"], files=run_files(self.context))
         origin = {"artifact": str(artifact), "dispatch_id": dispatch_id}
         read = receipts.artifact_files(source).read(("returned-result.json",), limit=None)
         # Retain the source contract of the evidence validator for unsafe file types.
@@ -350,11 +372,20 @@ class TaskLifecycle(RuntimeService):
         if snapshot_digest(snapshot) != pending["snapshot_digest"]:
             # The kept original, the gate's end and the receipt's consumption are one step: a kept
             # original beside its receipt would make a resumed gate replay a registered dispatch.
-            original = self.read_invalidated_review(pending, key)
+            source = self.context.run["review_receipts"].get(key)
+            original = None
+            if source is not None:
+                receipts = self.services.receipts
+                settlement = receipts.settlement(key)
+                if settlement.kind == "captured":
+                    receipts.validate_terminal_capture(source)
+                if settlement.kind == "recoverable":
+                    receipts.settle_return(key)
+                if settlement.kind in ("returned", "recoverable"):
+                    original = self.read_invalidated_review(pending, key)
             kept = []
             if original is not None:
                 raw, digest, origin = original
-                source = self.context.run["review_receipts"][key]
                 if "artifact_digest" not in source:
                     # A returned artifact can precede its receipt's digest. Bind the
                     # first bytes durably before using them or accepting a later read.
@@ -364,7 +395,8 @@ class TaskLifecycle(RuntimeService):
             feedback = {"task_id": tid, "recovery": {
                 "error": "任务候选已变化；旧验证及审阅失效，重新执行任务",
                 "verification": pending.get("verification")}}
-            with self.context.transition():
+            interrupts.deliver()
+            with self.context.publish():
                 self.context.run["review_history"].setdefault(tid, []).extend(kept)
                 self.context.run.pop("pending_task")
                 self.context.run["review_receipts"].pop(key, None)
@@ -374,36 +406,38 @@ class TaskLifecycle(RuntimeService):
         if pending["stage"] == "verifying":
             worker_id = Path(pending["worker_artifact"]).parent.name
             full_result = {"task_id": tid, "dispatch_id": worker_id, **pending["worker_result"]}
-            required = required_findings(self.context.run, tid, pending["snapshot_digest"])
+            required = required_findings(self.context.run, tid, pending["snapshot_digest"], files=run_files(self.context))
             delivered = delivered_worker_findings(self.context, tid, worker_id)
             # Only source reads occurred since this snapshot; verification will
             # independently rehash after its commands have run.
             preflight = candidate_preflight(task, full_result, worktree=self.context.worktree,
                 candidate_snapshot=snapshot, current_snapshot=snapshot,
                 worker_artifact=pending["worker_artifact"],
-                worker_artifact_digest=pending["worker_artifact_digest"], worker_dispatch_id=worker_id)
+                worker_artifact_digest=pending["worker_artifact_digest"], worker_dispatch_id=worker_id,
+                worker_files=returned_result_files(self.context, worker_id))
             preflight["failures"].extend(claim_gaps(full_result, delivered, snapshot))
             preflight["passed"] = not preflight["failures"]
             preflight_path = self.context.directory / "preflight" / tid / str(attempt) / "result.json"
             write_json(preflight_path, preflight)
             if not preflight["passed"]:
                 feedback = {"task_id": tid, "preflight": preflight, "artifact": str(preflight_path)}
-                with self.context.transition():
+                with self.context.publish():
                     self.context.run["feedback"] = feedback
                     self.context.run.pop("pending_task")
                 self.context.event("candidate_preflight_failed", task_id=tid, artifact=str(preflight_path))
                 return False
-            pending["required_findings"] = required
-            pending["verification_rounds"] += 1
+            verification_round = pending["verification_rounds"] + 1
             folder = self.services.verification.verification_directory(tid, attempt)
-            if pending["verification_rounds"] > 1:
-                folder /= f"retry-{pending['verification_rounds']}"
-            pending["verification"] = str(folder / "results.json")
-            self.context.save()
+            if verification_round > 1:
+                folder /= f"retry-{verification_round}"
+            verification = str(folder / "results.json")
+            with runtime.publish():
+                pending.update(required_findings=required, verification_rounds=verification_round,
+                               verification=verification)
             checks = self.services.verification.verify(tid, attempt, artifact_dir=folder, before=snapshot)
             if not checks_passed(checks):
                 feedback = {"task_id": tid, "verification": compact_checks(checks)}
-                with self.context.transition():
+                with self.context.publish():
                     self.context.run["feedback"] = feedback
                     self.context.run.pop("pending_task")
                 self.context.event("verification_failed", task_id=tid)
@@ -420,20 +454,24 @@ class TaskLifecycle(RuntimeService):
             except HarnessError as error:
                 proposals = []
                 self.context.event("memory_proposals_discarded", task_id=tid, reason=str(error))
-            pending.update(stage="reviewing", proposals=proposals,
-                           diff_artifact=str(evidence), snapshot_artifact=str(snapshot_artifact))
-            self.context.save()
+            diff_artifact, snapshot_path = str(evidence), str(snapshot_artifact)
+            with runtime.publish():
+                pending.update(stage="reviewing", proposals=proposals,
+                               diff_artifact=diff_artifact, snapshot_artifact=snapshot_path)
         evidence = Path(pending["diff_artifact"])
         snapshot_artifact = Path(pending["snapshot_artifact"])
         reviewed_digest = pending["snapshot_digest"]
-        checks = read_evidence_json(Path(pending["verification"]))
+        files = run_files(runtime).under("verification", "tasks", tid, str(attempt))
+        if pending["verification_rounds"] > 1:
+            files = files.under(f"retry-{pending['verification_rounds']}")
+        checks = evidence_json(files.under("results.json"), pending["verification"])
         proposals = pending["proposals"]
         prior_reviews = pending["prior_reviews"]
         if "required_findings" not in pending:
             raise HarnessError("审阅阶段缺少必需问题对照；保留证据")
         required = pending["required_findings"]
         # The saved mapping is rechecked against the history before its review is dispatched or replayed.
-        require_saved_batch(self.context.run, tid, reviewed_digest, required,
+        require_saved_batch(self.context.run, tid, reviewed_digest, required, files=run_files(self.context),
                             receipt=self.context.run["review_receipts"].get(key))
         delivered = delivered_worker_findings(self.context, tid, Path(pending["worker_artifact"]).parent.name)
         message = self.review_worker_message(pending)
@@ -473,7 +511,7 @@ class TaskLifecycle(RuntimeService):
         approved = not diagnostics and review_approved(review)
         # Computed after the record file and before any ledger change: an approving batch completes
         # the approval only if no historical blocking finding still lacks a resolution on this candidate.
-        remaining = (batch_after(self.context.run, tid, reviewed_digest, required,
+        remaining = (batch_after(self.context.run, tid, reviewed_digest, required, files=run_files(self.context),
                                  records=[*self.context.run["review_history"].get(tid, []), record])
                      if approved else [])
         # Only the batch that completes an approval reads its memory approvals.
@@ -494,6 +532,7 @@ class TaskLifecycle(RuntimeService):
         if outcome == "rejected":
             self.context.event("review_rejected", task_id=tid)
             return False
+        interrupts.deliver()
         return self.accept_pending()
 
     @stops.reads_evidence
@@ -595,7 +634,7 @@ class TaskLifecycle(RuntimeService):
         else:
             outcome = "rejected"
             successor = {"task_id": tid, "review": review, "artifact": record["artifact"], **diagnostics}
-        with self.context.transition():
+        with self.context.publish():
             self.context.run["review_history"].setdefault(tid, []).append(record)
             self.context.run["review_receipts"].pop(key, None)
             if outcome == "next_batch":
@@ -635,10 +674,10 @@ class TaskLifecycle(RuntimeService):
 
     def _check_accept_review(self, pending):
         tid = pending["task_id"]
-        validate_review_source(self.context.run, tid, pending, candidate_digest=pending["snapshot_digest"])
+        validate_review_source(self.context.run, tid, pending, files=run_files(self.context), candidate_digest=pending["snapshot_digest"])
         # The coverage gate, on the whole history: every historical blocking
         # finding has a usable resolution on this very snapshot.
-        if required_findings(self.context.run, tid, pending["snapshot_digest"]):
+        if required_findings(self.context.run, tid, pending["snapshot_digest"], files=run_files(self.context)):
             raise HarnessError("批准没有覆盖该任务全部历史阻断问题的独立解决处置；未提交", stop=stops.make("runtime_failure", "invariant"))
 
     def accept_pending(self):
@@ -665,7 +704,7 @@ class TaskLifecycle(RuntimeService):
                 "review_artifact": pending["review_artifact"]}}
             voided = acceptance_review_records(self.context.run, feedback, attempt=attempt,
                                                candidate_digest=pending["snapshot_digest"])
-            with self.context.transition():
+            with self.context.publish():
                 for record in voided:
                     record["status"] = "invalidated"
                 self.context.run.pop("pending_acceptance")
@@ -690,10 +729,10 @@ class TaskLifecycle(RuntimeService):
     def _complete_acceptance(self, task, pending, intent: acceptance.Intent, knowledge_ttl_days, *, publish_intent):
         runtime = self.context
         tid, commit, paths = pending["task_id"], intent["commit"], intent["files"]
-        with defer_cleanup_signals(inherit=False):
+        with interrupts.hold():
             if publish_intent:
-                pending["intent"] = intent
-                runtime.save()
+                with runtime.publish():
+                    pending["intent"] = intent
             current = acceptance.state(runtime, intent)
             if isinstance(current, acceptance.Rebuild):
                 if publish_intent:
@@ -719,14 +758,14 @@ class TaskLifecycle(RuntimeService):
                 "knowledge": {"status": "pending"},
             }
             successor = {"payload": {"task_id": tid, **accepted}, "completion": completion}
-            runtime.run["expected_head"] = commit
-            runtime.run["accepted"][tid] = {**accepted, "tree": intent["tree"]}
-            runtime.run["feedback"] = None
-            runtime.run["current_task"] = None
-            runtime.run.get("worker_recovery", {}).pop(tid, None)
-            runtime.run.pop("pending_acceptance")
-            runtime.run["pending_post_accept"] = successor
-            runtime.save()
+            with runtime.publish():
+                runtime.run["expected_head"] = commit
+                runtime.run["accepted"][tid] = {**accepted, "tree": intent["tree"]}
+                runtime.run["feedback"] = None
+                runtime.run["current_task"] = None
+                runtime.run.get("worker_recovery", {}).pop(tid, None)
+                runtime.run.pop("pending_acceptance")
+                runtime.run["pending_post_accept"] = successor
         self.finish_post_accept()
         runtime.checkpoint()
         return True

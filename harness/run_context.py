@@ -4,12 +4,11 @@ import contextlib
 import sys
 from copy import deepcopy
 from pathlib import Path
-from . import git
+from . import git, interrupts
 from .adapters import CLIBackend
 from .budgets import work_attempts
 from .memory import Memory
 from .operations import first_line, warn
-from .process_runtime import defer_cleanup_signals
 from .run_store import RunStore, replaced
 from .state_files import LockUnavailable, StateFiles, holding
 from .util import (HarnessError, append_event, confirm_dispatches_exited, ensure_dispatches_exited, group_alive,
@@ -135,17 +134,19 @@ class RunContext:
         return True
 
     @contextlib.contextmanager
-    def transition(self):
-        """Change the ledger in one step, then save it.
-
-        The body only assigns values computed before it. Keep its save in
-        the same signal deferral scope so a held signal cannot skip the save.
-        """
-        with defer_cleanup_signals(inherit=False):
-            yield
-            self.save()
+    def publish(self, *, terminal=False):
+        """Assign prepared values, then commit once after the last assignment."""
+        interrupts.require_outside_publication("publish")
+        with interrupts.publishing():
+            try:
+                yield
+            except BaseException:
+                self.store.poison()
+                raise
+        self.save(terminal=terminal)
 
     def event(self, event, **fields):
+        interrupts.require_outside_publication("event")
         append_event(self.directory / "events.jsonl", self.run["id"], event, **fields)
         print(f"[harness] {event} {one_line(fields.get('task_id', ''))}", file=sys.stderr, flush=True)
 
@@ -155,12 +156,14 @@ class RunContext:
         The ledger and its event log are not written atomically: a crash can omit
         an event, and recovery neither re-emits nor repeats one.
         """
+        interrupts.require_outside_publication("observe")
         try:
             self.event(event, **fields)
         except Exception:
             pass
 
     def checkpoint(self):
+        interrupts.require_outside_publication("checkpoint")
         # Model-independent handoff. Full logs remain separate and are never recycled as conversation.
         handoff = {"goal": self.run["goal"], "branch": self.run["branch"], "status": self.run["status"],
                    "accepted": self.run["accepted"], "pending": [t for t in self.run["tasks"] if t["id"] not in self.run["accepted"]],
@@ -181,6 +184,7 @@ class RunContext:
         write_json(self.directory / "handoff.json", handoff)
 
     def ensure_exited(self, *, commit=True):
+        interrupts.check_wait("ensure_exited")
         validate_command_directories(self.run["dispatches"], self.directory)
         try:
             exited = ensure_dispatches_exited(self.run["dispatches"], state=self.state, directory=self.directory,

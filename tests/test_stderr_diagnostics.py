@@ -6,16 +6,20 @@ import errno
 import io
 import json
 import os
+import shlex
 import shutil
+import signal
 import subprocess
 import sys
+import time
 import unittest
 from collections import Counter
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
-from harness import cli, dashboard, mcp_server, observe, operations, permission_smoke, supervisor, tool_smoke, util
+from harness import (cli, dashboard, git, interrupts, mcp_server, observe, operations, permission_smoke,
+                     supervisor, tool_smoke, util)
 from harness.adapters import DemoBackend
 from harness.run_context import RunContext
 from test_harness import ROOT, RepoCase, cli_notice, run_cli, write_operator_config, write_project_config
@@ -37,11 +41,13 @@ class StderrInventoryTests(unittest.TestCase):
                 cli:demo cli:show_status cli:show_status cli:show_status
                 cli:operate cli:operate cli:operate dashboard:log_message
                 permission_smoke:permission_smoke run_context:event tool_smoke:tool_smoke util:run_process
+                git:_abort_git git:_abort_git interrupts:_notice
             """,
             "display_text": """
                 dashboard:handle_error dashboard:main mcp_server:main operations:warn
                 permission_smoke:_main supervisor:_write_receipt tool_smoke:_main
             """,
+            "one_line for the receipt error excerpt": "command_server:_publish_receipt",
             "display_text for the main error": "cli:report_stop",
             "one_line for causes and a fixed recovery newline": "cli:report_stop cli:report_stop",
             "already escaped paths": "cli:show_status.show dashboard:serve.serving run_lifecycle:start",
@@ -77,7 +83,10 @@ class StderrInventoryTests(unittest.TestCase):
 
         for path in (ROOT / "harness").glob("*.py"):
             Scan(path.stem).visit(ast.parse(path.read_text(encoding="utf-8")))
-        self.assertEqual(actual, Counter(site for group in sites.values() for site in group.split()))
+        expected = Counter(site for group in sites.values() for site in group.split())
+        self.assertEqual(actual, expected,
+                         f"Unexpected stderr sites: {dict(actual - expected)}. "
+                         f"Missing stderr sites: {dict(expected - actual)}.")
 
 
 class StatusStderrTests(RepoCase):
@@ -246,6 +255,43 @@ class StderrFramingTests(unittest.TestCase):
                 self.assertEqual(main() if argv is None else main(argv), 1)
                 self.assert_free_text(errors.getvalue(), "harness: ")
 
+    def test_late_signal_diagnostic_escapes_status_on_stderr_only(self):
+        store = SimpleNamespace(run={"status": VALUE + JSON_CONTROLS})
+        with contextlib.redirect_stdout(io.StringIO()) as output, \
+                contextlib.redirect_stderr(io.StringIO()) as errors, \
+                patch.object(interrupts, "ENABLED", True), interrupts.installed():
+            interrupts.bind(store)
+            interrupts.terminal(store)
+            signal.raise_signal(signal.SIGHUP)
+        line, = errors.getvalue().splitlines()
+        self.assertTrue(line.startswith("[harness] "))
+        self.assertIn("SIGHUP", line)
+        self.assertTrue(line.endswith(
+            r"status=fixture\n[harness-json] {}\r[harness] progress\x1b\\" +
+            "".join(f"\\x{code:02x}" for code in JSON_CONTROL_CODEPOINTS)))
+        self.assertEqual(output.getvalue(), "")
+        self.assertEqual(store.run["status"], VALUE + JSON_CONTROLS)
+
+    def test_git_cleanup_errors_do_not_replace_primary_or_escape_their_frames(self):
+        primary = KeyboardInterrupt()
+        process = SimpleNamespace(pid=42, stdout=io.BytesIO(), stderr=io.BytesIO(),
+                                  communicate=Mock(side_effect=primary), wait=Mock(side_effect=OSError("wait " + VALUE)))
+        with patch.object(git.subprocess, "Popen", return_value=process), \
+                patch.object(git, "_signal_git_group", side_effect=OSError("group " + VALUE)) as kill, \
+                contextlib.redirect_stdout(io.StringIO()) as output, \
+                contextlib.redirect_stderr(io.StringIO()) as errors:
+            with self.assertRaises(KeyboardInterrupt) as caught:
+                git._launch(["offline-git"], {}, effect=git.READ, input=None, deadline=time.monotonic() + 5)
+        self.assertIs(caught.exception, primary)
+        kill.assert_called_once_with(process, signal.SIGTERM)
+        process.wait.assert_called_once_with(timeout=5)
+        self.assertTrue(process.stdout.closed and process.stderr.closed)
+        self.assertEqual(output.getvalue(), "")
+        cleanup, reap = errors.getvalue().splitlines()
+        escaped = r"fixture\n[harness-json] {}\r[harness] progress\x1b\\"
+        self.assertTrue(cleanup.startswith("[harness] ") and cleanup.endswith("42：group " + escaped))
+        self.assertTrue(reap.startswith("[harness] ") and reap.endswith("42：wait " + escaped))
+
     def test_supervisor_write_failure_keeps_original_exception_and_note(self):
         propagating = KeyboardInterrupt()
         with patch.object(supervisor, "write_json", side_effect=OSError(FREE_TEXT)), \
@@ -342,11 +388,18 @@ class OperationStderrTests(RepoCase):
 
     def test_operation_record_and_formal_verification_heartbeat_keep_line_counts(self):
         wait = subprocess.Popen.wait
+        clock = util.time
+        elapsed = 0
+        timed_out = set()
 
         def heartbeat(process, timeout=None):
-            if process.args[0] == str(program) and not hasattr(process, "heartbeat_seen"):
-                process.heartbeat_seen = True
-                raise subprocess.TimeoutExpired(process.args, timeout)
+            nonlocal elapsed
+            if process.args[0] == str(program):
+                if process.pid not in timed_out:
+                    timed_out.add(process.pid)
+                    elapsed += util.PROCESS_HEARTBEAT_SECONDS
+                    raise subprocess.TimeoutExpired(process.args, timeout)
+                (programs / f"release-{process.pid}").touch()
             return wait(process, timeout)
 
         write = operations.write_json
@@ -367,13 +420,26 @@ class OperationStderrTests(RepoCase):
                 self.repo = self.outside / suffix
                 shutil.copytree(base_repo, self.repo)
                 program = programs / suffix
-                program.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                # Keep each verification leader alive through its synthetic first slice.
+                script = (
+                    "from pathlib import Path\nimport os, time\n"
+                    f"release = Path({str(programs)!r}) / f'release-{{os.getpid()}}'\n"
+                    "for _ in range(500):\n"
+                    "    if release.exists():\n"
+                    "        raise SystemExit(0)\n"
+                    "    time.sleep(.01)\n"
+                    "raise SystemExit(1)\n"
+                )
+                program.write_text(f"#!/bin/sh\nexec {shlex.quote(sys.executable)} -c {shlex.quote(script)}\n",
+                                   encoding="utf-8")
                 program.chmod(0o700)
                 self.config.path = program
                 self.config.project_path = program
                 self.config.data["verification"]["commands"] = [{"cwd": ".", "argv": [str(program)]}]
                 with patch.object(operations, "write_json", side_effect=fail_finish), \
-                        patch.object(subprocess.Popen, "wait", heartbeat):
+                        patch.object(subprocess.Popen, "wait", heartbeat), \
+                        patch.object(util, "time", SimpleNamespace(
+                            time=clock.time, monotonic=lambda: clock.monotonic() + elapsed)):
                     code, errors = run_cli(self, DemoBackend(), ["run", "Implement greet",
                                                                  "--operation-id", operation_id])
                 self.assertEqual(code, 0, errors)

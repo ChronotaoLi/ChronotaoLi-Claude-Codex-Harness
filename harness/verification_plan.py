@@ -13,9 +13,11 @@ from pathlib import Path, PurePosixPath
 
 from . import git, stops
 from .context import prompt_json
-from .recovery import snapshot_digest
+from .recovery import bound_bytes, snapshot_digest
 from .review_progress import dispositions_usable, entries
-from .util import HarnessError, dump, write_json
+from .runtime_evidence import read_or_write
+from .state_files import StateFiles, StateReadError
+from .util import EvidenceError, HarnessError, dump
 
 
 def recent_costs(context, *, limit=64):
@@ -119,11 +121,12 @@ def _regular(path, boundary=None):
 
 def candidate_preflight(task, worker_result, *, worktree, candidate_snapshot, current_snapshot,
                         worker_artifact, worker_artifact_digest, worker_dispatch_id=None,
-                        prior_findings=()):
+                        prior_findings=(), worker_files=None):
     """Return mechanical gaps before expensive gates; never returns acceptance.
 
     The caller supplies the already-owned candidate snapshot and original worker
-    artifact. Required evidence files come from the task's evidence_requirements:
+    artifact. An owned worker_files handle binds the registered artifact to its
+    dispatch. Required evidence files come from the task's evidence_requirements:
     each must be a regular, non-symlink file inside the candidate snapshot, and
     its SHA256 is computed here; the worker declares nothing.
     """
@@ -132,23 +135,35 @@ def candidate_preflight(task, worker_result, *, worktree, candidate_snapshot, cu
     if snapshot_digest(current_snapshot) != digest:
         failures.append({"code": "candidate_changed"})
     source = Path(worker_artifact)
+    reference = {"artifact": str(worker_artifact), "artifact_digest": worker_artifact_digest}
     try:
-        if not _regular(source):
-            raise ValueError("worker source is not an ordinary file")
-        raw = source.read_bytes()
-        if hashlib.sha256(raw).hexdigest() != worker_artifact_digest:
-            raise ValueError("worker source hash mismatch")
-        saved = json.loads(raw)
-        # Adapter artifacts contain the validated response, sometimes wrapped.
-        response = saved.get("response", saved) if isinstance(saved, dict) else saved
-        if response != worker_result:
-            raise ValueError("worker declarations differ from source")
-        if worker_dispatch_id is not None and worker_result.get("dispatch_id") != worker_dispatch_id:
-            raise ValueError("worker dispatch mismatch")
-        if worker_result.get("task_id") != task["id"]:
-            raise ValueError("worker task mismatch")
-    except (OSError, ValueError, TypeError) as error:
+        if worker_files is None:
+            path = source.absolute()
+            files = StateFiles(path.parent).under(path.name)
+            raw, _ = bound_bytes(files, {**reference, "artifact": str(path)}, "worker")
+        else:
+            raw, _ = bound_bytes(worker_files, reference, "worker")
+    except (EvidenceError, StateReadError, ValueError) as error:
+        if worker_files is not None:
+            raise
         failures.append({"code": "worker_source_invalid", "detail": str(error)})
+    else:
+        try:
+            if worker_files is None:
+                saved = json.loads(raw)
+            else:
+                with stops.evidence_reads(source=reference):
+                    saved = json.loads(raw)
+            # Adapter artifacts contain the validated response, sometimes wrapped.
+            response = saved.get("response", saved) if isinstance(saved, dict) else saved
+            if response != worker_result:
+                raise ValueError("worker declarations differ from source")
+            if worker_dispatch_id is not None and worker_result.get("dispatch_id") != worker_dispatch_id:
+                raise ValueError("worker dispatch mismatch")
+            if worker_result.get("task_id") != task["id"]:
+                raise ValueError("worker task mismatch")
+        except (ValueError, TypeError) as error:
+            failures.append({"code": "worker_source_invalid", "detail": str(error)})
     for requirement in task.get("evidence_requirements", []):
         identity, expected = requirement["id"], requirement["path"]
         path = PurePosixPath(expected)
@@ -239,7 +254,7 @@ def finding_progress(run, task_ids, *, whole_run=False, limit=60):
             "history_task_ids": task_ids}
 
 
-def finding_progress_packet(run, task_ids, directory, *, whole_run=False):
+def finding_progress_packet(run, task_ids, directory, *, whole_run=False, files=None):
     """Retrieve the complete progress matrix through immutable private evidence.
 
     Callers authenticate original review sources before projecting this index,
@@ -254,16 +269,17 @@ def finding_progress_packet(run, task_ids, directory, *, whole_run=False):
     digest = hashlib.sha256(raw).hexdigest()
     folder = Path(directory) / "finding-progress" / "indexes"
     artifact = folder / (digest + ".json")
-    if not folder.is_absolute() or any(p.is_symlink() for p in (artifact, *artifact.parents)):
-        raise HarnessError("finding progress index path is a symlink or not absolute")
+    if files is None:
+        if not folder.is_absolute():
+            raise HarnessError("finding progress index path is not absolute")
+        files = StateFiles.nofollow_directory(directory)
     try:
-        if not artifact.exists():
-            write_json(artifact, value)
+        actual = read_or_write(files, ("finding-progress", "indexes", artifact.name), artifact, value)
     except OSError as error:
         raise HarnessError("cannot write finding progress index",
                            stop=stops.make("runtime_failure", "io", data={"error_type": type(error).__name__})) from error
     with stops.evidence_reads(source={"artifact": str(artifact)}):
-        if not artifact.is_file() or artifact.read_bytes() != raw:
+        if actual != raw:
             raise HarnessError("finding progress index changed; preserve original evidence")
     status_counts, severity_counts = {}, {}
     for row in progress["findings"]:

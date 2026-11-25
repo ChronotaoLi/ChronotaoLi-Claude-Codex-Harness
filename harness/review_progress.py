@@ -14,6 +14,7 @@ from pathlib import PurePosixPath
 
 from . import git, stops
 from .contracts import envelope, judge_review, review_approved, review_schema
+from .recovery import bound_result, run_files
 from .util import EvidenceError, HarnessError
 
 
@@ -145,7 +146,7 @@ def _batch(issues, status, done):
     return _keyed([issues[ident] for ident in missing])
 
 
-def _progress(run, task_id, *, whole_run=False, records=None):
+def _progress(run, task_id, *, files, whole_run=False, records=None):
     """One pass over a history: every blocking finding, its repair status, the
     findings each candidate holds a usable resolution for, and the checked
     mapping and dispositions of every entry that has them, in history order.
@@ -161,7 +162,7 @@ def _progress(run, task_id, *, whole_run=False, records=None):
     """
     issues, status, closed, keyed = {}, {}, {}, []
     for entry, approval in entries(_history(run, task_id, whole_run, records), whole_run):
-        validate_review_source(run, task_id, entry, kind="final_review" if whole_run else "review")
+        validate_review_source(run, task_id, entry, files=files, kind="final_review" if whole_run else "review")
         if approval and not _approval_holds(entry, task_id):
             raise HarnessError("批准条目不满足批准契约；保留证据")
         # The field's presence, not its truth, decides the check: an empty
@@ -194,21 +195,21 @@ def _progress(run, task_id, *, whole_run=False, records=None):
 
 
 @stops.reads_evidence
-def required_findings(run, task_id, candidate_digest, *, whole_run=False, records=None):
+def required_findings(run, task_id, candidate_digest, *, files, whole_run=False, records=None):
     """A review's required findings on one candidate: its next batch, empty once every blocking finding has a usable resolution there."""
-    issues, status, closed, _ = _progress(run, task_id, whole_run=whole_run, records=records)
+    issues, status, closed, _ = _progress(run, task_id, files=files, whole_run=whole_run, records=records)
     return _batch(issues, status, closed.get(candidate_digest, set()))
 
 
 @stops.reads_evidence
-def batch_after(run, task_id, candidate_digest, approved, *, whole_run=False, records):
+def batch_after(run, task_id, candidate_digest, approved, *, files, whole_run=False, records):
     """The next batch after an approved one is registered: it holds none of the approved batch's findings.
 
     An approved batch closes every row it was given on its candidate, so a row
     that comes back means the approval closed less than it is registered for;
     that is damaged evidence, never a batch to dispatch again.
     """
-    following = required_findings(run, task_id, candidate_digest, whole_run=whole_run, records=records)
+    following = required_findings(run, task_id, candidate_digest, files=files, whole_run=whole_run, records=records)
     if ({(row["review_dispatch_id"], row["finding_index"]) for row in following}
             & {(row["review_dispatch_id"], row["finding_index"]) for row in approved}):
         raise EvidenceError("已批准的审阅批没有关闭本批的全部问题；保留证据", stop=stops.make("evidence", "runtime_integrity"))
@@ -216,13 +217,13 @@ def batch_after(run, task_id, candidate_digest, approved, *, whole_run=False, re
 
 
 @stops.reads_evidence
-def require_saved_batch(run, task_id, candidate_digest, saved, *, whole_run=False, records=None, receipt=None):
+def require_saved_batch(run, task_id, candidate_digest, saved, *, files, whole_run=False, records=None, receipt=None):
     """Before a saved, unregistered batch is dispatched, replayed or preserved: it is the batch recomputed now.
 
     A receipt to replay must not be a dispatch the history already registered:
     bound to this batch, one review would count under two mappings.
     """
-    if required_findings(run, task_id, candidate_digest, whole_run=whole_run, records=records) != saved:
+    if required_findings(run, task_id, candidate_digest, files=files, whole_run=whole_run, records=records) != saved:
         raise EvidenceError("审阅处置与键对照不符；保留证据", stop=stops.make("evidence", "runtime_integrity"))
     ident = receipt.get("dispatch_id") if isinstance(receipt, dict) else None
     if ident is not None and any(_registered_dispatch(item) == ident for record in _history(run, task_id, whole_run, records)
@@ -232,20 +233,20 @@ def require_saved_batch(run, task_id, candidate_digest, saved, *, whole_run=Fals
 
 
 @stops.reads_evidence
-def verify_history(run, task_id, *, whole_run=False):
+def verify_history(run, task_id, *, files, whole_run=False):
     """One read-only traversal: every source authenticated, every saved mapping and approval checked.
 
     Returns each disposition entry's mapping and dispositions, the records a
     packet's prior_review_keys_index is published from, so that index holds
     only what this traversal checked.
     """
-    return _progress(run, task_id, whole_run=whole_run)[3]
+    return _progress(run, task_id, files=files, whole_run=whole_run)[3]
 
 
 @stops.reads_evidence
-def repair_findings(run, task_id):
+def repair_findings(run, task_id, *, files):
     """A worker's required findings: the first BATCH_LIMIT still open, in source order, whatever the candidate."""
-    issues, status, _, _ = _progress(run, task_id)
+    issues, status, _, _ = _progress(run, task_id, files=files)
     return _keyed([row for ident, row in issues.items() if status[ident] == "open"][:BATCH_LIMIT])
 
 
@@ -287,7 +288,7 @@ def delivered_worker_findings(context, task_id, dispatch_id):
                 matches = [r for r in records if (r.get("review_source") or {}).get("dispatch_id") == source]
                 if len(matches) != 1:
                     raise ValueError("review source missing or ambiguous")
-                validate_review_source(context.run, task_id, matches[0])
+                validate_review_source(context.run, task_id, matches[0], files=run_files(context))
                 canonical[source] = {r["finding_index"]: r for r in _blocking_requirements(matches[0])}
             original = canonical[source].get(row["finding_index"])
             artifact = row.get("artifact", sources.get(source, {}).get("artifact"))
@@ -340,27 +341,22 @@ def claims_for_review(required, delivered, claims):
 
 
 @stops.reads_evidence
-def validate_review_source(run, task_id, record, *, kind="review", candidate_digest=None):
+def validate_review_source(run, task_id, record, *, files, kind="review", candidate_digest=None):
     """Authenticate the original returned body before trusting ledger copies."""
-    from pathlib import Path
-    from .recovery import read_bound_result
     source = record.get("review_source")
     if not isinstance(source, dict) or not all(source.get(k) for k in
             ("dispatch_id", "artifact", "artifact_digest", "snapshot_digest")):
         raise HarnessError("审阅缺少原始来源绑定；禁止批准或遗忘阻断问题")
     ident = source["dispatch_id"]
     entries = [d for d in run.get("dispatches", []) if d.get("id") == ident]
-    path = Path(source["artifact"])
     if (len(entries) != 1 or entries[0].get("role") != "reviewer"
             or entries[0].get("kind") != kind or entries[0].get("task_id") != task_id
             or entries[0].get("snapshot_digest") != source["snapshot_digest"]
-            or path.parts[-5:] != ("runs", run["id"], "dispatches", ident, "returned-result.json")
-            or any(p.is_symlink() for p in (path, *path.parents))
             or source["snapshot_digest"] != record.get("snapshot_digest")
             or (candidate_digest is not None and source["snapshot_digest"] != candidate_digest)):
         raise HarnessError("审阅来源身份或候选绑定无效")
-    result, _ = read_bound_result(source, "审阅历史")
-    if (result.get("task_id") != task_id or result.get("dispatch_id") != ident
+    result, _ = bound_result(files.under("dispatches", ident, "returned-result.json"), source, "审阅历史")
+    if (not isinstance(result, dict) or result.get("task_id") != task_id or result.get("dispatch_id") != ident
             or {k: v for k, v in result.items() if k not in ("task_id", "dispatch_id")} != record.get("review")):
         raise HarnessError("审阅台账与原始结果不同")
     return source
@@ -376,5 +372,5 @@ def bind_review_source(context, kind, task_id, review, candidate_digest):
         if source.get("artifact") != str(expected):
             raise HarnessError("审阅来源不属于当前运行目录")
     record = {"review": review, "snapshot_digest": candidate_digest, "review_source": source}
-    validate_review_source(context.run, task_id, record, kind=kind, candidate_digest=candidate_digest)
+    validate_review_source(context.run, task_id, record, files=run_files(context), kind=kind, candidate_digest=candidate_digest)
     return {key: source[key] for key in ("dispatch_id", "artifact", "artifact_digest", "snapshot_digest")}

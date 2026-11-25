@@ -3,14 +3,17 @@ from __future__ import annotations
 
 import hashlib
 import json
-from pathlib import Path
+from dataclasses import dataclass
+from typing import Literal
 
 from . import git, stops
+from .adapters import CLIBackend, UndecodableOutput, result_kind
 from .contracts import envelope, judge_review, review_schema, validate
-from .recovery import read_bound_bytes, read_bound_result, snapshot_digest
+from .provider_failures import LIMIT
+from .recovery import bound_bytes, bound_result, evidence_path, snapshot_digest
 from .services import RuntimeService
 from .state_files import StateFiles
-from .util import EvidenceError, HarnessError, read_json, strict_json_loads
+from .util import EvidenceError, HarnessError, strict_json_loads, write_json
 
 # Error text carried into the next request's previous_invalid and events; the
 # dispatch entry keeps the full text.
@@ -75,6 +78,14 @@ def judged_decide(entry):
     return entry.get("role") == "commander" and entry.get("kind") == "decide" and entry.get("status") == "completed"
 
 
+@dataclass(frozen=True)
+class Settlement:
+    kind: Literal["returned", "captured", "recoverable", "invalid", "unreturned"]
+    raw: bytes | None = None
+    value: dict | None = None
+    capturable: bool = False
+
+
 class ResultReceipts(RuntimeService):
     def artifact_files(self, receipt):
         dispatch_id = receipt["dispatch_id"]
@@ -123,18 +134,104 @@ class ResultReceipts(RuntimeService):
                 and type(outcome.get("exit_code")) is int
                 and (outcome.get("termination_reason") == "normal" or outcome["exit_code"] == 0))
 
+    def _process_record(self, entry) -> dict | None:
+        dispatch_id = entry["id"]
+        read = self._dispatch_files(dispatch_id).read(("process.outcome.json",), limit=LIMIT)
+        if read.state == "absent" and read.step.leaf:
+            return None
+        source = {"dispatch_id": dispatch_id, "artifact": read.path}
+        raw = read.evidence(source)
+        try:
+            result = strict_json_loads(raw)
+            if not isinstance(result, dict):
+                raise ValueError("process outcome is not an object")
+        except (ValueError, UnicodeError, RecursionError) as error:
+            raise EvidenceError(f"终端结果的进程证据无效；保留证据：{read.path}",
+                                stop=stops.make("evidence", "runtime_integrity", source=source)) from error
+        return result
+
+    def process_facts(self, entry) -> dict | None:
+        """Use the saved process outcome, or its original if the ledger has no copy."""
+        outcome = entry.get("process_outcome")
+        return outcome if isinstance(outcome, dict) else self._process_record(entry)
+
+    @staticmethod
+    def _abnormal_terminal(outcome):
+        return bool(outcome and outcome.get("started") is True
+                    and (outcome.get("termination_reason") != "normal" or outcome.get("exit_code") not in (None, 0)))
+
+    @staticmethod
+    def _process_incomplete(entry):
+        return HarnessError("终端结果的进程证据不完整；保留证据，禁止重新抽取结论",
+                            stop=stops.make("evidence", "process_incomplete", data={"exit_unconfirmed": False},
+                                            source={"dispatch_id": entry["id"]}))
+
+    def settlement(self, key, *, capture=False) -> Settlement:
+        """Classify a commander or review intent without publishing any evidence."""
+        field = "commander_receipts" if key.startswith("commander:") else "review_receipts"
+        receipt = self.context.run[field][key]
+        if self.returned(receipt):
+            return Settlement("returned")
+        dispatch_id = receipt["dispatch_id"]
+        if "terminal_capture_digest" in receipt or self._capture_present(dispatch_id):
+            return Settlement("captured")
+        entry = next(d for d in self.context.run["dispatches"] if d["id"] == dispatch_id)
+        outcome = self._process_record(entry)
+        if outcome is None:
+            if "process_outcome" in entry:
+                raise EvidenceError("终端结果的进程证据缺失；保留证据",
+                                    stop=stops.make("evidence", "runtime_integrity",
+                                                    source={"dispatch_id": dispatch_id}))
+            return Settlement("unreturned")
+        if "process_outcome" in entry and entry["process_outcome"] != outcome:
+            raise self._process_incomplete(entry)
+        provider = self.context.config.role(entry["role"], self.context.commander)["cli"]
+        job = self.context.directory / "dispatches" / dispatch_id
+        if (outcome.get("started") is True and outcome.get("startup_state") == "started"
+                and outcome.get("termination_reason") == "normal"
+                and type(outcome.get("exit_code")) is int and outcome["exit_code"] == 0
+                and outcome.get("exit_confirmed") is True and outcome.get("evidence_complete") is True
+                and outcome.get("errors") == [] and outcome.get("cleanup_errors") == []):
+            read = CLIBackend(self.context.config, self.context.state).terminal_read(job, provider)
+            if provider == "codex" and read.state == "absent" and read.step.leaf:
+                return Settlement("unreturned")
+            raw = read.evidence({"dispatch_id": dispatch_id, "artifact": read.path})
+            kind, _, value, _ = result_kind(provider, raw)
+            if kind == "object":
+                return Settlement("recoverable", raw=raw, value=value)
+            if kind == "undecodable":
+                return Settlement("invalid", raw=raw)
+            return Settlement("unreturned")
+        capturable = False
+        if capture:
+            if self._abnormal_terminal(outcome):
+                source = "response.json" if provider == "codex" else "process.stdout"
+                read = self._dispatch_files(dispatch_id).read((source,), limit=LIMIT).or_local_io()
+                if read.state in ("absent", "refused") and not read.step.leaf:
+                    read.evidence({"dispatch_id": dispatch_id, "artifact": read.path})
+                capturable = read.state == "read" and result_kind(provider, read.data)[0] == "object"
+            capturable = capturable or bool(self.terminal_capture_required(outcome))
+        return Settlement("unreturned", capturable=capturable)
+
     def has_terminal_capture(self, receipt):
         """Whether the receipt's result was, or must be, recovered from the provider terminal."""
         entry = next(d for d in self.context.run["dispatches"] if d["id"] == receipt["dispatch_id"])
         return bool("terminal_capture_digest" in receipt
-                    or self.terminal_capture_required(entry.get("process_outcome"))
+                    or self.terminal_capture_required(self.process_facts(entry))
                     or self._capture_present(entry["id"]))
+
+    def terminal_capture_pending(self, receipt, *, captured=None):
+        """Whether an abnormal process outcome needs a terminal preservation attempt."""
+        entry = next(d for d in self.context.run["dispatches"] if d["id"] == receipt["dispatch_id"])
+        if captured is None:
+            captured = self._capture_present(entry["id"])
+        return not captured and self._abnormal_terminal(self.process_facts(entry))
 
     def validate_pending_terminal_captures(self):
         for field in ("review_receipts", "commander_receipts"):
             for receipt in self.context.run[field].values():
                 entry = next(d for d in self.context.run["dispatches"] if d["id"] == receipt["dispatch_id"])
-                if ("terminal_capture_digest" in receipt or "process_outcome" in entry
+                if ("terminal_capture_digest" in receipt or self.process_facts(entry) is not None
                         or self._capture_present(entry["id"])):
                     self.validate_terminal_capture(receipt)
                     if (self.has_terminal_capture(receipt)
@@ -150,19 +247,17 @@ class ResultReceipts(RuntimeService):
         entry = next(d for d in self.context.run["dispatches"] if d["id"] == receipt["dispatch_id"])
         job = self.context.directory / "dispatches" / entry["id"]
         marker = job / "terminal-capture.json"
-        outcome = entry.get("process_outcome")
         captured = self._capture_present(entry["id"])
-        if (not captured and outcome and outcome.get("started") is True
-                and (outcome.get("termination_reason") != "normal" or outcome.get("exit_code") not in (None, 0))):
-            from .adapters import CLIBackend
+        if not captured and "terminal_capture_digest" in receipt:
+            raise self._process_incomplete(entry)
+        outcome = self.process_facts(entry)
+        if not captured and self._abnormal_terminal(outcome):
             CLIBackend(self.context.config, self.context.state).preserve_terminal(
                 job, self.context.config.role(entry["role"], self.context.commander)["cli"], outcome, terminal_only=True)
             captured = self._capture_present(entry["id"])
         if not captured:
-            if receipt.get("terminal_capture_digest") or self.terminal_capture_required(outcome):
-                raise HarnessError("终端结果的进程证据不完整；保留证据，禁止重新抽取结论",
-                                   stop=stops.make("evidence", "process_incomplete", data={"exit_unconfirmed": False},
-                                                   source={"dispatch_id": entry["id"]}))
+            if self.terminal_capture_required(outcome):
+                raise self._process_incomplete(entry)
             return
         self.context.ensure_exited()
         with stops.evidence_reads(source={"artifact": str(marker), "dispatch_id": entry["id"]},
@@ -175,9 +270,10 @@ class ResultReceipts(RuntimeService):
     def _verified_terminal(self, entry, job, marker, receipt, outcome):
         """Read and check the terminal capture and its sources; returns the capture digest."""
         try:
-            if marker.is_symlink() or not marker.is_file() or marker.parent.resolve() != marker.parent:
-                raise ValueError("unsafe terminal capture path")
-            raw = marker.read_bytes()
+            files = self._dispatch_files(entry["id"])
+            marker_source = {"artifact": str(marker), "dispatch_id": entry["id"]}
+            evidence_path(files.under("terminal-capture.json"), marker_source)
+            raw = files.read(("terminal-capture.json",), limit=None).evidence(marker_source)
             digest = hashlib.sha256(raw).hexdigest()
             if receipt.get("terminal_capture_digest", digest) != digest:
                 raise ValueError("terminal capture changed")
@@ -191,9 +287,17 @@ class ResultReceipts(RuntimeService):
                                 ("process.outcome.json", "outcome_digest"),
                                 ("returned-result.json", "result_digest")):
                 path = job / name
-                if path.is_symlink() or not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != capture[field]:
+                source = {"artifact": str(path), "dispatch_id": entry["id"], "artifact_digest": capture[field]}
+                if name == "process.outcome.json":
+                    outcome_raw = files.read((name,), limit=None).evidence(source)
+                    digest_field = hashlib.sha256(outcome_raw).hexdigest()
+                else:
+                    read = files.digest((name,))
+                    read.evidence(source)
+                    digest_field = read.digest
+                if digest_field != capture[field]:
                     raise ValueError("terminal evidence changed")
-            original = read_json(job / "process.outcome.json")
+            original = json.loads(outcome_raw.decode("utf-8"))
             if (original != outcome or original.get("started") is not True
                     or type(original.get("exit_code")) is not int or original["exit_code"] != 0
                     or original.get("termination_reason") != "normal"
@@ -201,6 +305,8 @@ class ResultReceipts(RuntimeService):
                 raise HarnessError("终端结果的进程未正常完成；保留证据，禁止重新抽取结论",
                                    stop=stops.make("evidence", "process_incomplete", data={"exit_unconfirmed": False},
                                                    source={"dispatch_id": entry["id"]}))
+        except EvidenceError as error:
+            raise EvidenceError(f"终端结果证据缺失或改变；保留证据：{error}", stop=error.stop) from error
         except (TypeError, KeyError) as error:  # malformed capture content: a content-check failure
             raise ValueError(f"invalid terminal capture: {error!r}") from error
         return digest
@@ -216,6 +322,26 @@ class ResultReceipts(RuntimeService):
             entry.update(status="failed", error=str(error))
         self.context.save()
 
+    def settle_return(self, key):
+        """Publish a recoverable result or discard an unreturned intent after the exit gate."""
+        settlement = self.settlement(key)
+        if settlement.kind == "returned":
+            return None
+        if settlement.kind in ("captured", "unreturned"):
+            self.discard_unreturned(key)
+            return None
+        field = "commander_receipts" if key.startswith("commander:") else "review_receipts"
+        receipt = self.context.run[field][key]
+        entry = next(d for d in self.context.run["dispatches"] if d["id"] == receipt["dispatch_id"])
+        provider = self.context.config.role(entry["role"], self.context.commander)["cli"]
+        job = self.context.directory / "dispatches" / entry["id"]
+        try:
+            result = CLIBackend(self.context.config, self.context.state).completed_result(job, provider, settlement.raw)
+        except UndecodableOutput as error:
+            return error
+        write_json(job / "returned-result.json", result)
+        return None
+
     def discard_unreturned(self, key):
         """Drop a commander or review intent that never returned; a returned result never is.
 
@@ -225,7 +351,7 @@ class ResultReceipts(RuntimeService):
         receipt = receipts.get(key)
         if receipt is None:
             return
-        if self.returned(receipt):
+        if self.settlement(key).kind in ("returned", "recoverable", "invalid"):
             raise HarnessError("已有返回、尚未处理的结果；先普通 resume，不能丢弃")
         self.context.ensure_exited()
         self.validate_terminal_capture(receipt)
@@ -282,7 +408,8 @@ class ResultReceipts(RuntimeService):
             raise HarnessError("指挥结果的派发身份与接收记录不符")
         if snapshot_digest(receipt["request"]) != receipt["request_digest"]:
             raise EvidenceError("指挥原始请求已改变；保留证据，禁止重新抽取结论", stop=stops.make("evidence", "runtime_integrity", source={"dispatch_id": entry["id"]}))
-        raw, _ = read_bound_bytes(receipt, "指挥", bind=self.context.save)
+        raw, _ = bound_bytes(self.artifact_files(receipt).under("returned-result.json"),
+                             receipt, "指挥", bind=self.context.save)
         try:
             result = strict_json_loads(raw)
         except (ValueError, UnicodeError, RecursionError) as error:
@@ -357,10 +484,18 @@ class ResultReceipts(RuntimeService):
         if receipt is None:
             return False
         try:
-            raw = Path(receipt["artifact"]).read_bytes()
+            files = self.artifact_files(receipt)
+            evidence_path(files.under("returned-result.json"), receipt)
+            raw = files.read(("returned-result.json",), limit=None).bytes_or_none()
+            if raw is None:
+                return False
             result = strict_json_loads(raw)
-        except (OSError, ValueError, UnicodeError, RecursionError):
+        except (EvidenceError, ValueError, UnicodeError, RecursionError):
             return False
+        return self.is_ask(key, receipt, result)
+
+    @staticmethod
+    def is_ask(key, receipt, result):
         return (isinstance(result, dict) and result.get("action") == "ask"
                 and result.get("task_id") == key.rsplit(":", 1)[1] and result.get("dispatch_id") == receipt["dispatch_id"])
 
@@ -374,12 +509,8 @@ class ResultReceipts(RuntimeService):
         receipt = self.context.run["review_receipts"][key]
         self.validate_terminal_capture(receipt)
         entry = next(d for d in self.context.run["dispatches"] if d["id"] == receipt["dispatch_id"])
-        result, digest = read_bound_result(receipt, "审阅", bind=self.context.save)
-        if "artifact_digest" not in receipt:
-            receipt["artifact_digest"] = digest
-            self.context.save()
-        if digest != receipt["artifact_digest"]:
-            raise EvidenceError("审阅原始结果已改变；保留证据，禁止重新抽取结论", stop=stops.make("evidence", "runtime_integrity", source={"dispatch_id": entry["id"], "artifact": receipt["artifact"]}))
+        result, _ = bound_result(self.artifact_files(receipt).under("returned-result.json"),
+                                 receipt, "审阅", bind=self.context.save)
         if (git.head(self.context.worktree, binding=self.context.run["worktree_binding"]) != self.context.run["expected_head"]
                 or snapshot_digest(self.context.snapshot()) != receipt["snapshot_digest"]):
             raise HarnessError("审阅期间或之后修改了代码/HEAD；原审阅结果不能用于当前快照", stop=stops.make("workspace_mismatch", "candidate_changed", source={"dispatch_id": entry["id"]}))

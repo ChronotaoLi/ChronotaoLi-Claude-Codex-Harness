@@ -1,8 +1,9 @@
 """Waits preserve task work budgets, never erase actual invocation accounting."""
 import copy
 from pathlib import Path
+from unittest.mock import patch
 
-from harness import git
+from harness import budgets, git, stops
 from harness.budgets import work_attempts
 from harness.cli import status_summary
 from harness.util import HarnessError, read_json, write_json
@@ -25,6 +26,33 @@ class WorkAttemptBudgetTests(RepoCase):
         with self.assertRaises(HarnessError):
             engine.start("Implement greet", read_json(ROOT / "examples" / "plan.json"))
         return engine, backend
+
+    def test_exemption_validation_io_failure_keeps_invocation_charged(self):
+        def block(backend, kwargs, packet, result):
+            if kwargs["role"] == "worker":
+                result.update(status="blocked", blocker_kind="environment", blockers=["Wait for prerequisite"])
+
+        engine = self.engine(ScriptedBackend(block))
+        error = OSError(5, "exemption source I/O failed")
+        exemptions_during_validation = []
+
+        def fail_source_read(files, exemption, label):
+            worker, = [entry for entry in engine.run["dispatches"] if entry["role"] == "worker"]
+            exemptions_during_validation.append(worker.get("attempt_exemption"))
+            raise error
+
+        with patch.object(budgets, "bound_result", side_effect=fail_source_read):
+            with self.assertRaises(OSError) as blocked:
+                engine.start("Implement greet", read_json(ROOT / "examples" / "plan.json"))
+        self.assertIs(blocked.exception, error)
+        self.assertEqual(exemptions_during_validation, [None])
+        self.assertEqual((stops.of(error)["kind"], stops.of(error)["reason"]), ("runtime_failure", "io"))
+        worker, = [entry for entry in engine.run["dispatches"] if entry["role"] == "worker"]
+        self.assertNotIn("attempt_exemption", worker)
+        saved = read_json(engine.directory / "state.json")
+        self.assertEqual(work_attempts(saved), {"greet": 1})
+        self.assertEqual((saved["stop"]["kind"], saved["stop"]["reason"]), ("runtime_failure", "io"))
+        self.assertEqual(next(iter(saved["worker_receipts"].values()))["phase"], "sealed")
 
     def test_environment_wait_preserves_work_budget_and_every_invocation(self):
         engine, backend = self.start_blocked()

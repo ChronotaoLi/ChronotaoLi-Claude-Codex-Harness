@@ -6,14 +6,16 @@ from .services import RuntimeService
 from copy import deepcopy
 import hashlib
 import json
+import re
 from os import PathLike
 from pathlib import Path
 import time
 
 from .contracts import validate_work_core
 from .worker_receipts import delivered_work_contract
-from .recovery import RECOVERY_BUSY_KEYS, read_bound_result, snapshot_digest
-from .util import HarnessError, dump, write_json
+from .recovery import RECOVERY_BUSY_KEYS, bound_result, returned_result_files, run_files, snapshot_digest
+from .runtime_evidence import optional_bytes, read_or_write
+from .util import EvidenceError, HarnessError, dump, write_json
 
 
 def _text(value, label, limit=4000):
@@ -99,7 +101,7 @@ class DecisionRecovery(RuntimeService):
         expected = self.context.directory / 'dispatches' / dispatch_id / 'returned-result.json'
         if source.get('artifact') != str(expected) or not source.get('artifact_digest'):
             raise HarnessError('decision source reference invalid')
-        result, _ = read_bound_result(source, 'decision source ')
+        result, _ = bound_result(returned_result_files(self.context, dispatch_id), source, 'decision source ')
         if request['kind'] in ('worker', 'handoff'):
             if entry.get('role') != 'worker' or entry.get('kind') != 'implement' or entry.get('task_id') != request['source_task_id']:
                 raise HarnessError('decision worker source identity invalid')
@@ -144,28 +146,28 @@ class DecisionRecovery(RuntimeService):
             ('run_id', 'task_id', 'source_task_id', 'kind', 'source', 'question', 'request_key')})
 
     def _written_decision_artifact(self, record):
-        """The artifact an earlier, interrupted prewrite left for ``record``, or None; a different one conflicts."""
+        """Recover the prior artifact and its bytes, if any, or reject a conflicting retry."""
         artifact = self.context.directory / 'decisions' / (record['id'] + '.json')
-        if not artifact.exists():
-            return None
+        raw = optional_bytes(run_files(self.context), ('decisions', artifact.name), {'artifact': str(artifact)})
+        if raw is None:
+            return None, None
         try:
-            old = json.loads(artifact.read_bytes())
-        except (OSError, ValueError, UnicodeError) as error:
-            stops.keep_local_io(error)
+            old = json.loads(raw)
+        except (ValueError, UnicodeError) as error:
             raise HarnessError('unregistered decision artifact damaged') from error
         if not isinstance(old, dict) or {k: v for k, v in old.items() if k != 'recorded_at'} != {k: v for k, v in record.items() if k != 'recorded_at'}:
             raise HarnessError('immutable decision artifact conflict', stop=stops.make("invalid_input", "conflicting_retry", data={"option": "--operator-decision"}))
-        return old
+        return old, raw
 
     def _decision_artifact(self, record, category):
         artifact = self.context.directory / 'decisions' / (record['id'] + '.json')
-        old = self._written_decision_artifact(record)
+        old, raw = self._written_decision_artifact(record)
         if old is not None:
             record = old
         else:
             write_json(artifact, record)
-        row = {**deepcopy(record), 'artifact': str(artifact),
-               'artifact_digest': hashlib.sha256(artifact.read_bytes()).hexdigest()}
+            raw = run_files(self.context).read(('decisions', artifact.name), limit=None).evidence({'artifact': str(artifact)})
+        row = {**deepcopy(record), 'artifact': str(artifact), 'artifact_digest': hashlib.sha256(raw).hexdigest()}
         self.context.event(category, **{k: v for k, v in row.items() if k != 'run_id'})
         return row
 
@@ -248,7 +250,11 @@ class DecisionRecovery(RuntimeService):
                 ids.add(row['id'])
                 if row.get('artifact') != str(self.context.directory / 'decisions' / (row['id'] + '.json')) or not row.get('artifact_digest'):
                     raise HarnessError('decision artifact reference invalid')
-                record, _ = read_bound_result(row, 'operator decision ')
+                prefix = 'request_' if category == 'request' else 'decision_'
+                if not re.fullmatch(prefix + r'[0-9a-f]{64}', row['id']):
+                    raise HarnessError('decision ledger identity invalid')
+                files = run_files(self.context).under('decisions', row['id'] + '.json')
+                record, _ = bound_result(files, row, 'operator decision ')
                 expected = {k: v for k, v in row.items() if k not in ('artifact', 'artifact_digest')}
                 if record != expected or type(record.get('sequence')) is not int or record.get('sequence') != sequence:
                     raise HarnessError('decision artifact disagrees with ledger')
@@ -391,17 +397,22 @@ class DecisionRecovery(RuntimeService):
         raw = (dump(value) + '\n').encode('utf-8')
         digest = hashlib.sha256(raw).hexdigest()
         folder = self.context.directory / 'decisions' / 'indexes'
-        if any(p.is_symlink() for p in (folder, *folder.parents)):
-            raise HarnessError('decision index directory is a symlink')
         artifact = folder / (digest + '.json')
+        files = run_files(self.context)
+        parts = ('decisions', 'indexes', artifact.name)
+        source = {'artifact': str(artifact)}
         try:
-            if not artifact.exists() and not artifact.is_symlink():
-                write_json(artifact, value)
+            actual = read_or_write(files, parts, artifact, value)
+        except EvidenceError as error:
+            expected_folder = Path(files.path).joinpath(*files.prefix, *parts[:-1])
+            message = ('decision index changed' if folder == expected_folder
+                       else 'decision index directory is a symlink or differs from the run directory')
+            raise EvidenceError(f'{message}: {error}', stop=error.stop) from error
         except OSError as error:
             raise HarnessError('cannot write decision index',
                                stop=stops.make('runtime_failure', 'io', data={'error_type': type(error).__name__})) from error
-        with stops.evidence_reads(source={'artifact': str(artifact)}):
-            if artifact.is_symlink() or artifact.read_bytes() != raw:
+        with stops.evidence_reads(source=source):
+            if actual != raw:
                 raise HarnessError('decision index changed')
         return {'artifact': str(artifact), 'artifact_digest': digest, 'count': len(records)}
 

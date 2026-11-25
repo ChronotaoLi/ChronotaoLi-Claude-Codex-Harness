@@ -20,6 +20,7 @@ class InputDispatchIntegrationTests(RepoCase):
         source = self.repo / 'deps/input.txt'
         source.parent.mkdir()
         source.write_text('immutable dependency')
+        source.chmod(0o644)
         manifest = dict(schema_version=1, run_id=engine.run['id'], head=engine.run['expected_head'],
                         source_root='.', max_files=1, max_bytes=100,
                         files=[dict(source='deps/input.txt', destination='vendor/input.txt',

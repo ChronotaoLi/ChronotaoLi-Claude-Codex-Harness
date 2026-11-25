@@ -1,9 +1,9 @@
 """Guards for typed stops (spec-4 14.4): registry, literal reads, process matrix, read classes, settling."""
 import ast
 import errno
+import hashlib
 import json
 import os
-import pathlib
 import re
 import unittest
 from pathlib import Path
@@ -13,7 +13,7 @@ from harness import state_files, stops
 from harness.adapters import DemoBackend
 from harness.dispatch import invocation_stop, process_stop
 from harness.process_runtime import ProcessOutcome, failure
-from harness.recovery import read_bound_bytes
+from harness.recovery import bound_bytes, read_bound_bytes
 from harness.run_context import RunContext
 from harness.run_lifecycle import RunLifecycle
 from harness.runtime import Runtime
@@ -70,6 +70,10 @@ WRITERS = {("workflow.py", "stop"), ("scheduler.py", "_execute_until_terminal"),
 DELETERS = {("scheduler.py", "_execute_until_terminal"), ("run_lifecycle.py", "abandon_locked")}
 OUTPUT_KEYS = {("cli.py", "stop_notice"), ("operations.py", "create"), ("watch_cli.py", "watching")}
 READERS = {("observe.py", "_operation_summary"), ("watch_cli.py", "watching")}  # projections and records only
+WRITTEN_LEAVE_ERROR_ASSIGNMENT = ast.dump(ast.parse("""
+leave_error = {"stop": f"{value['kind']}/{value['reason']}",
+               "error": value["data"].get("detail") or type(error).__name__}
+""").body[0])
 
 
 def stop_literals(name, text):
@@ -104,6 +108,12 @@ def stop_literals(name, text):
               and isinstance(grand, ast.Expr)):
             role = "delete"
         elif isinstance(parent, ast.Dict) and node in parent.keys:
+            handler = parents.get(grand)
+            if (name == "run_lifecycle.py" and function(node) == "abandon_locked"
+                    and isinstance(handler, ast.ExceptHandler) and grand is handler.body[-1]
+                    and ast.dump(grand) == WRITTEN_LEAVE_ERROR_ASSIGNMENT):
+                # This diagnostic is published as run_abandoned.written_leave_error.
+                continue
             role = "output"
         found.append((name, function(node), role, node.lineno))
     return found
@@ -307,6 +317,47 @@ class ProcessMatrix(unittest.TestCase):
 # ---- G14: only path loss and changed bytes are evidence; local I/O stays I/O -----------------
 class ReadFailureClasses(RepoCase):
     def test_missing_is_evidence_permission_is_io(self):
+        from test_state_files import FakeOs
+
+        root = self.repo / ".harness"
+        folder = root / "evidence"
+        folder.mkdir(parents=True)
+        artifact = folder / "result.json"
+        files = state_files.StateFiles(root).under("evidence", artifact.name)
+        raw = b"{}"
+        digest = hashlib.sha256(raw).hexdigest()
+        source = {"artifact": str(artifact), "artifact_digest": digest}
+
+        with self.assertRaises(EvidenceError) as missing:
+            bound_bytes(files, source, "测试")
+        stop = stops.of(missing.exception)
+        self.assertEqual((stop["kind"], stop["reason"], stop["source"]),
+                         ("evidence", "runtime_integrity", source))
+
+        artifact.write_bytes(raw)
+        self.assertEqual(bound_bytes(files, source, "测试"), (raw, digest))
+        parent = folder.stat()
+        for code, error_type in ((errno.EACCES, "PermissionError"), (errno.EIO, "OSError")):
+            with self.subTest(errno=code):
+                def failed(real, name, *args, dir_fd=None, **kwargs):
+                    if name == artifact.name and dir_fd is not None:
+                        directory = os.fstat(dir_fd)
+                        if (directory.st_dev, directory.st_ino) == (parent.st_dev, parent.st_ino):
+                            raise OSError(code, os.strerror(code), name)
+                    return real(name, *args, dir_fd=dir_fd, **kwargs)
+
+                with patch.object(state_files, "os", FakeOs(open=failed)):
+                    with self.assertRaises(state_files.StateReadError) as caught:
+                        bound_bytes(files, source, "测试")
+                error = caught.exception
+                stop = stops.of(error)
+                self.assertEqual((stop["kind"], stop["reason"], stop["data"]["error_type"]),
+                                 ("runtime_failure", "io", error_type))
+                self.assertEqual(error.outcome.errno, code)
+                self.assertIn(os.strerror(code), str(error))
+                self.assertIn(str(artifact), str(error))
+
+    def test_legacy_path_read_for_held_view(self):
         with self.assertRaises(EvidenceError):
             read_bound_bytes({"artifact": str(self.repo / "gone.json"), "artifact_digest": "a" * 64}, "测试")
         locked = self.repo / "locked.json"
@@ -361,6 +412,8 @@ class LoadFailureClasses(RepoCase):
                 packet.write_bytes(raw)
 
     def test_checkpoint_chain(self):
+        from test_state_files import FakeOs
+
         case = _checkpoints.CheckpointDeclarationFailureTests
         self.declaration = case.declaration.__get__(self)
 
@@ -371,22 +424,26 @@ class LoadFailureClasses(RepoCase):
         backend = case.backend(self, mutate=keep_valid)
         engine = self.engine(backend)
         result = engine.start("Implement greet", plan())
-        self.assertTrue(result["task_checkpoints"])
-        folder = engine.directory / "checkpoints"
-        real_open = pathlib.Path.open
+        checkpoint, = result["task_checkpoints"]
+        target = Path(checkpoint["artifact"])
+        parent = target.parent.stat()
+        mode = target.stat().st_mode
+        raw = target.read_bytes()
 
-        def denied(path, *args, **kwargs):
-            if folder in path.parents:
-                raise PermissionError(errno.EACCES, "Permission denied", str(path))
-            return real_open(path, *args, **kwargs)
-        with patch.object(pathlib.Path, "open", denied):
+        def denied(real, name, *args, dir_fd=None, **kwargs):
+            if name == target.name and dir_fd is not None:
+                directory = os.fstat(dir_fd)
+                if (directory.st_dev, directory.st_ino) == (parent.st_dev, parent.st_ino):
+                    raise PermissionError(errno.EACCES, "Permission denied", str(target))
+            return real(name, *args, dir_fd=dir_fd, **kwargs)
+
+        with patch.object(state_files, "os", FakeOs(open=denied)):
             value = self.resume_error(backend, engine.run["id"])
         self.assertEqual((value["kind"], value["reason"]), ("runtime_failure", "io"))
-        # A checkpoint manifest (load-checked); the navigation index and batch files are other evidence,
-        # and rglob's order is the file system's, so the choice is made explicit.
-        target = next(p for p in sorted(folder.rglob("*.json")) if p.is_file()
-                      and not {"batches", "indexes"} & set(p.relative_to(folder).parts))
-        target.write_bytes(target.read_bytes() + b"x")
+        self.assertEqual(target.read_bytes(), raw)
+        self.assertEqual(target.stat().st_mode, mode)
+        self.addCleanup(target.write_bytes, raw)
+        target.write_bytes(raw + b"x")
         value = self.resume_error(backend, engine.run["id"])
         self.assertEqual((value["kind"], value["reason"]), ("evidence", "load_integrity"))
 

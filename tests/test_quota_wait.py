@@ -3,7 +3,7 @@
 A Claude role's usage-limit failure is a real local child process run through
 ``CLIBackend`` (the classifier and the immediate judgment are the real ones); the quota
 snapshot is the real probe landing on the ``claude``/``codex`` stubs (``quota_stubs``),
-whose windows each test sets. ``harness.quota_wait.time`` is a fake clock: no test sleeps.
+whose windows each test sets. ``harness.quota_wait.time`` normally uses a fake clock.
 Every quota number and time is synthetic; the one real envelope is the de-identified
 connection failure ``test_provider_failures.REAL_CONNECTION_REFUSED``.
 """
@@ -13,14 +13,18 @@ import json
 import math
 import os
 import re
+import select
 import signal
 import sys
+import threading
+import time
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
 import quota_stubs
-from harness import quota, quota_wait, stops
+from harness import interrupts, quota, quota_wait, stops
 from harness.adapters import CLIBackend, DemoBackend
 from harness.budgets import work_attempts
 from harness.cli import status_summary
@@ -522,6 +526,76 @@ class InterruptionTests(WaitCase):
         result = self.engine(self.backend()).resume(saved["id"])
         self.assertEqual(result["status"], "completed")
         self.assertEqual(self.clock.sleeps, [])
+
+    def test_controller_signal_wakes_real_quota_sleep(self):
+        # The reset plus the normal margin is a few seconds in the future.
+        reset = datetime.fromtimestamp(time.time() - quota_wait.MARGIN_SECONDS + 5, timezone.utc)
+        self.windows(window("session", 100, resets_at=reset.isoformat()))
+        backend = self.backend("worker")
+        engine = self.engine(backend)
+        real_select = select.select
+        signals_sent = []
+        timers = []
+
+        def interrupt():
+            signals_sent.append(time.monotonic())
+            os.kill(os.getpid(), signal.SIGINT)
+
+        def select_and_signal(readers, writers, errors, timeout=None):
+            if readers == [controller.reader] and not timers:
+                self.assertGreater(timeout, 1)
+                published = read_json(engine.directory / "state.json")
+                self.assertEqual(published["status"], "running")
+                self.assertIn("quota_wait", published)
+                self.assertTrue(engine.context.store.matches_commit())
+                timer = threading.Timer(0.02, interrupt)
+                timers.append(timer)
+                timer.start()
+            return real_select(readers, writers, errors, timeout)
+
+        with patch.object(quota_wait, "time", time), patch.object(interrupts, "ENABLED", True), \
+                interrupts.installed(), patch.object(select, "select", select_and_signal):
+            controller = interrupts.active()
+            try:
+                with self.assertRaises(KeyboardInterrupt):
+                    engine.start("Implement greet", plan())
+                stopped_at = time.monotonic()
+            finally:
+                for timer in timers:
+                    timer.cancel()
+                    timer.join()
+            self.assertEqual(controller.delivered_from, "QuotaWait._sleep_until")
+
+        sent_at, = signals_sent
+        self.assertLess(stopped_at - sent_at, 0.3)
+        saved = read_json(engine.directory / "state.json")
+        self.assertEqual((saved["status"], saved["stop"]["kind"]), ("interrupted", "interrupted"))
+        self.assertNotIn("quota_wait", saved)
+        self.assertEqual(self.judged(saved), ("failed", "provider_failure", "usage_limit", {"greet": 1}, 1))
+        self.assertEqual([call[0] for call in backend.calls], ["worker"])
+        self.assertEqual(self.events(engine, "quota_wait_finished"), [])
+
+    def test_controller_delivers_after_fake_sleep_segment(self):
+        def interrupt(clock, seconds):
+            os.kill(os.getpid(), signal.SIGINT)
+            self.assertTrue(interrupts.deliverable())
+
+        before = self.clock.monotonic()
+        self.clock.on_sleep = interrupt
+        self.windows(window("session", 100, 3600))
+        backend = self.backend("worker")
+        with patch.object(interrupts, "ENABLED", True), interrupts.installed():
+            controller = interrupts.active()
+            engine, saved = self.start(backend, expect=KeyboardInterrupt)
+            self.assertEqual(controller.delivered_from, "QuotaWait._sleep_until")
+
+        self.assertEqual(self.clock.sleeps, [quota_wait.SLICE_SECONDS])
+        self.assertEqual(self.clock.monotonic() - before, quota_wait.SLICE_SECONDS)
+        self.assertEqual(self.clock.time(), T0 + quota_wait.SLICE_SECONDS)
+        self.assertEqual((saved["status"], saved["stop"]["kind"]), ("interrupted", "interrupted"))
+        self.assertNotIn("quota_wait", saved)
+        self.assertEqual([call[0] for call in backend.calls], ["worker"])
+        self.assertEqual(self.events(engine, "quota_wait_finished"), [])
 
     def test_sigterm_during_wait_through_the_cli(self):  # T8-9 (SIGTERM, cli.main's handler)
         def terminate(clock, seconds):
@@ -1751,7 +1825,9 @@ class RealEvidenceTests(WaitCase):
         git.git(self.repo, "-c", "user.name=Test", "-c", "user.email=test@localhost", "-c", "commit.gpgsign=false",
                 "commit", "-m", "ignore dependency inputs")
         (self.repo / "deps").mkdir()
-        (self.repo / "deps" / "input").write_bytes(b"synthetic dependency")
+        source = self.repo / "deps" / "input"
+        source.write_bytes(b"synthetic dependency")
+        source.chmod(0o644)
         saved = self.engine(self.backend()).start("Implement greet", plan(), pause_after_plan=True)
         self.assertEqual(saved["status"], "awaiting_approval")
         workspace_inputs.prepare_run(self.repo, saved["id"], {

@@ -11,10 +11,10 @@ from .continuation import continuation_gate, continuation_stop, resolve_continua
 from .finalization import needs_decision, same_snapshot_record
 from .operations import observe_terminal
 from .planning import attempt_limit_error, DECIDE_KEY, directive_mismatch
-from .recovery import invalidate_acceptance_review, snapshot_digest
+from .recovery import acceptance_review_records, snapshot_digest
 from .run_store import RunStore
 from .util import HarnessError
-from . import quota_wait, stops
+from . import interrupts, quota_wait, stops
 from .services import RuntimeService
 
 Step = namedtuple("Step", "kind data")
@@ -32,18 +32,18 @@ class Scheduler(RuntimeService):
                 raise HarnessError(f"等待续作条件：{blocker}", stop=continuation_stop(self.context, blocker))
             resolve_continuation(self.context)
 
-    def next_step(self, *, step=False, accepted_this_call=0):
+    def next_step(self, *, step=False, accepted_this_call=0, resumed=False):
         # Every step derives from the plan: its published files are the authority.
         self.services.planning.verify_plan_authority()
         # A leave whose record file is written is a fact before anything is derived from the whole-run history.
         self.services.finalization.publish_written_leave()
-        result = self._next_step(step=step, accepted_this_call=accepted_this_call)
+        result = self._next_step(step=step, accepted_this_call=accepted_this_call, resumed=resumed)
         if (DECIDE_KEY in self.context.run["commander_receipts"] and result.kind in ADVANCING
                 and not (result.kind == "final_review" and self.context.reverify_requested)):
             raise HarnessError("指挥决定回执与当前推导不符；保留现场", stop=stops.make("runtime_failure", "invariant"))
         return result
 
-    def _next_step(self, *, step, accepted_this_call):
+    def _next_step(self, *, step, accepted_this_call, resumed):
         run = self.context.run
         workflow, planning = self.services.workflow, self.services.planning
         workflow.require_commander_answer()
@@ -94,10 +94,13 @@ class Scheduler(RuntimeService):
                 return Step("worker", (task, saved["directive"]))
             if planning.published_directive_missing():
                 raise HarnessError("修订已发布但待派发指令缺失；保留现场", stop=stops.make("runtime_failure", "invariant"))
-            if len(ready) == 1 and not run.get("feedback") and not run["attempts"].get(ready[0]["id"]):
-                # Direct dispatch: the worker skill states the default; no commander text.
-                return Step("worker", (ready[0], {"selected_task": ready[0]["id"], "action": "implement",
-                                                  "instruction": None}))
+            if len(ready) == 1 and not run.get("feedback"):
+                task = ready[0]
+                tid = task["id"]
+                if (not run["attempts"].get(tid)
+                        or (resumed and current == tid and self.services.worker_receipts.can_redo_direct_cancellation(tid))):
+                    # Direct dispatch: use the current default, including after a cancelled direct call.
+                    return Step("worker", (task, {"selected_task": tid, "action": "implement", "instruction": None}))
             return Step("decide", planning.task_trigger(ready))
         record = None
         if run["final_history"]:
@@ -108,11 +111,11 @@ class Scheduler(RuntimeService):
             return Step("decide", self.services.finalization.trigger(record))
         return Step("final_review", None)
 
-    def execute(self, supplied_plan=None, *, step=False):
+    def execute(self, supplied_plan=None, *, step=False, resumed=False):
         quota = self.services.quota
         primary = None
         try:
-            self._execute_until_terminal(supplied_plan, step=step)
+            self._execute_until_terminal(supplied_plan, step=step, resumed=resumed)
             observe_terminal("额度终态登记", quota.terminal_saved)
             observe_terminal("写检查点", self.context.checkpoint)
             event = {"awaiting_approval": "plan_awaiting_approval", "paused": "run_paused",
@@ -126,19 +129,24 @@ class Scheduler(RuntimeService):
             # A sample is an observation of the saved terminal state and the outgoing error, if any.
             observe_terminal("结束额度采样", quota.end_of_call, primary)
 
-    def _execute_until_terminal(self, supplied_plan, *, step):
+    def _execute_until_terminal(self, supplied_plan, *, step, resumed):
         try:
             self.admission()
             try:
+                interrupts.deliver()
                 replayed = self.services.tasks.replay_worker()
             except HarnessError as error:
                 # Not yet running: a quota failure of a replayed worker result's review stops, saying why it did not wait.
                 self.services.quota_wait.decline(error, "not_running")
                 raise
-            if invalidate_acceptance_review(self.context.run):
-                self.context.save()
+            invalidated = acceptance_review_records(self.context.run)
+            if invalidated:
+                with self.context.publish():
+                    for record in invalidated:
+                        record["status"] = "invalidated"
             self.services.workflow.synchronize_decision_requests()
             while not self.context.run["tasks"]:
+                interrupts.deliver()
                 planned = self.next_step()
                 if planned.kind == "supplied_plan":
                     plan = supplied_plan if supplied_plan is not None else planned.data
@@ -173,11 +181,13 @@ class Scheduler(RuntimeService):
             self.context.save()
             accepted_this_call = int(bool(replayed)) + int(self.services.tasks.finish_post_accept())
             if self.context.run.get("pending_acceptance"):
+                interrupts.deliver()
                 if self.services.tasks.accept_pending():
                     accepted_this_call += 1
             while True:
+                interrupts.deliver()
                 self.admission()
-                action = self.next_step(step=step, accepted_this_call=accepted_this_call)
+                action = self.next_step(step=step, accepted_this_call=accepted_this_call, resumed=resumed)
                 try:
                     if action.kind == "apply_revision":
                         self.services.planning.apply_pending_revision()

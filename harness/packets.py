@@ -18,7 +18,7 @@ from .util import HarnessError
 from .verification_plan import build_verification_plan, finding_progress_packet, project_finding_sources, verification_role_view, recent_costs
 from .continuation import packet as continuation_packet
 from .review_progress import entries, repair_findings, required_findings, verify_history
-from .recovery import snapshot_digest
+from .recovery import run_files, snapshot_digest
 
 
 def _reviewed(record):
@@ -96,7 +96,7 @@ class PacketBuilder(RuntimeService):
         if required is None:
             # Capacity preflight; a final review passes its saved mapping instead.
             required = required_findings(
-                self.context.run, "final", snapshot_digest(self.context.snapshot()),
+                self.context.run, "final", snapshot_digest(self.context.snapshot()), files=run_files(self.context),
                 whole_run=True, records=history) if entries(history, whole_run=True) else []
         return {
             "goal": self.context.run["goal"], **compact_plan(original_tasks, tasks),
@@ -242,7 +242,7 @@ class PacketBuilder(RuntimeService):
             packet = {**packet, "tool_constraints": constraints}
         task = next((item for item in self.context.run.get("tasks", []) if item["id"] == task_id), None)
         if role == "worker" and self.context.run.get("review_history", {}).get(task_id):
-            packet = {**packet, "required_findings": repair_findings(self.context.run, task_id)}
+            packet = {**packet, "required_findings": repair_findings(self.context.run, task_id, files=run_files(self.context))}
         # The call, never a task's name, makes a run-level view: the commander's decide and the
         # whole-run review see every history, any other call its own task's.
         scope = None if role == "commander" or kind == "final_review" else task_id
@@ -269,9 +269,9 @@ class PacketBuilder(RuntimeService):
         # every source authenticated, every saved mapping and approval checked.
         histories = [tid for tid in self.context.run.get("review_history", {}) if scope is None or tid == scope]
         carried = set() if scope is None else carried_histories(self.context.run, packet)
-        keyed = {tid: verify_history(self.context.run, tid) for tid in self.context.run.get("review_history", {})
+        keyed = {tid: verify_history(self.context.run, tid, files=run_files(self.context)) for tid in self.context.run.get("review_history", {})
                  if tid in histories or (tid, False) in carried}
-        whole = (verify_history(self.context.run, "final", whole_run=True)
+        whole = (verify_history(self.context.run, "final", files=run_files(self.context), whole_run=True)
                  if scope is None or ("final", True) in carried else None)
         packet = {**packet, **{key: value for key, value in continuation.items() if value}}
         # Stale authority is refused before this packet publishes either review index (the
@@ -288,7 +288,7 @@ class PacketBuilder(RuntimeService):
             if any(row["review_dispatch_id"] not in inline for row in records):
                 packet = project_review_keys(packet, self.context.directory, records)
         progress = finding_progress_packet(self.context.run, histories, self.context.directory,
-                                           whole_run=scope is None)
+                                           whole_run=scope is None, files=run_files(self.context))
         if progress is not None:
             packet = {**packet, "finding_progress": progress}
         packet = {**packet, "verification_plan": verification_role_view(

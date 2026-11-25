@@ -7,18 +7,20 @@ import uuid
 from copy import deepcopy
 from pathlib import Path
 
-from . import stops
-from .adapters import provider_usage, UndecodableOutput
+from . import interrupts, stops
+from .adapters import provider_usage, UndecodableOutput, _CompletedResultReadError
 from .context import compose
 from .continuation import validate_continuation_rejection
 from .receipts import ERROR_EXCERPT_CHARS, InvalidOutput, InvalidReviewRejection, judged_decide, RetainedProposal
 from .input_projection import validate_dispatch_indexes as validate_input_dispatch_indexes
 from .path_evidence import validate_dispatch_indexes, validate_indexes
 from .planning import attempt_limit_error
-from .recovery import read_bound_bytes, snapshot_digest
+from .provider_failures import LIMIT, classify, stop_facts
+from .recovery import bound_bytes, run_files, snapshot_digest
 from .services import RuntimeService
 from .shared import validate_mcp
-from .util import group_alive, HarnessError, write_json
+from .state_files import StateFiles
+from .util import EvidenceError, HarnessError, group_alive, run_process, write_json
 
 MODEL_ROLES = ("commander", "worker", "reviewer")
 JUDGED = ("invalid", "invalid_rejected", "invalid_asked", "invalid_blocked")
@@ -53,11 +55,12 @@ def _original_facts(code, provider, artifacts):
     Only when both read and each matches the digest the failure was typed by; a None digest
     (absent or unreadable then) never matches. A timeout or start failure shows no labels.
     """
-    from .provider_failures import read_for_boundary, stop_facts
+    job = Path(artifacts["job"])
+    files = artifacts.get("files") or StateFiles(job.parent).under(job.name)
     raw = {}
     for name in ("process.outcome.json", "process.stdout"):
-        state, data = read_for_boundary(artifacts["job"] / name)
-        if state != "read" or artifacts.get(name) is None or hashlib.sha256(data).hexdigest() != artifacts[name]:
+        data = files.read((name,), limit=LIMIT).bytes_or_none()
+        if data is None or artifacts.get(name) is None or hashlib.sha256(data).hexdigest() != artifacts[name]:
             return {}
         raw[name] = data
     facts = stop_facts(raw["process.outcome.json"], raw["process.stdout"], provider)
@@ -93,7 +96,7 @@ def failure_stop(code, http_status, *, role, provider, dispatch_id, task_id, tim
     return stops.make(kind, reason, data=data, source=source)
 
 
-def invocation_stop(failure, *, job, role, provider, dispatch_id, task_id, timeout):
+def invocation_stop(failure, *, job, role, provider, dispatch_id, task_id, timeout, files=None):
     """The type of a failed commander or reviewer invocation (spec-4 4.3, spec-5 6.1).
 
     Process facts first (persistence or cleanup faults, unconfirmed exit, start
@@ -101,7 +104,6 @@ def invocation_stop(failure, *, job, role, provider, dispatch_id, task_id, timeo
     Claude's envelope fields and never Codex's messages. A worker's failure is typed
     by its judgment instead (``Dispatcher.judge_worker_failure``).
     """
-    from .provider_failures import classify, read_for_boundary
     from .util import ProcessStartError, ProcessTimeout
     value = process_stop(failure, dispatch_id, task_id)
     if value is not None:
@@ -113,10 +115,14 @@ def invocation_stop(failure, *, job, role, provider, dispatch_id, task_id, timeo
         code = "agent_timeout"
     else:
         code = None
-    read = {name: read_for_boundary(Path(job) / name) for name in ("process.outcome.json", "process.stdout")}
-    found = classify(read["process.outcome.json"][1], read["process.stdout"][1] or b"", provider)
-    artifacts = {"job": Path(job), **{name: hashlib.sha256(data).hexdigest() if state == "read" else None
-                                      for name, (state, data) in read.items()}}
+    job = Path(job)
+    if files is None:
+        files = StateFiles(job.parent).under(job.name)
+    read = {name: files.read((name,), limit=LIMIT).bytes_or_none()
+            for name in ("process.outcome.json", "process.stdout")}
+    found = classify(read["process.outcome.json"], read["process.stdout"] or b"", provider)
+    digests = {name: hashlib.sha256(data).hexdigest() if data is not None else None for name, data in read.items()}
+    artifacts = {"job": job, "files": files, **digests}
     return failure_stop(code or found["code"], None if code else found["http_status"], role=role, provider=provider,
                         dispatch_id=dispatch_id, task_id=task_id, timeout=timeout, artifacts=artifacts)
 
@@ -180,12 +186,12 @@ class Dispatcher(RuntimeService):
         while True:
             self.context.ensure_exited()
             receipts = self.context.run[{"commander": "commander_receipts", "worker": "worker_receipts"}.get(role, "review_receipts")]
-            receipt = receipts.get(key)
-            if role != "worker" and receipt and not self.services.receipts.returned(receipt):
-                # Intent was saved before invoke; the provider never returned a
-                # usable result. Retrying still consumes a fresh dispatch budget.
-                self.services.receipts.discard_unreturned(key)
+            undecodable = None
+            if role != "worker" and key in receipts:
+                undecodable = self.services.receipts.settle_return(key)
             try:
+                if undecodable is not None:
+                    raise undecodable
                 if role == "worker" and key in receipts:
                     result = self.services.worker_receipts.finish(key, task)
                 elif role == "reviewer" and key in self.context.run["review_receipts"]:
@@ -201,6 +207,8 @@ class Dispatcher(RuntimeService):
                 validate_input_dispatch_indexes(self.context.directory, self.context.run["dispatches"])
                 return result
             except UndecodableOutput as error:
+                if self.context.store.poisoned:
+                    raise
                 if role == "worker":
                     return self.judge_worker_failure(key, error)
                 self.context.ensure_exited()
@@ -209,11 +217,18 @@ class Dispatcher(RuntimeService):
                 if invalid.entry.get("retry_of"):
                     raise self.stop_invalid(role, invalid) from error
             except InvalidOutput as invalid:
+                if self.context.store.poisoned:
+                    raise
                 if invalid.entry.get("retry_of"):
                     raise self.stop_invalid(role, invalid) from invalid
             except (InvalidReviewRejection, RetainedProposal):
                 raise
+            except _CompletedResultReadError:
+                # A failed local read supplies no verdict on the call's output.
+                raise
             except HarnessError as error:
+                if self.context.store.poisoned or getattr(error, "worker_handoff_read", False):
+                    raise
                 if role == "worker" and key in self.context.run["worker_receipts"]:
                     return self.judge_worker_failure(key, error)
                 # Also covers post-receipt process/index checks. Worker receipt
@@ -224,8 +239,8 @@ class Dispatcher(RuntimeService):
     def judge_worker_failure(self, key, error):
         """Judge a failed worker call at once, with the code a replay after a crash runs (spec-5 3.2).
 
-        The exit is confirmed first: unconfirmed, the original failure leaves with the
-        exit's type and nothing is judged. A sealed return is never judged here. An
+        The exit is confirmed first: unconfirmed or unreadable, the original failure leaves with the
+        gate's type and nothing is judged. A sealed return is never judged here. An
         invalid output continues scheduling; any other verdict (retryable) has already
         saved its judgment, exemption and consumption, and stops with its provider type.
         """
@@ -233,10 +248,10 @@ class Dispatcher(RuntimeService):
         dispatch_id = self.context.run["worker_receipts"][key]["dispatch_id"]
         try:
             self.context.ensure_exited()
-        except HarnessError as unconfirmed:
-            if unconfirmed.stop is None:
+        except HarnessError as gate_error:
+            if gate_error.stop is None:
                 raise
-            error.stop = unconfirmed.stop
+            error.stop = gate_error.stop
             raise error
         if receipts.pending() is not None:
             self.services.receipts.record_receipt_error(self.context.run["worker_receipts"].get(key), error)
@@ -246,10 +261,11 @@ class Dispatcher(RuntimeService):
             return None
         evidence = entry["worker_return_evidence"]
         job = self.context.directory / "dispatches" / dispatch_id
+        files = run_files(self.context).under("dispatches", dispatch_id)
         error.stop = failure_stop(evidence["provider"]["code"], evidence["provider"]["http_status"], role="worker",
                                   provider="claude", dispatch_id=dispatch_id, task_id=entry["task_id"],
                                   timeout=self.context.config.data["runtime"]["agent_timeout_seconds"],
-                                  artifacts={"job": job, **evidence["sources"]},
+                                  artifacts={"job": job, "files": files, **evidence["sources"]},
                                   attempt_charged="attempt_exemption" not in entry)
         raise error
 
@@ -258,10 +274,10 @@ class Dispatcher(RuntimeService):
         return HarnessError(f"{role} 输出连续两次无效：{invalid}；原件 {invalid.entry['invalid_output']['artifact']}；"
                             "普通 resume 重新请求，或 abandon", stop=stops.make("invalid_output", "redo_exhausted", data={"role": role}, source={"dispatch_id": invalid.entry["id"], "task_id": invalid.entry["task_id"], "artifact": invalid.entry["invalid_output"]["artifact"], "artifact_digest": invalid.entry["invalid_output"]["artifact_digest"]}))
 
-    def require_review_candidate(self, kind, entry, previous_invalid):
+    def require_review_candidate(self, kind, entry, digest, previous_invalid):
         """A review is bound to the candidate its batch mapping, and its redo judgment, belong to (spec-1 rule 15).
 
-        Checked once the entry's snapshot is bound and before any budget, receipt or call: a
+        Checked against the freshly computed snapshot digest before any budget, receipt or call: a
         review bound to another candidate could be attributed to no attempt, and a redo judged
         on another candidate (either way: a redo that is none, or a redo taken for a new
         request) is a different call. A local preparation failure, charged nothing.
@@ -269,10 +285,10 @@ class Dispatcher(RuntimeService):
         run = self.context.run
         batch = run["final_history"][-1] if kind == "final_review" else run["pending_task"]
         source = {"dispatch_id": entry["id"], "task_id": entry["task_id"]}
-        if entry["snapshot_digest"] != batch["snapshot_digest"]:
+        if digest != batch["snapshot_digest"]:
             raise HarnessError("审阅派发前候选已变化，与本批必需问题对照所属的快照不同；未调用模型",
                                stop=stops.make("workspace_mismatch", "candidate_changed", source=source))
-        bound, _ = redo_judgment(run["dispatches"], dispatch_key(entry), entry["snapshot_digest"])
+        bound, _ = redo_judgment(run["dispatches"], dispatch_key(entry), digest)
         if (bound and bound["dispatch_id"]) != (previous_invalid and previous_invalid["dispatch_id"]):
             raise HarnessError("审阅派发前候选已变化，按绑定的快照推导的重做判定与组包时不同；未调用模型",
                                stop=stops.make("workspace_mismatch", "candidate_changed", source=source))
@@ -290,6 +306,7 @@ class Dispatcher(RuntimeService):
         dispatch_id = str(uuid.uuid4())
         job = self.context.directory / "dispatches" / dispatch_id
         job.mkdir(parents=True)
+        job_files = run_files(self.context).under("dispatches", dispatch_id)
         if previous_invalid is not None:
             packet = {**packet, "previous_invalid": previous_invalid}
         contract, required = self.services.packets.role_input(
@@ -329,9 +346,8 @@ class Dispatcher(RuntimeService):
                 source={"artifact": str(job / "context-report.json")})
             raise
         write_json(job / "context-report.json", report)
-        self.context.run["dispatches"].append({"id": dispatch_id, "role": role, "kind": kind, "task_id": task_id,
-                                       "status": "running", "pgid": None, "process_state": "prepared", "invoked": False})
-        entry = self.context.run["dispatches"][-1]
+        entry = {"id": dispatch_id, "role": role, "kind": kind, "task_id": task_id,
+                 "status": "running", "pgid": None, "process_state": "prepared", "invoked": False}
         path_evidence = list(required["packet"].get("path_evidence_indexes", {}).values())
         if path_evidence:
             entry["path_evidence"] = path_evidence
@@ -341,7 +357,8 @@ class Dispatcher(RuntimeService):
         if role == "worker":
             (job / "commands").mkdir()
             entry["command_directory"] = str(job / "commands")
-        self.context.save()
+        with self.context.publish():
+            self.context.run["dispatches"].append(entry)
         # Events observe the ledger; the saved invoked flag stays authoritative.
         self.context.observe("dispatch_prepared", task_id=task_id, dispatch_id=dispatch_id, role=role)
         def on_start(pgid):
@@ -382,6 +399,7 @@ class Dispatcher(RuntimeService):
 
         invoked = False
         startup_interrupted = False
+        direct_worker = False
         try:
             from .workspace_inputs import validate_inputs
             validate_inputs(self.context.run, self.context.directory)
@@ -391,11 +409,21 @@ class Dispatcher(RuntimeService):
                 # The invalid original this call refers to (as a redo, or as the
                 # hint of a new request) is read by digest once, after local
                 # preparation; damage stops before the call is accounted.
-                read_bound_bytes(previous_invalid, "无效输出")
+                previous_id = previous_invalid["dispatch_id"]
+                files = run_files(self.context).under("dispatches", previous_id)
+                # Invalid output may be a judged result or the provider's undecodable original.
+                names = ("returned-result.json", "response.json", "process.stdout")
+                artifact = previous_invalid.get("artifact")
+                name = Path(artifact).name if isinstance(artifact, str) else None
+                if name not in names:
+                    raise EvidenceError("无效输出证据路径与派发不符；保留证据",
+                                        stop=stops.make("evidence", "runtime_integrity",
+                                                        source={"dispatch_id": previous_id}))
+                bound_bytes(files.under(name), previous_invalid, "无效输出")
             before = self.context.snapshot()
-            entry["snapshot_digest"] = snapshot_digest(before)
+            digest = snapshot_digest(before)
             if role == "reviewer":
-                self.require_review_candidate(kind, entry, previous_invalid)
+                self.require_review_candidate(kind, entry, digest, previous_invalid)
             rejection = validate_continuation_rejection(self.context, before,
                                                        worker_task=task_id if role == "worker" else None)
             if rejection and role != "worker":
@@ -415,45 +443,52 @@ class Dispatcher(RuntimeService):
                     f"已达 run 模型派发次数上限（已用 {self.context.run['agent_dispatches']}，上限 {limit}）；"
                     + (remaining["message"] + "；" if remaining else "")
                     + "可显式增大 max_agent_dispatches 后恢复", stop=stops.make("budget", "agent_dispatches", data={"config_key": "runtime.max_agent_dispatches", "used": self.context.run["agent_dispatches"], "limit": limit, **({"minimum_remaining_calls": remaining["lower_bound"]} if remaining else {})}))
-            # Persist all invocation budgets together after local preparation.
-            # Provider failures still count; local context/MCP/snapshot failures do not.
+            # Prepare all invocation accounting. Provider failures still count;
+            # local context, MCP, snapshot, and receipt preparation failures do not.
+            run = self.context.run
+            receipt_key = f"{role}:{kind}:{task_id}"
+            receipts = run["review_receipts" if role == "reviewer" else f"{role}_receipts"]
             if role == "worker":
-                attempts = self.context.run["attempts"].get(task_id, 0)
+                attempt = run["attempts"].get(task_id, 0) + 1
                 if self.services.budgets.task_budget_used(task_id) >= self.context.config.data["runtime"]["max_attempts"]:
                     raise attempt_limit_error(task_id, self.context.config.data["runtime"]["max_attempts"])
                 # Publish and verify the immutable packet and contract before any
                 # budget, receipt or invoked mutation; a failed write charges nothing.
                 inputs = self.services.worker_receipts.publish_inputs(entry, contract, required["packet"])
-                self.context.run["attempts"][task_id] = attempts + 1
-                # The saved selection belongs to this worker attempt. Retrying
-                # local preparation keeps it; starting a process consumes it.
-                self.context.run.pop("pending_directive", None)
-            self.context.run["agent_dispatches"] += 1
-            if retry_of is not None:
-                entry["retry_of"] = retry_of
-                if hint_omitted:
-                    entry["previous_invalid_omitted"] = True
-            if role == "worker":
-                self.services.worker_receipts.intent(entry, inputs)
-            if role == "reviewer":
-                # Persist the identity and expected path before calling the model:
-                # a crash immediately after the atomic result write must not reroll.
-                self.context.run["review_receipts"][f"{role}:{kind}:{task_id}"] = {
-                    "artifact": str(job / "returned-result.json"), "dispatch_id": dispatch_id,
-                    "snapshot_digest": entry["snapshot_digest"]}
-            elif role == "commander":
-                request = {"schema": deepcopy(schema), "packet": deepcopy(packet)}
-                self.context.run["commander_receipts"][f"{role}:{kind}:{task_id}"] = {
-                    "artifact": str(job / "returned-result.json"), "dispatch_id": dispatch_id,
-                    "snapshot_digest": entry["snapshot_digest"],
-                    "request": request, "request_digest": snapshot_digest(request),
-                    "request_id": dispatch_id}
-            entry["process_state"] = "starting"
-            entry["invoked"] = True
-            entry["invoked_at"] = time.time()
-            if rejection:
-                entry["continuation_rejection_id"] = rejection["id"]
-            self.context.save()
+                receipt = self.services.worker_receipts.prepare_intent(entry, inputs, digest=digest, attempt=attempt)
+                receipt_copy = deepcopy(receipt)
+                # Check the selection source before the same commit consumes any directive.
+                direct_worker = (kind == "implement" and not run.get("pending_directive")
+                                 and packet.get("instruction", "") is None
+                                 and not run.get("feedback") and not rejection)
+            else:
+                # Bind the returned result path before calling the model so a
+                # crash after the result write does not reroll the call.
+                receipt = {"artifact": str(job / "returned-result.json"), "dispatch_id": dispatch_id,
+                           "snapshot_digest": digest}
+                if role == "commander":
+                    request = {"schema": deepcopy(schema), "packet": deepcopy(packet)}
+                    receipt.update(request=request, request_digest=snapshot_digest(request), request_id=dispatch_id)
+            invoked_at = time.time()
+            interrupts.deliver()
+            with self.context.publish():
+                entry["snapshot_digest"] = digest
+                if role == "worker":
+                    run["attempts"][task_id] = attempt
+                    # Retrying local preparation keeps the saved selection.
+                    run.pop("pending_directive", None)
+                    entry["worker_receipt"] = receipt_copy
+                run["agent_dispatches"] += 1
+                receipts[receipt_key] = receipt
+                if retry_of is not None:
+                    entry["retry_of"] = retry_of
+                    if hint_omitted:
+                        entry["previous_invalid_omitted"] = True
+                entry["process_state"] = "starting"
+                entry["invoked"] = True
+                entry["invoked_at"] = invoked_at
+                if rejection:
+                    entry["continuation_rejection_id"] = rejection["id"]
             invoked = True
             self.services.quota.mark_used(self.context.config.role(role, self.context.commander)["cli"])
             # Only after the durable invoked=True; a failed append never blocks the call.
@@ -473,7 +508,7 @@ class Dispatcher(RuntimeService):
                     raise
                 stop = None if role == "worker" else invocation_stop(
                     failure, job=job, role=role, dispatch_id=dispatch_id, task_id=task_id,
-                    provider=self.context.config.role(role, self.context.commander)["cli"],
+                    provider=self.context.config.role(role, self.context.commander)["cli"], files=job_files,
                     timeout=self.context.config.data["runtime"]["agent_timeout_seconds"])
                 if isinstance(failure, HarnessError):
                     failure.stop = stop
@@ -483,11 +518,15 @@ class Dispatcher(RuntimeService):
                 raise typed from failure
             # The synchronous backend has returned through run_process cleanup.
             # Receipt validation may itself check that all processes exited.
+            if role == "worker":
+                with interrupts.hold():
+                    if process_outcome is None:
+                        observe_fallback()
+                    self.services.worker_receipts.seal(entry, result)
+                interrupts.deliver()
+                return self.services.worker_receipts.finish(f"worker:{kind}:{task_id}", task)
             if process_outcome is None:
                 observe_fallback()
-            if role == "worker":
-                self.services.worker_receipts.seal(entry, result)
-                return self.services.worker_receipts.finish(f"worker:{kind}:{task_id}", task)
             write_json(job / "returned-result.json", result)
             if role == "reviewer":
                 artifact = job / "returned-result.json"
@@ -499,10 +538,16 @@ class Dispatcher(RuntimeService):
                 return self.services.receipts.finish_review_receipt(key, schema)
             if role == "commander":
                 return self.services.receipts.finish_commander_receipt(f"{role}:{kind}:{task_id}")
-        except (InvalidReviewRejection, InvalidOutput, RetainedProposal):
-            # Already judged: the entry carries its verdict, never "failed".
-            raise
         except BaseException as error:
+            if self.context.store.poisoned:
+                if isinstance(error, Exception):
+                    # Commit refuses a partial publication without I/O and
+                    # keeps the original error in the refusal's context.
+                    self.context.save()
+                raise
+            if isinstance(error, (InvalidReviewRejection, InvalidOutput, RetainedProposal)):
+                # Already judged: the entry carries its verdict, never "failed".
+                raise
             startup_interrupted = (isinstance(error, (KeyboardInterrupt, SystemExit))
                                    and entry["process_state"] == "starting" and entry["pgid"] is None)
             # Read and inspect first (evidence digests); change the entry after. A worker's
@@ -511,13 +556,20 @@ class Dispatcher(RuntimeService):
             receipt = None
             if role in ("reviewer", "commander"):
                 receipt = self.context.run["review_receipts" if role == "reviewer" else "commander_receipts"].get(f"{role}:{kind}:{task_id}")
-                capture = job / "terminal-capture.json"
-                if receipt and capture.exists():
-                    if capture.is_file() and not capture.is_symlink():
-                        bound["terminal_capture_digest"] = hashlib.sha256(capture.read_bytes()).hexdigest()
-                    artifact = job / "returned-result.json"
-                    if artifact.is_file() and not artifact.is_symlink():
-                        bound["artifact_digest"] = hashlib.sha256(artifact.read_bytes()).hexdigest()
+                if receipt:
+                    marker = ("terminal-capture.json",)
+                    capture = job_files.digest(marker, keep=0)
+                    if capture.state == "read":
+                        bound["terminal_capture_digest"] = capture.digest
+                    # The returned artifact belongs to this capture only when
+                    # a marker is present, even if its digest is unavailable.
+                    present = capture.state == "read" or (capture.state == "refused" and capture.step.leaf)
+                    if capture.state == "failed":
+                        present = job_files.probe(marker).state == "present"
+                    if present:
+                        artifact = job_files.digest(("returned-result.json",), keep=0)
+                        if artifact.state == "read":
+                            bound["artifact_digest"] = artifact.digest
             if entry["status"] not in JUDGED and not judged_decide(entry):
                 # A judged delivery keeps its verdict (e.g. an invalid blocker's
                 # stop, or a decide original judged valid); only an unjudged
@@ -526,25 +578,40 @@ class Dispatcher(RuntimeService):
                 entry["error"] = str(error)
             if receipt is not None:
                 receipt.update(bound)
+            controller = interrupts.active()
+            if (direct_worker and invoked and isinstance(error, KeyboardInterrupt)
+                    and controller is not None and controller.delivered_from in (
+                        run_process.__qualname__, f"{run_process.__qualname__}.<locals>.start")
+                    and process_outcome is not None
+                    and getattr(error, "outcome", None) is process_outcome
+                    and process_outcome.termination_reason == "cancelled"
+                    and process_outcome.startup_state in ("started", "not_started")
+                    and process_outcome.exit_confirmed
+                    and process_outcome.evidence_complete):
+                # Persist with the supervised dispatch facts in this call's settlement.
+                entry["direct_worker_cancelled"] = True
             raise
         finally:
-            if process_outcome is None:
-                observe_fallback()
-            else:
-                # Supervision can add callback/persistence failures after the
-                # callback returns. Preserve those final facts as well.
-                apply_outcome(process_outcome)
-            if invoked:
-                # Observe the provider envelope even on CLI/protocol failures.
-                # Telemetry is best effort and cannot change acceptance/recovery.
-                try:
-                    from .diagnostics import invocation_diagnostics
-                    entry["diagnostics"] = invocation_diagnostics(job, self.context.config.role(role, self.context.commander)["cli"])
-                    usage = provider_usage(job, self.context.config.role(role, self.context.commander)["cli"])
-                    if usage is not None:
-                        entry["provider_usage"] = usage
-                except Exception:
-                    pass
-            self.context.save()
-            self.context.observe("dispatch_finished", task_id=task_id, dispatch_id=dispatch_id, role=role,
-                                 status=entry["status"], invoked=invoked, provider_usage=entry.get("provider_usage"))
+            # Stop handling rebases after a failed publication body.
+            if not self.context.store.poisoned:
+                if process_outcome is None:
+                    observe_fallback()
+                else:
+                    # Supervision can add callback/persistence failures after the
+                    # callback returns. Preserve those final facts as well.
+                    apply_outcome(process_outcome)
+                if invoked:
+                    # Observe the provider envelope even on CLI/protocol failures.
+                    # Telemetry is best effort and cannot change acceptance/recovery.
+                    try:
+                        from .diagnostics import invocation_diagnostics
+                        provider = self.context.config.role(role, self.context.commander)["cli"]
+                        entry["diagnostics"] = invocation_diagnostics(job, provider, files=job_files)
+                        usage = provider_usage(job, provider, files=job_files)
+                        if usage is not None:
+                            entry["provider_usage"] = usage
+                    except Exception:
+                        pass
+                self.context.save()
+                self.context.observe("dispatch_finished", task_id=task_id, dispatch_id=dispatch_id, role=role,
+                                     status=entry["status"], invoked=invoked, provider_usage=entry.get("provider_usage"))

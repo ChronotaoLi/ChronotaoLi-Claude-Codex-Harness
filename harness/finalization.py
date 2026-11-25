@@ -3,37 +3,26 @@ from __future__ import annotations
 
 import json
 import os
-import stat
 from collections import Counter
 from copy import deepcopy
 from pathlib import Path
 
-from . import checkout_identity, cleanup, git, stops
+from . import checkout_identity, cleanup, git, interrupts, stops
 from .context import compact_checks, compact_feedback
 from .contracts import (
     REVIEW, REVIEW_OPTIONAL, core_schema, core_value, envelope, judge_review, review_approved, review_schema, review_veto,
     validate_structure,
 )
-from .recovery import read_bound_bytes, read_evidence_json, snapshot_digest
+from .recovery import bound_bytes, decode_evidence_json, evidence_json, evidence_path, run_files, snapshot_digest
 from .review_progress import (
     batch_after, bind_review_source, entries, validate_review_source, required_findings, disposition_gaps, require_saved_batch,
 )
 from .services import RuntimeService
 from .verification import checks_failed
-from .util import EvidenceError, HarnessError, dump, read_json, write_json
+from .util import EvidenceError, HarnessError, dump, write_json
 
 
-def regular_bytes(path):
-    """A file's bytes, opened without following a link or blocking; None when it is no regular file or unreadable."""
-    try:
-        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    except OSError:
-        return None
-    try:
-        with os.fdopen(descriptor, "rb") as stream:
-            return stream.read() if stat.S_ISREG(os.fstat(stream.fileno()).st_mode) else None
-    except OSError:
-        return None
+FINAL_RECEIPT = "reviewer:final_review:final"
 
 
 def index_mismatch_paths(listing, tree_listing):
@@ -249,81 +238,57 @@ class FinalAcceptance(RuntimeService):
             if item["attempt"] != index + 1:
                 raise EvidenceError("整体批准的编号与台账位置不符；保留原证据，禁止完成 run",
                                     stop=stops.make("evidence", "runtime_integrity", source={"artifact": item["artifact"]}))
-            validate_review_source(self.context.run, "final", item, kind="final_review", candidate_digest=digest)
+            validate_review_source(self.context.run, "final", item, kind="final_review", files=run_files(self.context), candidate_digest=digest)
             # The attempt as it was when its last batch was computed: running, with its approved batches.
             before = {"status": "running", "snapshot_digest": digest, "approved_batches": item.get("approved_batches")}
-            if required_findings(self.context.run, "final", digest, whole_run=True,
+            if required_findings(self.context.run, "final", digest, files=run_files(self.context), whole_run=True,
                                  records=[*history[:index], before]) != item.get("required_findings"):
                 raise HarnessError("整体批准缺少历史阻断问题的独立解决处置；禁止完成 run", stop=stops.make("runtime_failure", "invariant"))
-        if required_findings(self.context.run, "final", digest, whole_run=True):
+        if required_findings(self.context.run, "final", digest, files=run_files(self.context), whole_run=True):
             return False
         return {"commit": commit, "tree": tree, "snapshot_digest": digest,
                 "attempts": [item["attempt"] for _, item in approved],
                 "verification_mode": _verification_mode(self.context.run)}
 
-    def leave_attempt(self, *, written=False):
-        """Leave the last attempt, running on another snapshot: its returned review becomes its conclusion.
-
-        Without a receipt it stays running; an unreturned intent is discarded.
-        A returned review is judged under the attempt's saved mapping: a veto
-        stays a rejection of the snapshot it reviewed (invalid_rejected),
-        anything else approves nothing (invalidated); neither closes a finding.
-        A terminal capture is never archived on another snapshot, and a returned
-        review bound to another candidate may be a veto no attempt can hold:
-        both stop and keep the receipt. Every read and check comes first, then
-        the record file, then one transition. Returns whether the ledger changed.
-
-        The written record file is the leave's publication point: its bytes
-        follow from the attempt, its saved mapping and the returned original
-        alone, never from the candidate a later call finds, so a leave once
-        written stands on any snapshot. With ``written`` (``publish_written_leave``,
-        whatever the candidate) nothing is written: the leave is published only
-        when the file holds exactly the bytes it would write. Anything else there
-        is no evidence of a leave: on the attempt's snapshot the receipt replays
-        as its review, on another one the leave is made as before.
-        """
+    def _written_candidate(self):
+        """Find a possible written leave before any exit or terminal-capture checks."""
         history = self.context.run["final_history"]
+        if not history or history[-1]["status"] != "running":
+            return None
         record = history[-1]
-        key = "reviewer:final_review:final"
-        receipts = self.services.receipts
-        receipt = self.context.run["review_receipts"].get(key)
-        if written:
-            # A leave binds and saves its original's digest before it writes; no other receipt was ever left.
-            if (receipt is None or "artifact_digest" not in receipt
-                    or receipt.get("snapshot_digest") != record["snapshot_digest"]):
-                return False
-            on_disk = regular_bytes(record["artifact"])
-            try:
-                shape = json.loads(on_disk) if on_disk is not None else None
-            except (ValueError, UnicodeError, RecursionError):
-                shape = None
-            # Only a necessary condition, so that the attempt's own record costs no further read.
-            if not isinstance(shape, dict) or shape.get("status") not in ("invalidated", "invalid_rejected"):
-                return False
-        else:
-            if receipt is None:
-                return False
-            if not receipts.returned(receipt):
-                receipts.discard_unreturned(key)
-                return True
-            if receipt.get("snapshot_digest") != record["snapshot_digest"]:
-                raise EvidenceError("整体审阅回执与进行中的尝试不属于同一候选；保留证据",
-                                    stop=stops.make("evidence", "runtime_integrity", source={"dispatch_id": receipt.get("dispatch_id")}))
-        self.context.ensure_exited()
-        receipts.validate_terminal_capture(receipt)
-        if receipts.has_terminal_capture(receipt):
-            if written:
-                # A capture is never left; on its own snapshot it is consumed as before.
-                return False
-            # The rule of resume's preflight, for any path that did not pass it.
-            raise HarnessError("终端结果的代码快照已变化；保留证据，禁止重新抽取结论", stop=stops.make("workspace_mismatch", "candidate_changed"))
+        receipt = self.context.run["review_receipts"].get(FINAL_RECEIPT)
+        # A leave binds and saves its original's digest before it writes; no other receipt was ever left.
+        if (receipt is None or "artifact_digest" not in receipt
+                or receipt.get("snapshot_digest") != record["snapshot_digest"]):
+            return None
+        files = run_files(self.context).under("verification", "final", str(record["attempt"]), "final.json")
+        origin = {"artifact": record["artifact"]}
+        evidence_path(files, origin)
+        # This preflight looks for an optional, not-yet-registered leave.
+        on_disk = files.read((), limit=None).or_local_io().bytes_or_none()
+        if on_disk is None:
+            return None
+        try:
+            shape = json.loads(on_disk)
+        except (ValueError, UnicodeError, RecursionError):
+            shape = None
+        # Only a necessary condition, so that the attempt's own record costs no further read.
+        if not isinstance(shape, dict) or shape.get("status") not in ("invalidated", "invalid_rejected"):
+            return None
+        return receipt, on_disk
+
+    def _leave_original(self, record, receipt, *, bind=None):
         if "required_findings" not in record:
             raise HarnessError("整体审阅缺少必需问题对照；保留证据", stop=stops.make("runtime_failure", "invariant"))
-        required = record["required_findings"]
         # Checked before the original is read or its digest bound.
-        require_saved_batch(self.context.run, "final", record["snapshot_digest"], required, whole_run=True,
-                            records=history, receipt=receipt)
-        raw, digest = read_bound_bytes(receipt, "审阅", bind=self.context.save)
+        require_saved_batch(self.context.run, "final", record["snapshot_digest"], record["required_findings"],
+                            files=run_files(self.context), whole_run=True,
+                            records=self.context.run["final_history"], receipt=receipt)
+        return bound_bytes(self.services.receipts.artifact_files(receipt).under("returned-result.json"),
+                           receipt, "审阅", bind=bind)
+
+    def _left_record(self, record, receipt, raw, digest):
+        required = record["required_findings"]
         dispatch_id = receipt["dispatch_id"]
         try:
             result = json.loads(raw)
@@ -346,29 +311,90 @@ class FinalAcceptance(RuntimeService):
                 if review_veto(result):
                     updated.update(status="invalid_rejected", reason="候选已离开；已返回的拒绝仍是对它审阅的快照的否决")
                 # Authenticated as every later traversal will: a record none would accept is never written.
-                validate_review_source(self.context.run, "final", updated, kind="final_review",
+                validate_review_source(self.context.run, "final", updated, kind="final_review", files=run_files(self.context),
                                        candidate_digest=record["snapshot_digest"])
-        if not written:
-            write_json(Path(record["artifact"]), updated)
-        elif on_disk != (dump(updated) + "\n").encode("utf-8"):
-            # Compared with the exact bytes write_json writes for this leave.
+        return updated
+
+    def _written_record(self, receipt, on_disk):
+        """Authenticate a possible leave without writing or binding evidence."""
+        record = self.context.run["final_history"][-1]
+        raw, digest = self._leave_original(record, receipt)
+        updated = self._left_record(record, receipt, raw, digest)
+        # Compare with the exact bytes write_json writes for this leave.
+        if on_disk == (dump(updated) + "\n").encode("utf-8"):
+            return updated
+        return None
+
+    def leave_attempt(self):
+        """Write the previous snapshot's returned review, then account for it.
+
+        A veto remains evidence against its own snapshot. An approval closes
+        nothing. An unreturned intent is discarded without closing the attempt.
+        """
+        history = self.context.run["final_history"]
+        record = history[-1]
+        receipts = self.services.receipts
+        receipt = self.context.run["review_receipts"].get(FINAL_RECEIPT)
+        if receipt is None:
             return False
-        with self.context.transition():
+        self.context.ensure_exited()
+        undecodable = receipts.settle_return(FINAL_RECEIPT)
+        if undecodable is not None:
+            receipts.record_invalid(FINAL_RECEIPT, undecodable, source={
+                "artifact": str(undecodable.artifact), "artifact_digest": undecodable.artifact_digest})
+            return True
+        if FINAL_RECEIPT not in self.context.run["review_receipts"]:
+            return True
+        if receipt.get("snapshot_digest") != record["snapshot_digest"]:
+            raise EvidenceError("整体审阅回执与进行中的尝试不属于同一候选；保留证据",
+                                stop=stops.make("evidence", "runtime_integrity", source={"dispatch_id": receipt.get("dispatch_id")}))
+        receipts.validate_terminal_capture(receipt)
+        if receipts.has_terminal_capture(receipt):
+            # The rule of resume's preflight, for any path that did not pass it.
+            raise HarnessError("终端结果的代码快照已变化；保留证据，禁止重新抽取结论", stop=stops.make("workspace_mismatch", "candidate_changed"))
+        raw, digest = self._leave_original(record, receipt, bind=self.context.save)
+        updated = self._left_record(record, receipt, raw, digest)
+        write_json(Path(record["artifact"]), updated)
+        with self.context.publish():
             history[-1] = updated
-            self.context.run["review_receipts"].pop(key, None)
-        self.context.event("final_attempt_left", attempt=updated["attempt"], dispatch_id=dispatch_id,
+            self.context.run["review_receipts"].pop(FINAL_RECEIPT, None)
+        self.context.event("final_attempt_left", attempt=updated["attempt"], dispatch_id=receipt["dispatch_id"],
                            status=updated["status"])
         return True
 
     def publish_written_leave(self):
-        """Publish a leave an earlier call wrote but never saved, before anything is derived from the history.
-
-        Decided from the ledger in memory first: only a running last attempt
-        whose returned review has its digest bound can have one, and only then
-        is its record file read. The same record is published on any candidate.
-        """
+        """Account for an authenticated leave from an earlier call, on any candidate."""
+        found = self._written_candidate()
+        if found is None:
+            return False
+        receipt, on_disk = found
+        receipts = self.services.receipts
+        self.context.ensure_exited()
+        receipts.validate_terminal_capture(receipt)
+        if receipts.has_terminal_capture(receipt):
+            return False
+        updated = self._written_record(receipt, on_disk)
+        if updated is None:
+            return False
         history = self.context.run["final_history"]
-        return bool(history and history[-1]["status"] == "running" and self.leave_attempt(written=True))
+        with self.context.publish():
+            history[-1] = updated
+            self.context.run["review_receipts"].pop(FINAL_RECEIPT, None)
+        self.context.event("final_attempt_left", attempt=updated["attempt"], dispatch_id=receipt["dispatch_id"],
+                           status=updated["status"])
+        interrupts.deliver()
+        return True
+
+    def written_leave_for_abandon(self):
+        """Authenticate a possible leave after exit confirmation, without terminal capture."""
+        found = self._written_candidate()
+        if found is None:
+            return None
+        receipt, on_disk = found
+        receipts = self.services.receipts
+        if receipts.has_terminal_capture(receipt) or receipts.terminal_capture_pending(receipt, captured=False):
+            return None
+        return self._written_record(receipt, on_disk)
 
     def final_review(self, *, reverify=False):
         # Consume the resume flag on first entry, including new snapshots and
@@ -399,10 +425,12 @@ class FinalAcceptance(RuntimeService):
         if history and history[-1]["status"] == "running" and (
                 history[-1]["snapshot_digest"] != digest or history[-1]["head"] != snapshot["head"]):
             # Before any use of this snapshot's history: another snapshot's returned veto enters it first.
-            if self.leave_attempt() and self.context.snapshot() != snapshot:
-                # The leave wrote and saved; nothing is reused or completed for the entry snapshot.
-                raise HarnessError("离开进行中的整体尝试期间代码快照已变化；离开已保存，禁止复用批准或完成 run",
-                                   stop=stops.make("workspace_mismatch", "candidate_changed"))
+            if self.leave_attempt():
+                interrupts.deliver()
+                if self.context.snapshot() != snapshot:
+                    # The leave wrote and saved; nothing is reused or completed for the entry snapshot.
+                    raise HarnessError("离开进行中的整体尝试期间代码快照已变化；离开已保存，禁止复用批准或完成 run",
+                                       stop=stops.make("workspace_mismatch", "candidate_changed"))
         same_snapshot = [item for item in history
                          if item["snapshot_digest"] == digest and item["head"] == snapshot["head"]]
         rejected = next((item for item in reversed(same_snapshot)
@@ -416,14 +444,17 @@ class FinalAcceptance(RuntimeService):
         # An approval that does not cover the whole history is reviewed again here: the running attempt, else a new one.
         record = history[-1] if history and history[-1] in same_snapshot else None
         if not record or record["status"] != "running":
-            if record and record["status"] == "verification_failed" and record["failure_kind"] != "timeout":
-                if not reverify:
-                    raise HarnessError("同一代码快照的整体验证曾失败；修复环境后使用 resume --reverify 显式重验", stop=stops.make("runtime_failure", "invariant"))
-                # An explicit re-verification replaces a decide that never
-                # returned; a returned one was refused before any write.
+            retry_failed = record and record["status"] == "verification_failed" and record["failure_kind"] != "timeout"
+            if retry_failed and not reverify:
+                raise HarnessError("同一代码快照的整体验证曾失败；修复环境后使用 resume --reverify 显式重验", stop=stops.make("runtime_failure", "invariant"))
+            attempt = len(history) + 1
+            directories = run_files(self.context).make_directories(("verification", "final", str(attempt)))
+            if directories.state != "present":
+                directories.evidence({"artifact": directories.path})
+            if retry_failed:
+                # Explicit re-verification replaces a decide that never returned.
                 self.services.receipts.discard_unreturned("commander:decide:run")
                 self.context.event("final_reverification_requested", previous_attempt=record["attempt"])
-            attempt = len(history) + 1
             folder = self.services.verification.verification_directory("final", attempt, whole_run=True)
             snapshot_artifact = folder / "snapshot.json"
             record = {"attempt": attempt, "head": commit, "tree": tree, "snapshot_digest": digest,
@@ -435,20 +466,23 @@ class FinalAcceptance(RuntimeService):
             self.context.save()
             self.context.checkpoint()
         attempt = record["attempt"]
-        folder = Path(record["artifact"]).parent
-        snapshot_artifact = Path(record["snapshot_artifact"])
-        if snapshot_artifact.exists() or snapshot_artifact.is_symlink():
-            with stops.evidence_reads(source={"artifact": str(snapshot_artifact)},
-                                      message="整体快照证据无法读取或已改变；保留原证据，禁止覆盖"):
-                saved_snapshot = read_json(snapshot_artifact)
-                if saved_snapshot != snapshot:
-                    raise HarnessError("整体快照证据与待恢复记录不符；保留原证据，禁止覆盖")
-        else:
-            # The attempt and its recovery phase are durable before artifact I/O.
+        files = run_files(self.context).under("verification", "final", str(attempt))
+        folder = evidence_path(files.under("final.json"), {"artifact": record["artifact"]}).parent
+        snapshot_files = files.under("snapshot.json")
+        origin = {"artifact": record["snapshot_artifact"]}
+        snapshot_artifact = evidence_path(snapshot_files, origin)
+        outcome = snapshot_files.read((), limit=None).or_local_io()
+        if outcome.state == "absent" and outcome.step.leaf:
+            # The attempt directory existed before the ledger registered it.
             write_json(snapshot_artifact, snapshot)
+        elif decode_evidence_json(
+                outcome.evidence(origin), origin,
+                message="整体快照证据无法读取或已改变；保留原证据，禁止覆盖") != snapshot:
+            raise EvidenceError("整体快照证据与待恢复记录不符；保留原证据，禁止覆盖",
+                                stop=stops.make("evidence", "runtime_integrity", source=origin))
         if record["phase"] == "verifying":
             # Computed before any record mutation: a failed evidence read saves nothing half-done.
-            required = required_findings(self.context.run, "final", digest, whole_run=True, records=history[:-1])
+            required = required_findings(self.context.run, "final", digest, files=run_files(self.context), whole_run=True, records=history[:-1])
             # Interrupted checks may have written partial evidence. Never overwrite it.
             rounds = record["verification_rounds"]
             verification_folder = folder / f"verification-{len(rounds) + 1}"
@@ -480,13 +514,14 @@ class FinalAcceptance(RuntimeService):
             else:
                 updated.update(phase="reviewing", required_findings=required)
             write_json(folder / "final.json", updated)
-            with self.context.transition():
+            with self.context.publish():
                 history[-1] = updated
                 if feedback is not None:
                     self.context.run["feedback"] = feedback
             record = updated
         else:
-            checks = read_evidence_json(Path(record["verification"]))
+            checks_files = files.under(f"verification-{len(record['verification_rounds'])}", "results.json")
+            checks = evidence_json(checks_files, record["verification"])
         if record["phase"] == "reviewing":
             # The verdict is durable: first entry and recovery try to reclaim at this one point.
             self.reclaim_verified_checkout(record)
@@ -495,7 +530,7 @@ class FinalAcceptance(RuntimeService):
                 raise HarnessError("整体审阅缺少必需问题对照；保留证据", stop=stops.make("runtime_failure", "invariant"))
             required = record["required_findings"]
             # The saved mapping is rechecked against the history before its review is dispatched or replayed.
-            require_saved_batch(self.context.run, "final", digest, required, whole_run=True, records=history,
+            require_saved_batch(self.context.run, "final", digest, required, files=run_files(self.context), whole_run=True, records=history,
                                 receipt=self.context.run.get("review_receipts", {}).get("reviewer:final_review:final"))
             review, diagnostics = self.services.receipts.dispatch_review("final_review", "final",
                      self.services.packets.final_review_packet(
@@ -514,7 +549,7 @@ class FinalAcceptance(RuntimeService):
             batch = {"dispatch_id": source["dispatch_id"], "required_findings": deepcopy(required),
                      "review": review, "review_source": source}
             # Computed before any record change: a failed read leaves nothing half-done.
-            remaining = (batch_after(self.context.run, "final", digest, required, whole_run=True, records=[
+            remaining = (batch_after(self.context.run, "final", digest, required, files=run_files(self.context), whole_run=True, records=[
                 *history[:-1], {**record, "approved_batches": [*record["approved_batches"], batch]}])
                 if approved else [])
             if discard_memory and not remaining:
@@ -531,7 +566,7 @@ class FinalAcceptance(RuntimeService):
                            "status": "approved" if approved else "rejected", **diagnostics}
                 feedback = None if approved else {"final_review": feedback_view(updated)}
             write_json(folder / "final.json", updated)
-            with self.context.transition():
+            with self.context.publish():
                 history[-1] = updated
                 self.context.run.get("review_receipts", {}).pop("reviewer:final_review:final", None)
                 if not remaining:
@@ -542,6 +577,8 @@ class FinalAcceptance(RuntimeService):
                                    dispatch_id=source["dispatch_id"], next_batch=len(remaining))
                 return False
         if record["status"] == "approved":
+            # Once the review is published, deliver before starting the completion gate.
+            interrupts.deliver()
             # The first approval passes the same gate as a reused one.
             return self.completion_gate(digest, commit, tree)
         if record["status"] == "verification_failed":

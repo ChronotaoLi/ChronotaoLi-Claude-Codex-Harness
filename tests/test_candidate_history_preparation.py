@@ -93,7 +93,7 @@ class CandidateHistoryPreparationTests(scan.TransitionCase):
                     receipt = saved["review_receipts"][scan.TASK_KEY]
                     active = self.engine(backend)
                     with scan.sigint_in_transition(TaskLifecycle.continue_task, lambda _: True, event,
-                                                   "review_receipts", keep=True) as fired, \
+                                                   "review_receipts", keep=True, before=True) as fired, \
                             self.assertRaises(KeyboardInterrupt):
                         active.resume(engine.run["id"])
                     self.assertEqual(fired["ledgers"][0]["review_history"], old_history)
@@ -128,7 +128,7 @@ class CandidateHistoryPreparationTests(scan.TransitionCase):
         self.assertEqual(engine.run, before)
         active = self.engine(backend)
         with scan.sigint_in_transition(TaskLifecycle.continue_task, lambda _: True, 0,
-                                      "review_receipts", keep=True) as fired, \
+                                      "review_receipts", keep=True, before=True) as fired, \
                 self.assertRaises(KeyboardInterrupt):
             active.resume(engine.run["id"])
         self.assertEqual(fired["ledgers"][0]["review_history"], {})

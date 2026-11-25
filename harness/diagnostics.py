@@ -4,7 +4,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from .provider_failures import read_original
+from .provider_failures import LIMIT
+from .state_files import StateFiles
 
 
 def _identifier(value):
@@ -30,13 +31,15 @@ def permission_denial_projection(value):
     return projected
 
 
-def invocation_diagnostics(job, provider):
+def invocation_diagnostics(job, provider, *, files=None):
     """Provider-reported permission denials; why a call failed is its stop and judgment record."""
     value = {'permission_denials': {'status': 'unknown'}}
     if provider == 'claude':
         try:
-            state, raw = read_original(job / 'process.stdout', lambda stream: stream.read(16 * 1024 * 1024 + 1))
-            if state == 'read' and len(raw) <= 16 * 1024 * 1024:
+            if files is None:
+                files = StateFiles(job.parent).under(job.name)
+            raw = files.read(("process.stdout",), limit=LIMIT).bytes_or_none()
+            if raw is not None:
                 envelope = json.loads(raw)
                 if isinstance(envelope, dict) and envelope.get('type') == 'result':
                     value['permission_denials'] = permission_denial_projection(envelope)

@@ -1,9 +1,12 @@
+import errno
 import json
+import os
 import sqlite3
 from pathlib import Path
 
 from harness import git
 from harness.adapters import DemoBackend
+from harness.state_files import StateReadError
 from harness.util import HarnessError, dump, read_json
 from unittest.mock import patch
 
@@ -265,6 +268,34 @@ class AcceptanceCompletionTests(RepoCase):
         resumed = self.engine(ProposedKnowledge())
         resumed.resume(engine.run["id"])
         self.assert_completed_once(resumed, commit, 2)
+
+    def test_acceptance_event_read_error_leaves_pending_post_accept_for_replay(self):
+        engine = self.engine(ProposedKnowledge())
+        service = engine.services.tasks
+        once, open_file = service.acceptance_event_once, os.open
+        issued = []
+
+        def fail_read(name, flags, *args, **kwargs):
+            if name == "events.jsonl" and kwargs.get("dir_fd") is not None:
+                issued.append(name)
+                raise OSError(errno.EIO, os.strerror(errno.EIO))
+            return open_file(name, flags, *args, **kwargs)
+
+        def read_during_acceptance(*args, **kwargs):
+            with patch.object(os, "open", fail_read):
+                return once(*args, **kwargs)
+
+        with patch.object(service, "acceptance_event_once", side_effect=read_during_acceptance), \
+                self.assertRaises(StateReadError) as caught:
+            engine.start("Implement greet")
+        self.assertEqual(caught.exception.stop["reason"], "io")
+        self.assertEqual(issued, ["events.jsonl"])
+        saved = read_json(engine.directory / "state.json")
+        self.assertIn("pending_post_accept", saved)
+        self.assertEqual(self.events(engine, "task_accepted"), [])
+        recovered = self.engine(ProposedKnowledge())
+        recovered.resume(engine.run["id"])
+        self.assert_completed_once(recovered, saved["accepted"]["greet"]["commit"], 2)
 
     def test_discarded_knowledge_stays_discarded_after_crash(self):
         engine = self.engine(ProposedKnowledge())

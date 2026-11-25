@@ -10,11 +10,12 @@ from .versions import RUN_SCHEMA_VERSION, missing_ledger, parse_current_ledger, 
 from .commands import validate_commands
 from .config import normalized, require_run_commands
 from .contracts import validate_required_commands
-from . import acceptance, checkout_identity, git, quota_wait, scope as boundary, stops
+from . import acceptance, checkout_identity, git, interrupts, quota_wait, scope as boundary, stops
 from .operations import observe_terminal, warn
-from .finalization import validate_result
+from .finalization import FINAL_RECEIPT, validate_result
 from .input_projection import validate_dispatch_indexes as validate_input_dispatch_indexes
 from .path_evidence import validate_dispatch_indexes
+from .planning import DECIDE_KEY
 from .review_progress import entries
 from .services import RuntimeService
 from .continuation import (packet as continuation_packet, prepare_continuation_rejection,
@@ -22,12 +23,15 @@ from .continuation import (packet as continuation_packet, prepare_continuation_r
                            record_execution_guidance)
 from .shared import asset_digest, validate_mcp
 from .state_files import StateFiles
-from .util import HarnessError, escape_json_controls, fold_name, uid, validate_command_directories
+from .util import (HarnessError, ensure_dispatches_exited, escape_json_controls, fold_name, uid,
+                   validate_command_directories)
 from .workflow import Workflow
 
 
 class RunLifecycle(RuntimeService):
+    @interrupts.installed()
     def start(self, goal, plan=None, *, scope=(), pause_after_plan=False, step=False):
+        interrupts.bind(self.context.store)
         runtime = self.context
         self.context.saved_stop = None
         if not goal.strip():
@@ -76,9 +80,11 @@ class RunLifecycle(RuntimeService):
 
         def start_locked():
             try:
-                self.context.run["worktree_binding"] = git.add_worktree(
-                    self.context.repo, worktree, "HEAD", branch=self.context.run["branch"])
-                self.context.save()
+                with interrupts.hold():
+                    binding = git.add_worktree(
+                        self.context.repo, worktree, "HEAD", branch=self.context.run["branch"])
+                    with self.context.publish():
+                        self.context.run["worktree_binding"] = binding
             except BaseException as error:
                 if self.services.workflow.stop(error) is Workflow.KEPT:
                     return self.context.run
@@ -281,6 +287,21 @@ class RunLifecycle(RuntimeService):
         from .workspace_inputs import validate_inputs
         validate_inputs(self.context.run, self.context.directory)
         self.services.worker_receipts.validate_links()
+
+    def verify_reverify(self, confirm_exited=()):
+        """Require a demonstrably unreturned decision before re-verification may write."""
+        run = self.context.run
+        receipt = run["commander_receipts"].get(DECIDE_KEY)
+        if receipt is None:
+            return
+        dispatch_id = receipt["dispatch_id"]
+        if dispatch_id not in confirm_exited:
+            entry = next(d for d in run["dispatches"] if d["id"] == dispatch_id)
+            ensure_dispatches_exited([entry], state=self.context.state, directory=self.context.directory)
+        settlement = self.services.receipts.settlement(DECIDE_KEY, capture=True)
+        if settlement.kind != "unreturned" or settlement.capturable:
+            raise HarnessError("--reverify 不能用于已返回、尚未处理的指挥决定；先普通 resume",
+                               stop=stops.make("invalid_input", "run_state", data={"status": run["status"]}))
 
     def wake_checks(self):
         """After a quota wait, before the scheduling loop: resume()'s read-only preconditions, in its order.
@@ -507,39 +528,61 @@ class RunLifecycle(RuntimeService):
                     or receipt.get("dispatch_id") == entry.get("id")):
                 fail("dispatches.proposal_rejection 必须只在已调用、已判定的指挥决定上，引用拒绝文件，且该派发没有回执")
 
+    @interrupts.installed()
     def abandon(self, ident, *, confirm_exited=()):
         """Mark an unfinished run abandoned; the worktree is removed only by cleanup-run."""
+        interrupts.bind(self.context.store)
         self.load_run(ident)
 
         def abandon_locked():
             # Reload under the lock so a concurrent completion cannot be lost.
             self.load_run(ident)
             try:
+                interrupts.deliver()
                 if self.context.run["status"] == "completed":
                     raise HarnessError("已完成的 run 不能标记为放弃",
                                        stop=stops.make("invalid_input", "run_state", data={"status": "completed"}))
                 self.context.confirm_exited(confirm_exited)
+                interrupts.deliver()
                 self.context.ensure_exited()
                 if self.context.run["status"] == "abandoned":
+                    interrupts.terminal()
                     return self.context.run
-                self.context.run["status"] = "abandoned"
-                self.context.run.pop("stop", None)
-                quota_wait.clear(self.context.run)   # a killed process's leftover record
-                self.context.save(terminal=True)
+                leave, leave_error = None, None
+                try:
+                    leave = self.services.finalization.written_leave_for_abandon()
+                except Exception as error:
+                    value = stops.of(error)
+                    leave_error = {"stop": f"{value['kind']}/{value['reason']}",
+                                   "error": value["data"].get("detail") or type(error).__name__}
+                with self.context.publish(terminal=True):
+                    if leave is not None:
+                        self.context.run["final_history"][-1] = leave
+                        self.context.run["review_receipts"].pop(FINAL_RECEIPT, None)
+                    self.context.run["status"] = "abandoned"
+                    self.context.run.pop("stop", None)
+                    quota_wait.clear(self.context.run)  # a killed process's leftover record
             except BaseException as error:
                 # The operation boundary: a refusal after a successful load is settled once.
                 if not self.context.store.keep_terminal(error):
                     self.settle_stop(error, ident=ident)
                     raise
             observe_terminal("写检查点", self.context.checkpoint)
-            observe_terminal("run_abandoned", self.context.event, "run_abandoned")
+            if leave is not None:
+                observe_terminal("final_attempt_left", self.context.event, "final_attempt_left",
+                                 attempt=leave["attempt"], dispatch_id=leave["review_source"]["dispatch_id"],
+                                 status=leave["status"])
+            fields = {"written_leave_error": leave_error} if leave_error is not None else {}
+            observe_terminal("run_abandoned", self.context.event, "run_abandoned", **fields)
             return self.context.run
         # A busy lock points to a wait the ledger read outside the lock records.
         return self.context.run_lock(quota_wait.busy_stop(self.context.run), abandon_locked)
 
+    @interrupts.installed()
     def resume(self, ident, *, step=False, approve_plan=False, reverify=False, confirm_exited=(),
                scope=(), environment_update=None, operator_decision=None,
                execution_guidance=None, reject_request=None):
+        interrupts.bind(self.context.store)
         runtime = self.context
         self.context.saved_stop = None
         self.load_run(ident)
@@ -548,6 +591,8 @@ class RunLifecycle(RuntimeService):
             self.load_run(ident)
             reporting_approval = False
             try:
+                interrupts.deliver()
+
                 def state(status):
                     return stops.make("invalid_input", "run_state", data={"status": status})
 
@@ -562,6 +607,7 @@ class RunLifecycle(RuntimeService):
                             or execution_guidance is not None or reject_request is not None):
                         raise HarnessError("恢复修改选项仅用于未完成的 run（含 --scope、--reject-request 与 --execution-guidance）",
                                            stop=state("completed"))
+                    interrupts.terminal()
                     return self.context.run
                 if reject_request is not None and (operator_decision is not None or environment_update is not None
                         or execution_guidance is not None or reverify or scope):
@@ -587,9 +633,8 @@ class RunLifecycle(RuntimeService):
                                                        data={"option": "--approve-plan", "status": self.context.run["status"]}))
                 # Checked before any write, including an exit confirmation: a returned
                 # decision is never discarded by re-verification.
-                if reverify and self.services.planning.decide_returned():
-                    raise HarnessError("--reverify 不能用于已返回、尚未处理的指挥决定；先普通 resume",
-                                       stop=state(self.context.run["status"]))
+                if reverify:
+                    self.verify_reverify(confirm_exited)
                 parsed_decisions = None
                 if operator_decision is not None:
                     # Read and parse the whole batch once, before any write; every later
@@ -673,6 +718,7 @@ class RunLifecycle(RuntimeService):
                         # Settled first, as any reported stop: its exits must not meet a load failure.
                         reporting_approval = True
                         self.settle_publication("plan_approval", "initial_plan", ident=ident)
+                        interrupts.terminal()
                         return self.context.run
                     if approve_plan:
                         self.context.run["plan_approved"] = True
@@ -680,8 +726,9 @@ class RunLifecycle(RuntimeService):
                         self.context.save()
                 # Announce after resume() gates pass; earlier explicit audit writes
                 # survive rejection. Stops inside execute() still emit run_stopped.
+                interrupts.deliver()
                 self.announce("run_resumed")
-                return self.services.scheduler.execute(step=step)
+                return self.services.scheduler.execute(step=step, resumed=True)
             except BaseException as error:
                 # The disk approval report and a saved stop already checked their own ledgers.
                 saved = self.context.saved_stop

@@ -402,8 +402,9 @@ class ConfigChangesTests(unittest.TestCase):
 
     def test_invocation_retains_full_local_schema_beside_provider_projection(self):
         config = self.load()
-        job = self.root / "invoke"
-        job.mkdir()
+        state_root = self.root / ".harness"
+        job = state_root / "runs" / "test-run" / "dispatches" / "dispatch-exact"
+        job.mkdir(parents=True)
         schema = envelope(REVIEW, "task-exact", "dispatch-exact")
         response = {"task_id": "task-exact", "dispatch_id": "dispatch-exact",
                     "verdict": "approve", "summary": "Offline adapter test", "findings": [],
@@ -414,7 +415,7 @@ class ConfigChangesTests(unittest.TestCase):
             return 0
 
         with patch("harness.adapters.run_process", side_effect=simulated_process):
-            value = CLIBackend(config, self.root / ".harness").invoke(
+            value = CLIBackend(config, state_root).invoke(
                 role="reviewer", model=config.role("reviewer"), cwd=self.root, job=job,
                 schema=schema, prompt="Offline test", run_path=None, on_start=lambda _: None)
         self.assertEqual(value, response)

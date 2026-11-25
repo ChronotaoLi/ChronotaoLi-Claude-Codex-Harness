@@ -73,11 +73,13 @@ class ErrorRepairsTests(RepoCase):
         self.assertEqual(os.fsencode(next(iter(read_json(path)))), b"file-\xff.txt")
 
     def invoke_provider(self, cli, raw):
-        job = self.repo / ("dispatch-" + cli + "-" + uuid.uuid4().hex)
-        job.mkdir()
+        state_root = self.repo / ".harness"
+        dispatches = state_root / "runs" / "test-run" / "dispatches"
+        job = dispatches / ("dispatch-" + cli + "-" + uuid.uuid4().hex)
+        job.mkdir(parents=True)
         self.provider_job = job
         model = {"cli": cli, "model": "exact-test-model", "effort": "high"}
-        backend = CLIBackend(self.config, self.repo / ".harness")
+        backend = CLIBackend(self.config, state_root)
         if cli == "codex":
             script = "from pathlib import Path; import sys; Path(sys.argv[1]).write_text(sys.argv[2])"
             argv = [sys.executable, "-c", script, str(job / "response.json"), raw]

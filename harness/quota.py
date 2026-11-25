@@ -41,7 +41,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import stops, util
+from . import interrupts, stops, util
 from .services import RuntimeService
 from .util import dump, strict_json_loads
 
@@ -361,11 +361,15 @@ class ProbeSignals:
     propagates), a captured signal is raised as ``KeyboardInterrupt``: neither the
     probe's ordinary error (timeout, shape) nor an outer exception being propagated
     can swallow it. Main thread only; elsewhere nothing is deferred.
+
+    An active run controller owns recording and delivery instead. A recorded
+    signal still shortens probe cleanup and ends the probe at a checkpoint.
     """
     SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
 
     def __init__(self):
         self.captured, self.old = [], {}
+        self.controller = None
         self.main = threading.current_thread() is threading.main_thread()
 
     def _remember(self, signum, frame):
@@ -373,14 +377,18 @@ class ProbeSignals:
             self.captured.append(signum)
 
     def pending(self):
-        return bool(self.captured)
+        return self.controller.first is not None if self.controller is not None else bool(self.captured)
 
     def checkpoint(self):
+        if self.controller is not None and self.pending():
+            interrupts.deliver()
+            raise Unavailable("internal_error", error_type="InterruptedProbe")
         if self.captured:
             raise KeyboardInterrupt(f"quota probe signal {self.captured[0]}")
 
     def __enter__(self):
-        if self.main:
+        self.controller = interrupts.active()
+        if self.controller is None and self.main:
             mask = signal.pthread_sigmask(signal.SIG_BLOCK, self.SIGNALS)
             try:
                 for sig in self.SIGNALS:
@@ -390,6 +398,8 @@ class ProbeSignals:
         return self
 
     def __exit__(self, kind, error, traceback):
+        if self.controller is not None:
+            return False
         interrupted = isinstance(error, (KeyboardInterrupt, SystemExit))
         if self.main:
             mask = signal.pthread_sigmask(signal.SIG_BLOCK, self.SIGNALS)

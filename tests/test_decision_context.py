@@ -123,8 +123,11 @@ class DecisionIndexTests(unittest.TestCase):
         artifact.unlink()
         artifact.symlink_to(target)
         original = target.read_bytes()
-        with self.assertRaisesRegex(HarnessError, 'decision index changed'):
+        with self.assertRaisesRegex(HarnessError, 'decision index changed') as caught:
             engine.decision_packet({}, task_id='one')
+        self.assertEqual((caught.exception.stop['kind'], caught.exception.stop['reason']),
+                         ('evidence', 'runtime_integrity'))
+        self.assertEqual(caught.exception.stop['source']['artifact'], str(artifact))
         self.assertEqual(target.read_bytes(), original)
 
     def test_run_directory_symlink_cannot_redirect_index_writes(self):
@@ -132,6 +135,8 @@ class DecisionIndexTests(unittest.TestCase):
         alias = engine.context.directory / 'run-alias'
         alias.symlink_to(engine.context.directory, target_is_directory=True)
         engine.context.directory = alias
-        with self.assertRaisesRegex(HarnessError, 'decision index directory is a symlink'):
+        with self.assertRaisesRegex(HarnessError, 'decision index directory is a symlink') as caught:
             engine._decision_index([])
+        self.assertEqual((caught.exception.stop['kind'], caught.exception.stop['reason']),
+                         ('evidence', 'runtime_integrity'))
         self.assertFalse((alias / 'decisions' / 'indexes').exists())

@@ -135,7 +135,8 @@ class WorktreeImageTests(IsolatedRepoCase):
         nested = self.worktree / "nested"
         nested.mkdir()
         self.plain(nested, "init", "-q")
-        self.plain(nested, *IDENTITY, "commit", "--allow-empty", "-qm", "nested fixture")
+        self.plain(nested, *IDENTITY, "-c", "maintenance.auto=false", "-c", "gc.auto=0",
+                   "commit", "--allow-empty", "-qm", "nested fixture")
         self.assert_image(name, "link", "nested")
 
     def test_real_index_listing_includes_stage_only_bytes_and_is_read_once(self):

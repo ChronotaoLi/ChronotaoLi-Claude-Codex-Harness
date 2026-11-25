@@ -90,12 +90,14 @@ import sys
 import threading
 import unittest
 import weakref
+from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import harness
-from harness import cleanup, cli, operations, stops, workspace_inputs
+from harness import cleanup, cli, interrupts, operations, stops, workspace_inputs
 from harness.operations import OperationRecord
+from harness.run_context import RunContext
 from harness.run_store import RunStore
 from harness.runtime import Runtime
 from harness.util import HarnessError
@@ -169,6 +171,7 @@ class Finding:
 class Frame:
     case: unittest.TestCase | None
     publications: list = field(default_factory=list)
+    dirty_waits: dict = field(default_factory=dict)
     consumed: list = field(default_factory=list)
     failures: list = field(default_factory=list)   # the tripwire's own errors: (type, str items of args)
 
@@ -841,6 +844,7 @@ def _test_run(original):
         frame = Frame(case)
         # Registered before setUp: cleanups run last-in first-out, so the check follows every cleanup of the test.
         case.addCleanup(_check, frame)
+        case.addCleanup(_check_dirty_waits, case, frame.dirty_waits)
         _tests.append(frame)
         try:
             return original(case, result)
@@ -882,5 +886,65 @@ def install():
     _wrap(unittest.TestCase, "run", _test_run)
 
 
+def _stop_checks_rebased_exits(boundary, action):
+    # Design 2 §3.5.3 checks exits on the rebased candidate before saving the
+    # terminal stop. The live ledger may contain a specific carried fact or
+    # a complete but unadopted candidate. Require that exact base at the gate.
+    if action != "ensure_exited" or boundary.f_code is not _EXIT_GATE:
+        return False
+    stop = boundary.f_back
+    if stop.f_code is not _WORKFLOW_STOP or boundary.f_locals.get("commit") is not False:
+        return False
+    context = boundary.f_locals["self"]
+    if stop.f_locals["self"].context is not context:
+        return False
+    store = context.store
+    if interrupts._local_controller().store is not store or store._poisoned or store._attempted is None:
+        return False
+    expected = deepcopy(store._attempted)
+    expected["store_revision"] = store.adopted_baseline[1]
+    expected.update(store._carried)
+    return store.run == expected
+
+
+def _report_dirty_wait(action):
+    # Defer the assertion until the test finishes. A failure here could be caught
+    # by Harness and would interfere with the very lifecycle being checked.
+    frame = _frame()
+    caller = sys._getframe(2)
+    if _stop_checks_rebased_exits(caller, action):
+        return
+    stack = []
+    while caller is not None:
+        filename = Path(caller.f_code.co_filename)
+        if filename.is_relative_to(PACKAGE.parent):
+            stack.append(f"{filename.name}:{caller.f_lineno} {caller.f_code.co_qualname}")
+        if caller.f_globals.get("__name__") == __name__ and caller.f_code.co_name == "run":
+            break
+        caller = caller.f_back
+    site = (action, *stack)
+    frame.dirty_waits[site] = frame.dirty_waits.get(site, 0) + 1
+
+
+def _dirty_wait_details(findings):
+    return "\n".join(f"  {site[0]} ({count}): " + " <- ".join(site[1:])
+                     for site, count in sorted(findings.items()))
+
+
+def _check_dirty_waits(case, findings):
+    if findings:
+        case.fail("Dirty ledger at a wait boundary before publication:\n" + _dirty_wait_details(findings))
+
+
+def _report_unattributed_waits():
+    if _outside.dirty_waits:
+        print("Dirty ledger at wait boundaries outside a test:\n" + _dirty_wait_details(_outside.dirty_waits),
+              file=sys.stderr)
+
+
+_WORKFLOW_STOP = inspect.unwrap(Workflow.stop).__code__
+_EXIT_GATE = RunContext.ensure_exited.__code__
 install()
 atexit.register(_at_exit)
+interrupts._wait_reporter = _report_dirty_wait
+atexit.register(_report_unattributed_waits)

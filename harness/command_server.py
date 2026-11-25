@@ -16,18 +16,18 @@ import re
 import signal
 import stat
 import sys
+import threading
 import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .process_runtime import defer_cleanup_signals
 from . import git, stops
 from .commands import command_id, valid_command, validate_command
 from .state_files import SIGNALS, HeldFiles, LockUnavailable, StateFiles, holding
 from .util import (DIRECTORY_FLAGS, PGID_MAX, EvidenceError, HarnessError, ProcessStartError, ProcessTimeout,
-                   fold_name, group_alive, observed_alive, read_process_exit, run_process, strict_json_loads,
-                   with_descriptors, write_json)
+                   fold_name, group_alive, json_bytes, observed_alive, one_line, read_process_exit, run_process,
+                   strict_json_loads, with_descriptors, write_json)
 from .versions import missing_ledger, parse_current_ledger
 
 
@@ -317,6 +317,60 @@ def _ensure_command_processes_exited(directory, parent_entry, files, observe):
     return records
 
 
+class CallSignals:
+    """Record broker signals until admission, a process checkpoint or call exit."""
+
+    def __init__(self):
+        self._captured = []
+        self._previous = {}
+
+    def _record(self, signum, frame):
+        self._captured.append(signum)
+
+    def deliver(self):
+        if self._captured:
+            signum = self._captured[0]
+            self._captured.clear()
+            raise KeyboardInterrupt(f"Command broker signal {signum}")
+
+    def __enter__(self):
+        if threading.current_thread() is threading.main_thread():
+            mask = signal.pthread_sigmask(signal.SIG_BLOCK, SIGNALS)
+            try:
+                for signum in SIGNALS:
+                    self._previous[signum] = signal.signal(signum, self._record)
+            finally:
+                signal.pthread_sigmask(signal.SIG_SETMASK, mask)
+        return self
+
+    def __exit__(self, kind, error, traceback):
+        preserve = error is not None and not isinstance(error, Exception)
+        if self._previous:
+            mask = signal.pthread_sigmask(signal.SIG_BLOCK, SIGNALS)
+            try:
+                try:
+                    # The masked snapshot is the handoff. Restoring SIG_IGN first
+                    # would discard an owned signal before we could record it.
+                    for signum in signal.sigpending().intersection(SIGNALS):
+                        self._record(signal.sigwait({signum}), None)
+                finally:
+                    for signum, handler in self._previous.items():
+                        signal.signal(signum, handler)
+            finally:
+                try:
+                    signal.pthread_sigmask(signal.SIG_SETMASK, mask)
+                except KeyboardInterrupt:
+                    if not preserve and not self._captured:
+                        raise
+        if not preserve:
+            try:
+                self.deliver()
+            except KeyboardInterrupt as interrupt:
+                if error is not None:
+                    raise interrupt from error
+                raise
+
+
 class Broker:
     def __init__(self, manifest, digest):
         self.path, self.digest = Path(manifest).absolute(), digest
@@ -418,7 +472,7 @@ class Broker:
             except (HarnessError, ValueError, KeyError, TypeError, RecursionError) as error:
                 raise HarnessError("Command evidence incomplete: " + prior["id"]) from error
 
-    def _admit(self, arguments, held):
+    def _admit(self, arguments, held, signals):
         # Reload authority, inspect every prior child, and durably register intent
         # under one dispatch lock. The active parent delegates this resource.
         # The root is opened into the caller's holder, which closes it however the call ends.
@@ -434,6 +488,7 @@ class Broker:
         if timeout <= 0:
             raise HarnessError(f"Command budget exhausted: remaining={remaining:.3f}s cleanup_margin={m['cleanup_margin']:.3f}s; not started")
         root = self._open_root(m, held)
+        signals.deliver()
         folder, entry = self._publish_journal(m, command["command_id"], process_state="starting", exit_confirmed=False)
         return m, command, timeout, folder, entry, root
 
@@ -480,12 +535,12 @@ class Broker:
 
     def run_command(self, arguments):
         # The holder exists before admission opens the root into it; a failed close loses no evidence.
-        return with_descriptors(lambda held: self._run_command(arguments, held))
+        with CallSignals() as signals:
+            return with_descriptors(lambda held: self._run_command(arguments, held, signals))
 
-    def _run_command(self, arguments, held):
+    def _run_command(self, arguments, held, signals):
         m, command, timeout, folder, entry, root = _with_admission(
-            self.manifest["job"], lambda: self._admit(arguments, held))
-        files = self.files.under("commands", folder.name)
+            self.manifest["job"], lambda: self._admit(arguments, held, signals))
         journal = folder / "process.json"
         result = {"call_id": entry["id"], "command_id": command["command_id"], "command": command["command"], "exit_code": None,
                   "error": None, "evidence_complete": False, "effective_timeout": timeout}
@@ -502,18 +557,13 @@ class Broker:
                 entry["process_state"] = "exited"
         started_clock = time.monotonic()
         result["started_at"] = datetime.now(timezone.utc).isoformat()
-        old = {}
         fatal_error = None
-        def interrupted(signum, frame):
-            raise KeyboardInterrupt(f"Command broker signal {signum}")
         try:
-            for signum in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
-                old[signum] = signal.signal(signum, interrupted)
             result["exit_code"] = run_process(command["command"]["argv"], Path(m["worktree"]), folder / "output",
                                                relative_cwd=command["command"]["cwd"], root_fd=root,
                                                timeout=timeout, on_start=started, on_outcome=outcome,
                                                execution_deadline=m["parent_deadline"] - m["cleanup_margin"],
-                                               cleanup_deadline=m["parent_deadline"])
+                                               cleanup_deadline=m["parent_deadline"], checkpoint=signals.deliver)
         except BaseException as error:
             if not isinstance(error, (Exception, KeyboardInterrupt, SystemExit)):
                 fatal_error = error
@@ -524,63 +574,55 @@ class Broker:
             if isinstance(error, ProcessStartError):
                 entry.update(process_state="exited", exit_confirmed=True)
         finally:
-            try:
-                with defer_cleanup_signals(primary=fatal_error or result["error"]) as deferred:
-                    result["finished_at"] = datetime.now(timezone.utc).isoformat()
-                    result["duration_seconds"] = max(0.0, time.monotonic() - started_clock)
-                    result["timing_scope"] = "worker_command_nested_in_dispatch"
-                    # Never replace known wait/timeout facts with a teardown observation.
-                    try:
-                        write_json(journal, entry)
-                        for stream in ("stdout", "stderr"):
-                            name = "output." + stream
-                            snippet = files.read((name,), limit=4000, part="tail")
-                            data = snippet.bytes_or_none()
-                            if data is not None:
-                                prefix = "[earlier output omitted; see log]\n" if snippet.size > 4000 else ""
-                                result[stream] = prefix + data.decode("utf-8", errors="replace")
-                            result[stream + "_path"] = str(folder / name)
-                            result[stream + "_sha256"] = _evidence_digest(files, (name,))
-                        result["exit_confirmed"] = entry["exit_confirmed"]
-                        result["journal_sha256"] = _evidence_digest(files, (journal.name,))
-                        result["manifest_sha256"] = self.digest
-                        write_json(folder / "receipt.json", result)
-                    except (Exception, KeyboardInterrupt, SystemExit) as error:
-                        result.update(evidence_complete=False, persistence_error="Command evidence persistence failed: " + str(error))
-                        result["exit_confirmed"] = entry["exit_confirmed"]
-                    if deferred and result["error"] is None and fatal_error is None:
-                        deferred.handled = True
-                        result.update(error=f"Command broker signal {deferred[0]}",
-                                      termination_reason="cancelled", timed_out=False)
-                        if "lifecycle" in result:
-                            result["lifecycle"]["termination_reason"] = "cancelled"
-                            result["lifecycle"]["errors"].append({
-                                "step": "execution", "type": "KeyboardInterrupt",
-                                "message": result["error"], "errno": None})
-                        try:
-                            if "lifecycle" in result:
-                                write_json(folder / "output.outcome.json", result["lifecycle"])
-                            write_json(folder / "receipt.json", result)
-                        except (Exception, KeyboardInterrupt, SystemExit) as error:
-                            result.update(evidence_complete=False, persistence_error="Command evidence persistence failed: " + str(error))
-            except KeyboardInterrupt as error:
-                # The command receipt may already be committed. Record a broker
-                # cancellation without rewriting its completed lifecycle facts.
-                if fatal_error is None and result["error"] is None:
-                    result.update(error=str(error) or "Command broker cancelled",
-                                  response_cancelled=True)
-                    with defer_cleanup_signals(primary=error):
-                        try:
-                            write_json(folder / "receipt.json", result)
-                        except (Exception, KeyboardInterrupt, SystemExit) as persistence_error:
-                            result.update(evidence_complete=False,
-                                          persistence_error=str(persistence_error))
-            finally:
-                for signum, handler in old.items():
-                    signal.signal(signum, handler)
+            result["finished_at"] = datetime.now(timezone.utc).isoformat()
+            result["duration_seconds"] = max(0.0, time.monotonic() - started_clock)
+            result["timing_scope"] = "worker_command_nested_in_dispatch"
+            self._publish_receipt(folder, entry, result)
         if fatal_error is not None:
             raise fatal_error
         return result
+
+    def _publish_receipt(self, folder, entry, result):
+        journal = folder / "process.json"
+        deletion = entry["command_id"] == DELETE_COMMAND_ID
+        prepared = None
+        try:
+            files = self.files.under("commands", folder.name)
+            if not deletion:
+                write_json(journal, entry)
+                for stream in ("stdout", "stderr"):
+                    name = "output." + stream
+                    snippet = files.read((name,), limit=4000, part="tail")
+                    data = snippet.bytes_or_none()
+                    if data is not None:
+                        prefix = "[earlier output omitted; see log]\n" if snippet.size > 4000 else ""
+                        result[stream] = prefix + data.decode("utf-8", errors="replace")
+                    result[stream + "_path"] = str(folder / name)
+                    result[stream + "_sha256"] = _evidence_digest(files, (name,))
+                result["exit_confirmed"] = entry["exit_confirmed"]
+            result["journal_sha256"] = _evidence_digest(files, (journal.name,))
+            if not deletion:
+                result["manifest_sha256"] = self.digest
+            # Prepare the exact serialized value before the sole publication attempt.
+            prepared = json_bytes(result)
+            write_json(folder / "receipt.json", result)
+        except (Exception, KeyboardInterrupt, SystemExit) as error:
+            if prepared is not None:
+                first_line = one_line((str(error).splitlines() or [type(error).__name__])[0])
+                message = f"Command receipt publication could not be confirmed: {entry['id']}: {first_line}"
+                try:
+                    observed = files.read(("receipt.json",), limit=None)
+                except (Exception, KeyboardInterrupt, SystemExit) as read_error:
+                    raise SystemExit(message) from read_error
+                if observed.state == "read" and observed.data == prepared:
+                    print("[harness-commands] 警告：回执写入报告了错误但已落盘，按已写入处理："
+                          + first_line, file=sys.stderr)
+                    return
+                if observed.state != "absent" or not observed.step.leaf:
+                    raise SystemExit(message) from error
+            operation = "Deletion" if deletion else "Command"
+            result.update(evidence_complete=False, exit_confirmed=entry["exit_confirmed"],
+                          persistence_error=f"{operation} evidence persistence failed: {error}")
 
     def _delete_scope(self, m):
         scope = m["delete_scope"]
@@ -625,63 +667,58 @@ class Broker:
         until that receipt is durable. Nothing replays a call; receipts are
         evidence. What the deletion itself guarantees is in _remove_tracked_file.
         """
-        if (not isinstance(arguments, dict) or set(arguments) != {"path"} or not isinstance(arguments["path"], str)
-                or len(arguments["path"]) > MAX_DELETE_PATH_CHARS):
-            raise HarnessError(f"delete_path accepts only path, a string of at most {MAX_DELETE_PATH_CHARS} characters")
-        return _with_admission(self.manifest["job"], lambda: self._delete_path(arguments["path"]))
+        with CallSignals() as signals:
+            if (not isinstance(arguments, dict) or set(arguments) != {"path"} or not isinstance(arguments["path"], str)
+                    or len(arguments["path"]) > MAX_DELETE_PATH_CHARS):
+                raise HarnessError(f"delete_path accepts only path, a string of at most {MAX_DELETE_PATH_CHARS} characters")
+            return _with_admission(self.manifest["job"], lambda: self._delete_path(arguments["path"], signals))
 
-    def _delete_path(self, path):
+    def _delete_path(self, path, signals):
         fatal_error = None
         m = self._load()
         scope = self._delete_scope(m)
         self._prior_evidence(m)
-        with defer_cleanup_signals():
-            folder, entry = self._publish_journal(m, DELETE_COMMAND_ID, process_state="exited",
-                                                  exit_confirmed=True)
-            journal = folder / "process.json"
-            files = self.files.under("commands", folder.name)
-            started_clock = time.monotonic()
-            result = {"call_id": entry["id"], "command_id": DELETE_COMMAND_ID, "operation": "delete_path",
-                      "path": path, "task_id": scope["task_id"], "head": None, "head_mode": None,
-                      "outcome": None, "deleted": False, "sha256": None, "bytes": None, "error": None,
-                      "concurrent_change": None, "intent_path": None, "intent_sha256": None,
-                      "started_at": datetime.now(timezone.utc).isoformat()}
-            facts = {"deleted": False}
-            def intent(found):
-                # Written before the final check: the verified file that is
-                # about to be removed. A refusal at that check keeps the
-                # intent and records deleted=false.
-                result.update(sha256=found["sha256"], bytes=found["bytes"])
-                value = {"call_id": entry["id"], "path": path, "head": result["head"],
-                         "head_mode": result["head_mode"], "sha256": found["sha256"],
-                         "bytes": found["bytes"], "time": datetime.now(timezone.utc).isoformat()}
-                write_json(folder / "delete-intent.json", value)
-                result.update(intent_path=str(folder / "delete-intent.json"),
-                              intent_sha256=_evidence_digest(files, ("delete-intent.json",)))
-            try:
-                result["head"], result["head_mode"] = self._delete_eligibility(m, scope, path)
-                _remove_tracked_file(Path(m["worktree"]), m["root_identity"], path, facts, intent)
-                result["concurrent_change"] = facts.get("concurrent_change")
-                result["outcome"] = "concurrent_change" if result["concurrent_change"] else "deleted"
-                if result["concurrent_change"]:
-                    result["error"] = result["concurrent_change"]
-            except _DeleteRefused as error:
-                result.update(outcome="refused", error=str(error))
-            except BaseException as error:
-                if not isinstance(error, (Exception, KeyboardInterrupt, SystemExit)):
-                    fatal_error = error
-                result.update(outcome="failed", error=str(error) or type(error).__name__)
-            finally:
-                result["deleted"] = bool(facts["deleted"])
-                result.update(finished_at=datetime.now(timezone.utc).isoformat(),
-                              duration_seconds=max(0.0, time.monotonic() - started_clock),
-                              exit_confirmed=True, evidence_complete=True, manifest_sha256=self.digest)
-                try:
-                    result["journal_sha256"] = _evidence_digest(files, (journal.name,))
-                    write_json(folder / "receipt.json", result)
-                except (Exception, KeyboardInterrupt, SystemExit) as error:
-                    result.update(evidence_complete=False,
-                                  persistence_error="Deletion evidence persistence failed: " + str(error))
+        signals.deliver()
+        folder, entry = self._publish_journal(m, DELETE_COMMAND_ID, process_state="exited",
+                                              exit_confirmed=True)
+        files = self.files.under("commands", folder.name)
+        started_clock = time.monotonic()
+        result = {"call_id": entry["id"], "command_id": DELETE_COMMAND_ID, "operation": "delete_path",
+                  "path": path, "task_id": scope["task_id"], "head": None, "head_mode": None,
+                  "outcome": None, "deleted": False, "sha256": None, "bytes": None, "error": None,
+                  "concurrent_change": None, "intent_path": None, "intent_sha256": None,
+                  "started_at": datetime.now(timezone.utc).isoformat()}
+        facts = {"deleted": False}
+        def intent(found):
+            # Written before the final check: the verified file that is
+            # about to be removed. A refusal at that check keeps the
+            # intent and records deleted=false.
+            result.update(sha256=found["sha256"], bytes=found["bytes"])
+            value = {"call_id": entry["id"], "path": path, "head": result["head"],
+                     "head_mode": result["head_mode"], "sha256": found["sha256"],
+                     "bytes": found["bytes"], "time": datetime.now(timezone.utc).isoformat()}
+            write_json(folder / "delete-intent.json", value)
+            result.update(intent_path=str(folder / "delete-intent.json"),
+                          intent_sha256=_evidence_digest(files, ("delete-intent.json",)))
+        try:
+            result["head"], result["head_mode"] = self._delete_eligibility(m, scope, path)
+            _remove_tracked_file(Path(m["worktree"]), m["root_identity"], path, facts, intent)
+            result["concurrent_change"] = facts.get("concurrent_change")
+            result["outcome"] = "concurrent_change" if result["concurrent_change"] else "deleted"
+            if result["concurrent_change"]:
+                result["error"] = result["concurrent_change"]
+        except _DeleteRefused as error:
+            result.update(outcome="refused", error=str(error))
+        except BaseException as error:
+            if not isinstance(error, (Exception, KeyboardInterrupt, SystemExit)):
+                fatal_error = error
+            result.update(outcome="failed", error=str(error) or type(error).__name__)
+        finally:
+            result["deleted"] = bool(facts["deleted"])
+            result.update(finished_at=datetime.now(timezone.utc).isoformat(),
+                          duration_seconds=max(0.0, time.monotonic() - started_clock),
+                          exit_confirmed=True, evidence_complete=True, manifest_sha256=self.digest)
+            self._publish_receipt(folder, entry, result)
         if fatal_error is not None:
             raise fatal_error
         return result

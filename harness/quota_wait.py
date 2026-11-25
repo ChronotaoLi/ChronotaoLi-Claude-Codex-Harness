@@ -15,7 +15,7 @@ then every scheduling gate. It is not a resume and never restarts a process.
 
 The sleep uses the wall clock as its target and the monotonic clock as its bound, in
 slices of at most a minute: a system suspend ends it once the target has passed, a
-clock rollback cannot extend it. Signals interrupt it as they interrupt any call.
+clock rollback cannot extend it. The interrupt controller can wake each slice early.
 """
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ import math
 import re
 import time
 
-from . import stops
+from . import interrupts, stops
 from .quota import EPOCH_MAX, NAME as SAMPLE_NAME, ROLES, _utc, bucket_label
 from .services import RuntimeService
 from .util import HarnessError
@@ -336,4 +336,4 @@ class QuotaWait(RuntimeService):
             remaining = min(deadline - time.monotonic(), until - time.time())
             if remaining <= 0:
                 return
-            time.sleep(min(SLICE_SECONDS, remaining))
+            interrupts.sleep(min(SLICE_SECONDS, remaining), clock=time)

@@ -15,7 +15,7 @@ import tempfile
 from contextlib import suppress
 from pathlib import Path
 
-from . import config as layers, dashboard, git, observe, quota_wait, scope as boundary, stops
+from . import config as layers, dashboard, git, interrupts, observe, quota_wait, scope as boundary, stops
 from .adapters import DemoBackend
 from .budgets import attempts_total, work_attempts
 from .cleanup import blocked, cleanup_run
@@ -105,6 +105,9 @@ def demo(config, live=False, commander="astra"):
 
 
 def main(argv=None):
+    if interrupts.active():
+        return _main(argv)
+
     def interrupted(signum, frame):
         raise KeyboardInterrupt()
 
@@ -632,6 +635,7 @@ def finish_saved_operation(operation, run, keys, *, code=0, error=None):
     return code
 
 
+@interrupts.installed()
 def operate(args, config, repo, state):
     """Run or resume under an exclusive operation record; the record never alters the exit code."""
     if args.command == "run":
@@ -946,10 +950,11 @@ def _main(argv=None):
             if args.command in ("run", "resume"):
                 return operate(args, config, repo, state)
             if args.command == "abandon":
-                precheck_run(state, args.run_id, load=True)
-                options = {"confirm_exited": args.confirm_exited} if args.confirm_exited else {}
-                result = Runtime(config, repo).abandon(args.run_id, **options)
-                observe_command_result(lambda: print_saved_result(status_summary(result)), saved_run_id=args.run_id)
+                with interrupts.installed():
+                    precheck_run(state, args.run_id, load=True)
+                    options = {"confirm_exited": args.confirm_exited} if args.confirm_exited else {}
+                    result = Runtime(config, repo).abandon(args.run_id, **options)
+                    observe_command_result(lambda: print_saved_result(status_summary(result)), saved_run_id=args.run_id)
             elif args.command == "sync":
                 claude, codex = mcp_configs(config, state, args.role)
                 try:

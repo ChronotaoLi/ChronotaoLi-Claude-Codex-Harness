@@ -8,13 +8,12 @@ from datetime import datetime, timezone
 import uuid
 from pathlib import Path
 
-from . import checkout_identity, git, stops
+from . import checkout_identity, git, interrupts, stops
 from .context import compact_checks
-from .process_runtime import defer_cleanup_signals
-from .recovery import snapshot_digest
+from .recovery import run_files, snapshot_digest
 from .services import RuntimeService
 from .util import (CommandDirectoryError, HarnessError, ProcessStartError, ProcessTimeout, ProgramStartError,
-                   run_process, tail, with_descriptors, write_json)
+                   output_tail_text, run_process, with_descriptors, write_json)
 
 
 def checks_failed(result):
@@ -37,10 +36,12 @@ class Verification(RuntimeService):
 
     def run_verification_commands(self, task_id, commands, cwd, folder, binding, *, phase=None):
         folder.mkdir(parents=True, exist_ok=True)
+        files = run_files(self.context).under(*folder.relative_to(self.context.directory).parts)
         results = []
         write_json(folder / "results.json", results)
         for i, command in enumerate(commands):
             self.context.ensure_exited()
+            interrupts.deliver()
             # The binding is checked on the very root the command starts from (rule 12).
             def run_check(held):
                 root_fd = git.open_bound_root(held, cwd, binding)
@@ -48,7 +49,8 @@ class Verification(RuntimeService):
                 record = log.with_suffix(".outcome.json").relative_to(self.context.directory)
                 entry = {"id": str(uuid.uuid4()), "role": "verification", "task_id": task_id,
                          "status": "running", "pgid": None, "process_state": "starting",
-                         "process_record": record.as_posix()}
+                         "process_record": record.as_posix(),
+                         "started_at": datetime.now(timezone.utc).isoformat()}
                 entry["worktree"] = str(cwd)
                 if phase:
                     entry["phase"] = phase
@@ -61,7 +63,6 @@ class Verification(RuntimeService):
                     self.context.save()
 
                 started = time.monotonic()
-                entry["started_at"] = datetime.now(timezone.utc).isoformat()
                 outcome = None
                 error = None
                 code = None
@@ -79,7 +80,8 @@ class Verification(RuntimeService):
                 try:
                     code = run_process(command["argv"], cwd, log, relative_cwd=command["cwd"], root_fd=root_fd,
                         timeout=self.context.config.data["runtime"]["verify_timeout_seconds"],
-                        on_start=on_start, on_outcome=on_outcome, record_owner=entry["id"])
+                        on_start=on_start, on_outcome=on_outcome, record_owner=entry["id"],
+                        checkpoint=interrupts.deliver if interrupts.active() else None)
                 except BaseException as caught:
                     error = caught
                     outcome = getattr(caught, "outcome", outcome)
@@ -121,7 +123,10 @@ class Verification(RuntimeService):
                     persistence_error = None
                     incomplete_status = "interrupted" if status == "interrupted" else "failed"
                     try:
-                        result.update(stdout=tail(log.with_suffix(".stdout")), stderr=tail(log.with_suffix(".stderr")))
+                        result.update({
+                            stream: output_tail_text(files.read((f"{log.name}.{stream}",), limit=4000, part="tail"))
+                            for stream in ("stdout", "stderr")
+                        })
                     except BaseException as caught:
                         result["evidence_complete"] = False
                         result["status"] = incomplete_status
@@ -237,7 +242,7 @@ class Verification(RuntimeService):
         checkout.parent.mkdir()
         checkout.mkdir()
         checkout_id = checkout_identity.directory_identity(checkout)
-        with defer_cleanup_signals(inherit=False):
+        with interrupts.hold():
             binding = git.add_worktree(self.context.worktree, checkout, commit, binding=run["worktree_binding"])
             with stops.classify("workspace_mismatch", "binding_changed"):
                 if binding.get("detached_head") != commit:
@@ -251,8 +256,8 @@ class Verification(RuntimeService):
                 entry = checkout_identity.build_entry(owner, root, checkout, identity, binding)
                 entries = run["verification_checkouts"]
                 checkout_identity.validate_checkout_entries({**run, "verification_checkouts": [*entries, entry]})
-            entries.append(entry)
-            self.context.save()
+            with self.context.publish():
+                entries.append(entry)
         baseline = git.snapshot(checkout, binding=binding)
         setup = self.run_verification_commands(task_id, environment["setup_commands"], checkout,
                                                folder / "setup", binding, phase="setup")

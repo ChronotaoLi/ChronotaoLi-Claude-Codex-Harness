@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 from . import stops
+from .state_files import StateFiles
 from .util import HarnessError, dump
 
 
@@ -161,12 +162,19 @@ def compact_worker(worker, artifact, budget=WORKER_CONTEXT_CHARS, *, digest=None
     view = worker_view(worker)
     if not artifact or not digest:
         return view
-    try:
-        raw = Path(artifact).read_bytes()
-    except OSError as error:
-        stops.keep_local_io(error)
-        raise HarnessError("worker 完整反馈产物缺失或无法读取；不能仅凭摘录继续") from error
-    if hashlib.sha256(raw).hexdigest() != digest:
+    path = Path(artifact).absolute()
+    if (path.name == "returned-result.json" and path.parent.parent.name == "dispatches"
+            and path.parent.parent.parent.parent.name == "runs"):
+        # Feedback keeps the original absolute filename. Walk the run and dispatch
+        # below its state root, which may itself use a platform path alias.
+        files = StateFiles(path.parents[4])
+        components = path.parts[-5:]
+    else:
+        files = StateFiles(path.parent)
+        components = (path.name,)
+    outcome = files.digest(components)
+    outcome.evidence({"artifact": str(path)})
+    if outcome.digest != digest:
         raise HarnessError("worker 完整反馈产物已改变；不能仅凭摘录继续")
     if "full_worker_artifact" in worker and len(dump(view)) <= budget:
         return view

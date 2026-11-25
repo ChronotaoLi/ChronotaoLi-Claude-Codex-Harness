@@ -1,5 +1,6 @@
 import contextlib
 import errno
+import io
 import os
 from pathlib import Path
 import signal
@@ -10,6 +11,7 @@ import time
 import unittest
 from unittest.mock import patch
 
+from harness import interrupts
 from harness.process_runtime import ProcessSupervisor
 from harness.util import HarnessError, ProcessStartError, ProcessTimeout, read_json, run_process
 
@@ -26,6 +28,130 @@ class ProcessRuntimeTests(unittest.TestCase):
         self.addCleanup(self.directory.cleanup)
         self.root = Path(self.directory.name)
         self.log = self.root / "process"
+
+    def test_prelaunch_checkpoint_cancels_before_child_start(self):
+        witness = self.root / "started"
+        owner = {"dispatch_id": "check"}
+        cancel = KeyboardInterrupt("checkpoint")
+
+        def checkpoint():
+            record = read_json(self.log.with_suffix(".outcome.json"))
+            self.assertEqual(record["startup_state"], "starting")
+            self.assertEqual(record["owner"], owner)
+            raise cancel
+
+        with self.assertRaises(KeyboardInterrupt) as caught:
+            self.invoke(f"from pathlib import Path; Path({str(witness)!r}).touch()",
+                        checkpoint=checkpoint, record_owner=owner)
+        self.assertIs(caught.exception, cancel)
+        record = read_json(self.log.with_suffix(".outcome.json"))
+        self.assertEqual(record["owner"], owner)
+        self.assertEqual(record["termination_reason"], "cancelled")
+        self.assertEqual(record["startup_state"], "not_started")
+        self.assertFalse(record["started"])
+        self.assertTrue(record["exit_confirmed"])
+        self.assertFalse(witness.exists())
+
+    def test_wait_checkpoint_cancels_owned_child_inside_callers_handler(self):
+        checks = []
+        launches = []
+        cancel = KeyboardInterrupt("checkpoint")
+
+        def checkpoint():
+            checks.append(time.monotonic())
+            if launches:
+                raise cancel
+
+        def started(pid):
+            launches.append((pid, time.monotonic()))
+
+        try:
+            raise ValueError("caller exception")
+        except ValueError:
+            with self.assertRaises(KeyboardInterrupt) as caught:
+                self.invoke("import time; time.sleep(10)", checkpoint=checkpoint, on_start=started)
+        self.assertIs(caught.exception, cancel)
+        prelaunch, delivery = checks
+        (pid, launched), = launches
+        self.assertLessEqual(prelaunch, launched)
+        self.assertLess(delivery - launched, .3)
+        outcome = caught.exception.outcome
+        self.assertEqual(outcome.pgid, pid)
+        self.assertEqual(outcome.termination_reason, "cancelled")
+        self.assertTrue(outcome.exit_confirmed)
+        with self.assertRaises(ProcessLookupError):
+            os.killpg(pid, 0)
+
+    def test_successful_wait_and_poll_after_timed_out_slice_skip_checkpoint(self):
+        wait = subprocess.Popen.wait
+        poll = subprocess.Popen.poll
+
+        for timeout_race in (False, True):
+            with self.subTest(timeout_race=timeout_race):
+                waits = []
+                polls = []
+                checks = []
+
+                def wait_slice(process, timeout=None):
+                    waits.append(timeout)
+                    code = wait(process, timeout=2)
+                    if timeout_race:
+                        raise subprocess.TimeoutExpired(process.args, timeout)
+                    return code
+
+                def observe(process):
+                    polls.append(poll(process))
+                    return polls[-1]
+
+                with patch.object(subprocess.Popen, "wait", wait_slice), \
+                        patch.object(subprocess.Popen, "poll", observe):
+                    code = self.invoke("raise SystemExit(7)", checkpoint=lambda: checks.append(len(waits)))
+                self.assertEqual(code, 7)
+                self.assertEqual(waits, [.1])
+                self.assertEqual(checks, [0])
+                # Supervisor cleanup polls once on either path. A timed-out slice
+                # must poll once more before it could call a checkpoint.
+                self.assertEqual(polls, [7, 7] if timeout_race else [7])
+
+    def test_absolute_deadline_wins_over_wait_checkpoint(self):
+        checks = []
+        waits = []
+        wait = subprocess.Popen.wait
+
+        def wait_slice(process, timeout=None):
+            waits.append(timeout)
+            return wait(process, timeout=timeout)
+
+        def checkpoint():
+            checks.append(time.monotonic())
+            if len(checks) > 1:
+                raise KeyboardInterrupt("pending during final slice")
+
+        def started(pid):
+            # Leave less than a full slice in the original execution budget.
+            time.sleep(max(0, deadline - time.monotonic() - .04))
+
+        deadline = time.monotonic() + .25
+        with patch.object(subprocess.Popen, "wait", wait_slice):
+            with self.assertRaises(ProcessTimeout) as caught:
+                self.invoke("import time; time.sleep(10)", timeout=10, execution_deadline=deadline,
+                            checkpoint=checkpoint, on_start=started)
+        self.assertEqual(len(checks), 1)
+        (final_slice,) = waits
+        self.assertGreater(final_slice, 0)
+        self.assertLess(final_slice, .1)
+        self.assertEqual(caught.exception.outcome.termination_reason, "timeout")
+        self.assertTrue(caught.exception.outcome.exit_confirmed)
+
+    def test_wait_without_checkpoint_throttles_heartbeat_and_keeps_timeout(self):
+        stream = io.StringIO()
+        with patch("harness.util.PROCESS_HEARTBEAT_SECONDS", .18), contextlib.redirect_stderr(stream):
+            with self.assertRaises(ProcessTimeout) as caught:
+                self.invoke("import time; time.sleep(10)", timeout=.35)
+        (heartbeat,) = stream.getvalue().splitlines()
+        self.assertIn(str(self.log), heartbeat)
+        self.assertEqual(caught.exception.outcome.termination_reason, "timeout")
+        self.assertTrue(caught.exception.outcome.exit_confirmed)
 
     def test_real_sigint_after_popen_creation_retains_ownership_and_cleans_child(self):
         original = subprocess.Popen
@@ -343,6 +469,112 @@ while not os.path.exists(sys.argv[2]):
         self.assertEqual(facts.termination_reason, 'timeout')
         self.assertTrue(facts.exit_confirmed)
         self.assertEqual(read_json(self.log.with_suffix('.outcome.json'))['termination_reason'], 'timeout')
+
+    def test_cleanup_hurry_requires_repeated_controller_signals(self):
+        killpg = os.killpg
+        poll = subprocess.Popen.poll
+        ready = self.root / "ready"
+        script = ("import signal,time; from pathlib import Path; "
+                  "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                  f"Path({str(ready)!r}).touch(); time.sleep(30)")
+        for enabled, repeat in ((True, True), (True, False), (False, True)):
+            with self.subTest(enabled=enabled, repeat=repeat):
+                ready.unlink(missing_ok=True)
+                signals = {}
+                repeated_at = None
+                stderr = io.StringIO()
+                timeout = ProcessTimeout(0, self.log)
+
+                def signal_group(pgid, sig):
+                    if sig:
+                        signals[sig] = time.monotonic()
+                    killpg(pgid, sig)
+                    if sig == signal.SIGTERM:
+                        os.kill(os.getpid(), signal.SIGINT)
+
+                def poll_leader(process):
+                    nonlocal repeated_at
+                    code = poll(process)
+                    if repeat and signal.SIGTERM in signals and repeated_at is None:
+                        repeated_at = time.monotonic()
+                        os.kill(os.getpid(), signal.SIGHUP)
+                    return code
+
+                def expire(pid):
+                    # The child has to install its TERM disposition before cleanup.
+                    deadline = time.monotonic() + 3
+                    while not ready.exists() and time.monotonic() < deadline:
+                        time.sleep(.005)
+                    self.assertTrue(ready.exists())
+                    raise timeout
+
+                with (contextlib.redirect_stderr(stderr),
+                      patch.object(interrupts, "ENABLED", enabled), interrupts.installed(),
+                      patch("harness.process_runtime.os.killpg", side_effect=signal_group),
+                      patch.object(subprocess.Popen, "poll", poll_leader)):
+                    with self.assertRaises(ProcessTimeout) as caught:
+                        self.invoke(script, on_start=expire)
+
+                self.assertIs(caught.exception, timeout)
+                self.assertEqual(list(signals), [signal.SIGTERM, signal.SIGKILL])
+                if enabled and repeat:
+                    self.assertLess(signals[signal.SIGKILL] - repeated_at, .1)
+                    self.assertEqual(stderr.getvalue().count("已收到第 2 次中断"), 1)
+                else:
+                    self.assertGreaterEqual(signals[signal.SIGKILL] - signals[signal.SIGTERM], .9)
+                    self.assertEqual(stderr.getvalue().count("已收到第 2 次中断"), 0)
+                facts = caught.exception.outcome
+                self.assertEqual(facts.termination_reason, "timeout")
+                self.assertEqual(facts.exit_code, -signal.SIGKILL)
+                self.assertTrue(facts.exit_confirmed)
+                self.assertTrue(facts.evidence_complete)
+                self.assertEqual(read_json(self.log.with_suffix(".outcome.json")), facts.to_dict())
+
+    def test_repeated_controller_signal_after_reaping_never_signals_group(self):
+        killpg = os.killpg
+        poll = subprocess.Popen.poll
+        for cancellation in (False, True):
+            with self.subTest(cancellation=cancellation):
+                sent = []
+                repeated = False
+
+                def signal_group(pgid, sig):
+                    if sig:
+                        sent.append(sig)
+                    killpg(pgid, sig)
+
+                def poll_leader(process):
+                    nonlocal repeated
+                    code = poll(process)
+                    if code is not None and not repeated:
+                        repeated = True
+                        if not cancellation:
+                            os.kill(os.getpid(), signal.SIGINT)
+                        os.kill(os.getpid(), signal.SIGHUP)
+                    return code
+
+                def request_cancel(pid):
+                    os.kill(os.getpid(), signal.SIGINT)
+
+                with (contextlib.redirect_stderr(io.StringIO()),
+                      patch.object(interrupts, "ENABLED", True), interrupts.installed(),
+                      patch("harness.process_runtime.os.killpg", side_effect=signal_group),
+                      patch.object(subprocess.Popen, "poll", poll_leader)):
+                    if cancellation:
+                        with self.assertRaises(KeyboardInterrupt) as caught:
+                            self.invoke("import time; time.sleep(30)", on_start=request_cancel,
+                                        checkpoint=interrupts.deliver)
+                        self.assertEqual(caught.exception.outcome.termination_reason, "cancelled")
+                    else:
+                        self.assertEqual(self.invoke("pass", checkpoint=interrupts.deliver), 0)
+
+                self.assertTrue(repeated)
+                self.assertEqual(sent, [signal.SIGTERM] if cancellation else [])
+                saved = read_json(self.log.with_suffix(".outcome.json"))
+                self.assertEqual(saved["termination_reason"], "cancelled" if cancellation else "normal")
+                self.assertEqual(saved["exit_code"], -signal.SIGTERM if cancellation else 0)
+                self.assertTrue(saved["exit_confirmed"])
+                self.assertTrue(saved["evidence_complete"])
 
     def test_injected_interrupt_does_not_replace_timeout(self):
         original = os.killpg

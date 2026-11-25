@@ -711,7 +711,9 @@ class BoundRootTests(InterruptSweep, unittest.TestCase):
 
     def verify(self, path, binding, name, started):
         """Run one formal check on ``path``; the stand-in for its process records the root it was given."""
-        context = SimpleNamespace(directory=self.base, run={"dispatches": []}, ensure_exited=lambda: None, save=lambda: None,
+        directory = self.base / "runs" / "run_checks"
+        context = SimpleNamespace(state=self.base, directory=directory, run={"id": "run_checks", "dispatches": []},
+                                  ensure_exited=lambda: None, save=lambda: None,
                                   save_fact=lambda *keys: True,
                                   config=SimpleNamespace(data={"runtime": {"verify_timeout_seconds": 5}}))
 
@@ -722,7 +724,7 @@ class BoundRootTests(InterruptSweep, unittest.TestCase):
 
         with patch("harness.verification.run_process", process):
             return Verification(context).run_verification_commands(
-                "task", [{"cwd": ".", "argv": ["check"]}], path, self.base / "verification" / "checks" / name, binding)
+                "task", [{"cwd": ".", "argv": ["check"]}], path, directory / "verification" / "checks" / name, binding)
 
     @contextlib.contextmanager
     def displaced(self, path):

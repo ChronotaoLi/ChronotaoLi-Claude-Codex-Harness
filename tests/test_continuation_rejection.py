@@ -25,7 +25,7 @@ class RejectionEvidenceTests(unittest.TestCase):
         self.root = Path(temporary.name).resolve()
         self.candidate = {'head': 'head', 'index': 'index', 'files': {'code': 'candidate'}}
         self.saved = []
-        self.context = SimpleNamespace(directory=self.root / 'run', state=self.root / '.harness',
+        self.context = SimpleNamespace(directory=self.root / '.harness' / 'runs' / 'run', state=self.root / '.harness',
             run=stopped({'id': 'run', 'tasks': [{'id': 'task'}], 'accepted': {}, 'dispatches': [],
                          'current_task': 'task', 'attempts': {'task': 1},
                          'agent_dispatches': 1, 'rounds': 3}),
@@ -41,7 +41,9 @@ class RejectionEvidenceTests(unittest.TestCase):
         self.source = {'dispatch_id': 'worker1', 'artifact': str(source_path),
                        'artifact_digest': hashlib.sha256(source_path.read_bytes()).hexdigest()}
         add_worker_dispatch(self.context.run, self.context.directory, 'worker1', 'task')
-        self.row = continuation.record_continuation(self.context, 'task', self.result, self.source, self.candidate)
+        prepared = continuation.prepare_continuation(self.context, 'task', self.result, self.source, self.candidate)
+        self.row = continuation.apply_continuation(self.context, prepared)
+        self.context.save()
         self.value = {'request_id': self.row['id'], 'reason': 'Use an alternative implementation.'}
         self.path = self.root / 'rejection.json'
         write_json(self.path, self.value)

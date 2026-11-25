@@ -141,14 +141,14 @@ class WorktreeBindingTests(unittest.TestCase):
 
     def test_command_stays_pinned_if_gitfile_changes_after_precheck(self):
         (self.worktree / "a.txt").write_text("reviewed\n")
-        subprocess_run = git.subprocess.run
+        launch = git._launch
 
-        def redirect_before_ref_write(argv, **kwargs):
+        def redirect_before_ref_write(argv, env, **kwargs):
             if "update-ref" in argv:
                 (self.worktree / ".git").write_text(f"gitdir: {self.repo / '.git'}\n")
-            return subprocess_run(argv, **kwargs)
+            return launch(argv, env, **kwargs)
 
-        with patch("harness.git.subprocess.run", side_effect=redirect_before_ref_write):
+        with patch.object(git, "_launch", side_effect=redirect_before_ref_write):
             with self.assertRaisesRegex(HarnessError, "绑定"):
                 accept_now(self.worktree, ["a.txt"], "run", "task", ACCEPT_MESSAGE, binding=self.binding)
         self.assert_main_unchanged()

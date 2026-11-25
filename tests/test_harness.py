@@ -341,7 +341,7 @@ def install_stop_guards(case):
     """
     import shlex
     from unittest.mock import patch
-    from harness import stops
+    from harness import interrupts, stops
     from harness.workflow import Workflow
     unclassified, mismatches, seen = [], [], {}
     original_stop = Workflow.stop
@@ -359,11 +359,20 @@ def install_stop_guards(case):
         value = run.get("stop") or {}
         path = directory / "state.json"
         if value.get("kind") and path.exists():
+            # This test-only reader checks the saved ledger independently of
+            # the caller's possibly unfinished in-memory stop candidate.
+            controller = interrupts._local_controller()
+            previous = controller.store if controller is not None else None
+            interrupts.bind(None)
             try:
-                Runtime(case.config, case.repo, backend=DemoBackend()).load_run(run["id"])
+                reader = Runtime(case.config, case.repo, backend=DemoBackend())
+                interrupts.bind(reader.context.store)
+                reader.load_run(run["id"])
                 loads = True
             except HarnessError:
                 loads = False
+            finally:
+                interrupts.bind(previous)
             exits = stops.project(value, run["id"])["exits"]
             if not loads and any(text.split()[0] in ("resume", "abandon") for text in exits):
                 mismatches.append(("exit listed but the load fails", value["kind"], value["reason"]))
@@ -400,8 +409,10 @@ def install_stop_guards(case):
                 raise
         return wrapped
 
-    def walk_abandon():
-        for run_id, (value, saved, directory, config, repo) in seen.items():
+    def walk_abandon(only_repo=None):
+        selected = [(ident, row) for ident, row in seen.items() if only_repo is None or row[-1] == only_repo]
+        for run_id, (value, saved, directory, config, repo) in selected:
+            seen.pop(run_id)
             state = directory / "state.json"
             if not state.exists() or state.read_bytes() != saved:
                 continue
@@ -442,6 +453,7 @@ def install_stop_guards(case):
     case.addCleanup(walk_abandon)
     for item in patches:
         case.addCleanup(item.stop)
+    return walk_abandon
 
 
 
@@ -532,17 +544,11 @@ class RepoCase(unittest.TestCase):
         self.outside = scratch(self)
         # After every other cleanup (cleanups run last-in first-out): whatever the runtime wrote into a
         # run directory, the observer can address it or excludes it by name.
-        self.addCleanup(lambda: self.assertEqual(
-            unregistered_run_entries(self.repo / ".harness"), [],
-            "run evidence the observer cannot address: register it in harness.observe or exclude it by name"))
-        git.git(self.repo, "init", "-b", "main")
-        (self.repo / ".gitignore").write_text("__pycache__/\n")
-        (self.repo / "test_hello.py").write_text('import unittest\nfrom hello import greet\nclass Tests(unittest.TestCase):\n    def test_greet(self):\n        self.assertEqual(greet("Ada"), "Hello, Ada!")\n')
-        git.git(self.repo, "add", ".")
-        git.git(self.repo, "-c", "user.name=Test", "-c", "user.email=test@localhost", "-c", "commit.gpgsign=false", "commit", "-m", "fixture")
+        self.addCleanup(lambda: self.check_run_entries(self.repo))
+        self.init_repo(self.repo)
         self.config = Config.load(ROOT / "harness.toml")
         self.config.data["verification"]["commands"] = [{"cwd": ".", "argv": [sys.executable, "-m", "unittest", "-v"]}]
-        install_stop_guards(self)
+        self.check_stop_abandon = install_stop_guards(self)
         # Every PATH lookup of claude or codex in a repository test lands on a recording stub;
         # quota probes are expected, any other call to either CLI fails the test.
         import quota_stubs
@@ -550,6 +556,19 @@ class RepoCase(unittest.TestCase):
         self.addCleanup(lambda: self.assertEqual(self.quota_calls.unexpected(), []))
         # A quota wait never sleeps for real: a test that expects one installs its own clock.
         self.quota_clock = install_clock(self, FakeClock(expect_sleep=False))
+
+    def check_run_entries(self, repo):
+        self.assertEqual(
+            unregistered_run_entries(repo / ".harness"), [],
+            "run evidence the observer cannot address: register it in harness.observe or exclude it by name")
+
+    @staticmethod
+    def init_repo(repo):
+        git.git(repo, "init", "-b", "main")
+        (repo / ".gitignore").write_text("__pycache__/\n")
+        (repo / "test_hello.py").write_text('import unittest\nfrom hello import greet\nclass Tests(unittest.TestCase):\n    def test_greet(self):\n        self.assertEqual(greet("Ada"), "Hello, Ada!")\n')
+        git.git(repo, "add", ".")
+        git.git(repo, "-c", "user.name=Test", "-c", "user.email=test@localhost", "-c", "commit.gpgsign=false", "commit", "-m", "fixture")
 
     def engine(self, backend=None):
         return Runtime(self.config, self.repo, backend=backend or DemoBackend())

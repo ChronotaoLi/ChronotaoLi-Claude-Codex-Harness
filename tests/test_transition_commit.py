@@ -1,12 +1,12 @@
-"""A task approval's ledger barrier owns its save through deferred cancellation."""
+"""A task approval's ledger barrier commits before cooperative interruption is delivered."""
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 import errno
 import os
 import signal
 from unittest.mock import patch
 
-from harness import git, state_files
+from harness import git, interrupts, state_files
 from harness.process_runtime import defer_cleanup_signals
 from harness.run_store import LEDGER, RunStore
 from harness.state_files import LockedDirectory
@@ -28,7 +28,7 @@ class TransitionCommitTests(transitions.TransitionCase):
         before_calls = transitions.signature(backend)
         resumed = self.engine(backend)
         context = resumed.context
-        transition = context.transition
+        publication = context.publish
         replace = LockedDirectory.replace
         read = LockedDirectory.read
         publish = RunStore._publish_candidate
@@ -38,19 +38,29 @@ class TransitionCommitTests(transitions.TransitionCase):
         rereads = []
         live_revisions = []
         write_failed = False
+        controllers = []
         failure = OSError(errno.EIO, "approval publication")
         body_error = KeyboardInterrupt("synchronous approval body") if cut == "synchronous" else failure
         abort_body = cut in {"synchronous", "body error"}
         write_error = cut in {"before replace", "ambiguous replace"}
 
         @contextmanager
-        def approval_transition():
-            with transition():
-                yield
-                if abort_body:
-                    raise body_error
-                if cut != "during replace":
+        def approval_publication(**options):
+            with interrupts.hold() if cut == "outer pending" else nullcontext():
+                if cut == "outer pending":
+                    controller = interrupts.active()
+                    controllers.append(controller)
                     os.kill(os.getpid(), signal.SIGINT)
+                with publication(**options):
+                    yield
+                    if abort_body:
+                        raise body_error
+                    if cut not in {"during replace", "outer pending"}:
+                        os.kill(os.getpid(), signal.SIGINT)
+                if cut == "outer pending":
+                    interrupts.deliver()
+                    self.assertIsNone(controller.delivered_from)
+                    self.assertEqual(controller.count, 1)
 
         def record_publication(store, locked, candidate, data):
             publications.append(candidate)
@@ -98,7 +108,7 @@ class TransitionCommitTests(transitions.TransitionCase):
             if original is not None:
                 self.assertIs(caught.exception, original)
 
-        with (patch.object(context, "transition", approval_transition),
+        with (patch.object(context, "publish", approval_publication),
               patch.object(RunStore, "_publish_candidate", record_publication),
               patch.object(LockedDirectory, "replace", trigger_replace),
               patch.object(LockedDirectory, "read", fail_immediate_reread),
@@ -109,6 +119,10 @@ class TransitionCommitTests(transitions.TransitionCase):
                         os.kill(os.getpid(), signal.SIGTERM)
                         resume_interrupted()
                         self.assertEqual(outer, [signal.SIGTERM])
+                        controller, = controllers
+                        self.assertEqual(controller.first[0], signal.SIGINT)
+                        self.assertEqual(controller.count, 1)
+                        self.assertIsNotNone(controller.delivered_from)
                 self.assertIn(str(signal.SIGTERM.value), str(caught.exception))
             else:
                 resume_interrupted()

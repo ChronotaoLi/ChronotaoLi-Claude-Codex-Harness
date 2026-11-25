@@ -17,8 +17,8 @@ class Fixture(DecisionRecovery):
         super().__init__(SimpleNamespace())
         self.context.save = lambda: self.save()
         self.context.event = lambda event, **fields: self.event(event, **fields)
-        self.context.directory = Path(directory).resolve()
-        self.context.state = self.context.directory.parent / '.harness'
+        self.context.state = Path(directory).resolve() / '.harness'
+        self.context.directory = self.context.state / 'runs' / 'run_test'
         self.events = []
         self.saves = 0
         self.context.run = {'id': 'run_test', 'schema_version': RUN_SCHEMA_VERSION, 'status': 'blocked',

@@ -46,6 +46,7 @@ class WorkspaceInputsTests(unittest.TestCase):
         (self.repo / 'deps').mkdir()
         self.source = self.repo / 'deps/input.txt'
         self.source.write_text('dependency')
+        self.source.chmod(0o644)
         self.manifest = dict(schema_version=1, run_id=self.ident, head=self.run['expected_head'],
                              source_root='.', max_files=1, max_bytes=100,
                              files=[dict(source='deps/input.txt', destination='vendor/input.txt',

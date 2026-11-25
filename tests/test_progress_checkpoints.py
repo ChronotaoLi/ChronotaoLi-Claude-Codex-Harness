@@ -4,10 +4,11 @@ from pathlib import Path
 import tempfile
 import time
 import unittest
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest.mock import patch
 
 from harness.progress import CheckpointDeclarationError, ProgressRecovery, validate_checkpoints
+from harness.run_context import RunContext
 from harness.util import HarnessError, write_json
 from harness.versions import RUN_SCHEMA_VERSION
 from test_harness import add_worker_dispatch
@@ -20,13 +21,14 @@ def sha(raw):
 class Runtime(ProgressRecovery):
     def __init__(self, root):
         super().__init__(SimpleNamespace())
-        self.context.save = lambda: self.save()
+        self.context.save = lambda **kwargs: self.save()
+        self.context.publish = MethodType(RunContext.publish, self.context)
         self.context.event = lambda event, **fields: self.event(event, **fields)
-        self.context.directory = root / 'run'
+        self.context.directory = root / '.harness' / 'runs' / 'run'
         self.context.state = root / '.harness'
         self.context.worktree = root / 'worktree'
         self.context.worktree.mkdir()
-        self.context.run = {'schema_version': RUN_SCHEMA_VERSION, 'tasks': [{'id': 'task'}], 'dispatches': [], 'task_checkpoints': [], 'checkpoint_batches': []}
+        self.context.run = {'id': 'run', 'schema_version': RUN_SCHEMA_VERSION, 'tasks': [{'id': 'task'}], 'dispatches': [], 'task_checkpoints': [], 'checkpoint_batches': []}
         self.events = []
         self.saved = 0
 

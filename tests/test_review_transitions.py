@@ -33,7 +33,8 @@ def transition_span(function, marker=None):
              for parent in ast.walk(ast.parse(source)) for field in ("body", "orelse")
              for node in (getattr(parent, field, None) if isinstance(getattr(parent, field, None), list) else [])
              if isinstance(node, ast.With) and any(
-                 isinstance(item.context_expr, ast.Call) and (getattr(item.context_expr.func, "attr", None) == "transition"
+                 isinstance(item.context_expr, ast.Call) and (getattr(item.context_expr.func, "attr", None) == "publish"
+                 or getattr(item.context_expr.func, "attr", None) == "hold"
                  or getattr(item.context_expr.func, "id", None) == "defer_cleanup_signals")
                  for item in node.items)
              and (marker is None or marker in ast.get_source_segment(source, node)
@@ -54,17 +55,24 @@ def ledger(run):
 
 
 @contextlib.contextmanager
-def sigint_in_transition(function, select, at=None, marker=None, keep=False):
+def sigint_in_transition(function, select, at=None, marker=None, keep=False, before=False):
     """Send SIGINT to this process at line event ``at`` of the transition of the call ``select`` picks.
 
     ``select`` reads the call's locals at the transition and returns the review
     dispatch it registers (any true value when it registers none), or None for
-    another call. Event 0 is the with line,
-    before the signals are deferred; every later one is inside the block, the
-    last on leaving it. Yields the events seen and the selected dispatch; with
-    ``keep``, also the in-memory ledger at each event.
+    another call. Event 0 is the with line unless ``before`` selects an
+    immediately preceding delivery point instead. The following events trace
+    the body and its exit. With ``keep``, also collect the live ledger.
     """
     first, last = transition_span(function, marker)
+    if before:
+        lines, start = inspect.getsourcelines(function)
+        assert lines[first - start - 1].strip() == "interrupts.deliver()"
+        first -= 1
+        # Select the delivery point in place of the first with-line event.
+        with_line = first + 1
+    else:
+        with_line = None
     seen = {"events": [], "ledgers": [], "dispatch": None, "frame": None, "done": False}
 
     def local(frame, event, arg):
@@ -78,6 +86,8 @@ def sigint_in_transition(function, select, at=None, marker=None, keep=False):
             return local
         if not inside:
             seen["done"] = True
+            return local
+        if frame.f_lineno == with_line and len(seen["events"]) == 1:
             return local
         seen["events"].append(frame.f_lineno)
         if keep:
@@ -169,9 +179,9 @@ class TransitionCase(RepoCase):
 
 
 class SignalInTransitionTests(TransitionCase):
-    """Layer one: a signal before a transition saves the whole old ledger, one inside it the whole new one."""
+    """Signals at the transition reach a later delivery point after registration."""
 
-    def sweep(self, backend_of, function, key, select, old, new, after=None, marker=None):
+    def sweep(self, backend_of, function, key, select, new, after=None, marker=None):
         """Interrupt at every line event of the selected transition, then resume to the uninterrupted end."""
         backend = backend_of()
         with sigint_in_transition(function, select, marker=marker) as seen:
@@ -193,14 +203,10 @@ class SignalInTransitionTests(TransitionCase):
                 saved = batches.state(engine)
                 self.assertEqual(saved["status"], "interrupted")
                 dispatch, registered = fired["dispatch"], sum(registrations(saved), [])
-                if at == 0:
-                    self.assertEqual(saved["review_receipts"][key]["dispatch_id"], dispatch)
-                    self.assertNotIn(dispatch, registered)
-                    old(saved)
-                else:
-                    self.assertNotIn(key, saved["review_receipts"])
-                    self.assertEqual(registered.count(dispatch), 1)
-                    new(saved, dispatch)
+                self.assert_stop(saved, "interrupted", "signal")
+                self.assertNotIn(key, saved["review_receipts"])
+                self.assertEqual(registered.count(dispatch), 1)
+                new(saved, dispatch)
                 result = self.engine(backend).resume(engine.run["id"])
                 self.assertEqual(result["status"], "completed")
                 self.assertEqual(signature(backend), expected)
@@ -209,16 +215,12 @@ class SignalInTransitionTests(TransitionCase):
                     after(result, backend)
 
     def test_task_next_batch(self):
-        def old(saved):
-            self.assertEqual(len(saved["review_history"]["greet"]), 4)
-            self.assertEqual(len(saved["pending_task"]["required_findings"]), 60)
-
         def new(saved, dispatch):
             self.assertEqual(saved["review_history"]["greet"][-1]["dispatch_id"], dispatch)
             self.assertEqual((saved["pending_task"]["stage"], batches.labels(saved["pending_task"]["required_findings"])),
                              ("reviewing", ["r3-19"]))
         self.sweep(lambda: batches.scripted([20, 20, 20, 1]), TaskLifecycle._finish_review, TASK_KEY,
-                   lambda local: local["outcome"] == "next_batch" and local["record"]["dispatch_id"], old, new)
+                   lambda local: local["outcome"] == "next_batch" and local["record"]["dispatch_id"], new)
 
     def test_task_approval(self):
         def new(saved, dispatch):
@@ -226,7 +228,7 @@ class SignalInTransitionTests(TransitionCase):
             self.assertEqual(saved["pending_acceptance"]["review_source"]["dispatch_id"], dispatch)
         self.sweep(ScriptedBackend, TaskLifecycle._finish_review, TASK_KEY,
                    lambda local: local["outcome"] == "approved" and local["record"]["dispatch_id"],
-                   lambda saved: self.assertNotIn("pending_acceptance", saved), new)
+                   new)
 
     def test_task_rejection(self):
         def new(saved, dispatch):
@@ -234,15 +236,10 @@ class SignalInTransitionTests(TransitionCase):
             self.assertEqual(saved["feedback"]["artifact"], saved["review_history"]["greet"][-1]["artifact"])
         self.sweep(lambda: batches.scripted([1]), TaskLifecycle._finish_review, TASK_KEY,
                    lambda local: local["outcome"] == "rejected" and local["record"]["dispatch_id"],
-                   lambda saved: self.assertEqual(saved["pending_task"]["stage"], "reviewing"), new)
+                   new)
 
     def test_final_intermediate_batch_of_one_hundred_twenty(self):
         """The review's case: both batches have keys f1..f60; after any interruption the second is reviewed."""
-        def old(saved):
-            record = saved["final_history"][-1]
-            self.assertEqual((record["status"], record["approved_batches"], len(record["required_findings"])),
-                             ("running", [], 60))
-
         def new(saved, dispatch):
             record = saved["final_history"][-1]
             self.assertEqual((record["status"], record["phase"]), ("running", "reviewing"))
@@ -260,7 +257,7 @@ class SignalInTransitionTests(TransitionCase):
             last = result["final_history"][-1]
             self.assertNotEqual(last["approved_batches"][0]["dispatch_id"], last["review_source"]["dispatch_id"])
         self.sweep(final_120, FinalAcceptance.final_review, FINAL_KEY,
-                   lambda local: local.get("remaining") and local["source"]["dispatch_id"], old, new, after,
+                   lambda local: local.get("remaining") and local["source"]["dispatch_id"], new, after,
                    marker="review_receipts")
 
     def test_final_last_batch_approval(self):
@@ -270,7 +267,7 @@ class SignalInTransitionTests(TransitionCase):
                              ("approved", dispatch, None))
         self.sweep(ScriptedBackend, FinalAcceptance.final_review, FINAL_KEY,
                    lambda local: local.get("approved") and not local.get("remaining") and local["source"]["dispatch_id"],
-                   lambda saved: self.assertEqual(saved["final_history"][-1]["status"], "running"), new,
+                   new,
                    marker="review_receipts")
 
     def test_final_last_batch_rejection(self):
@@ -280,7 +277,7 @@ class SignalInTransitionTests(TransitionCase):
             self.assertEqual(saved["feedback"]["final_review"]["review_source"]["dispatch_id"], dispatch)
         self.sweep(lambda: final_rejections(1, 1), FinalAcceptance.final_review, FINAL_KEY,
                    lambda local: "approved" in local and not local["approved"] and local["source"]["dispatch_id"],
-                   lambda saved: self.assertEqual(saved["final_history"][-1]["status"], "running"), new,
+                   new,
                    marker="review_receipts")
 
 
@@ -458,13 +455,8 @@ def evidence_plan():
 
 
 class LedgerSweepCase(TransitionCase):
-    def sweep_ledger(self, backend_of, function, marker, run, old_stop=None):
-        """Interrupt at every line event of one transition: the stop saves the whole ledger of the with line, or the
-        whole ledger at the block's end, and resuming makes the uninterrupted calls.
-
-        ``run(engine, backend)`` drives the run through the transition. ``old_stop`` is where a resume from the
-        old ledger stops instead, when the step before the transition already changed the worktree.
-        """
+    def sweep_ledger(self, backend_of, function, marker, run, *, review_can_prepare=False):
+        """At every line event, publish the full transition and resume without repeating a model call."""
         backend = backend_of()
         with sigint_in_transition(function, lambda local: True, marker=marker) as seen:
             baseline = run(self.engine(backend), backend)
@@ -481,17 +473,19 @@ class LedgerSweepCase(TransitionCase):
                     run(engine, backend)
                 saved = batches.state(engine)
                 self.assertEqual(saved["status"], "interrupted")
-                # Before the block the signal stops the trace at once; inside it, the block runs to its end.
-                self.assertEqual(len(fired["ledgers"]), 1 if at == 0 else len(seen["events"]))
-                self.assertTrue(at == 0 or fired["ledgers"][0] != fired["ledgers"][-1])
-                expected_ledger, saved_ledger = fired["ledgers"][0 if at == 0 else -1], ledger(saved)
+                self.assert_stop(saved, "interrupted", "signal")
+                self.assertEqual(len(fired["ledgers"]), len(seen["events"]))
+                self.assertNotEqual(fired["ledgers"][0], fired["ledgers"][-1])
+                expected_ledger, saved_ledger = fired["ledgers"][-1], ledger(saved)
+                if review_can_prepare and len(saved_ledger["dispatches"]) > len(expected_ledger["dispatches"]):
+                    # The next checkpoint can be precharge, after the review creates its local dispatch.
+                    prepared = saved_ledger["dispatches"].pop()
+                    self.assertEqual((prepared["role"], prepared["kind"], prepared["invoked"], prepared["status"]),
+                                     ("reviewer", "final_review", False, "failed"))
+                    self.assertTrue(prepared["exit_confirmed"])
+                    self.assertIsNone(prepared["pgid"])
                 self.assertEqual([key for key in sorted({*expected_ledger, *saved_ledger})
                                   if expected_ledger.get(key) != saved_ledger.get(key)], [])
-                if at == 0 and old_stop:
-                    with self.assertRaises(HarnessError) as caught:
-                        self.engine(backend).resume(engine.run["id"])
-                    self.assertEqual((caught.exception.stop["kind"], caught.exception.stop["reason"]), old_stop)
-                    continue
                 result = self.engine(backend).resume(engine.run["id"])
                 self.assertEqual(result["status"], "completed")
                 self.assertEqual(signature(backend), expected)
@@ -575,7 +569,7 @@ class LeaveTransitionTests(LedgerSweepCase):
 
     def test_signal_in_the_transition_of_a_written_leave(self):
         """Review 1d2: a signal after the leave wrote its record file; back on the reviewed candidate the same
-        transition publishes that leave, and a signal at any line of it saves the whole old or new ledger."""
+        transition publishes that leave, and a signal at any line preserves the whole transition."""
         def run(engine, backend):
             window, _ = after_save(engine, lambda run: "artifact_digest" in run["review_receipts"].get(FINAL_KEY, {}),
                                    interrupt)
@@ -585,20 +579,55 @@ class LeaveTransitionTests(LedgerSweepCase):
             os.chmod(hello, 0o664)
             written = finalization.write_json
 
-            def signal_after_the_leave(path, value):
+            def depart_after_the_leave(path, value):
                 written(path, value)
                 if Path(path).name == "final.json" and value.get("status") == "invalidated":
-                    os.kill(os.getpid(), signal.SIGINT)
-            with patch.object(finalization, "write_json", side_effect=signal_after_the_leave), \
+                    raise KeyboardInterrupt()
+            with patch.object(finalization, "write_json", side_effect=depart_after_the_leave), \
                     self.assertRaises(KeyboardInterrupt):
                 self.engine(backend).resume(engine.run["id"])
-            # Off its snapshot the leave never reached its transition: the one swept is the written leave's, on A.
+            # Inject a synchronous departure to stage an unpublished leave for the replay sweep.
             self.assertEqual([record["status"] for record in batches.state(engine)["final_history"]], ["running"])
             os.chmod(hello, 0o644)
             result = self.engine(backend).resume(engine.run["id"])
             self.assertEqual([record["status"] for record in result["final_history"]], ["invalidated", "approved"])
             return result
-        self.sweep_ledger(ScriptedBackend, FinalAcceptance.leave_attempt, None, run)
+        self.sweep_ledger(ScriptedBackend, FinalAcceptance.publish_written_leave, None, run)
+
+    def test_real_signal_after_writing_leave_publishes_it_before_delivery(self):
+        backend = ScriptedBackend()
+        engine = self.engine(backend)
+        window, _ = after_save(engine, lambda run: "artifact_digest" in run["review_receipts"].get(FINAL_KEY, {}),
+                               interrupt)
+        with window, self.assertRaises(KeyboardInterrupt):
+            engine.start("Implement greet", batches.plan())
+        original = batches.state(engine)["review_receipts"][FINAL_KEY]["dispatch_id"]
+        hello = engine.worktree / "hello.py"
+        os.chmod(hello, 0o664)
+        write = finalization.write_json
+        signals = []
+
+        def write_then_signal(path, value):
+            write(path, value)
+            if Path(path).name == "final.json" and value.get("status") == "invalidated":
+                signals.append(path)
+                os.kill(os.getpid(), signal.SIGINT)
+
+        with patch.object(finalization, "write_json", side_effect=write_then_signal), \
+                self.assertRaises(KeyboardInterrupt):
+            self.engine(backend).resume(engine.run["id"])
+        self.assertEqual(len(signals), 1)
+        saved = batches.state(engine)
+        self.assert_stop(saved, "interrupted", "signal")
+        self.assertNotIn(FINAL_KEY, saved["review_receipts"])
+        left, = saved["final_history"]
+        self.assertEqual((left["status"], left["review_source"]["dispatch_id"]), ("invalidated", original))
+        self.assertEqual([call["kind"] for call in backend.calls], ["implement", "review", "final_review"])
+        os.chmod(hello, 0o644)
+        result = self.engine(backend).resume(saved["id"])
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual([item["status"] for item in result["final_history"]], ["invalidated", "approved"])
+        self.assertEqual([call["kind"] for call in backend.calls], ["implement", "review", "final_review", "final_review"])
 
     def test_signal_in_the_transition_of_a_written_leave_before_a_decide(self):
         """Review 1d2 r2: back on C, rejected before, the scheduler publishes the leave written on B before it derives
@@ -626,7 +655,7 @@ class LeaveTransitionTests(LedgerSweepCase):
             self.assertEqual([record["status"] for record in result["final_history"]],
                              ["rejected", "invalid_rejected", "approved"])
             return result
-        self.sweep_ledger(lambda: c_then_a("request_changes"), FinalAcceptance.leave_attempt, None, run)
+        self.sweep_ledger(lambda: c_then_a("request_changes"), FinalAcceptance.publish_written_leave, None, run)
 
 
 class ExistingTransitionTests(LedgerSweepCase):
@@ -658,7 +687,7 @@ class ExistingTransitionTests(LedgerSweepCase):
 
     def test_recorded_acceptance(self):
         """The completion block defers SIGINT through both ledger saves and the Git writes."""
-        self.sweep_ledger(ScriptedBackend, TaskLifecycle._complete_acceptance, None,
+        self.sweep_ledger(ScriptedBackend, TaskLifecycle._complete_acceptance, "interrupts.hold()",
                           lambda engine, backend: engine.start("Implement greet", batches.plan()))
 
     def test_recorded_ref_move_resumes_to_one_acceptance(self):
@@ -696,7 +725,8 @@ class ExistingTransitionTests(LedgerSweepCase):
 
     def test_final_verification(self):
         self.sweep_ledger(ScriptedBackend, FinalAcceptance.final_review, "verifying",
-                          lambda engine, backend: engine.start("Implement greet", batches.plan()))
+                          lambda engine, backend: engine.start("Implement greet", batches.plan()),
+                          review_can_prepare=True)
 
 
 if __name__ == "__main__":

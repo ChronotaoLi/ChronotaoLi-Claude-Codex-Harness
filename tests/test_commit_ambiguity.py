@@ -193,7 +193,7 @@ class CommitAmbiguityTests(OperationCase):
         self.assert_saved_candidate(fault)
         self.assertEqual(fault.phases, [])
         self.assertEqual(fault.stops, [])
-        self.assertIn("终态已保存", errors)
+        self.assertIn("status=completed", errors)
         self.assertEqual(self.record("ambiguity")["result_status"], "completed")
 
     def test_another_store_commit_owns_the_ledger(self):

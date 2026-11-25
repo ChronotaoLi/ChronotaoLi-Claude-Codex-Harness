@@ -17,7 +17,8 @@ import time
 from .contracts import validate_work_core
 from .worker_receipts import delivered_work_contract
 from .commands import available_through, validate_command
-from .recovery import RECOVERY_BUSY_KEYS, read_bound_result, snapshot_digest
+from .recovery import RECOVERY_BUSY_KEYS, bound_result, evidence_path, returned_result_files, run_files, snapshot_digest
+from .runtime_evidence import optional_bytes, read_or_write
 from .util import EvidenceError, HarnessError, dump, write_json
 
 
@@ -121,9 +122,11 @@ class EnvironmentRecovery(RuntimeService):
 
     @stops.reads_evidence
     def environment_context(self, *, include_reports=False):
+        self.validate_environment_links()
+        files = run_files(self.context).under("environment")
         records = []
         for row in self.context.run.get("environment_updates", []):
-            record, _ = read_bound_result(row, "环境更新")
+            record, _ = bound_result(files.under(row["id"] + ".json"), row, "环境更新")
             if not isinstance(record, dict):
                 raise HarnessError("环境更新产物必须为对象")
             update = validate_update({key: record[key] for key in
@@ -138,7 +141,7 @@ class EnvironmentRecovery(RuntimeService):
         by_id = {record["id"]: record for record in records}
         reports = []
         for row in self.context.run.get("environment_checks", []):
-            report, _ = read_bound_result(row, "环境检查")
+            report, _ = bound_result(files.under(Path(row["artifact"]).name), row, "环境检查")
             record = by_id.get(row.get("update_id"))
             if (not isinstance(report, dict) or record is None
                     or report.get("update_id") != row["update_id"]
@@ -162,17 +165,15 @@ class EnvironmentRecovery(RuntimeService):
         raw = (dump(value) + "\n").encode("utf-8")
         digest = hashlib.sha256(raw).hexdigest()
         folder = self.context.directory / "environment" / "indexes"
-        if any(p.is_symlink() for p in (folder, *folder.parents)):
-            raise HarnessError("environment index directory is a symlink")
         artifact = folder / (digest + ".json")
         try:
-            if not artifact.exists() and not artifact.is_symlink():
-                write_json(artifact, value)
+            actual = read_or_write(run_files(self.context), ("environment", "indexes", artifact.name),
+                                   artifact, value)
         except OSError as error:
             raise HarnessError("cannot write environment index",
                                stop=stops.make("runtime_failure", "io", data={"error_type": type(error).__name__})) from error
         with stops.evidence_reads(source={"artifact": str(artifact)}):
-            if artifact.is_symlink() or artifact.read_bytes() != raw:
+            if actual != raw:
                 raise HarnessError("environment index changed")
         return {"artifact": str(artifact), "artifact_digest": digest,
                 "update_count": len(value["updates"]), "check_count": len(value["checks"])}
@@ -246,7 +247,7 @@ class EnvironmentRecovery(RuntimeService):
         if (not isinstance(source, dict) or source.get("artifact") != str(expected)
                 or not isinstance(source.get("artifact_digest"), str)):
             raise HarnessError("环境阻断原始证据引用无效")
-        result, _ = read_bound_result(source, "环境阻断")
+        result, _ = bound_result(returned_result_files(self.context, dispatch_id), source, "环境阻断")
         validate_work_core(result, delivered_work_contract(self.context.run, self.context.directory, dispatch_id),
                            self.context.state)
         if result["status"] != "blocked" or result["blocker_kind"] != "environment":
@@ -295,12 +296,15 @@ class EnvironmentRecovery(RuntimeService):
         if record is None:
             return
         artifact = self.context.directory / "environment" / (record["id"] + ".json")
-        if artifact.exists():
+        files = run_files(self.context)
+        parts = ("environment", artifact.name)
+        source = {"artifact": str(artifact)}
+        raw = optional_bytes(files, parts, source)
+        if raw is not None:
             # Recover artifact-before-ledger interruption without replacing evidence.
             try:
-                existing = json.loads(artifact.read_bytes())
-            except (OSError, ValueError, UnicodeError) as error:
-                stops.keep_local_io(error)
+                existing = json.loads(raw)
+            except (ValueError, UnicodeError) as error:
                 raise HarnessError("未登记环境更新产物损坏；保留证据") from error
             if not isinstance(existing, dict) or {k: v for k, v in existing.items() if k != "recorded_at"} != {
                     k: v for k, v in record.items() if k != "recorded_at"}:
@@ -308,8 +312,9 @@ class EnvironmentRecovery(RuntimeService):
             record = existing
         else:
             write_json(artifact, record)
+            raw = files.read(parts, limit=None).evidence(source)
         row = {key: record[key] for key in ("id", "sequence", "task_id", "blocker_dispatch_id", "update_digest")}
-        row.update(artifact=str(artifact), artifact_digest=hashlib.sha256(artifact.read_bytes()).hexdigest())
+        row.update(artifact=str(artifact), artifact_digest=hashlib.sha256(raw).hexdigest())
         # Audit before use. A crash can repeat the event with the same stable ID;
         # only the single ledger entry authorizes injection into model context.
         self.context.event("environment_update_recorded", **row)
@@ -345,13 +350,23 @@ class EnvironmentRecovery(RuntimeService):
                   "results": results, "passed": all(item["passed"] for item in results),
                   "limitation": "Local observations only; no commands executed, permissions granted, or acceptance proven."}
         # Independent artifacts survive repeated failed resumes.
-        while artifact.exists():
+        files = run_files(self.context)
+        while True:
+            parts = ("environment", artifact.name)
+            evidence_source = {"artifact": str(artifact)}
+            evidence_path(files.under(*parts), evidence_source)
+            outcome = files.probe(parts).or_local_io()
+            if outcome.state == "absent" and outcome.step.leaf:
+                break
+            if outcome.state != "present":
+                outcome.evidence(evidence_source)
             ident += 1
             artifact = artifact.with_name(f"checks-{ident}.json")
         write_json(artifact, report)
+        raw = files.read(parts, limit=None).evidence(evidence_source)
         self.context.run["environment_checks"].append({"update_id": record["id"], "task_id": task_id,
             "passed": report["passed"], "artifact": str(artifact),
-            "artifact_digest": hashlib.sha256(artifact.read_bytes()).hexdigest()})
+            "artifact_digest": hashlib.sha256(raw).hexdigest()})
         self.context.save()
         self.context.event("environment_checked", task_id=task_id, passed=report["passed"], artifact=str(artifact))
         if not report["passed"]:
