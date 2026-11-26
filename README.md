@@ -267,7 +267,7 @@ worker_commands = [
 
 同一份授权也可以写成 `[[permissions.worker_commands]]` 表数组（每个表一行 `cwd = …`、一行 `argv = […]`），两种写法解析成同一份数据。
 
-字面 `*` 或换行由 broker 原样传递。配置条目只授权 broker，不生成 Bash 规则：Harness 给 Claude worker 生成的 CLI 层 Bash 放行规则只有只读前缀（参数只能接在 `--` 之后）。Claude CLI 据此实际放行或拒绝哪些 Bash 调用，这一版没有用真实账号核对；预期是 argv 落在只读前缀里的命令仍可经 Bash 执行（那是只读前缀独立的能力，在 Bash 会话当时的目录里执行，不留 broker 记录），其余配置命令经 Bash 被拒绝。管道或重定向须显式授权完整 `{ cwd = …, argv = ["/bin/sh", "-c", "固定脚本"] }`，子目录写进 `cwd`，不要在脚本里 `cd`；删除范围内的已跟踪文件用 `delete_path`，移动文件或删除目录、未跟踪文件须配置含具体路径的精确命令（如 `rm`、`mv`）。不会自动组合命令、授权 `gh`／`ssh`／`curl` 前缀或跳过权限检查，不得用后台执行绕过 broker。必要命令被拒绝时 worker 应报告环境 blocker。当前 Codex 适配器只提供只读模式，配置 Codex worker 会提前报错。
+字面 `*` 或换行由 broker 原样传递。项目配置的命令只授权 broker。Harness 给 Claude worker 生成的 CLI 层 Bash 放行规则只有只读前缀（参数只能接在 `--` 之后）。这项只读能力独立于项目配置，在 Bash 会话当时的目录里执行，不留 broker 记录。A4 的真实权限夹具在 Claude Code 2.1.332 上观察到配置命令经 Bash 被拒，以及与只读前缀重叠的 `ls -- .` 获准，见[验证记录](docs/validation.md#真实账号上的检查提交-b41c9ee)。管道或重定向须显式授权完整 `{ cwd = …, argv = ["/bin/sh", "-c", "固定脚本"] }`，子目录写进 `cwd`，不要在脚本里 `cd`；删除范围内的已跟踪文件用 `delete_path`，移动文件或删除目录、未跟踪文件须配置含具体路径的精确命令（如 `rm`、`mv`）。不会自动组合命令、授权 `gh`／`ssh`／`curl` 前缀或跳过权限检查，不得用后台执行绕过 broker。必要命令被拒绝时 worker 应报告环境 blocker。当前 Codex 适配器只提供只读模式，配置 Codex worker 会提前报错。
 
 外部 MCP 支持 stdio / HTTP 和按 `roles` 限制；指挥、审阅服务必须声明 `read_only = true`，由配置维护者核实。凭据只填写环境变量名称。示例见 [examples/mcp.json](examples/mcp.json)；OpenWiki 默认关闭，启用前需填真实路径并关闭 agent 写入能力。预检验证配置，不连接服务或证明凭据可用。
 
